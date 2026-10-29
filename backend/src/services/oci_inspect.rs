@@ -498,11 +498,23 @@ async fn read_capped(storage: &dyn StorageBackend, key: &str, what: &str) -> Res
 
 /// Describe the image whose manifest (or index) has `manifest_digest`,
 /// reading everything from `storage`.
-pub async fn inspect(
+///
+/// `child_in_repository` answers whether a manifest digest named INSIDE the
+/// resolved one (the platform manifest and attestation an index lists) is
+/// recorded by the repository being inspected. Manifest objects are keyed by
+/// digest alone, and on storage shared by several repositories an index can
+/// list any digest, so a listed child that the repository does not hold is
+/// treated as absent rather than read.
+pub async fn inspect<F, Fut>(
     storage: &dyn StorageBackend,
     reference: &str,
     manifest_digest: &str,
-) -> Result<ImageInspect> {
+    child_in_repository: F,
+) -> Result<ImageInspect>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
     let top = read_capped(storage, &manifest_storage_key(manifest_digest), "manifest").await?;
     let mut index_digest = None;
     let mut platforms = Vec::new();
@@ -511,9 +523,18 @@ pub async fn inspect(
         let choice = choose_from_index(&top)?.ok_or_else(|| {
             AppError::UnprocessableEntity("index lists no image manifests".to_string())
         })?;
+        if !child_in_repository(choice.manifest_digest.clone()).await? {
+            return Err(AppError::NotFound(format!(
+                "platform manifest is not in storage ({})",
+                manifest_storage_key(&choice.manifest_digest)
+            )));
+        }
         index_digest = Some(manifest_digest.to_string());
         platforms = choice.platforms;
-        attestation_digest = choice.attestation_digest;
+        attestation_digest = match choice.attestation_digest {
+            Some(att) if child_in_repository(att.clone()).await? => Some(att),
+            _ => None,
+        };
         let bytes = read_capped(
             storage,
             &manifest_storage_key(&choice.manifest_digest),
@@ -679,7 +700,7 @@ mod tests {
         put(manifest_storage_key("sha256:att"), att_manifest).await;
         put(blob_storage_key("sha256:prov"), provenance).await;
 
-        let doc = inspect(&storage, "images/spike:0.1", "sha256:idx")
+        let doc = inspect(&storage, "images/spike:0.1", "sha256:idx", any_child)
             .await
             .unwrap();
         assert_eq!(doc.reference, "images/spike:0.1");
@@ -696,16 +717,46 @@ mod tests {
 
         // A plain manifest (no index) takes its platform from the config and
         // carries no provenance; a missing manifest is a 404.
-        let doc = inspect(&storage, "images/spike:0.1", "sha256:amd")
+        let doc = inspect(&storage, "images/spike:0.1", "sha256:amd", any_child)
             .await
             .unwrap();
         assert!(doc.index_digest.is_none());
         assert_eq!(doc.platforms[0].architecture, "amd64");
         assert!(doc.provenance.is_none());
-        let err = inspect(&storage, "images/x:1", "sha256:missing")
+        let err = inspect(&storage, "images/x:1", "sha256:missing", any_child)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err}");
+
+        // A child the repository does not record is not read: the platform
+        // manifest is NotFound, and an unrecorded attestation is dropped.
+        let err = inspect(
+            &storage,
+            "images/spike:0.1",
+            "sha256:idx",
+            |d: String| async move { Ok(d != "sha256:amd") },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err}");
+        let doc = inspect(
+            &storage,
+            "images/spike:0.1",
+            "sha256:idx",
+            |d: String| async move { Ok(d != "sha256:att") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(doc.digest, "sha256:amd");
+        assert!(
+            doc.provenance.is_none(),
+            "unrecorded attestation is not read"
+        );
+    }
+
+    /// Every child counts as recorded (the repository check is the caller's).
+    async fn any_child(_: String) -> Result<bool> {
+        Ok(true)
     }
 
     #[test]

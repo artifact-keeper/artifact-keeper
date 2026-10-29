@@ -416,14 +416,32 @@ fn prepare_build(req: &CreateImageBuildRequest, settings: &ImageBuildSettings) -
     ))
 }
 
+/// Resolve `reference` (a tag or a `sha256:` digest) to the manifest digest
+/// to inspect, within ONE repository and image.
+///
+/// A tag resolves through that image's `oci_tags` row. A digest is accepted
+/// only when the manifest belongs to the repository and image
+/// ([`digest_belongs_to_image`]): manifest and blob objects are addressed by
+/// digest alone, and on a cloud backend shared by several repositories the
+/// object for another repository's digest is readable under any key prefix,
+/// so the storage read cannot be what decides. A digest that belongs to
+/// another repository or image gets the same `NotFound` as one that does not
+/// exist anywhere. A Virtual repository records no manifests of its own, so
+/// neither tags nor digests resolve on one.
 async fn resolve_manifest_digest(
     db: &sqlx::PgPool,
     repo_id: Uuid,
+    repo_key: &str,
     image: &str,
     reference: &str,
 ) -> Result<String> {
     if reference.starts_with("sha256:") {
-        return Ok(reference.to_string());
+        if digest_belongs_to_image(db, repo_id, repo_key, image, reference).await? {
+            return Ok(reference.to_string());
+        }
+        return Err(AppError::NotFound(format!(
+            "no manifest {reference} for image {image}"
+        )));
     }
     let digest = sqlx::query_scalar::<_, String>(
         "SELECT manifest_digest FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
@@ -435,6 +453,205 @@ async fn resolve_manifest_digest(
     .await?;
     digest.ok_or_else(|| AppError::NotFound(format!("no tag {reference} for image {image}")))
 }
+
+/// Deepest index nesting [`digest_belongs_to_image`] follows from a child
+/// manifest up to an owning index (the registry's own limit for the same
+/// walk).
+const MAX_OWNING_INDEX_DEPTH: i32 = 8;
+
+/// Upper bound on the catalog rows read for the path-attribution half of the
+/// ancestor check, so a pathological reference graph cannot turn one request
+/// into an unbounded read. The tag half has no such bound.
+const MAX_ANCESTOR_CATALOG_ROWS: i64 = 256;
+
+/// The repository's indexes that reference `$2`, directly or through nested
+/// indexes, at most `$3` levels up.
+macro_rules! ancestor_indexes_cte {
+    () => {
+        r#"
+    WITH RECURSIVE anc(digest, depth) AS (
+        SELECT omr.parent_digest, 1
+        FROM oci_manifest_refs omr
+        WHERE omr.repository_id = $1 AND omr.child_digest = $2
+      UNION
+        SELECT omr.parent_digest, anc.depth + 1
+        FROM oci_manifest_refs omr
+        JOIN anc ON omr.child_digest = anc.digest
+        WHERE omr.repository_id = $1 AND anc.depth < $3
+    )
+"#
+    };
+}
+
+/// Whether a tag of image `$4` names any index above `$2`.
+const ANCESTOR_TAGGED_UNDER_IMAGE_SQL: &str = concat!(
+    ancestor_indexes_cte!(),
+    r#"
+    SELECT EXISTS (
+        SELECT 1 FROM anc
+        JOIN oci_tags ot
+          ON ot.repository_id = $1 AND ot.name = $4 AND ot.manifest_digest = anc.digest
+    )
+"#
+);
+
+/// Live manifest-shaped catalog rows of any index above `$2` whose path
+/// contains the image name `$5` (a cheap pre-filter; `$4` caps the count),
+/// for path attribution in Rust.
+const ANCESTOR_CATALOG_PATHS_SQL: &str = concat!(
+    ancestor_indexes_cte!(),
+    r#"
+    SELECT a.path::text
+    FROM artifacts a
+    JOIN anc
+      ON anc.digest LIKE 'sha256:%'
+     AND a.checksum_sha256 = SUBSTRING(anc.digest FROM 8)::bpchar
+    WHERE a.repository_id = $1
+      AND a.is_deleted = false
+      AND strpos(a.path, $5) > 0
+      AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+    r#"
+    LIMIT $4
+"#
+);
+
+/// Whether the manifest `digest` belongs to `image` in repository `repo_id`:
+///
+/// * the image has a tag pointing at it (a push or proxy fetch by digest
+///   records a digest-keyed tag too), or a live manifest row in the
+///   repository's catalog whose path names this image (data migrated from
+///   another registry can carry only that); or
+/// * the repository itself records the manifest, AND it is reached from an
+///   index that belongs to the image in one of those ways (the platform
+///   manifests and attestations of a multi-platform image are usually
+///   untagged).
+///
+/// Every lookup is scoped to the repository. The record requirement on the
+/// second arm matters because pushing an index records a reference to every
+/// digest it lists, whether or not this repository holds that manifest.
+async fn digest_belongs_to_image(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    image: &str,
+    digest: &str,
+) -> Result<bool> {
+    if digest_directly_owned(db, repo_id, repo_key, image, digest).await? {
+        return Ok(true);
+    }
+    if !manifest_recorded_in_repository(db, repo_id, digest).await? {
+        return Ok(false);
+    }
+    let tagged: bool = sqlx::query_scalar(ANCESTOR_TAGGED_UNDER_IMAGE_SQL)
+        .bind(repo_id)
+        .bind(digest)
+        .bind(MAX_OWNING_INDEX_DEPTH)
+        .bind(image)
+        .fetch_one(db)
+        .await?;
+    if tagged {
+        return Ok(true);
+    }
+    let paths: Vec<String> = sqlx::query_scalar(ANCESTOR_CATALOG_PATHS_SQL)
+        .bind(repo_id)
+        .bind(digest)
+        .bind(MAX_OWNING_INDEX_DEPTH)
+        .bind(MAX_ANCESTOR_CATALOG_ROWS)
+        .bind(image)
+        .fetch_all(db)
+        .await?;
+    Ok(paths_attribute_to_image(&paths, repo_key, image))
+}
+
+/// Whether repository `repo_id` itself records manifest `digest`: its
+/// `oci_manifests` row, any tag of the repository naming it (a manifest a
+/// pre-1.11 replica pushed before the row existed), or a live manifest-shaped
+/// catalog row with those bytes (migrated data before the backfill records
+/// it). Used for the children an index lists, which are read only when this
+/// repository holds them.
+async fn manifest_recorded_in_repository(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    digest: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        concat!(
+            "SELECT EXISTS (SELECT 1 FROM oci_manifests WHERE repository_id = $1 AND digest = $2) \
+                 OR EXISTS (SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2) \
+                 OR EXISTS (SELECT 1 FROM artifacts a WHERE a.repository_id = $1 \
+                     AND $2 LIKE 'sha256:%' AND a.is_deleted = false \
+                     AND a.checksum_sha256 = SUBSTRING($2 FROM 8)::bpchar AND ",
+            crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+            ")"
+        ),
+    )
+    .bind(repo_id)
+    .bind(digest)
+    .fetch_one(db)
+    .await?)
+}
+
+/// The non-recursive half of [`digest_belongs_to_image`]: a tag of `image`
+/// names `digest`, or a live manifest-shaped catalog row of the repository
+/// with those bytes is attributed to `image` by its path.
+async fn digest_directly_owned(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    image: &str,
+    digest: &str,
+) -> Result<bool> {
+    let tagged: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM oci_tags \
+         WHERE repository_id = $1 AND name = $2 AND manifest_digest = $3)",
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(digest)
+    .fetch_one(db)
+    .await?;
+    if tagged {
+        return Ok(true);
+    }
+    let Some(hex) = digest
+        .strip_prefix("sha256:")
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        return Ok(false);
+    };
+    let paths: Vec<String> = sqlx::query_scalar(SELECT_LIVE_MANIFEST_ROW_PATHS_SQL)
+        .bind(repo_id)
+        .bind(hex)
+        .fetch_all(db)
+        .await?;
+    Ok(paths_attribute_to_image(&paths, repo_key, image))
+}
+
+/// Whether any catalog path is attributed to `image` by
+/// `manifest_row_image`, the attribution the registry's by-digest delete
+/// uses. Like that delete, a repository-key prefix on the path is stripped
+/// first, so a migrated source-layout row is read relative to the key.
+fn paths_attribute_to_image(paths: &[String], repo_key: &str, image: &str) -> bool {
+    paths.iter().any(|path| {
+        crate::services::oci_migration_reindex::manifest_row_image(path, repo_key).as_deref()
+            == Some(image)
+    })
+}
+
+/// Live manifest-shaped catalog rows of a repository (`$1`) whose bytes are
+/// one sha256 digest (`$2`, hex). The image each row belongs to is read from
+/// its path ([`paths_attribute_to_image`]).
+const SELECT_LIVE_MANIFEST_ROW_PATHS_SQL: &str = concat!(
+    r#"
+    SELECT a.path::text
+    FROM artifacts a
+    WHERE a.repository_id = $1
+      AND a.checksum_sha256 = $2::bpchar
+      AND a.is_deleted = false
+      AND "#,
+    crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+);
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -473,10 +690,15 @@ async fn inspect_image(
             q.image
         )));
     }
-    let digest = resolve_manifest_digest(&state.db, repo.id, &q.image, &q.reference).await?;
+    let digest =
+        resolve_manifest_digest(&state.db, repo.id, &repo.key, &q.image, &q.reference).await?;
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let reference = format!("{}/{}:{}", repo.key, q.image, q.reference);
-    let doc = oci_inspect::inspect(storage.as_ref(), &reference, &digest).await?;
+    let (db, repo_id) = (&state.db, repo.id);
+    let doc = oci_inspect::inspect(storage.as_ref(), &reference, &digest, |child| async move {
+        manifest_recorded_in_repository(db, repo_id, &child).await
+    })
+    .await?;
     Ok(Json(doc))
 }
 
@@ -558,14 +780,23 @@ async fn base_image_info(
     if !is_container_image_repo(&base_repo) {
         return Ok(Json(not_found));
     }
-    let digest = match resolve_manifest_digest(&state.db, base_repo.id, &image, &reference).await {
-        Ok(d) => d,
-        Err(AppError::NotFound(_)) => return Ok(Json(not_found)),
-        Err(e) => return Err(e),
-    };
+    let digest =
+        match resolve_manifest_digest(&state.db, base_repo.id, &base_repo.key, &image, &reference)
+            .await
+        {
+            Ok(d) => d,
+            Err(AppError::NotFound(_)) => return Ok(Json(not_found)),
+            Err(e) => return Err(e),
+        };
     let storage = state.storage_for_repo(&base_repo.storage_location())?;
     let full = format!("{}/{}:{}", base_repo.key, image, reference);
-    match oci_inspect::inspect(storage.as_ref(), &full, &digest).await {
+    let db = &state.db;
+    let base_repo_id = base_repo.id;
+    match oci_inspect::inspect(storage.as_ref(), &full, &digest, |child| async move {
+        manifest_recorded_in_repository(db, base_repo_id, &child).await
+    })
+    .await
+    {
         Ok(doc) => Ok(Json(base_info_from_inspect(&full, &doc))),
         Err(AppError::NotFound(_)) => Ok(Json(not_found)),
         Err(e) => Err(e),
@@ -1083,16 +1314,443 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_digest_reference_resolves_without_the_database() {
-        let state = test_state();
-        let d = format!("sha256:{}", "ab".repeat(32));
-        assert_eq!(
-            resolve_manifest_digest(&state.db, Uuid::nil(), "team/app", &d)
+    // -----------------------------------------------------------------------
+    // Digest references resolve only within the requested repository and
+    // image, even when several repositories share one storage backend.
+    // -----------------------------------------------------------------------
+
+    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+
+    fn sha256_digest(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    /// Store an image (config + manifest) whose config carries `marker` in its
+    /// environment. Returns the manifest bytes and digest.
+    async fn store_image(
+        storage: &dyn crate::storage::StorageBackend,
+        marker: &str,
+    ) -> (Vec<u8>, String) {
+        use crate::api::handlers::oci_v2::{blob_storage_key, manifest_storage_key};
+        let config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64", "os": "linux",
+            "config": {"Env": [format!("MARKER={marker}")], "User": marker},
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": []
+        }))
+        .unwrap();
+        let config_digest = sha256_digest(&config);
+        storage
+            .put(&blob_storage_key(&config_digest), config.clone().into())
+            .await
+            .expect("put config");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": config_digest, "size": config.len()},
+            "layers": []
+        }))
+        .unwrap();
+        let digest = sha256_digest(&manifest);
+        storage
+            .put(&manifest_storage_key(&digest), manifest.clone().into())
+            .await
+            .expect("put manifest");
+        (manifest, digest)
+    }
+
+    async fn tag(pool: &sqlx::PgPool, repo_id: Uuid, image: &str, tag: &str, digest: &str) {
+        sqlx::query(
+            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .bind(tag)
+        .bind(digest)
+        .bind(OCI_MANIFEST)
+        .execute(pool)
+        .await
+        .expect("insert tag");
+    }
+
+    /// A manifest catalog row (`v2/<image>/manifests/<digest>`) with no tag, as
+    /// data migrated from another registry can carry.
+    async fn catalog_manifest(
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        image: &str,
+        digest: &str,
+        size: usize,
+    ) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(repo_id)
+        .bind(format!("v2/{image}/manifests/{digest}"))
+        .bind(image)
+        .bind(size as i64)
+        .bind(digest.strip_prefix("sha256:").unwrap())
+        .bind(OCI_MANIFEST)
+        .bind(format!("oci-manifests/{digest}"))
+        .execute(pool)
+        .await
+        .expect("insert manifest row");
+    }
+
+    async fn record_manifest(pool: &sqlx::PgPool, repo_id: Uuid, digest: &str, media: &str) {
+        sqlx::query(
+            "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes) \
+             VALUES ($1, $2, $3, 1) ON CONFLICT DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(digest)
+        .bind(media)
+        .execute(pool)
+        .await
+        .expect("insert oci_manifests row");
+    }
+
+    async fn reference(pool: &sqlx::PgPool, repo_id: Uuid, parent: &str, child: &str) {
+        sqlx::query(
+            "INSERT INTO oci_manifest_refs (repository_id, parent_digest, child_digest) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(repo_id)
+        .bind(parent)
+        .bind(child)
+        .execute(pool)
+        .await
+        .expect("insert ref");
+    }
+
+    /// Store an index listing `children` (each `(digest, size)`); returns its digest.
+    async fn store_index(
+        storage: &dyn crate::storage::StorageBackend,
+        children: &[(&str, usize)],
+        media: &str,
+    ) -> String {
+        let manifests: Vec<serde_json::Value> = children
+            .iter()
+            .map(|(d, size)| {
+                serde_json::json!({"mediaType": media, "digest": d, "size": size,
+                                   "platform": {"os": "linux", "architecture": "amd64"}})
+            })
+            .collect();
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": manifests
+        }))
+        .unwrap();
+        let digest = sha256_digest(&index);
+        storage
+            .put(
+                &crate::api::handlers::oci_v2::manifest_storage_key(&digest),
+                index.into(),
+            )
+            .await
+            .expect("put index");
+        digest
+    }
+
+    /// A private and a public container repository on ONE storage location,
+    /// as two repositories on a shared cloud bucket are. Both hold an image
+    /// named `team/app`, so only the repository scope separates them.
+    struct SharedStoragePair {
+        pool: sqlx::PgPool,
+        dir: std::path::PathBuf,
+        private_id: Uuid,
+        public_id: Uuid,
+        public_key: String,
+        /// Private `team/app:1`.
+        foreign: String,
+        /// Private `team/app`, catalogued only (untagged push by digest).
+        foreign_untagged: String,
+        /// The platform child of private `team/app:multi`.
+        foreign_child: String,
+        /// Public `team/app:1`.
+        owned_tagged: String,
+        /// Public `team/app`, pushed by digest (digest-keyed tag).
+        owned_by_digest: String,
+        /// Public `team/app`, catalogued only (migrated data).
+        owned_untagged: String,
+        /// Public `team/app`, catalogued but the row is in the trash.
+        owned_deleted: String,
+        /// Public `team/app:multi`, an index with one platform child.
+        owned_index: String,
+        /// The index's untagged platform child (recorded in the repository).
+        owned_child: String,
+        /// The leaf of public `team/app:nested` -> inner index -> leaf.
+        nested_leaf: String,
+        /// Public `team/other:1`.
+        other_image: String,
+    }
+
+    impl SharedStoragePair {
+        async fn setup() -> Option<Self> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let pool = tdh::try_pool().await?;
+            let (private_id, _private_key, dir) = tdh::create_repo(&pool, "local", "docker").await;
+            let (public_id, public_key, public_dir) =
+                tdh::create_repo(&pool, "local", "docker").await;
+            let _ = std::fs::remove_dir_all(&public_dir);
+            tdh::publish_repo(&pool, public_id).await;
+            sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+                .bind(dir.to_string_lossy().to_string())
+                .bind(public_id)
+                .execute(&pool)
                 .await
-                .unwrap(),
-            d
-        );
+                .expect("share storage");
+
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let repo = RepositoryService::new(pool.clone())
+                .get_by_key(&public_key)
+                .await
+                .expect("public repo");
+            let storage = state
+                .storage_for_repo(&repo.storage_location())
+                .expect("storage");
+            let storage = storage.as_ref();
+            let app = "team/app";
+
+            // Private repository: tagged, catalogued-only, and an index child.
+            let (_, foreign) = store_image(storage, "private-marker").await;
+            tag(&pool, private_id, app, "1", &foreign).await;
+            record_manifest(&pool, private_id, &foreign, OCI_MANIFEST).await;
+            let (bytes, foreign_untagged) = store_image(storage, "private-untagged").await;
+            catalog_manifest(&pool, private_id, app, &foreign_untagged, bytes.len()).await;
+            record_manifest(&pool, private_id, &foreign_untagged, OCI_MANIFEST).await;
+            let (bytes, foreign_child) = store_image(storage, "private-child").await;
+            let foreign_index =
+                store_index(storage, &[(&foreign_child, bytes.len())], OCI_MANIFEST).await;
+            tag(&pool, private_id, app, "multi", &foreign_index).await;
+            record_manifest(&pool, private_id, &foreign_index, OCI_INDEX).await;
+            record_manifest(&pool, private_id, &foreign_child, OCI_MANIFEST).await;
+            reference(&pool, private_id, &foreign_index, &foreign_child).await;
+
+            // Public repository.
+            let (_, owned_tagged) = store_image(storage, "public-tagged").await;
+            tag(&pool, public_id, app, "1", &owned_tagged).await;
+            record_manifest(&pool, public_id, &owned_tagged, OCI_MANIFEST).await;
+
+            let (_, owned_by_digest) = store_image(storage, "public-by-digest").await;
+            tag(&pool, public_id, app, &owned_by_digest, &owned_by_digest).await;
+            record_manifest(&pool, public_id, &owned_by_digest, OCI_MANIFEST).await;
+
+            let (bytes, owned_untagged) = store_image(storage, "public-untagged").await;
+            catalog_manifest(&pool, public_id, app, &owned_untagged, bytes.len()).await;
+
+            let (bytes, owned_deleted) = store_image(storage, "public-deleted").await;
+            catalog_manifest(&pool, public_id, app, &owned_deleted, bytes.len()).await;
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(public_id)
+            .bind(format!("v2/{app}/manifests/{owned_deleted}"))
+            .execute(&pool)
+            .await
+            .expect("trash row");
+
+            let (bytes, owned_child) = store_image(storage, "public-child").await;
+            let owned_index =
+                store_index(storage, &[(&owned_child, bytes.len())], OCI_MANIFEST).await;
+            tag(&pool, public_id, app, "multi", &owned_index).await;
+            record_manifest(&pool, public_id, &owned_index, OCI_INDEX).await;
+            record_manifest(&pool, public_id, &owned_child, OCI_MANIFEST).await;
+            reference(&pool, public_id, &owned_index, &owned_child).await;
+
+            // Two levels: tagged outer index -> untagged inner index -> leaf.
+            let (bytes, nested_leaf) = store_image(storage, "public-nested").await;
+            let inner = store_index(storage, &[(&nested_leaf, bytes.len())], OCI_MANIFEST).await;
+            let outer = store_index(storage, &[(&inner, 1)], OCI_INDEX).await;
+            tag(&pool, public_id, app, "nested", &outer).await;
+            for (d, media) in [
+                (&outer, OCI_INDEX),
+                (&inner, OCI_INDEX),
+                (&nested_leaf, OCI_MANIFEST),
+            ] {
+                record_manifest(&pool, public_id, d, media).await;
+            }
+            reference(&pool, public_id, &outer, &inner).await;
+            reference(&pool, public_id, &inner, &nested_leaf).await;
+
+            // An index pushed into the PUBLIC repository that lists the
+            // private child. Pushing records the reference whatever the
+            // repository holds; the private child has no row here.
+            let forged = store_index(storage, &[(&foreign_child, 1)], OCI_MANIFEST).await;
+            tag(&pool, public_id, app, "forged", &forged).await;
+            record_manifest(&pool, public_id, &forged, OCI_INDEX).await;
+            reference(&pool, public_id, &forged, &foreign_child).await;
+
+            let (_, other_image) = store_image(storage, "public-other").await;
+            tag(&pool, public_id, "team/other", "1", &other_image).await;
+            record_manifest(&pool, public_id, &other_image, OCI_MANIFEST).await;
+
+            Some(Self {
+                pool,
+                dir,
+                private_id,
+                public_id,
+                public_key,
+                foreign,
+                foreign_untagged,
+                foreign_child,
+                owned_tagged,
+                owned_by_digest,
+                owned_untagged,
+                owned_deleted,
+                owned_index,
+                owned_child,
+                nested_leaf,
+                other_image,
+            })
+        }
+
+        /// Anonymous GET against the public repository's routes.
+        async fn get(&self, uri: String) -> (StatusCode, String) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let state = tdh::build_state(self.pool.clone(), self.dir.to_string_lossy().as_ref());
+            let app = tdh::router_anon(repo_router(), state);
+            let (status, body) = tdh::send(app, tdh::get(uri)).await;
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        async fn inspect(&self, image: &str, reference: &str) -> (StatusCode, String) {
+            self.get(format!(
+                "/{}/image-inspect?image={image}&reference={reference}",
+                self.public_key
+            ))
+            .await
+        }
+
+        async fn base_info(&self, image: &str, reference: &str) -> serde_json::Value {
+            let sep = if reference.starts_with("sha256:") {
+                '@'
+            } else {
+                ':'
+            };
+            let (status, body) = self
+                .get(format!(
+                    "/{}/image-builds/base-info?image={}/{image}{sep}{reference}",
+                    self.public_key, self.public_key
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK, "base-info: {body}");
+            serde_json::from_str(&body).expect("base-info JSON")
+        }
+
+        async fn cleanup(self) {
+            for id in [self.private_id, self.public_id] {
+                let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await;
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The refusal for `digest` with the digest itself masked, so a foreign
+    /// digest's response can be compared byte for byte with an absent one's.
+    fn masked(body: &str, digest: &str) -> String {
+        body.replace(digest, "<digest>")
+    }
+
+    #[tokio::test]
+    async fn inspect_by_digest_stays_within_the_repository_and_image() {
+        let Some(f) = SharedStoragePair::setup().await else {
+            return;
+        };
+        let app = "team/app";
+        let absent = format!("sha256:{}", "0".repeat(64));
+        let (absent_status, absent_body) = f.inspect(app, &absent).await;
+        assert_eq!(absent_status, StatusCode::NOT_FOUND, "{absent_body}");
+
+        // The private repository's manifests of the SAME image name, on the
+        // same storage: tagged, catalogued only, and an index child. Each is
+        // refused exactly like a digest that does not exist.
+        for digest in [&f.foreign, &f.foreign_untagged, &f.foreign_child] {
+            let (status, body) = f.inspect(app, digest).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "foreign {digest}: {body}");
+            assert!(!body.contains("private-"), "{body}");
+            assert_eq!(masked(&body, digest), masked(&absent_body, &absent));
+        }
+
+        // An index in the public repository that lists the private child
+        // does not make the child readable, by digest or through the index.
+        let (status, body) = f.inspect(app, "forged").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "forged index: {body}");
+        assert!(!body.contains("private-"), "{body}");
+
+        // The right repository but the wrong image, both ways round.
+        let (status, body) = f.inspect(app, &f.other_image).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "wrong image: {body}");
+        assert_eq!(masked(&body, &f.other_image), masked(&absent_body, &absent));
+        let (status, body) = f.inspect("team/other", &f.owned_tagged).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "wrong image: {body}");
+
+        // A catalogued manifest whose row is in the trash is gone.
+        let (status, body) = f.inspect(app, &f.owned_deleted).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "trashed: {body}");
+
+        // Owned references resolve.
+        for (reference, marker) in [
+            ("1", "public-tagged"),
+            (f.owned_tagged.as_str(), "public-tagged"),
+            (f.owned_by_digest.as_str(), "public-by-digest"),
+            (f.owned_untagged.as_str(), "public-untagged"),
+            ("multi", "public-child"),
+            (f.owned_index.as_str(), "public-child"),
+            (f.owned_child.as_str(), "public-child"),
+            // Two levels up: the leaf of a nested index, by digest. (`inspect`
+            // does not descend a nested index by tag, so only the leaf is read.)
+            (f.nested_leaf.as_str(), "public-nested"),
+        ] {
+            let (status, body) = f.inspect(app, reference).await;
+            assert_eq!(status, StatusCode::OK, "{reference}: {body}");
+            assert!(body.contains(marker), "{reference}: {body}");
+        }
+        let (status, body) = f.inspect("team/other", &f.other_image).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The child is not reachable under another image name.
+        let (status, _) = f.inspect("team/other", &f.owned_child).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn base_image_info_by_digest_stays_within_the_repository_and_image() {
+        let Some(f) = SharedStoragePair::setup().await else {
+            return;
+        };
+        let app = "team/app";
+        let absent = format!("sha256:{}", "0".repeat(64));
+        for reference in [
+            absent.as_str(),
+            f.foreign.as_str(),
+            f.foreign_untagged.as_str(),
+            f.foreign_child.as_str(),
+            f.other_image.as_str(),
+            "forged",
+        ] {
+            let info = f.base_info(app, reference).await;
+            assert_eq!(info["found"], false, "{reference}: {info}");
+            assert!(!info.to_string().contains("private-"), "{info}");
+        }
+        for (reference, user) in [
+            ("1", "public-tagged"),
+            (f.owned_tagged.as_str(), "public-tagged"),
+            (f.owned_untagged.as_str(), "public-untagged"),
+            (f.owned_child.as_str(), "public-child"),
+        ] {
+            let info = f.base_info(app, reference).await;
+            assert_eq!(info["found"], true, "{reference}: {info}");
+            assert_eq!(info["user"], user, "{reference}: {info}");
+        }
+        f.cleanup().await;
     }
 
     #[tokio::test]
