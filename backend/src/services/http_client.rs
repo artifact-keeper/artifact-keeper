@@ -194,15 +194,23 @@ pub fn webhook_client() -> reqwest::Client {
 /// (fail-closed), and cloud-metadata, loopback and link-local addresses
 /// stay hard-blocked at connect time and across redirects regardless of
 /// any toggle.
+///
+/// Requests carry `User-Agent: artifact-keeper/<version>`
+/// ([`SSO_USER_AGENT`]): web application firewalls in front of identity
+/// providers commonly refuse requests without one (#5036).
 pub fn sso_client_builder() -> ClientBuilder {
     log_proxy_env();
 
     let builder = reqwest::Client::builder()
+        .user_agent(SSO_USER_AGENT)
         .redirect(ssrf_sso_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_sso());
 
     apply_custom_ca_cert(builder)
 }
+
+/// The `User-Agent` the SSO/OIDC-fetch client sends (#5036).
+pub const SSO_USER_AGENT: &str = concat!("artifact-keeper/", env!("CARGO_PKG_VERSION"));
 
 /// Build and return a ready-to-use SSO/OIDC-fetch client (see
 /// [`sso_client_builder`]).
@@ -233,9 +241,19 @@ pub const MAX_OIDC_RESPONSE_BYTES: usize = 512 * 1024;
 /// error variant (`AppError::Internal`, `AppError::Authentication`, ...)
 /// while keeping its existing message prefix.
 pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: usize,
 ) -> std::result::Result<T, String> {
+    let body = read_body_capped(response, max_bytes).await?;
+    serde_json::from_slice(&body).map_err(|e| format!("invalid JSON in response body: {e}"))
+}
+
+/// The body-reading half of [`read_json_capped`]: the response bytes, or an
+/// error once they would exceed `max_bytes`.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
     if let Some(declared) = response.content_length() {
         if declared > max_bytes as u64 {
             return Err(format!(
@@ -258,8 +276,85 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
         }
         body.extend_from_slice(&chunk);
     }
+    Ok(body)
+}
 
-    serde_json::from_slice(&body).map_err(|e| format!("invalid JSON in response body: {e}"))
+/// Longest prefix of a failed identity-provider response body written to the
+/// server log.
+const IDP_ERROR_SNIPPET_BYTES: usize = 512;
+
+/// At most the first `limit` bytes of a response body (fewer when reading
+/// fails part way); the rest is not read.
+async fn read_body_prefix(mut response: reqwest::Response, limit: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    while body.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            _ => break,
+        }
+    }
+    body.truncate(limit);
+    body
+}
+
+/// A short, single-line, printable prefix of `body` for the server log.
+fn idp_body_snippet(body: &[u8]) -> String {
+    let end = body.len().min(IDP_ERROR_SNIPPET_BYTES);
+    String::from_utf8_lossy(&body[..end])
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Require a 2xx status from an identity-provider fetch (discovery, JWKS)
+/// before its body is parsed (#5036). A WAF or proxy in front of the IdP
+/// answers with an HTML error page, which used to surface as "invalid JSON".
+///
+/// On a non-2xx answer the status, `what` and a short body snippet go to the
+/// server log, and the error names only `what` and the status: the snippet
+/// never reaches a client-facing message.
+pub async fn require_idp_success(
+    response: reqwest::Response,
+    what: &str,
+) -> std::result::Result<reqwest::Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = read_body_prefix(response, IDP_ERROR_SNIPPET_BYTES).await;
+    tracing::warn!(
+        %status,
+        body = %idp_body_snippet(&body),
+        "{what} returned a non-success status"
+    );
+    Err(format!("{what} returned HTTP {status}"))
+}
+
+/// Read an identity-provider token-endpoint response as JSON (#5036).
+///
+/// OAuth error responses are JSON bodies on a 400 (`{"error": ...}`), which
+/// the caller reports, so a non-2xx JSON body is returned like a 2xx one.
+/// Only a non-2xx answer whose body is not JSON (a WAF or proxy error page)
+/// fails here: the status and a body snippet go to the server log, and the
+/// error names only `what` and the status.
+pub async fn read_idp_token_response(
+    response: reqwest::Response,
+    what: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    let status = response.status();
+    let body = read_body_capped(response, MAX_OIDC_RESPONSE_BYTES).await?;
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => Ok(value),
+        Err(e) if status.is_success() => Err(format!("invalid JSON in response body: {e}")),
+        Err(_) => {
+            tracing::warn!(
+                %status,
+                body = %idp_body_snippet(&body),
+                "{what} returned a non-success status with a non-JSON body"
+            );
+            Err(format!("{what} returned HTTP {status}"))
+        }
+    }
 }
 
 /// Load operator-provided custom CA certificate(s) (`CUSTOM_CA_CERT_PATH`)
@@ -1501,5 +1596,162 @@ mod tests {
              never returns when the request under test was routed elsewhere, hanging \
              the whole test binary. Use `join_loopback_server(server)` (#3377)."
         );
+    }
+
+    // -------------------------------------------------------------------
+    // #5036: identity-provider fetches behind a WAF
+    // -------------------------------------------------------------------
+
+    /// A mock IdP that answers like a WAF: 403 with an HTML page unless the
+    /// request carries the SSO client's `User-Agent`.
+    async fn waf_fronted_idp_5036() -> wiremock::MockServer {
+        use wiremock::matchers::{header, method};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .and(header("user-agent", super::SSO_USER_AGENT))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"issuer": "https://idp.example.com"})),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_raw(
+                "<html><body>Request blocked by WAF rule-secret-42</body></html>",
+                "text/html",
+            ))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The SSO client sends `User-Agent: artifact-keeper/<version>`.
+    #[tokio::test]
+    async fn test_sso_client_sends_a_user_agent_5036() {
+        assert_eq!(
+            super::SSO_USER_AGENT,
+            format!("artifact-keeper/{}", env!("CARGO_PKG_VERSION"))
+        );
+        let server = waf_fronted_idp_5036().await;
+        let resp = loopback_client_from(super::sso_client_builder())
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok()),
+            Some(super::SSO_USER_AGENT)
+        );
+        // A client without the header gets the WAF page (the mock is sound).
+        let resp = loopback_test_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    /// A 403 HTML page from a discovery or JWKS fetch is reported by its
+    /// status, not as invalid JSON, and the page itself stays out of the
+    /// error (it goes to the server log only).
+    #[tokio::test]
+    async fn test_require_idp_success_reports_status_not_body_5036() {
+        let server = waf_fronted_idp_5036().await;
+        let resp = loopback_test_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let err = super::require_idp_success(resp, "OIDC discovery")
+            .await
+            .unwrap_err();
+        assert_eq!(err, "OIDC discovery returned HTTP 403 Forbidden");
+        assert!(!err.contains("rule-secret-42"), "{err}");
+
+        let resp = loopback_client_from(super::sso_client_builder())
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let resp = super::require_idp_success(resp, "OIDC discovery")
+            .await
+            .expect("2xx passes");
+        let value: serde_json::Value = read_json_capped(resp, 1024).await.unwrap();
+        assert_eq!(value["issuer"], "https://idp.example.com");
+    }
+
+    /// Token endpoint: an OAuth JSON error on a 400 is returned for the
+    /// caller to report; a non-JSON non-2xx body fails early by status only.
+    #[tokio::test]
+    async fn test_read_idp_token_response_5036() {
+        use wiremock::matchers::{method, path};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/oauth-error"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "invalid_grant"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/waf"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403)
+                    .set_body_raw("<html>blocked rule-secret-42</html>", "text/html"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/ok"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id_token": "x"})),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(method("POST"))
+            .and(path("/ok-not-json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("<html>"))
+            .mount(&server)
+            .await;
+        let post = |p: &str| {
+            let url = format!("{}/{p}", server.uri());
+            async move { loopback_test_client().post(url).send().await.unwrap() }
+        };
+        let what = "OIDC token endpoint";
+
+        let v = super::read_idp_token_response(post("oauth-error").await, what)
+            .await
+            .expect("OAuth JSON error body is returned");
+        assert_eq!(v["error"], "invalid_grant");
+        let err = super::read_idp_token_response(post("waf").await, what)
+            .await
+            .unwrap_err();
+        assert_eq!(err, "OIDC token endpoint returned HTTP 403 Forbidden");
+        assert!(!err.contains("rule-secret-42"), "{err}");
+        let v = super::read_idp_token_response(post("ok").await, what)
+            .await
+            .unwrap();
+        assert_eq!(v["id_token"], "x");
+        let err = super::read_idp_token_response(post("ok-not-json").await, what)
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid JSON"), "{err}");
+    }
+
+    #[test]
+    fn test_idp_body_snippet_is_short_and_single_line_5036() {
+        let body = format!("<html>\n\r\t{}", "x".repeat(4096));
+        let snippet = super::idp_body_snippet(body.as_bytes());
+        assert_eq!(snippet.len(), super::IDP_ERROR_SNIPPET_BYTES);
+        assert!(!snippet.chars().any(char::is_control), "{snippet}");
     }
 }
