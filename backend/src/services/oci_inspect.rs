@@ -483,10 +483,10 @@ pub fn detect_system_manager(
 // ---------------------------------------------------------------------------
 
 async fn read_capped(storage: &dyn StorageBackend, key: &str, what: &str) -> Result<Vec<u8>> {
-    let bytes = storage
-        .get(key)
-        .await
-        .map_err(|e| AppError::NotFound(format!("{what} is not in storage ({key}): {e}")))?;
+    let bytes = storage.get(key).await.map_err(|e| {
+        tracing::debug!(key, error = %e, "image inspect: {what} read failed");
+        not_in_storage(what, key)
+    })?;
     if bytes.len() > MAX_BLOB_BYTES {
         return Err(AppError::UnprocessableEntity(format!(
             "{what} is larger than {} bytes",
@@ -494,6 +494,12 @@ async fn read_capped(storage: &dyn StorageBackend, key: &str, what: &str) -> Res
         )));
     }
     Ok(bytes.to_vec())
+}
+
+/// The `NotFound` for an object that is absent, or that the repository does
+/// not record: one message for both, so the two cannot be told apart.
+fn not_in_storage(what: &str, key: &str) -> AppError {
+    AppError::NotFound(format!("{what} is not in storage ({key})"))
 }
 
 /// Describe the image whose manifest (or index) has `manifest_digest`,
@@ -505,15 +511,24 @@ async fn read_capped(storage: &dyn StorageBackend, key: &str, what: &str) -> Res
 /// digest alone, and on storage shared by several repositories an index can
 /// list any digest, so a listed child that the repository does not hold is
 /// treated as absent rather than read.
-pub async fn inspect<F, Fut>(
+///
+/// `blob_in_repository` answers the same for a blob a manifest names: the
+/// image config and the attestation's provenance layer. A manifest pushed
+/// into a repository can name any blob digest, so a config the repository
+/// does not record is `NotFound` exactly like an absent one, and an
+/// unrecorded provenance blob is dropped like an absent one.
+pub async fn inspect<F, Fut, G, GFut>(
     storage: &dyn StorageBackend,
     reference: &str,
     manifest_digest: &str,
     child_in_repository: F,
+    blob_in_repository: G,
 ) -> Result<ImageInspect>
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<bool>>,
+    G: Fn(String) -> GFut,
+    GFut: std::future::Future<Output = Result<bool>>,
 {
     let top = read_capped(storage, &manifest_storage_key(manifest_digest), "manifest").await?;
     let mut index_digest = None;
@@ -546,12 +561,11 @@ where
         (top, manifest_digest.to_string())
     };
     let parsed = parse_image_manifest(&manifest_bytes)?;
-    let config_bytes = read_capped(
-        storage,
-        &blob_storage_key(&parsed.config_digest),
-        "image config",
-    )
-    .await?;
+    let config_key = blob_storage_key(&parsed.config_digest);
+    if !blob_in_repository(parsed.config_digest.clone()).await? {
+        return Err(not_in_storage("image config", &config_key));
+    }
+    let config_bytes = read_capped(storage, &config_key, "image config").await?;
     let (config, history, platform) = parse_config(&config_bytes, &parsed.layers)?;
     if platforms.is_empty() {
         platforms.extend(platform);
@@ -562,7 +576,11 @@ where
             read_capped(storage, &manifest_storage_key(&att), "attestation").await
         {
             if let Ok(m) = parse_manifest_json(&att_manifest) {
-                if let Some(layer) = m.layers.first() {
+                let layer = match m.layers.first() {
+                    Some(l) if blob_in_repository(l.digest.clone()).await? => Some(l),
+                    _ => None,
+                };
+                if let Some(layer) = layer {
                     if let Ok(blob) = read_capped(
                         storage,
                         &blob_storage_key(&layer.digest),
@@ -700,9 +718,15 @@ mod tests {
         put(manifest_storage_key("sha256:att"), att_manifest).await;
         put(blob_storage_key("sha256:prov"), provenance).await;
 
-        let doc = inspect(&storage, "images/spike:0.1", "sha256:idx", any_child)
-            .await
-            .unwrap();
+        let doc = inspect(
+            &storage,
+            "images/spike:0.1",
+            "sha256:idx",
+            any_child,
+            any_child,
+        )
+        .await
+        .unwrap();
         assert_eq!(doc.reference, "images/spike:0.1");
         assert_eq!(doc.digest, "sha256:amd");
         assert_eq!(doc.index_digest.as_deref(), Some("sha256:idx"));
@@ -717,15 +741,27 @@ mod tests {
 
         // A plain manifest (no index) takes its platform from the config and
         // carries no provenance; a missing manifest is a 404.
-        let doc = inspect(&storage, "images/spike:0.1", "sha256:amd", any_child)
-            .await
-            .unwrap();
+        let doc = inspect(
+            &storage,
+            "images/spike:0.1",
+            "sha256:amd",
+            any_child,
+            any_child,
+        )
+        .await
+        .unwrap();
         assert!(doc.index_digest.is_none());
         assert_eq!(doc.platforms[0].architecture, "amd64");
         assert!(doc.provenance.is_none());
-        let err = inspect(&storage, "images/x:1", "sha256:missing", any_child)
-            .await
-            .unwrap_err();
+        let err = inspect(
+            &storage,
+            "images/x:1",
+            "sha256:missing",
+            any_child,
+            any_child,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err}");
 
         // A child the repository does not record is not read: the platform
@@ -735,6 +771,7 @@ mod tests {
             "images/spike:0.1",
             "sha256:idx",
             |d: String| async move { Ok(d != "sha256:amd") },
+            any_child,
         )
         .await
         .unwrap_err();
@@ -744,6 +781,7 @@ mod tests {
             "images/spike:0.1",
             "sha256:idx",
             |d: String| async move { Ok(d != "sha256:att") },
+            any_child,
         )
         .await
         .unwrap();
@@ -751,6 +789,60 @@ mod tests {
         assert!(
             doc.provenance.is_none(),
             "unrecorded attestation is not read"
+        );
+
+        // A blob the repository does not record is not read: an unrecorded
+        // config is NotFound with the message of an absent one, and an
+        // unrecorded provenance blob is dropped.
+        let err = inspect(
+            &storage,
+            "images/spike:0.1",
+            "sha256:idx",
+            any_child,
+            |d: String| async move { Ok(d != "sha256:cfg") },
+        )
+        .await
+        .unwrap_err();
+        let AppError::NotFound(refused) = err else {
+            panic!("{err}")
+        };
+        // The same platform manifest in a store that holds no config at all.
+        let empty = tempfile::tempdir().unwrap();
+        let bare = crate::storage::filesystem::FilesystemStorage::new(empty.path());
+        bare.put(
+            &manifest_storage_key("sha256:amd"),
+            storage
+                .get(&manifest_storage_key("sha256:amd"))
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let AppError::NotFound(absent) = inspect(
+            &bare,
+            "images/spike:0.1",
+            "sha256:amd",
+            any_child,
+            any_child,
+        )
+        .await
+        .unwrap_err() else {
+            panic!("absent config must be NotFound")
+        };
+        assert_eq!(refused, absent, "refused and absent configs answer alike");
+        let doc = inspect(
+            &storage,
+            "images/spike:0.1",
+            "sha256:idx",
+            any_child,
+            |d: String| async move { Ok(d != "sha256:prov") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(doc.config.user, "app");
+        assert!(
+            doc.provenance.is_none(),
+            "unrecorded provenance blob is not read"
         );
     }
 

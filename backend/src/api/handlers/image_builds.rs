@@ -592,6 +592,26 @@ async fn manifest_recorded_in_repository(
     .await?)
 }
 
+/// Whether repository `repo_id` records blob `digest` (its `oci_blobs` row),
+/// the same record the registry's blob GET serves a hosted blob from. Used
+/// for the config and provenance blobs an inspected manifest names: a
+/// manifest can name any digest, and on storage shared by several
+/// repositories the object of a blob recorded only for another repository is
+/// readable by its digest key.
+async fn blob_recorded_in_repository(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    digest: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM oci_blobs WHERE repository_id = $1 AND digest = $2)",
+    )
+    .bind(repo_id)
+    .bind(digest)
+    .fetch_one(db)
+    .await?)
+}
+
 /// The non-recursive half of [`digest_belongs_to_image`]: a tag of `image`
 /// names `digest`, or a live manifest-shaped catalog row of the repository
 /// with those bytes is attributed to `image` by its path.
@@ -695,9 +715,13 @@ async fn inspect_image(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let reference = format!("{}/{}:{}", repo.key, q.image, q.reference);
     let (db, repo_id) = (&state.db, repo.id);
-    let doc = oci_inspect::inspect(storage.as_ref(), &reference, &digest, |child| async move {
-        manifest_recorded_in_repository(db, repo_id, &child).await
-    })
+    let doc = oci_inspect::inspect(
+        storage.as_ref(),
+        &reference,
+        &digest,
+        |child| async move { manifest_recorded_in_repository(db, repo_id, &child).await },
+        |blob| async move { blob_recorded_in_repository(db, repo_id, &blob).await },
+    )
     .await?;
     Ok(Json(doc))
 }
@@ -792,9 +816,13 @@ async fn base_image_info(
     let full = format!("{}/{}:{}", base_repo.key, image, reference);
     let db = &state.db;
     let base_repo_id = base_repo.id;
-    match oci_inspect::inspect(storage.as_ref(), &full, &digest, |child| async move {
-        manifest_recorded_in_repository(db, base_repo_id, &child).await
-    })
+    match oci_inspect::inspect(
+        storage.as_ref(),
+        &full,
+        &digest,
+        |child| async move { manifest_recorded_in_repository(db, base_repo_id, &child).await },
+        |blob| async move { blob_recorded_in_repository(db, base_repo_id, &blob).await },
+    )
     .await
     {
         Ok(doc) => Ok(Json(base_info_from_inspect(&full, &doc))),
@@ -1327,13 +1355,15 @@ mod tests {
         format!("sha256:{:x}", Sha256::digest(bytes))
     }
 
-    /// Store an image (config + manifest) whose config carries `marker` in its
-    /// environment. Returns the manifest bytes and digest.
-    async fn store_image(
+    /// Store a config blob carrying `marker` in its environment and user,
+    /// recorded for `repo_id` the way a blob push records it. Returns its
+    /// digest.
+    async fn store_config(
         storage: &dyn crate::storage::StorageBackend,
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
         marker: &str,
-    ) -> (Vec<u8>, String) {
-        use crate::api::handlers::oci_v2::{blob_storage_key, manifest_storage_key};
+    ) -> String {
         let config = serde_json::to_vec(&serde_json::json!({
             "architecture": "amd64", "os": "linux",
             "config": {"Env": [format!("MARKER={marker}")], "User": marker},
@@ -1341,16 +1371,54 @@ mod tests {
             "history": []
         }))
         .unwrap();
-        let config_digest = sha256_digest(&config);
+        store_blob(storage, pool, repo_id, config).await
+    }
+
+    /// Store `bytes` as a blob recorded for `repo_id`; returns its digest.
+    async fn store_blob(
+        storage: &dyn crate::storage::StorageBackend,
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        bytes: Vec<u8>,
+    ) -> String {
+        use crate::api::handlers::oci_v2::blob_storage_key;
+        let digest = sha256_digest(&bytes);
+        let len = bytes.len();
         storage
-            .put(&blob_storage_key(&config_digest), config.clone().into())
+            .put(&blob_storage_key(&digest), bytes.into())
             .await
-            .expect("put config");
+            .expect("put blob");
+        sqlx::query(
+            "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .bind(len as i64)
+        .bind(blob_storage_key(&digest))
+        .execute(pool)
+        .await
+        .expect("insert oci_blobs row");
+        digest
+    }
+
+    /// Store an image manifest naming `config_digest` and `layers`. Returns
+    /// the manifest bytes and digest.
+    async fn store_manifest(
+        storage: &dyn crate::storage::StorageBackend,
+        config_digest: &str,
+        layers: &[(&str, &str)],
+    ) -> (Vec<u8>, String) {
+        use crate::api::handlers::oci_v2::manifest_storage_key;
+        let layers: Vec<serde_json::Value> = layers
+            .iter()
+            .map(|(media, d)| serde_json::json!({"mediaType": media, "digest": d, "size": 1}))
+            .collect();
         let manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2, "mediaType": OCI_MANIFEST,
             "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                       "digest": config_digest, "size": config.len()},
-            "layers": []
+                       "digest": config_digest, "size": 1},
+            "layers": layers
         }))
         .unwrap();
         let digest = sha256_digest(&manifest);
@@ -1359,6 +1427,73 @@ mod tests {
             .await
             .expect("put manifest");
         (manifest, digest)
+    }
+
+    /// Store an image (config + manifest) of repository `repo_id` whose config
+    /// carries `marker`. Returns the manifest bytes and digest.
+    async fn store_image(
+        storage: &dyn crate::storage::StorageBackend,
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        marker: &str,
+    ) -> (Vec<u8>, String) {
+        let config_digest = store_config(storage, pool, repo_id, marker).await;
+        store_manifest(storage, &config_digest, &[]).await
+    }
+
+    /// Store an index listing `child` and a BuildKit attestation manifest for
+    /// it whose provenance layer is `provenance_digest`; the attestation is
+    /// recorded for `repo_id`. Returns the index digest.
+    async fn store_attested_index(
+        storage: &dyn crate::storage::StorageBackend,
+        pool: &sqlx::PgPool,
+        repo_id: Uuid,
+        child: &str,
+        attestation_config: &str,
+        provenance_digest: &str,
+    ) -> String {
+        let (_, att) = store_manifest(
+            storage,
+            attestation_config,
+            &[("application/vnd.in-toto+json", provenance_digest)],
+        )
+        .await;
+        record_manifest(pool, repo_id, &att, OCI_MANIFEST).await;
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [
+                {"mediaType": OCI_MANIFEST, "digest": child, "size": 1,
+                 "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": OCI_MANIFEST, "digest": att, "size": 1,
+                 "platform": {"os": "unknown", "architecture": "unknown"},
+                 "annotations": {"vnd.docker.reference.type": "attestation-manifest",
+                                 "vnd.docker.reference.digest": child}}
+            ]
+        }))
+        .unwrap();
+        let digest = sha256_digest(&index);
+        storage
+            .put(
+                &crate::api::handlers::oci_v2::manifest_storage_key(&digest),
+                index.into(),
+            )
+            .await
+            .expect("put index");
+        record_manifest(pool, repo_id, &digest, OCI_INDEX).await;
+        reference(pool, repo_id, &digest, child).await;
+        reference(pool, repo_id, &digest, &att).await;
+        digest
+    }
+
+    /// An in-toto SLSA provenance statement whose Dockerfile is `dockerfile`.
+    fn provenance_statement(dockerfile: &str) -> Vec<u8> {
+        use base64::Engine;
+        serde_json::to_vec(&serde_json::json!({
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {"runDetails": {"builder": {"id": "buildkit"}, "metadata": {
+                "buildkit_metadata": {"source": {"infos": [{"filename": "Dockerfile",
+                    "data": base64::engine::general_purpose::STANDARD.encode(dockerfile)}]}}}}}
+        }))
+        .unwrap()
     }
 
     async fn tag(pool: &sqlx::PgPool, repo_id: Uuid, image: &str, tag: &str, digest: &str) {
@@ -1486,6 +1621,16 @@ mod tests {
         nested_leaf: String,
         /// Public `team/other:1`.
         other_image: String,
+        /// Public `team/app:borrowed`, a manifest naming the PRIVATE
+        /// repository's config blob.
+        borrowed_config: String,
+        /// That private config blob's digest.
+        borrowed_config_digest: String,
+        /// Public `team/app:missing`, a manifest naming a config stored
+        /// nowhere.
+        missing_config: String,
+        /// That config's digest.
+        missing_config_digest: String,
     }
 
     impl SharedStoragePair {
@@ -1516,13 +1661,15 @@ mod tests {
             let app = "team/app";
 
             // Private repository: tagged, catalogued-only, and an index child.
-            let (_, foreign) = store_image(storage, "private-marker").await;
+            let (_, foreign) = store_image(storage, &pool, private_id, "private-marker").await;
             tag(&pool, private_id, app, "1", &foreign).await;
             record_manifest(&pool, private_id, &foreign, OCI_MANIFEST).await;
-            let (bytes, foreign_untagged) = store_image(storage, "private-untagged").await;
+            let (bytes, foreign_untagged) =
+                store_image(storage, &pool, private_id, "private-untagged").await;
             catalog_manifest(&pool, private_id, app, &foreign_untagged, bytes.len()).await;
             record_manifest(&pool, private_id, &foreign_untagged, OCI_MANIFEST).await;
-            let (bytes, foreign_child) = store_image(storage, "private-child").await;
+            let (bytes, foreign_child) =
+                store_image(storage, &pool, private_id, "private-child").await;
             let foreign_index =
                 store_index(storage, &[(&foreign_child, bytes.len())], OCI_MANIFEST).await;
             tag(&pool, private_id, app, "multi", &foreign_index).await;
@@ -1531,18 +1678,21 @@ mod tests {
             reference(&pool, private_id, &foreign_index, &foreign_child).await;
 
             // Public repository.
-            let (_, owned_tagged) = store_image(storage, "public-tagged").await;
+            let (_, owned_tagged) = store_image(storage, &pool, public_id, "public-tagged").await;
             tag(&pool, public_id, app, "1", &owned_tagged).await;
             record_manifest(&pool, public_id, &owned_tagged, OCI_MANIFEST).await;
 
-            let (_, owned_by_digest) = store_image(storage, "public-by-digest").await;
+            let (_, owned_by_digest) =
+                store_image(storage, &pool, public_id, "public-by-digest").await;
             tag(&pool, public_id, app, &owned_by_digest, &owned_by_digest).await;
             record_manifest(&pool, public_id, &owned_by_digest, OCI_MANIFEST).await;
 
-            let (bytes, owned_untagged) = store_image(storage, "public-untagged").await;
+            let (bytes, owned_untagged) =
+                store_image(storage, &pool, public_id, "public-untagged").await;
             catalog_manifest(&pool, public_id, app, &owned_untagged, bytes.len()).await;
 
-            let (bytes, owned_deleted) = store_image(storage, "public-deleted").await;
+            let (bytes, owned_deleted) =
+                store_image(storage, &pool, public_id, "public-deleted").await;
             catalog_manifest(&pool, public_id, app, &owned_deleted, bytes.len()).await;
             sqlx::query(
                 "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
@@ -1553,7 +1703,7 @@ mod tests {
             .await
             .expect("trash row");
 
-            let (bytes, owned_child) = store_image(storage, "public-child").await;
+            let (bytes, owned_child) = store_image(storage, &pool, public_id, "public-child").await;
             let owned_index =
                 store_index(storage, &[(&owned_child, bytes.len())], OCI_MANIFEST).await;
             tag(&pool, public_id, app, "multi", &owned_index).await;
@@ -1562,7 +1712,8 @@ mod tests {
             reference(&pool, public_id, &owned_index, &owned_child).await;
 
             // Two levels: tagged outer index -> untagged inner index -> leaf.
-            let (bytes, nested_leaf) = store_image(storage, "public-nested").await;
+            let (bytes, nested_leaf) =
+                store_image(storage, &pool, public_id, "public-nested").await;
             let inner = store_index(storage, &[(&nested_leaf, bytes.len())], OCI_MANIFEST).await;
             let outer = store_index(storage, &[(&inner, 1)], OCI_INDEX).await;
             tag(&pool, public_id, app, "nested", &outer).await;
@@ -1584,9 +1735,60 @@ mod tests {
             record_manifest(&pool, public_id, &forged, OCI_INDEX).await;
             reference(&pool, public_id, &forged, &foreign_child).await;
 
-            let (_, other_image) = store_image(storage, "public-other").await;
+            let (_, other_image) = store_image(storage, &pool, public_id, "public-other").await;
             tag(&pool, public_id, "team/other", "1", &other_image).await;
             record_manifest(&pool, public_id, &other_image, OCI_MANIFEST).await;
+
+            // A manifest pushed into the PUBLIC repository that names the
+            // private repository's config blob by digest. Pushing a manifest
+            // records it whatever blobs it names; the config has no
+            // `oci_blobs` row here.
+            let borrowed_config_digest =
+                store_config(storage, &pool, private_id, "private-config").await;
+            let (_, borrowed_config) = store_manifest(storage, &borrowed_config_digest, &[]).await;
+            tag(&pool, public_id, app, "borrowed", &borrowed_config).await;
+            record_manifest(&pool, public_id, &borrowed_config, OCI_MANIFEST).await;
+            // The same shape naming a config that is stored nowhere.
+            let missing_config_digest = sha256_digest(b"no such config");
+            let (_, missing_config) = store_manifest(storage, &missing_config_digest, &[]).await;
+            tag(&pool, public_id, app, "missing", &missing_config).await;
+            record_manifest(&pool, public_id, &missing_config, OCI_MANIFEST).await;
+
+            // Two attested indexes over one public image: one attestation's
+            // provenance blob is the public repository's, the other's is the
+            // private repository's.
+            let (_, attested) = store_image(storage, &pool, public_id, "public-attested").await;
+            record_manifest(&pool, public_id, &attested, OCI_MANIFEST).await;
+            let att_config = store_blob(storage, &pool, public_id, b"{}".to_vec()).await;
+            let own_provenance = store_blob(
+                storage,
+                &pool,
+                public_id,
+                provenance_statement("FROM public-provenance\n"),
+            )
+            .await;
+            let foreign_provenance = store_blob(
+                storage,
+                &pool,
+                private_id,
+                provenance_statement("FROM private-provenance\n"),
+            )
+            .await;
+            for (tag_name, provenance) in [
+                ("attested-own", &own_provenance),
+                ("attested-foreign", &foreign_provenance),
+            ] {
+                let index = store_attested_index(
+                    storage,
+                    &pool,
+                    public_id,
+                    &attested,
+                    &att_config,
+                    provenance,
+                )
+                .await;
+                tag(&pool, public_id, app, tag_name, &index).await;
+            }
 
             Some(Self {
                 pool,
@@ -1605,6 +1807,10 @@ mod tests {
                 owned_child,
                 nested_leaf,
                 other_image,
+                borrowed_config,
+                borrowed_config_digest,
+                missing_config,
+                missing_config_digest,
             })
         }
 
@@ -1750,6 +1956,56 @@ mod tests {
             assert_eq!(info["found"], true, "{reference}: {info}");
             assert_eq!(info["user"], user, "{reference}: {info}");
         }
+        f.cleanup().await;
+    }
+
+    /// A manifest the repository holds can name any blob digest; the config
+    /// and provenance it names are read only when the repository records
+    /// those blobs too. A config recorded only for another repository answers
+    /// exactly like a config stored nowhere.
+    #[tokio::test]
+    async fn inspect_reads_config_and_provenance_only_from_the_repository() {
+        let Some(f) = SharedStoragePair::setup().await else {
+            return;
+        };
+        let app = "team/app";
+        let (status, missing_body) = f.inspect(app, "missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing_body}");
+        let missing = masked(&missing_body, &f.missing_config_digest);
+        for reference in ["borrowed", f.borrowed_config.as_str()] {
+            let (status, body) = f.inspect(app, reference).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{reference}: {body}");
+            assert!(!body.contains("private-"), "{reference}: {body}");
+            assert_eq!(masked(&body, &f.borrowed_config_digest), missing);
+        }
+        // Base-image info: the same refusal as an absent config.
+        for reference in ["borrowed", "missing", f.borrowed_config.as_str()] {
+            let info = f.base_info(app, reference).await;
+            assert_eq!(info["found"], false, "{reference}: {info}");
+            assert!(!info.to_string().contains("private-"), "{info}");
+        }
+
+        // Provenance: the repository's own provenance blob is read; another
+        // repository's is dropped as if absent, and the image still resolves.
+        let (status, body) = f.inspect(app, "attested-own").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("inspect JSON");
+        assert_eq!(doc["config"]["user"], "public-attested", "{body}");
+        assert!(
+            doc["provenance"]["dockerfile"]
+                .as_str()
+                .is_some_and(|d| d.contains("public-provenance")),
+            "{body}"
+        );
+        let (status, body) = f.inspect(app, "attested-foreign").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!body.contains("private-"), "{body}");
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("inspect JSON");
+        assert_eq!(doc["config"]["user"], "public-attested", "{body}");
+        assert!(doc["provenance"].is_null(), "{body}");
+        let info = f.base_info(app, "attested-foreign").await;
+        assert_eq!(info["found"], true, "{info}");
+
         f.cleanup().await;
     }
 
