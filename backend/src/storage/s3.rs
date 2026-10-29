@@ -2915,7 +2915,7 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to build a bucket URL for the S3 list fallback: {}",
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
         let root = bucket_root_url(&probe_url, S3_LIST_PROBE_SEGMENT);
@@ -2928,7 +2928,7 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to resolve S3 credentials for the list fallback: {}",
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
 
@@ -3108,7 +3108,7 @@ impl S3Backend {
                 AppError::Storage(format!(
                     "Failed to build copy URL for '{}': {}",
                     dest_path.as_ref(),
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })
     }
@@ -3135,7 +3135,8 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to resolve S3 credentials for {}: {}",
-                    what, e
+                    what,
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
 

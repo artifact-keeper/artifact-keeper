@@ -1040,6 +1040,29 @@ fn unhealthy_filesystem_storage(message: &'static str, error: &std::io::Error) -
     }
 }
 
+/// Replace every URL in a storage error with `<url>`, keeping only the
+/// product documentation link and the `example.com` placeholders the S3
+/// diagnostics quote as guidance. The health endpoints are unauthenticated,
+/// so a storage endpoint, bucket or key must never reach them.
+fn redact_storage_urls(text: &str) -> String {
+    static URL: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r#"(?i)\bhttps?://[^\s"'<>]+"#).expect("static regex"));
+    URL.replace_all(text, |caps: &regex::Captures<'_>| {
+        let url = &caps[0];
+        let host = url
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', ':', '?', '#']).next().unwrap_or(""))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if host == "artifactkeeper.com" || host == "example.com" || host.ends_with(".example.com") {
+            url.to_string()
+        } else {
+            "<url>".to_string()
+        }
+    })
+    .into_owned()
+}
+
 async fn probe_storage_health(
     config: &crate::config::Config,
     storage: &Arc<dyn StorageBackend>,
@@ -1094,7 +1117,7 @@ async fn probe_storage_health(
                     message: Some(format!(
                         "{} storage probe failed: {}",
                         config.storage_backend,
-                        crate::storage::s3::redact_urls_in_text(&e.to_string())
+                        redact_storage_urls(&e.to_string())
                     )),
                 },
                 Err(_) => CheckStatus {
@@ -1981,6 +2004,19 @@ mod tests {
                 assert!(!message.contains(secret), "{backend}: {message}");
             }
         }
+    }
+
+    /// The S3 diagnostics' documentation and example links stay readable.
+    #[test]
+    fn test_redact_storage_urls_keeps_the_guidance_links() {
+        let text = "See docs at https://artifactkeeper.com/docs/deployment/s3 \
+                    (e.g. https://s3.example.com:9000) after GET \
+                    http://minio.internal:9000/bucket/key?x=1 failed";
+        let redacted = redact_storage_urls(text);
+        assert!(redacted.contains("https://artifactkeeper.com/docs/deployment/s3"));
+        assert!(redacted.contains("https://s3.example.com:9000"));
+        assert!(!redacted.contains("minio.internal"), "{redacted}");
+        assert!(redacted.contains("<url>"), "{redacted}");
     }
 
     #[tokio::test]

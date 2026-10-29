@@ -211,7 +211,6 @@ fn map_status_error(status: u16, context: &str, body: &str) -> AppError {
     }
 }
 
-/// Check that an HTTP response indicates success; return an error with context otherwise.
 /// Map a reqwest error to a storage error without the request URL. A
 /// transport error names the URL it was sending to, which carries the
 /// endpoint host, the bucket and the object key; that text reaches API
@@ -221,6 +220,7 @@ fn request_error(operation: &str, e: reqwest::Error) -> AppError {
     AppError::Storage(format!("{}: {}", operation, e.without_url()))
 }
 
+/// Check that an HTTP response indicates success; return an error with context otherwise.
 async fn require_success(
     response: reqwest::Response,
     context: &str,
