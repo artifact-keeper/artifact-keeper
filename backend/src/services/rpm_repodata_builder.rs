@@ -281,13 +281,31 @@ const FOLD_LOCK_KEY: i64 = 0x4544_0309;
 /// deadlock; the builder takes the row locks here instead, one replica at a
 /// time and in key order. Returns the roots marked.
 pub async fn fold_marks(db: &PgPool) -> Result<u64> {
+    fold_marks_inner(db, false).await
+}
+
+/// [`fold_marks`], but waiting for another replica's fold instead of
+/// skipping (tests read `dirty_since` right after a write).
+#[cfg(test)]
+pub(crate) async fn fold_marks_waiting(db: &PgPool) -> Result<u64> {
+    fold_marks_inner(db, true).await
+}
+
+async fn fold_marks_inner(db: &PgPool, wait: bool) -> Result<u64> {
     let mut tx = db.begin().await?;
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(FOLD_LOCK_KEY)
-        .fetch_one(&mut *tx)
-        .await?;
-    if !got {
-        return Ok(0);
+    if wait {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(FOLD_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(FOLD_LOCK_KEY)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !got {
+            return Ok(0);
+        }
     }
     // Never stall every replica's fold behind one blocked root row: give up
     // and retry at the next tick.
@@ -312,7 +330,11 @@ pub async fn fold_marks(db: &PgPool) -> Result<u64> {
 
 /// Roots whose build is due: dirty and debounced, or past their retry time.
 async fn due_roots(db: &PgPool, settings: &BuilderSettings) -> Result<Vec<(Uuid, String)>> {
-    fold_marks(db).await?;
+    // A fold that timed out only delays marks to the next tick; the roots
+    // already marked are still due.
+    if let Err(e) = fold_marks(db).await {
+        debug!(error = %e, "RPM repodata: folding dirty marks failed; retried next tick");
+    }
     let sql = format!(
         "SELECT rr.repository_id, rr.root FROM rpm_repodata_roots rr \
            JOIN repositories r ON r.id = rr.repository_id \

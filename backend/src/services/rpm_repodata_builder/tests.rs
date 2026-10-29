@@ -64,14 +64,9 @@ async fn row(
     f: &tdh::Fixture,
     root: &str,
 ) -> Option<(Option<DateTime<Utc>>, Option<i64>, Option<i64>)> {
-    // A root is dirty when its row says so or a writer's mark is still
-    // queued (another test's fold may hold the fold lock).
-    fold_marks(&f.pool).await.expect("fold dirty marks");
+    fold_marks_waiting(&f.pool).await.expect("fold dirty marks");
     sqlx::query_as(
-        "SELECT CASE WHEN EXISTS (SELECT 1 FROM rpm_repodata_dirty d \
-                                   WHERE d.repository_id = $1 AND d.root = $2) \
-                     THEN COALESCE(dirty_since, now()) ELSE dirty_since END, \
-                built_revision, previous_revision FROM rpm_repodata_roots \
+        "SELECT dirty_since, built_revision, previous_revision FROM rpm_repodata_roots \
           WHERE repository_id = $1 AND root = $2",
     )
     .bind(f.repo_id)
@@ -79,6 +74,12 @@ async fn row(
     .fetch_optional(&f.pool)
     .await
     .unwrap()
+}
+
+/// The due roots once every queued mark is folded.
+async fn due(f: &tdh::Fixture, settings: &BuilderSettings) -> Vec<(Uuid, String)> {
+    fold_marks_waiting(&f.pool).await.unwrap();
+    due_roots(&f.pool, settings).await.unwrap()
 }
 
 async fn build(f: &tdh::Fixture, root: &str) -> BuildOutcome {
@@ -343,15 +344,15 @@ async fn due_roots_are_debounced_4544() {
         batch: 10_000,
         ..BuilderSettings::default()
     };
-    assert!(!mine(due_roots(&f.pool, &patient).await.unwrap()));
+    assert!(!mine(due(&f, &patient).await));
     let eager = BuilderSettings {
         quiet: Duration::ZERO,
         batch: 10_000,
         ..patient.clone()
     };
-    assert!(mine(due_roots(&f.pool, &eager).await.unwrap()));
+    assert!(mine(due(&f, &eager).await));
     request_build(&f.pool, f.repo_id, "").await.unwrap();
-    assert!(mine(due_roots(&f.pool, &patient).await.unwrap()));
+    assert!(mine(due(&f, &patient).await));
     f.teardown().await;
 }
 
@@ -528,11 +529,7 @@ async fn claim_waits_for_fenced_writers_and_crashed_builds_retry_4544() {
         batch: 10_000,
         ..BuilderSettings::default()
     };
-    assert!(!due_roots(&f.pool, &eager)
-        .await
-        .unwrap()
-        .iter()
-        .any(|(id, _)| *id == f.repo_id));
+    assert!(!due(&f, &eager).await.iter().any(|(id, _)| *id == f.repo_id));
     assert!(matches!(build(&f, "").await, BuildOutcome::Built { .. }));
 
     // A claim whose build never swapped: clean, deadline passed.
@@ -550,9 +547,8 @@ async fn claim_waits_for_fenced_writers_and_crashed_builds_retry_4544() {
         batch: 10_000,
         ..BuilderSettings::default()
     };
-    assert!(due_roots(&f.pool, &patient)
+    assert!(due(&f, &patient)
         .await
-        .unwrap()
         .iter()
         .any(|(id, _)| *id == f.repo_id));
     f.teardown().await;
