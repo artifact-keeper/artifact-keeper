@@ -3073,9 +3073,9 @@ async fn verify_pypi_curation_row(
     // (`urls[].url`), so a hostile or compromised mirror chooses it. Send the
     // repository's configured upstream credentials ONLY when it stays on the
     // configured upstream's origin — same rule as the NuGet remote-search fix
-    // (#3130/#2925). Network-level SSRF is already refused at connect time by the
-    // shared DNS guard; this is specifically about not handing an operator's
-    // Basic/token header to whatever public host the mirror names.
+    // (#3130/#2925). This is specifically about not handing an operator's
+    // Basic/token header to whatever public host the mirror names; the
+    // destination itself is checked below.
     let dist_auth = if same_upstream_origin(upstream_url, &dist_url) {
         upstream_auth.clone()
     } else {
@@ -3088,6 +3088,25 @@ async fn verify_pypi_curation_row(
         return AttestationVerdict::failure(
             "attestation lookup skipped: the upstream filter refuses the distribution URL"
                 .to_string(),
+        );
+    }
+    // The mirror names this host, so it gets the same upstream URL validation
+    // as the Remote's own URL before anything is sent: a client on an egress
+    // proxy hands the name to the proxy and never resolves it locally.
+    let check_url = dist_url.clone();
+    let allowed = tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&check_url, "Distribution URL").is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if !allowed {
+        tracing::info!(
+            staging_repo_id = %pkg.staging_repo_id,
+            remote_key = %remote_key,
+            "curation sync: distribution URL is not allowed; attestation lookup skipped"
+        );
+        return AttestationVerdict::failure(
+            "attestation lookup skipped: the distribution URL is not allowed".to_string(),
         );
     }
     let Some(bytes) = bounded_download(client, &dist_auth, &dist_url).await else {
@@ -5360,7 +5379,9 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let server = wiremock::MockServer::start().await;
+        // The distribution URL is validated, so the mock listens on a routable
+        // interface the test allowlists.
+        let (server, _allowlisted) = tdh::non_loopback_mock_server().await;
         let staging_id = uuid::Uuid::new_v4();
         let remote_id = uuid::Uuid::new_v4();
         let remote_key = format!("pypi840-remote-{}", remote_id.simple());
@@ -5514,6 +5535,30 @@ mod tests {
         let after_dist = server.received_requests().await.unwrap_or_default();
         let dist_requests = &after_dist[before_dist..];
 
+        // Distribution on a host the upstream URL validation refuses (the
+        // mirror's JSON names a loopback URL): failed, nothing sent there.
+        save_filter("^no-such-prefix/".to_string()).await;
+        let loopback = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"wheel bytes".to_vec()))
+            .mount(&loopback)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/demo/1.0.0/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "urls": [{
+                    "filename": "demo-1.0.0-py3-none-any.whl",
+                    "packagetype": "bdist_wheel",
+                    "digests": { "sha256": "abc123" },
+                    "url": format!("{}/files/demo-1.0.0-py3-none-any.whl", loopback.uri()),
+                }],
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let dist_disallowed = verify().await;
+        let loopback_requests = loopback.received_requests().await.unwrap_or_default();
+
         let _ = sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
             .bind(staging_id)
             .execute(&pool)
@@ -5593,6 +5638,29 @@ mod tests {
                 .iter()
                 .any(|r| r.url.path().starts_with("/files/")),
             "a refused distribution must not be downloaded"
+        );
+
+        assert_eq!(
+            dist_disallowed.state,
+            AttestationState::Failed,
+            "a distribution on a disallowed host must not verify: {:?}",
+            dist_disallowed.error
+        );
+        assert!(
+            dist_disallowed
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("distribution URL is not allowed")),
+            "the reason names the refused distribution URL: {:?}",
+            dist_disallowed.error
+        );
+        assert!(
+            loopback_requests.is_empty(),
+            "a disallowed distribution host must not be contacted: {:?}",
+            loopback_requests
+                .iter()
+                .map(|r| r.url.to_string())
+                .collect::<Vec<_>>()
         );
     }
 
