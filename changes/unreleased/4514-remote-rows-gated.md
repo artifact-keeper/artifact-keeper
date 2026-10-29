@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4514]
+---
+- **Package rows held by a Remote that scans on proxy are served through the scan gate on the Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift routes** (#4514). A Remote can hold `artifacts` rows of its own (from replication, a publish into the remote, or recorded before proxied content stopped being stored as rows), and the format route served those from storage without the gate while gating every file it proxied. Now the stored bytes go through the same gate, graded as the coordinate the request names by the same identity rule a proxied file of that format is: a blocking verdict for their SHA-256 is `403` `scan_blocked`, `fail_closed` scans inline when there is no reusable verdict (`423` if inconclusive), `fail_open` serves `pending` and scans in the background, and a row over the scan cap is `423` under `fail_closed` and served `pending` otherwise. The response carries `X-AK-Scan`. Hosted repositories, Remotes that do not scan and the generic download route are unchanged. See "The artifacts routes" and "Known gaps" in `docs/security/scan-on-proxy.md`.

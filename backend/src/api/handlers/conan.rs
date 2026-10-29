@@ -2167,18 +2167,38 @@ async fn recipe_file_download(
         .await
         .map_err(map_storage_err)?;
 
+    let ct = content_type_for_conan_file(&file_path);
+    // #4514: a row a scanning Remote holds goes through the scan gate, for
+    // the same files a proxied pull would be gated on.
+    let scan = if conan_file_serve_key(&file_path).scannable {
+        let filename = file_path.rsplit('/').next().unwrap_or(&file_path);
+        proxy_helpers::gate_stored_content(
+            &state,
+            &repo,
+            filename,
+            &content,
+            ConanArchive {
+                reference: Some((name.clone(), version.clone())),
+            },
+        )
+        .await?
+    } else {
+        None
+    };
+
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let ct = content_type_for_conan_file(&file_path);
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, ct)
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, ct)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+            .body(Body::from(content))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3495,18 +3515,38 @@ async fn package_file_download(
         .await
         .map_err(map_storage_err)?;
 
+    let ct = content_type_for_conan_file(&file_path);
+    // #4514: a row a scanning Remote holds goes through the scan gate, for
+    // the same files a proxied pull would be gated on.
+    let scan = if conan_file_serve_key(&file_path).scannable {
+        let filename = file_path.rsplit('/').next().unwrap_or(&file_path);
+        proxy_helpers::gate_stored_content(
+            &state,
+            &repo,
+            filename,
+            &content,
+            ConanArchive {
+                reference: Some((name.clone(), version.clone())),
+            },
+        )
+        .await?
+    } else {
+        None
+    };
+
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    let ct = content_type_for_conan_file(&file_path);
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, ct)
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, ct)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
+            .body(Body::from(content))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
