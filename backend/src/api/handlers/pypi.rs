@@ -2562,20 +2562,28 @@ async fn apply_pypi_download_age_gate(
 
 /// Run the remote-PyPI download age gate and, when the requested version is
 /// withheld, resolve the response the caller should return: the last-known-good
-/// wheel served via the proxy cache (presigned redirect / cache stream /
-/// upstream refetch), or the 451 block propagated as an `Err`.
+/// wheel (through the scan gate when the repository scans on proxy, otherwise
+/// via the proxy cache: presigned redirect / cache stream / upstream
+/// refetch), or the 451 block propagated as an `Err`.
 ///
 /// Returns `Ok(Some(response))` when the gate handled the request and
 /// `Ok(None)` when the version is allowed and the caller should keep serving
 /// normally. Shared by both the cache-miss and the local-`artifacts`-hit
 /// branches of `serve_file` so a young version is never streamed just because a
 /// local row exists (parity with npm's unconditional `serve_tarball` gate).
+///
+/// When `repo` scans on proxy, the substitute is served through the scan gate
+/// ([`serve_scanned_pypi_file`]) exactly as a requested file would be, never
+/// through the unscanned redirect / stream / refetch below. `virtual_id` names
+/// the Virtual repository when `repo` is one of its members, so the
+/// stricter-of-two policy applies as it does to the member's other files.
 async fn enforce_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
     project: &NormalizedProjectName,
     filename: &str,
+    virtual_id: Option<uuid::Uuid>,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
@@ -2588,6 +2596,34 @@ async fn enforce_pypi_download_age_gate(
             Some(lkg) => lkg,
             None => return Ok(None),
         };
+
+    // The substitute is a download like any other: a repository that scans
+    // on proxy serves it through the scan gate.
+    let scan = match virtual_id {
+        Some(virtual_id) => {
+            proxy_helpers::effective_virtual_scan_policy(&state.db, virtual_id, repo.id).await?
+        }
+        None if repo.repo_type == RepositoryType::Remote => {
+            proxy_helpers::remote_scan_policy(&state.db, repo.id).await?
+        }
+        None => None,
+    };
+    if let Some((action, severity_gate)) = scan {
+        return serve_scanned_pypi_file(
+            state,
+            proxy,
+            repo.id,
+            repo_key,
+            upstream_url,
+            project,
+            &lkg_filename,
+            action,
+            severity_gate,
+            ctx,
+        )
+        .await
+        .map(Some);
+    }
 
     // The gate above and this cache key are now the SAME string by
     // construction (#3186); they used to be `project` and
@@ -2723,6 +2759,7 @@ async fn serve_file(
                         repo_key,
                         project,
                         filename,
+                        None,
                         Some(ctx),
                     )
                     .await?
@@ -2750,7 +2787,7 @@ async fn serve_file(
                             filename,
                             action,
                             severity_gate,
-                            ctx,
+                            Some(ctx),
                         )
                         .await;
                     }
@@ -2988,6 +3025,7 @@ async fn serve_file(
                         &member.key,
                         project,
                         filename,
+                        Some(repo.id),
                         None,
                     )
                     .await?
@@ -3071,7 +3109,7 @@ async fn serve_file(
                                     filename,
                                     action,
                                     severity_gate,
-                                    ctx,
+                                    Some(ctx),
                                 )
                                 .await
                                 {
@@ -3174,9 +3212,16 @@ async fn serve_file(
     // withheld version returns 451 (or the last-known-good wheel) instead of the
     // young local artifact.
     if repo.repo_type == RepositoryType::Remote {
-        if let Some(resp) =
-            enforce_pypi_download_age_gate(state, repo, repo_key, project, filename, Some(ctx))
-                .await?
+        if let Some(resp) = enforce_pypi_download_age_gate(
+            state,
+            repo,
+            repo_key,
+            project,
+            filename,
+            None,
+            Some(ctx),
+        )
+        .await?
         {
             return Ok(resp);
         }
@@ -3973,7 +4018,7 @@ async fn serve_scanned_pypi_file(
     filename: &str,
     action: crate::services::proxy_scan_service::ProxyScanAction,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
-    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
 ) -> Result<Response, Response> {
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo_id).await;
     let target = resolve_pypi_remote_fetch_target(
@@ -3996,7 +4041,7 @@ async fn serve_scanned_pypi_file(
         filename,
         action,
         severity_gate,
-        ctx: Some(ctx),
+        ctx,
     };
     let file = PypiScannedFile {
         proxy,
@@ -19031,6 +19076,129 @@ mod tests {
                 "cached vulnerable digest must be a 403 scan_blocked (not 423: \
                  the verdict is conclusive)"
             ),
+        }
+    }
+
+    /// The age gate's last-known-good substitute is a download like any
+    /// other: on a Remote that scans on proxy it goes through the scan gate.
+    /// A young version is withheld, the substitute's bytes carry a blocking
+    /// verdict, and the pull must be refused, never answered with the
+    /// substitute's bytes or a redirect to them.
+    #[tokio::test]
+    async fn test_serve_file_age_gate_substitute_goes_through_the_scan_gate() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let project = "agedsub";
+        let young = "agedsub-2.0.0-py3-none-any.whl";
+        let lkg = "agedsub-1.0.0-py3-none-any.whl";
+        let wheel: &'static [u8] = b"PK\x03\x04 age-gate-substitute-blocked-wheel";
+        let digest = sha256_hex(&Bytes::from_static(wheel));
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_scan_upstream(&upstream, project, lkg, wheel).await;
+        let old = (Utc::now() - chrono::Duration::days(3650)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path(format!("/pypi/{project}/json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": {
+                    "1.0.0": [ { "upload_time_iso_8601": old } ],
+                    "2.0.0": [ { "upload_time_iso_8601": now } ],
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 30 WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("enable age gate");
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        // The last-known-good version is the newest older row the repository
+        // holds; only its row is needed, the gate fetches its bytes.
+        sqlx::query(
+            "INSERT INTO artifacts ( \
+                 repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, uploaded_by \
+             ) VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/zip', $6, $7)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("simple/{project}/{lkg}"))
+        .bind(project)
+        .bind(wheel.len() as i64)
+        .bind(&digest)
+        .bind(format!("rows/{}", uuid::Uuid::new_v4()))
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("seed last-known-good row");
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                &digest,
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-0.99.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed blocking verdict");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), storage_path.as_str(), proxy);
+        let mut repo_info = fx.repo_info("remote", Some(&upstream.uri()));
+        repo_info.format = "pypi".to_string();
+        repo_info.age_gate_enabled = true;
+        repo_info.age_gate_min_age_days = 30;
+
+        let result = super::serve_file(
+            &state,
+            &repo_info,
+            &fx.repo_key,
+            &proj(project),
+            young,
+            None,
+            &Default::default(),
+        )
+        .await;
+
+        sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&fx.pool)
+            .await
+            .expect("cleanup proxy_scan_results");
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        match result {
+            Ok(r) => panic!(
+                "the age-gate substitute must go through the scan gate, got {} \
+                 (location {:?})",
+                r.status(),
+                r.headers().get(axum::http::header::LOCATION)
+            ),
+            Err(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
         }
     }
 
