@@ -2149,11 +2149,6 @@ impl CiOidcService {
     }
 
     async fn fetch_jwks(&self, jwks_uri: &str) -> Result<serde_json::Value> {
-        // `jwks_uri` comes from the issuer's discovery document, not from
-        // configuration, so it gets the same check the issuer URL does (and
-        // the SSO login path applies to the same field). The SSO client's
-        // connect-time check never sees an IP-literal host.
-        crate::api::validation::validate_outbound_sso_url(jwks_uri, "CI OIDC JWKS URI")?;
         {
             let cache = jwks_cache().read().await;
             if let Some(entry) = cache.get(jwks_uri) {
@@ -2163,6 +2158,11 @@ impl CiOidcService {
             }
         }
 
+        // `jwks_uri` comes from the issuer's discovery document, not from
+        // configuration, so it gets the same check the issuer URL does (and
+        // the SSO login path applies to the same field) before it is fetched.
+        // The SSO client's connect-time check never sees an IP-literal host.
+        crate::api::validation::validate_outbound_sso_url(jwks_uri, "CI OIDC JWKS URI")?;
         let response = self
             .http
             .get(jwks_uri)
@@ -2397,7 +2397,7 @@ mod tests {
                 .await
                 .expect_err(&format!("{uri} must be refused"));
             assert!(
-                matches!(err, AppError::Validation(_)),
+                matches!(err, crate::error::AppError::Validation(_)),
                 "{uri}: expected a validation error, got {err:?}"
             );
         }

@@ -3847,7 +3847,11 @@ pub(crate) struct UpstreamClient {
     /// always refuses, so test builds exempt loopback literals by default.
     /// `Some(ports)` narrows the exemption to those ports, which lets a test
     /// keep its mock upstream reachable while proving that any other loopback
-    /// listener is refused. Never compiled into a release build.
+    /// listener is refused. Never compiled into a release build, and not into
+    /// `backend/tests/*` either (they link the library without `cfg(test)`).
+    /// A unit test that asserts a loopback refusal through `client_for` must
+    /// call `restrict_test_loopback_to_ports(&[])` first, or it passes
+    /// vacuously.
     #[cfg(test)]
     test_loopback_ports: std::sync::Mutex<Option<Vec<u16>>>,
 }
@@ -3914,7 +3918,8 @@ impl UpstreamClient {
     /// blocking lookup on the hot path. The configured private-address
     /// exceptions (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, `UPSTREAM_ALLOW_PRIVATE_IPS`)
     /// apply exactly as they do when the upstream URL is saved. A URL that
-    /// does not parse is left for `reqwest` to reject as before.
+    /// does not parse is left for `reqwest` to reject as before. A refusal is
+    /// `CodedBadGateway` (`UPSTREAM_DESTINATION_REFUSED`, 502).
     fn ensure_initial_destination_allowed(&self, target_url: &str) -> Result<()> {
         let Ok(parsed) = reqwest::Url::parse(target_url) else {
             return Ok(());
@@ -3930,7 +3935,20 @@ impl UpstreamClient {
         }
         #[cfg(not(test))]
         let _ = ip;
-        crate::api::validation::validate_outbound_url(target_url, "Upstream URL")
+        crate::api::validation::validate_outbound_url(target_url, "Upstream URL").map_err(|e| {
+            // The policy logged the refused address; the caller did nothing
+            // wrong, so this is the upstream's failure (502), not a 400 for
+            // the request path, and the client is not told the address.
+            tracing::warn!(
+                destination = %redact_url_for_diagnostics(target_url),
+                "upstream destination refused by the outbound address policy: {e}"
+            );
+            AppError::CodedBadGateway {
+                code: "UPSTREAM_DESTINATION_REFUSED",
+                message: "The upstream named a destination this server does not contact"
+                    .to_string(),
+            }
+        })
     }
 
     /// Whether a test build exempts this loopback destination (see
@@ -4201,8 +4219,8 @@ impl UpstreamClient {
             .await?;
         let custom_ua = self.get_custom_user_agent(repo_id).await;
 
-        let mut request = self
-            .http_client
+        let client = self.client_for(repo_id, url).await?;
+        let mut request = client
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "application/json;api-version=3.0-preview.1")
@@ -26609,13 +26627,30 @@ mod tests {
 
         // The whole point of the re-check: a proxy must not become a way to
         // reach a destination the upstream SSRF guard would otherwise refuse.
+        // An IP literal is refused up front in every routing mode
+        // (`ensure_initial_destination_allowed`); a host name the proxy would
+        // resolve is refused by the proxied-destination re-check.
         let err = uc
             .client_for(repo_id, "http://169.254.169.254/latest/meta-data/")
             .await
             .expect_err("a proxied fetch to the metadata endpoint must be refused");
         assert!(
+            matches!(
+                err,
+                AppError::CodedBadGateway {
+                    code: "UPSTREAM_DESTINATION_REFUSED",
+                    ..
+                }
+            ),
+            "expected the destination refusal, got {err:?}",
+        );
+        let err = uc
+            .client_for(repo_id, "http://localhost/latest/meta-data/")
+            .await
+            .expect_err("a proxied fetch to a blocked host name must be refused");
+        assert!(
             matches!(err, AppError::Validation(_)),
-            "expected a validation error, got {err:?}",
+            "expected the proxied-destination validation error, got {err:?}",
         );
 
         sqlx::query("DELETE FROM repositories WHERE id = $1")
@@ -26640,7 +26675,7 @@ mod tests {
 
     /// Restores the private-address settings on drop.
     struct OutboundPolicyEnv {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         saved: Vec<(&'static str, Option<String>)>,
     }
 
@@ -26651,10 +26686,10 @@ mod tests {
             "UPSTREAM_ALLOW_PRIVATE_IPS",
         ];
 
-        fn cleared() -> Self {
+        async fn cleared() -> Self {
             let lock = crate::api::validation::OUTBOUND_POLICY_ENV_LOCK
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .await;
             let saved = Self::VARS
                 .iter()
                 .map(|v| (*v, std::env::var(v).ok()))
@@ -26682,7 +26717,7 @@ mod tests {
     /// URL parser; IPv4-mapped IPv6 obeys the IPv4 rules.
     #[tokio::test]
     async fn test_client_for_refuses_internal_ip_literals() {
-        let _env = OutboundPolicyEnv::cleared();
+        let _env = OutboundPolicyEnv::cleared().await;
         let uc = enforcing_upstream_client();
         for url in [
             "http://127.0.0.1/chart.tgz",
@@ -26709,24 +26744,38 @@ mod tests {
             "http://100.64.0.1/",
             "http://[fd12:3456::1]/",
             "https://10.1.2.3:8443/index.yaml",
+            "http://[::7f00:1]/",
+            "http://127.0.0.1./",
+            "http://%31%32%37.0.0.1/",
+            "http://user@127.0.0.1/",
+            "http://[64:ff9b::a9fe:a9fe]/latest/meta-data/",
+            "http://[64:ff9b::7f00:1]/",
+            "http://[64:ff9b::a00:5]/",
+            "http://[64:ff9b:1::a00:5]/",
         ] {
             let err = uc
                 .client_for(Uuid::new_v4(), url)
                 .await
                 .expect_err(&format!("{url} must be refused"));
             assert!(
-                matches!(err, AppError::Validation(_)),
-                "{url}: expected a validation error, got {err:?}"
+                matches!(
+                    err,
+                    AppError::CodedBadGateway {
+                        code: "UPSTREAM_DESTINATION_REFUSED",
+                        ..
+                    }
+                ),
+                "{url}: expected the destination refusal, got {err:?}"
             );
         }
     }
 
     /// Public literals are allowed, and host names are not resolved here
-    /// (the connect-time guard covers them): with no reachable database the
-    /// call fails on the routing lookup, not on a destination refusal.
+    /// (the connect-time guard covers them); an unparseable URL is left for
+    /// `reqwest` to reject.
     #[tokio::test]
     async fn test_initial_destination_check_leaves_public_literals_and_hostnames() {
-        let _env = OutboundPolicyEnv::cleared();
+        let _env = OutboundPolicyEnv::cleared().await;
         let uc = enforcing_upstream_client();
         for url in [
             "https://93.184.216.34/chart.tgz",
@@ -26744,7 +26793,7 @@ mod tests {
     /// an upstream URL is saved; the loopback and metadata hard blocks stay.
     #[tokio::test]
     async fn test_initial_destination_check_honours_private_exceptions() {
-        let _env = OutboundPolicyEnv::cleared();
+        let _env = OutboundPolicyEnv::cleared().await;
         let uc = enforcing_upstream_client();
 
         std::env::set_var("AK_SSRF_ALLOW_PRIVATE_CIDRS", "10.20.0.0/16,fd12:3456::/32");
@@ -26779,7 +26828,7 @@ mod tests {
     /// working is loopback-only and can be narrowed to given ports.
     #[tokio::test]
     async fn test_test_loopback_allowance_is_loopback_only() {
-        let _env = OutboundPolicyEnv::cleared();
+        let _env = OutboundPolicyEnv::cleared().await;
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid/").unwrap();
         let uc = UpstreamClient::new(pool, Client::new());
         uc.ensure_initial_destination_allowed("http://127.0.0.1:1234/")

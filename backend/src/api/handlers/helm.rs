@@ -3716,7 +3716,11 @@ entries:
                 hits, 0,
                 "inherit routing: chart URL host {host} reached the loopback listener (status {status})"
             );
-            assert_ne!(status, StatusCode::OK, "inherit routing: {host}");
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "inherit routing: {host} must be refused by the outbound address policy"
+            );
         }
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
@@ -3749,7 +3753,11 @@ entries:
                 hits, 0,
                 "direct routing: chart URL host {host} reached the loopback listener (status {status})"
             );
-            assert_ne!(status, StatusCode::OK, "direct routing: {host}");
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "direct routing: {host} must be refused by the outbound address policy"
+            );
         }
         let _ = std::fs::remove_dir_all(&storage_dir);
     }

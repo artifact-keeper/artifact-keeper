@@ -18,6 +18,8 @@
 //! ```
 
 #![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +31,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 use artifact_keeper_backend::api::handlers::rubygems;
 use artifact_keeper_backend::api::middleware::auth::AuthExtension;
@@ -114,7 +116,7 @@ async fn cleanup(pool: &PgPool, ids: &[Uuid]) {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
 async fn stale_member_is_marked_within_grace_and_fails_after_it() {
-    let upstream = MockServer::start().await;
+    let upstream = common::upstream_mock::admitted_mock_server().await;
     Mock::given(method("GET"))
         .respond_with(
             ResponseTemplate::new(200)
