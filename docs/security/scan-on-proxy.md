@@ -341,6 +341,37 @@ before. A rescan in a repository whose format does not scan on proxy (for
 example `generic`) in which the scanner catalogs nothing and finds nothing is
 inconclusive: it answers `503` and records no verdict.
 
+## Proxy-cache fast paths
+
+A format route that gates a file buffers it and runs the gate on every
+read, cache hits included. Some reads hand out a cached file without
+buffering it: a presigned redirect to the cached object, a streaming cache
+hit, a cached metadata hit.
+
+- The redirect helpers that serve only files the format gates (PyPI
+  distributions, and the shared `proxy_cache_fresh_redirect`) consult the
+  verdict stored for the cached body's SHA-256 (the `checksum_sha256` of its
+  `__cache_meta__.json`) under the Remote's own scan configuration, by the
+  reuse rules above (#4514):
+
+  | Stored verdict | `fail_closed` | `fail_open` | `record_only` |
+  | --- | --- | --- | --- |
+  | Reusable and blocking under the severity gate | `403` `scan_blocked` (or the redirect is declined) | same | redirected |
+  | Reusable `clean` that graded something, graded as a coordinate the bytes carry themselves | redirected | redirected | redirected |
+  | Anything else: none, stale, unprovable, `clean` graded on nothing, `clean` graded as a coordinate only the request names (Go, Composer, Conan, Debian, RPM, Alpine) or graded without one | redirect declined | redirected | redirected |
+
+  A declined redirect is not an error: the request is answered by the next
+  path, which reads the body itself. A `403` answered here is audited
+  (`PROXY_SCAN_BLOCKED`) and counted in `ak_proxy_scan_verdicts_total`.
+  Verdict reads on these paths are memoised per digest, so a new verdict
+  reaches them within 30 seconds.
+- The Virtual member redirect, the streaming cache hit and the cached
+  metadata hit are not changed. On a Remote that scans, a file the format
+  gates never reaches them: the Virtual walk and the direct route send it
+  through the gate. What they serve there is what the format serves
+  unscanned (a Maven POM, an index document), and that is served whatever
+  any stored verdict says.
+
 ## Virtual repositories
 
 A Virtual repository walks its members in their configured priority order,
@@ -407,7 +438,7 @@ repository that scans on proxy:
 | `GET /api/v1/repositories/{key}/artifacts` | The files the proxy cache holds, rebuilt from the proxy-cache catalog: path, size, when it was cached, download count. Each item has a synthetic id and `analyzable: false`. | None. It serves no bytes and does not read verdicts, so a cached file is listed whatever its verdict. |
 | `GET /api/v1/repositories/{key}/artifacts/*path` | The metadata (JSON) of an `artifacts` row at that path; `404` when there is none. It never reads the proxy cache or the upstream. | None. It serves no bytes. |
 | `GET /api/v1/repositories/{key}/download/*path` | A file the cache or the upstream would supply: `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)). An `artifacts` row: its bytes from storage. | Refuses proxied files; serves rows without a scan. |
-| The format route (`/go/{key}/...`, `/gems/{key}/...`, ...) | An `artifacts` row: its bytes from storage. Otherwise the file through the gate. | Gates proxied files; serves rows without a scan. |
+| The format route (`/go/{key}/...`, `/gems/{key}/...`, ...) | An `artifacts` row: its bytes from storage, through the gate. Otherwise the file through the gate. | Gates proxied files and rows. |
 
 The reasoning:
 
@@ -420,8 +451,17 @@ The reasoning:
   has no such parser and refuses instead of serving unscanned.
 - An `artifacts` row in a Remote repository (from replication, or recorded
   before proxied content stopped being stored as rows) is content the
-  repository holds, not a proxied fetch. The format route and the generic
-  download route both serve it from storage, without a scan. See
+  repository holds, not a proxied fetch. The format route serves it from
+  storage through the gate (#4514): a blocking verdict for its SHA-256 is
+  the `403`, under `fail_closed` a row with no reusable verdict is scanned
+  inline (`423` if the scan is inconclusive), under `fail_open` it is served
+  `pending` and scanned in the background, and a row over the scan cap is
+  `423` under `fail_closed` and served `pending` otherwise. The row is
+  graded as the coordinate the request names, by the same identity rule a
+  proxied file of that format is, so a row whose archive declares another
+  package or version, cannot be read, or holds two entries at one path is
+  withheld under `fail_closed` exactly as the proxied file would be. The
+  generic download route still serves a row without a scan. See
   [Known gaps](#known-gaps).
 
 For a Virtual repository, `GET .../artifacts/*path` serves a member's bytes
@@ -491,25 +531,35 @@ have no core proxy path to gate.
 ## Known gaps
 
 - **Cache commit before the verdict.** The buffered fetch commits upstream
-  bytes to the proxy cache before the gate decides. A route that does not
-  re-check the verdict can then serve them warm (#4514; see the design note
-  [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)). The generic download
+  bytes to the proxy cache before the gate decides (#4514; see the design
+  note [proxy-cache-commit-after-gate.md](proxy-cache-commit-after-gate.md)).
+  The format routes re-run the gate on every read, the generic download
   route refuses before it reads the cache for a repository that scans on
-  proxy. A non-scanning Remote member of a scanning Virtual is still subject
-  to this gap: bytes the Virtual refused can be served warm by addressing the
-  member directly, on its format route or on the generic route.
+  proxy. A presigned redirect hands out a cached package without the gate;
+  the package-file redirect helpers consult the stored verdict (see
+  [Proxy-cache fast paths](#proxy-cache-fast-paths)). A non-scanning Remote
+  member of a scanning Virtual is still subject to this gap: bytes the
+  Virtual refused can be served warm by addressing the member directly, on
+  its format route or on the generic route, because the member's own
+  configuration does not scan.
 - **Maven-layout archives other than `.jar`/`.war`/`.ear`** (`.aar`,
   `.hpi`/`.jpi`, `.nbm`, `.jmod`, `.rar`, `.zip`) are scanned as raw files,
   not unpacked, and carry no identity pin.
-- **NuGet package rows in a Remote repository.** A Remote NuGet repository
-  can hold `artifacts` rows of its own (from before proxied content stopped
-  being recorded as rows, from replication, or from a publish into the
-  remote). A row whose blob is present is served from storage without the
-  gate. If the blob has gone missing:
-  - and the row records a SHA-256, the re-fetched bytes are held to that
-    digest instead of being scanned, and a stored `vulnerable` verdict for
-    that digest refuses the pull (`403`);
-  - and the row records no digest, the re-fetch goes through the gate.
+- **Package rows in a Remote repository.** A Remote can hold `artifacts`
+  rows of its own (from replication, from a publish into the remote, or
+  recorded before proxied content stopped being stored as rows).
+  - Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift: the format
+    route serves such a row through the gate (see
+    [The artifacts routes](#the-artifacts-routes)).
+  - NuGet, Debian, RPM and Alpine, and the rows of the other enforced
+    formats: the format route still serves a row whose blob is present from
+    storage without the gate. For NuGet, if the blob has gone missing and
+    the row records a SHA-256, the re-fetched bytes are held to that digest
+    instead of being scanned, and a stored `vulnerable` verdict for that
+    digest refuses the pull (`403`); a row with no digest is re-fetched
+    through the gate.
+  - Every enforced format: the generic download route serves a row from
+    storage without the gate.
 - **Conda packages graded on file contents.** A conda package the scanner
   catalogs nothing for is graded on its findings alone and recorded with
   `components_cataloged: 0` (#4594). A clean result there means the scanner
@@ -573,17 +623,6 @@ have no core proxy path to gate.
   (a `.dsc`, a `repodata/` path, a `.asc` file) streams unscanned. Alpine
   file names and branches come from the client's request, and an RPM's
   release from its own header.
-- **Debian, RPM and Alpine rows in a Remote repository.** As for NuGet, an
-  `artifacts` row a Remote repository holds for a package path (from
-  replication or a publish into the remote) is served from storage without
-  the gate.
-- **Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift rows in a Remote
-  repository.** As for Debian, RPM and Alpine, an `artifacts` row a Remote
-  repository holds for a package (from replication, or recorded before
-  proxied content stopped being stored as rows) is served from storage
-  without the gate, on the format route and on the generic download route.
-  Only a path with no row is fetched through the gate. See
-  [The artifacts routes](#the-artifacts-routes).
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.

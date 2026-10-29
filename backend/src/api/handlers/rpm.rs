@@ -52,6 +52,10 @@ use crate::services::signing_service::{openpgp_public_keyring, SigningService};
 #[cfg(test)]
 mod depth_tests;
 
+#[cfg(ak_test_shard = "router")]
+#[cfg(test)]
+mod precomputed_tests;
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -4131,6 +4135,215 @@ fn generate_updateinfo_xml() -> String {
 "#
     .to_string()
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/repositories/{key}/rpm/repodata/rebuild (#4544)
+// ---------------------------------------------------------------------------
+
+/// Routes mounted on the `/api/v1/repositories` nest.
+pub fn repo_router() -> Router<SharedState> {
+    Router::new().route("/:key/rpm/repodata/rebuild", post(rebuild_repodata))
+}
+
+/// Longest a `wait=true` rebuild waits for a build another replica is
+/// running before it builds the root itself.
+const REBUILD_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Synchronous (`wait=true`) builds one replica runs at once; more answer
+/// 503 rather than queue connections and render work.
+static REBUILD_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Query of `POST .../rpm/repodata/rebuild`.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct RebuildRepodataQuery {
+    /// Metadata root, as it appears in the repository URL (`el9/x86_64` at
+    /// depth two). Omit at depth zero.
+    #[serde(default)]
+    pub root: String,
+    /// Build now and answer once the root is built (`200`), instead of
+    /// asking the background builder to build it at its next tick (`202`).
+    #[serde(default)]
+    pub wait: bool,
+}
+
+/// Outcome of a repodata rebuild request.
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RebuildStatus {
+    /// A revision including every earlier write is being served.
+    Built,
+    /// The root has no packages left; it renders an empty document.
+    Empty,
+    /// Without `wait`: the builder builds the root at its next tick.
+    Queued,
+}
+
+/// Result of a repodata rebuild request.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RebuildRepodataResponse {
+    /// The metadata root (empty at depth zero).
+    pub root: String,
+    pub status: RebuildStatus,
+    /// The revision now served, when `status` is `built`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub revision: Option<i64>,
+    /// Packages the revision lists, when `status` is `built`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub packages: Option<i64>,
+}
+
+/// Rebuild the precomputed repodata of a hosted RPM root
+///
+/// Hosted RPM repositories serve repodata built in the background after a
+/// short debounce, so right after a publish a root can still describe the
+/// previous state. A CI job that publishes and then installs from the same
+/// root calls this with `wait=true`: it answers once a revision that
+/// includes every write committed before the call is being served (callers
+/// arriving together share one build). Without `wait` the build is only
+/// requested. Needs the repository `write` permission, like an upload.
+#[utoipa::path(
+    post,
+    path = "/{key}/rpm/repodata/rebuild",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        RebuildRepodataQuery,
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Root built (or empty)", body = RebuildRepodataResponse),
+        (status = 202, description = "Build requested", body = RebuildRepodataResponse),
+        (status = 400, description = "`root` is not a metadata root at the repository's depth"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Repository write permission required"),
+        (status = 404, description = "Repository not found, or `root` never held packages"),
+        (status = 409, description = "The repository renders repodata on request (`repodata_mode: on_request`), serves a curated publication or is being deleted; or a build or a long write on the root did not finish in time"),
+        (status = 422, description = "Not a hosted (local) RPM repository"),
+        (status = 503, description = "This replica is already running its maximum of synchronous rebuilds; retry"),
+    )
+)]
+pub async fn rebuild_repodata(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<RebuildRepodataQuery>,
+) -> crate::error::Result<Response> {
+    use crate::error::AppError;
+    use crate::services::repository_service::RepositoryService;
+    use rpm_repodata_builder::{BuildOutcome, RepodataMode};
+
+    let auth = auth.ok_or_else(|| AppError::Authentication("Authentication required".into()))?;
+    auth.require_scope("write:repositories")?;
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    crate::api::handlers::repositories::require_repo_write_access(&auth, &repo, &service).await?;
+    crate::api::handlers::repositories::require_repo_action(
+        &auth,
+        repo.id,
+        "write",
+        &state.permission_service,
+    )
+    .await?;
+    if repo.format != RepositoryFormat::Rpm || repo.repo_type != RepositoryType::Local {
+        return Err(AppError::UnprocessableEntity(
+            "Repodata rebuilds apply to hosted (local) RPM repositories only".into(),
+        ));
+    }
+    if rpm_repodata_builder::mode(&state.db, repo.id).await? == RepodataMode::OnRequest {
+        return Err(AppError::Conflict(
+            "This repository renders repodata on every request (repodata_mode: on_request); \
+             there is nothing to rebuild"
+                .into(),
+        ));
+    }
+    if rpm_repodata_builder::precomputed_location(&state.db, repo.id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Conflict(
+            "This repository's repodata is not precomputed (it serves a curated publication \
+             or is being deleted)"
+                .into(),
+        ));
+    }
+    let root = query.root.trim_matches('/').to_string();
+    let depth = rpm_layout::depth(&state.db, repo.id).await?;
+    rpm_layout::validate_root(&root, depth).map_err(|_| {
+        AppError::Validation(format!(
+            "'{root}' is not a metadata root of this repository (repodata_depth {depth})"
+        ))
+    })?;
+    if !rpm_repodata_builder::root_is_known(&state.db, repo.id, &root).await? {
+        return Err(AppError::NotFound(format!(
+            "No packages under root '{root}'"
+        )));
+    }
+
+    if !query.wait {
+        rpm_repodata_builder::request_build(&state.db, repo.id, &root).await?;
+        let body = RebuildRepodataResponse {
+            root,
+            status: RebuildStatus::Queued,
+            revision: None,
+            packages: None,
+        };
+        return Ok((StatusCode::ACCEPTED, axum::Json(body)).into_response());
+    }
+    // In its own task: a client that disconnects must not cancel a build
+    // half way, after it cleared the root's dirty flag.
+    let task_state = state.clone();
+    let (repo_id, task_root) = (repo.id, root.clone());
+    let outcome = tokio::spawn(async move {
+        rpm_repodata_builder::build_waiting(
+            &task_state,
+            repo_id,
+            &task_root,
+            REBUILD_WAIT,
+            &REBUILD_SLOTS,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("repodata rebuild task failed: {e}")))??;
+    let (status, revision, packages) = match outcome {
+        BuildOutcome::Built { revision, packages } => {
+            (RebuildStatus::Built, Some(revision), Some(packages))
+        }
+        BuildOutcome::Empty => (RebuildStatus::Empty, None, None),
+        BuildOutcome::Busy => {
+            return Err(AppError::Conflict(
+                "Another build of this root did not finish in time; retry".into(),
+            ))
+        }
+        BuildOutcome::WritersBusy => {
+            return Err(AppError::Conflict(
+                "A long-running write to this root is still in progress; retry".into(),
+            ))
+        }
+        BuildOutcome::NotPrecomputed => {
+            return Err(AppError::Conflict(
+                "This repository's repodata is not precomputed".into(),
+            ))
+        }
+    };
+    let body = RebuildRepodataResponse {
+        root,
+        status,
+        revision,
+        packages,
+    };
+    Ok((StatusCode::OK, axum::Json(body)).into_response())
+}
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(rebuild_repodata),
+    components(schemas(RebuildRepodataResponse, RebuildStatus))
+)]
+pub struct RpmRepodataApiDoc;
 
 // ---------------------------------------------------------------------------
 // Utility helpers

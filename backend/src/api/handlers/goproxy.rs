@@ -1532,30 +1532,37 @@ async fn download_zip(
         .await
         .map_err(|e| e.into_response())?;
 
-    let stream = storage
-        .get_stream(&artifact.storage_key)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+    // #4514: a row a scanning Remote holds goes through the scan gate.
+    let filename = format!("{}.zip", encode_module_path(version));
+    let proxy_helpers::StoredRowBody { body: stream, scan } = proxy_helpers::open_stored_row(
+        state,
+        storage.as_ref(),
+        &proxy_helpers::StoredRow {
+            repo,
+            filename: &filename,
+            storage_key: &artifact.storage_key,
+            size_bytes: artifact.size_bytes,
+        },
+        GoModuleZip { module, version },
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/zip")
-        .header(
-            "Content-Disposition",
-            build_go_zip_content_disposition(module, version),
-        )
-        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-        .body(Body::from_stream(stream))
-        .unwrap())
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/zip")
+            .header(
+                "Content-Disposition",
+                build_go_zip_content_disposition(module, version),
+            )
+            .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
+            .body(Body::from_stream(stream))
+            .unwrap(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

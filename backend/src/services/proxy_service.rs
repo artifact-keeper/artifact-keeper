@@ -36,6 +36,9 @@ use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
     Coordinator, HydrationCoordinator, StreamHandle, StreamHeaders,
 };
+use crate::services::proxy_scan_service::{
+    decide_cache_scan_gate, CacheScanGate, StoredProxyVerdict,
+};
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
 use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
@@ -1496,14 +1499,14 @@ impl CacheMetadata {
     }
 }
 
-/// Gate a proxy read on a Package Age Policy hold window (#1770).
-///
-/// Reuses the pure `quarantine_service::check_download_allowed` decision the
-/// hosted download paths already use: a `quarantine_until` in the future
-/// blocks the read with 409 Conflict; an elapsed window or an absent hold
-/// (legacy sidecar, or policy disabled at write time) allows it. The error
-/// MUST propagate to the handler — never be degraded to a cache `Miss`, which
-/// would refetch upstream and loop.
+/// A Remote's own scan-on-proxy policy, as the proxy-cache fast paths read
+/// it (#4514).
+struct FastPathScanPolicy {
+    repository_id: Uuid,
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+}
+
 /// How a cache entry point names the Remote whose origin policy it applies
 /// (#4506): by key or by id, when it holds no [`Repository`].
 #[derive(Clone, Copy)]
@@ -1512,6 +1515,14 @@ enum RemoteRef<'a> {
     Id(Uuid),
 }
 
+/// Gate a proxy read on a Package Age Policy hold window (#1770).
+///
+/// Reuses the pure `quarantine_service::check_download_allowed` decision the
+/// hosted download paths already use: a `quarantine_until` in the future
+/// blocks the read with 409 Conflict; an elapsed window or an absent hold
+/// (legacy sidecar, or policy disabled at write time) allows it. The error
+/// MUST propagate to the handler — never be degraded to a cache `Miss`, which
+/// would refetch upstream and loop.
 fn check_quarantine_until(quarantine_until: Option<DateTime<Utc>>) -> Result<()> {
     match quarantine_until {
         Some(until) => {
@@ -4978,10 +4989,11 @@ pub struct ProxyService {
     /// it would be listed as a cached 0-byte object. Bounded and short-lived;
     /// a later serve of the path that does tee clears its entry.
     uncached_serves: Cache<(Uuid, String), ()>,
-    /// Whether the origin-policy gate (#4506) runs. Always `true` outside
-    /// tests; only `without_origin_policy_gate`, which exists only
-    /// under `cfg(test)`, clears it, for the cache-mechanics unit tests that
-    /// run without a database.
+    /// Whether the database-backed serve gates run: the origin policy
+    /// (#4506) and the stored scan verdict on the cache fast paths (#4514).
+    /// Always `true` outside tests; only `without_origin_policy_gate`, which
+    /// exists only under `cfg(test)`, clears it, for the cache-mechanics unit
+    /// tests that run without a database.
     origin_policy_gate: bool,
     /// Instance-wide default for the RFC 5861 `stale-if-error` grace window
     /// (#4581), in seconds. Seeded from `Config::proxy_stale_if_error_grace_secs`
@@ -5535,6 +5547,168 @@ impl ProxyService {
             check_quarantine_until(metadata.quarantine_until)?;
         }
         Ok(())
+    }
+
+    /// Gate a presigned-redirect fast path on the stored scan verdict of the
+    /// cached body (#4514), the sibling of [`Self::cache_quarantine_gate`].
+    ///
+    /// For a redirect helper that serves only files the format's route gates
+    /// (a PyPI distribution): it treats `cache_path` as such a file. A
+    /// reader that also serves the files a format leaves unscanned (POMs,
+    /// index documents) must not call it, because those are served whatever
+    /// any verdict says.
+    ///
+    /// A redirect hands out the cached object without the body passing
+    /// through the buffered scan gate, so for a Remote that scans on proxy
+    /// it consults the verdict stored for the sidecar's `checksum_sha256`
+    /// under the Remote's own policy (see
+    /// [`decide_cache_scan_gate`](crate::services::proxy_scan_service::decide_cache_scan_gate)).
+    /// A Remote that does not scan and a format that does not enforce
+    /// scan-on-proxy are [`CacheScanGate::Serve`]; under `fail_closed` a path
+    /// whose sidecar cannot be read is [`CacheScanGate::NotForFastPath`].
+    ///
+    /// `scanner` supplies the live CVE-scanner version, read only when it
+    /// decides something (a `clean` verdict under `fail_closed`). With
+    /// `record_block` a [`CacheScanGate::Block`] is audited and counted as a
+    /// refused pull; a caller that declines instead and leaves the refusal to
+    /// the next reader passes `false`, so one pull is counted once.
+    pub(crate) async fn cache_scan_gate(
+        &self,
+        repo_key: &str,
+        cache_path: &str,
+        scanner: Option<&crate::services::scanner_service::ScannerService>,
+        record_block: bool,
+    ) -> Result<CacheScanGate> {
+        if !self.origin_policy_gate {
+            return Ok(CacheScanGate::Serve);
+        }
+        let Some(policy) = self.fast_path_scan_policy(RemoteRef::Key(repo_key)).await? else {
+            return Ok(CacheScanGate::Serve);
+        };
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, cache_path)?;
+        let metadata = self
+            .load_cache_metadata(&metadata_key)
+            .await
+            .unwrap_or(None);
+        let Some(metadata) = metadata.filter(|m| !m.checksum_sha256.is_empty()) else {
+            return Ok(if policy.action.is_fail_closed() {
+                CacheScanGate::NotForFastPath
+            } else {
+                CacheScanGate::Serve
+            });
+        };
+        let digest = metadata.checksum_sha256;
+        let stored = self.stored_verdict_for(&digest).await?;
+        let current_version = match (&stored, scanner) {
+            (Some(s), Some(scanner))
+                if policy.action.is_fail_closed()
+                    && s.row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN =>
+            {
+                scanner.cve_scanner_version().await
+            }
+            _ => None,
+        };
+        let gate = decide_cache_scan_gate(
+            stored.as_ref(),
+            current_version.as_deref(),
+            policy.action,
+            policy.severity_gate,
+            crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
+            Utc::now(),
+        );
+        if gate == CacheScanGate::Block && record_block {
+            self.note_fast_path_block(policy.repository_id, cache_path, &digest);
+        }
+        Ok(gate)
+    }
+
+    /// Audit and count a pull a fast path refused on its stored verdict
+    /// (#4514), as the buffered gate does for its own refusals (#4777,
+    /// #4676).
+    fn note_fast_path_block(&self, repository_id: Uuid, cache_path: &str, digest: &str) {
+        crate::services::metrics_service::record_proxy_scan_verdict("vulnerable", "blocked");
+        let file = cache_path
+            .rsplit('/')
+            .find(|seg| !seg.is_empty())
+            .unwrap_or(cache_path);
+        crate::services::audit_service::record_proxy_scan_blocked(
+            &self.db,
+            crate::services::audit_service::ProxyScanBlockEvent {
+                repository_id,
+                path: file.to_string(),
+                checksum_sha256: digest.to_string(),
+            },
+        );
+    }
+
+    /// The verdict stored for `digest`, read through the fast-path memo
+    /// (#4514). A sidecar without a digest has no verdict.
+    async fn stored_verdict_for(&self, digest: &str) -> Result<Option<StoredProxyVerdict>> {
+        if digest.is_empty() {
+            return Ok(None);
+        }
+        crate::services::proxy_scan_service::ProxyScanService::new(self.db.clone())
+            .lookup_verdict_memoized(digest, crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+            .await
+    }
+
+    /// The scan-on-proxy policy a Remote's cached content is served under on
+    /// a fast path (#4514): its own action and severity gate, or `None` when
+    /// it is not a Remote, does not scan on proxy, or its format does not
+    /// enforce scan-on-proxy. The same mapping as the direct pull's
+    /// `remote_scan_policy`. An unreadable config is a retryable `503`
+    /// (#4365 item 5), never "off".
+    async fn fast_path_scan_policy(
+        &self,
+        repo_ref: RemoteRef<'_>,
+    ) -> Result<Option<FastPathScanPolicy>> {
+        const BY_KEY: &str = "SELECT r.id, r.format::text, sc.proxy_scan_action, \
+             sc.block_on_policy_violation, sc.severity_threshold \
+             FROM repositories r JOIN scan_configs sc ON sc.repository_id = r.id \
+             WHERE r.key = $1 AND r.repo_type = 'remote' AND sc.scan_on_proxy";
+        const BY_ID: &str = "SELECT r.id, r.format::text, sc.proxy_scan_action, \
+             sc.block_on_policy_violation, sc.severity_threshold \
+             FROM repositories r JOIN scan_configs sc ON sc.repository_id = r.id \
+             WHERE r.id = $1 AND r.repo_type = 'remote' AND sc.scan_on_proxy";
+        let row: Option<(Uuid, String, String, bool, String)> = match repo_ref {
+            RemoteRef::Key(key) => {
+                sqlx::query_as(BY_KEY)
+                    .bind(key)
+                    .fetch_optional(&self.db)
+                    .await
+            }
+            RemoteRef::Id(id) => {
+                sqlx::query_as(BY_ID)
+                    .bind(id)
+                    .fetch_optional(&self.db)
+                    .await
+            }
+        }
+        .map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "could not read the scan-on-proxy config for a proxy-cache fast path (#4365)"
+            );
+            AppError::ServiceUnavailable(
+                "scan-on-proxy configuration is temporarily unreadable".to_string(),
+            )
+        })?;
+        Ok(
+            row.and_then(|(repository_id, format, action, block, threshold)| {
+                crate::formats::format_key_enforces_scan_on_proxy(&format).then(|| {
+                    FastPathScanPolicy {
+                        repository_id,
+                        action: crate::services::proxy_scan_service::ProxyScanAction::from_db(
+                            &action,
+                        ),
+                        severity_gate:
+                            crate::services::scan_config_service::proxy_severity_gate_for_row(
+                                block, &threshold, &action,
+                            ),
+                    }
+                })
+            }),
+        )
     }
 
     /// Release a held proxy-cache entry (#3912): clear the sidecar's Package

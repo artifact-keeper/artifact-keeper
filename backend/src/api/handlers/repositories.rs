@@ -51,6 +51,7 @@ use crate::services::repository_service::{
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
+use crate::services::rpm_repodata_builder::{self, RepodataMode};
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 use crate::services::upstream_filter::{self, UpstreamFilter};
@@ -976,6 +977,14 @@ pub struct CreateRepositoryRequest {
     #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
     #[schema(minimum = 0, maximum = 1023, nullable = false)]
     pub repodata_depth: Option<u32>,
+    /// How a local RPM repository's repodata is produced (#4544):
+    /// `precomputed` (the default) builds it in the background after each
+    /// change and serves it from storage; `on_request` renders it on the
+    /// request path and validates it against the repository on every request
+    /// (read-your-writes). Rejected (422) for any other repository.
+    #[serde(default, deserialize_with = "rpm_repodata_builder::deserialize_mode")]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub key: String,
     pub name: String,
     pub description: Option<String>,
@@ -1227,6 +1236,11 @@ pub struct UpdateRepositoryRequest {
     #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
     #[schema(minimum = 0, maximum = 1023, nullable = false)]
     pub repodata_depth: Option<u32>,
+    /// Omit to retain the RPM repodata mode (#4544); see
+    /// `CreateRepositoryRequest.repodata_mode`. Local RPM repositories only.
+    #[serde(default, deserialize_with = "rpm_repodata_builder::deserialize_mode")]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub key: Option<String>,
     pub name: Option<String>,
     /// Update or clear the description (#4729). Three-way semantics via
@@ -1456,6 +1470,11 @@ pub struct RepositoryResponse {
     pub repodata_depth: u32,
     /// Structural eligibility and emptiness only, not an authorization grant.
     pub repodata_depth_editable: bool,
+    /// RPM repodata mode (#4544), present for local RPM repositories only:
+    /// `precomputed` (default) or `on_request`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub id: Uuid,
     pub key: String,
     pub name: String,
@@ -1618,9 +1637,18 @@ pub struct RpmRepodataDepthCapability {
     pub default: u32,
 }
 
+/// Precomputed RPM repodata (#4544): `repodata_mode` and
+/// `POST /api/v1/repositories/{key}/rpm/repodata/rebuild`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RpmRepodataModeCapability {
+    pub supported: bool,
+    pub default: RepodataMode,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryCapabilities {
     pub rpm_repodata_depth: RpmRepodataDepthCapability,
+    pub rpm_repodata_mode: RpmRepodataModeCapability,
 }
 
 /// Non-mutating feature detection, including on an installation with no repositories.
@@ -1637,6 +1665,10 @@ pub async fn repository_capabilities() -> Json<RepositoryCapabilities> {
             max: rpm_layout::MAX_REPODATA_DEPTH,
             default: 0,
         },
+        rpm_repodata_mode: RpmRepodataModeCapability {
+            supported: true,
+            default: RepodataMode::Precomputed,
+        },
     })
 }
 
@@ -1650,6 +1682,9 @@ async fn with_repodata_depth(
         .ok_or_else(|| AppError::NotFound("Repository not found".into()))?;
     response.repodata_depth = depth;
     response.repodata_depth_editable = editable;
+    response.repodata_mode = rpm_repodata_builder::modes(db, &[response.id])
+        .await?
+        .remove(&response.id);
     Ok(response)
 }
 
@@ -1988,6 +2023,7 @@ fn repo_to_response(
     RepositoryResponse {
         repodata_depth: 0,
         repodata_depth_editable: false,
+        repodata_mode: None,
         id: repo.id,
         key: repo.key,
         name: repo.name,
@@ -4073,6 +4109,7 @@ pub async fn list_repositories(
     }
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
+    let mut repodata_modes = rpm_repodata_builder::modes(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -4088,6 +4125,7 @@ pub async fn list_repositories(
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
             }
+            resp.repodata_mode = repodata_modes.remove(&resp.id);
             resp
         })
         .collect();
@@ -4117,7 +4155,7 @@ pub async fn list_repositories(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
     )
 )]
 pub async fn create_repository(
@@ -4420,6 +4458,7 @@ pub async fn create_repository(
                 created_by: Some(auth.user_id),
             },
             payload.repodata_depth.unwrap_or(0),
+            payload.repodata_mode,
             provisioner,
         )
         .await?;
@@ -5244,7 +5283,7 @@ pub async fn get_repository_storage_tree(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
     )
 )]
 pub async fn update_repository(
@@ -5450,6 +5489,7 @@ pub async fn update_repository(
                 curation_default_action: payload.curation_default_action,
             },
             payload.repodata_depth,
+            payload.repodata_mode,
         )
         .await?;
 
@@ -13111,7 +13151,7 @@ pub async fn get_egress_proxy(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Upstream reachable"),
-        (status = 400, description = "Repository is not remote or has no upstream URL"),
+        (status = 400, description = "Repository is not remote, has no upstream URL, or its upstream URL is not allowed"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found, or the repository's upstream filter refuses the upstream root (nothing is sent)"),
         (status = 502, description = "Upstream unreachable"),
@@ -13149,25 +13189,7 @@ pub async fn test_upstream(
     )
     .await?;
 
-    let client = crate::services::http_client::base_client_builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
-
-    let mut request = client.head(upstream_url);
-
-    // Apply upstream auth if configured
-    if let Some(upstream_auth) =
-        crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
-    {
-        request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
-    }
-
-    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
-    // attributes, parented to this request's span, and `traceparent` sent on.
-    let response = crate::services::upstream_tracing::send_upstream(request)
-        .await
-        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {e}")))?;
+    let response = probe_upstream(&state.db, repo.id, upstream_url).await?;
 
     let status = response.status().as_u16();
     // 2xx or 404 (root URL may not serve content) are acceptable
@@ -13185,6 +13207,56 @@ pub async fn test_upstream(
             "Upstream returned HTTP {status}"
         )))
     }
+}
+
+/// Send the `test_upstream` connectivity probe the way the proxy fetch path
+/// reaches an upstream: the URL passes the upstream URL validation first,
+/// and the request goes out on the repository's egress route (its `direct`
+/// or `explicit` proxy configuration, else the default client).
+async fn probe_upstream(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    upstream_url: &str,
+) -> Result<reqwest::Response> {
+    // A stored URL predating the write-time check, or one the operator's
+    // allowlist no longer admits, is refused before any request is sent.
+    // Off the async worker: the validation may resolve the host.
+    let url = upstream_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&url, "Upstream URL")
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("upstream URL validation task failed: {e}")))??;
+    let egress = crate::services::egress_proxy::load_egress_proxy(db, repo_id).await?;
+    let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, repo_id).await?;
+    send_upstream_probe(&egress, upstream_url, upstream_auth.as_ref()).await
+}
+
+/// The client half of [`probe_upstream`]. The error never carries the
+/// request URL: a stored upstream URL may hold credentials in its userinfo.
+async fn send_upstream_probe(
+    egress: &crate::services::egress_proxy::EgressProxyConfig,
+    upstream_url: &str,
+    upstream_auth: Option<&crate::services::upstream_auth::UpstreamAuthType>,
+) -> Result<reqwest::Response> {
+    let client = if egress.overrides_default_routing() {
+        crate::services::egress_proxy::build_repo_client(egress)?
+    } else {
+        crate::services::http_client::base_client_builder()
+            .build()
+            .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?
+    };
+
+    let mut request = client.head(upstream_url).timeout(Duration::from_secs(15));
+    if let Some(upstream_auth) = upstream_auth {
+        request = crate::services::upstream_auth::apply_upstream_auth(request, upstream_auth);
+    }
+
+    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
+    // attributes, parented to this request's span, and `traceparent` sent on.
+    crate::services::upstream_tracing::send_upstream(request)
+        .await
+        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {}", e.without_url())))
 }
 
 // ---------------------------------------------------------------------------
@@ -13888,6 +13960,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryCapabilities,
         RpmRepodataDepthCapability,
+        RpmRepodataModeCapability,
+        RepodataMode,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
         StorageTreeQuery,
@@ -17010,6 +17084,7 @@ mod tests {
         let resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
@@ -18425,6 +18500,7 @@ mod tests {
         let resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
@@ -24489,6 +24565,102 @@ mod tests {
     // -----------------------------------------------------------------------
     // UpstreamAuthRequest deserialization
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // test_upstream connectivity probe
+    // -----------------------------------------------------------------------
+
+    /// The probe applies the upstream URL validation before it sends
+    /// anything: a stored upstream URL naming a disallowed address is refused
+    /// with a 400, and no database read or request happens.
+    #[tokio::test]
+    async fn test_upstream_probe_refuses_disallowed_address() {
+        // Never connected: validation refuses before the first query.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://probe@127.0.0.1:1/none")
+            .expect("lazy pool");
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/",
+            "http://localhost/",
+            "file:///etc/passwd",
+        ] {
+            let err = probe_upstream(&pool, Uuid::new_v4(), url)
+                .await
+                .expect_err(url);
+            assert!(matches!(err, AppError::Validation(_)), "{url}: {err:?}");
+        }
+    }
+
+    /// A probe that cannot reach the upstream answers 502 without echoing the
+    /// request URL, so credentials in the stored URL's userinfo stay out of
+    /// the response.
+    #[tokio::test]
+    async fn test_upstream_probe_error_does_not_echo_url_credentials() {
+        use crate::services::egress_proxy::{EgressProxyConfig, EgressProxyMode};
+        // A proxy on a closed local port: the send fails at once, with no DNS.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let egress = EgressProxyConfig {
+            mode: EgressProxyMode::Explicit,
+            proxy_url: Some(format!("http://127.0.0.1:{port}")),
+            no_proxy: None,
+        };
+        let err = send_upstream_probe(&egress, "https://user:secret@upstream.example.com/", None)
+            .await
+            .expect_err("nothing listens on the proxy port");
+        let AppError::BadGateway(msg) = err else {
+            panic!("expected a 502, got {err:?}");
+        };
+        assert!(msg.starts_with("Failed to reach upstream"), "{msg}");
+        assert!(!msg.contains("secret"), "credentials echoed: {msg}");
+        assert!(!msg.contains("user:"), "userinfo echoed: {msg}");
+    }
+
+    /// The probe goes out on the repository's egress route: with an explicit
+    /// proxy configured, the request reaches the proxy (absolute-form request
+    /// line) rather than the upstream host directly.
+    #[tokio::test]
+    async fn test_upstream_probe_uses_repository_egress_proxy() {
+        use crate::services::egress_proxy::{EgressProxyConfig, EgressProxyMode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let proxy = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("write");
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let egress = EgressProxyConfig {
+            mode: EgressProxyMode::Explicit,
+            proxy_url: Some(format!("http://127.0.0.1:{port}")),
+            no_proxy: None,
+        };
+        let response = send_upstream_probe(&egress, "http://upstream.example.com/simple/", None)
+            .await
+            .expect("the proxy answers");
+        assert_eq!(response.status().as_u16(), 200);
+        let head = proxy.await.expect("proxy task");
+        assert!(
+            head.starts_with("HEAD http://upstream.example.com/simple/ HTTP/1.1"),
+            "request did not go through the configured proxy: {head:?}"
+        );
+    }
 
     #[test]
     fn test_upstream_auth_request_basic() {
@@ -32741,6 +32913,7 @@ mod tests {
         let mut resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             id: Uuid::new_v4(),
             has_trusted_gpg_key: false,
             key: "ua-serde".to_string(),

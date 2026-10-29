@@ -1255,7 +1255,8 @@ impl RepositoryService {
         req: CreateRepositoryRequest,
         repodata_depth: u32,
     ) -> Result<Repository> {
-        self.create_with_options(req, repodata_depth, true).await
+        self.create_with_options(req, repodata_depth, None, true)
+            .await
     }
 
     /// Create with an explicit choice about the creator's owner auto-grant.
@@ -1270,9 +1271,17 @@ impl RepositoryService {
         &self,
         req: CreateRepositoryRequest,
         repodata_depth: u32,
+        repodata_mode: Option<crate::services::rpm_repodata_builder::RepodataMode>,
         grant_owner_role: bool,
     ) -> Result<Repository> {
         crate::services::rpm_layout::validate_depth(repodata_depth)?;
+        if repodata_mode.is_some()
+            && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
+        {
+            return Err(AppError::UnprocessableEntity(
+                crate::services::rpm_repodata_builder::MODE_UNSUPPORTED.into(),
+            ));
+        }
         if repodata_depth > 0
             && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
         {
@@ -1440,6 +1449,9 @@ impl RepositoryService {
                 if repodata_depth > 0 {
                     crate::services::rpm_layout::set_depth(&mut tx, repo.id, repodata_depth)
                         .await?;
+                }
+                if let Some(mode) = repodata_mode {
+                    crate::services::rpm_repodata_builder::set_mode(&mut tx, repo.id, mode).await?;
                 }
                 tx.commit()
                     .await
@@ -1801,7 +1813,7 @@ impl RepositoryService {
 
     /// Update a repository
     pub async fn update(&self, id: Uuid, req: UpdateRepositoryRequest) -> Result<Repository> {
-        self.update_with_repodata_depth(id, req, None).await
+        self.update_with_repodata_depth(id, req, None, None).await
     }
 
     pub async fn update_with_repodata_depth(
@@ -1809,7 +1821,18 @@ impl RepositoryService {
         id: Uuid,
         req: UpdateRepositoryRequest,
         repodata_depth: Option<u32>,
+        repodata_mode: Option<crate::services::rpm_repodata_builder::RepodataMode>,
     ) -> Result<Repository> {
+        if repodata_mode.is_some() {
+            let existing = self.get_by_id(id).await?;
+            if existing.format != RepositoryFormat::Rpm
+                || existing.repo_type != RepositoryType::Local
+            {
+                return Err(AppError::UnprocessableEntity(
+                    crate::services::rpm_repodata_builder::MODE_UNSUPPORTED.into(),
+                ));
+            }
+        }
         // Validate upstream_url is safe to contact if it is being updated.
         // `UpdateRepositoryRequest` carries neither `repo_type` nor `format`
         // (both are immutable after creation), so load the existing row to
@@ -1852,6 +1875,9 @@ impl RepositoryService {
             if crate::services::rpm_layout::depth_change_requested(&mut tx, id, depth).await? {
                 crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
             }
+        }
+        if let Some(mode) = repodata_mode {
+            crate::services::rpm_repodata_builder::set_mode(&mut tx, id, mode).await?;
         }
         // Project unassignment (#4026). The main UPDATE below reads a NULL
         // bind as "leave alone" (COALESCE), so clearing is a targeted write in
