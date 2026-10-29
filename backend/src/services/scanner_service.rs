@@ -362,10 +362,12 @@ pub fn oci_manifest_is_runnable_image(body: &[u8]) -> bool {
     if !has_image_config {
         return false;
     }
-    manifest
-        .layers
-        .iter()
-        .any(|layer| is_container_rootfs_layer(&layer.media_type))
+    // A layer type containerd unpacks counts whatever suffix it carries, so a
+    // non-image marker appended to a real layer type (`...tar+spdx`) cannot
+    // turn an image into an unscanned non-image.
+    manifest.layers.iter().any(|layer| {
+        is_container_rootfs_layer(&layer.media_type) || containerd_unpacks_layer(&layer.media_type)
+    })
 }
 
 /// How the inline proxy scan gate must treat a proxied OCI manifest body.
@@ -630,10 +632,8 @@ impl<'de> serde::de::Visitor<'de> for KeyAmbiguityWalk<'_> {
     ) -> std::result::Result<(), A::Error> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
-            if !self.free_form_keys {
-                if !seen.insert(key.clone()) || key_is_ambiguous(&key) {
-                    *self.ambiguous = true;
-                }
+            if !self.free_form_keys && (!seen.insert(key.clone()) || key_is_ambiguous(&key)) {
+                *self.ambiguous = true;
             }
             map.next_value_seed(KeyAmbiguityWalk {
                 ambiguous: &mut *self.ambiguous,
@@ -676,10 +676,16 @@ pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
         // Anomalous body on an OCI route: do not flip the path-based decision.
         return true;
     };
-    // Anything the proxy gate would not positively wave through as a
-    // non-image stays scannable, so hosted and async scans agree with it.
+    // What the proxy gate cannot classify stays scannable when its config is
+    // one Docker runs as an image (an image config, or Docker's legacy untyped
+    // forms), so hosted and async scans agree with the gate. An unknown
+    // config (a BuildKit cache, an old ORAS artifact) stays not applicable
+    // here: a scanner would only fail on it.
     if manifest.manifests.is_empty()
-        && classify_oci_manifest_for_proxy_scan(body) != ProxyScanClass::NotAnImage
+        && classify_oci_manifest_for_proxy_scan(body) == ProxyScanClass::Unclassifiable
+        && manifest.config.as_ref().is_some_and(|c| {
+            DOCKER_CLASSIC_CONFIG_MEDIA_TYPES.contains(&bare_media_type(&c.media_type).as_str())
+        })
     {
         return true;
     }

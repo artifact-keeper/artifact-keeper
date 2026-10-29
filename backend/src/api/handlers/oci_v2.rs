@@ -34268,18 +34268,6 @@ mod proxy_scan_block_tests {
                 r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{{"mediaType":"application/vnd.in-toto+json","MediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{b}","size":3}}]}}"#,
                 b = "b".repeat(64)
             ),
-            // A marker suffix on a runtime layer type does not hide it.
-            format!(
-                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
-                l = descriptor("application/vnd.oci.image.layer.v1.tar+spdx", 'b')
-            ),
-            format!(
-                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
-                l = descriptor(
-                    "APPLICATION/VND.DOCKER.IMAGE.ROOTFS.DIFF.TAR.GZIP+wasm",
-                    'b'
-                )
-            ),
             // Docker's legacy untyped config over an untyped layer.
             format!(
                 r#"{{"schemaVersion":2,"config":{c},"layers":[{l}]}}"#,
@@ -34300,12 +34288,28 @@ mod proxy_scan_block_tests {
             assert_eq!(class(&body), ProxyScanClass::Unclassifiable, "{body}");
         }
 
+        // A marker suffix on a runtime layer type does not hide it: under an
+        // image config it is a runnable image and is scanned.
+        for body in [
+            format!(
+                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
+                l = descriptor("application/vnd.oci.image.layer.v1.tar+spdx", 'b')
+            ),
+            format!(
+                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
+                l = descriptor(
+                    "APPLICATION/VND.DOCKER.IMAGE.ROOTFS.DIFF.TAR.GZIP+wasm",
+                    'b'
+                )
+            ),
+        ] {
+            assert_eq!(class(&body), ProxyScanClass::RunnableImage, "{body}");
+        }
+
         // Known non-images and pure indexes still skip.
-        let empty_cfg = format!(
-            r#"{{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2}}"#
-        );
+        let empty_cfg = r#"{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2}"#;
         let not_images = [
-            format!(r#"{{"schemaVersion":2,"manifests":null}}"#),
+            r#"{"schemaVersion":2,"manifests":null}"#.to_string(),
             // ORAS default push: empty config over an OCI tar layer.
             format!(
                 r#"{{"schemaVersion":2,"config":{empty_cfg},"layers":[{l}]}}"#,
