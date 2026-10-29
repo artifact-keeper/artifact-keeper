@@ -3722,15 +3722,36 @@ async fn get_package_version_metadata(
     };
 
     // Extract the requested version (or the version a dist-tag names) from
-    // the packument.
+    // the packument. A tag resolves against the dist-tags the package route
+    // serves: on an age-gated Remote or Virtual that is the gate's view,
+    // where `latest` names the newest version old enough to download.
+    let gated_view = if packument
+        .get("versions")
+        .and_then(|v| v.get(version))
+        .is_none()
+    {
+        npm_age_gated_tag_view(
+            state,
+            auth,
+            &repo,
+            repo_key,
+            package_name,
+            base_url,
+            &packument,
+        )
+        .await?
+    } else {
+        None
+    };
     let (version, version_obj) =
-        resolve_npm_version_segment(&packument, version).ok_or_else(|| {
-            AppError::NotFound(format!(
-                "Version '{}' not found for package '{}'",
-                version, package_name
-            ))
-            .into_response()
-        })?;
+        resolve_npm_version_segment(gated_view.as_ref().unwrap_or(&packument), version)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Version '{}' not found for package '{}'",
+                    version, package_name
+                ))
+                .into_response()
+            })?;
     let version = version.as_str();
 
     // #2955 on-demand curation ingestion: when a proxy first serves an npm
@@ -3779,6 +3800,49 @@ fn resolve_npm_version_segment(
     versions
         .get(target)
         .map(|doc| (target.to_string(), doc.clone()))
+}
+
+/// The packument a dist-tag on the version route resolves against when the
+/// age gate applies, or `None` when it does not (#5063). The package route
+/// serves Remote and Virtual packuments through the gate, which removes
+/// versions still inside its window, moves `latest` to the newest allowed
+/// version and drops tags naming a removed one; resolving a tag against the
+/// ungated packument would name a version the download then refuses.
+async fn npm_age_gated_tag_view(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    packument: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        let Some(svc) = state.age_gate_service.as_ref() else {
+            return Ok(None);
+        };
+        if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
+            return Ok(None);
+        }
+        let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if !AgeGateService::is_applicable(&params) {
+            return Ok(None);
+        }
+        let mut view = packument.clone();
+        svc.filter_npm_packument(&params, package_name, &mut view)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(Some(view))
+    } else if repo.repo_type == RepositoryType::Virtual {
+        Ok(Some(
+            collect_virtual_packument(state, auth, repo, repo_key, package_name, base_url, true)
+                .await?,
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Fetch the full packument JSON from a remote repository's upstream.
@@ -13972,6 +14036,73 @@ mod tests {
         let key = fx.repo_key.clone();
         let checks = async {
             assert_dist_tag_routes_5063(&state, &key, "beta", "1.0.0", "2.0.0-beta.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, age-gated Remote: a tag resolves against the gate's view, so
+    /// `latest` names the newest version old enough to download (the gate
+    /// moves it) and a tag naming a version still inside the window is 404.
+    /// An exact version is served as before.
+    #[tokio::test]
+    async fn age_gated_remote_version_route_resolves_gated_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let upstream = wiremock::MockServer::start().await;
+        let base = upstream.uri();
+        let doc = |v: &str| {
+            serde_json::json!({"name": "gated-pkg", "version": v,
+                "dist": {"tarball": format!("{base}/gated-pkg/-/gated-pkg-{v}.tgz"),
+                         "shasum": "0000000000000000000000000000000000000000"}})
+        };
+        let fresh = chrono::Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path("/gated-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "gated-pkg",
+                "dist-tags": {"latest": "2.0.0", "fresh": "2.0.0", "old": "1.0.0"},
+                "versions": {"1.0.0": doc("1.0.0"), "2.0.0": doc("2.0.0")},
+                "time": {"1.0.0": "2020-01-01T00:00:00.000Z", "2.0.0": fresh}
+            })))
+            .mount(&upstream)
+            .await;
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 7, age_gate_mode = 'upstream_publish_time' WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure gated remote");
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
+        let key = fx.repo_key.clone();
+        let checks = async {
+            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "latest").await;
+            assert_eq!(status, StatusCode::OK, "latest: {doc}");
+            assert_eq!(doc["version"], "1.0.0", "gate moves latest: {doc}");
+            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "old").await;
+            assert_eq!(status, StatusCode::OK, "old: {doc}");
+            assert_eq!(doc["version"], "1.0.0");
+            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "fresh").await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "tag naming a gated version: {doc}"
+            );
+            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "2.0.0").await;
+            assert_eq!(status, StatusCode::OK, "exact version as before: {doc}");
+            assert_eq!(doc["version"], "2.0.0");
         };
         let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
         fx.teardown().await;
