@@ -1889,6 +1889,11 @@ mod tests {
         let (status, body) = f.inspect(app, "forged").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "forged index: {body}");
         assert!(!body.contains("private-"), "{body}");
+        // Refused by the child check itself, before any config is considered.
+        assert!(
+            body.contains("platform manifest is not in storage"),
+            "forged index: {body}"
+        );
 
         // The right repository but the wrong image, both ways round.
         let (status, body) = f.inspect(app, &f.other_image).await;
