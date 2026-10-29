@@ -13196,7 +13196,7 @@ pub async fn test_upstream(
 }
 
 /// Send the `test_upstream` connectivity probe the way the proxy fetch path
-/// reaches an upstream: the URL passes the upstream SSRF validation first,
+/// reaches an upstream: the URL passes the upstream URL validation first,
 /// and the request goes out on the repository's egress route (its `direct`
 /// or `explicit` proxy configuration, else the default client).
 async fn probe_upstream(
@@ -13206,7 +13206,13 @@ async fn probe_upstream(
 ) -> Result<reqwest::Response> {
     // A stored URL predating the write-time check, or one the operator's
     // allowlist no longer admits, is refused before any request is sent.
-    crate::api::validation::validate_outbound_url(upstream_url, "Upstream URL")?;
+    // Off the async worker: the validation may resolve the host.
+    let url = upstream_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&url, "Upstream URL")
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("upstream URL validation task failed: {e}")))??;
     let egress = crate::services::egress_proxy::load_egress_proxy(db, repo_id).await?;
     let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, repo_id).await?;
     send_upstream_probe(&egress, upstream_url, upstream_auth.as_ref()).await
