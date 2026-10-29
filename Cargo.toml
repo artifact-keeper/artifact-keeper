@@ -102,6 +102,7 @@ bcrypt = "0.19"
 
 # Checksums
 sha2 = "0.10"
+sha3 = "0.10"
 md-5 = "0.10"
 # `oid` exposes `AssociatedOid` for Sha1, which `rsa::pkcs1v15::SigningKey<Sha1>`
 # needs to build the PKCS#1 v1.5 DigestInfo prefix. Required by the apk
@@ -169,7 +170,7 @@ anyhow = "1.0"
 dotenvy = "0.15"
 
 # UUID
-uuid = { version = "1.7", features = ["v4", "serde"] }
+uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

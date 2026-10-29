@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+// A faithful subset of buf.registry.owner.v1, transcribed from
+// buf.build/bufbuild/registry (Apache-2.0). Only the messages the hosted
+// protobuf handlers exchange with the buf CLI are declared, and the
+// protovalidate annotations of the originals are left out: prost ignores
+// them, and the server enforces what it needs in Rust. Field numbers and
+// types are the originals' -- they are the wire format.
+package buf.registry.owner.v1;
+
+message OwnerRef {
+  oneof value {
+    string id = 1;
+    string name = 2;
+  }
+}

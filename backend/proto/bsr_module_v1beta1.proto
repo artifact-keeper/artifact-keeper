@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+// A faithful subset of buf.registry.module.v1beta1, transcribed from
+// buf.build/bufbuild/registry (Apache-2.0). Only the messages the hosted
+// protobuf handlers exchange with the buf CLI are declared, and the
+// protovalidate annotations of the originals are left out: prost ignores
+// them, and the server enforces what it needs in Rust. Field numbers and
+// types are the originals' -- they are the wire format.
+//
+// The CLI pushes and pulls over this beta package, not v1, so Upload and
+// Download live here. Its DigestType numbers B5 = 2, where v1 numbers B5 = 1:
+// a response built with v1's number tells the CLI "b4" and it rejects the
+// commit's digest.
+package buf.registry.module.v1beta1;
+
+import "google/protobuf/timestamp.proto";
+
+enum DigestType {
+  DIGEST_TYPE_UNSPECIFIED = 0;
+  DIGEST_TYPE_B4 = 1;
+  DIGEST_TYPE_B5 = 2;
+}
+
+message Digest {
+  DigestType type = 1;
+  bytes value = 2;
+}
+
+message Commit {
+  string id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  string owner_id = 3;
+  string module_id = 4;
+  Digest digest = 5;
+  string created_by_user_id = 6;
+  string source_control_url = 7;
+}
+
+message ModuleRef {
+  message Name {
+    string owner = 1;
+    string module = 2;
+  }
+  oneof value {
+    string id = 1;
+    Name name = 2;
+  }
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_PROTO = 1;
+  FILE_TYPE_DOC = 2;
+  FILE_TYPE_LICENSE = 3;
+}
+
+message File {
+  string path = 1;
+  bytes content = 2;
+}
+
+message ScopedLabelRef {
+  oneof value {
+    string id = 1;
+    string name = 2;
+  }
+}
+
+message ResourceRef {
+  message Name {
+    string owner = 1;
+    string module = 2;
+    oneof child {
+      string label_name = 3;
+      string ref = 4;
+    }
+  }
+  oneof value {
+    string id = 1;
+    Name name = 2;
+  }
+}
+
+message UploadRequest {
+  message DepRef {
+    string commit_id = 1;
+    string registry = 2;
+  }
+  message Content {
+    ModuleRef module_ref = 1;
+    repeated File files = 2;
+    repeated ScopedLabelRef scoped_label_refs = 3;
+    string source_control_url = 4;
+  }
+  repeated Content contents = 1;
+  repeated DepRef dep_refs = 2;
+}
+
+message UploadResponse {
+  repeated Commit commits = 1;
+}
+
+message DownloadRequest {
+  message Value {
+    ResourceRef resource_ref = 1;
+    repeated FileType file_types = 2;
+    repeated string paths = 3;
+    bool paths_allow_not_exist = 4;
+  }
+  repeated Value values = 1;
+  DigestType digest_type = 2;
+}
+
+message DownloadResponse {
+  message Content {
+    Commit commit = 1;
+    repeated File files = 2;
+    File v1_buf_yaml_file = 3;
+    File v1_buf_lock_file = 4;
+  }
+  repeated Content contents = 1;
+}

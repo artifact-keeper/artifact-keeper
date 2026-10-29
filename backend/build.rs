@@ -26,6 +26,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
 
+    // The hosted BSR endpoints answer the buf CLI, which speaks Connect with
+    // the binary protobuf codec, so the messages it sends and expects need real
+    // generated types rather than hand-written serde structs. Only the subset
+    // the endpoints exchange is vendored; see proto/bsr_module_v1.proto.
+    prost_build::Config::new()
+        .out_dir(&out_dir)
+        .compile_protos(
+            &[
+                "proto/bsr_owner_v1.proto",
+                "proto/bsr_module_v1.proto",
+                "proto/bsr_module_v1beta1.proto",
+            ],
+            &["proto"],
+        )?;
+
     let git_sha = std::env::var("GIT_SHA")
         .ok()
         .filter(|s| !s.is_empty())
