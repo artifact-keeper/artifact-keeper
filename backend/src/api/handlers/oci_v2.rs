@@ -10130,10 +10130,22 @@ pub(crate) fn oci_manifest_requires_proxy_scan(body: &[u8]) -> bool {
     oci_manifest_proxy_scan_class(body) != ProxyScanClass::NotAnImage
 }
 
+/// The `403` for a Docker schema1 manifest under a scan-on-proxy policy
+/// (#3024), shared by the direct Remote and the Virtual-member arms.
+fn schema1_refused_under_scan_on_proxy() -> Response {
+    oci_error(
+        StatusCode::FORBIDDEN,
+        "DENIED",
+        "Docker schema1 manifests cannot be scanned and are refused under this repository's scan-on-proxy policy",
+    )
+}
+
 /// The gate's answer for a manifest it cannot classify
 /// ([`ProxyScanClass::Unclassifiable`]): the inconclusive branch, exactly as
-/// for a scan that could not run. `fail_closed` withholds it with the OCI
-/// `423`; `fail_open` and record-only serve it loudly `pending`.
+/// for a scan that could not run, but with its own message and metric label
+/// (`unclassifiable`), since the state does not clear on retry. `fail_closed`
+/// withholds it with the OCI `423`; `fail_open` and record-only serve it
+/// loudly `pending` (no scan is queued: there is no image to scan).
 fn unclassifiable_manifest_outcome(
     repo: &OciRepoInfo,
     reference: &str,
@@ -10147,15 +10159,21 @@ fn unclassifiable_manifest_outcome(
                 repo = %repo.key, reference = %reference,
                 "proxied manifest cannot be classified for the scan gate; fail-closed -> 423"
             );
-            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "locked");
-            Err(oci_scan_deny_response(StatusCode::LOCKED, &image_ref))
+            crate::services::metrics_service::record_proxy_scan_verdict("unclassifiable", "locked");
+            Err(oci_error(
+                StatusCode::LOCKED,
+                "DENIED",
+                &format!(
+                    "pull of {image_ref} withheld: the manifest cannot be classified for this repository's scan-on-proxy policy"
+                ),
+            ))
         }
         InconclusiveOutcome::ServePending => {
             tracing::warn!(
                 repo = %repo.key, reference = %reference,
                 "proxied manifest cannot be classified for the scan gate; serving it UNSCANNED"
             );
-            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
+            crate::services::metrics_service::record_proxy_scan_verdict("unclassifiable", "served");
             Ok(proxy_helpers::ProxyScanServed::Pending)
         }
     }
@@ -11190,11 +11208,7 @@ async fn maybe_gate_remote_manifest_scan(
             repo = %repo.key, reference = %reference,
             "refusing to proxy-serve a Docker schema1 (v2s1) manifest under a scan-on-proxy policy (#3024)"
         );
-        return Err(oci_error(
-            StatusCode::FORBIDDEN,
-            "DENIED",
-            "Docker schema1 manifests cannot be scanned and are refused under this repository's scan-on-proxy policy",
-        ));
+        return Err(schema1_refused_under_scan_on_proxy());
     }
     match oci_manifest_proxy_scan_class(manifest_body) {
         ProxyScanClass::NotAnImage => return Ok(None),
@@ -11501,6 +11515,10 @@ async fn handle_get_manifest(
                     Err(_) => return oci_scan_config_unreadable(),
                 };
                 if let Some((action, severity_gate)) = policy {
+                    // #3024 parity with the direct Remote gate.
+                    if oci_manifest_is_docker_schema1(&data) {
+                        return schema1_refused_under_scan_on_proxy();
+                    }
                     let gated =
                         match oci_manifest_proxy_scan_class(&data) {
                             ProxyScanClass::NotAnImage => None,
@@ -33800,7 +33818,8 @@ mod proxy_scan_block_tests {
     /// Manifest bodies a Go consumer (Docker, containerd) reads as a runnable
     /// image but serde's typed parse does not: case-variant keys, a duplicated
     /// key whose last value wins, a `manifests: null` that fails the typed
-    /// parse, a case-variant field inside the config descriptor, and an
+    /// parse, a case-variant `mediaType` inside a layer descriptor (serde sees
+    /// only an in-toto layer), a non-ASCII key Go folds onto `config`, and an
     /// unknown config media type over a rootfs layer. Each is unique per call
     /// so no two tests share a digest.
     fn unclassifiable_manifests() -> Vec<(&'static str, Bytes)> {
@@ -33839,10 +33858,16 @@ mod proxy_scan_block_tests {
                 ),
             ),
             (
-                "case-variant config mediaType",
+                "case-variant mediaType inside a layer descriptor",
                 format!(
-                    r#"{{"schemaVersion":2,"mediaType":"{mt}","config":{{"mediaType":"application/vnd.cncf.helm.config.v1+json","MediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{a}","size":3}},"layers":{layers},"annotations":{ann}}}"#,
-                    a = "a".repeat(64)
+                    r#"{{"schemaVersion":2,"mediaType":"{mt}","config":{cfg},"layers":[{{"mediaType":"application/vnd.in-toto+json","MediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{b}","size":3}}],"annotations":{ann}}}"#,
+                    b = "b".repeat(64)
+                ),
+            ),
+            (
+                "non-ASCII key folding onto config",
+                format!(
+                    r#"{{"schemaVersion":2,"mediaType":"{mt}","conf\u0130g":{cfg},"layers":{layers},"annotations":{ann}}}"#
                 ),
             ),
             (
@@ -33911,37 +33936,98 @@ mod proxy_scan_block_tests {
         );
     }
 
-    /// Under fail_open the same bodies take the inconclusive path: served,
-    /// loudly marked `pending`.
+    /// Under fail_open and record-only the same bodies take the inconclusive
+    /// path: served, loudly marked `pending`.
     #[tokio::test]
     async fn test_unclassifiable_manifest_served_pending_under_fail_open() {
+        for action in ["fail_open", "record_only"] {
+            let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+                return;
+            };
+            let results =
+                pull_through_scanning_remote(&fx, action, unclassifiable_manifests()).await;
+            fx.teardown().await;
+            let served: Vec<(&str, StatusCode, Option<String>)> = results
+                .iter()
+                .map(|(l, r)| {
+                    let scan = r
+                        .headers()
+                        .get("X-AK-Scan")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    (*l, r.status(), scan)
+                })
+                .collect();
+            assert!(
+                served
+                    .iter()
+                    .all(|(_, s, scan)| *s == StatusCode::OK && scan.as_deref() == Some("pending")),
+                "{action}: an unclassifiable manifest must be served marked pending: {served:?}"
+            );
+        }
+    }
+
+    /// The Virtual-member arm applies the same classification: through a
+    /// Virtual over a fail_closed scanning Remote an unclassifiable manifest
+    /// is withheld, and a schema1 manifest is refused as on the direct path.
+    #[tokio::test]
+    async fn test_unclassifiable_manifest_withheld_through_virtual() {
         let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
             return;
         };
-        let results =
-            pull_through_scanning_remote(&fx, "fail_open", unclassifiable_manifests()).await;
+        let mut bodies = unclassifiable_manifests();
+        let schema1 = serde_json::json!({
+            "schemaVersion": 1, "name": "app", "tag": "v1",
+            "fsLayers": [{"blobSum": format!("sha256:{}", "a".repeat(64))}],
+            "history": [{"v1Compatibility": "{}"}],
+            "signatures": [{"nonce": Uuid::new_v4().to_string()}],
+        });
+        bodies.push((
+            "schema1",
+            Bytes::from(serde_json::to_vec(&schema1).unwrap()),
+        ));
+        let upstream = wiremock::MockServer::start().await;
+        for (i, (_, body)) in bodies.iter().enumerate() {
+            mount_upstream_manifest(
+                &upstream,
+                "app",
+                &format!("v{i}"),
+                body,
+                IMAGE_MANIFEST_MT,
+                None,
+            )
+            .await;
+        }
+        wire_public_remote(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+        let (virt_id, virt_key) = virtual_over(&fx.pool, fx.repo_id).await;
+        let mut statuses = Vec::new();
+        for (i, (label, _)) in bodies.iter().enumerate() {
+            let status = pull_manifest(&state, &virt_key, &format!("v{i}"))
+                .await
+                .status();
+            statuses.push((*label, status));
+        }
+        cleanup_virtual(&fx.pool, virt_id).await;
         fx.teardown().await;
-        let served: Vec<(&str, StatusCode, Option<String>)> = results
-            .iter()
-            .map(|(l, r)| {
-                let scan = r
-                    .headers()
-                    .get("X-AK-Scan")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                (*l, r.status(), scan)
-            })
-            .collect();
+        let (schema1_status, rest) = statuses.split_last().map(|(l, r)| (l.1, r)).unwrap();
+        assert_eq!(
+            schema1_status,
+            StatusCode::FORBIDDEN,
+            "schema1 through the Virtual"
+        );
         assert!(
-            served
-                .iter()
-                .all(|(_, s, scan)| *s == StatusCode::OK && scan.as_deref() == Some("pending")),
-            "an unclassifiable manifest under fail_open must be served marked pending: {served:?}"
+            rest.iter().all(|(_, s)| *s == StatusCode::LOCKED),
+            "unclassifiable manifests through the Virtual must be withheld (423): {rest:?}"
         );
     }
 
     /// Control: positively classified non-images still pass a fail_closed
-    /// scanning Remote unscanned (no 423 for a pure index or a Helm chart).
+    /// scanning Remote unscanned (no 423 for a pure index, a Helm chart, a
+    /// Flux artifact or a cosign attestation).
     #[tokio::test]
     async fn test_positively_non_image_manifests_pass_fail_closed() {
         let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
@@ -33955,11 +34041,36 @@ mod proxy_scan_block_tests {
                          "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
             "annotations": {"nonce": Uuid::new_v4().to_string()},
         });
+        let flux = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"mediaType": "application/vnd.cncf.flux.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.cncf.flux.content.v1.tar+gzip",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+            "annotations": {"nonce": Uuid::new_v4().to_string()},
+        });
+        let cosign_att = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": IMAGE_MANIFEST_MT,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "a".repeat(64)), "size": 3},
+            "layers": [{"mediaType": "application/vnd.dsse.envelope.v1+json",
+                         "digest": format!("sha256:{}", "b".repeat(64)), "size": 3}],
+            "annotations": {"nonce": Uuid::new_v4().to_string()},
+        });
         let bodies = vec![
             ("pure index", index_manifest()),
             (
                 "helm chart",
                 Bytes::from(serde_json::to_vec(&helm).unwrap()),
+            ),
+            (
+                "flux artifact",
+                Bytes::from(serde_json::to_vec(&flux).unwrap()),
+            ),
+            (
+                "cosign attestation",
+                Bytes::from(serde_json::to_vec(&cosign_att).unwrap()),
             ),
         ];
         let results = pull_through_scanning_remote(&fx, "fail_closed", bodies).await;
@@ -34124,7 +34235,6 @@ mod proxy_scan_block_tests {
             format!(
                 r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{rootfs}],"manifests":null}}"#
             ),
-            format!(r#"{{"schemaVersion":2,"manifests":null}}"#),
             format!(r#"{{"schemaVersion":2,"config":{img_cfg},"layers":null}}"#),
             "not json".to_string(),
             format!(r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{rootfs}]}} x"#),
@@ -34147,8 +34257,82 @@ mod proxy_scan_block_tests {
             assert_eq!(class(&body), ProxyScanClass::Unclassifiable, "{body}");
         }
 
+        // Shapes a runtime may unpack that serde alone would wave through, or
+        // that are not a recognised runnable image.
+        for body in [
+            // Non-ASCII key Go folds onto `config` (U+0130 lower-cases to `i`).
+            format!(r#"{{"schemaVersion":2,"confİg":{img_cfg},"layers":[{rootfs}]}}"#),
+            // Case-variant `mediaType` in a layer descriptor: serde sees only
+            // the in-toto type, Go the last (rootfs) one.
+            format!(
+                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{{"mediaType":"application/vnd.in-toto+json","MediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{b}","size":3}}]}}"#,
+                b = "b".repeat(64)
+            ),
+            // A marker suffix on a runtime layer type does not hide it.
+            format!(
+                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
+                l = descriptor("application/vnd.oci.image.layer.v1.tar+spdx", 'b')
+            ),
+            format!(
+                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
+                l = descriptor(
+                    "APPLICATION/VND.DOCKER.IMAGE.ROOTFS.DIFF.TAR.GZIP+wasm",
+                    'b'
+                )
+            ),
+            // Docker's legacy untyped config over an untyped layer.
+            format!(
+                r#"{{"schemaVersion":2,"config":{c},"layers":[{l}]}}"#,
+                c = descriptor("", 'a'),
+                l = descriptor("application/octet-stream", 'b')
+            ),
+            // Image config with parameters over a rootfs layer.
+            format!(
+                r#"{{"schemaVersion":2,"config":{c},"layers":[{rootfs}]}}"#,
+                c = descriptor(
+                    "application/vnd.oci.image.config.v1+json; charset=utf-8",
+                    'a'
+                )
+            ),
+            // Docker schema1.
+            r#"{"schemaVersion":1,"name":"app","tag":"v1","fsLayers":[]}"#.to_string(),
+        ] {
+            assert_eq!(class(&body), ProxyScanClass::Unclassifiable, "{body}");
+        }
+
         // Known non-images and pure indexes still skip.
+        let empty_cfg = format!(
+            r#"{{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2}}"#
+        );
         let not_images = [
+            format!(r#"{{"schemaVersion":2,"manifests":null}}"#),
+            // ORAS default push: empty config over an OCI tar layer.
+            format!(
+                r#"{{"schemaVersion":2,"config":{empty_cfg},"layers":[{l}]}}"#,
+                l = descriptor("application/vnd.oci.image.layer.v1.tar", 'b')
+            ),
+            // cosign attestation (DSSE envelope).
+            format!(
+                r#"{{"schemaVersion":2,"config":{img_cfg},"layers":[{l}]}}"#,
+                l = descriptor("application/vnd.dsse.envelope.v1+json", 'b')
+            ),
+            // Flux artifact.
+            format!(
+                r#"{{"schemaVersion":2,"config":{c},"layers":[{l}]}}"#,
+                c = descriptor("application/vnd.cncf.flux.config.v1+json", 'a'),
+                l = descriptor("application/vnd.cncf.flux.content.v1.tar+gzip", 'b')
+            ),
+            // Model blobs under a Docker image config.
+            format!(
+                r#"{{"schemaVersion":2,"config":{c},"layers":[{l}]}}"#,
+                c = descriptor("application/vnd.docker.container.image.v1+json", 'a'),
+                l = descriptor("application/vnd.ollama.image.model", 'b')
+            ),
+            // OCI artifact manifest: `blobs`, no `schemaVersion`.
+            format!(
+                r#"{{"mediaType":"application/vnd.oci.artifact.manifest.v1+json","artifactType":"application/example","blobs":[{l}]}}"#,
+                l = descriptor("application/octet-stream", 'b')
+            ),
             String::from_utf8(index_manifest().to_vec()).unwrap(),
             format!(r#"{{"schemaVersion":2,"mediaType":"{INDEX_MT}","manifests":[]}}"#),
             format!(

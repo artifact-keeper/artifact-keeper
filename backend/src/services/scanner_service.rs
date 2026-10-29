@@ -370,26 +370,80 @@ pub fn oci_manifest_is_runnable_image(body: &[u8]) -> bool {
 
 /// How the inline proxy scan gate must treat a proxied OCI manifest body.
 ///
-/// The gate classifies POSITIVELY: only a body positively identified as a
-/// pure index or a known non-image artifact skips the scan. Anything the
-/// server cannot read the way a container runtime would is
-/// [`ProxyScanClass::Unclassifiable`], which the gate treats as an
-/// inconclusive scan (withheld under `fail_closed`), never as "not an image".
+/// The gate classifies POSITIVELY: only a body the server can show no
+/// container runtime would run skips the scan. Anything else that is not a
+/// recognised runnable image is [`ProxyScanClass::Unclassifiable`], which the
+/// gate treats like an inconclusive scan (withheld under `fail_closed`),
+/// never as "not an image".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyScanClass {
     /// A runnable image ([`oci_manifest_is_runnable_image`]): scan it.
     RunnableImage,
-    /// Positively not a runnable image: a pure index or manifest list (its
-    /// platform children re-enter the gate), a manifest with no config, an
-    /// image config with no layers, or a known non-image artifact (Helm
-    /// chart, cosign signature, SBOM / attestation, WASM module) that carries
-    /// no rootfs layer.
+    /// Nothing a runtime would run: a pure index or manifest list (its
+    /// platform children re-enter the gate), an artifact manifest, a manifest
+    /// with no config, no layers, or the empty config, or one none of whose
+    /// layers a runtime would unpack (Helm chart, cosign signature or
+    /// attestation, SBOM, in-toto, WASM, Flux, model blobs).
     NotAnImage,
-    /// Not parseable by the server, ambiguous to a lenient consumer
-    /// ([`oci_manifest_json_is_ambiguous`]), or a shape that is neither a
-    /// runnable image nor a known non-image artifact (for example an unknown
-    /// config media type with a rootfs layer).
+    /// Not parseable by the server, read differently by a lenient consumer
+    /// ([`oci_manifest_json_is_ambiguous`]), a Docker schema1 body, or a shape
+    /// a runtime might unpack that is not a recognised runnable image (for
+    /// example an unknown config media type over a rootfs layer).
     Unclassifiable,
+}
+
+/// Digest of the canonical empty JSON blob `{}` (`application/vnd.oci.empty.v1+json`).
+/// A config with these bytes has no `rootfs`, so no runtime can run layers
+/// under it: ORAS artifacts, SBOMs and attestations use it.
+const EMPTY_JSON_BLOB_DIGEST: &str =
+    "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+
+/// Config media types Docker's classic pull accepts for an image: the OCI and
+/// Docker image configs and its legacy list.
+const DOCKER_CLASSIC_CONFIG_MEDIA_TYPES: [&str; 6] = [
+    crate::formats::oci::media_types::OCI_CONFIG,
+    crate::formats::oci::media_types::CONFIG,
+    "",
+    "application/octet-stream",
+    "application/json",
+    "text/html",
+];
+
+/// Lower-cased media type without parameters.
+fn bare_media_type(media_type: &str) -> String {
+    media_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// A layer containerd would unpack: an OCI image layer or Docker rootfs type,
+/// whatever suffix follows.
+fn containerd_unpacks_layer(media_type: &str) -> bool {
+    let mt = bare_media_type(media_type);
+    mt.starts_with("application/vnd.oci.image.layer.")
+        || mt.starts_with("application/vnd.docker.image.rootfs.")
+}
+
+/// A layer Docker's classic pull accepts (it detects compression from the
+/// bytes, not the type): any OCI image or Docker type, or the legacy
+/// untyped forms.
+fn docker_classic_accepts_layer(media_type: &str) -> bool {
+    let mt = bare_media_type(media_type);
+    mt.starts_with("application/vnd.oci.image")
+        || mt.starts_with("application/vnd.docker")
+        || matches!(
+            mt.as_str(),
+            "" | "application/octet-stream" | "application/json" | "text/html"
+        )
+}
+
+/// Whether the top-level object names a Docker schema1 manifest
+/// (`schemaVersion: 1` or `fsLayers`), which the typed parse cannot describe.
+fn is_schema1_shaped(json: &serde_json::Value) -> bool {
+    json.get("fsLayers").is_some() || json.get("schemaVersion").and_then(|v| v.as_u64()) == Some(1)
 }
 
 /// Classify a proxied manifest body for the inline scan gate (see
@@ -397,15 +451,28 @@ pub enum ProxyScanClass {
 ///
 /// The typed parse below is serde's: case-sensitive keys, unknown keys
 /// ignored, duplicate fields rejected. Docker and containerd decode with Go's
-/// `encoding/json`, which matches keys case-insensitively and lets the last
-/// of a duplicated key win, so a body such as `{"Config": .., "Layers": ..}`
-/// is a runnable image to them and a config-less document to serde. Such a
-/// body is refused classification up front rather than normalised: matching
-/// Go's folding rules exactly is fragile, and no registry emits case-variant
-/// or duplicate keys.
+/// `encoding/json`, which matches keys case-insensitively (including some
+/// non-ASCII letters that fold onto ASCII) and lets the last of a duplicated
+/// key win, so a body such as `{"Config": .., "Layers": ..}` is a runnable
+/// image to them and a config-less document to serde. Such a body is refused
+/// classification up front rather than normalised: reproducing Go's folding
+/// exactly is fragile, and no registry emits case-variant, non-ASCII or
+/// duplicate field names.
 pub fn classify_oci_manifest_for_proxy_scan(body: &[u8]) -> ProxyScanClass {
     if oci_manifest_json_is_ambiguous(body) {
         return ProxyScanClass::Unclassifiable;
+    }
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ProxyScanClass::Unclassifiable;
+    };
+    if !json.is_object() || is_schema1_shaped(&json) {
+        return ProxyScanClass::Unclassifiable;
+    }
+    // No config (absent or null): an index, a manifest list, or an artifact
+    // manifest. No runtime runs a manifest without a config, and the key
+    // spelling is already known to be exact.
+    if json.get("config").is_none_or(|c| c.is_null()) && json.get("layers").is_none() {
+        return ProxyScanClass::NotAnImage;
     }
     let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
         return ProxyScanClass::Unclassifiable;
@@ -414,53 +481,26 @@ pub fn classify_oci_manifest_for_proxy_scan(body: &[u8]) -> ProxyScanClass {
         return ProxyScanClass::RunnableImage;
     }
     let Some(config) = manifest.config.as_ref() else {
-        // A pure index / manifest list, or a document with no config at all:
-        // no runtime can run a manifest without a config.
         return ProxyScanClass::NotAnImage;
     };
-    if manifest.layers.is_empty() {
-        // Nothing to unpack.
+    if manifest.layers.is_empty() || config.digest == EMPTY_JSON_BLOB_DIGEST {
         return ProxyScanClass::NotAnImage;
     }
-    let has_rootfs_layer = manifest
+    let containerd_layer = manifest
         .layers
         .iter()
-        .any(|layer| is_container_rootfs_layer(&layer.media_type));
-    let config_is_image = CONTAINER_IMAGE_CONFIG_MEDIA_TYPES
-        .iter()
-        .any(|allowed| config.media_type == *allowed);
-    if config_is_image {
-        // An image config with no rootfs layer (a runnable image was ruled
-        // out above). A cosign signature or attestation reuses the image
-        // config, and is recognised by EVERY layer being a known non-image
-        // payload. A layer of any other type might still be unpacked.
-        let all_layers_non_image = manifest
+        .any(|l| containerd_unpacks_layer(&l.media_type));
+    let docker_classic_image = DOCKER_CLASSIC_CONFIG_MEDIA_TYPES
+        .contains(&bare_media_type(&config.media_type).as_str())
+        && manifest
             .layers
             .iter()
-            .all(|layer| is_known_non_image_layer(&layer.media_type));
-        return if all_layers_non_image {
-            ProxyScanClass::NotAnImage
-        } else {
-            ProxyScanClass::Unclassifiable
-        };
-    }
-    // A non-image config (Helm, WASM, the empty config of an SBOM /
-    // attestation): not an image while nothing in it is a rootfs layer. With
-    // a rootfs layer it is neither a known artifact nor a known image.
-    if has_rootfs_layer {
+            .any(|l| docker_classic_accepts_layer(&l.media_type));
+    if containerd_layer || docker_classic_image {
         ProxyScanClass::Unclassifiable
     } else {
         ProxyScanClass::NotAnImage
     }
-}
-
-/// True when `media_type` is one of the known non-image payloads
-/// ([`NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS`]).
-fn is_known_non_image_layer(media_type: &str) -> bool {
-    let mt = media_type.to_ascii_lowercase();
-    NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
-        .iter()
-        .any(|marker| mt.contains(marker))
 }
 
 /// Manifest, descriptor and platform field names, as a Go consumer's structs
@@ -471,6 +511,7 @@ const OCI_MANIFEST_FIELD_NAMES: &[&str] = &[
     "artifactType",
     "config",
     "layers",
+    "blobs",
     "manifests",
     "subject",
     "annotations",
@@ -494,35 +535,14 @@ const OCI_MANIFEST_FIELD_NAMES: &[&str] = &[
     "signatures",
 ];
 
-/// Go's `encoding/json` key folding: ASCII letters upper-cased, any other
-/// character mapped through lower- then upper-case (which is how the Kelvin
-/// sign and the long s fold onto ASCII `K` and `S`). A character whose case
-/// mapping is not a single character is kept as is.
-fn go_json_fold(key: &str) -> String {
-    key.chars()
-        .map(|c| {
-            if c.is_ascii() {
-                return c.to_ascii_uppercase();
-            }
-            let mut lower = c.to_lowercase();
-            let (Some(l), None) = (lower.next(), lower.next()) else {
-                return c;
-            };
-            let mut upper = l.to_uppercase();
-            match (upper.next(), upper.next()) {
-                (Some(u), None) => u,
-                _ => c,
-            }
-        })
-        .collect()
-}
-
-/// Whether a manifest body would decode differently under Go's lenient
-/// `encoding/json` than under serde: some JSON object (outside an
-/// `annotations` map, whose keys are free-form) repeats a key, or spells a
-/// manifest field name with a different case (`Config`, `LAYERS`, or a
-/// Unicode key that folds onto one). Invalid JSON also counts, since the
-/// server cannot read it at all.
+/// Whether a manifest body could decode differently under Go's lenient
+/// `encoding/json` than under serde. Outside an `annotations` map (whose
+/// keys are free-form, and which Go does not fold), any JSON object that
+/// repeats a key, has a non-ASCII key (Go folds some non-ASCII letters onto
+/// ASCII field names), or spells a manifest field name with a different
+/// ASCII case counts. Invalid JSON also counts, since the server cannot read
+/// it at all. The duplicate check backs up serde's own duplicate-field error
+/// for the typed parse.
 pub fn oci_manifest_json_is_ambiguous(body: &[u8]) -> bool {
     let mut de = serde_json::Deserializer::from_slice(body);
     let mut ambiguous = false;
@@ -534,6 +554,15 @@ pub fn oci_manifest_json_is_ambiguous(body: &[u8]) -> bool {
         &mut de,
     );
     walked.is_err() || de.end().is_err() || ambiguous
+}
+
+/// Whether an object key would be read differently by a case-folding
+/// consumer.
+fn key_is_ambiguous(key: &str) -> bool {
+    !key.is_ascii()
+        || OCI_MANIFEST_FIELD_NAMES
+            .iter()
+            .any(|name| *name != key && name.eq_ignore_ascii_case(key))
 }
 
 /// The serde walk behind [`oci_manifest_json_is_ambiguous`]: visits every
@@ -602,14 +631,7 @@ impl<'de> serde::de::Visitor<'de> for KeyAmbiguityWalk<'_> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(key) = map.next_key::<String>()? {
             if !self.free_form_keys {
-                if !seen.insert(key.clone()) {
-                    *self.ambiguous = true;
-                }
-                let folded = go_json_fold(&key);
-                if OCI_MANIFEST_FIELD_NAMES
-                    .iter()
-                    .any(|name| *name != key && go_json_fold(name) == folded)
-                {
+                if !seen.insert(key.clone()) || key_is_ambiguous(&key) {
                     *self.ambiguous = true;
                 }
             }
@@ -654,6 +676,13 @@ pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
         // Anomalous body on an OCI route: do not flip the path-based decision.
         return true;
     };
+    // Anything the proxy gate would not positively wave through as a
+    // non-image stays scannable, so hosted and async scans agree with it.
+    if manifest.manifests.is_empty()
+        && classify_oci_manifest_for_proxy_scan(body) != ProxyScanClass::NotAnImage
+    {
+        return true;
+    }
     // A runnable image is always scannable — checked FIRST so a co-present
     // `manifests` array cannot route a real image down the index branch.
     if oci_manifest_is_runnable_image(body) {
