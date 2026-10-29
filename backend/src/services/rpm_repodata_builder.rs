@@ -71,7 +71,18 @@ pub const RPM_REPODATA_BUILD_LOCK_CLASS: i32 = 0x4544;
 pub const MODE_KEY: &str = "repodata_mode";
 
 /// How a hosted RPM repository's repodata is produced.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum RepodataMode {
     /// Built in the background and served from storage (the default).
     #[default]
@@ -894,6 +905,79 @@ pub async fn mark_dirty(db: &PgPool, repo_id: Uuid, root: &str) -> Result<()> {
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Why a `repodata_mode` cannot be set on a repository.
+pub const MODE_UNSUPPORTED: &str = "repodata_mode applies to hosted (local) RPM repositories only";
+
+/// Store `mode` for `repo_id` on the writer's connection. `precomputed`, the
+/// default, is stored as the absence of the key. Switching to `on_request`
+/// takes effect on the next request; the builder's maintenance pass then
+/// deletes the stored revisions.
+pub async fn set_mode(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    mode: RepodataMode,
+) -> Result<()> {
+    match mode {
+        RepodataMode::Precomputed => {
+            let switched =
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                    .bind(repo_id)
+                    .bind(MODE_KEY)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+            if switched == 0 {
+                return Ok(());
+            }
+            // Build afresh: a revision built before an opt-out is stale.
+            sqlx::query(
+                "UPDATE rpm_repodata_roots SET dirty_since = COALESCE(dirty_since, now()) \
+                  WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        RepodataMode::OnRequest => {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+                 ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(repo_id)
+            .bind(MODE_KEY)
+            .bind(mode.as_str())
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The modes of the hosted RPM repositories among `ids` (other repositories
+/// are absent from the map).
+pub async fn modes(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, RepodataMode>> {
+    let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT r.id, c.value FROM repositories r \
+           LEFT JOIN repository_config c ON c.repository_id = r.id AND c.key = 'repodata_mode' \
+          WHERE r.id = ANY($1) AND r.format = 'rpm' AND r.repo_type = 'local'",
+    )
+    .bind(ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, value)| {
+            (
+                id,
+                value
+                    .as_deref()
+                    .and_then(RepodataMode::parse)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect())
 }
 
 /// The repository's repodata mode (`repodata_mode` in `repository_config`;

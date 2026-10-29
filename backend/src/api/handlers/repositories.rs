@@ -51,6 +51,7 @@ use crate::services::repository_service::{
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
+use crate::services::rpm_repodata_builder::{self, RepodataMode};
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 use crate::services::upstream_filter::{self, UpstreamFilter};
@@ -976,6 +977,14 @@ pub struct CreateRepositoryRequest {
     #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
     #[schema(minimum = 0, maximum = 1023, nullable = false)]
     pub repodata_depth: Option<u32>,
+    /// How a local RPM repository's repodata is produced (#4544):
+    /// `precomputed` (the default) builds it in the background after each
+    /// change and serves it from storage; `on_request` renders it on the
+    /// request path and validates it against the repository on every request
+    /// (read-your-writes). Rejected (422) for any other repository.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub key: String,
     pub name: String,
     pub description: Option<String>,
@@ -1227,6 +1236,11 @@ pub struct UpdateRepositoryRequest {
     #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
     #[schema(minimum = 0, maximum = 1023, nullable = false)]
     pub repodata_depth: Option<u32>,
+    /// Omit to retain the RPM repodata mode (#4544); see
+    /// `CreateRepositoryRequest.repodata_mode`. Local RPM repositories only.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub key: Option<String>,
     pub name: Option<String>,
     /// Update or clear the description (#4729). Three-way semantics via
@@ -1456,6 +1470,10 @@ pub struct RepositoryResponse {
     pub repodata_depth: u32,
     /// Structural eligibility and emptiness only, not an authorization grant.
     pub repodata_depth_editable: bool,
+    /// RPM repodata mode (#4544), present for local RPM repositories only:
+    /// `precomputed` (default) or `on_request`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repodata_mode: Option<RepodataMode>,
     pub id: Uuid,
     pub key: String,
     pub name: String,
@@ -1618,9 +1636,18 @@ pub struct RpmRepodataDepthCapability {
     pub default: u32,
 }
 
+/// Precomputed RPM repodata (#4544): `repodata_mode` and
+/// `POST /api/v1/repositories/{key}/rpm/repodata/rebuild`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RpmRepodataModeCapability {
+    pub supported: bool,
+    pub default: RepodataMode,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryCapabilities {
     pub rpm_repodata_depth: RpmRepodataDepthCapability,
+    pub rpm_repodata_mode: RpmRepodataModeCapability,
 }
 
 /// Non-mutating feature detection, including on an installation with no repositories.
@@ -1637,6 +1664,10 @@ pub async fn repository_capabilities() -> Json<RepositoryCapabilities> {
             max: rpm_layout::MAX_REPODATA_DEPTH,
             default: 0,
         },
+        rpm_repodata_mode: RpmRepodataModeCapability {
+            supported: true,
+            default: RepodataMode::Precomputed,
+        },
     })
 }
 
@@ -1650,6 +1681,9 @@ async fn with_repodata_depth(
         .ok_or_else(|| AppError::NotFound("Repository not found".into()))?;
     response.repodata_depth = depth;
     response.repodata_depth_editable = editable;
+    response.repodata_mode = rpm_repodata_builder::modes(db, &[response.id])
+        .await?
+        .remove(&response.id);
     Ok(response)
 }
 
@@ -1988,6 +2022,7 @@ fn repo_to_response(
     RepositoryResponse {
         repodata_depth: 0,
         repodata_depth_editable: false,
+        repodata_mode: None,
         id: repo.id,
         key: repo.key,
         name: repo.name,
@@ -4073,6 +4108,7 @@ pub async fn list_repositories(
     }
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
+    let mut repodata_modes = rpm_repodata_builder::modes(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -4088,6 +4124,7 @@ pub async fn list_repositories(
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
             }
+            resp.repodata_mode = repodata_modes.remove(&resp.id);
             resp
         })
         .collect();
@@ -4117,7 +4154,7 @@ pub async fn list_repositories(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
     )
 )]
 pub async fn create_repository(
@@ -4420,6 +4457,7 @@ pub async fn create_repository(
                 created_by: Some(auth.user_id),
             },
             payload.repodata_depth.unwrap_or(0),
+            payload.repodata_mode,
             provisioner,
         )
         .await?;
@@ -5244,7 +5282,7 @@ pub async fn get_repository_storage_tree(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
     )
 )]
 pub async fn update_repository(
@@ -5450,6 +5488,7 @@ pub async fn update_repository(
                 curation_default_action: payload.curation_default_action,
             },
             payload.repodata_depth,
+            payload.repodata_mode,
         )
         .await?;
 
@@ -13871,6 +13910,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryCapabilities,
         RpmRepodataDepthCapability,
+        RpmRepodataModeCapability,
+        RepodataMode,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
         StorageTreeQuery,
@@ -16993,6 +17034,7 @@ mod tests {
         let resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
@@ -18408,6 +18450,7 @@ mod tests {
         let resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
@@ -32724,6 +32767,7 @@ mod tests {
         let mut resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             id: Uuid::new_v4(),
             has_trusted_gpg_key: false,
             key: "ua-serde".to_string(),

@@ -182,6 +182,7 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "proxy_cache_cap",
             handlers::proxy_cache_cap::ProxyCacheCapApiDoc::openapi(),
         ),
+        ("rpm_repodata", handlers::rpm::RpmRepodataApiDoc::openapi()),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
         ("banners", handlers::banners::BannersApiDoc::openapi()),
         (
