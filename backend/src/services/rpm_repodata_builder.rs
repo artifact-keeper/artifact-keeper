@@ -349,7 +349,12 @@ pub async fn try_build(
 }
 
 /// Build `root` now, waiting up to `wait` for a build another replica is
-/// running to finish first. Used by the rebuild endpoint (`wait=true`).
+/// running to finish first. Used by the rebuild endpoint (`wait=true`). When
+/// the current revision already includes every committed write (the root
+/// is clean, and no claimed build is outstanding: `retry_at` is only left
+/// set by a claim that never swapped or an incomplete build), it is
+/// returned instead of building again, so concurrent callers and retries
+/// share one build.
 pub async fn build_waiting(
     state: &SharedState,
     repo_id: Uuid,
@@ -366,16 +371,31 @@ pub async fn build_waiting(
     let Some(lease) = lease else {
         return Ok(BuildOutcome::Busy);
     };
+    let current: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT built_revision, built_count FROM rpm_repodata_roots \
+          WHERE repository_id = $1 AND root = $2 AND dirty_since IS NULL \
+            AND retry_at IS NULL AND built_revision IS NOT NULL",
+    )
+    .bind(repo_id)
+    .bind(root)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some((revision, packages)) = current {
+        lease.release().await;
+        return Ok(BuildOutcome::Built { revision, packages });
+    }
     build_leased(state, repo_id, root, &BuilderSettings::from_env(), lease).await
 }
 
-/// Ask for a build of `root` at the next tick, without the debounce.
+/// Ask for a build of `root` at the next tick, without the debounce. A root
+/// backing off after a failed build keeps its back-off.
 pub async fn request_build(db: &PgPool, repo_id: Uuid, root: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO rpm_repodata_roots (repository_id, root, dirty_since) \
          VALUES ($1, $2, 'epoch') \
          ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = 'epoch', \
-             retry_at = NULL, last_error = NULL",
+             retry_at = CASE WHEN rpm_repodata_roots.last_error IS NULL THEN NULL \
+                             ELSE rpm_repodata_roots.retry_at END",
     )
     .bind(repo_id)
     .bind(root)
@@ -426,7 +446,7 @@ async fn build_leased(
 }
 
 /// The repository's storage location when it is precomputed.
-async fn precomputed_location(db: &PgPool, repo_id: Uuid) -> Result<Option<StorageLocation>> {
+pub async fn precomputed_location(db: &PgPool, repo_id: Uuid) -> Result<Option<StorageLocation>> {
     let sql = format!(
         "SELECT r.storage_backend, r.storage_path FROM repositories r \
           WHERE r.id = $1 AND {PRECOMPUTED_REPO_SQL}"
@@ -835,6 +855,22 @@ pub async fn collect_garbage(state: &SharedState) -> Result<u64> {
         else {
             continue;
         };
+        // Recheck under the lease: the repository may have switched back to
+        // precomputed and been built since the listing.
+        let still: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM rpm_repodata_roots rr \
+               LEFT JOIN repositories r ON r.id = rr.repository_id \
+              WHERE rr.repository_id = $1 AND rr.root = $2 \
+                AND (r.id IS NULL OR NOT ({PRECOMPUTED_REPO_SQL})))"
+        )))
+        .bind(repo_id)
+        .bind(&root)
+        .fetch_one(&state.db)
+        .await?;
+        if !still {
+            lease.release().await;
+            continue;
+        }
         let result = drop_root(state, repo_id, &root).await;
         if gone && result.is_ok() {
             let _ = sqlx::query(
@@ -982,6 +1018,30 @@ pub async fn modes(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, RepodataMo
 
 /// The repository's repodata mode (`repodata_mode` in `repository_config`;
 /// absent means [`RepodataMode::Precomputed`]).
+/// Whether `root` of `repo_id` lists any package (a root a rebuild may name).
+pub async fn root_has_packages(db: &PgPool, repo_id: Uuid, root: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM artifacts a \
+          WHERE a.repository_id = $1 AND a.is_deleted = false AND a.path LIKE '%.rpm' \
+            AND starts_with(a.path, $2))",
+    )
+    .bind(repo_id)
+    .bind(root_prefix(root))
+    .fetch_one(db)
+    .await?)
+}
+
+/// Deserialize a present `repodata_mode`, refusing `null` (omit the field to
+/// keep the current mode).
+pub fn deserialize_mode<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RepodataMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <RepodataMode as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
 pub async fn mode(db: &PgPool, repo_id: Uuid) -> Result<RepodataMode> {
     let value: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",

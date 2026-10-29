@@ -126,6 +126,9 @@ async fn rebuild_wait_serves_the_write_and_matches_on_request_bytes_4544() {
     assert_eq!(body["packages"], 2);
     let precomputed = documents(&f).await;
     assert_ne!(precomputed[1], stale[1], "the rebuild includes beta");
+    let (status, body) = rebuild(&f, "?wait=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 2, "nothing changed: no second build");
     assert!(
         crate::services::rpm_repodata_builder::stored_revision(&f.pool, f.repo_id, "")
             .await
@@ -196,6 +199,13 @@ async fn rebuild_without_wait_queues_and_validates_the_root_4544() {
     );
     let (status, _) = rebuild(&f, "?root=el9&wait=true").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "no roots at depth zero");
+    sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (status, _) = rebuild(&f, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a root without packages");
     f.teardown().await;
 }
 
@@ -218,7 +228,7 @@ async fn repodata_mode_is_rejected_outside_local_rpm_4544() {
     assert_eq!(status, StatusCode::OK);
     assert!(json(&body).get("repodata_mode").is_none());
     let (status, _) = rebuild(&f, "?wait=true").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     let (status, body) = patch_mode(&f, "sometimes").await;
     assert!(status.is_client_error(), "{body}");
     f.teardown().await;
@@ -236,4 +246,67 @@ fn rebuild_endpoint_and_mode_are_documented_4544() {
     assert!(schemas["RepodataMode"].is_object(), "RepodataMode schema");
     assert!(schemas["CreateRepositoryRequest"]["properties"]["repodata_mode"].is_object());
     assert!(schemas["UpdateRepositoryRequest"]["properties"]["repodata_mode"].is_object());
+}
+
+/// A rebuild needs the repository `write` permission: a reader of a private
+/// repository and a non-member of a public one are refused, a member with
+/// write is not (#4544).
+#[tokio::test]
+async fn rebuild_requires_repository_write_permission_4544() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "alpha").await;
+    let as_user = |user_id, username: String| {
+        tdh::router_with_auth_ext(
+            Router::new().nest("/api/v1/repositories", super::repo_router()),
+            f.state.clone(),
+            tdh::make_auth(user_id, &username),
+        )
+    };
+    let post = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/v1/repositories/{}/rpm/repodata/rebuild?wait=true",
+                f.repo_key
+            ))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (reader, reader_name) = tdh::create_user(&f.pool).await;
+    tdh::grant_repo_role(&f.pool, f.repo_id, reader, "reader").await;
+    let (status, body) = tdh::send(as_user(reader, reader_name.clone()), post()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    sqlx::query("UPDATE repositories SET is_public = true, visibility = 'public' WHERE id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (stranger, stranger_name) = tdh::create_user(&f.pool).await;
+    let (status, _) = tdh::send(as_user(stranger, stranger_name), post()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "public is not writable");
+
+    // The fixture user is a developer of the repository.
+    let (status, body) = tdh::send(as_user(f.user_id, f.username.clone()), post()).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    for user in [reader, stranger] {
+        sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(user)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+    }
+    f.teardown().await;
 }

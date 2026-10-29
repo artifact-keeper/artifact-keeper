@@ -982,7 +982,7 @@ pub struct CreateRepositoryRequest {
     /// change and serves it from storage; `on_request` renders it on the
     /// request path and validates it against the repository on every request
     /// (read-your-writes). Rejected (422) for any other repository.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "rpm_repodata_builder::deserialize_mode")]
     #[schema(nullable = false)]
     pub repodata_mode: Option<RepodataMode>,
     pub key: String,
@@ -1238,7 +1238,7 @@ pub struct UpdateRepositoryRequest {
     pub repodata_depth: Option<u32>,
     /// Omit to retain the RPM repodata mode (#4544); see
     /// `CreateRepositoryRequest.repodata_mode`. Local RPM repositories only.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "rpm_repodata_builder::deserialize_mode")]
     #[schema(nullable = false)]
     pub repodata_mode: Option<RepodataMode>,
     pub key: Option<String>,
@@ -1473,6 +1473,7 @@ pub struct RepositoryResponse {
     /// RPM repodata mode (#4544), present for local RPM repositories only:
     /// `precomputed` (default) or `on_request`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub repodata_mode: Option<RepodataMode>,
     pub id: Uuid,
     pub key: String,
