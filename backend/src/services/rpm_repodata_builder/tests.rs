@@ -64,6 +64,7 @@ async fn row(
     f: &tdh::Fixture,
     root: &str,
 ) -> Option<(Option<DateTime<Utc>>, Option<i64>, Option<i64>)> {
+    fold_marks(&f.pool).await.expect("fold dirty marks");
     sqlx::query_as(
         "SELECT dirty_since, built_revision, previous_revision FROM rpm_repodata_roots \
           WHERE repository_id = $1 AND root = $2",
@@ -415,7 +416,9 @@ async fn deleted_repository_revisions_are_collected_4544() {
         .execute(&f.pool)
         .await
         .unwrap();
-    collect_garbage(&f.state).await.unwrap();
+    // One pass handles a page of roots; drain them (other tests' leftovers
+    // share the database).
+    while collect_garbage(&f.state).await.unwrap() > 0 {}
     assert!(!stored_at(&f, &loc, "", 1, "repomd.xml").await);
     assert!(row(&f, "").await.is_none());
     f.teardown().await;
@@ -542,5 +545,75 @@ async fn claim_waits_for_fenced_writers_and_crashed_builds_retry_4544() {
         .unwrap()
         .iter()
         .any(|(id, _)| *id == f.repo_id));
+    f.teardown().await;
+}
+
+/// Two transactions that each dirty two clean roots, in opposite order, do
+/// not wait on each other: writers only append dirty marks (migration 309),
+/// so neither holds a lock the other needs. Under migration 308 alone the
+/// second write of each transaction waited on the other's root row and
+/// Postgres aborted one of them as a deadlock (#4544). Metadata writes are
+/// the case that matters: they change no stored size, so unlike uploads they
+/// do not already serialize on the repository's usage-ledger row.
+#[tokio::test]
+async fn writers_dirtying_two_roots_in_opposite_order_do_not_deadlock_4544() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, 'repodata_depth', '1')",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    for (root, n) in [("a", 1), ("a", 2), ("b", 3), ("b", 4)] {
+        upload(
+            &f,
+            &format!("{root}/x{n}-1.0-1.noarch.rpm"),
+            &format!("x{n}"),
+            "1.0",
+        )
+        .await;
+    }
+    assert!(matches!(build(&f, "a").await, BuildOutcome::Built { .. }));
+    assert!(matches!(build(&f, "b").await, BuildOutcome::Built { .. }));
+    assert_eq!(row(&f, "a").await.unwrap().0, None, "a is clean");
+    assert_eq!(row(&f, "b").await.unwrap().0, None, "b is clean");
+
+    async fn enrich(
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+        f: &tdh::Fixture,
+        path: &str,
+    ) {
+        let step = sqlx::query(
+            "UPDATE artifact_metadata SET metadata = metadata || '{\"summary\": \"enriched\"}' \
+              WHERE artifact_id = (SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2)",
+        )
+        .bind(f.repo_id)
+        .bind(path)
+        .execute(&mut **tx);
+        tokio::time::timeout(Duration::from_secs(10), step)
+            .await
+            .expect("a writer waited on the other transaction")
+            .expect("metadata update");
+    }
+    let mut t1 = f.pool.begin().await.unwrap();
+    let mut t2 = f.pool.begin().await.unwrap();
+    enrich(&mut t1, &f, "a/x1-1.0-1.noarch.rpm").await;
+    enrich(&mut t2, &f, "b/x3-1.0-1.noarch.rpm").await;
+    enrich(&mut t1, &f, "b/x4-1.0-1.noarch.rpm").await;
+    enrich(&mut t2, &f, "a/x2-1.0-1.noarch.rpm").await;
+    t1.commit().await.unwrap();
+    t2.commit().await.unwrap();
+    assert!(row(&f, "a").await.unwrap().0.is_some(), "a dirtied");
+    assert!(row(&f, "b").await.unwrap().0.is_some(), "b dirtied");
+    let marks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rpm_repodata_dirty WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(marks, 0, "folded");
     f.teardown().await;
 }

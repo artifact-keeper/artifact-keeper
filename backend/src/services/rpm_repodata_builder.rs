@@ -10,10 +10,13 @@
 //! the background instead and served from storage:
 //!
 //! 1. **Dirty at the persistence boundary.** Triggers on `artifacts` and
-//!    `artifact_metadata` (migration 308) set `rpm_repodata_roots.dirty_since`
-//!    for the changed root, using migration 247's root derivation. A root that
-//!    is already dirty is only read, so a bulk import does not queue on its
-//!    row.
+//!    `artifact_metadata` (migration 308) mark the changed root, using
+//!    migration 247's root derivation. A writer only appends a row to
+//!    `rpm_repodata_dirty` (migration 309), and only when the root is not
+//!    already marked, so writers never lock a shared row: a bulk import does
+//!    not queue, and two writers touching two roots in opposite order cannot
+//!    deadlock. The builder folds the marks into
+//!    `rpm_repodata_roots.dirty_since` ([`fold_marks`]).
 //! 2. **Debounced builder.** Every replica ticks; a dirty root is built once
 //!    it has been quiet for [`BuilderSettings::quiet`] or dirty for
 //!    [`BuilderSettings::max_delay`], under a [`ClusterLock`] lease per root
@@ -268,8 +271,43 @@ pub async fn run_tick(state: &SharedState, settings: &BuilderSettings) -> usize 
     built
 }
 
+/// Advisory lock (single-key space) serializing [`fold_marks`] across
+/// replicas.
+const FOLD_LOCK_KEY: i64 = 0x4544_0309;
+
+/// Move the dirty marks writers queued in `rpm_repodata_dirty` (migration
+/// 309) into `rpm_repodata_roots.dirty_since`. Writers never lock a root
+/// row, so two uploads touching two roots in opposite order cannot
+/// deadlock; the builder takes the row locks here instead, one replica at a
+/// time and in key order. Returns the roots marked.
+pub async fn fold_marks(db: &PgPool) -> Result<u64> {
+    let mut tx = db.begin().await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(FOLD_LOCK_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !got {
+        return Ok(0);
+    }
+    let folded = sqlx::query(
+        "WITH moved AS (DELETE FROM rpm_repodata_dirty \
+                         RETURNING repository_id, root, marked_at) \
+         INSERT INTO rpm_repodata_roots (repository_id, root, dirty_since) \
+         SELECT repository_id, root, MIN(marked_at) FROM moved \
+          GROUP BY repository_id, root ORDER BY repository_id, root \
+         ON CONFLICT (repository_id, root) DO UPDATE \
+            SET dirty_since = COALESCE(rpm_repodata_roots.dirty_since, EXCLUDED.dirty_since)",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(folded)
+}
+
 /// Roots whose build is due: dirty and debounced, or past their retry time.
 async fn due_roots(db: &PgPool, settings: &BuilderSettings) -> Result<Vec<(Uuid, String)>> {
+    fold_marks(db).await?;
     let sql = format!(
         "SELECT rr.repository_id, rr.root FROM rpm_repodata_roots rr \
            JOIN repositories r ON r.id = rr.repository_id \
@@ -722,6 +760,13 @@ async fn claim(
         }
         Err(e) => return Err(e.into()),
     }
+    // Queued marks first, then the row: the same order as `fold_marks`, so
+    // the two never wait on each other in a cycle.
+    sqlx::query("DELETE FROM rpm_repodata_dirty WHERE repository_id = $1 AND root = $2")
+        .bind(repo_id)
+        .bind(root)
+        .execute(&mut *tx)
+        .await?;
     let revision: i64 = sqlx::query_scalar(
         "INSERT INTO rpm_repodata_roots \
              (repository_id, root, next_revision, retry_at, storage_backend, storage_path) \
