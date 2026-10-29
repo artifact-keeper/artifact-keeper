@@ -289,6 +289,11 @@ pub async fn fold_marks(db: &PgPool) -> Result<u64> {
     if !got {
         return Ok(0);
     }
+    // Never stall every replica's fold behind one blocked root row: give up
+    // and retry at the next tick.
+    sqlx::query("SET LOCAL lock_timeout = '1s'")
+        .execute(&mut *tx)
+        .await?;
     let folded = sqlx::query(
         "WITH moved AS (DELETE FROM rpm_repodata_dirty \
                          RETURNING repository_id, root, marked_at) \
@@ -764,11 +769,23 @@ async fn claim(
     }
     // Queued marks first, then the row: the same order as `fold_marks`, so
     // the two never wait on each other in a cycle.
-    sqlx::query("DELETE FROM rpm_repodata_dirty WHERE repository_id = $1 AND root = $2")
-        .bind(repo_id)
-        .bind(root)
-        .execute(&mut *tx)
-        .await?;
+    let consumed =
+        sqlx::query("DELETE FROM rpm_repodata_dirty WHERE repository_id = $1 AND root = $2")
+            .bind(repo_id)
+            .bind(root)
+            .execute(&mut *tx)
+            .await;
+    match consumed {
+        Ok(_) => {}
+        Err(e)
+            if e.as_database_error()
+                .and_then(|d| d.code())
+                .is_some_and(|c| c == "55P03" || c == "57014") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
     let revision: i64 = sqlx::query_scalar(
         "INSERT INTO rpm_repodata_roots \
              (repository_id, root, next_revision, retry_at, storage_backend, storage_path) \
@@ -1026,9 +1043,12 @@ pub async fn set_mode(
                 return Ok(());
             }
             // Build afresh: a revision built before an opt-out is stale.
+            // Append marks rather than update the roots: this runs inside the
+            // caller's repository transaction, which must not hold root row
+            // locks the builder's fold takes in another order.
             sqlx::query(
-                "UPDATE rpm_repodata_roots SET dirty_since = COALESCE(dirty_since, now()) \
-                  WHERE repository_id = $1",
+                "INSERT INTO rpm_repodata_dirty (repository_id, root) \
+                 SELECT repository_id, root FROM rpm_repodata_roots WHERE repository_id = $1",
             )
             .bind(repo_id)
             .execute(&mut *conn)
