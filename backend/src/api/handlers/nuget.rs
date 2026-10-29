@@ -1661,6 +1661,7 @@ fn parse_v2_feed_entries(xml: &str) -> Vec<V2Entry> {
                                 description: entry.description,
                                 hash_sha256_b64: entry.hash,
                                 size: entry.size,
+                                ..Default::default()
                             });
                         }
                     }
@@ -2093,6 +2094,7 @@ async fn v2_entries_from_v3_upstream(
         description: description.to_string(),
         hash_sha256_b64: None,
         size: 0,
+        ..Default::default()
     };
 
     // `Packages(Id='x',Version='y')`: one coordinate.
@@ -4534,8 +4536,18 @@ async fn v2_service_document(
     ))
 }
 
-/// Minimal static OData `$metadata` (EDMX) advertising the V1FeedPackage entity
-/// set. Sufficient for `choco`/`nuget` V2 clients to bind the feed.
+/// Static OData `$metadata` (EDMX) describing the `V2FeedPackage` entity set.
+///
+/// The property list is `NuGet.Server`'s, and it is load-bearing rather than
+/// decorative: a V2 client binds against this document *before* it queries, and
+/// drops any property the EDMX does not declare. Chocolatey resolves
+/// `<dependencies>` from `Dependencies` and picks a candidate from
+/// `IsLatestVersion`/`IsAbsoluteLatestVersion`, so a package whose dependencies
+/// are not declared here installs nothing at all — which is every Chocolatey
+/// meta package (`7zip`, `git`, ...).
+///
+/// Every property [`build_v2_entry`] renders MUST appear here; the
+/// `$metadata`-entry parity test fails otherwise.
 const V2_METADATA_EDMX: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <edmx:Edmx Version="1.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">
   <edmx:DataServices xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata" m:DataServiceVersion="2.0">
@@ -4544,30 +4556,167 @@ const V2_METADATA_EDMX: &str = r#"<?xml version="1.0" encoding="utf-8"?>
         <Key><PropertyRef Name="Id"/><PropertyRef Name="Version"/></Key>
         <Property Name="Id" Type="Edm.String" Nullable="false"/>
         <Property Name="Version" Type="Edm.String" Nullable="false"/>
+        <Property Name="NormalizedVersion" Type="Edm.String"/>
         <Property Name="Authors" Type="Edm.String"/>
         <Property Name="Description" Type="Edm.String"/>
+        <Property Name="Summary" Type="Edm.String"/>
+        <Property Name="Title" Type="Edm.String"/>
+        <Property Name="Tags" Type="Edm.String"/>
+        <Property Name="ProjectUrl" Type="Edm.String"/>
+        <Property Name="IconUrl" Type="Edm.String"/>
+        <Property Name="LicenseUrl" Type="Edm.String"/>
+        <Property Name="ReleaseNotes" Type="Edm.String"/>
+        <Property Name="Dependencies" Type="Edm.String"/>
+        <Property Name="RequireLicenseAcceptance" Type="Edm.Boolean"/>
+        <Property Name="IsLatestVersion" Type="Edm.Boolean"/>
+        <Property Name="IsAbsoluteLatestVersion" Type="Edm.Boolean"/>
+        <Property Name="IsPrerelease" Type="Edm.Boolean"/>
+        <Property Name="Listed" Type="Edm.Boolean"/>
+        <Property Name="Created" Type="Edm.DateTime"/>
+        <Property Name="Published" Type="Edm.DateTime"/>
+        <Property Name="LastUpdated" Type="Edm.DateTime"/>
+        <Property Name="DownloadCount" Type="Edm.Int32"/>
+        <Property Name="VersionDownloadCount" Type="Edm.Int32"/>
+        <Property Name="PackageSize" Type="Edm.Int64"/>
         <Property Name="PackageHash" Type="Edm.String"/>
         <Property Name="PackageHashAlgorithm" Type="Edm.String"/>
-        <Property Name="PackageSize" Type="Edm.Int64"/>
       </EntityType>
       <EntityContainer Name="FeedContext" m:IsDefaultEntityContainer="true">
         <EntitySet Name="Packages" EntityType="NuGet.Server.DataServices.V2FeedPackage"/>
         <FunctionImport Name="FindPackagesById" EntitySet="Packages" ReturnType="Collection(NuGet.Server.DataServices.V2FeedPackage)" m:HttpMethod="GET">
           <Parameter Name="id" Type="Edm.String"/>
+          <Parameter Name="$filter" Type="Edm.String"/>
+          <Parameter Name="$orderby" Type="Edm.String"/>
+          <Parameter Name="$skip" Type="Edm.Int32"/>
+          <Parameter Name="$top" Type="Edm.Int32"/>
+        </FunctionImport>
+        <FunctionImport Name="Search" EntitySet="Packages" ReturnType="Collection(NuGet.Server.DataServices.V2FeedPackage)" m:HttpMethod="GET">
+          <Parameter Name="searchTerm" Type="Edm.String"/>
+          <Parameter Name="targetFramework" Type="Edm.String"/>
+          <Parameter Name="includePrerelease" Type="Edm.Boolean"/>
+          <Parameter Name="$filter" Type="Edm.String"/>
+          <Parameter Name="$orderby" Type="Edm.String"/>
+          <Parameter Name="$skip" Type="Edm.Int32"/>
+          <Parameter Name="$top" Type="Edm.Int32"/>
         </FunctionImport>
       </EntityContainer>
     </Schema>
   </edmx:DataServices>
 </edmx:Edmx>"#;
 
-/// A single hosted-repo OData `<entry>` for a package version.
+/// A single V2 OData `<entry>` for one package version.
+///
+/// Carries the whole `V2FeedPackage` property set a client resolves against, not
+/// just identity: `Dependencies` is what makes a Chocolatey meta package install
+/// anything, and `IsLatestVersion`/`IsAbsoluteLatestVersion` are what a bare
+/// `choco install <id>` without `-Version` consults.
 struct V2Entry {
     id: String,
     version: String,
     authors: String,
     description: String,
+    /// Base64 of the `.nupkg`'s SHA-512 as recorded at push. The V2 protocol
+    /// hashes with SHA-512, so this is what `PackageHash` reports when present.
+    hash_sha512_b64: Option<String>,
+    /// Base64 SHA-256 for rows with no nuspec behind them (generic-route
+    /// uploads). Keeping it as the fallback means no client that gets a hash
+    /// today stops getting one.
     hash_sha256_b64: Option<String>,
     size: i64,
+    title: Option<String>,
+    summary: Option<String>,
+    tags: Option<String>,
+    project_url: Option<String>,
+    icon_url: Option<String>,
+    license_url: Option<String>,
+    release_notes: Option<String>,
+    require_license_acceptance: bool,
+    /// The protocol's `id:range:framework` shape, joined by `|`; rendered by
+    /// [`build_v2_dependencies`].
+    dependencies: String,
+    download_count: i64,
+    published: Option<chrono::DateTime<chrono::Utc>>,
+    is_latest: bool,
+    is_absolute_latest: bool,
+    is_prerelease: bool,
+    listed: bool,
+    /// Empty means "derive from `version`" ([`build_v2_entry`] falls back to
+    /// [`crate::formats::nuget::NugetHandler::normalized_version`]).
+    normalized_version: String,
+}
+
+impl Default for V2Entry {
+    /// The defaults describe a package known to exist and nothing more: listed,
+    /// not latest, no dependency claims. Construction sites that know better (the
+    /// hosted loader) overwrite them.
+    ///
+    /// `listed: true` is deliberately not the `false` a derive would give: an
+    /// entry built by a synthesized path (V3-translated member, parsed upstream
+    /// feed) that reported `Listed=false` would be hidden from `choco search`
+    /// even though it is a real, servable package.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            version: String::new(),
+            authors: String::new(),
+            description: String::new(),
+            hash_sha512_b64: None,
+            hash_sha256_b64: None,
+            size: 0,
+            title: None,
+            summary: None,
+            tags: None,
+            project_url: None,
+            icon_url: None,
+            license_url: None,
+            release_notes: None,
+            require_license_acceptance: false,
+            dependencies: String::new(),
+            download_count: 0,
+            published: None,
+            is_latest: false,
+            is_absolute_latest: false,
+            is_prerelease: false,
+            listed: true,
+            normalized_version: String::new(),
+        }
+    }
+}
+
+/// Render a nuspec dependency list into the V2 `Dependencies` property.
+///
+/// `id:range:framework|id:range:framework` — the shape `NuGet.Server` emits and
+/// Chocolatey parses. The framework segment is left empty: a Chocolatey
+/// `.nuspec` declares no target framework, and the clients that read this feed
+/// ignore the segment, so carrying one through would only invent a framework
+/// that no install actually honours.
+fn build_v2_dependencies(dependencies: &[(String, Option<String>)]) -> String {
+    dependencies
+        .iter()
+        .map(|(id, range)| format!("{}:{}:", id, range.as_deref().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// An `Option<&str>` as an escaped OData element body (`""` when absent).
+fn xml_opt(value: &Option<String>) -> String {
+    value.as_deref().map(xml_escape).unwrap_or_default()
+}
+
+/// Base64 of a lowercase-hex digest, the encoding the V2 `PackageHash` family of
+/// properties uses (NuGet hashes the `.nupkg` bytes with SHA-512, then base64s).
+fn base64_of_hex(hex_digest: &str) -> Option<String> {
+    hex::decode(hex_digest)
+        .ok()
+        .map(|bytes| base64_standard(&bytes))
+}
+
+/// An `Edm.DateTime` body: OData V2 wants `YYYY-MM-DDTHH:MM:SS` and rejects a
+/// trailing `Z`, so format without one.
+fn xml_datetime(value: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    value
+        .map(|ts| ts.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_else(|| "1900-01-01T00:00:00".to_string())
 }
 
 fn build_v2_entry(ak_v2_base: &str, e: &V2Entry) -> String {
@@ -4578,7 +4727,19 @@ fn build_v2_entry(ak_v2_base: &str, e: &V2Entry) -> String {
         e.id,
         e.version
     );
-    let hash = e.hash_sha256_b64.clone().unwrap_or_default();
+    // SHA-512 is what the V2 protocol advertises; a row without one (no nuspec
+    // ever parsed) keeps the SHA-256 fallback this feed has always served.
+    let (hash, algorithm) = match (&e.hash_sha512_b64, &e.hash_sha256_b64) {
+        (Some(sha512), _) => (sha512.clone(), "SHA512"),
+        (None, sha256) => (sha256.clone().unwrap_or_default(), "SHA256"),
+    };
+    let normalized_version = if e.normalized_version.is_empty() {
+        crate::formats::nuget::NugetHandler::normalized_version(&e.version)
+            .unwrap_or_else(|| e.version.clone())
+    } else {
+        e.normalized_version.clone()
+    };
+    let created = xml_datetime(e.published);
     format!(
         r#"  <entry>
     <id>{entry_id}</id>
@@ -4587,11 +4748,30 @@ fn build_v2_entry(ak_v2_base: &str, e: &V2Entry) -> String {
     <m:properties>
       <d:Id>{id}</d:Id>
       <d:Version>{version}</d:Version>
+      <d:NormalizedVersion>{normalized_version}</d:NormalizedVersion>
       <d:Authors>{authors}</d:Authors>
       <d:Description>{description}</d:Description>
-      <d:PackageHash>{hash}</d:PackageHash>
-      <d:PackageHashAlgorithm>SHA256</d:PackageHashAlgorithm>
+      <d:Summary>{summary}</d:Summary>
+      <d:Title>{title}</d:Title>
+      <d:Tags>{tags}</d:Tags>
+      <d:ProjectUrl>{project_url}</d:ProjectUrl>
+      <d:IconUrl>{icon_url}</d:IconUrl>
+      <d:LicenseUrl>{license_url}</d:LicenseUrl>
+      <d:ReleaseNotes>{release_notes}</d:ReleaseNotes>
+      <d:Dependencies>{dependencies}</d:Dependencies>
+      <d:RequireLicenseAcceptance m:type="Edm.Boolean">{require_license_acceptance}</d:RequireLicenseAcceptance>
+      <d:IsLatestVersion m:type="Edm.Boolean">{is_latest}</d:IsLatestVersion>
+      <d:IsAbsoluteLatestVersion m:type="Edm.Boolean">{is_absolute_latest}</d:IsAbsoluteLatestVersion>
+      <d:IsPrerelease m:type="Edm.Boolean">{is_prerelease}</d:IsPrerelease>
+      <d:Listed m:type="Edm.Boolean">{listed}</d:Listed>
+      <d:Created m:type="Edm.DateTime">{created}</d:Created>
+      <d:Published m:type="Edm.DateTime">{created}</d:Published>
+      <d:LastUpdated m:type="Edm.DateTime">{created}</d:LastUpdated>
+      <d:DownloadCount m:type="Edm.Int32">{download_count}</d:DownloadCount>
+      <d:VersionDownloadCount m:type="Edm.Int32">{download_count}</d:VersionDownloadCount>
       <d:PackageSize m:type="Edm.Int64">{size}</d:PackageSize>
+      <d:PackageHash>{hash}</d:PackageHash>
+      <d:PackageHashAlgorithm>{algorithm}</d:PackageHashAlgorithm>
     </m:properties>
   </entry>
 "#,
@@ -4599,10 +4779,27 @@ fn build_v2_entry(ak_v2_base: &str, e: &V2Entry) -> String {
         id = xml_escape(&e.id),
         content_src = content_src,
         version = xml_escape(&e.version),
+        normalized_version = xml_escape(&normalized_version),
         authors = xml_escape(&e.authors),
         description = xml_escape(&e.description),
-        hash = hash,
+        summary = xml_opt(&e.summary),
+        title = xml_opt(&e.title),
+        tags = xml_opt(&e.tags),
+        project_url = xml_opt(&e.project_url),
+        icon_url = xml_opt(&e.icon_url),
+        license_url = xml_opt(&e.license_url),
+        release_notes = xml_opt(&e.release_notes),
+        dependencies = xml_escape(&e.dependencies),
+        require_license_acceptance = e.require_license_acceptance,
+        is_latest = e.is_latest,
+        is_absolute_latest = e.is_absolute_latest,
+        is_prerelease = e.is_prerelease,
+        listed = e.listed,
+        created = created,
+        download_count = e.download_count,
         size = e.size,
+        hash = hash,
+        algorithm = algorithm,
     )
 }
 
@@ -4720,21 +4917,30 @@ async fn v2_odata(
     }
 
     // Hosted / local: build the OData feed from local rows.
-    let (id_filter, version_filter) = if odata.starts_with("Packages(") {
-        parse_packages_key(&odata)
-    } else if odata.eq_ignore_ascii_case("FindPackagesById()") {
-        (odata_string_arg(query.as_deref().unwrap_or(""), "id"), None)
-    } else {
-        // Search() and bare Packages: list everything (bounded).
-        (None, None)
-    };
+    //
+    // The query is parsed rather than guessed at per-verb: a Chocolatey client
+    // asks `FindPackagesById()?id=%27x%27&$filter=IsLatestVersion` for a bare
+    // `install`, `Search()?searchTerm=%27x%27&includePrerelease=false` for
+    // `search`, and `Packages(Id='x',Version='y')` for a pinned one. Answering
+    // any of them with the whole repository is how `choco search` used to list
+    // every package in the feed.
+    let v2_query = parse_v2_query(&odata, query.as_deref().unwrap_or(""));
+    if !v2_query.unhandled.is_empty() {
+        // A 400 here would break the client's next request, which is usually an
+        // install; answer unfiltered and say so.
+        warn!(
+            repo_key = %repo_key,
+            unhandled = %v2_query.unhandled.join(", "),
+            "unhandled OData filter/predicate; matching rows are returned unfiltered"
+        );
+    }
 
     let mut entries = load_hosted_v2_entries(
         &state,
         auth.as_ref(),
         &repo,
-        id_filter.as_deref(),
-        version_filter.as_deref(),
+        v2_query.id.as_deref(),
+        v2_query.version.as_deref(),
     )
     .await?;
 
@@ -4774,6 +4980,13 @@ async fn v2_odata(
             }
         }
     }
+
+    // Filter, sort and page last, once every member has contributed — and
+    // recompute the latest flags over the merged set, because a virtual repo's
+    // remote members bring entries whose `IsLatestVersion` came from their own
+    // upstream feed, not from this repository's version set.
+    mark_v2_latest_versions(&mut entries);
+    apply_v2_query(&mut entries, &v2_query);
 
     let feed = build_v2_feed(&ak_v2_base, &entries);
     Ok(xml_response(
@@ -4851,6 +5064,7 @@ async fn load_hosted_v2_entries(
         r#"
         SELECT a.name AS name, a.version AS "version?", a.size_bytes AS size_bytes,
                a.checksum_sha256 AS "checksum_sha256?",
+               a.created_at AS created_at,
                am.metadata AS "metadata?"
         FROM artifacts a
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
@@ -4874,36 +5088,442 @@ async fn load_hosted_v2_entries(
     // as V3 does -- not whichever spelling that version was pushed under.
     let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
     let authored = catalog_display_ids(&state.db, &repo_ids, &names).await;
-    Ok(rows
+    let mut entries: Vec<V2Entry> = rows
         .into_iter()
         .map(|r| {
             let meta = r.metadata;
-            let authors = meta
+            let text = |key: &str| -> String {
+                meta.as_ref()
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let opt_text = |key: &str| -> Option<String> {
+                meta.as_ref()
+                    .and_then(|m| m.get(key))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
+            // The push records the dependency list; a row with no nuspec behind
+            // it (generic-route upload) simply has none.
+            let dependencies: Vec<(String, Option<String>)> = meta
                 .as_ref()
-                .and_then(|m| m.get("authors"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = meta
-                .as_ref()
-                .and_then(|m| m.get("description"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let hash_sha256_b64 = r
-                .checksum_sha256
-                .as_ref()
-                .and_then(|hex| hex::decode(hex).ok().map(|bytes| base64_standard(&bytes)));
+                .and_then(|m| m.get("dependencies"))
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|dep| {
+                            let id = dep.get("id").and_then(|v| v.as_str())?;
+                            let range = dep.get("range").and_then(|v| v.as_str()).map(str::to_string);
+                            Some((id.to_string(), range))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let hash_sha512_b64 = opt_text("sha512Base64");
+            let hash_sha256_b64 = r.checksum_sha256.as_deref().and_then(base64_of_hex);
+            let version = r.version.unwrap_or_default();
             V2Entry {
                 id: authored_or_stored(&authored, &r.name),
-                version: r.version.unwrap_or_default(),
-                authors,
-                description,
+                is_prerelease: version.contains('-'),
+                normalized_version: crate::formats::nuget::NugetHandler::normalized_version(
+                    &version,
+                )
+                .unwrap_or_default(),
+                version,
+                authors: text("authors"),
+                description: text("description"),
+                hash_sha512_b64,
                 hash_sha256_b64,
                 size: r.size_bytes,
+                title: opt_text("title"),
+                summary: opt_text("summary"),
+                tags: opt_text("tags"),
+                project_url: opt_text("projectUrl"),
+                icon_url: opt_text("iconUrl"),
+                license_url: opt_text("licenseUrl"),
+                release_notes: opt_text("releaseNotes"),
+                require_license_acceptance: meta
+                    .as_ref()
+                    .and_then(|m| m.get("requireLicenseAcceptance"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                dependencies: build_v2_dependencies(&dependencies),
+                download_count: 0,
+                published: Some(r.created_at),
+                ..Default::default()
             }
         })
-        .collect())
+        .collect();
+
+    mark_v2_latest_versions(&mut entries);
+    Ok(entries)
+}
+
+/// Set `is_latest`/`is_absolute_latest` per package id, the way the V2 protocol
+/// defines them: the highest version of an id (`is_absolute_latest`, prereleases
+/// included — what an explicit `-Pre` install and `FindPackagesById` resolve
+/// against) and the highest *stable* version (`is_latest`, what a bare
+/// `choco install <id>` picks). Ids are case-insensitive, as everywhere in NuGet,
+/// and ordering is [`version_compare`] rather than string order, so `1.10.0`
+/// outranks `1.9.0`.
+fn mark_v2_latest_versions(entries: &mut [V2Entry]) {
+    let mut best: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let key = entry.id.to_lowercase();
+        let slot = best.entry(key).or_insert((index, index));
+        let (absolute, stable) = *slot;
+        if version_compare(&entries[index].version, &entries[absolute].version) > 0 {
+            slot.0 = index;
+        }
+        if !entry.is_prerelease
+            && (entries[stable].is_prerelease
+                || version_compare(&entries[index].version, &entries[stable].version) > 0)
+        {
+            slot.1 = index;
+        }
+    }
+    for (abs_index, stable_index) in best.into_values() {
+        entries[abs_index].is_absolute_latest = true;
+        entries[stable_index].is_latest = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hosted V2 OData queries
+// ---------------------------------------------------------------------------
+
+/// One `$filter` predicate this feed understands.
+///
+/// The set is what a NuGet/Chocolatey client actually sends against a V2 feed —
+/// Chocolatey asks `FindPackagesById()?$filter=IsLatestVersion` for a bare
+/// `install`, `IsAbsoluteLatestVersion` for one that includes prereleases, and
+/// `Search()?$filter=IsLatestVersion&searchTerm='...'` for `search`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum V2Predicate {
+    /// `IsLatestVersion` (bare, or `eq true`)
+    IsLatest(bool),
+    /// `IsAbsoluteLatestVersion`
+    IsAbsoluteLatest(bool),
+    /// `IsPrerelease`
+    IsPrerelease(bool),
+    /// `Id eq 'x'`, also `tolower(Id) eq 'x'`
+    IdEquals(String),
+    /// `substringof('x',Id)`, also `substringof('x',tolower(Id))`
+    IdContains(String),
+}
+
+impl V2Predicate {
+    fn matches(&self, entry: &V2Entry) -> bool {
+        match self {
+            Self::IsLatest(want) => entry.is_latest == *want,
+            Self::IsAbsoluteLatest(want) => entry.is_absolute_latest == *want,
+            Self::IsPrerelease(want) => entry.is_prerelease == *want,
+            Self::IdEquals(id) => entry.id.eq_ignore_ascii_case(id),
+            Self::IdContains(term) => entry
+                .id
+                .to_lowercase()
+                .contains(&term.to_lowercase()),
+        }
+    }
+}
+
+/// A `$orderby` property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2OrderKey {
+    Version,
+    NormalizedVersion,
+    Id,
+    DownloadCount,
+    Published,
+    IsLatest,
+    IsAbsoluteLatest,
+}
+
+/// A hosted V2 feed query: the OData verb's arguments plus the `$` options.
+#[derive(Debug, Default)]
+struct V2Query {
+    id: Option<String>,
+    version: Option<String>,
+    /// `Search()`'s `searchTerm`, unquoted.
+    search_term: Option<String>,
+    /// `Search()`'s `includePrerelease`; `Some(false)` hides prereleases.
+    include_prerelease: Option<bool>,
+    predicates: Vec<V2Predicate>,
+    order_by: Vec<(V2OrderKey, bool)>,
+    top: Option<usize>,
+    skip: usize,
+    /// `$filter` fragments this feed does not implement, reported by the caller.
+    unhandled: Vec<String>,
+}
+
+/// Decoded `key=value` pairs of a raw query string, in order.
+///
+/// Decoding is load-bearing rather than cosmetic: `choco` percent-encodes the
+/// quotes of an OData string literal, so the id arrives as `id=%277zip%27` and an
+/// undecoded reader sees no literal at all — which is how this feed used to
+/// answer every `FindPackagesById()` with the entire repository.
+fn v2_query_pairs(raw: &str) -> Vec<(String, String)> {
+    raw.split('&')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            let decode = |s: &str| {
+                urlencoding::decode(s)
+                    .map(|decoded| decoded.into_owned())
+                    .unwrap_or_else(|_| s.to_string())
+            };
+            (decode(key), decode(value))
+        })
+        .collect()
+}
+
+/// The predicate body of a `$filter` expression as one trimmed, lowercase
+/// comparison target — `(is_latest_version eq true)` -> `is_latest_version eq true`.
+fn normalize_filter_fragment(fragment: &str) -> String {
+    let mut out = fragment.trim().to_string();
+    while out.starts_with('(') && out.ends_with(')') {
+        out = out[1..out.len() - 1].trim().to_string();
+    }
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The contents of the first `'...'` literal in `fragment`, if any.
+fn filter_literal(fragment: &str) -> Option<String> {
+    let start = fragment.find('\'')? + 1;
+    let rest = &fragment[start..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse one `$filter` fragment; `None` when this feed does not implement it.
+fn parse_v2_predicate(fragment: &str) -> Option<V2Predicate> {
+    let normalized = normalize_filter_fragment(fragment);
+    let boolean = |name: &str| -> Option<bool> {
+        if normalized == name || normalized == format!("{name} eq true") {
+            Some(true)
+        } else if normalized == format!("{name} eq false") {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    if let Some(want) = boolean("islatestversion") {
+        return Some(V2Predicate::IsLatest(want));
+    }
+    if let Some(want) = boolean("isabsolutelatestversion") {
+        return Some(V2Predicate::IsAbsoluteLatest(want));
+    }
+    if let Some(want) = boolean("isprerelease") {
+        return Some(V2Predicate::IsPrerelease(want));
+    }
+    // `Id eq 'x'` and `tolower(Id) eq 'x'` are the same predicate: a NuGet id is
+    // case-insensitive, so `tolower` on either side changes nothing for us.
+    // `tolower(` holds a `(` that the paren-trim above deliberately leaves alone,
+    // so strip it here.
+    let comparable = normalized
+        .strip_prefix("tolower(")
+        .map(|rest| rest.replacen(')', "", 1))
+        .unwrap_or_else(|| normalized.clone());
+    if let Some(id) = comparable
+        .strip_prefix("id eq ")
+        .and_then(filter_literal)
+    {
+        return Some(V2Predicate::IdEquals(id));
+    }
+    if normalized.starts_with("substringof(") {
+        // `substringof('x',id)` / `substringof('x',tolower(id))`
+        let term = filter_literal(&normalized)?;
+        if normalized.contains("id") {
+            return Some(V2Predicate::IdContains(term));
+        }
+    }
+    None
+}
+
+fn parse_v2_order_key(property: &str) -> Option<V2OrderKey> {
+    let key = property.trim().to_lowercase();
+    Some(match key.as_str() {
+        "version" => V2OrderKey::Version,
+        "normalizedversion" => V2OrderKey::NormalizedVersion,
+        "id" => V2OrderKey::Id,
+        "downloadcount" | "versiondownloadcount" => V2OrderKey::DownloadCount,
+        "published" | "created" | "lastupdated" => V2OrderKey::Published,
+        "islatestversion" => V2OrderKey::IsLatest,
+        "isabsolutelatestversion" => V2OrderKey::IsAbsoluteLatest,
+        _ => return None,
+    })
+}
+
+/// Strip one layer of OData string-literal quoting: `'7zip'` -> `7zip`.
+///
+/// A client percent-encodes the quotes, so after [`v2_query_pairs`] decodes the
+/// query string the literal still arrives quoted.
+fn unquote_odata_literal(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// Parse a hosted `v2/{verb}` request: the OData segment plus its raw query.
+fn parse_v2_query(odata: &str, raw_query: &str) -> V2Query {
+    let mut query = V2Query::default();
+    let mut pairs = v2_query_pairs(raw_query);
+
+    // Verb arguments: `Packages(Id='x',Version='y')`, `FindPackagesById(id='x')`
+    // (and the common `FindPackagesById()` with `id` in the query string),
+    // `Search(searchTerm='x')`.
+    if odata.starts_with("Packages(") {
+        let (id, version) = parse_packages_key(odata);
+        query.id = id;
+        query.version = version;
+    } else {
+        query.id = odata_string_arg(odata, "id");
+        query.search_term = odata_string_arg(odata, "searchTerm");
+    }
+
+    for (key, value) in pairs.drain(..) {
+        match key.to_ascii_lowercase().as_str() {
+            "$top" => query.top = value.trim().parse().ok(),
+            "$skip" => query.skip = value.trim().parse().unwrap_or(0),
+            "$filter" => {
+                for fragment in split_v2_filter(&value) {
+                    match parse_v2_predicate(&fragment) {
+                        Some(predicate) => query.predicates.push(predicate),
+                        None if !fragment.trim().is_empty() => {
+                            query.unhandled.push(fragment.trim().to_string())
+                        }
+                        None => {}
+                    }
+                }
+            }
+            "$orderby" => {
+                for part in value.split(',') {
+                    let mut words = part.split_whitespace();
+                    let Some(property) = words.next() else {
+                        continue;
+                    };
+                    let descending = words
+                        .next()
+                        .is_some_and(|dir| dir.eq_ignore_ascii_case("desc"));
+                    match parse_v2_order_key(property) {
+                        Some(key) => query.order_by.push((key, descending)),
+                        None => query.unhandled.push(format!("$orderby={}", part.trim())),
+                    }
+                }
+            }
+            "id" if query.id.is_none() => query.id = Some(unquote_odata_literal(&value)),
+            "searchterm" if query.search_term.is_none() => {
+                let term = unquote_odata_literal(&value);
+                query.search_term = Some(term).filter(|term| !term.is_empty())
+            }
+            "includeprerelease" if query.include_prerelease.is_none() => {
+                query.include_prerelease = Some(value.eq_ignore_ascii_case("true"))
+            }
+            _ => {}
+        }
+    }
+    query
+}
+
+/// Split a `$filter` body on its top-level ` and ` connectives.
+///
+/// `or` is deliberately not handled: it is left inside a fragment, so that
+/// fragment fails to parse and is reported as unhandled instead of being
+/// misread as a conjunction. Quote state is tracked so an `'a and b'` literal is
+/// never split.
+fn split_v2_filter(filter: &str) -> Vec<String> {
+    let chars: Vec<char> = filter.chars().collect();
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        match ch {
+            '\'' => in_quote = !in_quote,
+            '(' if !in_quote => depth += 1,
+            ')' if !in_quote => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if !in_quote && depth == 0 && ch.is_whitespace() {
+            let start = index + 1;
+            let mut end = start;
+            while end < chars.len() && !chars[end].is_whitespace() {
+                end += 1;
+            }
+            let word: String = chars[start..end].iter().collect();
+            if word.eq_ignore_ascii_case("and") && end < chars.len() {
+                parts.push(current.trim().to_string());
+                current.clear();
+                index = end;
+                continue;
+            }
+        }
+        current.push(ch);
+        index += 1;
+    }
+    parts.push(current.trim().to_string());
+    parts.retain(|part| !part.is_empty());
+    parts
+}
+
+/// Apply a parsed query to already-loaded hosted entries.
+///
+/// Order matters: filter, then sort, then `$skip`/`$top` — paging the *filtered*
+/// set is what the protocol means, and doing it in the other order would answer
+/// `$top=1` with one arbitrary row.
+fn apply_v2_query(entries: &mut Vec<V2Entry>, query: &V2Query) {
+    if let Some(term) = &query.search_term {
+        let needle = term.to_lowercase();
+        entries.retain(|entry| entry.id.to_lowercase().contains(&needle));
+    }
+    if query.include_prerelease == Some(false) {
+        entries.retain(|entry| !entry.is_prerelease);
+    }
+    if !query.predicates.is_empty() {
+        entries.retain(|entry| query.predicates.iter().all(|p| p.matches(entry)));
+    }
+    // Stable sorts, applied least-significant key first.
+    for (key, descending) in query.order_by.iter().rev() {
+        let descending = *descending;
+        entries.sort_by(|a, b| {
+            let ordering = match key {
+                V2OrderKey::Version | V2OrderKey::NormalizedVersion => {
+                    version_compare(&a.version, &b.version).cmp(&0)
+                }
+                V2OrderKey::Id => a.id.to_lowercase().cmp(&b.id.to_lowercase()),
+                V2OrderKey::DownloadCount => a.download_count.cmp(&b.download_count),
+                V2OrderKey::Published => a.published.cmp(&b.published),
+                V2OrderKey::IsLatest => a.is_latest.cmp(&b.is_latest),
+                V2OrderKey::IsAbsoluteLatest => {
+                    a.is_absolute_latest.cmp(&b.is_absolute_latest)
+                }
+            };
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+    }
+    if query.skip > 0 {
+        let skip = query.skip.min(entries.len());
+        entries.drain(..skip);
+    }
+    if let Some(top) = query.top {
+        entries.truncate(top);
+    }
 }
 
 /// GET /nuget/{repo_key}/v2/package/{id}/{version} — download the .nupkg.
@@ -5217,6 +5837,11 @@ async fn push_package(
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
     let content_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    // The V2 feed advertises the SHA-512 of the bytes a client downloads
+    // (`PackageHash`/`PackageHashAlgorithm=SHA512`, the pair the protocol
+    // defines). Taken from the same staging pass that computes the SHA-256
+    // storage key, because the upload consumes the digest set below.
+    let sha512_b64 = base64_of_hex(&digests.sha512).unwrap_or_default();
     let artifact = artifact_service
         .upload_stream_with_sync_options(
             repo.id,
@@ -5237,8 +5862,8 @@ async fn push_package(
     // Scratch file no longer needed once the service has consumed the stream.
     drop(staged);
 
-    // Build metadata JSON.
-    let metadata = build_nuget_push_metadata(&nuspec);
+    // Build metadata JSON from the nuspec plus the SHA-512 taken above.
+    let metadata = build_nuget_push_metadata(&nuspec, &sha512_b64);
 
     // Store metadata.
     let _ = sqlx::query!(
@@ -5308,19 +5933,40 @@ async fn push_package(
 // .nupkg / .nuspec helpers
 // ---------------------------------------------------------------------------
 
-/// Metadata extracted from a .nuspec file.
+/// Everything the V2 feed needs to know about a pushed `.nupkg`'s nuspec.
+///
+/// Not just identity: `dependencies` is what a Chocolatey meta package *is*
+/// (`7zip` has no installer of its own — it declares `7zip.install`), so a push
+/// that drops the dependency list produces a package that installs nothing. The
+/// V2 protocol also reads `Title`/`Tags`/`ProjectUrl`/... back per version, so the
+/// fields a nuspec can carry are all captured here and rendered by
+/// [`build_v2_entry`].
 struct NuspecInfo {
     id: String,
     version: String,
     description: String,
     authors: String,
+    title: Option<String>,
+    summary: Option<String>,
+    tags: Option<String>,
+    project_url: Option<String>,
+    icon_url: Option<String>,
+    license_url: Option<String>,
+    release_notes: Option<String>,
+    require_license_acceptance: bool,
+    /// `(id, version range)` in declaration order. The range is the nuspec's raw
+    /// `version` attribute (`[26.4.0]`, `1.2.0`, ...) and stays unparsed: the V2
+    /// feed carries it verbatim, and it is the client that resolves it.
+    dependencies: Vec<(String, Option<String>)>,
 }
 
 /// Parse the .nuspec XML from inside a .nupkg (ZIP) archive.
 ///
 /// Reads directly from any `Read + Seek` source — the streaming push path passes
 /// the SEEKABLE staged scratch `File` so the archive is never re-buffered in
-/// memory. Uses simple string matching rather than a full XML parser.
+/// memory. Parsing is delegated to the NuGet format module's
+/// [`NugetHandler::parse_nuspec`], which handles nuspec namespaces and models
+/// `<dependencies>` including its `<group targetFramework>` form.
 fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
     reader: R,
 ) -> Result<NuspecInfo, String> {
@@ -5340,33 +5986,59 @@ fn parse_nuspec_from_reader<R: std::io::Read + std::io::Seek>(
         return Err("No .nuspec file found in package".to_string());
     }
 
-    // Simple tag extraction.
-    let id = extract_xml_tag(&nuspec_xml, "id").unwrap_or_default();
-    let version = extract_xml_tag(&nuspec_xml, "version").unwrap_or_default();
-    let description = extract_xml_tag(&nuspec_xml, "description").unwrap_or_default();
-    let authors = extract_xml_tag(&nuspec_xml, "authors").unwrap_or_default();
-
-    Ok(NuspecInfo {
-        id,
-        version,
-        description,
-        authors,
-    })
+    nuspec_info_from_xml(&nuspec_xml)
 }
 
-/// Extract the text content of a simple XML tag (no attributes, no nesting).
-/// e.g. `<id>Foo</id>` returns `Some("Foo")`.
-fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}", tag);
-    let close = format!("</{}>", tag);
+/// Parse a `.nuspec` document into [`NuspecInfo`].
+///
+/// A nuspec declares dependencies either flat (`<dependency>` directly under
+/// `<dependencies>`) or grouped per target framework
+/// (`<dependency>` under `<group targetFramework="...">`), and real packages use
+/// both; the V2 `Dependencies` string has no room for the distinction
+/// ([`build_v2_dependencies`] writes an empty framework segment), so the two
+/// shapes flatten into one list in declaration order.
+fn nuspec_info_from_xml(nuspec_xml: &str) -> Result<NuspecInfo, String> {
+    use crate::formats::nuget::NugetHandler;
 
-    let start_pos = xml.find(&open)?;
-    // Skip past the opening tag (handle possible attributes or xmlns).
-    let after_open = &xml[start_pos + open.len()..];
-    let content_start = after_open.find('>')? + 1;
-    let content = &after_open[content_start..];
-    let end_pos = content.find(&close)?;
-    Some(content[..end_pos].trim().to_string())
+    let spec = NugetHandler::parse_nuspec(nuspec_xml).map_err(|e| e.to_string())?;
+    let metadata = spec.metadata;
+    let mut dependencies: Vec<(String, Option<String>)> = Vec::new();
+    if let Some(deps) = metadata.dependencies.as_ref() {
+        dependencies.extend(
+            deps.dependencies
+                .iter()
+                .map(|dep| (dep.id.clone(), dep.version.clone())),
+        );
+        for group in &deps.groups {
+            dependencies.extend(
+                group
+                    .dependencies
+                    .iter()
+                    .map(|dep| (dep.id.clone(), dep.version.clone())),
+            );
+        }
+    }
+    let non_empty = |value: Option<String>| {
+        value
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    };
+
+    Ok(NuspecInfo {
+        id: metadata.id.trim().to_string(),
+        version: metadata.version.trim().to_string(),
+        description: metadata.description.unwrap_or_default().trim().to_string(),
+        authors: metadata.authors.unwrap_or_default().trim().to_string(),
+        title: non_empty(metadata.title),
+        summary: non_empty(metadata.summary),
+        tags: non_empty(metadata.tags),
+        project_url: non_empty(metadata.project_url),
+        icon_url: non_empty(metadata.icon_url),
+        license_url: non_empty(metadata.license_url),
+        release_notes: non_empty(metadata.release_notes),
+        require_license_acceptance: metadata.require_license_acceptance.unwrap_or(false),
+        dependencies,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5399,14 +6071,33 @@ fn build_nuget_artifact_path(package_id: &str, version: &str) -> String {
     format!("{}/{}/{}", package_id, version, filename)
 }
 
-/// Build the NuGet push metadata JSON.
-fn build_nuget_push_metadata(info: &NuspecInfo) -> serde_json::Value {
+/// Build the NuGet push metadata JSON — the single shape the V2 feed reads back.
+///
+/// Stored on `artifact_metadata` at push time and read by
+/// [`load_hosted_v2_entries`]. `sha512Base64` is what `PackageHash` advertises
+/// (the V2 protocol hashes with SHA-512); it is computed during the same staging
+/// pass as the SHA-256 the storage key uses, so it costs no extra read.
+fn build_nuget_push_metadata(info: &NuspecInfo, sha512_b64: &str) -> serde_json::Value {
     serde_json::json!({
         "id": info.id,
         "version": info.version,
         "description": info.description,
         "authors": info.authors,
         "filename": build_nupkg_filename(&info.id.to_lowercase(), &info.version),
+        "title": info.title,
+        "summary": info.summary,
+        "tags": info.tags,
+        "projectUrl": info.project_url,
+        "iconUrl": info.icon_url,
+        "licenseUrl": info.license_url,
+        "releaseNotes": info.release_notes,
+        "requireLicenseAcceptance": info.require_license_acceptance,
+        "dependencies": info
+            .dependencies
+            .iter()
+            .map(|(id, range)| serde_json::json!({ "id": id, "range": range }))
+            .collect::<Vec<_>>(),
+        "sha512Base64": sha512_b64,
     })
 }
 
@@ -6071,69 +6762,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extract_xml_tag
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_xml_tag_simple() {
-        let xml = "<id>MyPackage</id>";
-        assert_eq!(extract_xml_tag(xml, "id"), Some("MyPackage".to_string()));
-    }
-
-    #[test]
-    fn test_extract_xml_tag_with_whitespace() {
-        let xml = "<id>  MyPackage  </id>";
-        assert_eq!(extract_xml_tag(xml, "id"), Some("MyPackage".to_string()));
-    }
-
-    #[test]
-    fn test_extract_xml_tag_with_namespace() {
-        let xml = r#"<id xmlns="http://example.com">PackageWithNS</id>"#;
-        assert_eq!(
-            extract_xml_tag(xml, "id"),
-            Some("PackageWithNS".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_xml_tag_missing() {
-        let xml = "<name>Hello</name>";
-        assert_eq!(extract_xml_tag(xml, "id"), None);
-    }
-
-    #[test]
-    fn test_extract_xml_tag_empty_content() {
-        let xml = "<id></id>";
-        assert_eq!(extract_xml_tag(xml, "id"), Some("".to_string()));
-    }
-
-    #[test]
-    fn test_extract_xml_tag_in_nuspec() {
-        let xml = r#"<?xml version="1.0"?>
-<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
-  <metadata>
-    <id>Newtonsoft.Json</id>
-    <version>13.0.1</version>
-    <description>Popular JSON framework</description>
-    <authors>James Newton-King</authors>
-  </metadata>
-</package>"#;
-        assert_eq!(
-            extract_xml_tag(xml, "id"),
-            Some("Newtonsoft.Json".to_string())
-        );
-        assert_eq!(extract_xml_tag(xml, "version"), Some("13.0.1".to_string()));
-        assert_eq!(
-            extract_xml_tag(xml, "description"),
-            Some("Popular JSON framework".to_string())
-        );
-        assert_eq!(
-            extract_xml_tag(xml, "authors"),
-            Some("James Newton-King".to_string())
-        );
-    }
-
-    // -----------------------------------------------------------------------
+    // nuspec parsing (via the NuGet format module's parser) and
     // parse_nuspec_from_nupkg (byte-slice wrapper over parse_nuspec_from_reader)
     // -----------------------------------------------------------------------
 
@@ -6144,14 +6773,19 @@ mod tests {
         parse_nuspec_from_reader(std::io::Cursor::new(nupkg))
     }
 
-    #[test]
-    fn test_parse_nuspec_from_nupkg_valid() {
-        // Create a minimal ZIP with a .nuspec file
+    /// Zip `nuspec` into a minimal `.nupkg` under a `.nuspec` entry name.
+    fn nupkg_with_nuspec(id: &str, nuspec: &str) -> Vec<u8> {
         let buf = Vec::new();
         let cursor = std::io::Cursor::new(buf);
         let mut zip = zip::ZipWriter::new(cursor);
         let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("MyPackage.nuspec", options).unwrap();
+        zip.start_file(format!("{id}.nuspec"), options).unwrap();
+        std::io::Write::write_all(&mut zip, nuspec.as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn test_parse_nuspec_from_nupkg_valid() {
         let nuspec_content = r#"<?xml version="1.0"?>
 <package>
   <metadata>
@@ -6161,16 +6795,91 @@ mod tests {
     <authors>Test Author</authors>
   </metadata>
 </package>"#;
-        std::io::Write::write_all(&mut zip, nuspec_content.as_bytes()).unwrap();
-        let cursor = zip.finish().unwrap();
+        let nupkg = nupkg_with_nuspec("MyPackage", nuspec_content);
 
-        let result = parse_nuspec_from_nupkg(cursor.get_ref());
-        assert!(result.is_ok());
-        let nuspec = result.unwrap();
+        let nuspec = parse_nuspec_from_nupkg(&nupkg).expect("valid nuspec parses");
         assert_eq!(nuspec.id, "MyPackage");
         assert_eq!(nuspec.version, "1.2.3");
         assert_eq!(nuspec.description, "A test package");
         assert_eq!(nuspec.authors, "Test Author");
+        assert!(
+            nuspec.dependencies.is_empty(),
+            "no <dependencies> means no dependency claims"
+        );
+        assert!(!nuspec.require_license_acceptance);
+    }
+
+    /// A namespaced nuspec — what `dotnet pack` writes — must parse, including
+    /// its XML declaration. The old substring extractor read the declaration's
+    /// `?>`, so this is the shape that motivated delegating to the real parser.
+    #[test]
+    fn test_parse_nuspec_with_namespace_and_declaration() {
+        let nuspec_content = r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Newtonsoft.Json</id>
+    <version>13.0.1</version>
+    <title>Json.NET</title>
+    <authors>James Newton-King</authors>
+    <description>Popular JSON framework</description>
+    <projectUrl>https://www.newtonsoft.com/json</projectUrl>
+    <licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>
+    <tags>json serialization</tags>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+  </metadata>
+</package>"#;
+        let nuspec = nuspec_info_from_xml(nuspec_content).expect("namespaced nuspec parses");
+        assert_eq!(nuspec.id, "Newtonsoft.Json");
+        assert_eq!(nuspec.title.as_deref(), Some("Json.NET"));
+        assert_eq!(nuspec.tags.as_deref(), Some("json serialization"));
+        assert_eq!(
+            nuspec.project_url.as_deref(),
+            Some("https://www.newtonsoft.com/json")
+        );
+        assert_eq!(
+            nuspec.license_url.as_deref(),
+            Some("https://licenses.nuget.org/MIT")
+        );
+    }
+
+    /// The dependency list is what a Chocolatey meta package exists for, in both
+    /// nuspec shapes (`<dependency>` flat, and grouped per target framework).
+    #[test]
+    fn test_parse_nuspec_reads_flat_and_grouped_dependencies() {
+        let flat = r#"<?xml version="1.0"?>
+<package><metadata>
+  <id>7zip</id><version>26.4.0</version><authors>Rob Reynolds</authors>
+  <description>meta package</description>
+  <dependencies>
+    <dependency id="7zip.install" version="[26.4.0]"/>
+    <dependency id="chocolatey-core.extension"/>
+  </dependencies>
+</metadata></package>"#;
+        let nuspec = nuspec_info_from_xml(flat).expect("flat dependencies parse");
+        assert_eq!(
+            nuspec.dependencies,
+            vec![
+                ("7zip.install".to_string(), Some("[26.4.0]".to_string())),
+                ("chocolatey-core.extension".to_string(), None),
+            ],
+            "order preserved, an omitted version attribute stays None"
+        );
+
+        let grouped = r#"<?xml version="1.0"?>
+<package><metadata>
+  <id>Grouped</id><version>1.0.0</version><authors>a</authors>
+  <description>d</description>
+  <dependencies>
+    <group targetFramework="net48">
+      <dependency id="Newtonsoft.Json" version="13.0.1"/>
+    </group>
+  </dependencies>
+</metadata></package>"#;
+        let nuspec = nuspec_info_from_xml(grouped).expect("grouped dependencies parse");
+        assert_eq!(
+            nuspec.dependencies,
+            vec![("Newtonsoft.Json".to_string(), Some("13.0.1".to_string()))]
+        );
     }
 
     #[test]
@@ -6221,41 +6930,34 @@ mod tests {
         assert!(result.err().unwrap().contains("Invalid ZIP archive"));
     }
 
+    /// A nuspec without `<version>` is not a package: the format parser requires
+    /// id and version, so the push fails loudly here instead of storing a row at
+    /// an empty version.
     #[test]
-    fn test_parse_nuspec_missing_fields() {
-        let buf = Vec::new();
-        let cursor = std::io::Cursor::new(buf);
-        let mut zip = zip::ZipWriter::new(cursor);
-        let options = zip::write::SimpleFileOptions::default();
-        zip.start_file("Partial.nuspec", options).unwrap();
+    fn test_parse_nuspec_missing_version_is_rejected() {
         let nuspec_content = r#"<?xml version="1.0"?>
 <package><metadata><id>OnlyId</id></metadata></package>"#;
-        std::io::Write::write_all(&mut zip, nuspec_content.as_bytes()).unwrap();
-        let cursor = zip.finish().unwrap();
+        let nupkg = nupkg_with_nuspec("Partial", nuspec_content);
 
-        let result = parse_nuspec_from_nupkg(cursor.get_ref());
-        assert!(result.is_ok());
-        let nuspec = result.unwrap();
-        assert_eq!(nuspec.id, "OnlyId");
-        assert_eq!(nuspec.version, "");
-        assert_eq!(nuspec.description, "");
-        assert_eq!(nuspec.authors, "");
+        let result = parse_nuspec_from_nupkg(&nupkg);
+        assert!(
+            result.is_err(),
+            "a nuspec without <version> must not parse into a package"
+        );
     }
 
-    // -----------------------------------------------------------------------
-    // NuspecInfo struct
-    // -----------------------------------------------------------------------
-
+    /// The `Dependencies` property rendering: the protocol's
+    /// `id:range:framework` shape joined by `|`, framework left empty.
     #[test]
-    fn test_nuspec_info_construction() {
-        let info = NuspecInfo {
-            id: "TestPkg".to_string(),
-            version: "2.0.0".to_string(),
-            description: "A library".to_string(),
-            authors: "Author Name".to_string(),
-        };
-        assert_eq!(info.id, "TestPkg");
-        assert_eq!(info.version, "2.0.0");
+    fn test_build_v2_dependencies_renders_protocol_shape() {
+        assert_eq!(build_v2_dependencies(&[]), "");
+        assert_eq!(
+            build_v2_dependencies(&[
+                ("7zip.install".to_string(), Some("[26.4.0]".to_string())),
+                ("chocolatey-core.extension".to_string(), None),
+            ]),
+            "7zip.install:[26.4.0]:|chocolatey-core.extension::"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6485,35 +7187,69 @@ mod tests {
     // build_nuget_push_metadata
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_build_nuget_push_metadata_basic() {
-        let info = NuspecInfo {
-            id: "TestPackage".to_string(),
-            version: "2.0.0".to_string(),
+    /// A `NuspecInfo` with only identity filled in, for metadata tests.
+    fn nuspec_info_fixture(id: &str, version: &str) -> NuspecInfo {
+        NuspecInfo {
+            id: id.to_string(),
+            version: version.to_string(),
             description: "A test package".to_string(),
             authors: "Author".to_string(),
-        };
-        let meta = build_nuget_push_metadata(&info);
+            title: None,
+            summary: None,
+            tags: None,
+            project_url: None,
+            icon_url: None,
+            license_url: None,
+            release_notes: None,
+            require_license_acceptance: false,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_build_nuget_push_metadata_basic() {
+        let info = nuspec_info_fixture("TestPackage", "2.0.0");
+        let meta = build_nuget_push_metadata(&info, "c2hhNTEy");
         assert_eq!(meta["id"], "TestPackage");
         assert_eq!(meta["version"], "2.0.0");
         assert_eq!(meta["description"], "A test package");
         assert_eq!(meta["authors"], "Author");
         assert_eq!(meta["filename"], "testpackage.2.0.0.nupkg");
+        assert_eq!(
+            meta["sha512Base64"], "c2hhNTEy",
+            "the SHA-512 the V2 feed advertises is stored with the nuspec metadata"
+        );
+        assert_eq!(meta["dependencies"], serde_json::json!([]));
     }
 
     #[test]
     fn test_build_nuget_push_metadata_preserves_original_id() {
-        let info = NuspecInfo {
-            id: "Newtonsoft.Json".to_string(),
-            version: "13.0.1".to_string(),
-            description: "JSON framework".to_string(),
-            authors: "James NK".to_string(),
-        };
-        let meta = build_nuget_push_metadata(&info);
+        let info = nuspec_info_fixture("Newtonsoft.Json", "13.0.1");
+        let meta = build_nuget_push_metadata(&info, "c2hhNTEy");
         // id is preserved as-is (with original casing)
         assert_eq!(meta["id"], "Newtonsoft.Json");
         // filename is lowercased
         assert_eq!(meta["filename"], "newtonsoft.json.13.0.1.nupkg");
+    }
+
+    /// The dependency list is stored in the one shape the V2 feed reads back, and
+    /// an omitted range stays `null` rather than becoming `""` (which a client
+    /// would read as an empty version constraint).
+    #[test]
+    fn test_build_nuget_push_metadata_records_dependencies() {
+        let mut info = nuspec_info_fixture("7zip", "26.4.0");
+        info.dependencies = vec![
+            ("7zip.install".to_string(), Some("[26.4.0]".to_string())),
+            ("chocolatey-core.extension".to_string(), None),
+        ];
+        let meta = build_nuget_push_metadata(&info, "c2hhNTEy");
+        assert_eq!(
+            meta["dependencies"],
+            serde_json::json!([
+                {"id": "7zip.install", "range": "[26.4.0]"},
+                {"id": "chocolatey-core.extension", "range": null},
+            ])
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7930,6 +8666,7 @@ mod read_db_tests {
             description: "desc".to_string(),
             hash_sha256_b64: Some("abc==".to_string()),
             size: 42,
+            ..Default::default()
         }];
         let feed = build_v2_feed("https://ak.example/nuget/choco/v2", &entries);
         assert!(
@@ -8132,6 +8869,7 @@ mod read_db_tests {
             description: "d".to_string(),
             hash_sha256_b64: None,
             size: 1,
+            ..Default::default()
         }];
         let document = registration_from_v2_entries(&entries, "pkg", "https://ak.example", "choco");
         let leaf = &document["items"][0]["items"][0];
@@ -8155,6 +8893,7 @@ mod read_db_tests {
             description: "d".to_string(),
             hash_sha256_b64: None,
             size: 1,
+            ..Default::default()
         };
         let entries = vec![entry("1.0.0"), entry("2.0.0-beta"), entry("1.5.0")];
         let stable = search_from_v2_entries(&entries, "https://ak.example", "choco", false);
@@ -13611,6 +14350,361 @@ mod scan_on_proxy_tests {
         server.verify().await;
         tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// V2 wire fidelity for Chocolatey: the properties a `choco` client resolves an
+/// install against, over a real pushed package.
+///
+/// The feed used to emit identity only, so a meta package (`7zip`) installed
+/// nothing (no `Dependencies`), `choco search` returned every package (no query
+/// handling) and a bare `install` had no `IsLatestVersion` to pick.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod v2_fidelity_db_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use sha2::{Digest, Sha512};
+    use std::io::Write;
+
+    /// A `.nupkg` whose nuspec declares `dependencies` verbatim (the XML inside
+    /// `<dependencies>`), so a test can push a meta package or a plain one.
+    fn build_nupkg_with_deps(id: &str, version: &str, dependencies_xml: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(format!("{id}.nuspec"), options).unwrap();
+        let nuspec = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+             <package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\">\n\
+             <metadata>\n\
+             <id>{id}</id>\n\
+             <version>{version}</version>\n\
+             <title>{id}</title>\n\
+             <authors>Test Author</authors>\n\
+             <description>{id} description</description>\n\
+             <projectUrl>https://example.test/{id}</projectUrl>\n\
+             <tags>chocolatey test</tags>\n\
+             <dependencies>{dependencies_xml}</dependencies>\n\
+             </metadata>\n</package>"
+        );
+        zip.write_all(nuspec.as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    async fn push(fx: &tdh::Fixture, nupkg: Vec<u8>) -> StatusCode {
+        let app = fx.router_with_auth(super::router());
+        let req = tdh::put(
+            format!("/{}/api/v2/package", fx.repo_key),
+            bytes::Bytes::from(nupkg),
+        );
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "push failed: {} {}",
+            status,
+            String::from_utf8_lossy(&body)
+        );
+        status
+    }
+
+    /// GET a V2 OData URL anonymously (read paths need no credentials).
+    async fn v2_get(fx: &tdh::Fixture, odata: &str) -> String {
+        let app = fx.router_anon(super::router());
+        let uri = format!("/{}/v2/{}", fx.repo_key, odata);
+        let (status, body) = tdh::send(app, tdh::get(uri.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET {uri} failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    /// The `<m:properties>` block of the single entry in `feed`.
+    fn properties_of(feed: &str) -> &str {
+        let start = feed.find("<m:properties>").expect("feed has an entry");
+        let end = feed.find("</m:properties>").expect("entry has properties");
+        &feed[start..end]
+    }
+
+    /// Property name -> text body, for every `<d:Name>value</d:Name>` in `xml`.
+    fn property_map(xml: &str) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let mut rest = xml;
+        while let Some(open) = rest.find("<d:") {
+            let after = &rest[open + 3..];
+            let Some(name_end) = after.find(|c: char| c == '>' || c.is_whitespace()) else {
+                break;
+            };
+            let name = after[..name_end].to_string();
+            let Some(tag_end) = after.find('>') else { break };
+            let body = &after[tag_end + 1..];
+            let close = format!("</d:{name}>");
+            let Some(value_end) = body.find(&close) else { break };
+            out.insert(name, body[..value_end].to_string());
+            rest = &body[value_end + close.len()..];
+        }
+        out
+    }
+
+    fn property_names(xml: &str) -> std::collections::BTreeSet<String> {
+        property_map(xml).into_keys().collect()
+    }
+
+    /// The `$metadata` EDMX declares every property the entries render, and no
+    /// property the entries do not render: a client binds against the EDMX and
+    /// drops anything it does not declare, so a mismatch loses data on the wire.
+    #[test]
+    fn metadata_declares_exactly_the_rendered_properties() {
+        let entry = super::build_v2_entry(
+            "https://ak.example/nuget/choco/v2",
+            &super::V2Entry {
+                id: "Pkg".to_string(),
+                version: "1.0.0".to_string(),
+                ..Default::default()
+            },
+        );
+        let edmx = super::V2_METADATA_EDMX;
+        let declared: std::collections::BTreeSet<String> = edmx
+            .match_indices("<Property Name=\"")
+            .filter_map(|(index, tag)| {
+                let rest = &edmx[index + tag.len()..];
+                let end = rest.find('"')?;
+                Some(rest[..end].to_string())
+            })
+            .collect();
+        let rendered = property_names(&entry);
+        assert_eq!(
+            declared, rendered,
+            "the EDMX property set and the rendered entry properties must match"
+        );
+        assert!(
+            declared.contains("Dependencies"),
+            "Chocolatey resolves <dependencies> from this property"
+        );
+        assert!(
+            super::V2_METADATA_EDMX.contains("<FunctionImport Name=\"Search\""),
+            "a V2 client discovers Search() in $metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn pushed_dependencies_reach_the_v2_feed() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let nupkg = build_nupkg_with_deps(
+            "7zip",
+            "26.4.0",
+            "<dependency id=\"7zip.install\" version=\"[26.4.0]\"/>",
+        );
+        push(&fx, nupkg).await;
+
+        let feed = v2_get(&fx, "FindPackagesById()?id=%277zip%27").await;
+        let properties = property_map(properties_of(&feed));
+        fx.teardown().await;
+
+        assert_eq!(
+            properties.get("Dependencies").map(String::as_str),
+            Some("7zip.install:[26.4.0]:"),
+            "a meta package must carry its dependency on the wire: {feed}"
+        );
+        assert_eq!(properties.get("Id").map(String::as_str), Some("7zip"));
+        assert_eq!(properties.get("Title").map(String::as_str), Some("7zip"));
+        assert_eq!(
+            properties.get("Tags").map(String::as_str),
+            Some("chocolatey test")
+        );
+        assert_eq!(
+            properties.get("ProjectUrl").map(String::as_str),
+            Some("https://example.test/7zip")
+        );
+    }
+
+    /// Two versions of one id: only the higher is `IsLatestVersion`, and the feed
+    /// tells the client which one a bare `install` should take.
+    #[tokio::test]
+    async fn only_the_highest_version_is_latest() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        for version in ["1.2.0", "1.10.0"] {
+            push(&fx, build_nupkg_with_deps("LatestPkg", version, "")).await;
+        }
+        let feed = v2_get(&fx, "FindPackagesById()?id=%27LatestPkg%27").await;
+        fx.teardown().await;
+
+        // One properties block per entry, in feed order.
+        let mut blocks: Vec<&str> = Vec::new();
+        let mut rest = feed.as_str();
+        while let Some(start) = rest.find("<m:properties>") {
+            let end = rest.find("</m:properties>").unwrap() + "</m:properties>".len();
+            blocks.push(&rest[start..end]);
+            rest = &rest[end..];
+        }
+        assert_eq!(blocks.len(), 2, "both versions are in the feed: {feed}");
+
+        let latest: Vec<&str> = blocks
+            .iter()
+            .filter(|block| {
+                property_map(block).get("IsLatestVersion").map(String::as_str) == Some("true")
+            })
+            .copied()
+            .collect();
+        assert_eq!(latest.len(), 1, "exactly one version is latest: {feed}");
+        assert_eq!(
+            property_map(latest[0]).get("Version").map(String::as_str),
+            Some("1.10.0"),
+            "version ordering is numeric, not lexicographic"
+        );
+    }
+
+    /// A prerelease is `IsAbsoluteLatestVersion` but never `IsLatestVersion`, so a
+    /// bare `install` keeps resolving the stable one.
+    #[tokio::test]
+    async fn prerelease_is_absolute_latest_but_not_latest() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push(&fx, build_nupkg_with_deps("PrePkg", "2.0.0", "")).await;
+        push(&fx, build_nupkg_with_deps("PrePkg", "3.0.0-beta", "")).await;
+
+        let feed = v2_get(&fx, "FindPackagesById()?id=%27PrePkg%27").await;
+        let filtered = v2_get(&fx, "FindPackagesById()?id=%27PrePkg%27&$filter=IsLatestVersion").await;
+        fx.teardown().await;
+
+        assert!(feed.contains("<d:Version>3.0.0-beta</d:Version>"), "{feed}");
+        assert!(
+            feed.contains(r#"<d:IsPrerelease m:type="Edm.Boolean">true</d:IsPrerelease>"#),
+            "{feed}"
+        );
+        assert!(
+            feed.contains(r#"<d:IsAbsoluteLatestVersion m:type="Edm.Boolean">true</d:IsAbsoluteLatestVersion>"#),
+            "the prerelease is the absolute latest: {feed}"
+        );
+        assert_eq!(
+            filtered.matches("<entry>").count(),
+            1,
+            "IsLatestVersion pins the stable version: {filtered}"
+        );
+        assert!(
+            filtered.contains("<d:Version>2.0.0</d:Version>"),
+            "{filtered}"
+        );
+    }
+
+    /// `Search()` filters by id instead of dumping the repository, which is what
+    /// makes `choco search` usable.
+    #[tokio::test]
+    async fn search_returns_only_the_matching_id() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push(&fx, build_nupkg_with_deps("7zip", "26.4.0", "")).await;
+        push(&fx, build_nupkg_with_deps("git", "2.51.0", "")).await;
+
+        let search = v2_get(&fx, "Search()?searchTerm=%277zip%27").await;
+        let all = v2_get(&fx, "Search()").await;
+        fx.teardown().await;
+
+        assert_eq!(
+            search.matches("<entry>").count(),
+            1,
+            "only 7zip matches the term: {search}"
+        );
+        assert!(search.contains("<d:Id>7zip</d:Id>"), "{search}");
+        assert!(!search.contains("<d:Id>git</d:Id>"), "{search}");
+        assert_eq!(
+            all.matches("<entry>").count(),
+            2,
+            "an unterminated Search lists the feed: {all}"
+        );
+    }
+
+    /// `$filter=IsLatestVersion` over two ids yields one entry each.
+    #[tokio::test]
+    async fn filter_is_latest_returns_one_entry_per_id() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        for (id, versions) in [("Alpha", ["1.0.0", "2.0.0"]), ("Beta", ["1.0.0", "1.1.0"])] {
+            for version in versions {
+                push(&fx, build_nupkg_with_deps(id, version, "")).await;
+            }
+        }
+        let filtered = v2_get(&fx, "Packages()?$filter=IsLatestVersion").await;
+        fx.teardown().await;
+
+        assert_eq!(
+            filtered.matches("<entry>").count(),
+            2,
+            "one latest per id: {filtered}"
+        );
+        assert!(filtered.contains("<d:Version>2.0.0</d:Version>"), "{filtered}");
+        assert!(filtered.contains("<d:Version>1.1.0</d:Version>"), "{filtered}");
+    }
+
+    /// `$top` pages the filtered set, not the stored set.
+    #[tokio::test]
+    async fn top_and_skip_page_the_result() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        for id in ["One", "Two", "Three"] {
+            push(&fx, build_nupkg_with_deps(id, "1.0.0", "")).await;
+        }
+        let top = v2_get(&fx, "Packages()?$top=1").await;
+        let skipped = v2_get(&fx, "Packages()?$skip=2").await;
+        fx.teardown().await;
+
+        assert_eq!(top.matches("<entry>").count(), 1, "{top}");
+        assert_eq!(skipped.matches("<entry>").count(), 1, "{skipped}");
+    }
+
+    /// An unimplemented predicate is reported, and the rows are still served: a
+    /// 400 would break the client's next request, which is usually an install.
+    #[tokio::test]
+    async fn unknown_filter_is_ignored_but_rows_are_served() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        push(&fx, build_nupkg_with_deps("Alpha", "1.0.0", "")).await;
+        push(&fx, build_nupkg_with_deps("Beta", "1.0.0", "")).await;
+
+        let feed = v2_get(&fx, "Packages()?$filter=Nothing%20eq%20%27x%27").await;
+        fx.teardown().await;
+
+        assert_eq!(
+            feed.matches("<entry>").count(),
+            2,
+            "an unhandled predicate must not filter the feed: {feed}"
+        );
+    }
+
+    /// `PackageHash` is the base64 SHA-512 of the pushed bytes, as the V2 protocol
+    /// specifies — a Chocolatey client verifies the download against it.
+    #[tokio::test]
+    async fn package_hash_is_the_sha512_of_the_pushed_bytes() {
+        let Some(fx) = tdh::Fixture::setup("local", "nuget").await else {
+            return;
+        };
+        let nupkg = build_nupkg_with_deps("HashPkg", "1.0.0", "");
+        let expected = super::base64_standard(&Sha512::digest(&nupkg));
+        push(&fx, nupkg).await;
+
+        let feed = v2_get(&fx, "FindPackagesById()?id=%27HashPkg%27").await;
+        fx.teardown().await;
+        let properties = property_map(properties_of(&feed));
+
+        assert_eq!(
+            properties.get("PackageHashAlgorithm").map(String::as_str),
+            Some("SHA512")
+        );
+        assert_eq!(
+            properties.get("PackageHash").map(String::as_str),
+            Some(expected.as_str())
+        );
     }
 }
 
