@@ -21,6 +21,7 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
+use crate::util::byte_budget::{budget_from_env, ByteBudget};
 
 /// Parse a recorded SHA-256 into raw digest bytes.
 ///
@@ -215,8 +216,100 @@ pub fn verify_sha256_stream(
 /// a clean `502` and no byte of the bad object. A larger object is verified
 /// while it streams ([`verify_sha256_stream`]); a mismatch there can only
 /// abort the transfer, because the `200` and its headers are already on the
-/// wire. Memory per serve stays bounded by this value.
+/// wire. Memory per serve stays bounded by this value, and memory across all
+/// serves by [`serve_verify_buffer_budget`] (#4989).
 pub const VERIFY_BEFORE_HEADERS_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Default ceiling on the TOTAL bytes the before-headers verification buffer
+/// may hold across every in-flight serve (#4989). 256 MiB is 64 objects at
+/// [`VERIFY_BEFORE_HEADERS_MAX_BYTES`], or thousands of typical package files,
+/// and leaves most of the chart's default 2 GiB backend limit to the rest of
+/// the process.
+pub const DEFAULT_SERVE_VERIFY_BUFFER_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Env override for [`DEFAULT_SERVE_VERIFY_BUFFER_BUDGET_BYTES`]. A blank,
+/// non-numeric or zero value falls back to the default, and a value too large
+/// to represent is clamped; either case logs a warning at startup, as for
+/// `AK_PROXY_METADATA_BUDGET_BYTES` (#4881).
+pub const SERVE_VERIFY_BUFFER_BUDGET_BYTES_ENV: &str = "AK_SERVE_VERIFY_BUFFER_BUDGET_BYTES";
+
+/// The process-wide budget for the before-headers verification buffer (#4989).
+///
+/// A buffered serve holds its object in memory until the client has read it,
+/// and the request's concurrency permit is released when the handler returns
+/// the response, before the body is sent. Without this budget the total was
+/// bounded only by how many connections clients kept open, about 4 MiB each,
+/// and slow readers on a public repository could hold that anonymously. It is
+/// separate from the proxy-metadata budget, whose callers wait for room: a
+/// serve here never waits, so it must not take room those callers wait for.
+pub fn serve_verify_buffer_budget() -> &'static ByteBudget {
+    static BUDGET: std::sync::LazyLock<ByteBudget> = std::sync::LazyLock::new(|| {
+        budget_from_env(
+            SERVE_VERIFY_BUFFER_BUDGET_BYTES_ENV,
+            DEFAULT_SERVE_VERIFY_BUFFER_BUDGET_BYTES,
+        )
+    });
+    &BUDGET
+}
+
+/// A reservation of the before-headers verification budget (#4989). The
+/// buffered body owns it, so it is given back when the last buffered chunk
+/// has been handed out or the body is dropped (sent, or the client went
+/// away). Each change is reported as
+/// `ak_serve_verify_buffer_bytes_reserved`.
+struct VerifyBufferHold {
+    budget: &'static ByteBudget,
+    /// `Option` so `drop` can release the permit BEFORE it reports: a field
+    /// is only dropped after `Drop::drop` returns.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl VerifyBufferHold {
+    /// Reserve `total` bytes, rounded up to whole budget units, or `None` when
+    /// the budget cannot hold them now, or ever (a total above the whole
+    /// budget, which a reservation would otherwise clamp to the budget and so
+    /// under-count). Never waits: a reservation is held for as long as a
+    /// client takes to read the body, so waiting would let slow readers stall
+    /// every small download.
+    fn try_reserve(budget: &'static ByteBudget, total: u64) -> Option<Self> {
+        let bytes = usize::try_from(total).unwrap_or(usize::MAX);
+        if bytes > budget.total_bytes() {
+            return None;
+        }
+        let permit = budget.try_reserve(bytes)?;
+        report_verify_buffer_reserved(budget);
+        Some(Self {
+            budget,
+            permit: Some(permit),
+        })
+    }
+}
+
+impl Drop for VerifyBufferHold {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        report_verify_buffer_reserved(self.budget);
+    }
+}
+
+fn report_verify_buffer_reserved(budget: &ByteBudget) {
+    crate::services::metrics_service::set_serve_verify_buffer_bytes_reserved(
+        budget.total_bytes() - budget.available_bytes(),
+    );
+}
+
+/// The buffered chunks as a body stream that keeps `hold` until the last
+/// chunk has been handed out, or the stream is dropped.
+fn held_body(
+    held: Vec<Result<Bytes>>,
+    hold: VerifyBufferHold,
+) -> BoxStream<'static, Result<Bytes>> {
+    futures::stream::unfold((held.into_iter(), hold), |(mut chunks, hold)| async move {
+        let chunk = chunks.next()?;
+        Some((chunk, (chunks, hold)))
+    })
+    .boxed()
+}
 
 /// Machine-readable `code` of the `502` a failed verification answers with.
 pub const STORED_OBJECT_INTEGRITY_CODE: &str = "STORED_OBJECT_INTEGRITY";
@@ -287,8 +380,24 @@ fn log_mismatch(label: &str, expected: &[u8; 32], expected_len: u64, verdict: &I
 /// (#4323). An object of at most [`VERIFY_BEFORE_HEADERS_MAX_BYTES`] is read
 /// and checked now: a mismatch is an `Err` carrying the `502`
 /// ([`STORED_OBJECT_INTEGRITY_CODE`]) and nothing of the object is served. A
-/// larger object is returned wrapped in [`verify_sha256_stream`].
+/// larger object is returned wrapped in [`verify_sha256_stream`], and so is a
+/// small one when [`serve_verify_buffer_budget`] has no room for it (#4989):
+/// it is still never delivered complete if it is corrupt, but the mismatch
+/// then aborts the transfer instead of answering `502`.
 pub async fn verify_before_serve(
+    body: BoxStream<'static, Result<Bytes>>,
+    expected: [u8; 32],
+    total: u64,
+    label: String,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
+    verify_before_serve_with_budget(serve_verify_buffer_budget(), body, expected, total, label)
+        .await
+}
+
+/// [`verify_before_serve`] against an explicit budget, so a test can exhaust
+/// one of its own without touching the process-wide budget other serves use.
+pub(crate) async fn verify_before_serve_with_budget(
+    budget: &'static ByteBudget,
     mut body: BoxStream<'static, Result<Bytes>>,
     expected: [u8; 32],
     total: u64,
@@ -297,6 +406,15 @@ pub async fn verify_before_serve(
     if total > VERIFY_BEFORE_HEADERS_MAX_BYTES {
         return Ok(verify_sha256_stream(body, expected, Some(total), label));
     }
+    let Some(hold) = VerifyBufferHold::try_reserve(budget, total) else {
+        crate::services::metrics_service::record_serve_verify_buffer_fallback();
+        tracing::debug!(
+            object = %label,
+            total,
+            "verification buffer budget has no room; verifying while streaming instead (#4989)"
+        );
+        return Ok(verify_sha256_stream(body, expected, Some(total), label));
+    };
     let mut hasher = Sha256::new();
     let mut held = Vec::new();
     let mut len = 0u64;
@@ -322,7 +440,7 @@ pub async fn verify_before_serve(
         log_mismatch(&label, &expected, total, &verdict);
         return Err(integrity_error(&label));
     }
-    Ok(futures::stream::iter(held).boxed())
+    Ok(held_body(held, hold))
 }
 
 /// Verify a stored artifact body on a format-native or virtual-member serve
@@ -653,5 +771,176 @@ mod tests {
         let r = integrity_failure_response("repo/path");
         assert_eq!(r.status(), axum::http::StatusCode::BAD_GATEWAY);
         assert!(is_integrity_failure(&r));
+    }
+
+    // -----------------------------------------------------------------------
+    // #4989: the before-headers buffer draws on one process-wide budget.
+    // Every test uses a budget of its own (leaked, so it is `'static` like the
+    // global), never the global: exhausting that would turn other tests'
+    // up-front 502s into aborted transfers.
+    // -----------------------------------------------------------------------
+
+    use crate::util::byte_budget::BYTE_BUDGET_UNIT_BYTES as UNIT;
+
+    fn leaked_budget(bytes: usize) -> &'static ByteBudget {
+        Box::leak(Box::new(ByteBudget::new(bytes)))
+    }
+
+    /// A buffered serve reserves its size rounded up to whole units (not the
+    /// 4 MiB ceiling), holds it while the body is unread, and gives it back
+    /// once the body has been read to the end.
+    #[tokio::test]
+    async fn buffered_serve_reserves_its_size_until_the_body_is_read() {
+        let budget = leaked_budget(4 * UNIT);
+        let object = vec![7u8; 1024];
+        let body = futures::stream::iter(vec![Ok(Bytes::from(object.clone()))]).boxed();
+        let served = verify_before_serve_with_budget(budget, body, sha(&object), 1024, "t".into())
+            .await
+            .expect("intact");
+        assert_eq!(
+            budget.available_bytes(),
+            3 * UNIT,
+            "a 1 KiB object reserves one 4 KiB unit, not the ceiling"
+        );
+        let (bytes, err) = collect(served).await;
+        assert!(err.is_none());
+        assert_eq!(bytes, object);
+        assert_eq!(budget.available_bytes(), 4 * UNIT, "released once read");
+    }
+
+    /// A client that goes away before reading the body still gives the
+    /// reservation back, when the body is dropped.
+    #[tokio::test]
+    async fn dropped_body_releases_its_reservation() {
+        let budget = leaked_budget(2 * UNIT);
+        let served =
+            verify_before_serve_with_budget(budget, chunks(&[b"abc"]), sha(b"abc"), 3, "t".into())
+                .await
+                .expect("intact");
+        assert_eq!(budget.available_bytes(), UNIT);
+        drop(served);
+        assert_eq!(budget.available_bytes(), 2 * UNIT);
+    }
+
+    /// A zero-byte object reserves the one unit a reservation is rounded up
+    /// to, and releases it like any other.
+    #[tokio::test]
+    async fn empty_object_reserves_one_unit_and_releases_it() {
+        let budget = leaked_budget(UNIT);
+        let served = verify_before_serve_with_budget(budget, chunks(&[]), sha(b""), 0, "t".into())
+            .await
+            .expect("intact");
+        assert_eq!(budget.available_bytes(), 0);
+        let (bytes, err) = collect(served).await;
+        assert!(bytes.is_empty() && err.is_none());
+        assert_eq!(budget.available_bytes(), UNIT);
+    }
+
+    /// A mismatch found while buffering is still the up-front 502, and the
+    /// reservation does not outlive the refusal.
+    #[tokio::test]
+    async fn buffered_mismatch_refuses_and_releases() {
+        let budget = leaked_budget(2 * UNIT);
+        let err =
+            verify_before_serve_with_budget(budget, chunks(&[b"abd"]), sha(b"abc"), 3, "t".into())
+                .await
+                .err()
+                .expect("mismatch");
+        assert!(
+            matches!(
+                err,
+                AppError::CodedBadGateway {
+                    code: STORED_OBJECT_INTEGRITY_CODE,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(budget.available_bytes(), 2 * UNIT);
+    }
+
+    /// With the budget exhausted a small object is NOT buffered: it streams
+    /// through the streaming verifier, which still serves intact bytes and
+    /// still never completes a corrupt body. The mismatch now ends the stream
+    /// instead of failing up front.
+    #[tokio::test]
+    async fn exhausted_budget_streams_instead_of_buffering() {
+        let budget = leaked_budget(UNIT);
+        let _occupied = budget.try_reserve(UNIT).expect("take the whole budget");
+
+        let intact = verify_before_serve_with_budget(
+            budget,
+            chunks(&[b"a", b"bc"]),
+            sha(b"abc"),
+            3,
+            "t".into(),
+        )
+        .await
+        .expect("no budget is no reason to refuse");
+        {
+            let (bytes, err) = collect(intact).await;
+            assert!(err.is_none(), "{err:?}");
+            assert_eq!(bytes, b"abc".to_vec());
+        }
+
+        let corrupt = verify_before_serve_with_budget(
+            budget,
+            chunks(&[b"a", b"bd"]),
+            sha(b"abc"),
+            3,
+            "t".into(),
+        )
+        .await
+        .expect("without a buffer the mismatch is only known at the end");
+        let (bytes, err) = collect(corrupt).await;
+        assert!(err.is_some(), "a corrupt body is never completed");
+        assert_eq!(bytes, b"a", "the last chunk is withheld");
+        assert_eq!(
+            budget.available_bytes(),
+            0,
+            "nothing reserved for the streamed serves"
+        );
+    }
+
+    /// An object larger than the whole budget streams: a reservation would be
+    /// clamped to the budget and under-count what is buffered.
+    #[tokio::test]
+    async fn object_larger_than_the_budget_streams() {
+        let budget = leaked_budget(UNIT);
+        let object = vec![1u8; 2 * UNIT];
+        let body = futures::stream::iter(vec![Ok(Bytes::from(object.clone()))]).boxed();
+        let served = verify_before_serve_with_budget(
+            budget,
+            body,
+            sha(&object),
+            object.len() as u64,
+            "t".into(),
+        )
+        .await
+        .expect("streams");
+        assert_eq!(budget.available_bytes(), UNIT, "never reserved");
+        {
+            let (bytes, err) = collect(served).await;
+            assert!(err.is_none(), "{err:?}");
+            assert_eq!(bytes, object);
+        }
+    }
+
+    /// The env override follows the shared rules with its own default.
+    #[test]
+    fn serve_verify_budget_resolves_with_its_own_default() {
+        use crate::util::byte_budget::resolve_budget_bytes;
+        let default = DEFAULT_SERVE_VERIFY_BUFFER_BUDGET_BYTES;
+        assert_eq!(resolve_budget_bytes(None, default), (default, None));
+        assert_eq!(
+            resolve_budget_bytes(Some("8388608"), default),
+            (8_388_608, None)
+        );
+        for junk in ["", "   ", "0", "lots"] {
+            let (bytes, reason) = resolve_budget_bytes(Some(junk), default);
+            assert_eq!(bytes, default, "{junk:?}");
+            assert!(reason.is_some(), "{junk:?} is reported");
+        }
+        assert!(serve_verify_buffer_budget().total_bytes() > 0);
     }
 }

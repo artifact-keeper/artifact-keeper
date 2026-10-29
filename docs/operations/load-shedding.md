@@ -168,6 +168,27 @@ configured and effective values. The effective value is in the
 the first virtual conda merge runs. Sizing against the container memory limit
 is in [conda virtual merge memory](conda-virtual-merge-memory.md).
 
+## Download verification memory budget
+
+A download that checks stored bytes against their recorded SHA-256 (see
+[download integrity](download-integrity.md)) reads an object of at most
+4 MiB whole and checks it before the response status is sent, then holds it
+until the client has read it. Those buffers draw on one process-wide budget,
+`AK_SERVE_VERIFY_BUFFER_BUDGET_BYTES` (default 256 MiB), separate from the
+metadata budget above (#4989). The global concurrency limit does not bound
+them: a request's permit is released when its response starts, and the body
+is sent after that, so before this budget the total was set only by how many
+connections clients kept open.
+
+When the budget has no room, a download does not wait. It is checked while it
+streams, as an object over 4 MiB always is: a corrupt object is still never
+delivered complete, but the transfer is aborted instead of answered `502`.
+`ak_serve_verify_buffer_bytes_reserved` reports the budget in use and
+`ak_serve_verify_buffer_fallback_total` counts the downloads that streamed for
+lack of room; a steady rate means the budget is too small for the load. The
+budget uses the same 4 KiB accounting, and the same blank, zero and overflow
+handling, as `AK_PROXY_METADATA_BUDGET_BYTES`.
+
 ## Database connection budget
 
 Every replica opens its own pool, so size the fleet against the server

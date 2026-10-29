@@ -11820,6 +11820,9 @@ pub async fn download_artifact(
             }
             let db = state.db.clone();
             let path_clone = path.clone();
+            // #4989: a HEAD never polls the member's body, so it reads nothing
+            // to verify, as a HEAD answered from the artifact row does (#4323).
+            let verify_member = !is_head;
             let result = match proxy_helpers::resolve_virtual_download_from_members(
                 members,
                 proxy_for_virtual,
@@ -11830,8 +11833,15 @@ pub async fn download_artifact(
                     let state = state.clone();
                     let p = path_clone.clone();
                     async move {
-                        proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &p)
-                            .await
+                        proxy_helpers::local_fetch_by_path_verifying(
+                            &db,
+                            &state,
+                            member_id,
+                            &location,
+                            &p,
+                            verify_member,
+                        )
+                        .await
                     }
                 },
             )
@@ -38631,6 +38641,47 @@ mod conditional_put_and_serve_verification_tests {
         fx.teardown().await;
         assert_eq!(head_status, StatusCode::OK, "HEAD is answered from the row");
         assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET verifies");
+    }
+
+    /// #4989: a HEAD through a virtual member walk on the generic route reads
+    /// nothing, so it is not verified (it used to read up to 4 MiB of a small
+    /// member for nothing); the GET of the same corrupted member is still the
+    /// terminal 502.
+    #[tokio::test]
+    async fn head_through_a_virtual_does_not_read_or_verify_the_member_4989_db() {
+        let Some(mut fx) = Fx::setup().await else {
+            return;
+        };
+        let (member_id, member_key) = fx.repo("local", "generic", false).await;
+        let (virtual_id, virtual_key) = fx.repo("virtual", "generic", false).await;
+        tdh::link_virtual_member(&fx.pool, virtual_id, member_id, 1).await;
+        let (created, _, _) = fx.put(&member_key, "hv/x.bin", b"head member", &[]).await;
+        assert_eq!(created, StatusCode::CREATED);
+        fx.corrupt(member_id, "hv/x.bin", b"head membeR").await;
+
+        let (head_status, head_body, head_headers) = tdh::send_with_headers(
+            fx.router(),
+            tdh::head(format!("/{virtual_key}/download/hv/x.bin")),
+        )
+        .await;
+        let (get_status, _, get_body) = fx.download(&virtual_key, "hv/x.bin").await;
+        fx.teardown().await;
+
+        assert_eq!(
+            head_status,
+            StatusCode::OK,
+            "HEAD is answered without reading the member: {}",
+            String::from_utf8_lossy(&head_body)
+        );
+        assert_eq!(
+            head_headers
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("11"),
+            "with the length the row records"
+        );
+        assert_eq!(get_status, StatusCode::BAD_GATEWAY, "GET still verifies");
+        assert_eq!(code_of(&get_body), "STORED_OBJECT_INTEGRITY");
     }
 
     /// #4323: `ranged_stream_response_advertised` (Incus images) verifies a

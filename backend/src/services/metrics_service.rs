@@ -407,6 +407,21 @@ pub fn set_conda_virtual_merge_bytes_reserved(bytes: usize) {
     gauge!("ak_conda_virtual_merge_bytes_reserved").set(bytes as f64);
 }
 
+/// Bytes of the serve-time verification buffer budget currently reserved
+/// (#4989): small stored objects read whole and checked before their status
+/// is sent, held until the client has read them.
+pub fn set_serve_verify_buffer_bytes_reserved(bytes: usize) {
+    gauge!("ak_serve_verify_buffer_bytes_reserved").set(bytes as f64);
+}
+
+/// A small stored object served with its verification while streaming,
+/// because the verification buffer budget had no room for it (#4989). A
+/// steady rate means `AK_SERVE_VERIFY_BUFFER_BUDGET_BYTES` is too small for
+/// the load.
+pub fn record_serve_verify_buffer_fallback() {
+    counter!("ak_serve_verify_buffer_fallback_total").increment(1);
+}
+
 /// Outcome of a CEP-27 publish attestation decision (#4711). `outcome` is one
 /// of [`CONDA_ATTESTATION_OUTCOMES`]; `repository` is the repository key.
 ///

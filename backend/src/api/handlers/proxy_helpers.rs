@@ -50,24 +50,12 @@ pub const DEFAULT_PROXY_METADATA_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
 /// warning at startup naming the configured and effective values (#4881).
 pub const PROXY_METADATA_BUDGET_BYTES_ENV: &str = "AK_PROXY_METADATA_BUDGET_BYTES";
 
-/// Accounting granularity of every [`ProxyMetadataBudget`]: the semaphore
-/// counts one permit per 4 KiB, and a reservation is rounded UP to whole
-/// units (#4881). Counting bytes made the permit count bounded by the `u32`
-/// that `acquire_many` takes, which silently clamped any budget above
-/// 4 GiB. In 4 KiB units the semaphore can hold a budget as large as `usize`
-/// can express, and one reservation can hold up to 16 TiB.
-pub const PROXY_METADATA_BUDGET_UNIT_BYTES: usize = 4 * 1024;
-
-/// Largest budget [`ProxyMetadataBudget`] can represent: tokio's permit
-/// ceiling in [`PROXY_METADATA_BUDGET_UNIT_BYTES`] units, which on a 64-bit
-/// target saturates at `usize::MAX`.
-pub const MAX_PROXY_METADATA_BUDGET_BYTES: usize =
-    Semaphore::MAX_PERMITS.saturating_mul(PROXY_METADATA_BUDGET_UNIT_BYTES);
-
-/// Whole budget units covering `bytes`, rounded up.
-fn budget_units(bytes: usize) -> usize {
-    bytes.div_ceil(PROXY_METADATA_BUDGET_UNIT_BYTES)
-}
+// The accounting granularity (#4881) and the largest representable budget,
+// under their historical names: see `crate::util::byte_budget`.
+pub use crate::util::byte_budget::{
+    BYTE_BUDGET_UNIT_BYTES as PROXY_METADATA_BUDGET_UNIT_BYTES,
+    MAX_BYTE_BUDGET_BYTES as MAX_PROXY_METADATA_BUDGET_BYTES,
+};
 
 /// A process-wide byte budget bounding the TOTAL memory the *buffered*
 /// proxy-metadata path may hold resident at once, independent of request
@@ -90,69 +78,11 @@ fn budget_units(bytes: usize) -> usize {
 /// unbounded buffers. Mirrors the byte-bounded `scan_extraction_semaphore`
 /// pattern (`permits × per-item-cap` resident ceiling) already used by the
 /// scanner.
-pub struct ProxyMetadataBudget {
-    sem: Arc<Semaphore>,
-    total: usize,
-}
-
-impl ProxyMetadataBudget {
-    /// Build a budget of `total_bytes`, clamped to
-    /// `[1, MAX_PROXY_METADATA_BUDGET_BYTES]`. The semaphore holds the total
-    /// in [`PROXY_METADATA_BUDGET_UNIT_BYTES`] units, rounded up, so the
-    /// byte-facing methods keep byte semantics while the permit count stays
-    /// inside tokio's limits for any budget (#4881).
-    pub fn new(total_bytes: usize) -> Self {
-        let total = total_bytes.clamp(1, MAX_PROXY_METADATA_BUDGET_BYTES);
-        Self {
-            sem: Arc::new(Semaphore::new(budget_units(total))),
-            total,
-        }
-    }
-
-    /// Total budget in bytes.
-    pub fn total_bytes(&self) -> usize {
-        self.total
-    }
-
-    /// Currently unreserved bytes (observability / test helper). Counted in
-    /// whole units, so never more than [`Self::total_bytes`].
-    pub fn available_bytes(&self) -> usize {
-        self.sem
-            .available_permits()
-            .saturating_mul(PROXY_METADATA_BUDGET_UNIT_BYTES)
-            .min(self.total)
-    }
-
-    fn permits_for(&self, bytes: usize) -> u32 {
-        // A single request can reserve at most the whole budget, so an oversized
-        // request degrades to "hold the whole budget" rather than deadlocking on
-        // a permit count the semaphore can never satisfy. One `acquire_many`
-        // takes at most `u32::MAX` units (16 TiB); a budget larger than that
-        // still satisfies such a request, it just leaves the rest free.
-        let ceiling = budget_units(self.total).min(u32::MAX as usize);
-        budget_units(bytes).clamp(1, ceiling) as u32
-    }
-
-    /// Reserve `bytes` of the budget, awaiting when it is exhausted. The
-    /// returned permit releases the reservation on drop — hold it for as long
-    /// as the buffered bytes are resident.
-    pub async fn reserve(&self, bytes: usize) -> OwnedSemaphorePermit {
-        // `acquire_many_owned` only errors when the semaphore is closed; this
-        // one lives for the process lifetime and is never closed.
-        Arc::clone(&self.sem)
-            .acquire_many_owned(self.permits_for(bytes))
-            .await
-            .expect("proxy metadata budget semaphore is never closed")
-    }
-
-    /// Non-blocking reservation: `None` when the budget cannot currently satisfy
-    /// `bytes`. Used to prove the bound rejects once exhausted.
-    pub fn try_reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.sem)
-            .try_acquire_many_owned(self.permits_for(bytes))
-            .ok()
-    }
-}
+///
+/// The type is the shared [`ByteBudget`](crate::util::byte_budget::ByteBudget),
+/// moved to `util` so the storage layer can bound its serve-time verification
+/// buffer the same way (#4989).
+pub type ProxyMetadataBudget = crate::util::byte_budget::ByteBudget;
 
 /// Process-wide buffered-proxy-metadata byte budget (#2665). Sized once from
 /// [`PROXY_METADATA_BUDGET_BYTES_ENV`] (default
@@ -160,18 +90,10 @@ impl ProxyMetadataBudget {
 pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
     static BUDGET: OnceLock<ProxyMetadataBudget> = OnceLock::new();
     BUDGET.get_or_init(|| {
-        let configured = std::env::var(PROXY_METADATA_BUDGET_BYTES_ENV).ok();
-        let (total, adjustment) = resolve_proxy_metadata_budget_bytes(configured.as_deref());
-        if let Some(reason) = adjustment {
-            tracing::warn!(
-                env = PROXY_METADATA_BUDGET_BYTES_ENV,
-                configured = configured.as_deref().unwrap_or_default(),
-                effective_bytes = total,
-                max_bytes = MAX_PROXY_METADATA_BUDGET_BYTES,
-                "{PROXY_METADATA_BUDGET_BYTES_ENV} {reason}; using {total} bytes"
-            );
-        }
-        ProxyMetadataBudget::new(total)
+        crate::util::byte_budget::budget_from_env(
+            PROXY_METADATA_BUDGET_BYTES_ENV,
+            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
+        )
     })
 }
 
@@ -181,32 +103,7 @@ pub fn proxy_metadata_budget() -> &'static ProxyMetadataBudget {
 pub fn resolve_proxy_metadata_budget_bytes(
     configured: Option<&str>,
 ) -> (usize, Option<&'static str>) {
-    let Some(raw) = configured else {
-        return (DEFAULT_PROXY_METADATA_BUDGET_BYTES, None);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return (
-            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
-            Some("is blank, falling back to the default"),
-        );
-    }
-    // Parse wide so a value past `usize` is reported as clamped, not as junk.
-    match raw.parse::<u128>() {
-        Err(_) => (
-            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
-            Some("is not a byte count, falling back to the default"),
-        ),
-        Ok(0) => (
-            DEFAULT_PROXY_METADATA_BUDGET_BYTES,
-            Some("is zero, falling back to the default"),
-        ),
-        Ok(v) if v > MAX_PROXY_METADATA_BUDGET_BYTES as u128 => (
-            MAX_PROXY_METADATA_BUDGET_BYTES,
-            Some("exceeds the largest representable budget, clamping"),
-        ),
-        Ok(v) => (v as usize, None),
-    }
+    crate::util::byte_budget::resolve_budget_bytes(configured, DEFAULT_PROXY_METADATA_BUDGET_BYTES)
 }
 
 // ---------------------------------------------------------------------------
@@ -5914,6 +5811,22 @@ pub async fn local_fetch_by_path(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
+    local_fetch_by_path_verifying(db, state, repo_id, location, artifact_path, true).await
+}
+
+/// [`local_fetch_by_path`] with serve-time verification optional (#4989). A
+/// caller answering a HEAD passes `verify = false`: the body is never polled,
+/// and verifying it would read up to `VERIFY_BEFORE_HEADERS_MAX_BYTES` of the
+/// object for nothing, the way a HEAD answered from the artifact row already
+/// skips it (#4323).
+pub async fn local_fetch_by_path_verifying(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    artifact_path: &str,
+    verify: bool,
+) -> Result<StreamingFetchResult, Response> {
     let (artifact, storage) = local_lookup_artifact(
         db,
         state,
@@ -5922,7 +5835,7 @@ pub async fn local_fetch_by_path(
         LocalLookup::Path(artifact_path),
     )
     .await?;
-    read_local_stream(db, &artifact, &*storage).await
+    open_local_stream(db, &artifact, &*storage, verify).await
 }
 
 /// Generic local artifact fetch by name and version.
