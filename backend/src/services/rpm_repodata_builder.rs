@@ -600,11 +600,14 @@ async fn build_root(
     //    storage location is recorded now so the GC can find this revision's
     //    objects even if the build fails before it becomes current.
     let Some(revision) = claim(state, repo_id, root, &location, settings).await? else {
+        // An upsert: a root whose marks have not been folded yet has no row,
+        // and its back-off must not be lost.
         sqlx::query(
-            "UPDATE rpm_repodata_roots \
-                SET retry_at = now() + make_interval(secs => $3), \
-                    last_error = 'writers held the root past the fence timeout' \
-              WHERE repository_id = $1 AND root = $2",
+            "INSERT INTO rpm_repodata_roots (repository_id, root, retry_at, last_error) \
+             VALUES ($1, $2, now() + make_interval(secs => $3), \
+                     'writers held the root past the fence timeout') \
+             ON CONFLICT (repository_id, root) DO UPDATE \
+                SET retry_at = EXCLUDED.retry_at, last_error = EXCLUDED.last_error",
         )
         .bind(repo_id)
         .bind(root)
