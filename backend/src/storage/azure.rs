@@ -1535,7 +1535,7 @@ impl AzureBackend {
             let body = response
                 .text()
                 .await
-                .map_err(|e| AppError::Storage(format!("Azure List Blobs body: {e}")))?;
+                .map_err(|e| request_error("Azure List Blobs body", e))?;
             let page = parse_list_blobs_result(&body)?;
             keys.extend(page.keys);
             match page.next_marker {
