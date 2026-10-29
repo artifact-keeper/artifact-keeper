@@ -304,13 +304,15 @@ async fn download_gem(
             }
         };
 
-    proxy_helpers::serve_local_artifact(
+    // #4514: a row a scanning Remote holds goes through the scan gate.
+    proxy_helpers::serve_local_artifact_gated(
         &state,
         &repo,
         artifact.id,
         &artifact.storage_key,
         "application/octet-stream",
-        Some(filename),
+        filename,
+        ProxiedGem,
         &ctx,
     )
     .await

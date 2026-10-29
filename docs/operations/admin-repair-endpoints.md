@@ -24,16 +24,21 @@ Both share these rules:
 - **Safe on a live repository and idempotent.** Neither overwrites an existing
   row or takes a table lock, and a second run over a repaired repository does
   nothing.
-- **Audited.** Each call writes one audit row against the repository when it
-  returns, refusals (`409`, `422`) and failures included, with outcome
-  `failure` for those; a `404` for an unknown key is not audited. The action is
-  `STORAGE_REINDEX_RUN` or `DEBIAN_BACKFILL_RUN`, carrying `repository`,
-  `dry_run` and the report counts, or the `error`.
+- **Audited before the work starts.** Each call writes a `phase: "started"`
+  audit row before it touches any row or object, then a second row when it
+  returns: `completed` with the report counts, or `failed` with the `error`
+  for refusals (`404` unknown key, `409`, `422`) and failures. A call dropped
+  mid-run (request timeout, client disconnect) records `cancelled` instead.
+  `failed` and `cancelled` carry outcome `failure`. The action is
+  `STORAGE_REINDEX_RUN` or `DEBIAN_BACKFILL_RUN`; every row carries
+  `repository`, `dry_run`, `limit` (and `after` for the backfill), plus a
+  `run_id` shared by the rows of one call.
 - **Answered inside the request timeout.** These are ordinary requests, so
   `GLOBAL_REQUEST_TIMEOUT_SECS` (120 s by default) applies. A call cut off by
-  the timeout answers `503`; the rows it already wrote stay (each is its own
-  statement or transaction) and the lock is released, so the next call carries
-  on. Lower `limit` if a call comes near the timeout.
+  the timeout answers `503` and is audited as `cancelled`; the rows it
+  already wrote stay (each is its own statement or transaction) and the lock
+  is released, so the next call carries on. Lower `limit` if a call comes
+  near the timeout.
 
 ## Storage reindex (Maven, Gradle)
 
@@ -156,9 +161,11 @@ Report:
 | `registered_paths` | Up to 100 registered paths, each the path the package is filed under. |
 | `errors` | Up to 100 per-package failures (`path: reason`). |
 
-A dry run does not check the destination of a move, so a package whose
-destination is taken is counted in `packages_registered` and
-`packages_relocated` by the dry run and in `artifacts_failed` by the real run.
+A dry run checks the destination of each move the way the real run does
+(without locking or writing), including a destination an earlier package of
+the same call would move into, so a package whose destination is taken is
+counted in `artifacts_failed` with the same reason by both. A row written
+between the dry run and the real run can still change the outcome.
 
 ## Paging
 

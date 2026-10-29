@@ -17,11 +17,12 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
+use crate::services::proxy_scan_service::CacheScanGate;
 /// Re-exported so format handlers can pattern-match the buffered proxy result
 /// (named fields since #4581) without a second import path.
 pub(crate) use crate::services::proxy_service::CachedBody;
 pub use crate::services::proxy_service::StreamingFetchResult;
-use crate::services::proxy_service::{DirectUpstreamBody, ProxyService};
+use crate::services::proxy_service::{DeferredCommitSlot, DirectUpstreamBody, ProxyService};
 // Re-export the per-format buffered-metadata byte ceilings (#1608 Phase 4b /
 // #2181) so format handlers select a cap via `proxy_helpers::<CONST>`.
 pub use crate::services::proxy_service::{DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES};
@@ -1916,8 +1917,49 @@ pub fn stream_fetch_result(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())
 }
 
+/// [`ProxyService::cache_scan_gate`] for a presigned-redirect fast path
+/// (#4514), with the live CVE-scanner version. `None` when the gate could not
+/// be evaluated (the scan config is unreadable): the redirect declines and
+/// the fall-through path answers. `record_block` as for the gate itself.
+pub(crate) async fn cache_scan_gate_for_redirect(
+    state: &AppState,
+    proxy: &ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+    record_block: bool,
+) -> Option<CacheScanGate> {
+    proxy
+        .cache_scan_gate(
+            repo_key,
+            cache_path,
+            state.scanner_service.as_deref(),
+            record_block,
+        )
+        .await
+        .ok()
+}
+
+/// Whether the stored scan verdict lets a presigned redirect hand out the
+/// cached body at `cache_path` (#4514): only [`CacheScanGate::Serve`] does.
+/// A declined redirect leaves a refusal to the reader that serves the
+/// request instead, so it is not counted here.
+pub(crate) async fn cache_scan_allows_redirect(
+    state: &AppState,
+    proxy: &ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+) -> bool {
+    matches!(
+        cache_scan_gate_for_redirect(state, proxy, repo_key, cache_path, false).await,
+        Some(CacheScanGate::Serve)
+    )
+}
+
 /// Presigned redirect to the fresh proxy-cache entry at `cache_path`, signed
-/// without reading the cached body (#1018). `Ok(None)` when presigned downloads
+/// without reading the cached body (#1018). For a Remote that scans on proxy
+/// the stored scan verdict of the body is consulted too (#4514), so callers
+/// pass only files the format's route gates (package archives), never a
+/// file the format serves unscanned. `Ok(None)` when presigned downloads
 /// are disabled, the request is a `HEAD` (#3209), the backend cannot presign or
 /// the entry is missing or stale: the caller then serves the request itself. A
 /// held (#2075) or origin-refused (#4506) entry is refused as on the fetch paths.
@@ -1946,6 +1988,18 @@ pub(crate) async fn proxy_cache_fresh_redirect(
         .cache_origin_policy_gate(repo_key)
         .await
         .map_err(refused)?;
+    // #4514: the stored scan verdict of the cached body. A refusing verdict
+    // is the scan gate's 403; fail-closed without a reusable clean verdict
+    // is not for a redirect, and the caller serves the request itself.
+    match cache_scan_gate_for_redirect(state, proxy_service, repo_key, cache_path, true).await {
+        Some(CacheScanGate::Serve) => {}
+        Some(CacheScanGate::Block) => {
+            return Err(scan_blocked_response(
+                cache_path_filename(cache_path).unwrap_or(cache_path),
+            ))
+        }
+        Some(CacheScanGate::NotForFastPath) | None => return Ok(None),
+    }
     // Proxy-cache content is stored without the global key prefix, so it is
     // signed through that same no-prefix backend (#1555).
     let cache_key =
@@ -8471,6 +8525,316 @@ pub async fn serve_local_artifact(
     ))
 }
 
+/// [`serve_local_artifact`] for a package route of a format that enforces
+/// scan-on-proxy (#4514): a row a scanning Remote holds goes through the
+/// scan gate first ([`gate_stored_content`]) under `kind`, the format's own
+/// rule for the requested `filename`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_local_artifact_gated<
+    K: crate::api::handlers::proxy_scan_archive::ArchiveKind,
+>(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    storage_key: &str,
+    content_type: &str,
+    filename: &str,
+    kind: K,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
+
+    let content = storage
+        .get(storage_key)
+        .await
+        .map_err(|e| internal_error("Storage", e))?;
+    let scan = gate_stored_content(state, repo, filename, &content, kind).await?;
+
+    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
+
+    Ok(StoredRowBody::stamp(
+        scan,
+        build_download_response(
+            content,
+            Some(content_type.to_string()),
+            content_type,
+            Some(filename),
+        ),
+    ))
+}
+
+/// An `artifacts` row a format route is about to serve from storage (#4514).
+pub(crate) struct StoredRow<'a> {
+    /// The repository that holds the row (the URL repository on a direct
+    /// pull).
+    pub repo: &'a RepoInfo,
+    /// The file name the format's proxied gate names the file after; names
+    /// the scan target and the block/lock bodies.
+    pub filename: &'a str,
+    pub storage_key: &'a str,
+    pub size_bytes: i64,
+}
+
+/// The body of a [`StoredRow`], and how the scan gate passed it.
+pub(crate) struct StoredRowBody {
+    pub body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    /// The `X-AK-Scan` value to stamp on the response: `None` when the row
+    /// was not gated (a hosted repository, or a Remote that does not scan on
+    /// proxy), as before.
+    pub scan: Option<&'static str>,
+}
+
+impl StoredRowBody {
+    /// Stamp `X-AK-Scan` on `resp` when the row went through the gate.
+    pub(crate) fn stamp(scan: Option<&'static str>, mut resp: Response) -> Response {
+        if let Some(value) = scan {
+            resp.headers_mut()
+                .insert("X-AK-Scan", axum::http::HeaderValue::from_static(value));
+        }
+        resp
+    }
+}
+
+/// Open a stored `artifacts` row for a format route, through the scan gate
+/// when the repository is a Remote that scans on proxy (#4514).
+///
+/// A Remote can hold rows of its own (from replication, from a publish into
+/// the remote, or recorded before proxied content stopped being stored as
+/// rows). Those used to be served from storage without the gate, while a
+/// file the same repository proxied was gated. Now, for a scanning Remote
+/// in a format that enforces scan-on-proxy, the stored bytes are read into
+/// memory (up to the scan cap) and gated exactly as the same file proxied
+/// through the route would be: `kind` is the format's own
+/// [`ArchiveKind`](crate::api::handlers::proxy_scan_archive::ArchiveKind) for
+/// the requested coordinate, so the identity rule, the duplicate-entry rule
+/// and the verdict reuse rule are the proxied path's. A row over the scan cap
+/// is inconclusive: `423` under `fail_closed`, streamed `pending` otherwise.
+///
+/// Every other repository, and a Remote that does not scan, streams the row
+/// as before. The caller keeps its quarantine check and download recording.
+pub(crate) async fn open_stored_row<K: crate::api::handlers::proxy_scan_archive::ArchiveKind>(
+    state: &crate::api::SharedState,
+    storage: &dyn crate::storage::StorageBackend,
+    row: &StoredRow<'_>,
+    kind: K,
+) -> Result<StoredRowBody, Response> {
+    let stream = || async move {
+        storage
+            .get_stream(row.storage_key)
+            .await
+            .map_err(stored_row_storage_error)
+    };
+    let Some(policy) = stored_row_scan_policy(state, row.repo).await? else {
+        let body = stream().await?;
+        return Ok(StoredRowBody { body, scan: None });
+    };
+    if stored_row_over_cap(row.size_bytes) {
+        stored_row_over_cap_locks(&policy, row.repo, row.filename)?;
+        let body = stream().await?;
+        crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
+        return Ok(StoredRowBody {
+            body,
+            scan: Some("pending"),
+        });
+    }
+    let bytes = storage
+        .get(row.storage_key)
+        .await
+        .map_err(stored_row_storage_error)?;
+    let scan = gate_stored_bytes(state, &policy, row.repo, row.filename, &bytes, &kind).await?;
+    Ok(StoredRowBody {
+        body: futures::stream::once(async move { Ok(bytes) }).boxed(),
+        scan: Some(scan),
+    })
+}
+
+/// [`open_stored_row`] for a format route that has already read the row's
+/// bytes into memory (#4514): `Ok(None)` when the repository does not gate
+/// its rows, otherwise the `X-AK-Scan` value to serve them with, or the
+/// gate's `403` / `423`.
+pub(crate) async fn gate_stored_content<
+    K: crate::api::handlers::proxy_scan_archive::ArchiveKind,
+>(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    filename: &str,
+    content: &Bytes,
+    kind: K,
+) -> Result<Option<&'static str>, Response> {
+    let Some(policy) = stored_row_scan_policy(state, repo).await? else {
+        return Ok(None);
+    };
+    if stored_row_over_cap(content.len() as i64) {
+        stored_row_over_cap_locks(&policy, repo, filename)?;
+        crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
+        return Ok(Some("pending"));
+    }
+    gate_stored_bytes(state, &policy, repo, filename, content, &kind)
+        .await
+        .map(Some)
+}
+
+/// The `500` a format route answers when a stored row cannot be read, as the
+/// routes built it before #4514.
+fn stored_row_storage_error(e: crate::error::AppError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        crate::api::handlers::storage_err_message(&e),
+    )
+        .into_response()
+}
+
+/// The scan policy and format a stored row is gated under (#4514).
+pub(crate) struct StoredRowPolicy {
+    action: crate::services::proxy_scan_service::ProxyScanAction,
+    severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
+    format: RepositoryFormat,
+}
+
+/// The policy a stored row of `repo` is gated under: `Some` only for a
+/// Remote that scans on proxy, in a format that enforces it. An unreadable
+/// scan config is the retryable `503`.
+pub(crate) async fn stored_row_scan_policy(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+) -> Result<Option<StoredRowPolicy>, Response> {
+    if repo.repo_type != RepositoryType::Remote {
+        return Ok(None);
+    }
+    let Some(format) = RepositoryFormat::ALL
+        .iter()
+        .find(|f| f.as_key() == repo.format)
+        .filter(|f| crate::formats::format_enforces_scan_on_proxy(f))
+    else {
+        return Ok(None);
+    };
+    Ok(remote_scan_policy(&state.db, repo.id)
+        .await?
+        .map(|(action, severity_gate)| StoredRowPolicy {
+            action,
+            severity_gate,
+            format: format.clone(),
+        }))
+}
+
+/// Whether a stored row of `size_bytes` is too large to buffer for the
+/// inline scan.
+fn stored_row_over_cap(size_bytes: i64) -> bool {
+    size_bytes < 0
+        || size_bytes as u64 > crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as u64
+}
+
+/// The inconclusive branch for a stored row over the scan cap, as for a
+/// proxied file: the `423` under `fail_closed`; otherwise `Ok`, and the
+/// caller serves it `pending` (and counts it once it is served).
+fn stored_row_over_cap_locks(
+    policy: &StoredRowPolicy,
+    repo: &RepoInfo,
+    filename: &str,
+) -> Result<(), Response> {
+    use crate::services::proxy_scan_service::{decide_inconclusive, InconclusiveOutcome};
+    match decide_inconclusive(policy.action) {
+        InconclusiveOutcome::Locked => {
+            tracing::warn!(
+                repo_id = %repo.id, file = %filename,
+                "stored row of a scanning Remote exceeds the scan byte cap; fail-closed -> 423"
+            );
+            crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "locked");
+            Err(scan_pending_locked_response(filename))
+        }
+        InconclusiveOutcome::ServePending => {
+            tracing::warn!(
+                repo_id = %repo.id, file = %filename,
+                "stored row of a scanning Remote exceeds the scan byte cap; serving it UNSCANNED"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Run the scan gate over a stored row's bytes (#4514), with the identity
+/// the format's proxied gate would give the same bytes for the same request:
+/// the `X-AK-Scan` value to serve them with, or the gate's `403` / `423`.
+async fn gate_stored_bytes<K: crate::api::handlers::proxy_scan_archive::ArchiveKind>(
+    state: &crate::api::SharedState,
+    policy: &StoredRowPolicy,
+    repo: &RepoInfo,
+    filename: &str,
+    bytes: &Bytes,
+    kind: &K,
+) -> Result<&'static str, Response> {
+    if stored_row_over_cap(bytes.len() as i64) {
+        // The row recorded a smaller size than its blob holds.
+        stored_row_over_cap_locks(policy, repo, filename)?;
+        crate::services::metrics_service::record_proxy_scan_verdict("inconclusive", "served");
+        return Ok("pending");
+    }
+    let digest = sha256_hex(bytes);
+    let req = ScannedProxyRequest {
+        repo_id: repo.id,
+        repo_key: &repo.key,
+        fetch_base: "",
+        format: policy.format.clone(),
+        source_path: filename,
+        cache_path: filename,
+        filename,
+        action: policy.action,
+        severity_gate: policy.severity_gate,
+        ctx: None,
+    };
+    let identity = match crate::services::archive_entry_paths::duplicated_entry_path(
+        filename, bytes,
+    ) {
+        Some(entry) => {
+            tracing::warn!(
+                repo_id = %repo.id, file = %filename, digest = %digest,
+                entry = %entry, format = K::LABEL,
+                "stored archive has more than one entry at the same path; its identity is not established"
+            );
+            ProxyScanIdentity::Unestablished
+        }
+        None => kind.identity(filename, bytes).into_gate_identity(
+            K::LABEL,
+            &req,
+            &digest,
+            &kind.requested(),
+        ),
+    };
+    let synthetic = proxy_synthetic_artifact(
+        repo.id,
+        filename,
+        &digest,
+        bytes.len() as i64,
+        None,
+        K::CONTENT_TYPE,
+    );
+    // Boxed: the gate's future is deep, and inlining it into every format
+    // route's future overflows the layout query depth.
+    match Box::pin(gate_proxy_scan_serve(
+        state,
+        repo.id,
+        filename,
+        &digest,
+        synthetic,
+        bytes,
+        policy.action,
+        policy.severity_gate,
+        identity,
+        ProxyScanMode::File,
+    ))
+    .await
+    {
+        ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        ProxyScanServeOutcome::Serve(served) => Ok(served.header_value()),
+    }
+}
+
 /// Streaming-path counterpart to [`serve_local_artifact`]'s gate call (#3143):
 /// enforce quarantine + scan policy on an already-resolved
 /// [`StreamingFetchResult`], then record the download.
@@ -9779,10 +10143,11 @@ pub(crate) fn stored_clean_graded_nothing(
     stored_pin: Option<&str>,
     components_cataloged: Option<i32>,
 ) -> bool {
-    row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN
-        && row.findings_count == 0
-        && components_cataloged.unwrap_or(0) <= 0
-        && stored_pin.is_none()
+    crate::services::proxy_scan_service::clean_verdict_graded_nothing(
+        row,
+        stored_pin,
+        components_cataloged,
+    )
 }
 
 /// What a served proxy pull's `X-AK-Scan` header reports.
@@ -10373,27 +10738,46 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
         req.fetch_base,
         req.format.clone(),
     );
+    // #4514: a fresh fill is held back from the proxy cache until the gate
+    // below serves it; a refused body is never committed.
+    let deferred = DeferredCommitSlot::new();
+    let fetched = proxy
+        .fetch_artifact_with_cache_path_capped_deferred(
+            &remote,
+            req.source_path,
+            req.cache_path,
+            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
+            &deferred,
+        )
+        .await;
+    let pending = deferred.take();
     let CachedBody {
         content: bytes,
         content_type,
         content_encoding,
         ..
-    } = match proxy
-        .fetch_artifact_with_cache_path_capped(
-            &remote,
-            req.source_path,
-            req.cache_path,
-            crate::services::scanner_service::PROXY_SCAN_MAX_BYTES,
-        )
-        .await
-    {
+    } = match fetched {
         Ok(fetched) => fetched,
         Err(e) if is_over_cap_error(&e) => {
             return serve_oversized_proxy_file(state, req, file).await
         }
-        Err(e) => return Err(e.into_response()),
+        Err(e) => {
+            // A fill refused by a Package Age Policy hold is committed so the
+            // hold is recorded and can be released; reads of it answer the
+            // hold, and once it elapses the gate runs on every read.
+            if let Some(pending) = pending {
+                // Only the hold refusal leaves a fill behind an error.
+                debug_assert!(matches!(
+                    e,
+                    AppError::Conflict(_) | AppError::Authorization(_)
+                ));
+                proxy.publish_deferred(pending).await;
+            }
+            return Err(e.into_response());
+        }
     };
     let digest = sha256_hex(&bytes);
+    // Bytes the format refuses outright are dropped with `pending`.
     file.after_buffered_fetch(state, req, &bytes, &digest)
         .await?;
 
@@ -10413,8 +10797,23 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     )
     .await
     {
-        ProxyScanServeOutcome::Deny(resp) => Err(resp),
+        ProxyScanServeOutcome::Deny(resp) => {
+            // #4514: a body that is inconclusive under fail-closed (`423`)
+            // is dropped with `pending`, so nothing unscanned is left in the
+            // cache. A blocked body (`403`) is committed as before: every
+            // reader of a scanning Remote refuses it from its verdict, and
+            // the cached copy keeps it listed, counted and rescannable.
+            if resp.status() == StatusCode::FORBIDDEN {
+                if let Some(pending) = pending {
+                    proxy.publish_deferred(pending).await;
+                }
+            }
+            Err(resp)
+        }
         ProxyScanServeOutcome::Serve(served) => {
+            if let Some(pending) = pending {
+                proxy.publish_deferred(pending).await;
+            }
             record_scanned_proxy_download(state, req).await;
             let body = ScannedProxyBody {
                 bytes,
@@ -11387,6 +11786,293 @@ mod scanned_proxy_file_tests {
         assert_eq!(body["file"], "pkg-1.0.fake");
         assert_eq!(recorded(&fx).await, 0, "a withheld pull records nothing");
         fx.teardown().await;
+    }
+
+    /// #4514: an `artifacts` row a scanning Remote holds is served through
+    /// the scan gate: a stored blocking verdict refuses it, fail-closed with
+    /// no verdict and no scanner withholds it, fail-open serves it pending,
+    /// and a Remote that does not scan (or a hosted repository) is untouched.
+    #[tokio::test]
+    async fn stored_rows_of_a_scanning_remote_are_gated_4514() {
+        let Some(fx) = tdh::Fixture::setup("remote", "go").await else {
+            return;
+        };
+        let state = tdh::build_state_with_proxy(
+            fx.pool.clone(),
+            fx.storage_dir.to_str().unwrap(),
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap()),
+        );
+        let repo = resolve_repo_by_key(&fx.pool, &fx.repo_key, &["go"], "a Go")
+            .await
+            .unwrap();
+        let storage = state.storage_for_repo(&repo.storage_location()).unwrap();
+        let bytes = Bytes::from(format!("go-row-4514-{}", Uuid::new_v4()).into_bytes());
+        let key = format!("rows-4514/{}", Uuid::new_v4());
+        storage.put(&key, bytes.clone()).await.unwrap();
+        let row = StoredRow {
+            repo: &repo,
+            filename: "v1.0.0.zip",
+            storage_key: &key,
+            size_bytes: bytes.len() as i64,
+        };
+        /// A format whose files grade on their contents (Pub, CocoaPods and
+        /// Swift answer the same for a well-formed archive).
+        struct ContentGradedKind;
+        impl crate::api::handlers::proxy_scan_archive::ArchiveKind for ContentGradedKind {
+            const LABEL: &'static str = "test archive";
+            const CONTENT_TYPE: &'static str = "application/zip";
+            fn requested(&self) -> String {
+                "test@1.0.0".to_string()
+            }
+            fn identity(
+                &self,
+                _filename: &str,
+                _bytes: &Bytes,
+            ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
+                crate::api::handlers::proxy_scan_archive::ArchiveIdentity::ContentGraded
+            }
+        }
+        async fn open(
+            state: &crate::api::SharedState,
+            storage: &dyn crate::storage::StorageBackend,
+            row: &StoredRow<'_>,
+        ) -> Result<Option<&'static str>, StatusCode> {
+            open_stored_row(state, storage, row, ContentGradedKind)
+                .await
+                .map(|body| body.scan)
+                .map_err(|resp| resp.status())
+        }
+
+        // Scanning off: streamed as before, no X-AK-Scan.
+        let off = open(&state, storage.as_ref(), &row).await;
+        let off_buffered =
+            gate_stored_content(&state, &repo, "v1.0.0.zip", &bytes, ContentGradedKind)
+                .await
+                .map_err(|r| r.status());
+
+        // Fail-open with no verdict: served pending (scanned in the background).
+        tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
+        let open_pending = open(&state, storage.as_ref(), &row).await;
+
+        // Fail-closed with no verdict and no scanner: withheld.
+        sqlx::query(
+            "UPDATE scan_configs SET proxy_scan_action = 'fail_closed' WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let closed_locked = open(&state, storage.as_ref(), &row).await;
+
+        // A stored blocking verdict for the row's bytes: refused.
+        let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, true).await;
+        let blocked = open(&state, storage.as_ref(), &row).await;
+        let blocked_buffered =
+            gate_stored_content(&state, &repo, "v1.0.0.zip", &bytes, ContentGradedKind)
+                .await
+                .map_err(|r| r.status());
+
+        // Over the scan cap under fail-closed: withheld without reading it.
+        let huge = StoredRow {
+            size_bytes: crate::services::scanner_service::PROXY_SCAN_MAX_BYTES as i64 + 1,
+            ..row
+        };
+        let over_cap = open(&state, storage.as_ref(), &huge).await;
+
+        tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;
+        let _ = sqlx::query(
+            "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(off, Ok(None));
+        assert_eq!(off_buffered, Ok(None));
+        assert_eq!(open_pending, Ok(Some("pending")));
+        assert_eq!(closed_locked, Err(StatusCode::LOCKED));
+        assert_eq!(blocked, Err(StatusCode::FORBIDDEN));
+        assert_eq!(blocked_buffered, Err(StatusCode::FORBIDDEN));
+        assert_eq!(over_cap, Err(StatusCode::LOCKED));
+    }
+
+    /// What the proxy cache holds for the request's path after a pull
+    /// (#4514): `(sidecar digest, body present, catalog rows)`.
+    async fn cache_state(fx: &tdh::Fixture, proxy: &ProxyService) -> (Option<String>, bool, i64) {
+        const PATH: &str = "files/pkg-1.0.fake";
+        let sidecar = proxy
+            .get_cache_metadata(&fx.repo_key, PATH)
+            .await
+            .unwrap()
+            .map(|m| m.checksum_sha256);
+        let content_key =
+            ProxyService::cache_storage_key(proxy.cache_scope(), &fx.repo_key, PATH).unwrap();
+        let body = proxy
+            .cache_storage_backend()
+            .exists(&content_key)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(PATH)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        (sidecar, body, rows)
+    }
+
+    async fn upstream_hits(upstream: &wiremock::MockServer) -> usize {
+        upstream.received_requests().await.unwrap_or_default().len()
+    }
+
+    /// #4514: a fill the gate serves is committed to the proxy cache, and the
+    /// next pull is answered from it.
+    #[tokio::test]
+    async fn served_fill_is_committed_after_the_gate_4514() {
+        let bytes = format!("fake-4514-served-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        for _ in 0..2 {
+            let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let (sidecar, body, _) = cache_state(&fx, &proxy).await;
+        let hits = upstream_hits(&upstream).await;
+        fx.teardown().await;
+        assert_eq!(sidecar.as_deref(), Some(digest.as_str()));
+        assert!(body, "a served fill is cached");
+        assert_eq!(hits, 1, "the second pull is a cache hit");
+    }
+
+    /// #4514: a fill refused on a blocking verdict is still committed, so it
+    /// stays listed, counted and rescannable; the next pull is refused from
+    /// the cached copy without asking the upstream again.
+    #[tokio::test]
+    async fn blocked_fill_is_cached_and_refused_4514() {
+        let bytes = format!("fake-4514-blocked-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        seed_vulnerable(&fx, &digest, "critical").await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+                .await
+                .unwrap_err();
+            statuses.push(resp.status());
+        }
+        let (sidecar, body, rows) = cache_state(&fx, &proxy).await;
+        let hits = upstream_hits(&upstream).await;
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+        assert_eq!(statuses, [StatusCode::FORBIDDEN, StatusCode::FORBIDDEN]);
+        assert_eq!(sidecar.as_deref(), Some(digest.as_str()));
+        assert!(body, "a blocked body stays cached");
+        assert_eq!(rows, 1, "and listed");
+        assert_eq!(hits, 1, "the second refusal is decided on the cached copy");
+    }
+
+    /// #4514: under fail-closed an inconclusive fill (`423`) leaves nothing
+    /// in the proxy cache, not even a sidecar.
+    #[tokio::test]
+    async fn locked_fill_is_not_cached_4514() {
+        let bytes = format!("fake-4514-locked-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let resp = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        let state_after = cache_state(&fx, &proxy).await;
+        fx.teardown().await;
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert_eq!(state_after, (None, false, 0));
+    }
+
+    /// #4514: concurrent fail-closed pulls of a file that is inconclusive
+    /// each wait at most once on another pull's held fill, so every one of
+    /// them answers 423 (none runs into the hydration deadline), and nothing
+    /// is cached.
+    #[tokio::test]
+    async fn concurrent_locked_pulls_all_answer_423_4514() {
+        let bytes = format!("fake-4514-concurrent-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailClosed);
+        let pulls = futures::future::join_all(
+            (0..4).map(|_| serve_scanned_proxy_file(&state, &proxy, &req, &file)),
+        );
+        let statuses: Vec<StatusCode> =
+            tokio::time::timeout(std::time::Duration::from_secs(60), pulls)
+                .await
+                .expect("concurrent pulls finish well inside the hydration wait")
+                .into_iter()
+                .map(|r| r.map(|ok| ok.status()).unwrap_or_else(|e| e.status()))
+                .collect();
+        let state_after = cache_state(&fx, &proxy).await;
+        fx.teardown().await;
+        assert_eq!(statuses, vec![StatusCode::LOCKED; 4]);
+        assert_eq!(state_after, (None, false, 0));
+    }
+
+    /// #4514: a body cached before its blocking verdict existed (here, a
+    /// fail-open pull whose verdict arrives later) is refused on its next
+    /// pull from the cached copy, which stays in the cache.
+    #[tokio::test]
+    async fn blocked_warm_entry_is_refused_and_kept_4514() {
+        let bytes = format!("fake-4514-warm-{}", Uuid::new_v4()).into_bytes();
+        let digest = sha256_hex(&Bytes::from(bytes.clone()));
+        let Some((fx, state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+        let req = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let served = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+        let warm = cache_state(&fx, &proxy).await;
+
+        seed_vulnerable(&fx, &digest, "critical").await;
+        let refused = serve_scanned_proxy_file(&state, &proxy, &req, &file)
+            .await
+            .unwrap_err();
+        let (sidecar, body, rows) = cache_state(&fx, &proxy).await;
+        let hits = upstream_hits(&upstream).await;
+        cleanup_verdict(&fx, &digest).await;
+        fx.teardown().await;
+
+        assert!(warm.1, "the fail-open pull was cached");
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(hits, 1, "the refusal was decided on the cached bytes");
+        assert_eq!(sidecar.as_deref(), Some(digest.as_str()));
+        assert!(body, "the refused body is not evicted");
+        assert_eq!(rows, 1, "nor its catalog row");
     }
 
     /// Over the cap, the fail-open stream is recorded exactly once and the
@@ -14064,6 +14750,126 @@ mod tests {
                 .is_none()
         );
         assert!(redirect(&unsigned, PATH, &get_ctx()).await.is_none());
+    }
+
+    /// #4514: the package-file redirect fast paths of a Remote that scans on
+    /// proxy consult the verdict stored for the cached body's digest. A
+    /// refusing verdict is the scan gate's 403 (the PyPI helper declines);
+    /// under fail-closed, a body with no reusable clean verdict is not
+    /// redirected to. DB-backed.
+    #[tokio::test]
+    async fn package_redirects_consult_the_stored_scan_verdict_4514() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::StorageBackend;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let scope = scoped_test_scope();
+        let (proxy, backend) = tdh::build_scoped_presign_proxy(pool.clone(), scope.clone());
+        let (repo_id, repo_key, _dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = tdh::build_state_with_proxy_presigned(
+            pool.clone(),
+            dir.path().to_str().unwrap(),
+            proxy.clone(),
+        );
+        let path = "simple/foo/foo-1.0-py3-none-any.whl";
+        let digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let content_key = ProxyService::cache_storage_key(&scope, &repo_key, path).unwrap();
+        let meta_key = ProxyService::cache_metadata_key(&scope, &repo_key, path).unwrap();
+        backend.seed_fresh_entry(&content_key, &meta_key);
+        let mut sidecar: crate::services::proxy_service::CacheMetadata =
+            serde_json::from_slice(&tdh::fresh_cache_sidecar_bytes()).unwrap();
+        sidecar.checksum_sha256 = digest.clone();
+        backend
+            .put(
+                &meta_key,
+                Bytes::from(serde_json::to_vec(&sidecar).unwrap()),
+            )
+            .await
+            .unwrap();
+        let ctx = get_ctx();
+        let redirect = || async {
+            proxy_cache_fresh_redirect(proxy.as_ref(), state.as_ref(), &repo_key, path, &ctx).await
+        };
+        let set_action = |action: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE scan_configs SET proxy_scan_action = $2 WHERE repository_id = $1",
+                )
+                .bind(repo_id)
+                .bind(action)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        // Scanning off: redirected as before.
+        assert!(matches!(redirect().await, Ok(Some(_))));
+
+        // Fail-open with no verdict: the buffered gate would serve it pending.
+        tdh::enable_proxy_scan(&pool, repo_id, "fail_open").await;
+        assert!(matches!(redirect().await, Ok(Some(_))));
+
+        // Fail-closed with no verdict: declined, so a gated route reads it.
+        set_action("fail_closed").await;
+        assert!(matches!(redirect().await, Ok(None)));
+
+        // A stored vulnerable verdict: the scan gate's own 403 on the shared
+        // redirect helper, a declined PyPI redirect, under either enforcing
+        // action.
+        crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+            .record_verdict(
+                &digest,
+                PROXY_SCAN_TYPE,
+                crate::services::proxy_scan_service::VERDICT_VULNERABLE,
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-test"),
+                Some(repo_id),
+            )
+            .await
+            .unwrap();
+        for action in ["fail_closed", "fail_open"] {
+            set_action(action).await;
+            let refused = redirect().await.expect_err("a blocked body is refused");
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{action}");
+            let body = axum::body::to_bytes(refused.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("scan_blocked"),
+                "{action}"
+            );
+
+            // The PyPI distribution redirect declines it.
+            assert!(
+                !cache_scan_allows_redirect(state.as_ref(), proxy.as_ref(), &repo_key, path).await,
+                "{action}"
+            );
+        }
+
+        // Record-only never refuses.
+        set_action("record_only").await;
+        assert!(matches!(redirect().await, Ok(Some(_))));
+
+        let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+            .bind(&digest)
+            .execute(&pool)
+            .await;
+        for sql in [
+            "DELETE FROM audit_log WHERE action = 'PROXY_SCAN_BLOCKED' AND resource_id = $1",
+            "DELETE FROM scan_configs WHERE repository_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sql).bind(repo_id).execute(&pool).await;
+        }
     }
 
     /// `record_proxy_download` (proxy_helpers.rs) persists a catalog placeholder
@@ -24712,6 +25518,13 @@ mod proxy_download_recording_tests {
                 1,
             ),
             ("pypi.rs", "serve_file", "serve_scanned_pypi_file(", 2),
+            // The age gate's last-known-good substitute (#5075).
+            (
+                "pypi.rs",
+                "enforce_pypi_download_age_gate",
+                "serve_scanned_pypi_file(",
+                1,
+            ),
             (
                 "pypi.rs",
                 "serve_scanned_pypi_file",

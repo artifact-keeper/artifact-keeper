@@ -424,6 +424,14 @@ pub fn validate_no_proxy(no_proxy: &str) -> Result<()> {
 ///
 /// [`http_client::base_client_builder`]: crate::services::http_client::base_client_builder
 pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> {
+    repo_client_builder(config)?
+        .build()
+        .map_err(|e| AppError::Internal(format!("Failed to build egress-proxy HTTP client: {e}")))
+}
+
+/// The [`reqwest::ClientBuilder`] behind [`build_repo_client`], for a caller
+/// that adds its own settings (a client-wide timeout) before building.
+pub fn repo_client_builder(config: &EgressProxyConfig) -> Result<reqwest::ClientBuilder> {
     let mut builder = crate::services::http_client::base_client_builder();
 
     match config.mode {
@@ -482,9 +490,7 @@ pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> 
         }
     }
 
-    builder
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build egress-proxy HTTP client: {e}")))
+    Ok(builder)
 }
 
 /// Re-apply the destination SSRF check that routing through a proxy would

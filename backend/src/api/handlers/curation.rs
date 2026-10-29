@@ -2169,9 +2169,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        // Point the remote at an address that refuses instantly so the sync pass
-        // fails fast (connection refused) instead of waiting on a DNS/HTTP
-        // timeout — the trigger's authz + audit behavior is what this asserts.
+        // Point the remote at a loopback address: the sync pass skips it
+        // without a request (the upstream URL validation refuses loopback), so
+        // it never waits on a DNS/HTTP timeout. The trigger's authz + audit
+        // behavior is what this asserts.
         sqlx::query("UPDATE repositories SET upstream_url = 'http://127.0.0.1:1' WHERE id = $1")
             .bind(remote)
             .execute(&pool)

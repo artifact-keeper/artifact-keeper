@@ -1102,6 +1102,9 @@ fn api_v1_routes(
                 // Per-Remote proxy-cache cap and usage (#4660):
                 // GET/PUT/DELETE /repositories/{key}/proxy-cache-cap.
                 .merge(handlers::proxy_cache_cap::repo_router())
+                // Precomputed RPM repodata (#4544):
+                // POST /repositories/{key}/rpm/repodata/rebuild.
+                .merge(handlers::rpm::repo_router())
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).

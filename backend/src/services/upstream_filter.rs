@@ -28,8 +28,13 @@
 //! path: the npm `/-/` passthroughs (search, attestations, ping, and the rest
 //! of the meta namespace) and npm audit apply the filter to the wire path they
 //! would send (`-/v1/search?text=...`, `-/npm/v1/security/advisories/bulk`)
-//! through [`upstream_allows`] since 1.12.0 (#840). Not filtered yet: the
-//! curation upstream sync, change feeds and the admin `test-upstream` probe.
+//! through [`upstream_allows`] since 1.12.0 (#840). So does the curation
+//! upstream sync — the RPM and Debian index walks, and the PyPI attestation
+//! enrichment's JSON, provenance and distribution fetches — and the admin
+//! `test-upstream` probe, which requests the upstream root (subject: the empty
+//! path). The npm upstream change feed is the one remaining upstream contact
+//! outside this gate: it is a single global subscription, not a per-repository
+//! fetch, so it has no subject to match.
 //!
 //! # Enforcement
 //!
@@ -393,6 +398,17 @@ async fn compiled_filter(db: &PgPool, repo_id: Uuid) -> Result<CachedFilter> {
     Ok(compiled)
 }
 
+/// The compiled filter for the Remote `repo_id`, for callers that test many
+/// subjects in memory (#840: the curation sync filtering a parsed index) instead
+/// of one async lookup per subject. `Ok(None)` means "no filter configured"; a
+/// read error is returned, never treated as "no filter".
+pub async fn compiled_upstream_filter(
+    db: &PgPool,
+    repo_id: Uuid,
+) -> Result<Option<Arc<CompiledUpstreamFilter>>> {
+    compiled_filter(db, repo_id).await
+}
+
 /// Pure decision used by [`ensure_upstream_allowed`]: `Err(NotFound)` when the
 /// filter refuses the fetch.
 fn check_filter(
@@ -435,8 +451,9 @@ pub async fn ensure_upstream_allowed(
 
 /// [`ensure_upstream_allowed`] as a yes/no for callers that contact the
 /// upstream outside `ProxyService` (#840: the npm `/-/` passthroughs and npm
-/// audit). A refused path is `Ok(false)`; a failure to read the filter is an
-/// error, never an admission, as on the proxy path.
+/// audit, and the curation upstream sync). A refused path is `Ok(false)`; a
+/// failure to read the filter is an error, never an admission, as on the proxy
+/// path.
 pub async fn upstream_allows(
     db: &PgPool,
     repo_id: Uuid,

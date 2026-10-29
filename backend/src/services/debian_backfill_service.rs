@@ -39,6 +39,7 @@
 //! - One backfill per repository at a time (advisory lock). Each package is
 //!   its own short statement or transaction; no table lock is taken.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -183,6 +184,8 @@ impl DebianBackfillService {
 
         let mut cursor = after.unwrap_or_else(Uuid::nil);
         let mut examined = 0u64;
+        // Dry run only: destinations this call would have moved a row into.
+        let mut dry_run_moves: HashMap<String, String> = HashMap::new();
         'walk: loop {
             let rows: Vec<Candidate> = sqlx::query_as(
                 r#"
@@ -250,10 +253,21 @@ impl DebianBackfillService {
                 };
 
                 if dry_run {
-                    result.packages_registered += 1;
+                    // Check the destination the way the real run's move
+                    // does, so a taken destination is reported as a failure
+                    // here too instead of as a registration.
                     if relocate {
+                        if let Err(reason) = self
+                            .dry_run_destination(repo.id, &row, &target_path, &mut dry_run_moves)
+                            .await
+                        {
+                            result.artifacts_failed += 1;
+                            push_sample(&mut result.errors, &format!("{}: {reason}", row.path));
+                            continue;
+                        }
                         result.packages_relocated += 1;
                     }
+                    result.packages_registered += 1;
                     push_sample(&mut result.registered_paths, &target_path);
                     continue;
                 }
@@ -334,7 +348,10 @@ impl DebianBackfillService {
         .await
         .map_err(db_err)?;
 
-        let outcome = match existing {
+        let existing = existing
+            .as_ref()
+            .map(|(id, deleted, checksum)| (*id, *deleted, checksum.as_str()));
+        let outcome = match destination_verdict(existing, &row.checksum_sha256, target_path)? {
             None => {
                 let moved = sqlx::query(
                     "UPDATE artifacts SET path = $3, updated_at = NOW() \
@@ -352,7 +369,7 @@ impl DebianBackfillService {
                 }
                 Relocated::Moved
             }
-            Some((id, false, checksum)) if checksum.trim() == row.checksum_sha256.trim() => {
+            Some(id) => {
                 sqlx::query(
                     "UPDATE artifacts SET is_deleted = true, updated_at = NOW() \
                      WHERE id = $1 AND repository_id = $2",
@@ -364,20 +381,51 @@ impl DebianBackfillService {
                 .map_err(db_err)?;
                 Relocated::MergedInto(id)
             }
-            Some((_, false, _)) => {
-                return Err(format!(
-                    "belongs under {target_path}, which holds a different package"
-                ));
-            }
-            Some((_, true, _)) => {
-                return Err(format!(
-                    "belongs under {target_path}, which holds a deleted row; \
-                     purge it from the trash and run the backfill again"
-                ));
-            }
         };
         tx.commit().await.map_err(db_err)?;
         Ok(outcome)
+    }
+
+    /// The dry-run counterpart of [`Self::relocate`]: read the destination
+    /// (no lock, no write) and apply the same verdict. `planned` holds the
+    /// destinations earlier candidates of this dry run would have moved into,
+    /// with their checksums, so two misfiled rows aimed at one destination are
+    /// judged as the real run would judge them.
+    async fn dry_run_destination(
+        &self,
+        repo_id: Uuid,
+        row: &Candidate,
+        target_path: &str,
+        planned: &mut HashMap<String, String>,
+    ) -> std::result::Result<(), String> {
+        let verdict = if let Some(checksum) = planned.get(target_path) {
+            destination_verdict(
+                Some((row.id, false, checksum.as_str())),
+                &row.checksum_sha256,
+                target_path,
+            )?
+        } else {
+            let existing: Option<(Uuid, bool, String)> = sqlx::query_as(
+                "SELECT id, is_deleted, checksum_sha256 FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo_id)
+            .bind(target_path)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| format!("could not check {target_path}: {e}"))?;
+            destination_verdict(
+                existing
+                    .as_ref()
+                    .map(|(id, deleted, checksum)| (*id, *deleted, checksum.as_str())),
+                &row.checksum_sha256,
+                target_path,
+            )?
+        };
+        if verdict.is_none() {
+            planned.insert(target_path.to_string(), row.checksum_sha256.clone());
+        }
+        Ok(())
     }
 
     /// Drop the source's `dists/` copies from the artifact list. On a hosted
@@ -410,6 +458,28 @@ impl DebianBackfillService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .rows_affected();
         Ok(removed)
+    }
+}
+
+/// What moving a package with `checksum` to `target_path` does, given the
+/// row (id, is_deleted, checksum) that holds the destination now: `None`, the
+/// destination is free and the row moves; `Some(id)`, a live row with the same
+/// bytes keeps the package; `Err`, the move is refused with the reason.
+fn destination_verdict(
+    existing: Option<(Uuid, bool, &str)>,
+    checksum: &str,
+    target_path: &str,
+) -> std::result::Result<Option<Uuid>, String> {
+    match existing {
+        None => Ok(None),
+        Some((id, false, theirs)) if theirs.trim() == checksum.trim() => Ok(Some(id)),
+        Some((_, false, _)) => Err(format!(
+            "belongs under {target_path}, which holds a different package"
+        )),
+        Some((_, true, _)) => Err(format!(
+            "belongs under {target_path}, which holds a deleted row; \
+             purge it from the trash and run the backfill again"
+        )),
     }
 }
 
@@ -875,12 +945,64 @@ mod tests {
             .expect("trash row");
         let behind_trash = seed("pool/t/trash/trash_1.0_amd64.deb", "trash", "x").await;
 
+        // A second misfiled copy aimed at the same free destination as a
+        // first one, with different bytes: the first moves, the second is
+        // refused (the dry run must judge it against the planned move).
+        seed("pool/p/pair/pair_1.0_amd64.deb", "pair", "first").await;
+        seed("p/pair/pair_1.0_amd64.deb", "pair", "second").await;
+        assert_eq!(
+            crate::services::migration_worker::debian_destination_path(
+                "pool/p/pair/pair_1.0_amd64.deb",
+                None
+            ),
+            crate::services::migration_worker::debian_destination_path(
+                "p/pair/pair_1.0_amd64.deb",
+                None
+            ),
+            "both copies are aimed at one destination"
+        );
+
         let service = DebianBackfillService::new(f.pool.clone(), f.state.storage_registry.clone());
+        // The dry run checks each move's destination, so it reports the same
+        // counts and refusals as the real run below and writes nothing.
+        let dry = service
+            .backfill(&repo, true, 100, None)
+            .await
+            .expect("dry run succeeds");
+        let expected_failed = 3;
+        assert_eq!(dry.artifacts_failed, expected_failed, "{:?}", dry.errors);
+        assert!(
+            dry.errors
+                .iter()
+                .any(|e| e.contains("clash_1.0_amd64.deb") && e.contains("different package")),
+            "{:?}",
+            dry.errors
+        );
+        assert!(
+            dry.errors
+                .iter()
+                .any(|e| e.contains("trash_1.0_amd64.deb") && e.contains("deleted row")),
+            "{:?}",
+            dry.errors
+        );
+        assert_eq!(
+            artifact_path(&f.pool, clash).await,
+            "pool/c/clash/clash_1.0_amd64.deb"
+        );
+        assert!(!is_deleted(&f.pool, dup).await, "a dry run retires nothing");
+
         let result = service
             .backfill(&repo, false, 100, None)
             .await
             .expect("backfill succeeds");
-        assert_eq!(result.artifacts_failed, 2, "{:?}", result.errors);
+        assert_eq!(
+            result.artifacts_failed, expected_failed,
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(dry.packages_registered, result.packages_registered);
+        assert_eq!(dry.packages_relocated, result.packages_relocated);
+        assert_eq!(dry.errors, result.errors);
         assert!(
             result
                 .errors
