@@ -3673,8 +3673,10 @@ async fn get_package_metadata(
 /// For remote and virtual repos the full packument is fetched from upstream
 /// (or the first matching member) and parsed as JSON. For local/staging repos
 /// the packument is built from stored artifacts. In either case the
-/// `versions[version]` object is extracted and returned. Returns 404 when
-/// the package exists but does not contain the requested version.
+/// `versions[version]` object is extracted and returned. `version` may also
+/// name a dist-tag (`latest`, `next`, ...), as on the npm registry: it is
+/// resolved through the packument's `dist-tags` ([`resolve_npm_version_segment`]).
+/// Returns 404 when the package exists but has no such version or tag.
 async fn get_package_version_metadata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -3695,14 +3697,16 @@ async fn get_package_version_metadata(
         if artifacts.is_empty() {
             return Err(AppError::NotFound("Package not found".to_string()).into_response());
         }
-        // Version extraction ignores dist-tags; pass an empty map.
-        // Always build the full packument here so the version can be extracted.
+        // The stored dist-tags let a tag name resolve (#5063); the builder
+        // still derives `latest` when none is stored. Always build the full
+        // packument here so the version can be extracted.
+        let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
         let resp = build_npm_metadata_response(
             &artifacts,
             package_name,
             base_url,
             repo_key,
-            &serde_json::Map::new(),
+            &dist_tags,
             false,
         )?;
         #[allow(clippy::disallowed_methods)]
@@ -3717,18 +3721,17 @@ async fn get_package_version_metadata(
         })?
     };
 
-    // Extract the requested version from the packument.
-    let version_obj = packument
-        .get("versions")
-        .and_then(|v| v.get(version))
-        .cloned()
-        .ok_or_else(|| {
+    // Extract the requested version (or the version a dist-tag names) from
+    // the packument.
+    let (version, version_obj) =
+        resolve_npm_version_segment(&packument, version).ok_or_else(|| {
             AppError::NotFound(format!(
                 "Version '{}' not found for package '{}'",
                 version, package_name
             ))
             .into_response()
         })?;
+    let version = version.as_str();
 
     // #2955 on-demand curation ingestion: when a proxy first serves an npm
     // version doc, enqueue a pending curation row for any staging repo curating
@@ -3757,6 +3760,25 @@ async fn get_package_version_metadata(
     Ok(build_json_metadata_response(
         serde_json::to_string(&version_obj).unwrap(),
     ))
+}
+
+/// The version document a version-route segment names in `packument`: the
+/// `versions` entry of that exact key, else the entry the `dist-tags` tag of
+/// that name points at (`GET /npm/{repo}/{pkg}/latest`, #5063). An exact
+/// version wins over a tag of the same name. Returns the resolved version and
+/// its document, or `None` when neither names a listed version.
+fn resolve_npm_version_segment(
+    packument: &serde_json::Value,
+    segment: &str,
+) -> Option<(String, serde_json::Value)> {
+    let versions = packument.get("versions")?;
+    if let Some(doc) = versions.get(segment) {
+        return Some((segment.to_string(), doc.clone()));
+    }
+    let target = packument.get("dist-tags")?.get(segment)?.as_str()?;
+    versions
+        .get(target)
+        .map(|doc| (target.to_string(), doc.clone()))
 }
 
 /// Fetch the full packument JSON from a remote repository's upstream.
@@ -13783,6 +13805,205 @@ mod tests {
         assert_eq!(scalar, serde_json::json!("not an object"));
         merge_packument_into(&mut acc, serde_json::json!(42));
         assert!(acc["versions"].get("2.0.0").is_some());
+    }
+
+    /// #5063: the version route resolves a dist-tag when no version of that
+    /// name exists; an exact version wins over a tag of the same name.
+    #[test]
+    fn resolve_npm_version_segment_takes_a_version_then_a_dist_tag_5063() {
+        let packument = serde_json::json!({
+            "versions": {"1.0.0": {"version": "1.0.0"}, "2.0.0": {"version": "2.0.0"}},
+            "dist-tags": {"latest": "1.0.0", "next": "2.0.0", "1.0.0": "2.0.0",
+                          "gone": "9.9.9", "odd": 7}
+        });
+        let resolve = |seg: &str| resolve_npm_version_segment(&packument, seg).map(|(v, _)| v);
+        assert_eq!(resolve("latest").as_deref(), Some("1.0.0"));
+        assert_eq!(resolve("next").as_deref(), Some("2.0.0"));
+        assert_eq!(resolve("2.0.0").as_deref(), Some("2.0.0"));
+        assert_eq!(
+            resolve("1.0.0").as_deref(),
+            Some("1.0.0"),
+            "an exact version wins over a tag of the same name"
+        );
+        let (_, doc) = resolve_npm_version_segment(&packument, "next").unwrap();
+        assert_eq!(doc["version"], "2.0.0");
+        assert_eq!(resolve("nope"), None, "unknown tag");
+        assert_eq!(resolve("gone"), None, "tag naming an unlisted version");
+        assert_eq!(resolve("odd"), None, "non-string tag value");
+        assert_eq!(
+            resolve_npm_version_segment(&serde_json::json!({"versions": {}}), "latest"),
+            None,
+            "no dist-tags at all"
+        );
+    }
+
+    /// Call the version route and return `(status, version document)`.
+    async fn version_route_5063(
+        state: &SharedState,
+        repo_key: &str,
+        package: &str,
+        segment: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = match super::get_package_version_metadata(
+            state,
+            None,
+            repo_key,
+            package,
+            segment,
+            "http://localhost",
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r,
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The upstream packument the Remote and Virtual #5063 cases serve:
+    /// `latest` -> 1.0.0, `beta` -> 2.0.0-beta.1.
+    async fn mount_dist_tag_upstream_5063(upstream: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let base = upstream.uri();
+        let doc = |v: &str| {
+            serde_json::json!({"name": "tagged-pkg", "version": v,
+                "dist": {"tarball": format!("{base}/tagged-pkg/-/tagged-pkg-{v}.tgz"),
+                         "shasum": "0000000000000000000000000000000000000000"}})
+        };
+        Mock::given(method("GET"))
+            .and(path("/tagged-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "tagged-pkg",
+                "dist-tags": {"latest": "1.0.0", "beta": "2.0.0-beta.1"},
+                "versions": {"1.0.0": doc("1.0.0"), "2.0.0-beta.1": doc("2.0.0-beta.1")}
+            })))
+            .mount(upstream)
+            .await;
+    }
+
+    /// Assert the #5063 cases against a repository serving `tagged-pkg` with
+    /// `latest` -> `latest_version` and `custom` -> `custom_version`.
+    async fn assert_dist_tag_routes_5063(
+        state: &SharedState,
+        repo_key: &str,
+        custom: &str,
+        latest_version: &str,
+        custom_version: &str,
+    ) {
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", "latest").await;
+        assert_eq!(status, StatusCode::OK, "latest: {doc}");
+        assert_eq!(doc["version"], latest_version, "latest: {doc}");
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", custom).await;
+        assert_eq!(status, StatusCode::OK, "{custom}: {doc}");
+        assert_eq!(doc["version"], custom_version, "{custom}: {doc}");
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", latest_version).await;
+        assert_eq!(status, StatusCode::OK, "exact version: {doc}");
+        assert_eq!(doc["version"], latest_version);
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", "no-such-tag").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown tag: {doc}");
+    }
+
+    /// #5063, Local: `latest` (derived) and a stored custom tag resolve on
+    /// the version route; an exact version beats a tag of the same name.
+    #[tokio::test]
+    async fn local_version_route_resolves_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        for ver in ["1.0.0", "1.1.0", "2.0.0-rc.1"] {
+            let path = format!("tagged-pkg/{ver}/tagged-pkg-{ver}.tgz");
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &format!("npm/{path}"),
+                &path,
+                "tagged-pkg",
+                ver,
+                "application/gzip",
+                Bytes::from_static(b"tgz"),
+                fx.user_id,
+            )
+            .await;
+        }
+        sqlx::query("INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3)")
+            .bind(fx.repo_id)
+            .bind("tagged-pkg")
+            .bind(serde_json::json!({"next": "2.0.0-rc.1", "1.0.0": "1.1.0"}))
+            .execute(&fx.pool)
+            .await
+            .expect("seed npm_dist_tags");
+        let state = fx.state.clone();
+        let key = fx.repo_key.clone();
+        let (status, exact) = version_route_5063(&state, &key, "tagged-pkg", "1.0.0").await;
+        // `latest` is derived (highest stable) since none is stored.
+        let checks = async {
+            assert_dist_tag_routes_5063(&state, &key, "next", "1.1.0", "2.0.0-rc.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK, "{exact}");
+        assert_eq!(
+            exact["version"], "1.0.0",
+            "an exact version wins over a tag of the same name: {exact}"
+        );
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, Remote: the upstream packument's `dist-tags` resolve.
+    #[tokio::test]
+    async fn remote_version_route_resolves_dist_tags_5063() {
+        let upstream = wiremock::MockServer::start().await;
+        mount_dist_tag_upstream_5063(&upstream).await;
+        let Some((fx, state)) = remote_on(&upstream).await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let checks = async {
+            assert_dist_tag_routes_5063(&state, &key, "beta", "1.0.0", "2.0.0-beta.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, Virtual: the merged packument's `dist-tags` resolve.
+    #[tokio::test]
+    async fn virtual_version_route_resolves_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_dist_tag_upstream_5063(&upstream).await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        attach_public_remote(&fx, remote_id, &upstream.uri(), 1).await;
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let key = fx.repo_key.clone();
+        let checks = async {
+            assert_dist_tag_routes_5063(&state, &key, "beta", "1.0.0", "2.0.0-beta.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// #1543 end-to-end: a custom dist-tag is served in the packument and
