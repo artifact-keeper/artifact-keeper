@@ -3836,6 +3836,12 @@ async fn npm_age_gated_tag_view(
             .map_err(IntoResponse::into_response)?;
         Ok(Some(view))
     } else if repo.repo_type == RepositoryType::Virtual {
+        // Without a gated member the gated merge equals the one already built.
+        if state.age_gate_service.is_none()
+            || !proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await
+        {
+            return Ok(None);
+        }
         Ok(Some(
             collect_virtual_packument(state, auth, repo, repo_key, package_name, base_url, true)
                 .await?,
@@ -14044,16 +14050,11 @@ mod tests {
         }
     }
 
-    /// #5063, age-gated Remote: a tag resolves against the gate's view, so
-    /// `latest` names the newest version old enough to download (the gate
-    /// moves it) and a tag naming a version still inside the window is 404.
-    /// An exact version is served as before.
-    #[tokio::test]
-    async fn age_gated_remote_version_route_resolves_gated_dist_tags_5063() {
-        use crate::api::handlers::test_db_helpers as tdh;
+    /// The upstream for the age-gated #5063 cases: `latest` and `fresh` name
+    /// 2.0.0, published now; `old` names 1.0.0, published in 2020.
+    async fn mount_gated_upstream_5063(upstream: &wiremock::MockServer) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
-        let upstream = wiremock::MockServer::start().await;
         let base = upstream.uri();
         let doc = |v: &str| {
             serde_json::json!({"name": "gated-pkg", "version": v,
@@ -14069,8 +14070,73 @@ mod tests {
                 "versions": {"1.0.0": doc("1.0.0"), "2.0.0": doc("2.0.0")},
                 "time": {"1.0.0": "2020-01-01T00:00:00.000Z", "2.0.0": fresh}
             })))
-            .mount(&upstream)
+            .mount(upstream)
             .await;
+    }
+
+    /// The gated #5063 assertions against `repo_key`.
+    async fn assert_gated_dist_tag_routes_5063(state: &SharedState, key: &str) {
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "latest").await;
+        assert_eq!(status, StatusCode::OK, "latest: {doc}");
+        assert_eq!(doc["version"], "1.0.0", "gate moves latest: {doc}");
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "old").await;
+        assert_eq!(status, StatusCode::OK, "old: {doc}");
+        assert_eq!(doc["version"], "1.0.0");
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "fresh").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "tag naming a gated version: {doc}"
+        );
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "2.0.0").await;
+        assert_eq!(status, StatusCode::OK, "exact version as before: {doc}");
+        assert_eq!(doc["version"], "2.0.0");
+    }
+
+    /// #5063, Virtual over an age-gated Remote member: the same as the
+    /// gated Remote case, through the gated merge.
+    #[tokio::test]
+    async fn age_gated_virtual_version_route_resolves_gated_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_gated_upstream_5063(&upstream).await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        attach_public_remote(&fx, remote_id, &upstream.uri(), 1).await;
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 7, \
+             age_gate_mode = 'upstream_publish_time' WHERE id = $1",
+        )
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("gate the member");
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
+        let key = fx.repo_key.clone();
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            assert_gated_dist_tag_routes_5063(&state, &key),
+        ))
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, age-gated Remote: a tag resolves against the gate's view, so
+    /// `latest` names the newest version old enough to download (the gate
+    /// moves it) and a tag naming a version still inside the window is 404.
+    /// An exact version is served as before.
+    #[tokio::test]
+    async fn age_gated_remote_version_route_resolves_gated_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let upstream = wiremock::MockServer::start().await;
+        mount_gated_upstream_5063(&upstream).await;
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
@@ -14087,23 +14153,7 @@ mod tests {
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
         let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
         let key = fx.repo_key.clone();
-        let checks = async {
-            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "latest").await;
-            assert_eq!(status, StatusCode::OK, "latest: {doc}");
-            assert_eq!(doc["version"], "1.0.0", "gate moves latest: {doc}");
-            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "old").await;
-            assert_eq!(status, StatusCode::OK, "old: {doc}");
-            assert_eq!(doc["version"], "1.0.0");
-            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "fresh").await;
-            assert_eq!(
-                status,
-                StatusCode::NOT_FOUND,
-                "tag naming a gated version: {doc}"
-            );
-            let (status, doc) = version_route_5063(&state, &key, "gated-pkg", "2.0.0").await;
-            assert_eq!(status, StatusCode::OK, "exact version as before: {doc}");
-            assert_eq!(doc["version"], "2.0.0");
-        };
+        let checks = assert_gated_dist_tag_routes_5063(&state, &key);
         let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
         fx.teardown().await;
         if let Err(panic) = outcome {
