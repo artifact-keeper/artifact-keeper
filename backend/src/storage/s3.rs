@@ -191,10 +191,10 @@ async fn collect_finished_s3_part(
             parts.push(part);
             Ok(())
         }
-        Ok(Err(e)) => Err(AppError::Storage(format!(
-            "Multipart upload part failed for '{}': {}",
-            key, e
-        ))),
+        Ok(Err(e)) => Err(s3_storage_error(
+            format!("Multipart upload part failed for '{}'", key),
+            &e,
+        )),
         Err(e) => Err(AppError::Storage(format!(
             "Multipart upload task failed for '{}': {}",
             key, e
@@ -2451,7 +2451,7 @@ impl super::StorageBackend for S3Backend {
 
         let stream = result
             .into_stream()
-            .map(|r| r.map_err(|e| AppError::Storage(format!("Stream read error: {}", e))));
+            .map(|r| r.map_err(|e| s3_storage_error("Stream read error", &e)));
 
         Ok(Box::pin(stream))
     }
@@ -2752,7 +2752,7 @@ impl S3Backend {
                     );
                 }
                 Err(e) => {
-                    return Err(AppError::Storage(format!("Failed to list objects: {}", e)));
+                    return Err(s3_storage_error("Failed to list objects", &e));
                 }
             }
         }
@@ -2812,7 +2812,7 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to build a bucket URL for the S3 list fallback: {}",
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
         let root = bucket_root_url(&probe_url, S3_LIST_PROBE_SEGMENT);
@@ -2825,7 +2825,7 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to resolve S3 credentials for the list fallback: {}",
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
 
@@ -2868,7 +2868,10 @@ impl S3Backend {
                 send = send.timeout(timeout);
             }
             let response = send.send().await.map_err(|e| {
-                AppError::Storage(format!("Failed to list objects (REST fallback): {}", e))
+                AppError::Storage(format!(
+                    "Failed to list objects (REST fallback): {}",
+                    e.without_url()
+                ))
             })?;
 
             let status = response.status();
@@ -3002,7 +3005,7 @@ impl S3Backend {
                 AppError::Storage(format!(
                     "Failed to build copy URL for '{}': {}",
                     dest_path.as_ref(),
-                    e
+                    redact_urls_in_text(&e.to_string())
                 ))
             })
     }
@@ -3029,7 +3032,8 @@ impl S3Backend {
             .map_err(|e| {
                 AppError::Storage(format!(
                     "Failed to resolve S3 credentials for {}: {}",
-                    what, e
+                    what,
+                    redact_urls_in_text(&e.to_string())
                 ))
             })?;
 
@@ -3174,10 +3178,13 @@ impl S3Backend {
         let dest_path: ObjectPath = self.full_key(dest).into();
 
         let upload_id = self.store.create_multipart(&dest_path).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to start multipart copy of '{}' -> '{}': {}",
-                source, dest, e
-            ))
+            s3_storage_error(
+                format!(
+                    "Failed to start multipart copy of '{}' -> '{}'",
+                    source, dest
+                ),
+                &e,
+            )
         })?;
         // Aborts the upload if this future is dropped mid-copy, mirroring
         // `put_stream`; defused on completion or by the inline aborts below.
@@ -3293,10 +3300,10 @@ impl S3Backend {
                 "Storage key not found: {}",
                 key
             ))),
-            Err(e) => Err(AppError::Storage(format!(
-                "Failed to get size of '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(s3_storage_error(
+                format!("Failed to get size of '{}'", key),
+                &e,
+            )),
         }
     }
 
