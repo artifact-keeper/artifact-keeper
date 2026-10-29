@@ -148,6 +148,60 @@ before parsing, as the PEP 503 simple-index proxy does
 Small, bounded inputs (a single coordinate string, a short header) do not
 need offloading.
 
+## Declaring route authorization
+
+Every `/api/v1` operation is meant to declare what authorization it needs, in
+its `#[utoipa::path]` annotation. Nothing enforces the declaration yet: it is
+metadata that a CI guard checks, and the handler's own checks stay
+authoritative. The permission catalog (`backend/src/api/authz/catalog.rs`) is the
+only source of permission names.
+
+Declare exactly one of these forms:
+
+```rust
+#[utoipa::path(
+    put,
+    path = "/{key}/labels",
+    context_path = "/api/v1/repositories",
+    // A catalog permission on the resource named by a resolver:
+    extensions(
+        ("x-required-permission" = json!("repository.label.manage")),
+        ("x-resource" = json!("repo:key")),
+    ),
+    // ...
+)]
+// or, for an operation that needs a login but no permission, or none at all:
+//     extensions(("x-auth-requirement" = json!("authenticated")))
+//     extensions(("x-auth-requirement" = json!("public")))
+```
+
+- `x-required-permission` and `x-resource` always go together. The resolver
+  must be one of the closed set in `backend/src/api/authz/declaration.rs`
+  (`repo:key`, `artifact:id`, `project:id`, `group:id`, `instance`), and the
+  permission must be applicable at the resolver's scope (`project.read` cannot
+  be checked on a repository).
+- Unknown permissions, unknown resolvers, partial or conflicting declarations
+  fail the guard with the operation named.
+
+The guard test (`iam_route_guard::api_v1_declarations_match_the_live_router`,
+in `backend/src/api/routes.rs`) compares the declarations with the assembled
+router in both directions and requires the operations that are still
+undeclared to equal `backend/src/api/authz/uncovered_api_v1_routes.txt`:
+
+- **You added a route and the guard fails.** Declare its authorization as above.
+  Do not add it to the baseline to get CI green.
+- **You declared an existing route and the guard fails.** The baseline lists a
+  route that is now covered. Regenerate it and commit the diff, which should
+  only remove lines:
+
+  ```bash
+  AK_UPDATE_AUTHZ_BASELINE=1 cargo nextest run --lib api_v1_declarations
+  ```
+
+The baseline file is generated, never edited by hand, and is expected to shrink
+to empty before authorization enforcement is switched on. Background and the
+plan for the following steps are in the IAM epic (#4214).
+
 ## Regression-test contract for bug fixes
 
 Every PR that fixes a bug must land with a regression test that fails on
