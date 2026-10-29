@@ -75,30 +75,85 @@ live key and writes the sidecar.
 
 ## What it interacts with
 
-- **Digest-gated commit** (GHSA-qxv7-p3mq-88fv, #2274): a spool a follower has
-  tailed may still fail the digest gate at the end. A follower that tails must
-  therefore either buffer until `published` or accept that its client received
-  bytes that were then refused for the cache (the client verifies the digest
-  itself, as it does for an uncached stream today). The second matches current
-  semantics for the leader's own client.
+- **Digest-gated commit** (GHSA-qxv7-p3mq-88fv, #2274): only the leader's writer
+  task commits the object (staging key → copy onto the live key → sidecar);
+  followers never finalize cache commits. The gate stays on the leader for
+  every algorithm (SHA-256 via the storage layer's observed checksum,
+  SHA-1/SHA-512 via `TeeDigestHasher`). A tailing follower must either buffer
+  until `state = published` or accept the same semantics the leader's client
+  has today (the client verifies the digest itself for an uncached stream),
+  because a leader that refuses the spool at the digest gate leaves a
+  partially-tailed follower's client with bytes whose cache entry was never
+  published.
 - **Per-object ceiling** (#2928) and **per-Remote cap** (#4660): the spool is
   bounded by the same ceiling; the cap's admission check runs at election, and
-  eviction after the publish, as now.
-- **Scan-on-proxy**: the scanned path buffers the body and does not tee, so it
-  is unchanged.
+  eviction after the publish, as now. The `max_cache_bytes` check must run on
+  the leader as it streams from upstream (independent of client pacing), not
+  driven by the client's read rate. Today, when the ceiling trips mid-stream,
+  `tee_stream` abandons only the cache half and keeps yielding bytes to the
+  client; a body that will never be cached (`cache_published.is_none()`)
+  releases the lock at once. Once the client reads from the spool instead of
+  the tee, an abandoned spool leaves the leader's client and any tailing
+  follower with nothing to read: a known `Content-Length` over the ceiling
+  must skip the spool and pass through as today, and an unknown length that
+  trips the ceiling mid-stream must switch the leader's client to direct
+  pass-through and mark the row `failed` so followers stop tailing.
+- **Scan-on-proxy and commit-after-gate** (#4514, #5070): the scanned path
+  buffers the body and does not tee, so decoupling the fill does not change how
+  it reads upstream, and the gate still decides on the full object. Since #5070
+  the fill is not committed before the gate: it is held until
+  `gate_proxy_scan_serve` decides, then a served or `403` blocked body is
+  committed (a blocked body stays cached, and every reader of the scanning
+  Remote refuses it from its stored verdict), while a `fail_closed` `423`
+  (inconclusive) body is dropped and never cached. Today a request on another replica that lost the advisory
+  lock polls for the cache entry, so after a dropped fill it waits out the
+  65-second hydration wait before fetching the file itself. The row removes
+  that wait: a held fill stays `filling` while the gate decides, a committed
+  body (served or blocked) moves it to `published`, and a dropped body moves it
+  to `failed`, so followers fetch and gate the file themselves at once.
+  Followers never tail a scanned fill's spool; they wait for `published` and
+  read the committed entry through the gate, as today.
 
 ## Open questions
 
 1. **Spool lifecycle on leader death.** Who deletes an orphaned spool, and when
    may a successor reuse the bytes already committed rather than refetch?
    (Proposal: a successor refetches from byte 0; the janitor deletes spools of
-   rows whose heartbeat is older than the lease TTL.)
+   rows whose heartbeat is older than the lease TTL. Orphan cleanup must be
+   driven by a background sweep keyed off `heartbeat_at` and `state !=
+   'published'`. A retention rule is also needed for `published` and `failed`
+   rows (not only orphaned spools), or the `proxy_cache_inflight` table will
+   grow by one row per cold object; stale spool objects must be removed
+   without blocking new elections.)
 2. **Heartbeat write rate.** Updating `bytes_committed` per chunk is too much
    write traffic; per N MiB or per second? (Proposal: every 1 s or 8 MiB,
    whichever comes first; tailing followers read the spool's size, not the row,
-   for progress.)
+   for progress. The transitions to `published` and `failed` also write the
+   row. A successor detects a dead leader only by a stale `heartbeat_at`.)
 3. **Does the in-process `BufferedCoordinator` stay** as a first layer (no DB
    round trip for the common single-replica case), with the row only for
-   cross-replica election? (Proposal: yes.)
-4. **Opt-in or default.** The advisory-lock coordinator is opt-in today. Should
-   the row-based coordinator be the default for multi-replica Helm installs?
+   cross-replica election? (Proposal: yes.) The in-process fan-out and local
+   leader election must remain as the fast path for single-replica and for
+   coalescing within a pod.
+4. **Opt-in or default and configuration compatibility.** The advisory-lock
+   coordinator is opt-in today. Should the row-based coordinator be the default
+   for multi-replica Helm installs? The row-based approach must remain
+   compatible with existing `PROXY_SINGLEFLIGHT_*` configuration and degrade
+   gracefully when Postgres is unavailable (fall back to per-replica fetches,
+   as today). Of those variables, `PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS`
+   and `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` are lock-specific; under a
+   row-based coordinator they become no-ops unless there is still a lock-based
+   path. The other two need an explicit answer rather than an assumption that
+   they carry over: does `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED` also turn
+   the row-based coordinator on, and does
+   `PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS` (65 s) become a follower's wait
+   on a `filling` row?
+5. **Keeping an inconclusive body.** Since #5070 a `fail_closed` inconclusive
+   fill is dropped, so its next pull fetches it from the upstream again
+   (bounded by `PROXY_SCAN_MAX_BYTES`), and
+   `docs/security/proxy-cache-commit-after-gate.md` leaves keeping those bytes
+   for a retry to this spool. Should a dropped scanned fill keep its spool,
+   outside the live cache key, so the retry rescans it without a refetch?
+   (Proposal: not in the first cut. A kept spool must never be served or
+   committed without passing the gate again, and it needs the same retention
+   rule as question 1.)
