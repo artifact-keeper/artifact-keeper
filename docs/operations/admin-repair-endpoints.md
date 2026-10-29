@@ -156,9 +156,11 @@ Report:
 | `registered_paths` | Up to 100 registered paths, each the path the package is filed under. |
 | `errors` | Up to 100 per-package failures (`path: reason`). |
 
-A dry run does not check the destination of a move, so a package whose
-destination is taken is counted in `packages_registered` and
-`packages_relocated` by the dry run and in `artifacts_failed` by the real run.
+A dry run checks the destination of each move the way the real run does
+(without locking or writing), including a destination an earlier package of
+the same call would move into, so a package whose destination is taken is
+counted in `artifacts_failed` with the same reason by both. A row written
+between the dry run and the real run can still change the outcome.
 
 ## Paging
 
