@@ -1435,6 +1435,16 @@ impl ScanWorkspace {
         content: &Bytes,
         pin: Option<&ExpectedComponent>,
     ) -> Result<()> {
+        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
+
+        // #1966: an ISO9660 live or installer medium is not staged as one
+        // opaque file (which catalogs nothing and read as clean). Only the
+        // package database of its embedded rootfs is staged, or nothing at
+        // all when there is none to be had.
+        if Self::stages_iso_rootfs(original_filename, content, pin.is_some()) {
+            return Self::stage_iso_rootfs(workspace, artifact, content).await;
+        }
+
         // NAMESPACE ISOLATION (#3004 follow-up 3). When this scan also writes
         // control files, the archive is unpacked into a dedicated subdirectory
         // instead of the workspace root, so the archive's namespace and ours
@@ -1458,7 +1468,6 @@ impl ScanWorkspace {
             None => workspace.to_path_buf(),
         };
 
-        let original_filename = artifact.path.rsplit('/').next().unwrap_or(&artifact.name);
         let safe_filename = sanitize_artifact_filename(original_filename);
         let artifact_path = extract_root.join(&safe_filename);
 
@@ -1858,6 +1867,56 @@ impl ScanWorkspace {
                 e
             );
         }
+    }
+
+    /// Whether this upload is staged as an ISO9660 image (#1966): its bytes
+    /// carry the ISO9660 volume descriptor, detected by magic and never by
+    /// the `.iso` extension.
+    ///
+    /// A name [`Self::is_archive`] recognises, or a package file the engines
+    /// catalog as it is staged ([`ISO_EXCLUDED_PACKAGE_SUFFIXES`]: `.deb`,
+    /// `.rpm` and their variants), keeps its own path even when the bytes are
+    /// also ISO9660 (a polyglot), and so does a pinned scan: an image cannot
+    /// stand in for the package its name or pin says it is. Bytes that start
+    /// with the magic of another format the engines catalog as staged
+    /// ([`starts_with_non_iso_magic`]: executables, zip, gzip and other
+    /// compressed streams, `ar`, RPM) keep their path too, whatever the
+    /// name: an executable or package carrying a volume descriptor at byte
+    /// 32769 must not have its own inventory replaced by an embedded image's.
+    /// The orchestrator uses the same predicate to decide that the upload
+    /// expects a catalog, so staging and grading never disagree.
+    pub(crate) fn stages_iso_rootfs(filename: &str, content: &[u8], pinned: bool) -> bool {
+        !pinned
+            && !Self::is_archive(filename)
+            && !is_iso_excluded_package_file(filename)
+            && !starts_with_non_iso_magic(content)
+            && crate::services::iso_rootfs::is_iso9660(content)
+    }
+
+    /// Stage an ISO9660 image's rootfs package database into `workspace`
+    /// (see [`crate::services::iso_rootfs`]). An image with no scannable
+    /// rootfs leaves the workspace empty, never holding the raw image: the
+    /// engines then catalog nothing and the scan is recorded
+    /// `not_cataloged`, because [`Self::stages_iso_rootfs`] made it expect a
+    /// catalog.
+    async fn stage_iso_rootfs(
+        workspace: &Path,
+        artifact: &Artifact,
+        content: &Bytes,
+    ) -> Result<()> {
+        use crate::services::iso_rootfs::{stage_iso_rootfs, IsoLimits, IsoStaging};
+        match stage_iso_rootfs(workspace, content, IsoLimits::for_scan_workspace()).await? {
+            IsoStaging::Extracted { probe } => info!(
+                "ISO9660 image {} ({}): staged the package database of {} for the scan",
+                artifact.name, artifact.id, probe
+            ),
+            IsoStaging::Unscannable(reason) => warn!(
+                "ISO9660 image {} ({}) has no scannable root filesystem: {}. Nothing was staged; \
+                 the scan is recorded not_cataloged",
+                artifact.name, artifact.id, reason
+            ),
+        }
+        Ok(())
     }
 
     /// Check if the file is an extractable archive.
@@ -2632,6 +2691,72 @@ pub(crate) fn format_expects_pin(repository_format: &str, filename: &str) -> boo
         .is_some()
 }
 
+/// Whether an on-demand rescan (#3396) of the object cached at `cache_path`
+/// in a repository with `handler_key` must see the CVE engine catalog
+/// SOMETHING before a zero-finding result may be recorded as `clean`.
+///
+/// A rescan has no request coordinate, so it cannot pin (see its caller). The
+/// inline gate grades these objects only through a pin or a staged image, and
+/// without one the engine has nothing to grade:
+///
+/// * the package archives [`pinned_ecosystem`] names and the engine catalogs
+///   as themselves once pinned: an npm tarball, a PyPI sdist, a `.gem`, a
+///   `.crate`, a `.nupkg`;
+/// * the archives a proxy route pins from the request coordinate
+///   ([`ComponentEcosystem::is_request_pinned`]): a Go module zip, a Composer
+///   dist, a Conan archive, a `.deb`, `.rpm` or `.apk`;
+/// * an OCI image manifest, which the inline gate grades as the image it
+///   describes, never as the manifest document a file scan sees.
+///
+/// For those, a scan in which the engine cataloged nothing and found nothing
+/// is inconclusive and the stored verdict stands, the same rule the inline
+/// gate applies once it has pinned or staged.
+///
+/// Conda is the one pinned ecosystem left out: the engine never catalogs a
+/// conda package as itself, and an empty catalog over a completed scan is the
+/// normal result there (#4594), graded on its findings exactly as the inline
+/// gate grades it ([`ComponentEcosystem::engine_catalogs_the_package`]).
+/// Everything else (a wheel, a Maven jar, a VS Code extension, a layer blob)
+/// catalogs itself or is graded on its contents inline too, and keeps the
+/// rescan behavior it had.
+///
+/// The exception is a repository whose format does not gate its downloads
+/// (`generic`, Helm and the other formats outside
+/// [`crate::formats::SCAN_ON_PROXY_ENFORCED_HANDLERS`]). Its rescans require
+/// a catalog for every object (part of #3396). Verdicts are keyed per content
+/// digest and shared by every repository, so such a repository's verdict
+/// matters only where other repositories serve the same bytes, and there it
+/// must be a grade. Such a repository can cache any bytes under any name,
+/// so the file name cannot tell a package archive from a plain file. A
+/// rescan there that catalogs nothing and finds nothing is therefore
+/// inconclusive and records nothing.
+pub(crate) fn proxy_rescan_requires_catalog(handler_key: &str, cache_path: &str) -> bool {
+    if !crate::formats::handler_enforces_scan_on_proxy(handler_key) {
+        return true;
+    }
+    let filename = cache_path
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(cache_path);
+    if pinned_ecosystem(handler_key, filename)
+        .is_some_and(ComponentEcosystem::engine_catalogs_the_package)
+    {
+        return true;
+    }
+    let lower = filename.to_ascii_lowercase();
+    match handler_key {
+        "go" | "composer" => lower.ends_with(".zip"),
+        "conan" => lower.ends_with(".tgz") || lower.ends_with(".tar.gz"),
+        "debian" => [".deb", ".udeb", ".ddeb"]
+            .iter()
+            .any(|ext| lower.ends_with(ext)),
+        "rpm" => lower.ends_with(".rpm"),
+        "alpine" => lower.ends_with(".apk"),
+        "oci" => cache_path.contains("/manifests/"),
+        _ => false,
+    }
+}
+
 /// Whether a hosted artifact of `filename` in a `repository_format`
 /// repository is a PACKAGE ARCHIVE whose contents a cataloging scanner is
 /// expected to enumerate (#4036).
@@ -2680,6 +2805,61 @@ pub(crate) fn format_expects_catalog(repository_format: &str, filename: &str) ->
         "generic" => generic_archive_expects_catalog(&lower),
         _ => false,
     }
+}
+
+/// Package files that are not archives the scan workspace unpacks but that
+/// the engines catalog as staged (Debian and RPM packages). Their bytes can
+/// carry an ISO9660 volume descriptor at byte 32769 like any other payload,
+/// so they are never routed to the ISO rootfs path (#1966).
+const ISO_EXCLUDED_PACKAGE_SUFFIXES: &[&str] = &[".deb", ".udeb", ".ddeb", ".rpm"];
+
+/// Leading magic of formats the engines catalog as they are staged (or that
+/// the scan workspace unpacks), none of which an ISO9660 medium starts with:
+/// a hybrid image starts with MBR boot code or a GPT protective MBR, a plain
+/// one with zeros (#1966, [`ScanWorkspace::stages_iso_rootfs`]).
+const NON_ISO_LEADING_MAGIC: &[&[u8]] = &[
+    b"\x7fELF",          // ELF executable or shared object
+    b"MZ",               // PE / COFF executable
+    b"\xfe\xed\xfa\xce", // Mach-O 32-bit
+    b"\xfe\xed\xfa\xcf", // Mach-O 64-bit
+    b"\xce\xfa\xed\xfe", // Mach-O 32-bit, little-endian
+    b"\xcf\xfa\xed\xfe", // Mach-O 64-bit, little-endian
+    b"\xca\xfe\xba\xbe", // Mach-O universal binary or Java class
+    b"PK\x03\x04",       // zip (jar, war, apk, whl, nupkg, ...)
+    b"\x1f\x8b",         // gzip (tar.gz, Alpine apk, ...)
+    b"\xfd7zXZ\x00",     // xz
+    b"\x28\xb5\x2f\xfd", // zstd
+    b"BZh",              // bzip2
+    b"!<arch>\n",        // ar (Debian packages)
+    b"\xed\xab\xee\xdb", // RPM lead
+];
+
+fn starts_with_non_iso_magic(content: &[u8]) -> bool {
+    NON_ISO_LEADING_MAGIC
+        .iter()
+        .any(|magic| content.starts_with(magic))
+}
+
+fn is_iso_excluded_package_file(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    ISO_EXCLUDED_PACKAGE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+/// Whether this upload expects a catalog: [`format_expects_catalog`] for its
+/// format and file name, or an ISO9660 image the scan workspace stages as
+/// a rootfs package database (#1966, [`ScanWorkspace::stages_iso_rootfs`]),
+/// in any repository format. An image that yields no package database is
+/// then `not_cataloged` rather than a clean grade.
+pub(crate) fn upload_expects_catalog(
+    repository_format: &str,
+    filename: &str,
+    content: &[u8],
+    pinned: bool,
+) -> bool {
+    format_expects_catalog(repository_format, filename)
+        || ScanWorkspace::stages_iso_rootfs(filename, content, pinned)
 }
 
 /// Whether an archive in a GENERIC repository expects a catalog (#4154, grace
@@ -3251,7 +3431,7 @@ const DEFAULT_MAX_SCAN_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Maximum number of archive entries extracted into a scan workspace. Bounds
 /// inode-exhaustion bombs (millions of tiny files).
-const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
+pub(crate) const MAX_SCAN_EXTRACTED_ENTRIES: u64 = 200_000;
 
 /// Env var overriding the extracted-tree byte ceiling. The value is a plain
 /// decimal byte count (e.g. `4294967296` for 4 GiB).
@@ -3274,7 +3454,7 @@ fn positive_env_or(name: &str, default: u64) -> u64 {
 /// [`MAX_SCAN_EXTRACTED_BYTES_ENV`] over [`DEFAULT_MAX_SCAN_EXTRACTED_BYTES`].
 /// A blank, non-numeric, or zero override is treated as "unset" (a zero cap
 /// would reject every archive).
-fn max_scan_extracted_bytes() -> u64 {
+pub(crate) fn max_scan_extracted_bytes() -> u64 {
     positive_env_or(
         MAX_SCAN_EXTRACTED_BYTES_ENV,
         DEFAULT_MAX_SCAN_EXTRACTED_BYTES,
@@ -3667,7 +3847,7 @@ fn unpack_conda<R: std::io::Read + std::io::Seek>(
 /// to a root component are not payload: `pkg-../x.tar.zst` stays two
 /// components deep (`pkg-..` is an ordinary name, not a traversal) and
 /// `../pkg-x.tar.zst` climbs above the root, so both are skipped.
-fn is_conda_payload_member(name: &Path) -> bool {
+pub(crate) fn is_conda_payload_member(name: &Path) -> bool {
     let mut components = name.components();
     let Some(std::path::Component::Normal(leaf)) = components.next() else {
         return false;
@@ -4460,8 +4640,12 @@ pub struct ScanTarget<'a> {
     /// [`run_inline_proxy_scanners_target`] treats "no catalog reported"
     /// (`None`) and "cataloged nothing" (`Some(empty)`) both as INCONCLUSIVE,
     /// so the caller's fail-closed branch withholds (423) instead of serving
-    /// a false clean. `false` (hosted upload scans, file formats, unit tests)
-    /// keeps prior behavior exactly.
+    /// a false clean. The on-demand rescan of a cached package archive or
+    /// image manifest sets it too (see
+    /// [`ScannerService::scan_content_requiring_catalog`]): it has no
+    /// coordinate to pin, so this is the only form of the gate it can apply.
+    /// `false` (hosted upload scans, inline file formats, unit tests) keeps
+    /// prior behavior exactly.
     pub require_nonempty_catalog: bool,
 }
 
@@ -5584,7 +5768,10 @@ async fn run_inline_proxy_scanners_target(
     // expected-component gate above, a `None` catalog is NOT "keep prior
     // behavior" here: the OCI callers only set this flag on the inline proxy
     // gate, where "the engine could not report what it graded" must fail
-    // closed, not serve clean.
+    // closed, not serve clean. The on-demand rescan of a cached package
+    // archive or image manifest sets it for the same reason (#3396): it
+    // cannot pin, so a zero-finding scan in which the engine cataloged
+    // nothing is inconclusive and the stored verdict stands.
     if target.require_nonempty_catalog
         && findings.is_empty()
         && !cve_cataloged.as_ref().is_some_and(|c| !c.is_empty())
@@ -5593,12 +5780,13 @@ async fn run_inline_proxy_scanners_target(
             artifact = %synthetic.name,
             catalog_reported = cve_cataloged.is_some(),
             "inline proxy scan: CVE engine cataloged no components for the served \
-             image; zero findings does not mean clean -> inconclusive"
+             image or rescanned object; zero findings does not mean clean \
+             -> inconclusive"
         );
         return Err(AppError::Internal(
             "CVE-authoritative scanner cataloged no gradeable component for the \
-             served image; verdict inconclusive (a zero-finding scan of nothing \
-             is not a clean verdict)"
+             served image or rescanned object; verdict inconclusive (a \
+             zero-finding scan of nothing is not a clean verdict)"
                 .to_string(),
         ));
     }
@@ -8851,6 +9039,34 @@ impl ScannerService {
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
 
+    /// [`ScannerService::scan_content`] for bytes that cannot be pinned but
+    /// must not grade `clean` on an empty catalog: the on-demand rescan of a
+    /// cached package archive or image manifest (#3396, see
+    /// [`proxy_rescan_requires_catalog`]).
+    ///
+    /// Sets [`ScanTarget::require_nonempty_catalog`], so a zero-finding scan
+    /// in which the CVE engine cataloged nothing is inconclusive rather than
+    /// `clean`. A scan WITH findings is graded on them exactly as before.
+    pub async fn scan_content_requiring_catalog(
+        &self,
+        synthetic: &Artifact,
+        content: &Bytes,
+    ) -> Result<ProxyScanVerdict> {
+        let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
+
+        let target = ScanTarget {
+            artifact: synthetic,
+            repository_key: "",
+            repository_type: "",
+            db: None,
+            storage: None,
+            manifest_body: None,
+            expected_component: None,
+            require_nonempty_catalog: true,
+        };
+        run_inline_proxy_scanners_target(&self.scanners, &target, content).await
+    }
+
     /// Context-aware sibling of [`ScannerService::scan_content`] for callers
     /// that need repository routing context threaded to the leaf scanners
     /// (the OCI proxy manifest gate; see [`ScanTarget`]). File formats (PyPI
@@ -9093,7 +9309,12 @@ impl ScannerService {
             require_nonempty_catalog: false,
         };
         let mut catalog_set = CatalogSetTally::default();
-        let expects_catalog = format_expects_catalog(&repository_format, upload_filename);
+        let expects_catalog = upload_expects_catalog(
+            &repository_format,
+            upload_filename,
+            &content,
+            upload_pin.is_some(),
+        );
 
         for scanner in &self.scanners {
             // Take any pre-allocated row id committed by the trigger handler.
@@ -9421,7 +9642,7 @@ impl ScannerService {
                     // component with 2 real vulnerabilities, and openssl
                     // (.conda) as one component with 0 findings; both were
                     // wrongly floored to F before this guard.
-                    let uncataloged = format_expects_catalog(&repository_format, upload_filename)
+                    let uncataloged = expects_catalog
                         && matches!(&cataloged, Some(c) if c.is_empty())
                         && findings.is_empty()
                         && packages.is_empty();
@@ -11547,6 +11768,131 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1966: an upload is staged as an ISO9660 image when its BYTES carry
+    /// the volume descriptor, whatever it is called; the `.iso` name alone is
+    /// not trusted. A name the archive path recognises, or a pinned scan,
+    /// keeps the archive path, so a polyglot cannot swap a package's contents
+    /// for an image's.
+    #[test]
+    fn stages_iso_rootfs_detects_iso9660_by_magic_unless_named_or_pinned_as_an_archive() {
+        use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+        let iso = build(&IsoSpec::live(
+            "live",
+            "filesystem.squashfs",
+            b"hsqs".to_vec(),
+        ));
+        for name in ["debian-live-12.iso", "debian-live-12.img", "download"] {
+            assert!(
+                ScanWorkspace::stages_iso_rootfs(name, &iso, false),
+                "{name}"
+            );
+        }
+        assert!(
+            !ScanWorkspace::stages_iso_rootfs("debian-live-12.iso", b"not an image", false),
+            "the .iso name alone must not select the ISO path"
+        );
+        for archive in [
+            "pkg-1.0.tar.gz",
+            "lib-1.0.jar",
+            "tool-1.0-py3-none-any.whl",
+            "openssl_3.0.11-1_amd64.deb",
+            "openssl-3.0.7-24.el9.x86_64.rpm",
+            "OPENSSL.RPM",
+        ] {
+            assert!(
+                !ScanWorkspace::stages_iso_rootfs(archive, &iso, false),
+                "{archive} keeps the archive path"
+            );
+        }
+        assert!(
+            !ScanWorkspace::stages_iso_rootfs("debian-live-12.iso", &iso, true),
+            "a pinned scan keeps its pin"
+        );
+        // A polyglot whose leading bytes are another catalogable format (an
+        // executable, a zip, a gzip stream, an ar or RPM package) keeps its
+        // own path even with an ISO9660 volume descriptor at byte 32769 and
+        // a name the archive path does not know.
+        for magic in [
+            &b"\x7fELF"[..],
+            b"MZ",
+            b"\xcf\xfa\xed\xfe",
+            b"PK\x03\x04",
+            b"\x1f\x8b",
+            b"!<arch>\n",
+            b"\xed\xab\xee\xdb",
+        ] {
+            let mut polyglot = iso.clone();
+            polyglot[..magic.len()].copy_from_slice(magic);
+            assert!(
+                crate::services::iso_rootfs::is_iso9660(&polyglot),
+                "the polyglot keeps its volume descriptor"
+            );
+            assert!(
+                !ScanWorkspace::stages_iso_rootfs("mytool", &polyglot, false),
+                "leading magic {magic:?} keeps its own path"
+            );
+        }
+    }
+
+    /// #1966: an ISO9660 upload expects a catalog in any repository format,
+    /// so an image that yields no package database is `not_cataloged`
+    /// rather than a clean grade; everything else keeps
+    /// `format_expects_catalog`'s answer.
+    #[test]
+    fn an_iso9660_upload_expects_a_catalog() {
+        use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+        let iso = build(&IsoSpec::live("boot", "vmlinuz", b"kernel".to_vec()));
+        assert!(upload_expects_catalog("generic", "media.iso", &iso, false));
+        assert!(upload_expects_catalog("debian", "media.iso", &iso, false));
+        assert!(!upload_expects_catalog(
+            "generic",
+            "media.iso",
+            b"plain text",
+            false
+        ));
+        assert!(!upload_expects_catalog(
+            "generic",
+            "notes.txt",
+            b"plain text",
+            false
+        ));
+        assert!(upload_expects_catalog(
+            "generic",
+            "lib-1.0.jar",
+            b"PK",
+            false
+        ));
+    }
+
+    /// #1966: an ISO with no embedded rootfs stages NOTHING. Before, the raw
+    /// image was written into the workspace, the engines cataloged nothing
+    /// inside it, and the scan read as clean.
+    #[tokio::test]
+    async fn prepare_pinned_stages_nothing_for_an_iso_without_a_rootfs() {
+        use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("ws-base");
+        let artifact = test_helpers::make_test_artifact(
+            "installer.iso",
+            "application/octet-stream",
+            "media/installer.iso",
+        );
+        let content = Bytes::from(build(&IsoSpec::live("boot", "vmlinuz", b"kernel".to_vec())));
+        let mut guard =
+            ScanWorkspace::prepare_pinned(base.to_str().unwrap(), None, &artifact, &content, None)
+                .await
+                .expect("an unscannable image is not a workspace error");
+        let staged: Vec<_> = std::fs::read_dir(&*guard)
+            .expect("workspace exists")
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            staged.is_empty(),
+            "nothing may be staged for an image without a rootfs, got {staged:?}"
+        );
+        guard.cleanup().await;
     }
 
     /// #1429: the lifecycle hands the extractor this job's own directory
@@ -14637,6 +14983,85 @@ mod tests {
                 format_expects_pin(f, filename),
                 hosted_upload_pin(f, filename, "widget", Some("1.0")).is_some(),
                 "{f}/{filename}"
+            );
+        }
+    }
+
+    /// #3396: a rescan requires a catalog for exactly the objects the inline
+    /// gate grades through a pin or a staged image. Conda is pinned but graded
+    /// on its contents (#4594), and everything else either catalogs itself or
+    /// is graded on its contents inline too, so neither changes.
+    #[test]
+    fn test_proxy_rescan_requires_catalog_tracks_the_unpinnable_archives() {
+        for (handler_key, path) in [
+            // Pinned per artifact for PyPI, per extension for the rest
+            // (#3003, #3603).
+            ("npm", "minimist/-/minimist-1.2.5.tgz"),
+            ("pypi", "packages/PyYAML-5.3.1.tar.gz"),
+            ("pypi", "PyYAML-5.3.1.zip"),
+            ("rubygems", "gems/rack-2.0.7.gem"),
+            ("cargo", "smallvec/smallvec-1.6.0.crate"),
+            ("nuget", "Newtonsoft.Json.12.0.1.nupkg"),
+            // Pinned from the request coordinate by the proxy route (#4952,
+            // #4111, #4112, #4113).
+            ("go", "golang.org/x/text/@v/v0.3.0.zip"),
+            ("composer", "dist/a/b/1.0.0/ref.zip"),
+            (
+                "conan",
+                "v2/conans/zlib/1.2.11/_/_/revisions/r/files/conan_export.tgz",
+            ),
+            ("debian", "pool/main/o/openssl/libssl3_3.0.11-1_amd64.deb"),
+            ("debian", "pool/main/d/debian-installer/di_1.0_amd64.udeb"),
+            ("rpm", "Packages/o/openssl-3.0.7-1.x86_64.rpm"),
+            ("alpine", "v3.19/main/x86_64/openssl-3.1.4-r0.apk"),
+            // Graded as the image it describes, not as a JSON document.
+            ("oci", "v2/library/alpine/manifests/3.10"),
+            ("oci", "v2/library/alpine/manifests/sha256:0123"),
+        ] {
+            assert!(
+                proxy_rescan_requires_catalog(handler_key, path),
+                "{handler_key}/{path} cannot be graded without a pin or an image"
+            );
+        }
+
+        // #4594: conda is pinned but graded on its contents. A wheel and a jar
+        // catalog themselves, an OCI layer blob is graded on its contents,
+        // and a blob in a pinned format is not a package.
+        for (handler_key, path) in [
+            ("conda", "numpy-1.26.4-py312_0.conda"),
+            ("conda", "numpy-1.26.4-py312_0.tar.bz2"),
+            ("conda_native", "numpy-1.26.4-py312_0.conda"),
+            ("pypi", "packages/PyYAML-5.3.1-py3-none-any.whl"),
+            (
+                "maven",
+                "commons-collections/commons-collections/3.2.1/commons-collections-3.2.1.jar",
+            ),
+            ("vscode", "ms-python.python-2024.1.0.vsix"),
+            ("cargo", "notes.txt"),
+            ("go", "golang.org/x/text/@v/v0.3.0.mod"),
+            ("debian", "dists/bookworm/main/binary-amd64/Packages.gz"),
+            ("oci", "v2/library/alpine/blobs/sha256:0123"),
+        ] {
+            assert!(
+                !proxy_rescan_requires_catalog(handler_key, path),
+                "{handler_key}/{path} keeps the prior rescan behavior"
+            );
+        }
+
+        // Part of #3396: a repository that does not gate its downloads
+        // requires a catalog for every object, whatever its name, since its
+        // verdict is read only by the repositories that do.
+        for (handler_key, path) in [
+            ("generic", "blob.bin"),
+            ("generic", "minimist-1.2.5.tgz"),
+            ("generic", "Newtonsoft.Json.12.0.1.nupkg"),
+            ("generic", "images/boot.iso"),
+            ("generic", "numpy-1.26.4-py312_0.conda"),
+            ("helm", "charts/nginx-1.0.0.tgz"),
+        ] {
+            assert!(
+                proxy_rescan_requires_catalog(handler_key, path),
+                "{handler_key}/{path}: a repository that does not gate downloads requires a catalog"
             );
         }
     }
@@ -26547,6 +26972,96 @@ tonic-build = "0.12"
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #3396: the on-demand rescan of a cached package archive. It has no
+    // coordinate to pin, so it requires a catalog instead (the OCI form of
+    // the gate above): a zero-finding scan in which the engine cataloged
+    // nothing is inconclusive, never `clean`.
+    // -----------------------------------------------------------------------
+
+    fn rescanned_npm_tarball() -> Artifact {
+        test_helpers::make_test_artifact(
+            "minimist-1.2.5.tgz",
+            "application/octet-stream",
+            "minimist-1.2.5.tgz",
+        )
+    }
+
+    /// The engine ran `Ok` over an unpinned npm tarball, cataloged nothing
+    /// and found nothing. That is not `clean`; it is inconclusive, so the
+    /// stored verdict stands.
+    #[tokio::test]
+    async fn test_proxy_rescan_empty_catalog_is_inconclusive() {
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = rescanned_npm_tarball();
+        let target = require_catalog_target(&artifact);
+        assert!(
+            run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+                .await
+                .is_err(),
+            "a rescan that cataloged nothing must not record clean"
+        );
+    }
+
+    /// A rescan WITH findings still grades on them: requiring a catalog only
+    /// guards the false-clean direction, so an operator's rescan can still
+    /// record `vulnerable` for an archive cached before inventory recording.
+    #[tokio::test]
+    async fn test_proxy_rescan_findings_grade_vulnerable_without_catalog() {
+        use inline_proxy_scan_fixtures::*;
+        use std::sync::Arc;
+
+        let scanners: Vec<Arc<dyn Scanner>> = vec![Arc::new(CveAuthoritativeScanner {
+            outcome: CveOutcome::Critical,
+        })];
+        let artifact = rescanned_npm_tarball();
+        let target = require_catalog_target(&artifact);
+        let verdict = run_inline_proxy_scanners_target(&scanners, &target, &Bytes::new())
+            .await
+            .expect("findings must yield a vulnerable verdict, not inconclusive");
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.critical_count, 1);
+    }
+
+    /// `ScannerService::scan_content_requiring_catalog`: the seam the rescan
+    /// endpoint reaches through `ProxyScanMode::FileRequiringCatalog`. It
+    /// must set the catalog requirement, so the same empty-catalog scan that
+    /// `scan_content` grades `clean` is inconclusive here. Skips cleanly when
+    /// DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_scan_content_requiring_catalog_through_service() {
+        use std::sync::Arc;
+
+        let Some(fx) = crate::api::handlers::test_db_helpers::Fixture::setup("remote", "npm").await
+        else {
+            return;
+        };
+        let mut svc = scanner_for_fixture(&fx);
+        svc.scanners = vec![Arc::new(CatalogingCveScanner {
+            cataloged: Some(Vec::new()),
+        })];
+        let artifact = rescanned_npm_tarball();
+        let unpinned = svc.scan_content(&artifact, &Bytes::new()).await;
+        let requiring = svc
+            .scan_content_requiring_catalog(&artifact, &Bytes::new())
+            .await;
+
+        fx.teardown().await;
+
+        assert!(
+            unpinned.is_ok(),
+            "scan_content keeps the prior behavior for callers that do not require a catalog"
+        );
+        assert!(
+            requiring.is_err(),
+            "scan_content_requiring_catalog must not grade an empty catalog clean"
+        );
+    }
+
     /// The #2954 gate still outranks the #3003 one: a Grype ERROR is
     /// inconclusive regardless of any catalog.
     #[tokio::test]
@@ -30041,6 +30556,107 @@ tonic-build = "0.12"
                 "generic blob must not flag has_uncataloged_scan"
             );
 
+            finish(fx).await;
+        }
+
+        /// #1966: an ISO9660 image in a GENERIC repository whose rootfs could
+        /// not be staged (here: none embedded) is `not_cataloged` with a
+        /// reason and `inventory_status='partial'`, and flags the repository
+        /// (`has_uncataloged_scan`), instead of reading as a complete clean
+        /// scan. It is not package-shaped, so the grade letter stays (#4154).
+        #[tokio::test]
+        async fn test_iso_without_a_rootfs_is_not_cataloged() {
+            use crate::services::iso_rootfs::test_iso::{build, IsoSpec};
+            let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let iso = Bytes::from(build(&IsoSpec::live("boot", "vmlinuz", b"kernel".to_vec())));
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "installer.iso",
+                "1",
+                "media/installer.iso",
+                iso,
+            )
+            .await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.status, "completed");
+            assert_eq!(
+                row.scan_completeness, "not_cataloged",
+                "an ISO whose rootfs was not inventoried must not read complete"
+            );
+            assert!(row.scan_completeness_reason.is_some());
+            assert_eq!(row.inventory_status, "partial");
+
+            let score = ScanResultService::new(fx.pool.clone())
+                .get_score(fx.repo_id)
+                .await
+                .expect("score query")
+                .expect("score row must exist after a scan");
+            assert!(
+                score.has_uncataloged_scan,
+                "the repository must be flagged has_uncataloged_scan"
+            );
+            assert_eq!(
+                score.grade, "A",
+                "a generic image does not floor the legacy grade letter (#4154)"
+            );
+            // #4336: an image whose rootfs was not inventoried is not rated,
+            // and is counted as uncataloged in the coverage.
+            assert_eq!(score.grade_status.as_deref(), Some("unrated"));
+            assert_eq!(score.rated_grade, None);
+            assert_eq!(score.uncataloged_count, Some(1));
+
+            finish(fx).await;
+        }
+
+        /// #1966 negative control: the same name with bytes that are not
+        /// ISO9660 keeps the generic-blob behaviour (complete, no flag): the
+        /// decision is the magic, not the `.iso` extension.
+        #[tokio::test]
+        async fn test_iso_named_blob_without_the_magic_stays_complete() {
+            let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let artifact_id = seed_versioned_scannable_artifact(
+                &fx,
+                "installer.iso",
+                "1",
+                "media/installer.iso",
+                Bytes::from_static(b"not an image"),
+            )
+            .await;
+            let scanner = make_scanner_service_with(
+                &fx,
+                vec![FakeScanner::completed_with_catalog(
+                    "grype",
+                    vec![],
+                    vec![],
+                    Some(vec![]),
+                )],
+                None,
+            );
+            scanner
+                .scan_artifact_with_options(artifact_id, true, true)
+                .await
+                .expect("scan orchestration must return Ok");
+            let row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            assert_eq!(row.scan_completeness, "complete");
             finish(fx).await;
         }
 

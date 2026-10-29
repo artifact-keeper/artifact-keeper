@@ -800,18 +800,25 @@ else
     # repository's linked-issue gate means this is populated for every PR that
     # is not explicitly exempted, which is what makes the mapping reliable
     # enough to gate on.
+    #
+    # The lookup is `issueOrPullRequest`, not `pullRequest`: a commit
+    # rebase-merged onto a release line keeps its cherry-picked subject, which
+    # can end in the ISSUE number it fixes (`... (#4933)`). `pullRequest` on
+    # an issue number is a NOT_FOUND error that fails the whole query; here an
+    # issue resolves to an empty object, is left out of the map, and is still
+    # in range_prs, so an entry citing that issue accounts for the commit.
     closes_map=""
     if [[ -n "$range_prs" ]]; then
       gql="query{repository(owner:\"${REPO%%/*}\",name:\"${REPO##*/}\"){"
       idx=0
       while IFS= read -r p; do
         [[ -z "$p" ]] && continue
-        gql+=" p${idx}: pullRequest(number:${p}){number closingIssuesReferences(first:20){nodes{number}}}"
+        gql+=" p${idx}: issueOrPullRequest(number:${p}){... on PullRequest{number closingIssuesReferences(first:20){nodes{number}}}}"
         idx=$((idx + 1))
       done <<< "$range_prs"
       gql+="}}"
       if ! closes_map="$(gh api graphql -f query="$gql" \
-            --jq '.data.repository | to_entries[] | "\(.value.number):\([.value.closingIssuesReferences.nodes[].number] | join(","))"' \
+            --jq '.data.repository | to_entries[] | select(.value.number != null) | "\(.value.number):\([.value.closingIssuesReferences.nodes[].number] | join(","))"' \
             2>/dev/null)"; then
         echo "INFRA: could not resolve the PR->closing-issue map for ${prev_tag}..HEAD" >&2
         infra_exit

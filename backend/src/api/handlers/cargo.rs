@@ -9182,7 +9182,15 @@ mod age_gate_tests {
             format!("api/v1/crates/{name}/{version}/download")
         }
 
-        async fn seed_verdict(pool: &PgPool, digest: &str, verdict: &str, repo_id: uuid::Uuid) {
+        /// Seed `verdict` for `digest` as the gate records it: graded as the
+        /// crate `name@version` it is served as (#3396).
+        async fn seed_verdict(
+            pool: &PgPool,
+            digest: &str,
+            verdict: &str,
+            repo_id: uuid::Uuid,
+            (name, version): (&str, &str),
+        ) {
             let vulnerable = verdict == "vulnerable";
             ProxyScanService::new(pool.clone())
                 .record_verdict(
@@ -9200,6 +9208,16 @@ mod age_gate_tests {
                 )
                 .await
                 .expect("seed verdict");
+            crate::api::handlers::test_db_helpers::pin_proxy_verdict(
+                pool,
+                digest,
+                &crate::services::scanner_service::ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::Cargo,
+                    name,
+                    version,
+                ),
+            )
+            .await;
         }
 
         /// Proxy downloads recorded for `path` on `repo_id` (#3446).
@@ -9308,7 +9326,14 @@ mod age_gate_tests {
             };
             let body = crate_bytes(name, version);
             rig.mount_download(name, version, &body, 1).await;
-            seed_verdict(&rig.fx.pool, &digest_of(&body), "clean", rig.fx.repo_id).await;
+            seed_verdict(
+                &rig.fx.pool,
+                &digest_of(&body),
+                "clean",
+                rig.fx.repo_id,
+                (name, version),
+            )
+            .await;
 
             for pull in 1..=2 {
                 let (status, served, headers) = rig.get(rig.download_uri(name, version)).await;
@@ -9340,6 +9365,7 @@ mod age_gate_tests {
                 &digest_of(&body),
                 "vulnerable",
                 rig.fx.repo_id,
+                (name, version),
             )
             .await;
 
@@ -9421,6 +9447,7 @@ mod age_gate_tests {
                 &digest_of(&body),
                 "vulnerable",
                 rig.fx.repo_id,
+                (name, version),
             )
             .await;
 
@@ -9467,7 +9494,14 @@ mod age_gate_tests {
             let body = crate_bytes(name, version);
             rig.mount_index_cksum(name, version, &"9".repeat(64)).await;
             rig.mount_download(name, version, &body, 2).await;
-            seed_verdict(&rig.fx.pool, &digest_of(&body), "clean", rig.fx.repo_id).await;
+            seed_verdict(
+                &rig.fx.pool,
+                &digest_of(&body),
+                "clean",
+                rig.fx.repo_id,
+                (name, version),
+            )
+            .await;
 
             for _ in 0..2 {
                 let (status, _, headers) = rig.get(rig.download_uri(name, version)).await;
@@ -9491,7 +9525,14 @@ mod age_gate_tests {
             rig.mount_index_cksum(name, version, &digest_of(&body))
                 .await;
             rig.mount_download(name, version, &body, 1).await;
-            seed_verdict(&rig.fx.pool, &digest_of(&body), "clean", rig.fx.repo_id).await;
+            seed_verdict(
+                &rig.fx.pool,
+                &digest_of(&body),
+                "clean",
+                rig.fx.repo_id,
+                (name, version),
+            )
+            .await;
 
             for _ in 0..2 {
                 let (status, _, headers) = rig.get(rig.download_uri(name, version)).await;
@@ -9642,6 +9683,7 @@ mod age_gate_tests {
                 &digest_of(&body),
                 "vulnerable",
                 rig.remotes[first].id,
+                (name, version),
             )
             .await;
 
@@ -9742,7 +9784,14 @@ mod age_gate_tests {
             rig.mount_download(member, name, version, &body, 0).await;
             enable_member_scan(&rig, member, "fail_open").await;
             let member_id = rig.remotes[member].id;
-            seed_verdict(&rig.virt.pool, &digest_of(&body), "clean", member_id).await;
+            seed_verdict(
+                &rig.virt.pool,
+                &digest_of(&body),
+                "clean",
+                member_id,
+                (name, version),
+            )
+            .await;
 
             let (status, served, headers) = rig.get(rig.download_uri(name, version)).await;
             assert_eq!(
@@ -9785,7 +9834,14 @@ mod age_gate_tests {
             rig.mount_download(member, name, version, &body, 2).await;
             enable_member_scan(&rig, member, "fail_open").await;
             let member_id = rig.remotes[member].id;
-            seed_verdict(&rig.virt.pool, &digest_of(&body), "clean", member_id).await;
+            seed_verdict(
+                &rig.virt.pool,
+                &digest_of(&body),
+                "clean",
+                member_id,
+                (name, version),
+            )
+            .await;
 
             for _ in 0..2 {
                 let (status, _, headers) = rig.get(rig.download_uri(name, version)).await;
@@ -9850,5 +9906,68 @@ mod serve_key_4365_tests {
             assert_eq!(got.cache_key, key);
             assert!(got.scannable);
         }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_crate_with_two_cargo_toml_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let file = CargoScannedCrate {
+            proxy: &proxy,
+            name: "demo",
+            version: "1.0.0",
+            expected_cksum: None,
+        };
+        let good: &[u8] = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        let other: &[u8] = b"[package]\nname = \"other\"\nversion = \"9.9.9\"\n";
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Cargo, "demo-1.0.0.crate", bytes);
+        let dup = tar_gz_with(&[
+            ("demo-1.0.0/Cargo.toml", good),
+            ("demo-1.0.0/src/lib.rs", b""),
+            ("demo-1.0.0/Cargo.toml", other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(established(&own), "the reader takes the first copy");
+        assert!(unestablished(&gate));
+        let single = tar_gz_with(&[
+            ("demo-1.0.0/Cargo.toml", good),
+            ("demo-1.0.0/src/lib.rs", b""),
+        ]);
+        assert!(established(&check(&single).1));
     }
 }

@@ -4535,13 +4535,33 @@ async fn upload(
     // If this is a maven-metadata.xml upload, just store it. Row-less put: same
     // claim-on-write-success rule as the checksum branch (#2574, V3b).
     //
-    // #4889 decision: this document deliberately stays row-less and is not
-    // pushed to peers. It is a mutable aggregate of the versions the peer
-    // receives, not a publishable coordinate; giving it an artifact row would
-    // make a generated index look like a release and let one deploy's snapshot
-    // overwrite the peer's own generated view. Peer metadata is regenerated
-    // from the replicated versioned artifacts and converges on its own.
+    // #4889 decision: an artifact-level version index deliberately stays
+    // row-less and is not pushed to peers. It is a mutable aggregate of the
+    // versions the peer receives, not a publishable coordinate; giving it an
+    // artifact row would make a generated index look like a release and let
+    // one deploy's snapshot overwrite the peer's own generated view. Peer
+    // metadata is regenerated from the replicated versioned artifacts and
+    // converges on its own.
+    //
+    // #4916: a group-level plugin-prefix document (`<plugins>`) cannot be
+    // regenerated that way (it is the only copy of the prefix mapping), so it
+    // takes the normal row-and-push path below.
     if MavenHandler::is_metadata(&path) {
+        if let Some(document) = staged_plugin_prefix_document(&staged, storage.as_ref()).await? {
+            let published = publish_plugin_prefix_metadata(
+                &state,
+                &repo,
+                &path,
+                document,
+                &storage_key,
+                &storage,
+                user_id,
+                &headers,
+            )
+            .await;
+            staged.discard().await;
+            return published;
+        }
         // Row-less metadata put: atomic claim-gate before the write, same as the
         // checksum branch (#2586); release on put failure (V3b). Staged stream
         // opened first so a local scratch-file failure never claims.
@@ -4936,6 +4956,260 @@ async fn upload(
     info!(
         "Maven upload: {}:{}:{} ({}) to repo {}",
         coords.group_id, coords.artifact_id, coords.version, coords.extension, repo_key
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::CREATED)
+        .body(Body::from("Created"))
+        .unwrap())
+}
+
+/// Bound on the maven-metadata.xml body inspected for plugin-prefix entries.
+/// Real prefix documents are a few KiB; anything larger is treated as an
+/// artifact-level version index and stored row-less as before.
+const MAX_PLUGIN_PREFIX_METADATA_DETECT_BYTES: i64 = 8 * 1024 * 1024;
+
+/// The staged body when it is a group-level plugin-prefix `maven-metadata.xml`
+/// (`<plugins>`), else `None` (#4916). The body is read from wherever it was
+/// staged, local scratch or the repository's own backend.
+async fn staged_plugin_prefix_document(
+    staged: &super::repositories::GenericStagedBody,
+    storage: &dyn crate::storage::StorageBackend,
+) -> Result<Option<Bytes>, Response> {
+    if staged.size_bytes() > MAX_PLUGIN_PREFIX_METADATA_DETECT_BYTES {
+        return Ok(None);
+    }
+    let bytes = staged.read_all(storage).await.map_err(map_storage_err)?;
+    Ok(
+        crate::formats::maven::is_plugin_prefix_metadata_document(&String::from_utf8_lossy(&bytes))
+            .then_some(bytes),
+    )
+}
+
+/// The plugin-prefix document this hosted repository already stores at
+/// `path`, read the way the download handler reads it: the repo-scoped key
+/// first, then the attribution-gated legacy flat key.
+async fn read_hosted_stored_metadata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    storage: &dyn crate::storage::StorageBackend,
+    path: &str,
+) -> Option<Bytes> {
+    if let Some(scoped_key) = crate::storage::StorageKeyScheme::from_env().scoped_read_key(
+        &repo.storage_backend,
+        "maven",
+        repo.id,
+        path,
+    ) {
+        if let Ok(content) = storage.get(&scoped_key).await {
+            return Some(content);
+        }
+    }
+    let flat_key = format!("maven/{}", path);
+    if crate::services::maven_flat_attribution::flat_key_readable(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        &flat_key,
+    )
+    .await
+    {
+        if let Ok(content) = storage.get(&flat_key).await {
+            return Some(content);
+        }
+    }
+    None
+}
+
+/// Publish a group-level Maven plugin-prefix `maven-metadata.xml` as a normal
+/// artifact (#4916).
+///
+/// This document is the only record of the prefix -> artifactId mapping; a
+/// peer cannot regenerate it from the replicated versioned artifacts the way
+/// it regenerates an artifact-level version index. Give it a row and queue it
+/// like any other upload so the mapping reaches every push peer.
+#[allow(clippy::too_many_arguments)]
+async fn publish_plugin_prefix_metadata(
+    state: &SharedState,
+    repo: &RepoInfo,
+    path: &str,
+    document: Bytes,
+    storage_key: &str,
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    user_id: Uuid,
+    headers: &HeaderMap,
+) -> Result<Response, Response> {
+    let replication = super::is_replication_request(headers);
+    let normalized = path.trim_start_matches('/');
+    let group_path = normalized
+        .strip_suffix("/maven-metadata.xml")
+        .unwrap_or(normalized);
+    let group_id = group_path.replace('/', ".");
+    let name = if group_id.is_empty() {
+        "maven-metadata.xml".to_string()
+    } else {
+        group_id.clone()
+    };
+
+    super::publish_quota::preflight_publish_quota(
+        &state.db,
+        repo.id,
+        super::publish_quota::PublishAt::Path(path),
+        document.len() as i64,
+    )
+    .await?;
+
+    let flat_key_claim = crate::services::maven_flat_attribution::claim_flat_key_for_write(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        storage_key,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
+    let published: Result<(Uuid, i64), Response> = async {
+        let mut tx = state.db.begin().await.map_err(map_db_err)?;
+        lock_maven_publish_key(&mut tx, repo.id, &repo.storage_backend, storage_key)
+            .await
+            .map_err(map_db_err)?;
+        crate::services::maven_flat_attribution::claim_flat_key_for_write_on(
+            &mut tx,
+            repo.id,
+            &repo.storage_backend,
+            storage_key,
+        )
+        .await
+        .map_err(|e| e.into_response())?;
+
+        // A replicated mapping is merged into the one this peer already
+        // holds instead of replacing it: the peer may carry prefixes the
+        // source does not (a plugin deployed here, or by another peer). The
+        // incoming entries win a prefix collision. When the incoming document
+        // already covers every stored prefix it is stored byte for byte.
+        // A client deploy is authoritative as before: Maven itself merges the
+        // group document before uploading it.
+        let body = if replication {
+            match read_hosted_stored_metadata(state, repo, storage.as_ref(), path).await {
+                Some(existing) => crate::formats::maven::merge_replicated_plugin_prefix_metadata(
+                    &String::from_utf8_lossy(&document),
+                    &String::from_utf8_lossy(&existing),
+                )
+                .map(Bytes::from)
+                .unwrap_or_else(|| document.clone()),
+                None => document.clone(),
+            }
+        } else {
+            document.clone()
+        };
+        let size_bytes = body.len() as i64;
+        let digests = {
+            let mut hasher = crate::services::artifact_service::MultiHasher::new();
+            hasher.update(&body);
+            hasher.finalize()
+        };
+        storage
+            .put(storage_key, body)
+            .await
+            .map_err(map_storage_err)?;
+
+        super::publish_quota::admit_publish_in_tx(&mut tx, &state.db, repo.id, path, size_bytes)
+            .await?;
+
+        let artifact_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO artifacts (
+                repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_sha1, checksum_md5,
+                content_type, storage_key, uploaded_by
+            )
+            VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (repository_id, path) DO UPDATE SET
+                name = EXCLUDED.name,
+                version = EXCLUDED.version,
+                size_bytes = EXCLUDED.size_bytes,
+                checksum_sha256 = EXCLUDED.checksum_sha256,
+                checksum_sha1 = EXCLUDED.checksum_sha1,
+                checksum_md5 = EXCLUDED.checksum_md5,
+                content_type = EXCLUDED.content_type,
+                storage_key = EXCLUDED.storage_key,
+                uploaded_by = EXCLUDED.uploaded_by,
+                is_deleted = false,
+                updated_at = NOW()
+            RETURNING id
+            "#,
+        )
+        .bind(repo.id)
+        .bind(path)
+        .bind(&name)
+        .bind(size_bytes)
+        .bind(&digests.sha256)
+        .bind(&digests.sha1)
+        .bind(&digests.md5)
+        .bind(content_type_for_path(path))
+        .bind(storage_key)
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        let metadata = serde_json::json!({
+            "groupId": group_id,
+            "pluginPrefixMetadata": true,
+        });
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'maven', $2) \
+             ON CONFLICT (artifact_id) DO UPDATE SET \
+                 format = EXCLUDED.format, metadata = EXCLUDED.metadata",
+        )
+        .bind(artifact_id)
+        .bind(&metadata)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+
+        tx.commit().await.map_err(map_db_err)?;
+        Ok((artifact_id, size_bytes))
+    }
+    .await;
+
+    let (artifact_id, size_bytes) = match published {
+        Ok(published) => published,
+        Err(response) => {
+            discard_failed_maven_publish(
+                &state.db,
+                storage,
+                repo.id,
+                &repo.storage_backend,
+                storage_key,
+                flat_key_claim,
+            )
+            .await;
+            return Err(response);
+        }
+    };
+
+    if should_enqueue_maven_sync_tasks(headers) {
+        crate::services::peer_instance_service::PeerInstanceService::new(state.db.clone())
+            .queue_push_sync_tasks(&crate::services::peer_instance_service::PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo.id,
+                path,
+                size_bytes,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+    }
+
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo.id)
+        .execute(&state.db)
+        .await;
+
+    info!(
+        "Maven plugin-prefix metadata: group {} ({}) to repo {}",
+        group_id, path, repo.key
     );
 
     Ok(Response::builder()
@@ -6324,6 +6598,228 @@ mod tests {
             queued,
             vec![jar.to_string()],
             "only the versioned file is pushed; peers regenerate maven-metadata.xml"
+        );
+    }
+
+    /// #4916: a group-level plugin-prefix `maven-metadata.xml` is the only
+    /// copy of the prefix -> artifactId mapping and cannot be regenerated by
+    /// a peer. Unlike an artifact-level version index it gets a row and is
+    /// pushed to peers, while still being served at its original path.
+    #[tokio::test]
+    async fn plugin_prefix_metadata_is_pushed_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "maven-4916").await;
+        let router = fx.router_with_auth(super::router());
+        let plugin_path = "org/example/plugins/maven-metadata.xml";
+        let plugin_xml = br#"<metadata>
+  <plugins>
+    <plugin>
+      <name>Example Plugin</name>
+      <prefix>example</prefix>
+      <artifactId>example-maven-plugin</artifactId>
+    </plugin>
+  </plugins>
+</metadata>"#;
+        let (status, upload_body) = tdh::send(
+            router.clone(),
+            tdh::put(
+                format!("/{}/{}", fx.repo_key, plugin_path),
+                bytes::Bytes::from_static(plugin_xml),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "plugin-prefix metadata upload failed: {}",
+            String::from_utf8_lossy(&upload_body)
+        );
+
+        let queued =
+            tdh::queued_push_paths_settled(&fx.pool, peer_id, fx.repo_id, plugin_path).await;
+        let row: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT a.path, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(plugin_path)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("load plugin metadata row");
+        let package_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count packages");
+        let (get_status, get_body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/{}", fx.repo_key, plugin_path)),
+        )
+        .await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+
+        let (row_path, metadata) = row.expect("plugin-prefix metadata must have an artifact row");
+        assert_eq!(row_path, plugin_path);
+        assert_eq!(metadata["pluginPrefixMetadata"], true);
+        assert_eq!(
+            queued,
+            vec![plugin_path.to_string()],
+            "the plugin mapping must be queued for the push peer"
+        );
+        assert_eq!(
+            package_rows, 0,
+            "a plugin-prefix mapping is not a package version"
+        );
+        assert_eq!(get_status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&get_body).contains("<prefix>example</prefix>"),
+            "the stored mapping must still be served at its original path"
+        );
+    }
+
+    /// #4916: a replicated plugin-prefix mapping is merged into the one the
+    /// peer already holds, not written over it. A peer-only prefix survives,
+    /// the incoming entry wins a prefix collision, and an incoming document
+    /// that already covers every stored prefix is stored byte for byte. The
+    /// replicated write is not queued back to the source.
+    #[tokio::test]
+    async fn replicated_plugin_prefix_metadata_is_merged_not_overwritten_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "maven-4916-merge").await;
+        let router = fx.router_with_auth(super::router());
+        let plugin_path = "org/example/plugins/maven-metadata.xml";
+        let uri = format!("/{}/{}", fx.repo_key, plugin_path);
+        let doc = |entries: &[(&str, &str)]| {
+            let mut xml = String::from("<metadata>\n  <plugins>\n");
+            for (prefix, artifact_id) in entries {
+                xml.push_str(&format!(
+                    "    <plugin>\n      <prefix>{prefix}</prefix>\n      \
+                     <artifactId>{artifact_id}</artifactId>\n    </plugin>\n"
+                ));
+            }
+            xml.push_str("  </plugins>\n</metadata>\n");
+            bytes::Bytes::from(xml)
+        };
+        let replicated_put = |body: bytes::Bytes| {
+            let mut req = tdh::put(uri.clone(), body);
+            req.headers_mut().insert(
+                "x-artifact-keeper-replication",
+                axum::http::HeaderValue::from_static("true"),
+            );
+            req
+        };
+
+        // The peer's own mapping, deployed by a client here.
+        let (status, _) = tdh::send(
+            router.clone(),
+            tdh::put(
+                uri.clone(),
+                doc(&[
+                    ("local", "local-maven-plugin"),
+                    ("shared", "old-maven-plugin"),
+                ]),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let queued_before =
+            tdh::queued_push_paths_settled(&fx.pool, peer_id, fx.repo_id, plugin_path).await;
+        // Settle the client deploy's push, so a replicated write that queued
+        // (or re-armed) a push back to the source would show as pending.
+        sqlx::query("UPDATE sync_tasks SET status = 'completed' WHERE peer_instance_id = $1")
+            .bind(peer_id)
+            .execute(&fx.pool)
+            .await
+            .expect("settle the client deploy's push");
+
+        // A replicated mapping that lacks the peer-only prefix.
+        let (status, _) = tdh::send(
+            router.clone(),
+            replicated_put(doc(&[
+                ("shared", "new-maven-plugin"),
+                ("remote", "remote-maven-plugin"),
+            ])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, merged) = tdh::send(router.clone(), tdh::get(uri.clone())).await;
+        let merged_entries =
+            crate::formats::maven::parse_plugin_prefix_entries(&String::from_utf8_lossy(&merged));
+        let queued_after_merge: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_tasks WHERE peer_instance_id = $1 \
+             AND status = 'pending'",
+        )
+        .bind(peer_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count pending push tasks");
+        let (row_size, row_sha): (i64, String) = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(plugin_path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("plugin metadata row");
+
+        // A replicated mapping that covers every stored prefix is kept as sent.
+        let superset = doc(&[
+            ("shared", "new-maven-plugin"),
+            ("remote", "remote-maven-plugin"),
+            ("local", "local-maven-plugin"),
+            ("extra", "extra-maven-plugin"),
+        ]);
+        let (status, _) = tdh::send(router.clone(), replicated_put(superset.clone())).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (_, stored) = tdh::send(router, tdh::get(uri.clone())).await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+
+        let prefixes: Vec<(&str, &str)> = merged_entries
+            .iter()
+            .map(|e| (e.prefix.as_str(), e.artifact_id.as_str()))
+            .collect();
+        assert!(
+            prefixes.contains(&("local", "local-maven-plugin")),
+            "{prefixes:?}"
+        );
+        assert!(
+            prefixes.contains(&("remote", "remote-maven-plugin")),
+            "{prefixes:?}"
+        );
+        assert!(
+            prefixes.contains(&("shared", "new-maven-plugin")),
+            "the incoming entry wins a prefix collision: {prefixes:?}"
+        );
+        assert_eq!(prefixes.len(), 3, "{prefixes:?}");
+        assert_eq!(
+            row_size,
+            merged.len() as i64,
+            "the row describes the merged bytes"
+        );
+        assert_eq!(row_sha.trim(), format!("{:x}", Sha256::digest(&merged)));
+        assert_eq!(queued_before, vec![plugin_path.to_string()]);
+        assert_eq!(
+            queued_after_merge, 0,
+            "a replicated write must not queue a push back to the source"
+        );
+        assert_eq!(
+            stored, superset,
+            "a covering document is stored byte for byte"
         );
     }
 
@@ -12878,6 +13374,16 @@ mod scan_on_proxy_tests {
         let (state, _cache) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
         tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
         let digest = seed_verdict(&fx.pool, &bytes, fx.repo_id, false).await;
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Maven,
+                &format!("{GROUP}:widget"),
+                "1.0",
+            ),
+        )
+        .await;
 
         for pulls in 1..=2 {
             let (status, body, headers) = pull(&state, &fx.repo_key, JAR).await;
@@ -14387,5 +14893,74 @@ mod age_gate_4702_tests {
         drop_repo(&pool, id).await;
         assert_eq!(jar.0, StatusCode::OK);
         assert!(String::from_utf8_lossy(&meta.1).contains(&format!("<version>{YOUNG}</version>")));
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_jar_with_two_pom_properties_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let coordinate = JvmArchiveCoordinate {
+            group_id: "org.demo".to_string(),
+            artifact_id: "demo".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let file = MavenScannedArchive {
+            proxy: &proxy,
+            upstream_url: "http://upstream.invalid",
+            coordinate: Some(&coordinate),
+            sidecar: std::sync::Mutex::new(None),
+        };
+        let entry = "META-INF/maven/org.demo/demo/pom.properties";
+        let good: &[u8] = b"groupId=org.demo\nartifactId=demo\nversion=1.0.0\n";
+        let other: &[u8] = b"groupId=org.demo\nartifactId=demo\nversion=0.1.0\n";
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Maven, "demo-1.0.0.jar", bytes);
+        let normalised = zip_with(&[
+            (entry, good),
+            ("org/demo/A.class", b"x"),
+            (&format!("./{entry}"), other),
+        ]);
+        let repeated = zip_with(&[(entry, other), (entry, good)]);
+        for dup in [normalised, repeated] {
+            let (own, gate) = check(&dup);
+            assert!(established(&own));
+            assert!(unestablished(&gate));
+        }
+        let single = zip_with(&[(entry, good), ("org/demo/A.class", b"x")]);
+        assert!(established(&check(&single).1));
     }
 }

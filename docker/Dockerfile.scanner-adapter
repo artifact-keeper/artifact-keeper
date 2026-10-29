@@ -202,7 +202,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.76.0-r2 (note: no leading
+# This digest is the manifest-list digest of tag 0.76.0-r3 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -224,7 +224,17 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # was merged, tagged v0.76.0-r2, and this FROM repoints to the published
 # digest. docker/scanner-adapter/VERSION moves 1.5.0 -> 1.6.0 with it, because
 # exact versions are never republished (scripts/ci/check-version-pin-bump.sh).
-FROM ghcr.io/artifact-keeper/trivy@sha256:1076c0b7fe3295c7b1ebb6bd360e405ab0e61795881475f8ef5b2fdc4f28adb1 AS trivy
+#
+# 0.76.0-r2 -> 0.76.0-r3 (#5041): Docker Publish's gate reported HIGH
+# CVE-2026-116587 (GHSA-mgcc-cww5-fp2q, go-jose v4.1.5, fixed in 4.1.6) in
+# the bundled trivy on main from 79e52871 (run 40671050571). No Trivy release
+# carries the fix (v0.76.0 and v0.76.1 pin v4.1.5); upstream main made the
+# bump in aquasecurity/trivy#11488, so artifact-keeper/trivy added a go-jose
+# override on top of the unchanged v0.76.0 source (trivy#20), tagged
+# v0.76.0-r3, and this FROM repoints to that published manifest-list digest
+# (verified with `skopeo inspect --raw`). docker/scanner-adapter/VERSION moves
+# 1.6.0 -> 1.6.1 with it.
+FROM ghcr.io/artifact-keeper/trivy@sha256:e324a1cc4ad525ed0a39d623a277a12cd138fd8ee2a88f60f776ae5a40b5b0ce AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security

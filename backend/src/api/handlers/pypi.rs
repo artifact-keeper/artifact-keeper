@@ -19098,6 +19098,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "verified",
+                "3.2.1",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
@@ -19303,6 +19313,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "sameversion",
+                "1.0.0",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let state = scan_state_with_live_scanner(
@@ -19806,6 +19826,16 @@ mod tests {
             )
             .await
             .expect("seed clean verdict");
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::Python,
+                "probenoneopen",
+                "1.0.0",
+            ),
+        )
+        .await;
 
         let storage_path = fx.storage_dir.to_str().unwrap().to_string();
         let state = scan_state_with_live_scanner(
@@ -22852,5 +22882,86 @@ mod serve_key_4365_tests {
                 "{raw}"
             );
         }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    /// PyPI's proxy identity comes from the file name, so the reader is not
+    /// fooled here; the archive is still refused, as for every format.
+    #[tokio::test]
+    async fn a_wheel_or_sdist_with_two_metadata_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let project = crate::formats::pypi_name::NormalizedProjectName::parse("demo").unwrap();
+        let file = PypiScannedFile {
+            proxy: &proxy,
+            upstream_url: "http://upstream.invalid",
+            project: &project,
+            index_path: "simple/demo/",
+        };
+        let good: &[u8] = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\n";
+        let other: &[u8] =
+            b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0.0\nRequires-Dist: other\n";
+        let wheel_name = "demo-1.0.0-py3-none-any.whl";
+        let sdist_name = "demo-1.0.0.tar.gz";
+        let wheel = |entries: &[(&str, &[u8])]| zip_with(entries);
+        let sdist = |entries: &[(&str, &[u8])]| tar_gz_with(entries);
+
+        let dup_wheel = wheel(&[
+            ("demo-1.0.0.dist-info/METADATA", good),
+            ("demo/__init__.py", b""),
+            ("demo-1.0.0.dist-info/./METADATA", other),
+        ]);
+        let (own, gate) = identities_for_test(&file, DupFormat::Pypi, wheel_name, &dup_wheel);
+        assert!(established(&own));
+        assert!(unestablished(&gate));
+        let dup_sdist = sdist(&[
+            ("demo-1.0.0/PKG-INFO", good),
+            ("demo-1.0.0/PKG-INFO", other),
+        ]);
+        let (own, gate) = identities_for_test(&file, DupFormat::Pypi, sdist_name, &dup_sdist);
+        assert!(established(&own));
+        assert!(unestablished(&gate));
+
+        let ok_wheel = wheel(&[("demo-1.0.0.dist-info/METADATA", good)]);
+        assert!(established(
+            &identities_for_test(&file, DupFormat::Pypi, wheel_name, &ok_wheel).1
+        ));
+        let ok_sdist = sdist(&[("demo-1.0.0/PKG-INFO", good)]);
+        assert!(established(
+            &identities_for_test(&file, DupFormat::Pypi, sdist_name, &ok_sdist).1
+        ));
     }
 }

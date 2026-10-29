@@ -5149,6 +5149,62 @@ fn offline_refresh_token(
     Some(refresh.to_string())
 }
 
+/// Mint the `/v2/token` response for a validated API token.
+///
+/// Shared by both credential slots an API token can occupy: the Basic
+/// password (`docker login -u user -p <token>`) and the Bearer header. The
+/// Bearer slot matters for clients that configure a bare `token` rather than a
+/// username/password pair — Renovate's Docker datasource sends it as
+/// `Authorization: Bearer <token>` when exchanging credentials for a tags/list
+/// probe (#4903). Before the share, only the Basic slot recognized an API
+/// token there and the exchange answered 401.
+///
+/// The minted bearer keeps the token's action-scope ceiling (#2430), its
+/// repository allow-list (#2290), and the expiry cap (#3460), exactly as the
+/// Basic-password arm does. No refresh token is issued: `offline_refresh_token`
+/// suppresses it for every API-token session.
+fn api_token_exchange_response(
+    auth_service: &AuthService,
+    validation: crate::services::auth_service::ApiTokenValidation,
+) -> Response {
+    let crate::services::auth_service::ApiTokenValidation {
+        user,
+        scopes,
+        allowed_repo_ids,
+        expires_at,
+    } = validation;
+    let allowed_repo_ids: Option<Vec<Uuid>> = allowed_repo_ids.into();
+    let tokens = match auth_service.generate_tokens_with_scope_capped(
+        &user,
+        Some(scopes),
+        allowed_repo_ids,
+        expires_at,
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "failed to generate tokens",
+            )
+        }
+    };
+
+    let resp = TokenResponse {
+        token: tokens.access_token.clone(),
+        access_token: tokens.access_token.clone(),
+        expires_in: tokens.expires_in,
+        refresh_token: None,
+        issued_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&resp).unwrap()))
+        .unwrap()
+}
+
 /// Normalize the GET-flow `?offline_token=true` query parameter into the same
 /// `"offline"` string that the POST OAuth2 path's `access_type=offline` form
 /// field carries. Strict `"true"` match by design: any other value
@@ -5338,7 +5394,8 @@ async fn token(
             // (public-pull) token. The `validate_token` async call now
             // consults the DB credential-change watermark (#1173), so a
             // deactivated user's token fails here too.
-            let had_bearer_header = extract_bearer_token(&headers).is_some();
+            let bearer = extract_bearer_token(&headers);
+            let had_bearer_header = bearer.is_some();
             let bearer_claims = match validate_token(&state.db, &state.config, &headers).await {
                 Ok(claims) => Some(claims),
                 // #4750: an outage while checking a presented JWT is a
@@ -5450,6 +5507,29 @@ async fn token(
                     .unwrap();
             }
 
+            // A non-JWT bearer may still be a raw API token (#4903). Renovate's
+            // Docker datasource sends a configured `token` as
+            // `Authorization: Bearer <token>` when it exchanges credentials for
+            // the unauthenticated `tags/list?n=10000` probe, and refusing that
+            // slot left it with no registry token at all. Recognizing it here
+            // mirrors the content handlers, which already accept an API token
+            // in the Bearer slot.
+            if let Some(token) = bearer.as_deref() {
+                let auth_service =
+                    AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+                match auth_service.validate_api_token(token).await {
+                    Ok(validation) => {
+                        return api_token_exchange_response(&auth_service, validation)
+                    }
+                    // #4750: validation that could not be completed is a
+                    // retryable 503, never a 401.
+                    Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+                        return oci_auth_unavailable()
+                    }
+                    Err(_) => {}
+                }
+            }
+
             // If the caller presented a Bearer token but it failed to
             // validate (e.g. credential change on a peer replica, account
             // deactivated), reject with 401 instead of silently downgrading
@@ -5524,71 +5604,46 @@ async fn token(
     // locks itself out. `validate_api_token` has no failure-counter side
     // effect, so trying it first keeps the lockout counter accurate while
     // still falling through to bcrypt for actual passwords.
-    let (user, tokens, authenticated_via_api_token) = match auth_service
-        .validate_api_token(&credentials.1)
-        .await
-    {
-        // #4750: validation that could not be completed is a retryable 503;
-        // falling through to the next credential shape would end in a 401.
-        Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
-            return oci_auth_unavailable()
-        }
-        Ok(validation) => {
-            // Carry the API token's declared repository allow-list onto the
-            // minted OCI bearer so the resource handlers enforce it (#2290).
-            // `AccessScope::Admin` (an unscoped token) maps to `None` =
-            // unrestricted, preserving prior behaviour for full-scope tokens.
-            let allowed_repo_ids: Option<Vec<Uuid>> = validation.allowed_repo_ids.clone().into();
-            // Carry the API token's action-scope allowlist onto the minted OCI
-            // bearer so write/delete handlers enforce it (#2430): a read-only
-            // `docker login` token must not exchange up into a push-capable
-            // bearer.
-            let token_scopes = Some(validation.scopes.clone());
-            let user = validation.user;
-            // Cap the minted bearer at the API token's own expiry (#3460) so
-            // an exchanged JWT never outlives the credential that minted it.
-            let tokens = match auth_service.generate_tokens_with_scope_capped(
-                &user,
-                token_scopes,
-                allowed_repo_ids,
-                validation.expires_at,
-            ) {
-                Ok(t) => t,
-                Err(_) => {
-                    return oci_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "INTERNAL_ERROR",
-                        "failed to generate tokens",
-                    )
-                }
-            };
-            (user, tokens, true)
-        }
-        Err(_) => match auth_service
-            .authenticate_with_reason(&credentials.0, &credentials.1)
-            .await
-        {
-            Ok((user, tokens)) => (user, tokens, false),
-            Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
+    let (user, tokens, authenticated_via_api_token) =
+        match auth_service.validate_api_token(&credentials.1).await {
+            // #4750: validation that could not be completed is a retryable 503;
+            // falling through to the next credential shape would end in a 401.
+            Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
                 return oci_auth_unavailable()
             }
-            Err(password_failure) => {
-                // Final fallback: accept a valid AK access token (JWT) as the
-                // Docker password. This enables the CI/CD keyless push flow:
-                //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
-                //   2. docker login -u <ci-user> -p <access_token>  (this path)
-                //   3. docker push ...
-                // This mirrors how Artifactory handles its OIDC-issued tokens.
-                match auth_service
-                    .validate_access_token_async(&credentials.1)
-                    .await
-                {
-                    Ok(claims) => {
-                        let user =
-                            match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
-                                .bind(claims.sub)
-                                .fetch_one(&state.db)
-                                .await
+            Ok(validation) => {
+                // Carry the token's repository and action ceilings onto the minted
+                // OCI bearer (#2290/#2430) and cap it at the token's own expiry
+                // (#3460); `api_token_exchange_response` is shared with the Bearer
+                // slot so the two cannot drift.
+                return api_token_exchange_response(&auth_service, validation);
+            }
+            Err(_) => match auth_service
+                .authenticate_with_reason(&credentials.0, &credentials.1)
+                .await
+            {
+                Ok((user, tokens)) => (user, tokens, false),
+                Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
+                    return oci_auth_unavailable()
+                }
+                Err(password_failure) => {
+                    // Final fallback: accept a valid AK access token (JWT) as the
+                    // Docker password. This enables the CI/CD keyless push flow:
+                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
+                    //   3. docker push ...
+                    // This mirrors how Artifactory handles its OIDC-issued tokens.
+                    match auth_service
+                        .validate_access_token_async(&credentials.1)
+                        .await
+                    {
+                        Ok(claims) => {
+                            let user = match sqlx::query_as::<_, User>(
+                                "SELECT * FROM users WHERE id = $1",
+                            )
+                            .bind(claims.sub)
+                            .fetch_one(&state.db)
+                            .await
                             {
                                 Ok(u) => u,
                                 Err(ref e)
@@ -5604,50 +5659,50 @@ async fn token(
                                     )
                                 }
                             };
-                        // Preserve the incoming access token's action-scope
-                        // ceiling and repository scope on the re-minted bearer
-                        // so this keyless fallback cannot re-widen a restricted
-                        // token (#2430/#2290). Cap at the presented token's
-                        // `exp` (#3460): the re-mint must not extend lifetime.
-                        let tokens = match auth_service.generate_tokens_with_scope_capped(
-                            &user,
-                            claims.scopes.clone(),
-                            claims.allowed_repo_ids.clone(),
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
-                        ) {
-                            Ok(t) => t,
-                            Err(_) => {
-                                return oci_error(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "INTERNAL_ERROR",
-                                    "failed to generate tokens",
-                                )
-                            }
-                        };
-                        // Treat like an API token: bypass the TOTP guard below.
-                        (user, tokens, true)
-                    }
-                    Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
-                        return oci_auth_unavailable()
-                    }
-                    Err(_) => {
-                        // Neither an API token, a password nor an access
-                        // token: count it as the password rejection (#4676).
-                        record_token_auth_failure(
-                            password_failure
-                                .metric_reason()
-                                .unwrap_or(AuthFailureReason::BadPassword),
-                        );
-                        return oci_error(
-                            StatusCode::UNAUTHORIZED,
-                            "UNAUTHORIZED",
-                            "invalid username or password",
-                        );
+                            // Preserve the incoming access token's action-scope
+                            // ceiling and repository scope on the re-minted bearer
+                            // so this keyless fallback cannot re-widen a restricted
+                            // token (#2430/#2290). Cap at the presented token's
+                            // `exp` (#3460): the re-mint must not extend lifetime.
+                            let tokens = match auth_service.generate_tokens_with_scope_capped(
+                                &user,
+                                claims.scopes.clone(),
+                                claims.allowed_repo_ids.clone(),
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
+                            ) {
+                                Ok(t) => t,
+                                Err(_) => {
+                                    return oci_error(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "INTERNAL_ERROR",
+                                        "failed to generate tokens",
+                                    )
+                                }
+                            };
+                            // Treat like an API token: bypass the TOTP guard below.
+                            (user, tokens, true)
+                        }
+                        Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+                            return oci_auth_unavailable()
+                        }
+                        Err(_) => {
+                            // Neither an API token, a password nor an access
+                            // token: count it as the password rejection (#4676).
+                            record_token_auth_failure(
+                                password_failure
+                                    .metric_reason()
+                                    .unwrap_or(AuthFailureReason::BadPassword),
+                            );
+                            return oci_error(
+                                StatusCode::UNAUTHORIZED,
+                                "UNAUTHORIZED",
+                                "invalid username or password",
+                            );
+                        }
                     }
                 }
-            }
-        },
-    };
+            },
+        };
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
@@ -34059,7 +34114,7 @@ mod proxy_scan_block_tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -34071,6 +34126,11 @@ mod proxy_scan_block_tests {
                 None,
                 Some("grype-1.0.0-test"),
                 Some(fx.repo_id),
+                // The image gate records what it cataloged with a clean image
+                // verdict; a clean row that cataloged nothing is not reused
+                // under fail-closed (part of #3396).
+                Some(1),
+                None,
             )
             .await
             .expect("seed clean verdict");
@@ -37252,7 +37312,7 @@ mod proxy_scan_block_tests {
         enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
 
         ProxyScanService::new(fx.pool.clone())
-            .record_verdict(
+            .record_verdict_with_catalog(
                 &digest,
                 "grype",
                 "clean",
@@ -37264,6 +37324,11 @@ mod proxy_scan_block_tests {
                 None,
                 Some("grype-1.0.0-test"),
                 Some(fx.repo_id),
+                // The image gate records what it cataloged with a clean image
+                // verdict; a clean row that cataloged nothing is not reused
+                // under fail-closed (part of #3396).
+                Some(1),
+                None,
             )
             .await
             .expect("seed clean verdict");
@@ -38394,7 +38459,7 @@ mod proxy_scan_block_tests {
         let rows_after_refusal = package_rows(&fx.pool, fx.repo_id).await;
 
         // The verdict flips to clean; the image upstream is unchanged.
-        scan.record_verdict(
+        scan.record_verdict_with_catalog(
             &digest,
             "grype",
             "clean",
@@ -38406,6 +38471,11 @@ mod proxy_scan_block_tests {
             None,
             Some("grype-1.0.0-test"),
             Some(fx.repo_id),
+            // The image gate records what it cataloged with a clean image
+            // verdict; a clean row that cataloged nothing is not reused
+            // under fail-closed (part of #3396).
+            Some(1),
+            None,
         )
         .await
         .expect("flip verdict to clean");
@@ -45732,6 +45802,110 @@ mod token_exchange_expiry_cap_3460 {
         );
 
         tdh::cleanup_user(&pool, user_id).await;
+    }
+}
+
+#[allow(clippy::disallowed_methods)] // test-only: bounded to_bytes on a tiny JSON body
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod token_exchange_bearer_api_token_4903 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::auth_service::AuthService;
+    use std::sync::Arc;
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    /// Drive the real `/v2/token` handler with the headers under test.
+    async fn call_token_endpoint(state: SharedState, headers: HeaderMap) -> Response {
+        token(
+            State(state),
+            headers,
+            Ok(Query(TokenQuery {
+                service: Some(OCI_TOKEN_SERVICE.to_string()),
+                account: None,
+                offline_token: None,
+            })),
+            Ok(bytes::Bytes::new()),
+        )
+        .await
+    }
+
+    /// #4903: Renovate's Docker datasource configures a bare `token` and sends
+    /// it as `Authorization: Bearer <token>` to `/v2/token`; its unauthenticated
+    /// `tags/list` probe returned 401 and the exchange used to answer 401 too,
+    /// because only a JWT was recognized in that slot. A raw API token must
+    /// exchange, and the bearer it mints must keep the token's action ceiling.
+    #[tokio::test]
+    async fn api_token_in_the_bearer_slot_exchanges_for_a_registry_token() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _u) = tdh::create_user(&pool).await;
+        let storage = std::env::temp_dir().join(format!("oci-4903-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage).unwrap();
+        let state = tdh::build_state(pool.clone(), storage.to_str().unwrap());
+        let auth = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+
+        let (api_token, token_id) = auth
+            .generate_api_token(
+                user_id,
+                "renovate-bearer",
+                vec!["read:artifacts".into()],
+                Some(30),
+            )
+            .await
+            .expect("mint API token");
+
+        let resp = call_token_endpoint(state.clone(), bearer_headers(&api_token)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an API token in the Bearer slot must exchange for a registry token"
+        );
+        let body = to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("token response JSON");
+        let minted = json["token"].as_str().expect("token field").to_string();
+        assert_ne!(minted, ANONYMOUS_TOKEN, "must not downgrade to anonymous");
+        assert!(
+            json.get("refresh_token").is_none(),
+            "an API-token exchange must not mint a parallel refresh token: {json}"
+        );
+
+        // The minted bearer authenticates on the content surface and preserves
+        // the API token's action ceiling (#2430).
+        let (claims, scopes) =
+            authenticate_oci_with_scopes(&state.db, &state.config, &bearer_headers(&minted))
+                .await
+                .expect("minted bearer validates");
+        assert_eq!(claims.sub, user_id);
+        assert_eq!(scopes, Some(vec!["read:artifacts".to_string()]));
+
+        // A bearer that is neither a JWT nor an API token is still refused.
+        let rejected = call_token_endpoint(state.clone(), bearer_headers("not-a-token")).await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        // A revoked API token is refused in the Bearer slot exactly as in the
+        // Basic slot: the same validator runs, and revocation is honoured even
+        // though the successful exchange above cached the validation.
+        auth.revoke_api_token(token_id, user_id)
+            .await
+            .expect("revoke API token");
+        let revoked = call_token_endpoint(state.clone(), bearer_headers(&api_token)).await;
+        assert_eq!(
+            revoked.status(),
+            StatusCode::UNAUTHORIZED,
+            "a revoked API token must not exchange through the Bearer slot"
+        );
+
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage);
     }
 }
 

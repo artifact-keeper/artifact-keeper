@@ -888,7 +888,12 @@ fn map_proxy_error_classified(
                     e
                 );
             }
-            (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response()
+            let mut response =
+                (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response();
+            if let Some(status) = crate::services::proxy_service::upstream_refusal_status(&e) {
+                response.extensions_mut().insert(UpstreamRefusal(status));
+            }
+            response
         }
     }
 }
@@ -902,6 +907,22 @@ pub(crate) struct UpstreamAuthFailure;
 /// Whether a proxy error `Response` is an upstream authentication failure.
 pub(crate) fn is_upstream_auth_failure(response: &Response) -> bool {
     response.extensions().get::<UpstreamAuthFailure>().is_some()
+}
+
+/// Response extension carrying the upstream `401`/`403` that produced a
+/// generic 502 (#4929).
+///
+/// The error mapping deliberately renders every non-404 4xx as the opaque
+/// "Failed to fetch from upstream" 502, so a format handler that knows the
+/// resource is OPTIONAL (a compressed conda repodata candidate, a `.sig`) can
+/// no longer tell an absent key from a real failure. This extension preserves
+/// only the status classification, never the upstream URL or body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamRefusal(pub(crate) StatusCode);
+
+/// The upstream `401`/`403` behind a proxy error `Response`, if any.
+pub(crate) fn upstream_refusal_status(response: &Response) -> Option<StatusCode> {
+    response.extensions().get::<UpstreamRefusal>().map(|r| r.0)
 }
 
 /// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
@@ -9275,6 +9296,11 @@ pub(crate) enum ProxyScanMode {
     /// The bytes ARE the scannable unit (a PyPI wheel, an npm tarball):
     /// file/archive scan over the synthetic artifact. Pre-#3003-PR-2 behavior.
     File,
+    /// [`Self::File`] for a cached package archive or image manifest that is
+    /// rescanned with no coordinate to pin (#3396): the CVE engine must
+    /// catalog SOMETHING before a zero-finding scan is trusted as `clean` (see
+    /// [`proxy_rescan_requires_catalog`](crate::services::scanner_service::proxy_rescan_requires_catalog)).
+    FileRequiringCatalog,
     /// The bytes are an OCI IMAGE MANIFEST: the scannable unit is the whole
     /// image (config + layers). The scan stages any missing blobs from
     /// upstream into local storage (bounded by the shared byte cap) and runs
@@ -9392,7 +9418,9 @@ async fn run_scan_within_budget<T, E>(
 /// passes one in explicitly.
 pub(crate) fn proxy_scan_mode_budget(mode: &ProxyScanMode) -> std::time::Duration {
     match mode {
-        ProxyScanMode::File => crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        ProxyScanMode::File | ProxyScanMode::FileRequiringCatalog => {
+            crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET
+        }
         ProxyScanMode::OciImage(_) => {
             crate::services::scanner_service::OCI_PROXY_SCAN_INLINE_BUDGET
         }
@@ -9422,6 +9450,75 @@ pub(crate) async fn proxy_scan_and_record(
     budget: std::time::Duration,
 ) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
 {
+    scan_and_record(
+        state, repo_id, digest, synthetic, bytes, expected, mode, budget, false,
+    )
+    .await
+}
+
+/// [`proxy_scan_and_record`] for the on-demand rescan of cached bytes (#3396).
+///
+/// A rescan has no request coordinate, so it never pins. It records its
+/// verdict exactly as an inline scan would, with one exception: a `clean`
+/// result does not replace a stored `vulnerable` verdict for the same digest
+/// when the engine cataloged fewer components than that verdict was graded
+/// on (see [`rescan_may_replace_stored_verdict`]). Such a rescan saw less of
+/// the package than the scan it would overrule, so it is inconclusive
+/// ([`ProxyScanInconclusive::ScanFailed`]) and the stored verdict, inventory
+/// and findings are left as they are.
+pub(crate) async fn proxy_rescan_and_record(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    mode: &ProxyScanMode,
+    budget: std::time::Duration,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    scan_and_record(
+        state, repo_id, digest, synthetic, bytes, None, mode, budget, true,
+    )
+    .await
+}
+
+/// Whether a rescan verdict `new` may replace the stored verdict for the same
+/// digest (#3396), given the stored row's `(verdict, components_cataloged)`
+/// when one exists.
+///
+/// A `vulnerable` verdict is replaced by a `clean` one only when the rescan
+/// cataloged at least as many components as the stored verdict was graded
+/// on. Every other replacement (no stored row, a stored `clean`, a rescan
+/// that finds vulnerabilities, a stored verdict with no recorded catalog
+/// size) is allowed, as before. A rescan that reported no catalog counts as
+/// having cataloged nothing.
+pub(crate) fn rescan_may_replace_stored_verdict(
+    stored: Option<(&str, Option<i32>)>,
+    new: &crate::services::scanner_service::ProxyScanVerdict,
+) -> bool {
+    use crate::services::proxy_scan_service::{verdict_blocks, VERDICT_CLEAN};
+    let Some((stored_verdict, stored_cataloged)) = stored else {
+        return true;
+    };
+    if new.verdict_token() != VERDICT_CLEAN || !verdict_blocks(stored_verdict) {
+        return true;
+    }
+    new.components_cataloged.unwrap_or(0) >= stored_cataloged.unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn scan_and_record(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    mode: &ProxyScanMode,
+    budget: std::time::Duration,
+    rescan: bool,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
     let scanner = state
         .scanner_service
         .as_ref()
@@ -9432,6 +9529,11 @@ pub(crate) async fn proxy_scan_and_record(
             ProxyScanMode::File => {
                 scanner
                     .scan_content_expecting(synthetic, bytes, expected)
+                    .await
+            }
+            ProxyScanMode::FileRequiringCatalog => {
+                scanner
+                    .scan_content_requiring_catalog(synthetic, bytes)
                     .await
             }
             ProxyScanMode::OciImage(ctx) => {
@@ -9459,6 +9561,31 @@ pub(crate) async fn proxy_scan_and_record(
     };
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    if rescan {
+        // #3396: see `rescan_may_replace_stored_verdict`. An unreadable
+        // stored row cannot be compared, so it is inconclusive too.
+        let stored = match pss.lookup_verdict_catalog(digest, PROXY_SCAN_TYPE).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, error = %e,
+                    "proxy rescan: could not read the stored verdict; leaving it unchanged"
+                );
+                return Err(ProxyScanInconclusive::ScanFailed);
+            }
+        };
+        let stored_ref = stored.as_ref().map(|(v, c)| (v.as_str(), *c));
+        if !rescan_may_replace_stored_verdict(stored_ref, &verdict) {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                stored_components = ?stored_ref.and_then(|(_, c)| c),
+                rescan_components = ?verdict.components_cataloged,
+                "proxy rescan cataloged fewer components than the stored vulnerable \
+                 verdict was graded on; inconclusive, stored verdict unchanged"
+            );
+            return Err(ProxyScanInconclusive::ScanFailed);
+        }
+    }
     // #4594: the cataloged-component count is written with the verdict, so
     // the proxy-scans view can say when a verdict was graded on file
     // contents only.
@@ -9586,8 +9713,20 @@ pub(crate) enum ProxyScanIdentity {
 ///   as for a first pull;
 /// * a request whose identity is not established cannot be scanned, so it
 ///   does not reuse a CLEAN verdict graded as such a pin (a clean grade on
-///   one release says nothing about an undetermined one); a blocking verdict
-///   still blocks it.
+///   one release says nothing about an undetermined one), nor a CLEAN
+///   verdict graded with no pin at all (an on-demand rescan in any
+///   repository, which may have cataloged an OS package with no release to
+///   grade it against; part of #3396). It reuses a clean verdict graded as
+///   a coordinate the bytes carry themselves (npm, PyPI and the like); a
+///   blocking verdict still blocks it.
+///
+/// For every other established pin (npm, PyPI, RubyGems, Cargo, NuGet, conda,
+/// Maven) the stored pin need not match, but a CLEAN verdict recorded with no
+/// pin at all (an on-demand rescan, or a row written before pins were
+/// recorded) is not reused for a pinned request (#3396): the inline gate
+/// grades these packages through the pin, and a grade made without one says
+/// nothing about the package itself. The gate scans again as for a first
+/// pull and records the pin. A blocking verdict still blocks.
 pub(crate) fn stored_verdict_pertains(
     stored_pin: Option<&str>,
     verdict: &str,
@@ -9602,12 +9741,43 @@ pub(crate) fn stored_verdict_pertains(
                 None => verdict_blocks(verdict),
             }
         }
-        ProxyScanIdentity::Established(_) | ProxyScanIdentity::NotApplicable => true,
+        ProxyScanIdentity::Established(_) => stored_pin.is_some() || verdict_blocks(verdict),
+        ProxyScanIdentity::NotApplicable => true,
         ProxyScanIdentity::Unestablished => {
             verdict_blocks(verdict)
-                || !stored_pin.is_some_and(ExpectedComponent::pin_identity_is_request_pinned)
+                || stored_pin
+                    .is_some_and(|pin| !ExpectedComponent::pin_identity_is_request_pinned(pin))
         }
     }
+}
+
+/// Whether a stored proxy verdict graded nothing: `clean` with no findings,
+/// recorded with no pin, and with no component cataloged (`components_cataloged`
+/// `0`, or `None` when the row predates that column or the writer reported no
+/// catalog). Part of #3396.
+///
+/// Verdicts are keyed per content digest and shared by every repository that
+/// serves those bytes. A row like this says only that a scan ran and saw
+/// nothing it could grade, for example an on-demand rescan run from a
+/// repository whose format does not catalog these bytes. Under fail-closed it
+/// is therefore not reused for ANY request identity
+/// ([`stored_verdict_pertains`] decides the identity question first): the
+/// gate scans as for a first pull, which grades an established coordinate,
+/// withholds an unestablished one (423), and scans a format without a
+/// coordinate. Fail-open and record-only keep reusing it, as before.
+///
+/// A pinned `clean` verdict is not affected even with an empty catalog: the
+/// inline gate recorded it after grading the request's coordinate (a conda
+/// package legitimately catalogs nothing).
+pub(crate) fn stored_clean_graded_nothing(
+    row: &crate::services::proxy_scan_service::ProxyScanRow,
+    stored_pin: Option<&str>,
+    components_cataloged: Option<i32>,
+) -> bool {
+    row.verdict == crate::services::proxy_scan_service::VERDICT_CLEAN
+        && row.findings_count == 0
+        && components_cataloged.unwrap_or(0) <= 0
+        && stored_pin.is_none()
 }
 
 /// What a served proxy pull's `X-AK-Scan` header reports.
@@ -9831,13 +10001,15 @@ async fn decide_proxy_scan_serve(
 
     let pss = ProxyScanService::new(state.db.clone());
     // #4952: a verdict graded as another coordinate than this request's is
-    // not this request's verdict; see [`stored_verdict_pertains`].
+    // not this request's verdict; see [`stored_verdict_pertains`]. Under
+    // fail-closed a clean verdict that graded nothing is not reused for any
+    // identity either; see [`stored_clean_graded_nothing`] (part of #3396).
     let row = pss
         .lookup_verdict_with_pin(digest, PROXY_SCAN_TYPE)
         .await
         .ok()
         .flatten()
-        .and_then(|(row, pin)| {
+        .and_then(|(row, pin, cataloged)| {
             let pertains = stored_verdict_pertains(pin.as_deref(), &row.verdict, &identity);
             if !pertains {
                 tracing::info!(
@@ -9845,8 +10017,20 @@ async fn decide_proxy_scan_serve(
                     stored_pin = ?pin,
                     "stored proxy verdict was graded as another coordinate; not reused"
                 );
+                return None;
             }
-            pertains.then_some(row)
+            if action.is_fail_closed()
+                && stored_clean_graded_nothing(&row, pin.as_deref(), cataloged)
+            {
+                tracing::info!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    components_cataloged = ?cataloged,
+                    "stored clean proxy verdict graded no components and carries no pin; \
+                     not reused under fail-closed, scanning"
+                );
+                return None;
+            }
+            Some(row)
         });
     // #2976: compare the verdict's stored provenance against the LIVE
     // CVE-scanner version (VersionCache-backed — a memory read on the hot
@@ -10208,7 +10392,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
     file.after_buffered_fetch(state, req, &bytes, &digest)
         .await?;
 
-    let identity = file.identity(req, &bytes, &digest);
+    let identity = gate_identity(file, req, &bytes, &digest);
     let synthetic = F::synthetic_artifact(req.repo_id, req.filename, &digest, bytes.len() as i64);
     match gate_proxy_scan_serve(
         state,
@@ -10241,6 +10425,62 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
             Ok(resp)
         }
     }
+}
+
+/// The identity the gate acts on for `bytes`: the format's own
+/// [`ScannedProxyFile::identity`], unless the bytes are an archive with two
+/// entries at one path. The format readers take the first such entry and the
+/// scan extractor keeps the last, so neither copy can be vouched for: the
+/// identity is [`ProxyScanIdentity::Unestablished`], inconclusive exactly like
+/// an archive that does not read as its format (fail-closed withholds it,
+/// fail-open serves it `pending`, and nothing is scanned or recorded).
+pub(crate) fn gate_identity<F: ScannedProxyFile>(
+    file: &F,
+    req: &ScannedProxyRequest<'_>,
+    bytes: &Bytes,
+    digest: &str,
+) -> ProxyScanIdentity {
+    if let Some(entry) =
+        crate::services::archive_entry_paths::duplicated_entry_path(req.filename, bytes)
+    {
+        tracing::warn!(
+            repo_id = %req.repo_id, file = %req.filename, digest = %digest,
+            entry = %entry, format = F::LABEL,
+            "proxied archive has more than one entry at the same path; its identity is not established"
+        );
+        return ProxyScanIdentity::Unestablished;
+    }
+    file.identity(req, bytes, digest)
+}
+
+/// Test seam for the per-format duplicate-entry suites: `file`'s own identity
+/// for `bytes` served as `filename`, and the one [`gate_identity`] acts on.
+#[cfg(test)]
+pub(crate) fn identities_for_test<F: ScannedProxyFile>(
+    file: &F,
+    format: RepositoryFormat,
+    filename: &str,
+    bytes: &[u8],
+) -> (ProxyScanIdentity, ProxyScanIdentity) {
+    use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
+    let bytes = Bytes::copy_from_slice(bytes);
+    let digest = sha256_hex(&bytes);
+    let req = ScannedProxyRequest {
+        repo_id: Uuid::nil(),
+        repo_key: "remote",
+        fetch_base: "http://upstream.invalid",
+        format,
+        source_path: filename,
+        cache_path: filename,
+        filename,
+        action: ProxyScanAction::FailClosed,
+        severity_gate: ProxySeverityGate::BlockOnAny,
+        ctx: None,
+    };
+    (
+        file.identity(&req, &bytes, &digest),
+        gate_identity(file, &req, &bytes, &digest),
+    )
 }
 
 /// The over-cap branch of [`serve_scanned_proxy_file`]: the object is too
@@ -11514,6 +11754,82 @@ mod tests {
 
     // ── #3396: rescan of already-cached bytes ──
 
+    /// A rescan replaces a stored `vulnerable` verdict with `clean` only when
+    /// it cataloged at least as many components as that verdict was graded
+    /// on; every other replacement stands.
+    #[test]
+    fn rescan_replaces_a_vulnerable_verdict_only_with_an_equal_or_larger_catalog() {
+        use crate::services::scanner_service::aggregate_proxy_verdict;
+        let clean = |cataloged: Option<i32>| {
+            let mut v = aggregate_proxy_verdict(&[], Some("grype-test".to_string()));
+            v.components_cataloged = cataloged;
+            v
+        };
+        let vulnerable = {
+            let mut v = aggregate_proxy_verdict(
+                &[crate::models::security::RawFinding {
+                    severity: crate::models::security::Severity::High,
+                    title: "CVE-2026-3396 test".to_string(),
+                    description: None,
+                    cve_id: Some("CVE-2026-3396".to_string()),
+                    affected_component: Some("x".to_string()),
+                    affected_version: Some("1.0".to_string()),
+                    fixed_version: None,
+                    source: Some("grype".to_string()),
+                    source_url: None,
+                    finding_class: crate::models::security::FindingClass::Vulnerability,
+                }],
+                Some("grype-test".to_string()),
+            );
+            v.components_cataloged = Some(0);
+            v
+        };
+        assert_eq!(clean(None).verdict_token(), "clean");
+        assert_eq!(vulnerable.verdict_token(), "vulnerable");
+
+        // Fewer components than the stored vulnerable verdict: kept.
+        assert!(!rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(1))),
+            &clean(Some(0))
+        ));
+        assert!(!rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(1))),
+            &clean(None)
+        ));
+        assert!(!rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(12))),
+            &clean(Some(3))
+        ));
+        // As many or more: replaced.
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(3))),
+            &clean(Some(3))
+        ));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(0))),
+            &clean(Some(0))
+        ));
+        // Nothing to overrule, or nothing to compare against.
+        assert!(rescan_may_replace_stored_verdict(None, &clean(Some(0))));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("clean", Some(5))),
+            &clean(Some(0))
+        ));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", None)),
+            &clean(Some(0))
+        ));
+        // A rescan that finds vulnerabilities is recorded whatever it saw.
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("vulnerable", Some(5))),
+            &vulnerable
+        ));
+        assert!(rescan_may_replace_stored_verdict(
+            Some(("clean", Some(5))),
+            &vulnerable
+        ));
+    }
+
     /// Scanner applicability and archive extraction are driven by the
     /// FILENAME, so a rescan that derives the wrong one does not fail — it
     /// silently catalogs nothing and records a clean verdict. Every shape a
@@ -11902,7 +12218,7 @@ mod tests {
             .expect("pinnable")
         };
         let established = |pin: &ExpectedComponent| ProxyScanIdentity::Established(pin.clone());
-        let digests: Vec<String> = (0..6)
+        let digests: Vec<String> = (0..8)
             .map(|_| format!("{:0>64}", Uuid::new_v4().simple()))
             .collect();
         let state = &fx.state;
@@ -11961,15 +12277,28 @@ mod tests {
         );
 
         // A format whose bytes carry their coordinate keeps one verdict per
-        // digest, rows from before #4952 included.
+        // digest whatever it was pinned as, but a clean grade made without a
+        // pin (a rescan, or a row from before pins were recorded) is not
+        // reused for a pinned request (#3396). A format with no pin at all
+        // reuses it as before.
+        let npm = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.21");
         let d = digests[5].clone();
         seed(d.clone(), "clean", None).await;
-        let npm = ExpectedComponent::new(ComponentEcosystem::Npm, "lodash", "4.17.21");
-        assert_eq!(gate_reuse_4952(state, &d, established(&npm)).await, "clean");
+        assert_eq!(
+            gate_reuse_4952(state, &d, established(&npm)).await,
+            "pending",
+            "a clean verdict graded without a pin must not serve a pinned npm request"
+        );
         assert_eq!(
             gate_reuse_4952(state, &d, ProxyScanIdentity::NotApplicable).await,
             "clean"
         );
+        let d = digests[6].clone();
+        seed(d.clone(), "clean", Some(npm.pin_identity())).await;
+        assert_eq!(gate_reuse_4952(state, &d, established(&npm)).await, "clean");
+        let d = digests[7].clone();
+        seed(d.clone(), "vulnerable", None).await;
+        assert_eq!(gate_reuse_4952(state, &d, established(&npm)).await, "403");
 
         for digest in &digests {
             let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
@@ -12015,9 +12344,16 @@ mod tests {
             "vulnerable",
             &ProxyScanIdentity::Unestablished
         ));
-        assert!(stored_verdict_pertains(
+        // Part of #3396: an unestablished request does not reuse a clean
+        // verdict graded with no pin; a blocking one still blocks it.
+        assert!(!stored_verdict_pertains(
             None,
             "clean",
+            &ProxyScanIdentity::Unestablished
+        ));
+        assert!(stored_verdict_pertains(
+            None,
+            "vulnerable",
             &ProxyScanIdentity::Unestablished
         ));
         assert!(stored_verdict_pertains(
@@ -12030,6 +12366,41 @@ mod tests {
             "clean",
             &ProxyScanIdentity::NotApplicable
         ));
+        // #3396: a pinned request in any other ecosystem reuses a verdict
+        // graded with some pin, never a clean one graded with none; a
+        // blocking verdict still blocks.
+        for (eco, name, version) in [
+            (ComponentEcosystem::Npm, "minimist", "1.2.5"),
+            (ComponentEcosystem::Python, "pyyaml", "5.3.1"),
+            (ComponentEcosystem::RubyGems, "rack", "2.0.7"),
+            (ComponentEcosystem::Cargo, "smallvec", "1.6.0"),
+            (ComponentEcosystem::NuGet, "newtonsoft.json", "12.0.1"),
+            (ComponentEcosystem::Conda, "numpy", "1.26.4"),
+            (
+                ComponentEcosystem::Maven,
+                "commons-collections:commons-collections",
+                "3.2.1",
+            ),
+        ] {
+            let pin = ExpectedComponent::new(eco, name, version);
+            let identity = ProxyScanIdentity::Established(pin.clone());
+            assert!(
+                !stored_verdict_pertains(None, "clean", &identity),
+                "{eco:?}: an unpinned clean verdict must not be reused"
+            );
+            assert!(
+                stored_verdict_pertains(None, "vulnerable", &identity),
+                "{eco:?}: an unpinned vulnerable verdict still blocks"
+            );
+            assert!(
+                stored_verdict_pertains(Some(&pin.pin_identity()), "clean", &identity),
+                "{eco:?}"
+            );
+            assert!(
+                stored_verdict_pertains(None, "clean", &ProxyScanIdentity::NotApplicable),
+                "{eco:?}"
+            );
+        }
         for eco in ["go", "composer", "conan", "debian", "rpm", "alpine"] {
             assert!(
                 ExpectedComponent::pin_identity_is_request_pinned(&format!("{eco}|x|1")),
@@ -12044,6 +12415,59 @@ mod tests {
                 "{eco}"
             );
         }
+    }
+
+    /// Part of #3396: under fail-closed a stored verdict is not reused when it
+    /// is clean, has no findings, carries no pin and cataloged no component.
+    /// A pin, a non-empty catalog, a finding or a blocking verdict each keep
+    /// the row reusable.
+    #[test]
+    fn stored_clean_graded_nothing_requires_clean_unpinned_and_empty_3396() {
+        use crate::services::proxy_scan_service::ProxyScanRow;
+        let row = |verdict: &str, findings: i32| ProxyScanRow {
+            checksum_sha256: "d".repeat(64),
+            scan_type: PROXY_SCAN_TYPE.to_string(),
+            verdict: verdict.to_string(),
+            findings_count: findings,
+            critical_count: 0,
+            high_count: 0,
+            medium_count: 0,
+            low_count: 0,
+            max_severity: None,
+            scanner_version: Some("grype-test".to_string()),
+            scanned_at: Utc::now(),
+        };
+        let clean = row("clean", 0);
+        assert!(stored_clean_graded_nothing(&clean, None, Some(0)));
+        assert!(
+            stored_clean_graded_nothing(&clean, None, None),
+            "a row with no recorded catalog graded nothing either"
+        );
+        assert!(!stored_clean_graded_nothing(&clean, None, Some(1)));
+        assert!(
+            !stored_clean_graded_nothing(&clean, Some("conda|numpy|1.26.4"), Some(0)),
+            "a pinned clean verdict was graded as the request's coordinate"
+        );
+        assert!(!stored_clean_graded_nothing(
+            &clean,
+            Some("npm|lodash|4.17.21"),
+            None
+        ));
+        assert!(!stored_clean_graded_nothing(
+            &row("clean", 2),
+            None,
+            Some(0)
+        ));
+        assert!(!stored_clean_graded_nothing(
+            &row("vulnerable", 1),
+            None,
+            Some(0)
+        ));
+        assert!(!stored_clean_graded_nothing(
+            &row("error", 0),
+            None,
+            Some(0)
+        ));
     }
 
     /// NoScanner arm: fail-closed still 423s and fail-open still serves
@@ -24477,12 +24901,12 @@ mod proxy_download_recording_tests {
             (
                 "composer.rs",
                 "download_archive",
-                "serve_scanned_virtual_composer_dist(",
+                "serve_virtual_composer_dist(",
                 1,
             ),
             (
                 "composer.rs",
-                "serve_scanned_virtual_composer_dist",
+                "serve_virtual_composer_dist",
                 "serve_scanned_composer_dist(",
                 1,
             ),

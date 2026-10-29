@@ -747,7 +747,67 @@ async fn save_label_index(
     headers: &HeaderMap,
 ) -> Result<(), Response> {
     let label_path = build_label_path(module_name);
-    let metadata = serde_json::json!({ "labels": labels });
+    let storage = state.storage_for_repo_or_500(&repo.storage_location())?;
+
+    // Write the row and its metadata together: a sync task must never observe
+    // a row whose label document is still the previous revision.
+    let mut tx = state.db.begin().await.map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+
+    // #4916: the label document carries a monotonic revision so a peer that
+    // receives a delayed or simultaneous move can compare it with the index it
+    // already holds instead of blindly applying the last writer. Allocate the
+    // revision under a per-module advisory lock and store the doc in the same
+    // transaction, so two local moves cannot both claim the same revision
+    // (the row lock alone does not serialise the first write, when no row
+    // exists yet).
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "protobuf-label\u{1f}{}\u{1f}{}",
+            repo.id, label_path
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            connect_error(
+                crate::api::handlers::db_status(&e),
+                "internal",
+                crate::api::handlers::db_err_message(&e),
+            )
+        })?;
+    let previous: Option<(uuid::Uuid, String, Option<serde_json::Value>)> = sqlx::query_as(
+        r#"SELECT a.id, a.storage_key, am.metadata
+        FROM artifacts a
+        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.path = $2
+        FOR UPDATE OF a"#,
+    )
+    .bind(repo.id)
+    .bind(&label_path)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| {
+        connect_error(
+            crate::api::handlers::db_status(&e),
+            "internal",
+            crate::api::handlers::db_err_message(&e),
+        )
+    })?;
+    let previous_storage_key = previous.as_ref().map(|(_, key, _)| key.clone());
+    let revision = previous
+        .as_ref()
+        .and_then(|(_, _, metadata)| metadata.as_ref())
+        .and_then(|metadata| metadata.get("revision"))
+        .and_then(|revision| revision.as_i64())
+        .unwrap_or(0)
+        + 1;
+    let metadata = serde_json::json!({ "labels": labels, "revision": revision });
     let bytes = Bytes::from(serde_json::to_vec(&metadata).map_err(|e| {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -760,22 +820,11 @@ async fn save_label_index(
     let storage_key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
         &checksum_sha256,
     );
-    let storage = state.storage_for_repo_or_500(&repo.storage_location())?;
     storage.put(&storage_key, bytes).await.map_err(|e| {
         connect_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             crate::api::handlers::storage_err_message(&e),
-        )
-    })?;
-
-    // Write the row and its metadata together: a sync task must never observe
-    // a row whose label document is still the previous revision.
-    let mut tx = state.db.begin().await.map_err(|e| {
-        connect_error(
-            crate::api::handlers::db_status(&e),
-            "internal",
-            crate::api::handlers::db_err_message(&e),
         )
     })?;
 
@@ -843,6 +892,52 @@ async fn save_label_index(
             crate::api::handlers::db_err_message(&e),
         )
     })?;
+
+    // #4916: the previous label document is content-addressed and immutable,
+    // so the upsert replaced the row's pointer but left its object behind.
+    // Delete it once no live row on the same backend still names it (two
+    // modules can legitimately dedupe to one document). Best-effort: a failed
+    // delete leaks an object, never a row.
+    if let Some(previous_storage_key) = previous_storage_key {
+        if previous_storage_key != storage_key
+            && previous_storage_key != "none"
+            && previous_storage_key != label_path
+        {
+            let still_referenced = sqlx::query_scalar::<_, bool>(
+                r#"SELECT EXISTS (
+                    SELECT 1
+                    FROM artifacts a
+                    JOIN repositories r ON r.id = a.repository_id
+                    WHERE a.storage_key = $1
+                      AND a.is_deleted = false
+                      AND r.storage_backend = $2
+                      AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3)
+                    UNION ALL
+                    SELECT 1
+                    FROM artifact_versions av
+                    JOIN repositories r ON r.id = av.repository_id
+                    WHERE av.storage_key = $1
+                      AND r.storage_backend = $2
+                      AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3)
+                )"#,
+            )
+            .bind(&previous_storage_key)
+            .bind(&repo.storage_backend)
+            .bind(&repo.storage_path)
+            .fetch_one(&state.db)
+            .await
+            .unwrap_or(true);
+            if !still_referenced {
+                if let Err(e) = storage.delete(&previous_storage_key).await {
+                    tracing::warn!(
+                        storage_key = %previous_storage_key,
+                        error = %e,
+                        "failed to delete a superseded protobuf label document"
+                    );
+                }
+            }
+        }
+    }
 
     // #4725/#4889: fan the label index out like any other upload (the helper
     // skips a write that is itself a replication). The sync worker sends the
@@ -3025,6 +3120,222 @@ mod tests {
             "the client push queues the commit and the label index; \
              the replicated push must not queue another task"
         );
+    }
+
+    /// #4916: every label move stores a new content-addressed JSON document.
+    /// The superseded object must be reclaimed once no live row names it, and
+    /// the document must carry a monotonic revision for peer conflict
+    /// resolution.
+    #[tokio::test]
+    async fn save_label_index_reclaims_superseded_document_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let module = "acme/labels";
+        let mut labels = serde_json::Map::new();
+        labels.insert("main".to_string(), serde_json::json!("commit-a"));
+        save_label_index(
+            &fx.state,
+            &repo,
+            module,
+            &labels,
+            fx.user_id,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("first label move");
+
+        let label_path = build_label_path(module);
+        let (first_key, first_metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT a.storage_key, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&label_path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("first label row");
+        let first_object = fx.storage_dir.join(&first_key);
+        assert!(
+            tokio::fs::metadata(&first_object).await.is_ok(),
+            "the first label document must be stored"
+        );
+        assert_eq!(first_metadata["revision"], 1);
+
+        labels.insert("main".to_string(), serde_json::json!("commit-b"));
+        save_label_index(
+            &fx.state,
+            &repo,
+            module,
+            &labels,
+            fx.user_id,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("second label move");
+
+        let (second_key, second_metadata, second_size): (String, serde_json::Value, i64) =
+            sqlx::query_as(
+                "SELECT a.storage_key, am.metadata, a.size_bytes FROM artifacts a \
+                 JOIN artifact_metadata am ON am.artifact_id = a.id \
+                 WHERE a.repository_id = $1 AND a.path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(&label_path)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("second label row");
+        let stored = tokio::fs::read(fx.storage_dir.join(&second_key))
+            .await
+            .expect("read the current label document");
+        fx.teardown().await;
+
+        assert_ne!(first_key, second_key, "a label move writes a new document");
+        assert_eq!(second_metadata["revision"], 2);
+        assert_eq!(second_metadata["labels"]["main"], "commit-b");
+        assert_eq!(second_size, stored.len() as i64);
+        assert!(
+            tokio::fs::metadata(&first_object).await.is_err(),
+            "the superseded label document must not be left behind"
+        );
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(stored["labels"]["main"], "commit-b");
+        assert_eq!(stored["revision"], 2);
+    }
+
+    /// #4916: a label document replicated to a peer arrives byte for byte.
+    /// The source's stored JSON is what the sync worker sends; the peer must
+    /// store exactly those bytes (same sha256 and size) with the same label
+    /// map and revision, and a later move must replace it the same way.
+    #[tokio::test]
+    async fn replicated_label_document_round_trips_byte_exact_4916() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use sha2::{Digest, Sha256};
+
+        let Some(source) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let Some(peer) = tdh::Fixture::setup("local", "protobuf").await else {
+            source.teardown().await;
+            return;
+        };
+        let repo = source.repo_info("local", None);
+        let module = "acme/roundtrip";
+        let label_path = build_label_path(module);
+        let row_sql = "SELECT a.storage_key, a.size_bytes, a.checksum_sha256, am.metadata \
+                       FROM artifacts a JOIN artifact_metadata am ON am.artifact_id = a.id \
+                       WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false";
+        let mut labels = serde_json::Map::new();
+        let mut rounds = Vec::new();
+        for (revision, commit) in [(1, "commit-a"), (2, "commit-b")] {
+            labels.insert("main".to_string(), serde_json::json!(commit));
+            labels.insert(format!("v{revision}"), serde_json::json!(commit));
+            save_label_index(
+                &source.state,
+                &repo,
+                module,
+                &labels,
+                source.user_id,
+                &HeaderMap::new(),
+            )
+            .await
+            .expect("label move");
+            let (key, size, sha, metadata): (String, i64, String, serde_json::Value) =
+                sqlx::query_as(row_sql)
+                    .bind(source.repo_id)
+                    .bind(&label_path)
+                    .fetch_one(&source.pool)
+                    .await
+                    .expect("source label row");
+            let sent = tokio::fs::read(source.storage_dir.join(&key))
+                .await
+                .expect("source label document");
+
+            // What the sync worker sends: the stored bytes, their sha256, and
+            // the `protobuf` metadata document.
+            let (status, body) = peer
+                .chunked_upload_as(
+                    tdh::admin_auth(peer.user_id, &peer.username),
+                    &label_path,
+                    &sent,
+                    serde_json::json!({
+                        "artifact_name": module,
+                        "artifact_version": "_labels",
+                        "artifact_metadata_format": "protobuf",
+                        "artifact_metadata": metadata,
+                    }),
+                    true,
+                )
+                .await;
+            let (peer_key, peer_size, peer_sha, peer_metadata): (
+                String,
+                i64,
+                String,
+                serde_json::Value,
+            ) = sqlx::query_as(row_sql)
+                .bind(peer.repo_id)
+                .bind(&label_path)
+                .fetch_one(&peer.pool)
+                .await
+                .expect("peer label row");
+            let received = tokio::fs::read(peer.storage_dir.join(&peer_key))
+                .await
+                .expect("peer label document");
+            rounds.push((
+                revision,
+                status,
+                body,
+                sent,
+                size,
+                sha,
+                metadata,
+                received,
+                peer_size,
+                peer_sha,
+                peer_metadata,
+            ));
+        }
+        sqlx::query("DELETE FROM upload_sessions WHERE repository_id = $1")
+            .bind(peer.repo_id)
+            .execute(&peer.pool)
+            .await
+            .ok();
+        source.teardown().await;
+        peer.teardown().await;
+
+        for (
+            revision,
+            status,
+            body,
+            sent,
+            size,
+            sha,
+            metadata,
+            received,
+            peer_size,
+            peer_sha,
+            peer_metadata,
+        ) in rounds
+        {
+            assert!(
+                status.is_success(),
+                "revision {revision}: {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(received, sent, "revision {revision}: bytes must match");
+            assert_eq!(peer_size, size);
+            assert_eq!(peer_size, sent.len() as i64);
+            assert_eq!(peer_sha.trim(), sha.trim());
+            assert_eq!(peer_sha.trim(), format!("{:x}", Sha256::digest(&sent)));
+            assert_eq!(peer_metadata, metadata);
+            assert_eq!(peer_metadata["revision"], revision);
+            let doc: serde_json::Value = serde_json::from_slice(&received).unwrap();
+            assert_eq!(doc["labels"], peer_metadata["labels"]);
+        }
     }
 
     /// #4921: a pushed commit must be accepted by the receiving peer. The

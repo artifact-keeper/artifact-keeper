@@ -86,6 +86,14 @@ case "$1" in
         # The PR -> closing-issue map for check 5. $FAKE_CLOSES_MAP is already
         # in the `<pr>:<issue>,<issue>` shape the real --jq produces.
         [ "${FAKE_GRAPHQL_FAIL-0}" = "1" ] && exit 1
+        # $FAKE_ISSUE_NUMBER is an ISSUE that a range subject ends in. The
+        # real API answers `pullRequest(number:N)` on it with NOT_FOUND and gh
+        # exits 1, failing the whole query; `issueOrPullRequest` resolves it.
+        if [ -n "${FAKE_ISSUE_NUMBER-}" ] \
+           && printf '%s ' "$@" | grep -qE "[^A-Za-z]pullRequest\(number:${FAKE_ISSUE_NUMBER}\)"; then
+          echo "gh: Could not resolve to a PullRequest with the number of ${FAKE_ISSUE_NUMBER}." >&2
+          exit 1
+        fi
         [ -n "${FAKE_CLOSES_MAP-}" ] && printf '%s\n' "$FAKE_CLOSES_MAP"
         exit 0
         ;;
@@ -891,6 +899,42 @@ if [ "$rc" = "2" ] && grep -qF "no previous stable tag" "$WORK/out.txt"; then
   pass "no previous stable tag -> INFRA (exit 2)"
 else
   fail "no previous stable tag: expected exit 2 with INFRA, got $rc"
+  sed 's/^/        /' "$WORK/out.txt" >&2
+fi
+
+# 11. A commit rebase-merged onto a release line keeps its cherry-picked
+#     subject, which can end in the ISSUE number it fixes rather than a PR
+#     number (`fix(c): gamma (#203)`; 1.11.8 had two). Looking that number up
+#     as a pull request is a NOT_FOUND error that used to fail the whole
+#     PR -> issue query and turn every line cut INFRA. An entry citing the
+#     issue accounts for the commit.
+REPO5C="$WORK/repo5c"
+cp -r "$REPO5" "$REPO5C"
+# Back to the base fixture (#101-#104): later cases add #105 and #106 to REPO5.
+git -C "$REPO5C" reset -q --hard "$(git -C "$REPO5C" log --format=%H -1 --grep='(#104)$')"
+git -C "$REPO5C" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "fix(c): gamma (#203)"
+cat > "$REPO5C/CHANGELOG.md" << 'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+- **alpha is fixed** (#201). prose about alpha.
+- **beta is fixed** (#202). prose about beta.
+- **gamma is fixed** (#203). prose about gamma.
+
+## [9.9.8] - 2026-01-01
+- older work
+EOF
+( cd "$REPO5C" && PATH="$STUB4:$PATH" PREFLIGHT_REPO=artifact-keeper/artifact-keeper \
+    PREFLIGHT_SKIP_DOCKER_HEALTH=1 PREFLIGHT_SKIP_VERSION_PIN=1 \
+    FAKE_CLOSES_MAP="$CLOSES_MAP" FAKE_ISSUE_NUMBER=203 \
+    bash scripts/ci/release-preflight.sh >"$WORK/out.txt" 2>&1 )
+rc=$?
+if [ "$rc" = "0" ] && grep -qF "pending sections reconcile" "$WORK/out.txt"; then
+  pass "range subject ending in an issue number -> READY (exit 0)"
+else
+  fail "range subject ending in an issue number: expected exit 0, got $rc"
   sed 's/^/        /' "$WORK/out.txt" >&2
 fi
 

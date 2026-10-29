@@ -3179,7 +3179,11 @@ mod scan_on_proxy_4104 {
             body: gem("dtf-scanned", "1.0.0"),
             recorded_path: format!("gems/{FILE}"),
             file: FILE.to_string(),
-            pin: None,
+            pin: Some(crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::RubyGems,
+                "dtf-scanned",
+                "1.0.0",
+            )),
         }
     }
 
@@ -3285,5 +3289,56 @@ mod serve_key_4365_tests {
             assert_eq!(got.cache_key, key);
             assert!(got.scannable);
         }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    fn metadata_gz(name: &str, version: &str) -> Vec<u8> {
+        use std::io::Write;
+        let yaml = format!(
+            "--- !ruby/object:Gem::Specification\nname: {name}\nversion: !ruby/object:Gem::Version\n  version: {version}\n"
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(yaml.as_bytes()).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_gem_with_two_metadata_gz_entries_is_not_established() {
+        let (good, other) = (metadata_gz("demo", "1.0.0"), metadata_gz("other", "9.9.9"));
+        let check = |bytes: &[u8]| {
+            archive_identities(ProxiedGem, DupFormat::Rubygems, "demo-1.0.0.gem", bytes)
+        };
+        let dup = tar_with(&[
+            ("metadata.gz", &good),
+            ("data.tar.gz", b""),
+            ("metadata.gz", &other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(
+            matches!(own, ProxyScanIdentity::Established(_)),
+            "the reader takes the first copy"
+        );
+        assert!(unestablished(&gate));
+        let single = tar_with(&[("metadata.gz", &good), ("data.tar.gz", b"")]);
+        assert!(matches!(
+            check(&single).1,
+            ProxyScanIdentity::Established(_)
+        ));
     }
 }

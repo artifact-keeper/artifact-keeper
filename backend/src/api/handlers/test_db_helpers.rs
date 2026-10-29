@@ -2793,6 +2793,23 @@ pub async fn seed_proxy_verdict(
     digest
 }
 
+/// Record on the stored verdict for `digest` the pin `pin` it was graded as,
+/// as the inline gate records it (#4952). A pinned pull reuses a `clean`
+/// verdict only when it carries a pin (#3396), so a test that seeds one for a
+/// pinned format and expects it reused records the pin with it.
+pub async fn pin_proxy_verdict(
+    pool: &PgPool,
+    digest: &str,
+    pin: &crate::services::scanner_service::ExpectedComponent,
+) {
+    sqlx::query("UPDATE proxy_scan_results SET pin_identity = $2 WHERE checksum_sha256 = $1")
+        .bind(digest)
+        .bind(pin.pin_identity())
+        .execute(pool)
+        .await
+        .expect("record the verdict's pin");
+}
+
 /// Remove the verdicts [`seed_proxy_verdict`] wrote.
 pub async fn drop_proxy_verdicts(pool: &PgPool, digests: &[String]) {
     sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = ANY($1)")

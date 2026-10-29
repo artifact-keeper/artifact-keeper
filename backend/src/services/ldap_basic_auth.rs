@@ -1028,9 +1028,10 @@ async fn sync_directory_user(
     let db = auth_service.db();
 
     // The username lookup above covers the usual case, but a renamed account
-    // is matched by its stable DN. Reject a deactivated row here too: the
-    // federated sync would otherwise reactivate it, turning an admin disable
-    // into a no-op for package clients.
+    // is matched by its stable DN. Reject a deactivated row here too, before
+    // the federated sync: an admin disable must stay effective for package
+    // clients (#4933), and this check also covers the window before the sync's
+    // own `is_active` preservation runs.
     let existing_by_dn = sqlx::query_as::<_, (Uuid, bool)>(
         "SELECT id, is_active FROM users WHERE external_id = $1 AND auth_provider = 'ldap'",
     )
@@ -1993,6 +1994,251 @@ mod tests {
             .execute(&pool)
             .await;
         cleanup(&pool, provider_id, &dir_user).await;
+    }
+
+    /// Inner package-route auth for the guest-guard regression below: exactly
+    /// what `repo_visibility_middleware` does with a Basic credential, minus
+    /// the repository lookup.
+    async fn package_route_auth(
+        axum::extract::State(auth): axum::extract::State<std::sync::Arc<AuthService>>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        use crate::api::middleware::auth::{
+            extract_visibility_token, try_resolve_auth_outcome_with_passthrough, AuthOutcome,
+        };
+        use axum::response::IntoResponse;
+
+        let extracted = extract_visibility_token(&request);
+        let outcome = try_resolve_auth_outcome_with_passthrough(
+            &auth,
+            extracted,
+            true,
+            request.uri().path(),
+            request.method().as_str(),
+        )
+        .await;
+        match outcome {
+            AuthOutcome::Resolved(_) => next.run(request).await,
+            _ => axum::http::StatusCode::UNAUTHORIZED.into_response(),
+        }
+    }
+
+    async fn poll_login_failed(pool: &PgPool, username: &str) -> i64 {
+        let mut last = 0;
+        for _ in 0..100 {
+            last = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'LOGIN_FAILED' AND details->>'username' = $1",
+            )
+            .bind(username)
+            .fetch_one(pool)
+            .await
+            .expect("count LOGIN_FAILED rows");
+            if last > 0 {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        last
+    }
+
+    /// #4933 items 1 and 2: with guest access off, the global guard must not
+    /// bind against the directory. It defers a package-route Basic credential
+    /// to the route middleware (one bind, one LOGIN_FAILED row) and answers
+    /// management/Oci requests itself (no bind, no audit row).
+    #[tokio::test]
+    async fn test_guest_guard_does_not_bind_and_keeps_one_login_failed_row() {
+        use crate::api::middleware::guest_access::{guest_access_guard, GuestAccessState};
+        use crate::services::guest_access_policy::GuestAccessPolicy;
+        use axum::body::Body;
+        use axum::http::header::AUTHORIZATION;
+        use axum::http::{Request as HttpRequest, StatusCode};
+        use axum::middleware::from_fn_with_state;
+        use axum::routing::get;
+        use axum::Router;
+        use base64::Engine as _;
+        use tower::ServiceExt;
+
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let denied_user = format!("ldapguarddenied{suffix}");
+        let allowed_user = format!("ldapguardallowed{suffix}");
+        let local_user = format!("localguard{suffix}");
+        let denied_dn = format!("uid={denied_user},ou=people,{BASE}");
+        let allowed_dn = format!("uid={allowed_user},ou=people,{BASE}");
+        let (denied_port, denied_ops) = scripted_directory(&denied_user, &denied_dn, 0x31).await;
+        let (allowed_port, allowed_ops) =
+            scripted_directory(&allowed_user, &allowed_dn, 0x00).await;
+        let denied_provider =
+            create_provider(&pool, &format!("guard-denied-{suffix}"), denied_port).await;
+        let allowed_provider =
+            create_provider(&pool, &format!("guard-allowed-{suffix}"), allowed_port).await;
+        insert_known_user(&pool, &denied_user, &denied_dn, denied_provider).await;
+        insert_known_user(&pool, &allowed_user, &allowed_dn, allowed_provider).await;
+        let local_hash = AuthService::hash_password("Local!Secret9").await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'local', true, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&local_user)
+        .bind(format!("{local_user}@example.com"))
+        .bind(&local_hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+
+        let auth = std::sync::Arc::new(test_auth_service(&pool));
+        let app = Router::new()
+            .route("/pypi/private/simple/pkg/", get(|| async { "package" }))
+            .route(
+                "/api/v1/repositories/private/download/pkg.whl",
+                get(|| async { "download" }),
+            )
+            .route("/api/v1/repositories", get(|| async { "repos" }))
+            .route(
+                "/v2/library/nginx/manifests/latest",
+                get(|| async { "manifest" }),
+            )
+            .layer(from_fn_with_state(auth.clone(), package_route_auth))
+            .layer(from_fn_with_state(
+                GuestAccessState {
+                    policy: std::sync::Arc::new(GuestAccessPolicy::fixed(false)),
+                    auth_service: auth.clone(),
+                },
+                guest_access_guard,
+            ));
+        let basic = |user: &str, pass: &str| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+            )
+        };
+        let _pin = test_seam::SettingsOverride::set(settings());
+
+        // The management API and OCI answer the local decision: 401, no
+        // directory connection, no LOGIN_FAILED row.
+        for uri in ["/api/v1/repositories", "/v2/library/nginx/manifests/latest"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(uri)
+                        .header(AUTHORIZATION, basic(&allowed_user, "directory-password"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        assert_eq!(
+            count(&allowed_ops, "connect"),
+            0,
+            "the guest guard must not reach the directory for management/Oci"
+        );
+        assert_eq!(
+            poll_login_failed(&pool, &allowed_user).await,
+            0,
+            "the guard must not write a package-manager LOGIN_FAILED row"
+        );
+
+        // A wrong password on a package route: the guard defers, the package
+        // middleware performs the one bind, and exactly one LOGIN_FAILED row
+        // is written (not one from the guard plus one from the passthrough).
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/pypi/private/simple/pkg/")
+                    .header(AUTHORIZATION, basic(&denied_user, "wrong-password"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            count(&denied_ops, "bind"),
+            1,
+            "one bind, from the package route"
+        );
+        assert_eq!(
+            poll_login_failed(&pool, &denied_user).await,
+            1,
+            "one rejected request must write exactly one LOGIN_FAILED row"
+        );
+
+        // Repeating the rejected credential is refused without another bind.
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/pypi/private/simple/pkg/")
+                    .header(AUTHORIZATION, basic(&denied_user, "wrong-password"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            count(&denied_ops, "bind"),
+            1,
+            "the failure window must not re-bind the rejected password"
+        );
+
+        // A local username with a directory-shaped password is refused by the
+        // package route without a directory connection, and the generic
+        // download route (also managed under /api/v1) still defers correctly.
+        let connects_before = count(&denied_ops, "connect") + count(&allowed_ops, "connect");
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/pypi/private/simple/pkg/")
+                    .header(AUTHORIZATION, basic(&local_user, "directory-password"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            count(&denied_ops, "connect") + count(&allowed_ops, "connect"),
+            connects_before,
+            "a local account's username must never reach the directory"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/v1/repositories/private/download/pkg.whl")
+                    .header(AUTHORIZATION, basic(&allowed_user, "directory-password"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the generic download route must still run the passthrough under guest-off"
+        );
+
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1")
+            .bind(&local_user)
+            .execute(&pool)
+            .await;
+        cleanup(&pool, denied_provider, &denied_user).await;
+        cleanup(&pool, allowed_provider, &allowed_user).await;
     }
 
     /// The same rejected password is bound once per failure window, even

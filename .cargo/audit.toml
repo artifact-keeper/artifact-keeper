@@ -58,4 +58,19 @@ ignore = [
     # at >= 0.7.6. Remove once `cargo tree -i crypto-bigint@0.5.5` prints
     # nothing (#4940).
     "RUSTSEC-2026-0387",
+    # zstd / zstd-safe advisories of 2026-10-16 (RUSTSEC-2026-0391 zstd,
+    # -0398 and -0403 zstd-safe; patched in zstd >= 0.14.3 and zstd-safe >=
+    # 8.2.0). Every copy the backend reaches at run time is on the patched
+    # line: the direct zstd dependency, zip, async-compression and
+    # rattler_package_streaming (0.27.16) all use zstd 0.14.3 / zstd-safe
+    # 8.2.0. The ONLY pre-fix copy left, zstd 0.13.3 with zstd-safe 7.2.4,
+    # comes from wasmtime-internal-cache, which wasmtime's default `cache`
+    # feature links. That crate only runs when an Engine is built from a
+    # Config with a compilation cache configured, and wasm_runtime.rs never
+    # configures one, so its zstd calls are unreachable. No wasmtime release
+    # (through 50.0.0) requires zstd 0.14 yet. Remove these three once
+    # `cargo tree -i zstd@0.13.3` prints nothing.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]

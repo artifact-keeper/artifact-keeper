@@ -804,6 +804,23 @@ fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
     Some((user.to_owned(), pass.to_owned()))
 }
 
+/// Decode the `username:password` carried by a credential that can reach the
+/// LDAP Basic-auth passthrough: an HTTP `Basic` header, or the base64 form
+/// npm/cargo/goproxy sometimes put under `Bearer`.
+///
+/// Shared with the guest-access guard so its "is this a directory credential
+/// the package route should answer?" decision cannot drift from the
+/// passthrough's own decoding.
+pub(crate) fn extracted_basic_credentials(
+    extracted: ExtractedToken<'_>,
+) -> Option<(String, String)> {
+    match extracted {
+        ExtractedToken::Basic(encoded) => decode_basic_credentials(encoded),
+        ExtractedToken::Bearer(token) => decode_basic_credentials(token),
+        ExtractedToken::ApiKey(_) | ExtractedToken::None | ExtractedToken::Invalid => None,
+    }
+}
+
 /// Whether `path` is reachable by a principal flagged `must_change_password`.
 ///
 /// A forced-rotation user is otherwise blocked from every route (see
@@ -1334,14 +1351,10 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
         resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
 
     if matches!(outcome, AuthOutcome::InvalidCredential) && allow_basic_api_token {
-        let basic = match extracted {
-            ExtractedToken::Basic(encoded) => decode_basic_credentials(encoded),
-            // npm/cargo/goproxy sometimes send base64 `user:pass` under
-            // `Bearer`; `resolve_auth_outcome` already tried it as bcrypt.
-            ExtractedToken::Bearer(token) => decode_basic_credentials(token),
-            ExtractedToken::ApiKey(_) | ExtractedToken::None | ExtractedToken::Invalid => None,
-        };
-        if let Some((username, password)) = basic {
+        // `resolve_auth_outcome` already tried the same decoded pair as
+        // bcrypt (and the Bearer form as a JWT/API token), so this only
+        // reaches the directory after every cheaper form has failed.
+        if let Some((username, password)) = extracted_basic_credentials(extracted) {
             match crate::services::ldap_basic_auth::try_authenticate(
                 auth_service,
                 &username,

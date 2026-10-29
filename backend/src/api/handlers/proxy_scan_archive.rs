@@ -282,6 +282,9 @@ pub(crate) struct UnscannedArchiveRuns<'a, L> {
     pub proxy: &'a ProxyService,
     /// The path the member resolver fetches and caches under.
     pub path: &'a str,
+    /// Absolute upstream URLs for Remote members whose download URL cannot be
+    /// derived from `member.upstream_url` + `path` (#3952), keyed by member id.
+    pub member_fetch_urls: &'a std::collections::HashMap<uuid::Uuid, String>,
     pub local_fetch: L,
     pub default_content_type: &'a str,
     pub disposition: Option<&'a str>,
@@ -314,10 +317,11 @@ where
 {
     let runs = &runs;
     let unscanned_run = |run: Vec<Repository>| async move {
-        match proxy_helpers::resolve_virtual_download_from_members(
+        match proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
             run,
             Some(runs.proxy),
             runs.path,
+            runs.member_fetch_urls,
             Some(runs.ctx),
             &runs.local_fetch,
         )
@@ -473,9 +477,11 @@ where
             }
         }
     };
+    let no_fetch_urls = std::collections::HashMap::new();
     let runs = UnscannedArchiveRuns {
         proxy,
         path: route.upstream_path,
+        member_fetch_urls: &no_fetch_urls,
         local_fetch,
         default_content_type: route.default_content_type,
         disposition: route.virtual_disposition,
@@ -1086,13 +1092,36 @@ pub(crate) mod test_support {
         pub recorded_path: String,
         /// The `file` a 403 / 423 body names.
         pub file: String,
-        /// The pin the gate grades this file as, for a format whose pin
-        /// comes from the request (#4952): a seeded verdict records it, as a
-        /// verdict the gate graded would. `None` for the other formats.
+        /// The pin the gate grades this file as (#4952, #3396): a seeded
+        /// verdict records it, as a verdict the gate graded would. `None` for
+        /// a format the gate grades on contents, with no pin.
         pub pin: Option<crate::services::scanner_service::ExpectedComponent>,
     }
 
     pub(crate) type CaseFn = fn(&str) -> ArchiveCase;
+
+    /// An [`ArchiveKind`](super::ArchiveKind)'s own identity for `bytes`
+    /// served as `filename`, and the one the gate acts on
+    /// ([`proxy_helpers::gate_identity`](crate::api::handlers::proxy_helpers::gate_identity)).
+    pub(crate) fn archive_identities<K: super::ArchiveKind>(
+        kind: K,
+        format: crate::models::repository::RepositoryFormat,
+        filename: &str,
+        bytes: &[u8],
+    ) -> (
+        crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+        crate::api::handlers::proxy_helpers::ProxyScanIdentity,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy =
+            tdh::build_proxy_service_with_fs(tdh::lazy_pool(), dir.path().to_str().unwrap());
+        let file = super::ScannedArchive {
+            proxy: &proxy,
+            kind,
+            disposition: None,
+        };
+        crate::api::handlers::proxy_helpers::identities_for_test(&file, format, filename, bytes)
+    }
 
     /// A Remote repository and a Virtual over a second Remote member, both
     /// proxying one mock upstream (non-loopback, so a dist URL the upstream

@@ -627,6 +627,14 @@ fn extract_element_text(fragment: &str, tag: &str) -> Option<String> {
     }
 }
 
+/// Whether a `maven-metadata.xml` document is a group-level plugin-prefix
+/// mapping (`<plugins><plugin>...`) rather than an artifact-level version
+/// list. Unlike a version list, a peer cannot regenerate this document from
+/// the versioned artifacts it receives (#4916).
+pub fn is_plugin_prefix_metadata_document(xml: &str) -> bool {
+    xml.contains("<plugins")
+}
+
 /// Parse the `<plugins>` block of a group-level plugin-prefix
 /// maven-metadata.xml. Returns an empty Vec for documents without plugin
 /// entries (such as artifact-level metadata carrying a `<versions>` block).
@@ -657,6 +665,24 @@ pub fn parse_plugin_prefix_entries(xml: &str) -> Vec<PluginPrefixEntry> {
         }
     }
     entries
+}
+
+/// Merge a replicated group-level plugin-prefix document into the one a peer
+/// already stores (#4916).
+///
+/// Returns `None` when the incoming document can be stored exactly as sent:
+/// every prefix the peer holds is already in it (the usual case, a source
+/// that only added entries). Otherwise returns the union, incoming entries
+/// first so they win a prefix collision, and the peer's own entries kept.
+pub fn merge_replicated_plugin_prefix_metadata(incoming: &str, existing: &str) -> Option<String> {
+    let incoming_entries = parse_plugin_prefix_entries(incoming);
+    let peer_only = parse_plugin_prefix_entries(existing)
+        .iter()
+        .any(|held| !incoming_entries.iter().any(|e| e.prefix == held.prefix));
+    if !peer_only {
+        return None;
+    }
+    merge_plugin_prefix_metadata(&[incoming.to_string(), existing.to_string()])
 }
 
 /// Merge group-level plugin-prefix metadata documents from the members of a
@@ -1232,6 +1258,32 @@ mod tests {
             merged.find("<prefix>compiler</prefix>").unwrap()
                 < merged.find("<prefix>versions</prefix>").unwrap()
         );
+    }
+
+    #[test]
+    fn test_merge_replicated_plugin_prefix_metadata_4916() {
+        let peer = r#"<metadata><plugins>
+<plugin><prefix>local</prefix><artifactId>local-maven-plugin</artifactId></plugin>
+<plugin><prefix>shared</prefix><artifactId>old-maven-plugin</artifactId></plugin>
+</plugins></metadata>"#;
+        let covering = r#"<metadata><plugins>
+<plugin><prefix>shared</prefix><artifactId>new-maven-plugin</artifactId></plugin>
+<plugin><prefix>local</prefix><artifactId>local-maven-plugin</artifactId></plugin>
+</plugins></metadata>"#;
+        assert!(
+            merge_replicated_plugin_prefix_metadata(covering, peer).is_none(),
+            "a document that covers every stored prefix is stored as sent"
+        );
+
+        let partial = r#"<metadata><plugins>
+<plugin><prefix>shared</prefix><artifactId>new-maven-plugin</artifactId></plugin>
+</plugins></metadata>"#;
+        let merged = merge_replicated_plugin_prefix_metadata(partial, peer).unwrap();
+        let entries = parse_plugin_prefix_entries(&merged);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].prefix, "shared");
+        assert_eq!(entries[0].artifact_id, "new-maven-plugin");
+        assert_eq!(entries[1].prefix, "local");
     }
 
     #[test]

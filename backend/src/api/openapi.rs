@@ -311,6 +311,17 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    use axum::body::Body;
+    use axum::extract::{MatchedPath, Path as AxumPath, Request};
+    use axum::http::{Method, StatusCode};
+    use axum::middleware::{self, Next};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::put;
+    use axum::Router;
+    use tower::ServiceExt;
 
     #[test]
     fn test_openapi_spec_is_valid() {
@@ -748,294 +759,413 @@ mod tests {
         assert!(description.contains("concurrent"), "{description}");
     }
 
-    /// Verify every path documented in the OpenAPI spec has a corresponding
-    /// route registered in the handler routers. This catches the class of bug
-    /// where a handler is annotated with `#[utoipa::path(...)]` and listed in
-    /// the module's `ApiDoc` struct but never `.route()`-ed in the router.
+    /// Verify every path documented in the OpenAPI spec is served by the real
+    /// production router, and that each handler extracts the same number of
+    /// path parameters the document advertises.
     ///
-    /// For each documented path, we find the longest-matching prefix from a
-    /// known mapping of OpenAPI context_path → handler source file(s), then
-    /// verify the first static route segment appears in the source.
-    #[test]
-    fn test_all_openapi_paths_have_handlers() {
-        let spec = build_openapi();
+    /// The previous version walked a hand-maintained map from context prefix to
+    /// handler source and skipped any path whose first segment below that prefix
+    /// was a `{param}`. That silently skipped `/peers/{id}/network-profile`, so
+    /// the #4884 miswire (router mounted at `/peers`, handler still binding
+    /// `Path(peer_id)`) shipped. This version instead:
+    ///
+    /// 1. replaces each `{param}` with a well-formed probe value,
+    /// 2. sends the documented method through `create_router`, with a
+    ///    `route_layer` that answers 204 only after axum has matched both the
+    ///    path and the method (so no handler or database is touched), and
+    /// 3. compares the path parameter count with the handler signature's
+    ///    `Path(...)` extractor arity found next to its `#[utoipa::path]`.
+    ///
+    /// The negative test below re-introduces the #4884 mount and proves this
+    /// probe rejects it.
+    #[tokio::test]
+    async fn test_all_openapi_paths_have_handlers() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize OpenAPI");
+        let handlers = scan_handler_signatures();
+        let paths = spec["paths"].as_object().expect("paths object");
 
-        // Collect all (METHOD, path) pairs from the OpenAPI spec
-        let mut documented: Vec<(String, String)> = Vec::new();
-        for (path, item) in &spec.paths.paths {
-            if item.get.is_some() {
-                documented.push(("GET".to_string(), path.clone()));
-            }
-            if item.post.is_some() {
-                documented.push(("POST".to_string(), path.clone()));
-            }
-            if item.put.is_some() {
-                documented.push(("PUT".to_string(), path.clone()));
-            }
-            if item.delete.is_some() {
-                documented.push(("DELETE".to_string(), path.clone()));
-            }
-            if item.patch.is_some() {
-                documented.push(("PATCH".to_string(), path.clone()));
-            }
-        }
-
-        // Top-level health/readiness endpoints use context_path="" and are
-        // registered directly in routes.rs (not under /api/v1/).
-        let top_level_prefixes = ["/health", "/ready", "/live"];
-
-        // Map from OpenAPI context_path prefix to the handler source file(s)
-        // that register routes under that prefix. Sorted by prefix length
-        // descending so the longest (most specific) prefix wins — this ensures
-        // nested sub-modules (e.g. /api/v1/admin/analytics/) match their own
-        // handler file rather than the parent admin.rs.
-        //
-        // When adding a new handler module, add its prefix here to keep this
-        // test covering it.
-        let mut handler_sources: Vec<(&str, Vec<&str>)> = vec![
-            // --- Nested admin sub-modules ---
-            (
-                "/api/v1/admin/analytics/",
-                vec![include_str!("handlers/analytics.rs")],
-            ),
-            (
-                "/api/v1/admin/lifecycle/",
-                vec![include_str!("handlers/lifecycle.rs")],
-            ),
-            (
-                "/api/v1/admin/telemetry/",
-                vec![include_str!("handlers/telemetry.rs")],
-            ),
-            (
-                "/api/v1/admin/monitoring/",
-                vec![include_str!("handlers/monitoring.rs")],
-            ),
-            (
-                "/api/v1/admin/sso/",
-                vec![include_str!("handlers/sso_admin.rs")],
-            ),
-            // --- Nested auth sub-modules ---
-            (
-                "/api/v1/auth/ci/",
-                vec![include_str!("handlers/ci_auth.rs")],
-            ),
-            (
-                "/api/v1/auth/device/",
-                vec![
-                    include_str!("handlers/device.rs"),
-                    include_str!("routes.rs"),
-                ],
-            ),
-            ("/api/v1/auth/sso/", vec![include_str!("handlers/sso.rs")]),
-            ("/api/v1/auth/totp/", vec![include_str!("handlers/totp.rs")]),
-            // --- Top-level API modules ---
-            ("/api/v1/setup", vec![include_str!("handlers/auth.rs")]),
-            ("/api/v1/auth/", vec![include_str!("handlers/auth.rs")]),
-            (
-                "/api/v1/profile/",
-                vec![include_str!("handlers/profile.rs")],
-            ),
-            ("/api/v1/users/", vec![include_str!("handlers/users.rs")]),
-            (
-                "/api/v1/repositories/",
-                vec![
-                    include_str!("handlers/repositories.rs"),
-                    include_str!("handlers/repository_labels.rs"),
-                    include_str!("handlers/security.rs"),
-                    include_str!("handlers/repo_tokens.rs"),
-                    include_str!("handlers/environments.rs"),
-                    include_str!("handlers/artifact_presence.rs"),
-                    include_str!("handlers/proxy_cache_cap.rs"),
-                ],
-            ),
-            (
-                "/api/v1/environments/",
-                vec![include_str!("handlers/environments.rs")],
-            ),
-            (
-                "/api/v1/attestations/",
-                vec![include_str!("handlers/attestations.rs")],
-            ),
-            (
-                "/api/v1/artifacts/",
-                vec![
-                    include_str!("handlers/artifacts.rs"),
-                    include_str!("handlers/artifact_labels.rs"),
-                ],
-            ),
-            ("/api/v1/groups/", vec![include_str!("handlers/groups.rs")]),
-            (
-                "/api/v1/permissions/",
-                vec![include_str!("handlers/permissions.rs")],
-            ),
-            ("/api/v1/builds/", vec![include_str!("handlers/builds.rs")]),
-            (
-                "/api/v1/packages/",
-                vec![include_str!("handlers/packages.rs")],
-            ),
-            ("/api/v1/tree/", vec![include_str!("handlers/tree.rs")]),
-            ("/api/v1/search", vec![include_str!("handlers/search.rs")]),
-            (
-                "/api/v1/peers/",
-                vec![
-                    include_str!("handlers/peers.rs"),
-                    include_str!("handlers/peer.rs"),
-                    include_str!("handlers/transfer.rs"),
-                    include_str!("handlers/peer_instance_labels.rs"),
-                ],
-            ),
-            (
-                "/api/v1/sync-policies/",
-                vec![include_str!("handlers/sync_policies.rs")],
-            ),
-            // Admin routes: includes routes.rs because some routes (e.g. /metrics)
-            // are added inline in the route tree rather than in admin.rs
-            (
-                "/api/v1/admin/",
-                vec![
-                    include_str!("handlers/admin.rs"),
-                    include_str!("handlers/health.rs"),
-                    include_str!("handlers/storage_integrity.rs"),
-                    include_str!("routes.rs"),
-                ],
-            ),
-            (
-                "/api/v1/plugins/",
-                vec![include_str!("handlers/plugins.rs")],
-            ),
-            (
-                "/api/v1/formats/",
-                vec![include_str!("handlers/plugins.rs")],
-            ),
-            (
-                "/api/v1/webhooks/",
-                vec![include_str!("handlers/webhooks.rs")],
-            ),
-            (
-                "/api/v1/signing/",
-                vec![include_str!("handlers/signing.rs")],
-            ),
-            (
-                "/api/v1/security/",
-                vec![include_str!("handlers/security.rs")],
-            ),
-            ("/api/v1/sbom/", vec![include_str!("handlers/sbom.rs")]),
-            (
-                "/api/v1/promotion-rules/",
-                vec![include_str!("handlers/promotion_rules.rs")],
-            ),
-            (
-                "/api/v1/promotion/",
-                vec![include_str!("handlers/promotion.rs")],
-            ),
-            (
-                "/api/v1/approval/",
-                vec![include_str!("handlers/approval.rs")],
-            ),
-            (
-                "/api/v1/quarantine/",
-                vec![include_str!("handlers/quarantine.rs")],
-            ),
-            (
-                "/api/v1/quality/",
-                vec![include_str!("handlers/quality_gates.rs")],
-            ),
-            (
-                "/api/v1/dependency-track/",
-                vec![include_str!("handlers/dependency_track.rs")],
-            ),
-            (
-                "/api/v1/instances/",
-                vec![include_str!("handlers/remote_instances.rs")],
-            ),
-            (
-                "/api/v1/service-accounts/",
-                vec![include_str!("handlers/service_accounts.rs")],
-            ),
-            (
-                "/api/v1/migrations/",
-                vec![include_str!("handlers/migration.rs")],
-            ),
-            (
-                "/api/v1/bundles/",
-                vec![include_str!("handlers/bundles.rs")],
-            ),
-            (
-                "/api/v1/curation/",
-                vec![include_str!("handlers/curation.rs")],
-            ),
-            ("/api/v1/uploads/", vec![include_str!("handlers/upload.rs")]),
-            // Format endpoints documented for the SDKs (#3783). Their first
-            // route segment is `{repo_key}`, so the segment check below skips
-            // them; the prefix entry is what admits them past the
-            // `/api/v1/` guard.
-            ("/pypi/", vec![include_str!("handlers/pypi.rs")]),
-            (
-                "/api/v1/system/",
-                vec![
-                    include_str!("handlers/system_config.rs"),
-                    include_str!("routes.rs"),
-                ],
-            ),
-        ];
-
-        // Sort by prefix length descending so longest match wins
-        handler_sources.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
-
-        let mut missing = Vec::new();
-
-        for (method, path) in &documented {
-            // Skip top-level health/readiness endpoints — they are registered
-            // directly in create_router() in routes.rs and use context_path=""
-            if top_level_prefixes.iter().any(|p| path.starts_with(p)) {
+        let mut operations = Vec::new();
+        let mut failures = Vec::new();
+        for (path, item) in paths {
+            let Some(item) = item.as_object() else {
                 continue;
-            }
+            };
+            for (method_name, op) in item {
+                let method = match method_name.as_str() {
+                    "get" => Method::GET,
+                    "post" => Method::POST,
+                    "put" => Method::PUT,
+                    "delete" => Method::DELETE,
+                    "patch" => Method::PATCH,
+                    _ => continue,
+                };
+                let uri = concrete_path(path, op);
+                operations.push((method.clone(), uri));
 
-            let known_format_prefix = handler_sources
-                .iter()
-                .any(|(prefix, _)| !prefix.starts_with("/api/v1/") && path.starts_with(prefix));
-            if !path.starts_with("/api/v1/") && !known_format_prefix {
-                missing.push(format!(
-                    "{method} {path} — unexpected prefix (expected /api/v1/ or known top-level)"
-                ));
-                continue;
-            }
-
-            // Find the handler source(s) for this path (longest prefix match)
-            let source = handler_sources
-                .iter()
-                .find(|(prefix, _)| path.starts_with(prefix));
-
-            if let Some((prefix, source_files)) = source {
-                // Extract the route segment after the matching prefix.
-                // e.g. path="/api/v1/auth/tokens/{token_id}", prefix="/api/v1/auth/"
-                //   → route_suffix="/tokens/{token_id}" → first_segment="tokens"
-                let route_suffix = &path[prefix.len() - 1..]; // keep leading /
-                let first_segment = route_suffix.split('/').nth(1).unwrap_or("");
-
-                // Skip empty segments and path parameters (e.g. {user_id})
-                if first_segment.is_empty() || first_segment.starts_with('{') {
+                let operation_id = op["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method_name} {path} has no operationId"));
+                let Some(handler) = handlers.get(operation_id) else {
+                    failures.push(format!(
+                        "{method} {path} (operationId {operation_id}) has no scanned #[utoipa::path] handler"
+                    ));
                     continue;
-                }
-
-                // The route string in source should contain this segment
-                // e.g. .route("/tokens", ...) for the /tokens endpoint
-                let route_pattern = format!("\"/{first_segment}");
-                let found = source_files.iter().any(|src| src.contains(&route_pattern));
-                if !found {
-                    missing.push(format!(
-                        "{method} {path} — route segment '/{first_segment}' not found in handler source(s)"
+                };
+                let documented = path_parameter_count(path);
+                if handler.path_extractors != documented {
+                    failures.push(format!(
+                        "{method} {path} (operationId {operation_id}, {}::{}) documents {documented} \
+                         path parameter(s) but extracts {} with Path(...)",
+                        handler.file, handler.fn_name, handler.path_extractors
                     ));
                 }
             }
-            // Paths not covered by handler_sources are not checked here;
-            // add the prefix to handler_sources when adding new modules.
         }
 
         assert!(
-            missing.is_empty(),
-            "The following OpenAPI-documented endpoints appear to be missing route registrations:\n{}",
-            missing.join("\n")
+            operations.len() >= 500,
+            "only {} documented operations found; the route probe is not covering the API",
+            operations.len()
+        );
+
+        // `create_router` is the production router. `route_layer` (unlike
+        // `layer`) wraps each method handler *after* axum has selected the
+        // method, so an unsupported method still answers 405 and the probe
+        // answers 204 for every matched path+method without running a handler.
+        let state = crate::api::handlers::test_db_helpers::build_state(
+            crate::api::handlers::test_db_helpers::lazy_pool(),
+            "/tmp/ak-openapi-route-probe",
+        );
+        let app =
+            crate::api::routes::create_router(state).route_layer(middleware::from_fn(route_probe));
+        failures.extend(probe_operations(app, &operations).await);
+
+        assert!(
+            failures.is_empty(),
+            "OpenAPI-documented endpoints that the production router does not serve \
+             (or whose handler extractor arity disagrees with the document):\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The marker the route probe puts on a successful response, so a failure
+    /// message can name the route axum actually matched.
+    #[derive(Clone, Debug)]
+    struct ProbedRoute(String);
+
+    /// Runs only after axum has matched a documented method to a route, because
+    /// it is installed with `Router::route_layer`. Return 204 without invoking
+    /// the handler: route registration is what this test asserts, and a real
+    /// handler would need auth, a database row, or an upstream.
+    async fn route_probe(req: Request, _next: Next) -> Response {
+        let matched = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map(|path| path.as_str().to_string())
+            .unwrap_or_default();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        response.extensions_mut().insert(ProbedRoute(matched));
+        response
+    }
+
+    async fn probe_operations(app: Router, operations: &[(Method, String)]) -> Vec<String> {
+        let mut failures = Vec::new();
+        for (method, uri) in operations {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build route-probe request");
+            match app.clone().oneshot(request).await {
+                Ok(response) => {
+                    if response.status() != StatusCode::NO_CONTENT {
+                        let matched = response
+                            .extensions()
+                            .get::<ProbedRoute>()
+                            .map(|route| route.0.as_str())
+                            .unwrap_or("<none>");
+                        failures.push(format!(
+                            "{method} {uri} — expected the documented route to answer 204, got {} \
+                             (axum matched {matched})",
+                            response.status()
+                        ));
+                    }
+                }
+                Err(error) => failures.push(format!("{method} {uri} — router error: {error}")),
+            }
+        }
+        failures
+    }
+
+    /// Replace every `{param}` with a value matching the parameter's OpenAPI
+    /// schema where one is documented (UUID, integer, enum, ...), and with a
+    /// non-empty segment otherwise. Route probing only needs a well-formed
+    /// value; handlers are not invoked.
+    fn concrete_path(path: &str, operation: &serde_json::Value) -> String {
+        let mut resolved = String::new();
+        let mut rest = path;
+        while let Some(open) = rest.find('{') {
+            resolved.push_str(&rest[..open]);
+            let close = rest[open..]
+                .find('}')
+                .expect("unbalanced {param} in OpenAPI path")
+                + open;
+            let raw = &rest[open + 1..close];
+            let name = raw.trim_start_matches('*').split(':').next().unwrap_or(raw);
+            resolved.push_str(&placeholder_for(name, operation));
+            rest = &rest[close + 1..];
+        }
+        resolved.push_str(rest);
+        resolved
+    }
+
+    fn placeholder_for(name: &str, operation: &serde_json::Value) -> String {
+        let schema = operation["parameters"]
+            .as_array()
+            .and_then(|parameters| {
+                parameters.iter().find(|parameter| {
+                    parameter["in"] == "path" && parameter["name"].as_str() == Some(name)
+                })
+            })
+            .map(|parameter| &parameter["schema"]);
+
+        if let Some(value) = schema
+            .and_then(|schema| schema["enum"].as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.as_str())
+        {
+            if value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            {
+                return value.to_string();
+            }
+        }
+
+        let schema_type = schema
+            .and_then(|schema| {
+                schema["type"].as_str().or_else(|| {
+                    schema["type"]
+                        .as_array()?
+                        .iter()
+                        .find_map(|value| value.as_str())
+                })
+            })
+            .unwrap_or_default();
+        let format = schema
+            .and_then(|schema| schema["format"].as_str())
+            .unwrap_or_default();
+
+        match (schema_type, format) {
+            ("integer" | "number", _) => "1".to_string(),
+            ("boolean", _) => "true".to_string(),
+            ("string", "uuid") => uuid::Uuid::new_v4().to_string(),
+            ("string", "date-time") => "2020-01-01T00:00:00Z".to_string(),
+            _ if name == "id" || name.ends_with("_id") => uuid::Uuid::new_v4().to_string(),
+            _ => "probe".to_string(),
+        }
+    }
+
+    fn path_parameter_count(path: &str) -> usize {
+        path.matches('{').count()
+    }
+
+    #[derive(Debug)]
+    struct HandlerSignature {
+        file: String,
+        fn_name: String,
+        path_extractors: usize,
+    }
+
+    /// Every `#[utoipa::path]` handler, keyed by the operationId utoipa emits
+    /// for it. Mirrors the scan in `test_every_annotated_handler_is_in_the_openapi_spec`
+    /// so the route probe can compare the documented parameter list with the
+    /// handler's actual `Path(...)` extractors.
+    fn scan_handler_signatures() -> HashMap<String, HandlerSignature> {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let handlers_dir = manifest_dir.join("src/api/handlers");
+        let mut files = Vec::new();
+        collect_handler_sources(&handlers_dir, &mut files);
+        files.sort();
+
+        let marker = "#[utoipa::path(";
+        let mut signatures = HashMap::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read handler source");
+            let relative = file.strip_prefix(manifest_dir).unwrap_or(&file).display();
+            let mut cursor = 0;
+            while let Some(offset) = source[cursor..].find(marker) {
+                let start = cursor + offset;
+                let Some(attr_len) = source[start..].find("\n)]") else {
+                    panic!("unterminated utoipa::path in {file:?}");
+                };
+                let end = start + attr_len;
+                let attr = &source[start..end];
+                let after = &source[end..];
+                let Some(fn_pos) = after.find("fn ") else {
+                    panic!("no fn after utoipa::path in {file:?}");
+                };
+                let fn_name: String = after[fn_pos + 3..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let signature_end = after[fn_pos..].find('{').expect("handler body");
+                let signature = &after[fn_pos..fn_pos + signature_end];
+                let operation_id =
+                    quoted_value(attr, "operation_id = \"").unwrap_or_else(|| fn_name.clone());
+                signatures.insert(
+                    operation_id,
+                    HandlerSignature {
+                        file: relative.to_string(),
+                        fn_name,
+                        path_extractors: path_extractor_count(signature),
+                    },
+                );
+                cursor = end;
+            }
+        }
+        signatures
+    }
+
+    fn quoted_value(source: &str, prefix: &str) -> Option<String> {
+        let start = source.find(prefix)? + prefix.len();
+        let rest = &source[start..];
+        Some(rest[..rest.find('"')?].to_string())
+    }
+
+    fn collect_handler_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read handlers dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_handler_sources(&path, out);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Count the path parameters a handler destructures with `Path(...)`.
+    /// Scalars (`Path(id)`) count once; tuples (`Path((a, b))`) count their
+    /// elements. A `Path<...>` *type* (the extractor's generic argument) is
+    /// ignored because `Path` is followed by `<`, not `(`.
+    fn path_extractor_count(signature: &str) -> usize {
+        let bytes = signature.as_bytes();
+        let mut index = 0;
+        let mut total = 0;
+        while index + 4 <= bytes.len() {
+            if &bytes[index..index + 4] == b"Path" {
+                let boundary = index == 0
+                    || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_');
+                let mut open = index + 4;
+                while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                    open += 1;
+                }
+                if boundary && open < bytes.len() && bytes[open] == b'(' {
+                    let mut depth = 1;
+                    let mut close = open + 1;
+                    while close < bytes.len() && depth > 0 {
+                        match bytes[close] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            _ => {}
+                        }
+                        close += 1;
+                    }
+                    total += path_pattern_arity(&signature[open + 1..close - 1]);
+                    index = close;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        total
+    }
+
+    fn path_pattern_arity(pattern: &str) -> usize {
+        let pattern = pattern.trim();
+        if pattern.starts_with('(') && pattern.ends_with(')') {
+            split_top_level(&pattern[1..pattern.len() - 1]).len()
+        } else {
+            1
+        }
+    }
+
+    fn split_top_level(source: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (index, character) in source.char_indices() {
+            match character {
+                '(' | '[' | '<' | '{' => depth += 1,
+                ')' | ']' | '>' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(source[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        let tail = source[start..].trim();
+        if !tail.is_empty() {
+            parts.push(tail);
+        }
+        parts
+    }
+
+    #[test]
+    fn path_extractor_count_handles_scalars_tuples_and_qualified_paths() {
+        assert_eq!(path_extractor_count("fn h(Path(id): Path<Uuid>)"), 1);
+        assert_eq!(
+            path_extractor_count("fn h(Path((key, path)): Path<(String, String)>)"),
+            2
+        );
+        assert_eq!(
+            path_extractor_count(
+                "fn h(axum::extract::Path((a, b, c)): axum::extract::Path<(u8, u8, u8)>)"
+            ),
+            3
+        );
+        assert_eq!(
+            path_extractor_count("fn h(Path(a): Path<String>, Path(b): Path<Uuid>)"),
+            2
+        );
+    }
+
+    /// #4884: the network-profile router was merged at `/peers` instead of
+    /// nested under `/:id`. Reintroduce that mount in a throwaway router and
+    /// prove the production-router probe above rejects it.
+    #[tokio::test]
+    async fn test_route_probe_catches_miswired_peer_network_profile_4930() {
+        async fn update_network_profile(AxumPath(_peer_id): AxumPath<uuid::Uuid>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        let documented = (
+            Method::PUT,
+            format!("/api/v1/peers/{}/network-profile", uuid::Uuid::new_v4()),
+        );
+
+        let correct = Router::new()
+            .route(
+                "/api/v1/peers/:id/network-profile",
+                put(update_network_profile),
+            )
+            .route_layer(middleware::from_fn(route_probe));
+        assert!(
+            probe_operations(correct.clone(), std::slice::from_ref(&documented))
+                .await
+                .is_empty(),
+            "the correctly nested route must pass the probe"
+        );
+
+        let miswired = Router::new()
+            .route("/api/v1/peers/network-profile", put(update_network_profile))
+            .route_layer(middleware::from_fn(route_probe));
+        let failures = probe_operations(miswired, &[documented]).await;
+        assert_eq!(failures.len(), 1, "miswired mount must fail the probe");
+        assert!(
+            failures[0].contains("404"),
+            "the documented path must miss the miswired mount: {failures:?}"
         );
     }
 

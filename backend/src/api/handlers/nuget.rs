@@ -1001,27 +1001,32 @@ async fn proxy_v3_search(
     if let UpstreamProtocol::V2 { base } =
         discover_upstream_protocol(proxy, fetch_repo_id, fetch_repo_key, upstream_url).await?
     {
+        // V2 Search() returns one row per package version, while V3 `take`
+        // pages package ids. Do not send `$top`/`$skip` to the V2 feed: doing
+        // so can truncate a package's version list before it is grouped. The
+        // grouped V3 response is paged below instead.
         let odata = format!(
-            "Search()?searchTerm='{}'&$skip={}&$top={}&includePrerelease={}&semVerLevel=2.0.0",
+            "Search()?searchTerm='{}'&includePrerelease={}&semVerLevel=2.0.0",
             urlencoding::encode(query_term),
-            skip,
-            take,
             prerelease
         );
-        let entries = fetch_v2_entries(
+        let entries = fetch_v2_entries_capped(
             proxy,
             fetch_repo_id,
             fetch_repo_key,
             upstream_url,
             &base,
             &odata,
+            Some(MAX_V2_SEARCH_ENTRIES),
         )
         .await?;
-        return Ok(search_from_v2_entries(
+        return Ok(search_from_v2_entries_paged(
             &entries,
             ak_base,
             client_repo_key,
             prerelease,
+            skip,
+            take,
         ));
     }
     let resources =
@@ -1437,31 +1442,120 @@ async fn proxy_v3_autocomplete(
     })
 }
 
-/// Merge upstream search `data` entries into the local result set, deduped
-/// case-insensitively by package id with local entries winning, bounded by
-/// `take`. Returns how many upstream entries were added.
-fn merge_upstream_search_data(
+/// Extract the version objects a search result carries, adding its root
+/// version as a fallback for feeds that omit the `versions` array.
+fn search_version_items(entry: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut items = entry
+        .get("versions")
+        .and_then(|versions| versions.as_array())
+        .map(|versions| {
+            versions
+                .iter()
+                .filter(|item| item.get("version").and_then(|v| v.as_str()).is_some())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
+        return items;
+    };
+    if items.iter().any(|item| {
+        item.get("version")
+            .and_then(|v| v.as_str())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(version))
+    }) {
+        return items;
+    }
+
+    // Some upstream V3 search responses only expose the root version. Keep a
+    // usable version object when that result is merged with another member.
+    let mut item = serde_json::json!({"version": version});
+    if let Some(id) = entry.get("@id") {
+        item["@id"] = id.clone();
+    }
+    items.push(item);
+    items
+}
+
+/// Merge the version lists of two results for the same package id.
+fn merge_search_result_versions(
+    target: &mut serde_json::Value,
+    incoming: &serde_json::Value,
+    prerelease: bool,
+) {
+    let mut versions = search_version_items(target);
+    let mut seen: std::collections::HashSet<String> = versions
+        .iter()
+        .filter_map(|item| item.get("version").and_then(|v| v.as_str()))
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    for item in search_version_items(incoming) {
+        let Some(version) = item.get("version").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if seen.insert(version.to_ascii_lowercase()) {
+            versions.push(item);
+        }
+    }
+
+    versions.sort_by(|a, b| {
+        let a = a
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let b = b
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        version_compare(&a, &b).cmp(&0)
+    });
+
+    let version_strings: Vec<String> = versions
+        .iter()
+        .filter_map(|item| item.get("version").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    if !version_strings.is_empty() {
+        let latest = select_latest_version(&version_strings, prerelease);
+        target["version"] = serde_json::Value::String(latest.to_string());
+    }
+    target["versions"] = serde_json::Value::Array(versions);
+}
+
+fn merge_upstream_search_data_with_prerelease(
     data: &mut Vec<serde_json::Value>,
     upstream: &serde_json::Value,
     take: usize,
+    prerelease: bool,
 ) -> usize {
-    let mut seen: std::collections::HashSet<String> = data
-        .iter()
-        .filter_map(|e| e.get("id").and_then(|v| v.as_str()))
-        .map(str::to_ascii_lowercase)
-        .collect();
     let mut added = 0;
     let Some(entries) = upstream.get("data").and_then(|d| d.as_array()) else {
         return added;
     };
     for entry in entries {
-        if data.len() >= take {
-            break;
-        }
         let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        if seen.insert(id.to_ascii_lowercase()) {
+        if let Some(index) = data.iter().position(|existing| {
+            existing
+                .get("id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|existing_id| existing_id.eq_ignore_ascii_case(id))
+        }) {
+            // A duplicate still needs merging even when the package page has
+            // reached `take`; otherwise a local/earlier member hides versions
+            // contributed by a later member.
+            merge_search_result_versions(&mut data[index], entry, prerelease);
+        } else {
+            // The page is full: a new id is dropped, but keep scanning, since
+            // a later entry may still be a duplicate whose versions merge.
+            if data.len() >= take {
+                continue;
+            }
             data.push(entry.clone());
             added += 1;
         }
@@ -1686,6 +1780,29 @@ async fn fetch_v2_entries(
     base: &str,
     odata: &str,
 ) -> Result<Vec<V2Entry>, Response> {
+    fetch_v2_entries_capped(proxy, repo_id, repo_key, upstream_url, base, odata, None).await
+}
+
+/// Most rows an unpaged V2 `Search()` walk keeps (#4976). The V3 search
+/// projection sends no `$top`, since V2 rows are versions and V3 pages
+/// packages, so without this cap the walk is bounded only by
+/// [`MAX_V2_UPSTREAM_PAGES`] times the per-page byte ceiling, and an upstream
+/// serving very dense pages could make one search hold and group a very large
+/// row set. 2000 rows is 20 pages at the common page size of 100.
+const MAX_V2_SEARCH_ENTRIES: usize = 2000;
+
+/// [`fetch_v2_entries`] with an extra local row cap that is never sent
+/// upstream. The effective limit is the smaller of `max_entries` and the
+/// query's own `$top`.
+async fn fetch_v2_entries_capped(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    base: &str,
+    odata: &str,
+    max_entries: Option<usize>,
+) -> Result<Vec<V2Entry>, Response> {
     let first_url = format!("{}/{}", base.trim_end_matches('/'), odata);
     let mut next_url = Some(first_url);
     let mut entries = Vec::new();
@@ -1693,7 +1810,10 @@ async fn fetch_v2_entries(
     // Paging is not a stable snapshot: an upstream that changes between pages
     // can repeat a row, so keep the first copy of each (id, version).
     let mut seen_entries = std::collections::HashSet::new();
-    let entry_limit = v2_odata_top_limit(odata);
+    let entry_limit = match (v2_odata_top_limit(odata), max_entries) {
+        (Some(top), Some(cap)) => Some(top.min(cap)),
+        (top, cap) => top.or(cap),
+    };
     if entry_limit == Some(0) {
         return Ok(entries);
     }
@@ -1866,12 +1986,16 @@ fn registration_from_v2_entries(
 }
 
 /// Build a V3 search page out of V2 feed entries: one result per package id,
-/// carrying its highest version.
-fn search_from_v2_entries(
+/// carrying every version and selecting the highest version for the root entry.
+/// Paging is applied after grouping because a V2 feed returns one row per
+/// version rather than one row per package.
+fn search_from_v2_entries_paged(
     entries: &[V2Entry],
     ak_base: &str,
     client_repo_key: &str,
     prerelease: bool,
+    skip: i64,
+    take: i64,
 ) -> serde_json::Value {
     let base = build_nuget_base_url(ak_base, client_repo_key);
     let mut by_id: Vec<(String, Vec<String>, String)> = Vec::new();
@@ -1880,7 +2004,14 @@ fn search_from_v2_entries(
             .iter_mut()
             .find(|(id, _, _)| id.eq_ignore_ascii_case(&entry.id))
         {
-            Some((_, versions, _)) => versions.push(entry.version.clone()),
+            Some((_, versions, _)) => {
+                if !versions
+                    .iter()
+                    .any(|version| version.eq_ignore_ascii_case(&entry.version))
+                {
+                    versions.push(entry.version.clone());
+                }
+            }
             None => by_id.push((
                 entry.id.clone(),
                 vec![entry.version.clone()],
@@ -1892,6 +2023,15 @@ fn search_from_v2_entries(
         .iter()
         .map(|(id, versions, description)| {
             let latest = select_latest_version(versions, prerelease);
+            let version_items = versions
+                .iter()
+                .map(|version| {
+                    serde_json::json!({
+                        "version": version,
+                        "@id": format!("{}/v3/registration/{}/{}.json", base, id.to_lowercase(), version),
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "@id": format!("{}/v3/registration/{}/index.json", base, id.to_lowercase()),
                 "@type": "Package",
@@ -1900,14 +2040,31 @@ fn search_from_v2_entries(
                 "version": latest,
                 "description": description,
                 "totalDownloads": 0,
-                "versions": [{
-                    "version": latest,
-                    "@id": format!("{}/v3/registration/{}/{}.json", base, id.to_lowercase(), latest),
-                }],
+                "versions": version_items,
             })
         })
         .collect();
-    serde_json::json!({ "totalHits": data.len(), "data": data })
+    let total_hits = data.len();
+    let start = skip.max(0) as usize;
+    let page_size = take.max(0) as usize;
+    let data = data
+        .into_iter()
+        .skip(start)
+        .take(page_size)
+        .collect::<Vec<_>>();
+    serde_json::json!({ "totalHits": total_hits, "data": data })
+}
+
+/// Build an unpaged V2 search result for unit tests that exercise the
+/// projection without HTTP paging.
+#[cfg(test)]
+fn search_from_v2_entries(
+    entries: &[V2Entry],
+    ak_base: &str,
+    client_repo_key: &str,
+    prerelease: bool,
+) -> serde_json::Value {
+    search_from_v2_entries_paged(entries, ak_base, client_repo_key, prerelease, 0, i64::MAX)
 }
 
 /// Answer one V2 OData verb from a V3 upstream (#4122).
@@ -2992,11 +3149,19 @@ async fn search_packages(
             // only fall back to a pre-release if no stable version exists.
             let latest = select_latest_version(&p.versions, prerelease);
 
-            // Build version list entry for the latest version.
-            let versions = vec![serde_json::json!({
-                "version": latest,
-                "@id": format!("{}/v3/registration/{}/{}.json", base, id, latest),
-            })];
+            // Keep every known version in the search result. Virtual
+            // repositories merge this list with versions from remote members;
+            // the root `version` remains the latest version selected below.
+            let versions = p
+                .versions
+                .iter()
+                .map(|version| {
+                    serde_json::json!({
+                        "version": version,
+                        "@id": format!("{}/v3/registration/{}/{}.json", base, id, version),
+                    })
+                })
+                .collect::<Vec<_>>();
 
             serde_json::json!({
                 "@id": format!("{}/v3/registration/{}/index.json", base, id),
@@ -3057,10 +3222,13 @@ async fn search_packages(
     }
 
     // Virtual repo: merge each remote member's upstream results into the local
-    // ones, deduped case-insensitively by package id with local entries
-    // winning. `totalHits` takes the max of the local and upstream totals —
-    // the true merged total is unknowable without enumerating both corpora,
-    // and max never double-counts a package present on both sides.
+    // ones, deduped case-insensitively by package id. The first source to list
+    // an id keeps its entry and its copy of any version listed twice; versions
+    // only a later member has are added, and the root `version` is recomputed
+    // over the union (#4976). `totalHits` takes the max of the local and
+    // upstream totals: the true merged total is unknowable without enumerating
+    // both corpora, and max never double-counts a package present on both
+    // sides.
     if repo.repo_type == RepositoryType::Virtual {
         if let Some(proxy) = &state.proxy_service {
             for member in &members {
@@ -3090,7 +3258,12 @@ async fn search_packages(
                             .and_then(|v| v.as_i64())
                             .unwrap_or(0);
                         total_hits = total_hits.max(upstream_total);
-                        merge_upstream_search_data(&mut data, &upstream, take as usize);
+                        merge_upstream_search_data_with_prerelease(
+                            &mut data,
+                            &upstream,
+                            take as usize,
+                            prerelease,
+                        );
                     }
                     Err(resp) => {
                         warn!(
@@ -5777,7 +5950,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_upstream_search_data_dedupes_local_wins() {
+    fn test_merge_upstream_search_data_dedupes_and_recomputes_latest() {
         let mut data = vec![serde_json::json!({"id": "Newtonsoft.Json", "version": "1.0.0-local"})];
         let upstream = serde_json::json!({
             "totalHits": 3,
@@ -5787,14 +5960,114 @@ mod tests {
                 {"id": "Dapper", "version": "2.1.0"}
             ]
         });
-        let added = merge_upstream_search_data(&mut data, &upstream, 2);
+        let added = merge_upstream_search_data_with_prerelease(&mut data, &upstream, 2, false);
         assert_eq!(added, 1, "bounded by take and deduped case-insensitively");
         assert_eq!(data.len(), 2);
         assert_eq!(
-            data[0]["version"], "1.0.0-local",
-            "the local entry wins over the upstream duplicate"
+            data[0]["version"], "13.0.1",
+            "the merged package reports the highest version across members"
         );
         assert_eq!(data[1]["id"], "Serilog");
+    }
+
+    #[test]
+    fn test_merge_upstream_search_data_unions_duplicate_versions_and_updates_latest() {
+        let mut data = vec![serde_json::json!({
+            "id": "Inoa.Cli",
+            "version": "1.15.1",
+            "versions": [{"version": "1.15.1"}]
+        })];
+        let upstream = serde_json::json!({
+            "data": [{
+                "id": "inoa.cli",
+                "version": "1.77.0",
+                "versions": [
+                    {"version": "1.76.2"},
+                    {"version": "1.77.0"},
+                    {"version": "1.77.0-rc.1"}
+                ]
+            }]
+        });
+
+        let added = merge_upstream_search_data_with_prerelease(&mut data, &upstream, 1, false);
+        assert_eq!(added, 0, "the duplicate package must not be added twice");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["version"], "1.77.0");
+        let versions: Vec<&str> = data[0]["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|version| version["version"].as_str())
+            .collect();
+        assert_eq!(versions, ["1.15.1", "1.76.2", "1.77.0", "1.77.0-rc.1"]);
+
+        merge_upstream_search_data_with_prerelease(&mut data, &upstream, 1, true);
+        assert_eq!(data[0]["version"], "1.77.0-rc.1");
+    }
+
+    /// A full page drops new ids but must keep scanning: a duplicate listed
+    /// after a dropped id still merges its versions (#4976).
+    #[test]
+    fn test_merge_upstream_search_data_merges_duplicates_after_a_dropped_id() {
+        let mut data = vec![serde_json::json!({
+            "id": "Inoa.Cli",
+            "version": "1.15.1",
+            "versions": [{"version": "1.15.1"}]
+        })];
+        let upstream = serde_json::json!({
+            "data": [
+                {"id": "Other.Pkg", "version": "9.0.0"},
+                {"id": "inoa.cli", "version": "1.77.0", "versions": [{"version": "1.77.0"}]}
+            ]
+        });
+        let added = merge_upstream_search_data_with_prerelease(&mut data, &upstream, 1, false);
+        assert_eq!(added, 0);
+        assert_eq!(data.len(), 1, "take stays the page bound");
+        assert_eq!(
+            data[0]["id"], "Inoa.Cli",
+            "the first source keeps its entry"
+        );
+        assert_eq!(data[0]["version"], "1.77.0");
+    }
+
+    #[test]
+    fn test_search_from_v2_entries_keeps_all_versions_and_selects_latest() {
+        let entries = [
+            V2Entry {
+                id: "Inoa.Cli".to_string(),
+                version: "1.15.1".to_string(),
+                authors: String::new(),
+                description: String::new(),
+                hash_sha256_b64: None,
+                size: 0,
+            },
+            V2Entry {
+                id: "inoa.cli".to_string(),
+                version: "1.77.0".to_string(),
+                authors: String::new(),
+                description: String::new(),
+                hash_sha256_b64: None,
+                size: 0,
+            },
+            V2Entry {
+                id: "inoa.cli".to_string(),
+                version: "1.77.0-rc.1".to_string(),
+                authors: String::new(),
+                description: String::new(),
+                hash_sha256_b64: None,
+                size: 0,
+            },
+        ];
+        let result = search_from_v2_entries_paged(
+            &entries,
+            "https://ak.example.test",
+            "nuget-all",
+            false,
+            0,
+            i64::MAX,
+        );
+        assert_eq!(result["data"][0]["version"], "1.77.0");
+        assert_eq!(result["data"][0]["versions"].as_array().unwrap().len(), 3);
     }
 
     // -----------------------------------------------------------------------
@@ -9439,6 +9712,116 @@ mod virtual_federation_tests {
         (member_id, dir)
     }
 
+    /// A V2-only upstream whose Search() response contains several versions
+    /// for one package. The missing `/index.json` makes protocol discovery take
+    /// the legacy V2 path just as it would for a real V2 remote.
+    async fn v2_search_upstream(package_id: &str, versions: &[&str]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let entries: String = versions
+            .iter()
+            .map(|version| {
+                format!(
+                    r#"<entry><title type="text">{package_id}</title><m:properties><d:Id>{package_id}</d:Id><d:Version>{version}</d:Version></m:properties></entry>"#
+                )
+            })
+            .collect();
+        let feed = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">{entries}</feed>"#
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v2/Search()"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/atom+xml;charset=utf-8")
+                    .set_body_string(feed),
+            )
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    /// The V3 search route must merge version rows from every V2 remote member,
+    /// rather than keeping the first member's package result. This is the
+    /// end-to-end regression for the reported `dotnet package search` behavior.
+    #[tokio::test]
+    async fn virtual_v3_search_aggregates_versions_from_multiple_v2_members() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let first = v2_search_upstream("Inoa.Cli", &["1.15.1", "1.76.2"]).await;
+        let second = v2_search_upstream("Inoa.Cli", &["1.77.0", "1.77.0-rc.1"]).await;
+        let (first_id, first_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", first.uri()), 1).await;
+        let (second_id, second_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", second.uri()), 2).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v3/search?q=Inoa.Cli", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, first_id, &first_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, second_id, &second_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["totalHits"], 1);
+        assert_eq!(document["data"][0]["id"], "Inoa.Cli");
+        assert_eq!(document["data"][0]["version"], "1.77.0");
+        let versions: Vec<&str> = document["data"][0]["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["version"].as_str())
+            .collect();
+        assert_eq!(versions, ["1.15.1", "1.76.2", "1.77.0", "1.77.0-rc.1"]);
+    }
+
+    /// The unpaged V2 Search() walk keeps at most `MAX_V2_SEARCH_ENTRIES`
+    /// rows, however many one upstream page carries (#4976).
+    #[tokio::test]
+    async fn virtual_v3_search_caps_rows_read_from_a_v2_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let versions: Vec<String> = (0..super::MAX_V2_SEARCH_ENTRIES + 50)
+            .map(|i| format!("1.0.{i}"))
+            .collect();
+        let version_refs: Vec<&str> = versions.iter().map(String::as_str).collect();
+        let upstream = v2_search_upstream("Dense.Pkg", &version_refs).await;
+        let (member_id, member_dir) =
+            link_remote_member(&fx, format!("{}/api/v2", upstream.uri()), 1).await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let (status, body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!("/{}/v3/search?q=Dense.Pkg", fx.repo_key)),
+        )
+        .await;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            document["data"][0]["versions"].as_array().unwrap().len(),
+            super::MAX_V2_SEARCH_ENTRIES
+        );
+    }
+
     /// A V2 upstream that exposes the second page through an Atom continuation
     /// link. The `&amp;` in the link exercises XML attribute decoding as well as
     /// the pagination loop.
@@ -12444,6 +12827,16 @@ mod scan_on_proxy_tests {
         let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
         tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
         let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, false).await;
+        tdh::pin_proxy_verdict(
+            &fx.pool,
+            &digest,
+            &crate::services::scanner_service::ExpectedComponent::new(
+                crate::services::scanner_service::ComponentEcosystem::NuGet,
+                ID,
+                VERSION,
+            ),
+        )
+        .await;
 
         for pulls in 1..=2 {
             let (status, body, headers) = pull_anon(&state, &fx.repo_key, FLAT).await;
@@ -12702,6 +13095,16 @@ mod scan_on_proxy_tests {
             let (state, _cache) = tdh::rewire_remote_proxy(&fx, &v3_index_url(&server)).await;
             tdh::enable_proxy_scan(&fx.pool, fx.repo_id, "fail_open").await;
             let digest = tdh::seed_proxy_verdict(&fx.pool, &bytes, fx.repo_id, vulnerable).await;
+            tdh::pin_proxy_verdict(
+                &fx.pool,
+                &digest,
+                &crate::services::scanner_service::ExpectedComponent::new(
+                    crate::services::scanner_service::ComponentEcosystem::NuGet,
+                    ID,
+                    VERSION,
+                ),
+            )
+            .await;
             let row = seed_blobless_row(&fx, "no-recorded-digest").await;
 
             for pull in ["cold", "warm"] {
@@ -13263,5 +13666,77 @@ mod serve_key_4365_tests {
             v2_package_cache_path("chocolatey", "2.2.2"),
             "v2/package/chocolatey/2.2.2/package.nupkg"
         );
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_nupkg_with_two_nuspec_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let file = NugetScannedPackage {
+            proxy: &proxy,
+            id_lower: "demo",
+            version: "1.0.0",
+        };
+        let nuspec = |id: &str, version: &str| {
+            format!(
+                "<?xml version=\"1.0\"?><package><metadata><id>{id}</id><version>{version}</version>\
+                 <authors>a</authors><description>d</description></metadata></package>"
+            )
+            .into_bytes()
+        };
+        let (good, other) = (nuspec("Demo", "1.0.0"), nuspec("Other", "9.9.9"));
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Nuget, "demo.1.0.0.nupkg", bytes);
+        // The exact-name reader reads the first; the extractor writes both
+        // onto one file and keeps the second.
+        let normalised = zip_with(&[
+            ("Demo.nuspec", &good),
+            ("lib/a.dll", b"x"),
+            ("./Demo.nuspec", &other),
+        ]);
+        // One raw name twice: the zip reader keeps the last record, a client
+        // that takes the first installs the other one.
+        let repeated = zip_with(&[("Demo.nuspec", &other), ("Demo.nuspec", &good)]);
+        for dup in [normalised, repeated] {
+            let (own, gate) = check(&dup);
+            assert!(established(&own));
+            assert!(unestablished(&gate));
+        }
+        let single = zip_with(&[("Demo.nuspec", &good), ("lib/a.dll", b"x")]);
+        assert!(established(&check(&single).1));
     }
 }

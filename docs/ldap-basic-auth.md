@@ -46,6 +46,14 @@ The generic `GET /api/v1/repositories/{key}/download/{path}` route uses the
 same passthrough. The OCI Distribution API (`/v2/...` and `/v2/token`)
 authenticates separately and is not changed by this switch.
 
+When guest access is disabled (`AK_GUEST_ACCESS_ENABLED=false`), the global
+guest-access guard checks only local credentials and never binds against the
+directory. A Basic credential on a package route is handed to that route,
+which performs at most one bind; a Basic credential on the management API or
+`/v2` is refused by the guard, so those surfaces cause no directory traffic.
+That also means one rejected package request writes exactly one
+`LOGIN_FAILED` audit row.
+
 ## Order of credential checks
 
 A Basic password is tried in this order, and the directory is contacted only
@@ -94,9 +102,14 @@ password; the directory is not consulted.
   the old password stops working within five minutes.
 - **Deactivation wins immediately.** Every cache hit re-reads
   `users.is_active` from the database. Admin deactivation and the periodic
-  LDAP reconcile clear both the success and failure entries for the user.
-- **Audited.** Successful and failed passthrough logins write the normal
-  `LOGIN` / `LOGIN_FAILED` audit events. Passwords are never included.
+  LDAP reconcile clear both the success and failure entries for the user. Web
+  LDAP login now matches the passthrough: a successful directory bind does not
+  reactivate an account an administrator disabled. An administrator must
+  explicitly reactivate it.
+- **Audited.** A successful passthrough login writes `LOGIN`; a rejected
+  request writes exactly one `LOGIN_FAILED` event, whether the directory
+  rejected the password or the failure was served from the failure window.
+  Passwords are never included.
 - **Locally managed accounts are never bound.** If a username exists with
   `auth_provider` other than `ldap`, the passthrough refuses without contacting
   the directory: a mistyped local password must not spend an AD account's

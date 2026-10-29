@@ -373,13 +373,16 @@ fn build_metadata_v1_response(
 /// the package wins. Returns 404 only when no member can satisfy the request.
 ///
 /// `render_local` builds the response from a member's DB rows; `upstream_path`
-/// is the v1 or v2 path proxied from remote members. The virtual `repo_key` is
-/// threaded through so locally-rendered `dist.url`s route back through us.
+/// is the v1 or v2 path proxied from remote members. The virtual `repo_key` and
+/// `base_url` are threaded through so every `dist.url` — locally rendered or
+/// proxied from a member (#4951) — is absolute and routes back through us.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_virtual_composer_metadata<R>(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     virtual_repo_id: uuid::Uuid,
     virtual_repo_key: &str,
+    base_url: &str,
     full_name: &str,
     upstream_path: &str,
     render_local: R,
@@ -433,6 +436,12 @@ where
         .await
         {
             Ok((content, content_type)) => {
+                // #4951: rewrite the member's `dist.url`s to this VIRTUAL
+                // repo, exactly as the single-repo Remote path does. Serving
+                // them verbatim would send the Composer client straight to the
+                // off-registry dist host, bypassing the virtual repo (and its
+                // proxy cache) entirely.
+                let content = rewrite_remote_metadata_body(base_url, virtual_repo_key, &content);
                 return Ok(build_composer_proxy_response(content, content_type));
             }
             Err(_e) => {
@@ -1154,6 +1163,7 @@ async fn metadata_v2(
             auth.as_ref(),
             repo.id,
             &repo_key,
+            base_url.as_str(),
             &full_name,
             &upstream_path,
             |repo_key, full_name, artifacts| {
@@ -1238,6 +1248,7 @@ async fn metadata_v1(
             auth.as_ref(),
             repo.id,
             &repo_key,
+            base_url.as_str(),
             &full_name,
             &upstream_path,
             |repo_key, full_name, artifacts| {
@@ -1423,6 +1434,8 @@ async fn download_archive(
                 // #4105: a member with scan-on-proxy on (stricter of virtual
                 // and member policy) serves only through the inline gate,
                 // fetching from the dist URL its own metadata names.
+                // #4951: members that do not scan resolve that same real dist
+                // URL instead of a synthesized one their upstream never served.
                 if let Some(proxy) = state.proxy_service.as_deref() {
                     let dist = ComposerDistCoordinate {
                         full_name: &full_name,
@@ -1430,7 +1443,7 @@ async fn download_archive(
                         version: &version,
                         reference,
                     };
-                    if let Some(served) = serve_scanned_virtual_composer_dist(
+                    if let Some(served) = serve_virtual_composer_dist(
                         &state,
                         auth.as_ref(),
                         proxy,
@@ -1670,12 +1683,63 @@ async fn serve_scanned_composer_dist(
     proxy_helpers::serve_scanned_proxy_file(state, proxy, &req, &file).await
 }
 
-/// The Virtual dist walk with scan-on-proxy (#4105): `Ok(None)` when no
-/// member scans (the caller keeps its resolver). Otherwise the priority
-/// walk: each scanning Remote member resolves the dist URL from its own
-/// upstream metadata and serves through the gate under its own id, and the
-/// runs of members that do not scan go through the existing resolver.
-async fn serve_scanned_virtual_composer_dist(
+/// The real upstream dist URL of a Remote member, resolved from that member's
+/// own metadata, keyed by member id.
+///
+/// A Composer dist URL cannot be synthesized from the member's upstream base:
+/// Packagist-style upstreams advertise the archive on a different host (a
+/// GitHub zipball, a CDN mirror, ...) in their `p2` document. The virtual walk
+/// must therefore fetch each Remote member's metadata to learn where its bytes
+/// actually live (#4951). Members whose metadata does not name the requested
+/// reference/version are omitted and simply miss.
+async fn composer_virtual_member_dist_urls(
+    proxy: &crate::services::proxy_service::ProxyService,
+    members: &[crate::models::repository::Repository],
+    dist: &ComposerDistCoordinate<'_>,
+) -> std::collections::HashMap<uuid::Uuid, String> {
+    let mut urls = std::collections::HashMap::new();
+    let remotes: Vec<_> = members
+        .iter()
+        .filter(|m| m.repo_type == RepositoryType::Remote && m.upstream_url.is_some())
+        .collect();
+    for batch in remotes.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
+        let lookups = batch.iter().map(|member| async move {
+            let upstream_url = member.upstream_url.as_deref()?;
+            let target = resolve_composer_remote_dist_target(
+                proxy,
+                member.id,
+                &member.key,
+                upstream_url,
+                dist.full_name,
+                dist.version,
+                dist.reference,
+            )
+            .await
+            .ok()?;
+            Some((
+                member.id,
+                format!("{}/{}", target.fetch_base, target.fetch_path),
+            ))
+        });
+        urls.extend(
+            futures::future::join_all(lookups)
+                .await
+                .into_iter()
+                .flatten(),
+        );
+    }
+    urls
+}
+
+/// The Virtual dist walk (#4105, #4951).
+///
+/// Scanning Remote members resolve their dist URL from their own metadata and
+/// serve through the inline gate under their own id; runs of members that do
+/// not scan go through the shared resolver with each Remote member's real
+/// upstream dist URL (rather than a synthesized path no Packagist-style
+/// upstream serves). When no member scans this falls back to the same
+/// resolver over the whole authorized member list.
+async fn serve_virtual_composer_dist(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     proxy: &crate::services::proxy_service::ProxyService,
@@ -1690,6 +1754,7 @@ async fn serve_scanned_virtual_composer_dist(
         vendor, dist.package, dist.version, dist.reference
     );
     let filename = dist.filename();
+    let member_fetch_urls = composer_virtual_member_dist_urls(proxy, &members, dist).await;
     let (name, version) = (dist.full_name, dist.version);
     let local_fetch = |member_id: uuid::Uuid, location: crate::storage::StorageLocation| async move {
         proxy_helpers::local_fetch_by_name_version(
@@ -1700,7 +1765,8 @@ async fn serve_scanned_virtual_composer_dist(
     let runs = crate::api::handlers::proxy_scan_archive::UnscannedArchiveRuns {
         proxy,
         path: &upstream_path,
-        local_fetch,
+        member_fetch_urls: &member_fetch_urls,
+        local_fetch: &local_fetch,
         default_content_type: "application/zip",
         disposition: Some(&filename),
         ctx,
@@ -1730,12 +1796,34 @@ async fn serve_scanned_virtual_composer_dist(
         )
         .await
     };
-    Ok(
-        crate::api::handlers::proxy_scan_archive::walk_scanned_archive_members(
-            state, virtual_id, members, runs, scanned,
-        )
-        .await,
+    // The walk borrows the member list it is given, so the no-scanning
+    // fallback below can still resolve over all of them.
+    if let Some(served) = crate::api::handlers::proxy_scan_archive::walk_scanned_archive_members(
+        state,
+        virtual_id,
+        members.clone(),
+        runs,
+        scanned,
     )
+    .await
+    {
+        return Ok(Some(served));
+    }
+
+    let result = proxy_helpers::resolve_virtual_download_from_members_with_fetch_urls(
+        members,
+        Some(proxy),
+        &upstream_path,
+        &member_fetch_urls,
+        Some(ctx),
+        &local_fetch,
+    )
+    .await?;
+    Ok(Some(proxy_helpers::stream_fetch_result(
+        result,
+        "application/zip",
+        Some(filename),
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -4949,6 +5037,112 @@ mod metadata_db_tests {
             "the advertised dist.url must serve the published archive bytes"
         );
     }
+
+    /// #4951: a Composer Virtual over a Packagist-style Remote must serve the
+    /// package's metadata and its dist archive through the virtual key.
+    ///
+    /// The upstream advertises the real off-registry dist URL in its `p2`
+    /// document (the Packagist shape: `.../p2/<vendor>/<package>.json` plus a
+    /// dist URL on another host). A non-scanning Remote member under a Virtual
+    /// used to answer 404 for the dist because the virtual walk synthesized
+    /// `dist/<vendor>/<package>/<version>/<ref>.zip` against the member's
+    /// upstream base, which no Packagist-style upstream serves. The same walk
+    /// also served the member's metadata verbatim, so the advertised `dist.url`
+    /// bypassed the virtual repo entirely. Both directions are asserted here.
+    #[tokio::test]
+    async fn virtual_remote_member_resolves_packagist_metadata_and_dist_4951() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const NAME: &str = "dtf/vulnpkg";
+        const REFERENCE: &str = "0123456789abcdef0123456789abcdef01234567";
+        let archive: &[u8] = b"PK\x03\x04 composer package archive bytes";
+
+        let Some(vf) = tdh::Fixture::setup("virtual", "composer").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let metadata = serde_json::json!({
+            "packages": {
+                NAME: [{
+                    "name": NAME,
+                    "version": "1.0.0",
+                    "dist": {
+                        "type": "zip",
+                        "url": format!("{}/composer/zipball/vulnpkg.zip", server.uri()),
+                        "reference": REFERENCE,
+                    }
+                }]
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/composer/p2/{NAME}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(metadata.to_string()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/composer/zipball/vulnpkg.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.to_vec()))
+            .mount(&server)
+            .await;
+
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&vf.pool, "remote", "composer").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(format!("{}/composer", server.uri()))
+            .bind(member_id)
+            .execute(&vf.pool)
+            .await
+            .expect("set member upstream");
+        add_member(&vf.pool, vf.repo_id, member_id, 0).await;
+        tdh::grant_repo_access(&vf.pool, member_id, vf.user_id).await;
+
+        let cache = tempfile::tempdir().expect("proxy cache dir");
+        let state = tdh::build_state_with_proxy(
+            vf.pool.clone(),
+            cache.path().to_str().unwrap(),
+            tdh::build_proxy_service_with_fs(vf.pool.clone(), cache.path().to_str().unwrap()),
+        );
+        let auth = tdh::make_auth(vf.user_id, &vf.username);
+
+        let (meta_status, meta_body) = tdh::send(
+            tdh::router_with_auth(super::router(), state.clone(), auth.clone()),
+            tdh::get(format!("/{}/p2/{NAME}.json", vf.repo_key)),
+        )
+        .await;
+        assert_eq!(meta_status, StatusCode::OK, "virtual p2 metadata");
+        let meta: serde_json::Value = serde_json::from_slice(&meta_body).expect("metadata is JSON");
+        let dist_url = meta["packages"][NAME][0]["dist"]["url"]
+            .as_str()
+            .expect("metadata advertises dist.url");
+        assert!(
+            dist_url.contains(&format!("/composer/{}/dist/{NAME}/", vf.repo_key)),
+            "the virtual metadata must route downloads back through the virtual repo, got {dist_url}"
+        );
+
+        let (dist_status, dist_body) = tdh::send(
+            tdh::router_with_auth(super::router(), state, auth),
+            tdh::get(format!(
+                "/{}/dist/{NAME}/1.0.0/{REFERENCE}.zip",
+                vf.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(
+            dist_status,
+            StatusCode::OK,
+            "a non-scanning Remote member's dist must resolve from its own metadata"
+        );
+        assert_eq!(
+            &dist_body[..],
+            archive,
+            "the virtual must stream the member's real dist bytes"
+        );
+
+        tdh::cleanup(&vf.pool, member_id, Uuid::new_v4()).await;
+        let _ = std::fs::remove_dir_all(member_dir);
+        vf.teardown().await;
+    }
 }
 
 /// #4105: scan-on-proxy on Composer dist archives, Remote and Virtual,
@@ -5150,5 +5344,51 @@ mod serve_key_4365_tests {
             assert_eq!(got.cache_key, key);
             assert!(got.scannable);
         }
+    }
+}
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+    use crate::api::handlers::proxy_scan_archive::test_support::archive_identities;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{tar_gz_with, tar_with, zip_with};
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_dist_with_two_composer_json_entries_is_not_established() {
+        let good: &[u8] = br#"{"name":"acme/demo"}"#;
+        let other: &[u8] = br#"{"name":"acme/other"}"#;
+        let kind = || ComposerDist {
+            full_name: "acme/demo",
+            version: "1.0.0",
+        };
+        let check = |bytes: &[u8]| {
+            archive_identities(kind(), DupFormat::Composer, "acme-demo-1.0.0.zip", bytes)
+        };
+        let normalised = zip_with(&[
+            ("composer.json", good),
+            ("src/A.php", b""),
+            ("./composer.json", other),
+        ]);
+        let repeated = zip_with(&[("composer.json", other), ("composer.json", good)]);
+        for dup in [normalised, repeated] {
+            let (own, gate) = check(&dup);
+            assert!(matches!(own, ProxyScanIdentity::Established(_)));
+            assert!(unestablished(&gate));
+        }
+        let single = zip_with(&[("composer.json", good), ("src/A.php", b"")]);
+        assert!(matches!(
+            check(&single).1,
+            ProxyScanIdentity::Established(_)
+        ));
     }
 }

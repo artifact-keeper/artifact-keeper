@@ -829,6 +829,45 @@ async fn complete_session_commit(
             &repo.format,
             &session.artifact_path,
         );
+    // #4916: a protobuf label index carries a monotonic revision. A delayed
+    // or simultaneous peer move must not overwrite the newer index already
+    // held here; settle the session as a successful no-op instead of
+    // rewriting the row. Equal revisions are ordered by checksum so two peers
+    // that each moved a label from the same base converge on one document
+    // (the deterministic loser's move is dropped, never interleaved).
+    if mutable_replication
+        && repo.format == crate::models::repository::RepositoryFormat::Protobuf
+        && is_protobuf_label_index_path(&session.artifact_path)
+    {
+        let incoming_metadata = session.artifact_metadata.as_ref();
+        match stale_label_index_replication(
+            &state.db,
+            session.repository_id,
+            &session.artifact_path,
+            &session.checksum_sha256,
+            incoming_metadata,
+        )
+        .await
+        {
+            Ok(Some((artifact_id, size, checksum_sha256))) => {
+                return finish_stale_label_index_replication(
+                    state,
+                    &session,
+                    storage.as_ref(),
+                    artifact_id,
+                    size,
+                    checksum_sha256,
+                    is_replication_request,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                UploadService::release_commit_lease(&state.db, &session).await;
+                return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+            }
+        }
+    }
     if !identical_replay && !mutable_replication {
         if let Err(e) = crate::services::artifact_service::enforce_path_immutability(
             &state.db,
@@ -1453,6 +1492,108 @@ async fn complete_session_commit(
         path: session.artifact_path,
         size: session.total_size,
         checksum_sha256: session.checksum_sha256,
+    })
+    .into_response())
+}
+
+/// True for the registry-generated protobuf label index (`_labels`), the one
+/// protobuf path a trusted peer may rewrite in place (#4889).
+fn is_protobuf_label_index_path(path: &str) -> bool {
+    path.trim_start_matches('/')
+        .trim_end_matches('/')
+        .ends_with("/_labels")
+}
+
+/// Compare an incoming replicated label document with the index already held
+/// at this path (#4916).
+///
+/// Returns `Some((artifact_id, size, checksum))` when the incoming write is
+/// stale and must be ignored. The revision is the primary order; equal
+/// revisions are broken deterministically by checksum (the larger wins), so
+/// two peers that moved different labels from the same base converge on the
+/// same document. A document without a revision (a peer older than #4916) is
+/// accepted as before.
+async fn stale_label_index_replication(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    path: &str,
+    incoming_checksum: &str,
+    incoming_metadata: Option<&serde_json::Value>,
+) -> Result<Option<(Uuid, i64, String)>, sqlx::Error> {
+    let Some(incoming_metadata) = incoming_metadata else {
+        return Ok(None);
+    };
+    let Some(incoming_revision) = incoming_metadata
+        .get("revision")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        // Backward compatibility: pre-#4916 peers send no revision.
+        return Ok(None);
+    };
+    let existing: Option<(Uuid, i64, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT a.id, a.size_bytes, a.checksum_sha256, am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await?;
+    let Some((artifact_id, size, current_checksum, current_metadata)) = existing else {
+        return Ok(None);
+    };
+    let Some(current_revision) = current_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("revision"))
+        .and_then(serde_json::Value::as_i64)
+    else {
+        // The receiver's row predates revisions; the first revisioned write
+        // wins.
+        return Ok(None);
+    };
+    let incoming_checksum = incoming_checksum.trim().to_ascii_lowercase();
+    let stale = incoming_revision < current_revision
+        || (incoming_revision == current_revision
+            && incoming_checksum <= current_checksum.trim().to_ascii_lowercase());
+    Ok(stale.then_some((artifact_id, size, current_checksum)))
+}
+
+/// Finish a replication session whose label document lost the revision
+/// comparison: settle the session so the peer records a successful delivery,
+/// drop the staged chunks, and report the winner that is already stored.
+async fn finish_stale_label_index_replication(
+    state: &SharedState,
+    session: &upload_service::UploadSession,
+    storage: &dyn crate::storage::StorageBackend,
+    artifact_id: Uuid,
+    size: i64,
+    checksum_sha256: String,
+    is_replication_request: bool,
+) -> Result<Response, Response> {
+    let finalize_result = UploadService::finalize_completed(&state.db, session).await;
+    settle_completed_session(&state.db, session, finalize_result)
+        .await
+        .map_err(map_upload_err)?;
+    if let Err(e) =
+        UploadService::purge_staged_chunks(&state.db, storage, session.id, session.total_chunks)
+            .await
+    {
+        tracing::warn!(session = %session.id, error = %e, "failed to purge staged upload chunks");
+    }
+    if is_replication_request || session.is_replication {
+        cleanup_completed_upload_session(&state.db, session.id).await;
+    }
+    tracing::info!(
+        session = %session.id,
+        path = %session.artifact_path,
+        "Ignored a stale replicated protobuf label index"
+    );
+    Ok(Json(CompleteResponse {
+        artifact_id,
+        path: session.artifact_path.clone(),
+        size,
+        checksum_sha256,
     })
     .into_response())
 }
@@ -6597,6 +6738,157 @@ mod tests {
             label_packages, 0,
             "the generated label index must not become a package version"
         );
+    }
+
+    /// #4916: a delayed peer move whose revision is older than the index
+    /// already stored must be acknowledged (so the source stops retrying) but
+    /// must not roll the label back.
+    #[tokio::test]
+    async fn stale_protobuf_label_replication_is_ignored_4916() {
+        let Some(f) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let artifact_path = "modules/acme/stale/_labels";
+        let newer_bytes = br#"{"labels":{"main":"commit-new"},"revision":2}"#;
+        let older_bytes = br#"{"labels":{"main":"commit-old"},"revision":1}"#;
+        let body = |metadata: serde_json::Value, payload: &[u8]| {
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "acme/stale",
+                "artifact_version": "_labels",
+                "artifact_metadata_format": "protobuf",
+                "artifact_metadata": metadata,
+                "total_size": payload.len() as i64,
+                "checksum_sha256": sha256_hex(payload),
+                "chunk_size": 1024 * 1024_i64,
+            })
+        };
+        let admin = || tdh::admin_auth(f.user_id, &f.username);
+        let newer = complete_replication_upload_as(
+            &f,
+            admin,
+            body(
+                serde_json::json!({"labels": {"main": "commit-new"}, "revision": 2}),
+                newer_bytes,
+            ),
+            newer_bytes,
+        )
+        .await;
+        let older = complete_replication_upload_as(
+            &f,
+            admin,
+            body(
+                serde_json::json!({"labels": {"main": "commit-old"}, "revision": 1}),
+                older_bytes,
+            ),
+            older_bytes,
+        )
+        .await;
+
+        let (checksum, metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT a.checksum_sha256, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("label index row");
+        for session_id in [newer, older] {
+            let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+        }
+        f.teardown().await;
+
+        assert_eq!(
+            checksum.trim(),
+            sha256_hex(newer_bytes),
+            "the stale revision must not replace the newer document"
+        );
+        assert_eq!(metadata["labels"]["main"], "commit-new");
+        assert_eq!(metadata["revision"], 2);
+    }
+
+    /// #4916: peers that each moved a label from the same base produce two
+    /// documents with the same revision. The checksum tie-break must pick one
+    /// winner deterministically, whichever peer delivers first.
+    #[tokio::test]
+    async fn equal_revision_label_replication_picks_the_same_winner_4916() {
+        let Some(f) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        let artifact_path = "modules/acme/tie/_labels";
+        let a = (
+            br#"{"labels":{"main":"commit-a"},"revision":2}"#.as_slice(),
+            "commit-a",
+        );
+        let b = (
+            br#"{"labels":{"main":"commit-b"},"revision":2}"#.as_slice(),
+            "commit-b",
+        );
+        let (low, high) = if sha256_hex(a.0) < sha256_hex(b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let body = |label: &str, payload: &[u8]| {
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "acme/tie",
+                "artifact_version": "_labels",
+                "artifact_metadata_format": "protobuf",
+                "artifact_metadata": {"labels": {"main": label}, "revision": 2},
+                "total_size": payload.len() as i64,
+                "checksum_sha256": sha256_hex(payload),
+                "chunk_size": 1024 * 1024_i64,
+            })
+        };
+        let admin = || tdh::admin_auth(f.user_id, &f.username);
+        let mut sessions = Vec::new();
+        for (payload, label) in [low, high, low] {
+            sessions.push(
+                complete_replication_upload_as(&f, admin, body(label, payload), payload).await,
+            );
+        }
+
+        let (checksum, metadata): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT a.checksum_sha256, am.metadata FROM artifacts a \
+             JOIN artifact_metadata am ON am.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.path = $2",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("label index row");
+        for session_id in sessions {
+            let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .execute(&f.pool)
+                .await;
+        }
+        f.teardown().await;
+
+        assert_eq!(
+            checksum.trim(),
+            sha256_hex(high.0),
+            "the larger checksum must win an equal-revision tie"
+        );
+        assert_eq!(metadata["labels"]["main"], high.1);
+        assert_eq!(metadata["revision"], 2);
     }
 
     #[tokio::test]

@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#3396]
+---
+- **A `clean` proxy verdict that graded no components is no longer reused under `fail_closed`** (#3396). Proxy scan verdicts are stored per content digest and shared by every repository that serves those bytes. A `clean` verdict with no findings, no cataloged components and no recorded coordinate (for example one written by an on-demand rescan) says only that the scan saw nothing it could grade, so a `fail_closed` download no longer serves from it: the bytes are scanned again as for a first pull. A download whose identity cannot be established no longer reuses any `clean` verdict recorded without a coordinate, so it stays withheld (423) under `fail_closed` and is served `pending` under `fail_open`. A `POST /api/v1/repositories/{key}/security/proxy-scans/rescan` in a repository whose format does not scan on proxy (for example `generic`) in which the scanner catalogs nothing and finds nothing is now inconclusive: it answers 503 `RESCAN_SCAN_FAILED` and records no verdict, instead of recording `clean`.
