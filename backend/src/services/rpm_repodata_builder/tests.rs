@@ -427,9 +427,32 @@ async fn deleted_repository_revisions_are_collected_4544() {
         .execute(&f.pool)
         .await
         .unwrap();
-    // One pass handles a page of roots; drain them (other tests' leftovers
-    // share the database).
-    while collect_garbage(&f.state).await.unwrap() > 0 {}
+    // The hard delete queued a dirty mark for the root (migration 309), and
+    // the mark outlives the repository. Fold it first, as the builder's tick
+    // does: folded after the GC removed the row, it would recreate the row.
+    // Without this the test passed only when another test's fold on the
+    // shared database happened to consume the mark in between.
+    fold_marks_waiting(&f.pool).await.unwrap();
+    // One pass handles a page of 64 roots in no set order, and another
+    // test's GC may hold this root's lease, so a pass that collected
+    // nothing does not mean this root was collected. Retry until this
+    // repository's row is gone (its objects are deleted before the row).
+    let mut remaining = 1;
+    for _ in 0..100 {
+        collect_garbage(&f.state).await.unwrap();
+        remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM rpm_repodata_roots WHERE repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        if remaining == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(remaining, 0, "the deleted repository's root was collected");
     assert!(!stored_at(&f, &loc, "", 1, "repomd.xml").await);
     assert!(row(&f, "").await.is_none());
     f.teardown().await;
