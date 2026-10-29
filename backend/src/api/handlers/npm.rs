@@ -3673,8 +3673,10 @@ async fn get_package_metadata(
 /// For remote and virtual repos the full packument is fetched from upstream
 /// (or the first matching member) and parsed as JSON. For local/staging repos
 /// the packument is built from stored artifacts. In either case the
-/// `versions[version]` object is extracted and returned. Returns 404 when
-/// the package exists but does not contain the requested version.
+/// `versions[version]` object is extracted and returned. `version` may also
+/// name a dist-tag (`latest`, `next`, ...), as on the npm registry: it is
+/// resolved through the packument's `dist-tags` ([`resolve_npm_version_segment`]).
+/// Returns 404 when the package exists but has no such version or tag.
 async fn get_package_version_metadata(
     state: &SharedState,
     auth: Option<&AuthExtension>,
@@ -3695,14 +3697,16 @@ async fn get_package_version_metadata(
         if artifacts.is_empty() {
             return Err(AppError::NotFound("Package not found".to_string()).into_response());
         }
-        // Version extraction ignores dist-tags; pass an empty map.
-        // Always build the full packument here so the version can be extracted.
+        // The stored dist-tags let a tag name resolve (#5063); the builder
+        // still derives `latest` when none is stored. Always build the full
+        // packument here so the version can be extracted.
+        let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
         let resp = build_npm_metadata_response(
             &artifacts,
             package_name,
             base_url,
             repo_key,
-            &serde_json::Map::new(),
+            &dist_tags,
             false,
         )?;
         #[allow(clippy::disallowed_methods)]
@@ -3717,18 +3721,38 @@ async fn get_package_version_metadata(
         })?
     };
 
-    // Extract the requested version from the packument.
-    let version_obj = packument
+    // Extract the requested version (or the version a dist-tag names) from
+    // the packument. A tag resolves against the dist-tags the package route
+    // serves: on an age-gated Remote or Virtual that is the gate's view,
+    // where `latest` names the newest version old enough to download.
+    let gated_view = if packument
         .get("versions")
         .and_then(|v| v.get(version))
-        .cloned()
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "Version '{}' not found for package '{}'",
-                version, package_name
-            ))
-            .into_response()
-        })?;
+        .is_none()
+    {
+        npm_age_gated_tag_view(
+            state,
+            auth,
+            &repo,
+            repo_key,
+            package_name,
+            base_url,
+            &packument,
+        )
+        .await?
+    } else {
+        None
+    };
+    let (version, version_obj) =
+        resolve_npm_version_segment(gated_view.as_ref().unwrap_or(&packument), version)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Version '{}' not found for package '{}'",
+                    version, package_name
+                ))
+                .into_response()
+            })?;
+    let version = version.as_str();
 
     // #2955 on-demand curation ingestion: when a proxy first serves an npm
     // version doc, enqueue a pending curation row for any staging repo curating
@@ -3757,6 +3781,74 @@ async fn get_package_version_metadata(
     Ok(build_json_metadata_response(
         serde_json::to_string(&version_obj).unwrap(),
     ))
+}
+
+/// The version document a version-route segment names in `packument`: the
+/// `versions` entry of that exact key, else the entry the `dist-tags` tag of
+/// that name points at (`GET /npm/{repo}/{pkg}/latest`, #5063). An exact
+/// version wins over a tag of the same name. Returns the resolved version and
+/// its document, or `None` when neither names a listed version.
+fn resolve_npm_version_segment(
+    packument: &serde_json::Value,
+    segment: &str,
+) -> Option<(String, serde_json::Value)> {
+    let versions = packument.get("versions")?;
+    if let Some(doc) = versions.get(segment) {
+        return Some((segment.to_string(), doc.clone()));
+    }
+    let target = packument.get("dist-tags")?.get(segment)?.as_str()?;
+    versions
+        .get(target)
+        .map(|doc| (target.to_string(), doc.clone()))
+}
+
+/// The packument a dist-tag on the version route resolves against when the
+/// age gate applies, or `None` when it does not (#5063). The package route
+/// serves Remote and Virtual packuments through the gate, which removes
+/// versions still inside its window, moves `latest` to the newest allowed
+/// version and drops tags naming a removed one; resolving a tag against the
+/// ungated packument would name a version the download then refuses.
+async fn npm_age_gated_tag_view(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &proxy_helpers::RepoInfo,
+    repo_key: &str,
+    package_name: &str,
+    base_url: &str,
+    packument: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, Response> {
+    if repo.repo_type == RepositoryType::Remote {
+        let Some(svc) = state.age_gate_service.as_ref() else {
+            return Ok(None);
+        };
+        if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
+            return Ok(None);
+        }
+        let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if !AgeGateService::is_applicable(&params) {
+            return Ok(None);
+        }
+        let mut view = packument.clone();
+        svc.filter_npm_packument(&params, package_name, &mut view)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        Ok(Some(view))
+    } else if repo.repo_type == RepositoryType::Virtual {
+        // Without a gated member the gated merge equals the one already built.
+        if state.age_gate_service.is_none()
+            || !proxy_helpers::virtual_has_age_gated_member(&state.db, repo.id).await
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            collect_virtual_packument(state, auth, repo, repo_key, package_name, base_url, true)
+                .await?,
+        ))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Fetch the full packument JSON from a remote repository's upstream.
@@ -13783,6 +13875,316 @@ mod tests {
         assert_eq!(scalar, serde_json::json!("not an object"));
         merge_packument_into(&mut acc, serde_json::json!(42));
         assert!(acc["versions"].get("2.0.0").is_some());
+    }
+
+    /// #5063: the version route resolves a dist-tag when no version of that
+    /// name exists; an exact version wins over a tag of the same name.
+    #[test]
+    fn resolve_npm_version_segment_takes_a_version_then_a_dist_tag_5063() {
+        let packument = serde_json::json!({
+            "versions": {"1.0.0": {"version": "1.0.0"}, "2.0.0": {"version": "2.0.0"}},
+            "dist-tags": {"latest": "1.0.0", "next": "2.0.0", "1.0.0": "2.0.0",
+                          "gone": "9.9.9", "odd": 7}
+        });
+        let resolve = |seg: &str| resolve_npm_version_segment(&packument, seg).map(|(v, _)| v);
+        assert_eq!(resolve("latest").as_deref(), Some("1.0.0"));
+        assert_eq!(resolve("next").as_deref(), Some("2.0.0"));
+        assert_eq!(resolve("2.0.0").as_deref(), Some("2.0.0"));
+        assert_eq!(
+            resolve("1.0.0").as_deref(),
+            Some("1.0.0"),
+            "an exact version wins over a tag of the same name"
+        );
+        let (_, doc) = resolve_npm_version_segment(&packument, "next").unwrap();
+        assert_eq!(doc["version"], "2.0.0");
+        assert_eq!(resolve("nope"), None, "unknown tag");
+        assert_eq!(resolve("gone"), None, "tag naming an unlisted version");
+        assert_eq!(resolve("odd"), None, "non-string tag value");
+        assert_eq!(
+            resolve_npm_version_segment(&serde_json::json!({"versions": {}}), "latest"),
+            None,
+            "no dist-tags at all"
+        );
+    }
+
+    /// Call the version route and return `(status, version document)`.
+    async fn version_route_5063(
+        state: &SharedState,
+        repo_key: &str,
+        package: &str,
+        segment: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = match super::get_package_version_metadata(
+            state,
+            None,
+            repo_key,
+            package,
+            segment,
+            "http://localhost",
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r,
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The upstream packument the Remote and Virtual #5063 cases serve:
+    /// `latest` -> 1.0.0, `beta` -> 2.0.0-beta.1.
+    async fn mount_dist_tag_upstream_5063(upstream: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let base = upstream.uri();
+        let doc = |v: &str| {
+            serde_json::json!({"name": "tagged-pkg", "version": v,
+                "dist": {"tarball": format!("{base}/tagged-pkg/-/tagged-pkg-{v}.tgz"),
+                         "shasum": "0000000000000000000000000000000000000000"}})
+        };
+        Mock::given(method("GET"))
+            .and(path("/tagged-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "tagged-pkg",
+                "dist-tags": {"latest": "1.0.0", "beta": "2.0.0-beta.1"},
+                "versions": {"1.0.0": doc("1.0.0"), "2.0.0-beta.1": doc("2.0.0-beta.1")}
+            })))
+            .mount(upstream)
+            .await;
+    }
+
+    /// Assert the #5063 cases against a repository serving `tagged-pkg` with
+    /// `latest` -> `latest_version` and `custom` -> `custom_version`.
+    async fn assert_dist_tag_routes_5063(
+        state: &SharedState,
+        repo_key: &str,
+        custom: &str,
+        latest_version: &str,
+        custom_version: &str,
+    ) {
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", "latest").await;
+        assert_eq!(status, StatusCode::OK, "latest: {doc}");
+        assert_eq!(doc["version"], latest_version, "latest: {doc}");
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", custom).await;
+        assert_eq!(status, StatusCode::OK, "{custom}: {doc}");
+        assert_eq!(doc["version"], custom_version, "{custom}: {doc}");
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", latest_version).await;
+        assert_eq!(status, StatusCode::OK, "exact version: {doc}");
+        assert_eq!(doc["version"], latest_version);
+        let (status, doc) = version_route_5063(state, repo_key, "tagged-pkg", "no-such-tag").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "unknown tag: {doc}");
+    }
+
+    /// #5063, Local: `latest` (derived) and a stored custom tag resolve on
+    /// the version route; an exact version beats a tag of the same name.
+    #[tokio::test]
+    async fn local_version_route_resolves_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        for ver in ["1.0.0", "1.1.0", "2.0.0-rc.1"] {
+            let path = format!("tagged-pkg/{ver}/tagged-pkg-{ver}.tgz");
+            tdh::seed_artifact(
+                &fx.state,
+                &fx.pool,
+                &repo,
+                &format!("npm/{path}"),
+                &path,
+                "tagged-pkg",
+                ver,
+                "application/gzip",
+                Bytes::from_static(b"tgz"),
+                fx.user_id,
+            )
+            .await;
+        }
+        sqlx::query("INSERT INTO npm_dist_tags (repository_id, name, tags) VALUES ($1, $2, $3)")
+            .bind(fx.repo_id)
+            .bind("tagged-pkg")
+            .bind(serde_json::json!({"next": "2.0.0-rc.1", "1.0.0": "1.1.0"}))
+            .execute(&fx.pool)
+            .await
+            .expect("seed npm_dist_tags");
+        let state = fx.state.clone();
+        let key = fx.repo_key.clone();
+        let (status, exact) = version_route_5063(&state, &key, "tagged-pkg", "1.0.0").await;
+        // `latest` is derived (highest stable) since none is stored.
+        let checks = async {
+            assert_dist_tag_routes_5063(&state, &key, "next", "1.1.0", "2.0.0-rc.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::OK, "{exact}");
+        assert_eq!(
+            exact["version"], "1.0.0",
+            "an exact version wins over a tag of the same name: {exact}"
+        );
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, Remote: the upstream packument's `dist-tags` resolve.
+    #[tokio::test]
+    async fn remote_version_route_resolves_dist_tags_5063() {
+        let upstream = wiremock::MockServer::start().await;
+        mount_dist_tag_upstream_5063(&upstream).await;
+        let Some((fx, state)) = remote_on(&upstream).await else {
+            return;
+        };
+        let key = fx.repo_key.clone();
+        let checks = async {
+            assert_dist_tag_routes_5063(&state, &key, "beta", "1.0.0", "2.0.0-beta.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The upstream for the age-gated #5063 cases: `latest` and `fresh` name
+    /// 2.0.0, published now; `old` names 1.0.0, published in 2020.
+    async fn mount_gated_upstream_5063(upstream: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let base = upstream.uri();
+        let doc = |v: &str| {
+            serde_json::json!({"name": "gated-pkg", "version": v,
+                "dist": {"tarball": format!("{base}/gated-pkg/-/gated-pkg-{v}.tgz"),
+                         "shasum": "0000000000000000000000000000000000000000"}})
+        };
+        let fresh = chrono::Utc::now().to_rfc3339();
+        Mock::given(method("GET"))
+            .and(path("/gated-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "gated-pkg",
+                "dist-tags": {"latest": "2.0.0", "fresh": "2.0.0", "old": "1.0.0"},
+                "versions": {"1.0.0": doc("1.0.0"), "2.0.0": doc("2.0.0")},
+                "time": {"1.0.0": "2020-01-01T00:00:00.000Z", "2.0.0": fresh}
+            })))
+            .mount(upstream)
+            .await;
+    }
+
+    /// The gated #5063 assertions against `repo_key`.
+    async fn assert_gated_dist_tag_routes_5063(state: &SharedState, key: &str) {
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "latest").await;
+        assert_eq!(status, StatusCode::OK, "latest: {doc}");
+        assert_eq!(doc["version"], "1.0.0", "gate moves latest: {doc}");
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "old").await;
+        assert_eq!(status, StatusCode::OK, "old: {doc}");
+        assert_eq!(doc["version"], "1.0.0");
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "fresh").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "tag naming a gated version: {doc}"
+        );
+        let (status, doc) = version_route_5063(state, key, "gated-pkg", "2.0.0").await;
+        assert_eq!(status, StatusCode::OK, "exact version as before: {doc}");
+        assert_eq!(doc["version"], "2.0.0");
+    }
+
+    /// #5063, Virtual over an age-gated Remote member: the same as the
+    /// gated Remote case, through the gated merge.
+    #[tokio::test]
+    async fn age_gated_virtual_version_route_resolves_gated_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_gated_upstream_5063(&upstream).await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        attach_public_remote(&fx, remote_id, &upstream.uri(), 1).await;
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 7, \
+             age_gate_mode = 'upstream_publish_time' WHERE id = $1",
+        )
+        .bind(remote_id)
+        .execute(&fx.pool)
+        .await
+        .expect("gate the member");
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
+        let key = fx.repo_key.clone();
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            assert_gated_dist_tag_routes_5063(&state, &key),
+        ))
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, age-gated Remote: a tag resolves against the gate's view, so
+    /// `latest` names the newest version old enough to download (the gate
+    /// moves it) and a tag naming a version still inside the window is 404.
+    /// An exact version is served as before.
+    #[tokio::test]
+    async fn age_gated_remote_version_route_resolves_gated_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let upstream = wiremock::MockServer::start().await;
+        mount_gated_upstream_5063(&upstream).await;
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = 7, age_gate_mode = 'upstream_publish_time' WHERE id = $2",
+        )
+        .bind(upstream.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure gated remote");
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
+        let key = fx.repo_key.clone();
+        let checks = assert_gated_dist_tag_routes_5063(&state, &key);
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// #5063, Virtual: the merged packument's `dist-tags` resolve.
+    #[tokio::test]
+    async fn virtual_version_route_resolves_dist_tags_5063() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        mount_dist_tag_upstream_5063(&upstream).await;
+        let (remote_id, _rkey, remote_dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+        attach_public_remote(&fx, remote_id, &upstream.uri(), 1).await;
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let key = fx.repo_key.clone();
+        let checks = async {
+            assert_dist_tag_routes_5063(&state, &key, "beta", "1.0.0", "2.0.0-beta.1").await;
+        };
+        let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(checks)).await;
+        tdh::cleanup_member_repo(&fx.pool, remote_id, &remote_dir).await;
+        fx.teardown().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// #1543 end-to-end: a custom dist-tag is served in the packument and
