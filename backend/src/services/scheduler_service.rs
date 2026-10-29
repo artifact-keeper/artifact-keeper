@@ -2180,7 +2180,7 @@ async fn run_curation_sync_cycle_for(
                                     record_curation_failure(
                                         &mut failures,
                                         *staging_id,
-                                        format_args!("repomd.xml read error: {e}"),
+                                        format_args!("repomd.xml read error: {}", e.without_url()),
                                     );
                                     continue;
                                 }
@@ -2198,7 +2198,7 @@ async fn run_curation_sync_cycle_for(
                             record_curation_failure(
                                 &mut failures,
                                 *staging_id,
-                                format_args!("repomd.xml fetch error: {e}"),
+                                format_args!("repomd.xml fetch error: {}", e.without_url()),
                             );
                             continue;
                         }
@@ -2310,7 +2310,7 @@ async fn run_curation_sync_cycle_for(
                                 record_curation_failure(
                                     &mut failures,
                                     *staging_id,
-                                    format_args!("primary.xml read error: {e}"),
+                                    format_args!("primary.xml read error: {}", e.without_url()),
                                 );
                                 continue;
                             }
@@ -2413,7 +2413,7 @@ async fn run_curation_sync_cycle_for(
                         record_curation_failure(
                             &mut failures,
                             *staging_id,
-                            format_args!("primary.xml fetch error: {e}"),
+                            format_args!("primary.xml fetch error: {}", e.without_url()),
                         );
                         continue;
                     }
@@ -2430,7 +2430,9 @@ async fn run_curation_sync_cycle_for(
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
-                        let bytes = resp.bytes().await?;
+                        // `without_url`: the error text reaches the sync
+                        // failure, and the URL may carry upstream credentials.
+                        let bytes = resp.bytes().await.map_err(|e| e.without_url())?;
                         // Bound the upstream-index decompression (#2556): a
                         // malicious/compromised upstream mirror cannot inflate
                         // Packages.gz unbounded during sync. #2561: the
@@ -2452,7 +2454,7 @@ async fn run_curation_sync_cycle_for(
                         }
                         match crate::services::upstream_tracing::send_upstream(plain_req).await {
                             Ok(resp) if resp.status().is_success() => {
-                                let content = resp.text().await?;
+                                let content = resp.text().await.map_err(|e| e.without_url())?;
                                 curation_sync::parse_deb_packages_index(&content, "main")
                             }
                             _ => {
@@ -4318,6 +4320,43 @@ mod tests {
             ],
             "one CLIENT span per index fetch, each with an integer status"
         );
+    }
+
+    /// A curation index fetch that fails at the transport records its error
+    /// without the request URL, so credentials in the upstream URL's userinfo
+    /// stay out of the cycle's failure text (and the log line built from it).
+    #[tokio::test]
+    async fn test_curation_sync_fetch_error_omits_upstream_url_credentials() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            format!(
+                "http://user:secret@{}/gone",
+                listener.local_addr().expect("addr")
+            )
+        };
+        let staging_id = uuid::Uuid::new_v4();
+        let remote = seed_rpm_curation_pair(&pool, staging_id, &refused).await;
+        let result = run_curation_sync_cycle_for(&pool, Some(&[staging_id]), None).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![staging_id, remote])
+            .execute(&pool)
+            .await;
+
+        let err = result
+            .expect_err("a refused index fetch fails the cycle")
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "staging repo {staging_id}: repomd.xml fetch error"
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("secret"), "credentials echoed: {err}");
+        assert!(!err.contains("user:"), "userinfo echoed: {err}");
     }
 
     /// #3954: a curation index fetch that fails keeps its failure handling

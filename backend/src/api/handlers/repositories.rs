@@ -13151,7 +13151,7 @@ pub async fn get_egress_proxy(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Upstream reachable"),
-        (status = 400, description = "Repository is not remote or has no upstream URL"),
+        (status = 400, description = "Repository is not remote, has no upstream URL, or its upstream URL is not allowed"),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
         (status = 502, description = "Upstream unreachable"),
@@ -13175,25 +13175,7 @@ pub async fn test_upstream(
         AppError::Validation("Repository has no upstream URL configured".to_string())
     })?;
 
-    let client = crate::services::http_client::base_client_builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
-
-    let mut request = client.head(upstream_url);
-
-    // Apply upstream auth if configured
-    if let Some(upstream_auth) =
-        crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
-    {
-        request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
-    }
-
-    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
-    // attributes, parented to this request's span, and `traceparent` sent on.
-    let response = crate::services::upstream_tracing::send_upstream(request)
-        .await
-        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {e}")))?;
+    let response = probe_upstream(&state.db, repo.id, upstream_url).await?;
 
     let status = response.status().as_u16();
     // 2xx or 404 (root URL may not serve content) are acceptable
@@ -13211,6 +13193,50 @@ pub async fn test_upstream(
             "Upstream returned HTTP {status}"
         )))
     }
+}
+
+/// Send the `test_upstream` connectivity probe the way the proxy fetch path
+/// reaches an upstream: the URL passes the upstream SSRF validation first,
+/// and the request goes out on the repository's egress route (its `direct`
+/// or `explicit` proxy configuration, else the default client).
+async fn probe_upstream(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    upstream_url: &str,
+) -> Result<reqwest::Response> {
+    // A stored URL predating the write-time check, or one the operator's
+    // allowlist no longer admits, is refused before any request is sent.
+    crate::api::validation::validate_outbound_url(upstream_url, "Upstream URL")?;
+    let egress = crate::services::egress_proxy::load_egress_proxy(db, repo_id).await?;
+    let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, repo_id).await?;
+    send_upstream_probe(&egress, upstream_url, upstream_auth.as_ref()).await
+}
+
+/// The client half of [`probe_upstream`]. The error never carries the
+/// request URL: a stored upstream URL may hold credentials in its userinfo.
+async fn send_upstream_probe(
+    egress: &crate::services::egress_proxy::EgressProxyConfig,
+    upstream_url: &str,
+    upstream_auth: Option<&crate::services::upstream_auth::UpstreamAuthType>,
+) -> Result<reqwest::Response> {
+    let client = if egress.overrides_default_routing() {
+        crate::services::egress_proxy::build_repo_client(egress)?
+    } else {
+        crate::services::http_client::base_client_builder()
+            .build()
+            .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?
+    };
+
+    let mut request = client.head(upstream_url).timeout(Duration::from_secs(15));
+    if let Some(upstream_auth) = upstream_auth {
+        request = crate::services::upstream_auth::apply_upstream_auth(request, upstream_auth);
+    }
+
+    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
+    // attributes, parented to this request's span, and `traceparent` sent on.
+    crate::services::upstream_tracing::send_upstream(request)
+        .await
+        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {}", e.without_url())))
 }
 
 // ---------------------------------------------------------------------------
@@ -24516,6 +24542,102 @@ mod tests {
     // -----------------------------------------------------------------------
     // UpstreamAuthRequest deserialization
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // test_upstream connectivity probe
+    // -----------------------------------------------------------------------
+
+    /// The probe applies the upstream URL validation before it sends
+    /// anything: a stored upstream URL naming a disallowed address is refused
+    /// with a 400, and no database read or request happens.
+    #[tokio::test]
+    async fn test_upstream_probe_refuses_disallowed_address() {
+        // Never connected: validation refuses before the first query.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://probe@127.0.0.1:1/none")
+            .expect("lazy pool");
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/",
+            "http://localhost/",
+            "file:///etc/passwd",
+        ] {
+            let err = probe_upstream(&pool, Uuid::new_v4(), url)
+                .await
+                .expect_err(url);
+            assert!(matches!(err, AppError::Validation(_)), "{url}: {err:?}");
+        }
+    }
+
+    /// A probe that cannot reach the upstream answers 502 without echoing the
+    /// request URL, so credentials in the stored URL's userinfo stay out of
+    /// the response.
+    #[tokio::test]
+    async fn test_upstream_probe_error_does_not_echo_url_credentials() {
+        use crate::services::egress_proxy::{EgressProxyConfig, EgressProxyMode};
+        // A proxy on a closed local port: the send fails at once, with no DNS.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let egress = EgressProxyConfig {
+            mode: EgressProxyMode::Explicit,
+            proxy_url: Some(format!("http://127.0.0.1:{port}")),
+            no_proxy: None,
+        };
+        let err = send_upstream_probe(&egress, "https://user:secret@upstream.example.com/", None)
+            .await
+            .expect_err("nothing listens on the proxy port");
+        let AppError::BadGateway(msg) = err else {
+            panic!("expected a 502, got {err:?}");
+        };
+        assert!(msg.starts_with("Failed to reach upstream"), "{msg}");
+        assert!(!msg.contains("secret"), "credentials echoed: {msg}");
+        assert!(!msg.contains("user:"), "userinfo echoed: {msg}");
+    }
+
+    /// The probe goes out on the repository's egress route: with an explicit
+    /// proxy configured, the request reaches the proxy (absolute-form request
+    /// line) rather than the upstream host directly.
+    #[tokio::test]
+    async fn test_upstream_probe_uses_repository_egress_proxy() {
+        use crate::services::egress_proxy::{EgressProxyConfig, EgressProxyMode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let proxy = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("write");
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let egress = EgressProxyConfig {
+            mode: EgressProxyMode::Explicit,
+            proxy_url: Some(format!("http://127.0.0.1:{port}")),
+            no_proxy: None,
+        };
+        let response = send_upstream_probe(&egress, "http://upstream.example.com/simple/", None)
+            .await
+            .expect("the proxy answers");
+        assert_eq!(response.status().as_u16(), 200);
+        let head = proxy.await.expect("proxy task");
+        assert!(
+            head.starts_with("HEAD http://upstream.example.com/simple/ HTTP/1.1"),
+            "request did not go through the configured proxy: {head:?}"
+        );
+    }
 
     #[test]
     fn test_upstream_auth_request_basic() {
