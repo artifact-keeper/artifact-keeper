@@ -2450,11 +2450,11 @@ mod raw_error_body_class_tests {
     ///     operator configured (a migration source connection, an IdP's
     ///     published JWK, the jemalloc profiler, a remote repository's upstream
     ///     URL), on a diagnostic route whose entire job is reporting why that
-    ///     configuration did not work. All are admin-gated except
-    ///     `POST /repositories/{key}/test-upstream`, which is reachable by any
-    ///     caller who can read the repository — and returns `upstream_url` in
-    ///     its own success body, so the error names nothing the caller could
-    ///     not already read.
+    ///     configuration did not work. All are admin-gated:
+    ///     `POST /repositories/{key}/test-upstream` needs repository admin,
+    ///     and its "Failed to reach upstream" error is built from the HTTP
+    ///     client error without the request URL, so it names no credentials
+    ///     stored in the upstream URL.
     ///
     /// A third group needs no entry: the webhook retry worker and the Incus
     /// session reaper build these strings for a background task's log, not for
