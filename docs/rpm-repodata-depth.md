@@ -196,9 +196,10 @@ curl -u "$AK_USER:$AK_PASSWORD" -X POST \
   "$AK_URL/api/v1/repositories/releases/rpm/repodata/rebuild?root=build-a&wait=true"
 ```
 
-`root` is the metadata root (omit it at depth zero); it must hold packages
-(404 otherwise). With `wait=true` the call returns `200` once a revision that
-includes every write committed before the call is being served, with the
+`root` is the metadata root (omit it at depth zero); a root that never held
+packages is refused with 404. With `wait=true` the call returns `200` once a
+revision that includes every write committed before the call is being served,
+with the
 revision and the package count; callers arriving together share one build,
 and a build another replica is running is waited for (up to five minutes).
 Without `wait` the call returns `202` and the next builder tick builds the
@@ -206,7 +207,8 @@ root without the debounce. It needs the repository `write` permission, like
 an upload. A large root can take longer to build than a proxy or ingress
 timeout allows; the build still finishes if the client gives up, so a CI job
 can retry the call, which then returns at once. Each replica runs at most two
-`wait=true` builds at a time and answers `503` beyond that.
+`wait=true` builds at a time and answers `503` beyond that (waiting for
+another replica's build of the same root does not count).
 
 To keep the previous behaviour for one repository, set
 `"repodata_mode": "on_request"` on create or `PATCH`: every request then

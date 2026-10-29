@@ -355,11 +355,16 @@ pub async fn try_build(
 /// set by a claim that never swapped or an incomplete build), it is
 /// returned instead of building again, so concurrent callers and retries
 /// share one build.
+///
+/// `slots` caps the builds this replica runs synchronously; a permit is
+/// taken only once the lease is held, so waiting on another replica's build
+/// does not occupy one. No free permit is a 503.
 pub async fn build_waiting(
     state: &SharedState,
     repo_id: Uuid,
     root: &str,
     wait: Duration,
+    slots: &'static tokio::sync::Semaphore,
 ) -> Result<BuildOutcome> {
     let lease = PgAdvisoryLock::new(state.db.clone())
         .acquire_blocking(
@@ -384,6 +389,12 @@ pub async fn build_waiting(
         lease.release().await;
         return Ok(BuildOutcome::Built { revision, packages });
     }
+    let Ok(_permit) = slots.try_acquire() else {
+        lease.release().await;
+        return Err(AppError::ServiceUnavailable(
+            "Too many synchronous repodata rebuilds in progress; retry".into(),
+        ));
+    };
     build_leased(state, repo_id, root, &BuilderSettings::from_env(), lease).await
 }
 
@@ -1016,17 +1027,20 @@ pub async fn modes(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, RepodataMo
         .collect())
 }
 
-/// The repository's repodata mode (`repodata_mode` in `repository_config`;
-/// absent means [`RepodataMode::Precomputed`]).
-/// Whether `root` of `repo_id` lists any package (a root a rebuild may name).
-pub async fn root_has_packages(db: &PgPool, repo_id: Uuid, root: &str) -> Result<bool> {
+/// Whether a rebuild may name `root` of `repo_id`: it lists a package, or
+/// it is already tracked (it had packages, so a build that empties it must
+/// be possible). A made-up root is neither.
+pub async fn root_is_known(db: &PgPool, repo_id: Uuid, root: &str) -> Result<bool> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM artifacts a \
+        "SELECT EXISTS (SELECT 1 FROM rpm_repodata_roots \
+                         WHERE repository_id = $1 AND root = $3) \
+             OR EXISTS (SELECT 1 FROM artifacts a \
           WHERE a.repository_id = $1 AND a.is_deleted = false AND a.path LIKE '%.rpm' \
             AND starts_with(a.path, $2))",
     )
     .bind(repo_id)
     .bind(root_prefix(root))
+    .bind(root)
     .fetch_one(db)
     .await?)
 }
@@ -1042,6 +1056,8 @@ where
     <RepodataMode as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
+/// The repository's repodata mode (`repodata_mode` in `repository_config`;
+/// absent means [`RepodataMode::Precomputed`]).
 pub async fn mode(db: &PgPool, repo_id: Uuid) -> Result<RepodataMode> {
     let value: Option<String> = sqlx::query_scalar(
         "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",

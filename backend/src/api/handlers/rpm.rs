@@ -4219,7 +4219,7 @@ pub struct RebuildRepodataResponse {
         (status = 400, description = "`root` is not a metadata root at the repository's depth"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Repository write permission required"),
-        (status = 404, description = "Repository not found, or no packages under `root`"),
+        (status = 404, description = "Repository not found, or `root` never held packages"),
         (status = 409, description = "The repository renders repodata on request (`repodata_mode: on_request`), serves a curated publication or is being deleted; or a build or a long write on the root did not finish in time"),
         (status = 422, description = "Not a hosted (local) RPM repository"),
         (status = 503, description = "This replica is already running its maximum of synchronous rebuilds; retry"),
@@ -4276,7 +4276,7 @@ pub async fn rebuild_repodata(
             "'{root}' is not a metadata root of this repository (repodata_depth {depth})"
         ))
     })?;
-    if !rpm_repodata_builder::root_has_packages(&state.db, repo.id, &root).await? {
+    if !rpm_repodata_builder::root_is_known(&state.db, repo.id, &root).await? {
         return Err(AppError::NotFound(format!(
             "No packages under root '{root}'"
         )));
@@ -4292,18 +4292,19 @@ pub async fn rebuild_repodata(
         };
         return Ok((StatusCode::ACCEPTED, axum::Json(body)).into_response());
     }
-    let permit = REBUILD_SLOTS.try_acquire().map_err(|_| {
-        AppError::ServiceUnavailable(
-            "Too many synchronous repodata rebuilds in progress; retry".into(),
-        )
-    })?;
     // In its own task: a client that disconnects must not cancel a build
     // half way, after it cleared the root's dirty flag.
     let task_state = state.clone();
     let (repo_id, task_root) = (repo.id, root.clone());
     let outcome = tokio::spawn(async move {
-        let _permit = permit;
-        rpm_repodata_builder::build_waiting(&task_state, repo_id, &task_root, REBUILD_WAIT).await
+        rpm_repodata_builder::build_waiting(
+            &task_state,
+            repo_id,
+            &task_root,
+            REBUILD_WAIT,
+            &REBUILD_SLOTS,
+        )
+        .await
     })
     .await
     .map_err(|e| AppError::Internal(format!("repodata rebuild task failed: {e}")))??;

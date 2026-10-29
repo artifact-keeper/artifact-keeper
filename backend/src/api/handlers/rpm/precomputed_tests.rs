@@ -204,8 +204,13 @@ async fn rebuild_without_wait_queues_and_validates_the_root_4544() {
         .execute(&f.pool)
         .await
         .unwrap();
-    let (status, _) = rebuild(&f, "").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "a root without packages");
+    let (status, body) = rebuild(&f, "?wait=true").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an emptied root can be rebuilt: {body}"
+    );
+    assert_eq!(body["status"], "empty");
     f.teardown().await;
 }
 
