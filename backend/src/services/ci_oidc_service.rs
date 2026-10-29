@@ -2075,6 +2075,10 @@ impl CiOidcService {
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("CI OIDC discovery fetch failed: {e}")))?;
+        let response =
+            crate::services::http_client::require_idp_success(response, "CI OIDC discovery")
+                .await
+                .map_err(AppError::Internal)?;
         let discovery: serde_json::Value = crate::services::http_client::read_json_capped(
             response,
             crate::services::http_client::MAX_OIDC_RESPONSE_BYTES,
@@ -2106,6 +2110,10 @@ impl CiOidcService {
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("CI JWKS fetch failed: {e}")))?;
+        let response =
+            crate::services::http_client::require_idp_success(response, "CI OIDC JWKS endpoint")
+                .await
+                .map_err(AppError::Internal)?;
         let jwks: serde_json::Value = crate::services::http_client::read_json_capped(
             response,
             crate::services::http_client::MAX_OIDC_RESPONSE_BYTES,

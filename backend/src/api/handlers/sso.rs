@@ -187,6 +187,10 @@ async fn fetch_oidc_discovery(issuer_url: &str) -> Result<serde_json::Value> {
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch OIDC discovery: {e}")))?;
+    let discovery_response =
+        crate::services::http_client::require_idp_success(discovery_response, "OIDC discovery")
+            .await
+            .map_err(AppError::Internal)?;
     read_json_capped(discovery_response, MAX_OIDC_RESPONSE_BYTES)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse OIDC discovery: {e}")))
@@ -661,10 +665,12 @@ async fn oidc_callback_inner(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Token exchange failed: {e}")))?;
-    let token_response: serde_json::Value =
-        read_json_capped(token_exchange_response, MAX_OIDC_RESPONSE_BYTES)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
+    let token_response: serde_json::Value = crate::services::http_client::read_idp_token_response(
+        token_exchange_response,
+        "OIDC token endpoint",
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
 
     let id_token = token_response["id_token"]
         .as_str()
@@ -2284,6 +2290,10 @@ async fn validate_id_token(
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("Failed to fetch JWKS: {e}")))?;
+    let jwks_response =
+        crate::services::http_client::require_idp_success(jwks_response, "OIDC JWKS endpoint")
+            .await
+            .map_err(AppError::Internal)?;
     let jwks: serde_json::Value = read_json_capped(jwks_response, MAX_OIDC_RESPONSE_BYTES)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse JWKS: {e}")))?;
