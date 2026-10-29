@@ -506,9 +506,20 @@ async fn claim_waits_for_fenced_writers_and_crashed_builds_retry_4544() {
         ..BuilderSettings::default()
     };
     let outcome = try_build(&f.state, f.repo_id, "", &hasty).await.unwrap();
-    assert_eq!(outcome, BuildOutcome::Busy);
+    assert_eq!(outcome, BuildOutcome::WritersBusy);
     assert!(row(&f, "").await.unwrap().0.is_some(), "still dirty");
     writer.commit().await.unwrap();
+    // Backed off: not due until the back-off passes.
+    let eager = BuilderSettings {
+        quiet: Duration::ZERO,
+        batch: 10_000,
+        ..BuilderSettings::default()
+    };
+    assert!(!due_roots(&f.pool, &eager)
+        .await
+        .unwrap()
+        .iter()
+        .any(|(id, _)| *id == f.repo_id));
     assert!(matches!(build(&f, "").await, BuildOutcome::Built { .. }));
 
     // A claim whose build never swapped: clean, deadline passed.

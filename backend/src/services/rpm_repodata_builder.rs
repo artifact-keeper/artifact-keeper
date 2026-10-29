@@ -148,7 +148,7 @@ impl Default for BuilderSettings {
             failure_backoff: Duration::from_secs(30),
             maintenance_every: Duration::from_secs(60),
             build_deadline: Duration::from_secs(15 * 60),
-            fence_timeout: Duration::from_secs(5),
+            fence_timeout: Duration::from_millis(500),
             batch: 16,
         }
     }
@@ -184,6 +184,10 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
         max_delay_secs = settings.max_delay.as_secs(),
         "RPM repodata builder started (#4544)"
     );
+    sweep_spool_files(
+        &crate::api::handlers::incus::staging_root(&state.config.storage_path),
+        settings.build_deadline,
+    );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(settings.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -206,6 +210,32 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
         }
     });
 }
+
+/// Delete spool files a build left behind when its process died: older
+/// than any build may run. Best effort.
+fn sweep_spool_files(dir: &std::path::Path, older_than: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SPOOL_PREFIX)
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > older_than);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// File name prefix of the builder's spool files.
+const SPOOL_PREFIX: &str = "ak-rpm-repodata-";
 
 /// One pass over the roots due for a build. Returns how many were built.
 pub async fn run_tick(state: &SharedState, settings: &BuilderSettings) -> usize {
@@ -266,6 +296,11 @@ pub enum BuildOutcome {
     Empty,
     /// Another replica holds the root's lease.
     Busy,
+    /// A writer transaction on the root outlasted
+    /// [`BuilderSettings::fence_timeout`]; the root stays dirty and is not
+    /// tried again for [`BuilderSettings::failure_backoff`], so a long import
+    /// does not have new uploads queue behind the builder every tick.
+    WritersBusy,
     /// The repository is not precomputed (opted out, virtual, publication, or
     /// gone).
     NotPrecomputed,
@@ -351,6 +386,7 @@ async fn build_leased(
         Ok(BuildOutcome::Built { .. }) => "built",
         Ok(BuildOutcome::Empty) => "empty",
         Ok(BuildOutcome::Busy) => "busy",
+        Ok(BuildOutcome::WritersBusy) => "writers_busy",
         Ok(BuildOutcome::NotPrecomputed) => "skipped",
         Err(_) => "failed",
     };
@@ -403,7 +439,7 @@ impl Spool {
         std::fs::create_dir_all(dir)
             .map_err(|e| AppError::Internal(format!("repodata spool directory: {e}")))?;
         let file = tempfile::Builder::new()
-            .prefix("ak-rpm-repodata-")
+            .prefix(SPOOL_PREFIX)
             .tempfile_in(dir)
             .map_err(|e| AppError::Internal(format!("repodata spool file: {e}")))?;
         let writer = file
@@ -455,7 +491,18 @@ async fn build_root(
     //    storage location is recorded now so the GC can find this revision's
     //    objects even if the build fails before it becomes current.
     let Some(revision) = claim(state, repo_id, root, &location, settings).await? else {
-        return Ok(BuildOutcome::Busy);
+        sqlx::query(
+            "UPDATE rpm_repodata_roots \
+                SET retry_at = now() + make_interval(secs => $3), \
+                    last_error = 'writers held the root past the fence timeout' \
+              WHERE repository_id = $1 AND root = $2",
+        )
+        .bind(repo_id)
+        .bind(root)
+        .bind(settings.failure_backoff.as_secs_f64())
+        .execute(&state.db)
+        .await?;
+        return Ok(BuildOutcome::WritersBusy);
     };
 
     // 3. Render one snapshot into spool files.
