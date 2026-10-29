@@ -368,6 +368,260 @@ pub fn oci_manifest_is_runnable_image(body: &[u8]) -> bool {
         .any(|layer| is_container_rootfs_layer(&layer.media_type))
 }
 
+/// How the inline proxy scan gate must treat a proxied OCI manifest body.
+///
+/// The gate classifies POSITIVELY: only a body positively identified as a
+/// pure index or a known non-image artifact skips the scan. Anything the
+/// server cannot read the way a container runtime would is
+/// [`ProxyScanClass::Unclassifiable`], which the gate treats as an
+/// inconclusive scan (withheld under `fail_closed`), never as "not an image".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyScanClass {
+    /// A runnable image ([`oci_manifest_is_runnable_image`]): scan it.
+    RunnableImage,
+    /// Positively not a runnable image: a pure index or manifest list (its
+    /// platform children re-enter the gate), a manifest with no config, an
+    /// image config with no layers, or a known non-image artifact (Helm
+    /// chart, cosign signature, SBOM / attestation, WASM module) that carries
+    /// no rootfs layer.
+    NotAnImage,
+    /// Not parseable by the server, ambiguous to a lenient consumer
+    /// ([`oci_manifest_json_is_ambiguous`]), or a shape that is neither a
+    /// runnable image nor a known non-image artifact (for example an unknown
+    /// config media type with a rootfs layer).
+    Unclassifiable,
+}
+
+/// Classify a proxied manifest body for the inline scan gate (see
+/// [`ProxyScanClass`]).
+///
+/// The typed parse below is serde's: case-sensitive keys, unknown keys
+/// ignored, duplicate fields rejected. Docker and containerd decode with Go's
+/// `encoding/json`, which matches keys case-insensitively and lets the last
+/// of a duplicated key win, so a body such as `{"Config": .., "Layers": ..}`
+/// is a runnable image to them and a config-less document to serde. Such a
+/// body is refused classification up front rather than normalised: matching
+/// Go's folding rules exactly is fragile, and no registry emits case-variant
+/// or duplicate keys.
+pub fn classify_oci_manifest_for_proxy_scan(body: &[u8]) -> ProxyScanClass {
+    if oci_manifest_json_is_ambiguous(body) {
+        return ProxyScanClass::Unclassifiable;
+    }
+    let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
+        return ProxyScanClass::Unclassifiable;
+    };
+    if oci_manifest_is_runnable_image(body) {
+        return ProxyScanClass::RunnableImage;
+    }
+    let Some(config) = manifest.config.as_ref() else {
+        // A pure index / manifest list, or a document with no config at all:
+        // no runtime can run a manifest without a config.
+        return ProxyScanClass::NotAnImage;
+    };
+    if manifest.layers.is_empty() {
+        // Nothing to unpack.
+        return ProxyScanClass::NotAnImage;
+    }
+    let has_rootfs_layer = manifest
+        .layers
+        .iter()
+        .any(|layer| is_container_rootfs_layer(&layer.media_type));
+    let config_is_image = CONTAINER_IMAGE_CONFIG_MEDIA_TYPES
+        .iter()
+        .any(|allowed| config.media_type == *allowed);
+    if config_is_image {
+        // An image config with no rootfs layer (a runnable image was ruled
+        // out above). A cosign signature or attestation reuses the image
+        // config, and is recognised by EVERY layer being a known non-image
+        // payload. A layer of any other type might still be unpacked.
+        let all_layers_non_image = manifest
+            .layers
+            .iter()
+            .all(|layer| is_known_non_image_layer(&layer.media_type));
+        return if all_layers_non_image {
+            ProxyScanClass::NotAnImage
+        } else {
+            ProxyScanClass::Unclassifiable
+        };
+    }
+    // A non-image config (Helm, WASM, the empty config of an SBOM /
+    // attestation): not an image while nothing in it is a rootfs layer. With
+    // a rootfs layer it is neither a known artifact nor a known image.
+    if has_rootfs_layer {
+        ProxyScanClass::Unclassifiable
+    } else {
+        ProxyScanClass::NotAnImage
+    }
+}
+
+/// True when `media_type` is one of the known non-image payloads
+/// ([`NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS`]).
+fn is_known_non_image_layer(media_type: &str) -> bool {
+    let mt = media_type.to_ascii_lowercase();
+    NON_IMAGE_LAYER_MEDIA_TYPE_MARKERS
+        .iter()
+        .any(|marker| mt.contains(marker))
+}
+
+/// Manifest, descriptor and platform field names, as a Go consumer's structs
+/// declare them (OCI image-spec, Docker schema2 and schema1).
+const OCI_MANIFEST_FIELD_NAMES: &[&str] = &[
+    "schemaVersion",
+    "mediaType",
+    "artifactType",
+    "config",
+    "layers",
+    "manifests",
+    "subject",
+    "annotations",
+    "digest",
+    "size",
+    "urls",
+    "data",
+    "platform",
+    "architecture",
+    "os",
+    "os.version",
+    "os.features",
+    "variant",
+    "features",
+    "name",
+    "tag",
+    "fsLayers",
+    "blobSum",
+    "history",
+    "v1Compatibility",
+    "signatures",
+];
+
+/// Go's `encoding/json` key folding: ASCII letters upper-cased, any other
+/// character mapped through lower- then upper-case (which is how the Kelvin
+/// sign and the long s fold onto ASCII `K` and `S`). A character whose case
+/// mapping is not a single character is kept as is.
+fn go_json_fold(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii() {
+                return c.to_ascii_uppercase();
+            }
+            let mut lower = c.to_lowercase();
+            let (Some(l), None) = (lower.next(), lower.next()) else {
+                return c;
+            };
+            let mut upper = l.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
+/// Whether a manifest body would decode differently under Go's lenient
+/// `encoding/json` than under serde: some JSON object (outside an
+/// `annotations` map, whose keys are free-form) repeats a key, or spells a
+/// manifest field name with a different case (`Config`, `LAYERS`, or a
+/// Unicode key that folds onto one). Invalid JSON also counts, since the
+/// server cannot read it at all.
+pub fn oci_manifest_json_is_ambiguous(body: &[u8]) -> bool {
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let mut ambiguous = false;
+    let walked = serde::de::DeserializeSeed::deserialize(
+        KeyAmbiguityWalk {
+            ambiguous: &mut ambiguous,
+            free_form_keys: false,
+        },
+        &mut de,
+    );
+    walked.is_err() || de.end().is_err() || ambiguous
+}
+
+/// The serde walk behind [`oci_manifest_json_is_ambiguous`]: visits every
+/// value, checking each object's keys.
+struct KeyAmbiguityWalk<'a> {
+    ambiguous: &'a mut bool,
+    /// True for the object that is an `annotations` value.
+    free_form_keys: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for KeyAmbiguityWalk<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for KeyAmbiguityWalk<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+        self,
+        mut seq: A,
+    ) -> std::result::Result<(), A::Error> {
+        while seq
+            .next_element_seed(KeyAmbiguityWalk {
+                ambiguous: &mut *self.ambiguous,
+                free_form_keys: false,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<(), A::Error> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !self.free_form_keys {
+                if !seen.insert(key.clone()) {
+                    *self.ambiguous = true;
+                }
+                let folded = go_json_fold(&key);
+                if OCI_MANIFEST_FIELD_NAMES
+                    .iter()
+                    .any(|name| *name != key && go_json_fold(name) == folded)
+                {
+                    *self.ambiguous = true;
+                }
+            }
+            map.next_value_seed(KeyAmbiguityWalk {
+                ambiguous: &mut *self.ambiguous,
+                free_form_keys: !self.free_form_keys && key == "annotations",
+            })?;
+        }
+        Ok(())
+    }
+}
+
 /// Decide whether an already-loaded OCI manifest `body` describes a real
 /// container image that the image-vuln scanners should run on.
 ///
@@ -390,6 +644,12 @@ pub fn oci_manifest_is_runnable_image(body: &[u8]) -> bool {
 /// already passed `is_oci_image_artifact`, and a malformed body must not flip
 /// a possibly-real image to skipped (#1971 passthrough contract).
 pub fn oci_manifest_is_scannable_image(body: &[u8]) -> bool {
+    // A body a lenient consumer reads differently from serde (case-variant or
+    // duplicate keys) is anomalous in the same way as an unparseable one: do
+    // not let serde's reading of it flip a possibly-real image to skipped.
+    if oci_manifest_json_is_ambiguous(body) {
+        return true;
+    }
     let Ok(manifest) = crate::formats::oci::OciHandler::parse_manifest(body) else {
         // Anomalous body on an OCI route: do not flip the path-based decision.
         return true;
