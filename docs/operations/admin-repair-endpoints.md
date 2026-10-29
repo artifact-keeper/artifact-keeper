@@ -37,7 +37,8 @@ Both share these rules:
   `GLOBAL_REQUEST_TIMEOUT_SECS` (120 s by default) applies. A call cut off by
   the timeout answers `503` and is audited as `cancelled`; the rows it
   already wrote stay (each is its own statement or transaction) and the lock
-  is released, so the next call carries on. Lower `limit` if a call comes near the timeout.
+  is released, so the next call carries on. Lower `limit` if a call comes
+  near the timeout.
 
 ## Storage reindex (Maven, Gradle)
 
