@@ -3607,6 +3607,248 @@ entries:
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Chart URLs read from an upstream `index.yaml` that name an IP literal
+    // must pass the upstream outbound address policy in every routing mode.
+    // -----------------------------------------------------------------------
+
+    /// Fetch `mychart-1.0.0.tgz` through `fetch_chart_via_index` for
+    /// `repo_id`, with an upstream index whose chart URL is
+    /// `http://{internal_host}:{port}/charts/mychart-1.0.0.tgz` pointing at a
+    /// separate loopback listener. Returns the response status (or the error
+    /// response's status) and the number of requests the listener received.
+    ///
+    /// The index is served from the host's non-loopback address, admitted by
+    /// a narrow `AK_SSRF_ALLOW_PRIVATE_CIDRS` entry the way an operator admits
+    /// an internal mirror, so it also proves a configured exception keeps an
+    /// IP-literal upstream working. The test-build loopback allowance is
+    /// switched off entirely, so the loopback listener gets the production
+    /// policy.
+    async fn fetch_index_named_literal(
+        pool: &sqlx::PgPool,
+        repo_id: uuid::Uuid,
+        internal_host: &str,
+    ) -> (StatusCode, usize) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (index_server, _allowlist) = tdh::non_loopback_mock_server().await;
+        let internal = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"internal-response"[..]))
+            .mount(&internal)
+            .await;
+
+        let chart_url = format!(
+            "http://{}:{}/charts/mychart-1.0.0.tgz",
+            internal_host,
+            internal.address().port()
+        );
+        let index_yaml = make_index_yaml("mychart", "1.0.0", &chart_url);
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(index_yaml.as_bytes()))
+            .mount(&index_server)
+            .await;
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        proxy.restrict_test_loopback_to_ports(&[]);
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+
+        let status = match fetch_chart_via_index(
+            &state,
+            proxy,
+            repo_id,
+            "helm-proxy",
+            &index_server.uri(),
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz",
+            &ctx,
+        )
+        .await
+        {
+            Ok(resp) => resp.status(),
+            Err(resp) => resp.status(),
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // The index itself must have been fetched, or the test proves nothing.
+        let index_hits = index_server
+            .received_requests()
+            .await
+            .expect("request recording")
+            .len();
+        assert!(index_hits >= 1, "the upstream index must have been read");
+        let internal_hits = internal
+            .received_requests()
+            .await
+            .expect("request recording")
+            .len();
+        (status, internal_hits)
+    }
+
+    /// Loopback spellings the chart URL may use. The WHATWG parser maps the
+    /// numeric and hex IPv4 forms to `127.0.0.1`; the IPv4-mapped IPv6 form
+    /// reaches the IPv4 listener through the dual-stack socket.
+    const LOOPBACK_SPELLINGS: &[&str] = &[
+        "127.0.0.1",
+        "2130706433",
+        "0x7f.0.0.1",
+        "0177.0.0.1",
+        "[::ffff:127.0.0.1]",
+    ];
+
+    /// An inherit-routed Remote (no egress configuration: the shared client)
+    /// must not dial an IP-literal chart URL the upstream policy refuses.
+    #[tokio::test]
+    async fn test_index_chart_url_ip_literal_refused_inherited_routing() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        for host in LOOPBACK_SPELLINGS {
+            let (status, hits) = fetch_index_named_literal(&pool, repo_id, host).await;
+            assert_eq!(
+                hits, 0,
+                "inherit routing: chart URL host {host} reached the loopback listener (status {status})"
+            );
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "inherit routing: {host} must be refused by the outbound address policy"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// A Remote pinned to `direct` egress builds its own client; an
+    /// IP-literal chart URL must be refused there too.
+    #[tokio::test]
+    async fn test_index_chart_url_ip_literal_refused_direct_routing() {
+        use crate::services::egress_proxy::{
+            save_egress_proxy, EgressProxyConfig, EgressProxyMode,
+        };
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        save_egress_proxy(
+            &pool,
+            repo_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Direct,
+                proxy_url: None,
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save direct");
+        for host in LOOPBACK_SPELLINGS {
+            let (status, hits) = fetch_index_named_literal(&pool, repo_id, host).await;
+            assert_eq!(
+                hits, 0,
+                "direct routing: chart URL host {host} reached the loopback listener (status {status})"
+            );
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "direct routing: {host} must be refused by the outbound address policy"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// An explicit egress proxy keeps working: an index and a chart named by
+    /// a public IP literal are fetched through the proxy, which answers for
+    /// them. The destination itself is never dialled.
+    #[tokio::test]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    #[allow(clippy::disallowed_methods)]
+    async fn test_index_chart_url_public_literal_served_through_explicit_proxy() {
+        use crate::services::egress_proxy::{
+            save_egress_proxy, EgressProxyConfig, EgressProxyMode,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        // Documentation range (TEST-NET-3): public by the policy, never dialled.
+        let upstream = "http://203.0.113.10";
+        let chart_bytes: &[u8] = b"proxied-chart";
+        let proxy_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    make_index_yaml(
+                        "mychart",
+                        "1.0.0",
+                        &format!("{upstream}/charts/mychart-1.0.0.tgz"),
+                    )
+                    .into_bytes(),
+                ),
+            )
+            .mount(&proxy_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/charts/mychart-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(chart_bytes))
+            .mount(&proxy_server)
+            .await;
+
+        let (repo_id, _key, storage_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        save_egress_proxy(
+            &pool,
+            repo_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Explicit,
+                proxy_url: Some(proxy_server.uri()),
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save explicit");
+
+        let tmp = proxy_tmp_dir();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
+        let proxy = state.proxy_service.as_deref().expect("proxy service");
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let result = fetch_chart_via_index(
+            &state,
+            proxy,
+            repo_id,
+            "helm-proxy",
+            upstream,
+            "mychart",
+            "1.0.0",
+            "mychart-1.0.0.tgz",
+            &ctx,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(resp) => panic!("explicit proxy fetch failed: {}", resp.status()),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect streamed chart body");
+        assert_eq!(&body[..], chart_bytes);
+    }
+
     // #2192 / #1608 Phase 4c: a chart larger than the old buffered cap
     // (DEFAULT_METADATA_MAX_BYTES = 8 MiB) must now STREAM with 200 instead of
     // 502, and the second request must be served WARM from the teed proxy cache

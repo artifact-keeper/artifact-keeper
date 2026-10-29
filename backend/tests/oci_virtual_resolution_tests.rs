@@ -25,13 +25,15 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::PgPool;
 use uuid::Uuid;
 use wiremock::matchers::{method, path as wm_path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 use artifact_keeper_backend::api::handlers::oci_v2::{
     resolve_virtual_blob, resolve_virtual_manifest, virtual_negative_cache_clear,
@@ -181,9 +183,9 @@ async fn resolve_virtual_blob_walks_to_third_member_when_first_two_404() {
     let blob_body = b"layer-content-bytes".to_vec();
     let blob_digest = format!("sha256:{}", sha256_hex(&blob_body));
 
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-    let server_c = MockServer::start().await;
+    let server_a = common::upstream_mock::admitted_mock_server().await;
+    let server_b = common::upstream_mock::admitted_mock_server().await;
+    let server_c = common::upstream_mock::admitted_mock_server().await;
 
     Mock::given(method("GET"))
         .and(wm_path(format!("/v2/myimage/blobs/{}", blob_digest)))
@@ -256,8 +258,8 @@ async fn resolve_virtual_blob_returns_none_when_no_member_has_it_and_negative_ca
 
     let blob_digest = format!("sha256:{}", sha256_hex(b"never-served"));
 
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
+    let server_a = common::upstream_mock::admitted_mock_server().await;
+    let server_b = common::upstream_mock::admitted_mock_server().await;
 
     // Each mock asserts it is called AT MOST ONCE. The negative cache
     // should prevent a second walk.
@@ -329,8 +331,8 @@ async fn resolve_virtual_manifest_rejects_digest_ref_mismatch_and_falls_through(
         "fixture invariant: tampered body must differ"
     );
 
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
+    let server_a = common::upstream_mock::admitted_mock_server().await;
+    let server_b = common::upstream_mock::admitted_mock_server().await;
 
     // member_a serves tampered bytes under the requested digest.
     Mock::given(method("GET"))
@@ -398,7 +400,7 @@ async fn resolve_virtual_manifest_returns_none_when_every_member_tampers() {
     let digest = format!("sha256:{}", sha256_hex(&honest_body));
     let tampered_body = br#"{"evil":true}"#.to_vec();
 
-    let server = MockServer::start().await;
+    let server = common::upstream_mock::admitted_mock_server().await;
     Mock::given(method("GET"))
         .and(wm_path(format!("/v2/myimage/manifests/{}", digest)))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(tampered_body.clone()))
@@ -482,7 +484,7 @@ async fn published_blob_visible_on_second_probe(config_tweak: fn(&mut Config)) -
 
     let blob_digest = format!("sha256:{}", sha256_hex(b"published-after-the-first-probe"));
 
-    let server = MockServer::start().await;
+    let server = common::upstream_mock::admitted_mock_server().await;
     Mock::given(method("GET"))
         .and(wm_path(format!("/v2/wiring/blobs/{}", blob_digest)))
         .respond_with(ResponseTemplate::new(404))
@@ -557,7 +559,7 @@ async fn resolve_virtual_manifest_honors_configured_zero_max_entries() {
         br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#.to_vec();
     let digest = format!("sha256:{}", sha256_hex(&body));
 
-    let server = MockServer::start().await;
+    let server = common::upstream_mock::admitted_mock_server().await;
     Mock::given(method("GET"))
         .and(wm_path("/v2/wiring/manifests/latest"))
         .respond_with(ResponseTemplate::new(404))

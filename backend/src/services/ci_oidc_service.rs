@@ -2094,6 +2094,11 @@ impl CiOidcService {
             }
         }
 
+        // `jwks_uri` comes from the issuer's discovery document, not from
+        // configuration, so it gets the same check the issuer URL does (and
+        // the SSO login path applies to the same field) before it is fetched.
+        // The SSO client's connect-time check never sees an IP-literal host.
+        crate::api::validation::validate_outbound_sso_url(jwks_uri, "CI OIDC JWKS URI")?;
         let response = self
             .http
             .get(jwks_uri)
@@ -2310,6 +2315,29 @@ mod tests {
     const GITLAB_MAIN_SUB: &str = "project_path:group/repo:ref_type:branch:ref:main";
     /// GitHub Actions' `sub` for a branch push: `repo:{org}/{repo}:ref:{ref}`.
     const GITHUB_MAIN_SUB: &str = "repo:org/repo:ref:refs/heads/main";
+
+    /// A `jwks_uri` taken from a discovery document is checked against the
+    /// outbound address policy before it is fetched: an IP-literal internal
+    /// destination is refused without a request.
+    #[tokio::test]
+    async fn test_fetch_jwks_refuses_internal_ip_literals() {
+        let svc = test_service();
+        for uri in [
+            "http://127.0.0.1:9/jwks",
+            "http://[::ffff:127.0.0.1]:9/jwks",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://2130706433/jwks",
+        ] {
+            let err = svc
+                .fetch_jwks(uri)
+                .await
+                .expect_err(&format!("{uri} must be refused"));
+            assert!(
+                matches!(err, crate::error::AppError::Validation(_)),
+                "{uri}: expected a validation error, got {err:?}"
+            );
+        }
+    }
 
     fn test_service() -> CiOidcService {
         let pool = PgPoolOptions::new()

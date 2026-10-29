@@ -48,7 +48,10 @@ pub async fn try_pool() -> Option<PgPool> {
 /// tests that need a wiremock upstream. Production correctly blocks loopback,
 /// so the mock listens on the host's non-loopback address and only that /32 or
 /// /128 is allowlisted for the lifetime of the guard.
-static SSRF_TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// It is the same lock the outbound-policy unit tests take
+/// (`validation::OUTBOUND_POLICY_ENV_LOCK`), so the two never interleave.
+static SSRF_TEST_ENV_LOCK: &tokio::sync::Mutex<()> =
+    &crate::api::validation::OUTBOUND_POLICY_ENV_LOCK;
 
 pub struct SsrfTestAllowlistGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
