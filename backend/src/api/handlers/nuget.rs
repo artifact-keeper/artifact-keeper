@@ -13668,3 +13668,75 @@ mod serve_key_4365_tests {
         );
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_nupkg_with_two_nuspec_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let file = NugetScannedPackage {
+            proxy: &proxy,
+            id_lower: "demo",
+            version: "1.0.0",
+        };
+        let nuspec = |id: &str, version: &str| {
+            format!(
+                "<?xml version=\"1.0\"?><package><metadata><id>{id}</id><version>{version}</version>\
+                 <authors>a</authors><description>d</description></metadata></package>"
+            )
+            .into_bytes()
+        };
+        let (good, other) = (nuspec("Demo", "1.0.0"), nuspec("Other", "9.9.9"));
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Nuget, "demo.1.0.0.nupkg", bytes);
+        // The exact-name reader reads the first; the extractor writes both
+        // onto one file and keeps the second.
+        let normalised = zip_with(&[
+            ("Demo.nuspec", &good),
+            ("lib/a.dll", b"x"),
+            ("./Demo.nuspec", &other),
+        ]);
+        // One raw name twice: the zip reader keeps the last record, a client
+        // that takes the first installs the other one.
+        let repeated = zip_with(&[("Demo.nuspec", &other), ("Demo.nuspec", &good)]);
+        for dup in [normalised, repeated] {
+            let (own, gate) = check(&dup);
+            assert!(established(&own));
+            assert!(unestablished(&gate));
+        }
+        let single = zip_with(&[("Demo.nuspec", &good), ("lib/a.dll", b"x")]);
+        assert!(established(&check(&single).1));
+    }
+}

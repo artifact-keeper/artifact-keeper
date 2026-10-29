@@ -14895,3 +14895,72 @@ mod age_gate_4702_tests {
         assert!(String::from_utf8_lossy(&meta.1).contains(&format!("<version>{YOUNG}</version>")));
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_jar_with_two_pom_properties_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let coordinate = JvmArchiveCoordinate {
+            group_id: "org.demo".to_string(),
+            artifact_id: "demo".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        let file = MavenScannedArchive {
+            proxy: &proxy,
+            upstream_url: "http://upstream.invalid",
+            coordinate: Some(&coordinate),
+            sidecar: std::sync::Mutex::new(None),
+        };
+        let entry = "META-INF/maven/org.demo/demo/pom.properties";
+        let good: &[u8] = b"groupId=org.demo\nartifactId=demo\nversion=1.0.0\n";
+        let other: &[u8] = b"groupId=org.demo\nartifactId=demo\nversion=0.1.0\n";
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Maven, "demo-1.0.0.jar", bytes);
+        let normalised = zip_with(&[
+            (entry, good),
+            ("org/demo/A.class", b"x"),
+            (&format!("./{entry}"), other),
+        ]);
+        let repeated = zip_with(&[(entry, other), (entry, good)]);
+        for dup in [normalised, repeated] {
+            let (own, gate) = check(&dup);
+            assert!(established(&own));
+            assert!(unestablished(&gate));
+        }
+        let single = zip_with(&[(entry, good), ("org/demo/A.class", b"x")]);
+        assert!(established(&check(&single).1));
+    }
+}

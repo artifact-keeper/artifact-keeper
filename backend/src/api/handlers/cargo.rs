@@ -9908,3 +9908,66 @@ mod serve_key_4365_tests {
         }
     }
 }
+
+/// Archives with two entries at one path (see `services::archive_entry_paths`):
+/// the format's reader takes the first copy and the scan extractor keeps the
+/// last, so the gate establishes no identity for them.
+#[cfg(test)]
+mod duplicate_entry_tests {
+    use super::*;
+    use crate::api::handlers::proxy_helpers::{identities_for_test, ProxyScanIdentity};
+    use crate::api::handlers::test_db_helpers as dup_tdh;
+    use crate::models::repository::RepositoryFormat as DupFormat;
+    #[allow(unused_imports)]
+    use crate::services::archive_entry_paths::test_support::{
+        tar_bz2_with, tar_gz_with, tar_with, tar_zst_with, zip_with,
+    };
+
+    fn proxy_for_test() -> (
+        tempfile::TempDir,
+        std::sync::Arc<crate::services::proxy_service::ProxyService>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = dup_tdh::build_proxy_service_with_fs(
+            dup_tdh::lazy_pool(),
+            dir.path().to_str().unwrap(),
+        );
+        (dir, proxy)
+    }
+
+    fn established(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Established(_))
+    }
+
+    fn unestablished(identity: &ProxyScanIdentity) -> bool {
+        matches!(identity, ProxyScanIdentity::Unestablished)
+    }
+
+    #[tokio::test]
+    async fn a_crate_with_two_cargo_toml_entries_is_not_established() {
+        let (_dir, proxy) = proxy_for_test();
+        let file = CargoScannedCrate {
+            proxy: &proxy,
+            name: "demo",
+            version: "1.0.0",
+            expected_cksum: None,
+        };
+        let good: &[u8] = b"[package]\nname = \"demo\"\nversion = \"1.0.0\"\n";
+        let other: &[u8] = b"[package]\nname = \"other\"\nversion = \"9.9.9\"\n";
+        let check =
+            |bytes: &[u8]| identities_for_test(&file, DupFormat::Cargo, "demo-1.0.0.crate", bytes);
+        let dup = tar_gz_with(&[
+            ("demo-1.0.0/Cargo.toml", good),
+            ("demo-1.0.0/src/lib.rs", b""),
+            ("demo-1.0.0/Cargo.toml", other),
+        ]);
+        let (own, gate) = check(&dup);
+        assert!(established(&own), "the reader takes the first copy");
+        assert!(unestablished(&gate));
+        let single = tar_gz_with(&[
+            ("demo-1.0.0/Cargo.toml", good),
+            ("demo-1.0.0/src/lib.rs", b""),
+        ]);
+        assert!(established(&check(&single).1));
+    }
+}

@@ -1,20 +1,47 @@
 //! Package allowlist on a virtual conda channel (#4576).
 //!
-//! A virtual conda repository can restrict what its **remote** members
-//! contribute to an approved set of packages. The list is enforced at the two
-//! seams a conda client touches, and the two always agree:
+//! A virtual conda repository can restrict what it serves to an approved set
+//! of packages. By default the list is the channel's boundary: it applies to
+//! EVERY member, hosted (local and staging) and remote alike (#5055). The list
+//! is enforced at the seams a conda client touches through the virtual, and
+//! they always agree:
 //!
-//! - the merged index (`repodata.json` in every encoding, and
-//!   `channeldata.json`): a remote record the list does not admit is dropped,
-//!   so the solver never sees it and reports the package as not found;
-//! - the package download through the virtual: a filename the list does not
-//!   admit is never fetched from (or served out of the cache of) a remote
-//!   member, and answers the same 404 the index implies.
+//! - the merged index (`repodata.json` in every encoding, the CEP-16 shard
+//!   index and its shards, `current_repodata.json`, `run_exports.json` and
+//!   `channeldata.json`): a record the list does not admit is dropped, so the
+//!   solver never sees it and reports the package as not found;
+//! - the package download (and its CEP-50 sidecar) through the virtual: a
+//!   filename the list does not admit is never served by any member, nor
+//!   fetched from a remote one, and answers the same 404 the index implies.
 //!
-//! Hosted (local and staging) members are not filtered: what they hold is
-//! already curated by upload policy and promotion gates. The per-remote
-//! upstream filter ([`crate::services::upstream_filter`]) stays an independent
-//! backstop on the remote itself.
+//! Reads of a member repository itself (its own URL) are never filtered: the
+//! list belongs to the virtual channel, not to the members.
+//!
+//! # Scope
+//!
+//! `scope` selects which members the list applies to:
+//!
+//! - `all_members` (the default, also when `scope` is omitted): hosted and
+//!   remote members.
+//! - `remote_only`: the behaviour before #5055. Hosted members pass through
+//!   unfiltered, on the assumption that uploaded content is already curated
+//!   by upload policy and promotion gates.
+//!
+//! A `PUT` that omits `scope` keeps the scope already stored, so a client that
+//! does not know the field (an older web UI) cannot reset an opt-out.
+//!
+//! # Hosted records and name ownership
+//!
+//! A hosted member OWNS the names it publishes (the dependency-confusion
+//! guard in the conda handler): no remote record of an owned name is ever
+//! merged. Ownership is decided by what the hosted members hold, not by what
+//! the list admits. So when the list does not admit a hosted record, that
+//! record is dropped, and remote records of the same name stay excluded by
+//! ownership (they are also still subject to the list). Narrowing the list
+//! can never hand an internal name to an upstream.
+//!
+//! The per-remote upstream filter ([`crate::services::upstream_filter`]) stays
+//! an independent backstop on the remote itself.
 //!
 //! # Entries and matching
 //!
@@ -37,17 +64,23 @@
 //! upstream record that claims a different identity than its filename is
 //! dropped. A filename that does not have the conda shape is never admitted.
 //!
-//! `channeldata.json` is a per-name summary, so it is filtered by name only: a
-//! remote entry is kept when some list entry's `name` admits it.
+//! `channeldata.json` is a per-name summary, so a remote entry is filtered by
+//! name only: it is kept when some list entry's `name` admits it. A hosted
+//! entry is built from the first hosted record of the name the list admits,
+//! so a hosted name with no admitted record is left out.
 //!
 //! # State
 //!
 //! `enabled` is explicit. An enabled list admits only what its entries admit,
-//! so an enabled EMPTY list admits nothing from remote members. A disabled
-//! list (or none at all) leaves the merge unfiltered. The list is stored as
-//! JSON in `repository_config` under [`CONDA_ALLOWLIST_CONFIG_KEY`]; a stored
-//! value that no longer parses or validates (only reachable by editing the
-//! table directly) is enforced as admit-nothing, never as "no list".
+//! so an enabled EMPTY list admits nothing from the members it applies to. A
+//! disabled list (or none at all) leaves the merge unfiltered. The list,
+//! scope included, is stored as JSON in `repository_config` under
+//! [`CONDA_ALLOWLIST_CONFIG_KEY`]; the stored value is the list's generation,
+//! so every merged document derived under it is rebuilt when the entries,
+//! `enabled` or `scope` change. A stored value that no longer parses or
+//! validates (only reachable by editing the table directly) is enforced as
+//! admit-nothing, never as "no list", with the scope it names when that can
+//! still be read and `all_members` otherwise.
 //!
 //! # Validation
 //!
@@ -109,20 +142,41 @@ pub struct AllowlistEntry {
     pub subdirs: Vec<String>,
 }
 
+/// Which members of the virtual a [`CondaAllowlist`] applies to (#5055).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowlistScope {
+    /// Every member, hosted and remote: the list is the channel's boundary.
+    #[default]
+    AllMembers,
+    /// Remote members only; hosted members pass through unfiltered (the
+    /// behaviour before #5055).
+    RemoteOnly,
+}
+
 /// The allowlist of a virtual conda repository, as stored and as accepted by
 /// `PUT /api/v1/repositories/{key}/allowlist`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CondaAllowlist {
     /// Whether the list is enforced. Required: an enabled empty list admits
-    /// nothing from remote members.
+    /// nothing from the members it applies to.
     pub enabled: bool,
+    /// Which members the list applies to. Omitted: `all_members` for a new
+    /// list; on `PUT`, the scope already stored is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<AllowlistScope>,
     /// The admitted packages.
     #[serde(default)]
     pub entries: Vec<AllowlistEntry>,
 }
 
 impl CondaAllowlist {
+    /// The scope in force: `all_members` unless `remote_only` is stored.
+    pub fn effective_scope(&self) -> AllowlistScope {
+        self.scope.unwrap_or_default()
+    }
+
     /// Validate and compile. The error names the offending entry by index.
     pub fn compile(&self) -> std::result::Result<CompiledAllowlist, String> {
         if self.entries.len() > MAX_ENTRIES {
@@ -136,6 +190,7 @@ impl CondaAllowlist {
             globs: Vec::new(),
             rules: Vec::with_capacity(self.entries.len()),
             deny_all: false,
+            scope: self.effective_scope(),
         };
         for (i, entry) in self.entries.iter().enumerate() {
             let rule = compile_entry(entry).map_err(|e| format!("entries[{i}]: {e}"))?;
@@ -246,16 +301,30 @@ pub struct CompiledAllowlist {
     rules: Vec<CompiledEntry>,
     /// Fail-closed stand-in for a stored value that no longer parses.
     deny_all: bool,
+    /// Which members the list applies to.
+    scope: AllowlistScope,
 }
 
 impl CompiledAllowlist {
-    fn deny_all() -> Self {
+    fn deny_all(scope: AllowlistScope) -> Self {
         Self {
             exact: HashMap::new(),
             globs: Vec::new(),
             rules: Vec::new(),
             deny_all: true,
+            scope,
         }
+    }
+
+    /// The scope the list was stored with.
+    pub fn scope(&self) -> AllowlistScope {
+        self.scope
+    }
+
+    /// Whether the list filters hosted (local and staging) members too, not
+    /// only remote ones (#5055).
+    pub fn applies_to_hosted(&self) -> bool {
+        self.scope == AllowlistScope::AllMembers
     }
 
     /// The rules whose name admits `name` (already lower-cased).
@@ -388,13 +457,24 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// What is stored for a repository, as the read API reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredAllowlist {
-    /// No allowlist configured: remote members are not filtered.
+    /// No allowlist configured: no member is filtered.
     None,
     /// A valid list, enforced as stored when `enabled`.
     Valid(CondaAllowlist),
     /// A stored value that no longer parses or validates. Enforced as
-    /// admit-nothing.
-    Unusable(String),
+    /// admit-nothing, with the scope it still names.
+    Unusable(String, AllowlistScope),
+}
+
+impl StoredAllowlist {
+    /// The scope stored (`all_members` when nothing is stored).
+    pub fn scope(&self) -> AllowlistScope {
+        match self {
+            Self::None => AllowlistScope::default(),
+            Self::Valid(list) => list.effective_scope(),
+            Self::Unusable(_, scope) => *scope,
+        }
+    }
 }
 
 fn parse_stored(raw: &str) -> std::result::Result<(CondaAllowlist, CompiledAllowlist), String> {
@@ -419,7 +499,7 @@ pub async fn load_allowlist(db: &PgPool, repo_id: Uuid) -> Result<StoredAllowlis
         None => StoredAllowlist::None,
         Some(raw) => match parse_stored(&raw) {
             Ok((list, _)) => StoredAllowlist::Valid(list),
-            Err(e) => StoredAllowlist::Unusable(e),
+            Err(e) => StoredAllowlist::Unusable(e, salvage_scope(&raw)),
         },
     })
 }
@@ -469,18 +549,34 @@ static COMPILED: Lazy<MokaCache<Uuid, CacheEntry>> = Lazy::new(|| {
         .build()
 });
 
+/// The scope an unusable stored value still names, read leniently:
+/// `remote_only` only when the value is a JSON object whose `scope` says so,
+/// `all_members` (the fail-closed default) otherwise.
+fn salvage_scope(raw: &str) -> AllowlistScope {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| {
+            v.get("scope")
+                .cloned()
+                .and_then(|s| serde_json::from_value::<AllowlistScope>(s).ok())
+        })
+        .unwrap_or_default()
+}
+
 /// Compile a raw stored value for enforcement: `None` for a disabled list,
 /// admit-nothing for one that no longer parses.
 fn compile_for_enforcement(repo_id: Uuid, raw: &str) -> Option<Arc<CompiledAllowlist>> {
     match parse_stored(raw) {
         Ok((list, compiled)) => list.enabled.then(|| Arc::new(compiled)),
         Err(err) => {
+            let scope = salvage_scope(raw);
             tracing::error!(
                 repository_id = %repo_id,
                 error = %err,
-                "stored conda allowlist is unusable; admitting nothing from remote members until it is replaced"
+                scope = ?scope,
+                "stored conda allowlist is unusable; admitting nothing from the members it applies to until it is replaced"
             );
-            Some(Arc::new(CompiledAllowlist::deny_all()))
+            Some(Arc::new(CompiledAllowlist::deny_all(scope)))
         }
     }
 }
@@ -534,6 +630,7 @@ mod tests {
     fn compiled(entries: Vec<AllowlistEntry>) -> CompiledAllowlist {
         CondaAllowlist {
             enabled: true,
+            scope: None,
             entries,
         }
         .compile()
@@ -665,7 +762,7 @@ mod tests {
 
     #[test]
     fn deny_all_admits_nothing() {
-        let list = CompiledAllowlist::deny_all();
+        let list = CompiledAllowlist::deny_all(AllowlistScope::AllMembers);
         assert!(!list.admits("numpy", "1", "noarch"));
         assert!(!list.admits_name("numpy"));
     }
@@ -675,6 +772,7 @@ mod tests {
         let bad = |e: AllowlistEntry| {
             CondaAllowlist {
                 enabled: true,
+                scope: None,
                 entries: vec![entry("ok", None, &[]), e],
             }
             .compile()
@@ -695,6 +793,7 @@ mod tests {
         assert!(bad(entry("numpy", None, &many_subdirs)).contains("subdirs"));
         let too_many = CondaAllowlist {
             enabled: true,
+            scope: None,
             entries: vec![entry("numpy", None, &[]); MAX_ENTRIES + 1],
         };
         assert!(too_many.compile().unwrap_err().contains("at most"));
@@ -743,7 +842,8 @@ mod tests {
         assert!(list.admits_all_versions("scipy", "osx-arm64"));
         assert!(!list.admits_all_versions("scipy", "linux-64"));
         assert!(!list.admits_all_versions("absent", "noarch"));
-        assert!(!CompiledAllowlist::deny_all().admits_all_versions("tzdata", "noarch"));
+        assert!(!CompiledAllowlist::deny_all(AllowlistScope::AllMembers)
+            .admits_all_versions("tzdata", "noarch"));
     }
 
     #[test]
@@ -755,5 +855,52 @@ mod tests {
         let on = compile_for_enforcement(id, r#"{"enabled":true,"entries":[{"name":"numpy"}]}"#)
             .expect("enabled");
         assert!(on.admits("numpy", "1", "noarch"));
+        assert!(on.applies_to_hosted(), "the default scope is every member");
+    }
+
+    /// #5055: the scope defaults to every member, `remote_only` is the
+    /// opt-out, an omitted scope is not serialized (so a stored pre-#5055
+    /// value keeps its bytes), and an unusable stored value keeps the scope
+    /// it still names.
+    #[test]
+    fn scope_defaults_to_all_members_5055() {
+        let plain: CondaAllowlist =
+            serde_json::from_str(r#"{"enabled":true,"entries":[{"name":"numpy"}]}"#).unwrap();
+        assert_eq!(plain.scope, None);
+        assert_eq!(plain.effective_scope(), AllowlistScope::AllMembers);
+        assert!(plain.compile().unwrap().applies_to_hosted());
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"enabled":true,"entries":[{"name":"numpy"}]}"#
+        );
+
+        let opt_out: CondaAllowlist = serde_json::from_str(
+            r#"{"enabled":true,"scope":"remote_only","entries":[{"name":"numpy"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(opt_out.effective_scope(), AllowlistScope::RemoteOnly);
+        assert!(!opt_out.compile().unwrap().applies_to_hosted());
+        assert_eq!(
+            serde_json::to_value(&opt_out).unwrap()["scope"],
+            serde_json::json!("remote_only")
+        );
+        let explicit: CondaAllowlist =
+            serde_json::from_str(r#"{"enabled":true,"scope":"all_members","entries":[]}"#).unwrap();
+        assert!(explicit.compile().unwrap().applies_to_hosted());
+        assert!(
+            serde_json::from_str::<CondaAllowlist>(r#"{"enabled":true,"scope":"hosted"}"#).is_err(),
+            "an unknown scope is refused"
+        );
+
+        let id = Uuid::new_v4();
+        let broken_opt_out = compile_for_enforcement(
+            id,
+            r#"{"enabled":true,"scope":"remote_only","entries":[{"name":"Bad Name"}]}"#,
+        )
+        .expect("enforced");
+        assert!(!broken_opt_out.admits("numpy", "1", "noarch"));
+        assert!(!broken_opt_out.applies_to_hosted());
+        let broken = compile_for_enforcement(id, "{not json").expect("enforced");
+        assert!(broken.applies_to_hosted(), "fail closed on every member");
     }
 }

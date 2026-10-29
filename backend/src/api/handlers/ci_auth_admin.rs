@@ -594,6 +594,7 @@ mod tests {
                 State(state.clone()),
                 Extension(auth.clone()),
                 Json(CreateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     name: "p".to_string(),
                     provider_type: Some("generic".to_string()),
                     issuer_url: "https://issuer.example.com".to_string(),
@@ -612,6 +613,7 @@ mod tests {
                 Extension(auth.clone()),
                 Path(pid),
                 Json(UpdateCiOidcProviderRequest {
+                    token_ttl_secs: None,
                     name: Some("x".to_string()),
                     provider_type: Some("github".to_string()),
                     issuer_url: Some("https://issuer.example.com".to_string()),
@@ -723,6 +725,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Json(CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: "admin-provider-roundtrip".to_string(),
                 provider_type: Some("generic".to_string()),
                 issuer_url: "https://issuer.example.com".to_string(),
@@ -757,6 +760,7 @@ mod tests {
             Extension(auth.clone()),
             Path(provider.id),
             Json(UpdateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: Some("admin-provider-updated".to_string()),
                 provider_type: Some("github".to_string()),
                 issuer_url: Some("https://issuer2.example.com".to_string()),
@@ -1005,6 +1009,7 @@ mod tests {
         let auth = auth_with_admin(true);
         let update = |static_jwks: Option<serde_json::Value>, name: Option<String>| {
             UpdateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name,
                 provider_type: None,
                 issuer_url: None,
@@ -1022,6 +1027,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Json(CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("k8s-log-{}", Uuid::new_v4()),
                 provider_type: Some("kubernetes".to_string()),
                 issuer_url: "https://kubernetes.default.svc.cluster.local".to_string(),
@@ -1075,6 +1081,7 @@ mod tests {
             Extension(auth.clone()),
             Path(provider.id),
             Json(UpdateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 provider_type: Some("Generic".to_string()),
                 ..update(None, None)
             }),
@@ -1100,6 +1107,7 @@ mod tests {
             Extension(auth.clone()),
             Path(provider.id),
             Json(UpdateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 provider_type: Some("k8s".to_string()),
                 ..update(None, None)
             }),
@@ -1206,6 +1214,7 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Json(CreateCiOidcProviderRequest {
+                token_ttl_secs: None,
                 name: format!("binding-audit-{}", Uuid::new_v4()),
                 provider_type: Some("gitlab".to_string()),
                 issuer_url: "https://gitlab.example.com".to_string(),

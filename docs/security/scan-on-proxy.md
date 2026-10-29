@@ -91,6 +91,13 @@ are not a readable package, the scan is inconclusive: these bytes are not what
 they are served as. A `vulnerable` verdict on the bytes still blocks either
 way.
 
+**Duplicate entry paths.** A package archive in which two files share one path
+(after `./` and empty path components are dropped), in the archive itself or,
+for a conda `.conda`, across its payload tars, is inconclusive before any of
+the checks above run. The metadata check reads one copy of a manifest and the
+scan workspace unpacks the other, so neither can be vouched for. Published
+packages do not carry repeated paths.
+
 **Archive formats graded on their contents (Go, Composer, Conan, CocoaPods, Swift).** The gate
 takes the coordinate from the request and checks it against the archive
 first, as for every format: a Go module zip must hold only
@@ -312,8 +319,9 @@ or a `clean` one graded without a coordinate (the rescan endpoint), is not
 reused, and the bytes are scanned again as for a first pull; a `vulnerable`
 verdict graded without a coordinate still blocks. A pull whose identity
 cannot be established (for example an OS package whose release cannot be
-determined) never inherits a `clean` verdict graded as another coordinate,
-and is still refused by a stored `vulnerable` one (#4952).
+determined) never inherits a `clean` verdict graded as another coordinate or
+graded without one, and is still refused by a stored `vulnerable` one
+(#4952).
 
 Each verdict also records `components_cataloged`: how many distinct
 components the scanner cataloged when it graded the bytes (migration 287).
@@ -321,6 +329,17 @@ components the scanner cataloged when it graded the bytes (migration 287).
 `clean` or `vulnerable` item. `0` means the verdict was graded on the file
 contents only (see the conda rule above); `null` means the scanner reported no
 catalog, or the verdict was recorded before 1.11.0.
+
+A `fail_closed` repository does not reuse a `clean` verdict that has no
+findings, cataloged no components (`0` or `null`) and was recorded without a
+coordinate. Verdicts are shared by every repository that serves the same
+bytes, and such a verdict says only that a scan saw nothing it could grade.
+The bytes are scanned again as for a first pull, and a pull whose identity
+cannot be established is withheld (`423`). A `clean` verdict recorded with a
+coordinate, such as a conda package graded on its contents, is reused as
+before. A rescan in a repository whose format does not scan on proxy (for
+example `generic`) in which the scanner catalogs nothing and finds nothing is
+inconclusive: it answers `503` and records no verdict.
 
 ## Virtual repositories
 
@@ -374,6 +393,49 @@ is on (#4442):
 Files stored in the repository itself (an `artifacts` row) are still served
 from storage behind the repository's download gate. Formats that do not
 enforce scan-on-proxy, and repositories with it off, are unaffected.
+
+## The artifacts routes
+
+The repository `artifacts` routes behave the same for every enforced format.
+The formats gated in 1.12.0 (Go, RubyGems, Composer, Pub, Conan, CocoaPods and
+Swift) follow the rules the earlier formats (npm, PyPI, Maven, NuGet, Cargo
+and the rest of the [coverage table](#coverage)) already did. For a Remote
+repository that scans on proxy:
+
+| Route | What it returns | Gate |
+| --- | --- | --- |
+| `GET /api/v1/repositories/{key}/artifacts` | The files the proxy cache holds, rebuilt from the proxy-cache catalog: path, size, when it was cached, download count. Each item has a synthetic id and `analyzable: false`. | None. It serves no bytes and does not read verdicts, so a cached file is listed whatever its verdict. |
+| `GET /api/v1/repositories/{key}/artifacts/*path` | The metadata (JSON) of an `artifacts` row at that path; `404` when there is none. It never reads the proxy cache or the upstream. | None. It serves no bytes. |
+| `GET /api/v1/repositories/{key}/download/*path` | A file the cache or the upstream would supply: `403` `scan_on_proxy_route_required` (see [The generic download route](#the-generic-download-route)). An `artifacts` row: its bytes from storage. | Refuses proxied files; serves rows without a scan. |
+| The format route (`/go/{key}/...`, `/gems/{key}/...`, ...) | An `artifacts` row: its bytes from storage. Otherwise the file through the gate. | Gates proxied files; serves rows without a scan. |
+
+The reasoning:
+
+- The listing and the metadata route are catalogs, not downloads. The web UI
+  lists a Remote's cached files through the first route and downloads one
+  through the generic download route, which refuses it for a scanning
+  Remote; a client pulls it through the format route, which gates it.
+- The gate grades bytes against the coordinate a format route parses from its
+  own request (#3003), so only the format route can run it. The generic route
+  has no such parser and refuses instead of serving unscanned.
+- An `artifacts` row in a Remote repository (from replication, or recorded
+  before proxied content stopped being stored as rows) is content the
+  repository holds, not a proxied fetch. The format route and the generic
+  download route both serve it from storage, without a scan. See
+  [Known gaps](#known-gaps).
+
+For a Virtual repository, `GET .../artifacts/*path` serves a member's bytes
+through the member walk, so it takes the same refusal as the generic download
+route: `403` when a Remote member the caller may read scans under the
+stricter-of-two rule (see [Virtual repositories](#virtual-repositories)). The
+listing aggregates the `artifacts` rows of the members the caller may see and
+serves no bytes.
+
+A unit test in `api/handlers/repositories.rs`
+(`generic_route_checks_exactly_the_enforced_formats_4442`) pins the generic
+route's refusal to exactly the formats `GET /api/v1/formats` reports as
+`enforced`, and names each 1.12.0 format, so a format cannot adopt the gate
+without the generic route refusing it too.
 
 ## Coverage
 
@@ -515,6 +577,13 @@ have no core proxy path to gate.
   `artifacts` row a Remote repository holds for a package path (from
   replication or a publish into the remote) is served from storage without
   the gate.
+- **Go, RubyGems, Composer, Pub, Conan, CocoaPods and Swift rows in a Remote
+  repository.** As for Debian, RPM and Alpine, an `artifacts` row a Remote
+  repository holds for a package (from replication, or recorded before
+  proxied content stopped being stored as rows) is served from storage
+  without the gate, on the format route and on the generic download route.
+  Only a path with no row is fetched through the gate. See
+  [The artifacts routes](#the-artifacts-routes).
 - **Conda `.sigs` sidecars** follow the stored verdict of their package's
   cached bytes. Before the package has been pulled through the repository
   there is nothing to follow and the sidecar is served.
