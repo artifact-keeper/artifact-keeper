@@ -6,6 +6,12 @@
 -- No foreign key to `repositories`: when a repository is deleted its rows
 -- outlive it so the builder can still find (by `storage_backend` /
 -- `storage_path`) and delete the stored revisions, then the rows.
+-- The triggers below take a brief lock on the hot `artifacts` and
+-- `artifact_metadata` tables; bound the wait (#4153) so a long transaction
+-- on them fails this migration (retried at the next start) instead of
+-- queueing every writer behind it.
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE rpm_repodata_roots (
     repository_id uuid NOT NULL,
     -- The first `repodata_depth` path segments of the root's packages, ''
