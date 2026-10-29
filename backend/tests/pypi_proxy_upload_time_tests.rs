@@ -18,6 +18,8 @@
 //! ```
 
 #![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,7 +30,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 use artifact_keeper_backend::api::handlers::pypi;
 use artifact_keeper_backend::api::middleware::auth::AuthExtension;
@@ -120,7 +122,7 @@ fn upstream_pep691_json() -> String {
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
 async fn remote_pypi_proxy_serves_pep691_json_with_upload_time() {
-    let upstream = MockServer::start().await;
+    let upstream = common::upstream_mock::admitted_mock_server().await;
     // Respond to any GET with the PEP 691 JSON. The fix requests the JSON form
     // from upstream; pre-fix it relayed whatever it got verbatim (URLs never
     // rewritten) — which is what this test's URL assertions catch.

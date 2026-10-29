@@ -658,6 +658,18 @@ fn is_blocked_ipv6(v6: std::net::Ipv6Addr, ctx: OutboundUrlContext) -> bool {
         // Honor the same allowlist as IPv4 private addresses.
         return !private_ip_allowed(std::net::IpAddr::V6(v6), ctx);
     }
+    // The NAT64 well-known prefix `64:ff9b::/96` (RFC 6052) embeds an IPv4
+    // address in its last 32 bits, which a NAT64 gateway translates to: it
+    // obeys the IPv4 rules. The local-use prefix `64:ff9b:1::/48` (RFC 8215)
+    // carries site-chosen translations, so it is treated as private.
+    if segs[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        let [.., hi, lo] = segs;
+        let v4 = std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+        return is_blocked_ipv4(v4, ctx);
+    }
+    if segs[..3] == [0x64, 0xff9b, 1] {
+        return !private_ip_allowed(std::net::IpAddr::V6(v6), ctx);
+    }
     // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
     // forms must obey the IPv4 rules so attackers cannot bypass them
     // by writing the v4 address inside a v6 literal.
@@ -905,17 +917,22 @@ fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     crate::services::metrics_service::record_ssrf_block(surface);
 }
 
+/// Tests that mutate the process-wide private-address settings
+/// (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, the per-context toggles) serialize on this
+/// lock, wherever they live: `cargo test` runs tests in parallel threads, so
+/// without it an env-mutating test can flip state under another test.
+#[cfg(test)]
+pub(crate) static OUTBOUND_POLICY_ENV_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Tests that mutate process-wide env vars (the private-IP allowlist
-    /// toggles) must serialize to avoid racing parallel test threads.
-    /// `cargo test` runs tests in parallel; without this lock, an
-    /// env-var-mutating test can flip state under another test's nose.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// See [`OUTBOUND_POLICY_ENV_LOCK`]. These tests are synchronous, so they
+    /// take it with `blocking_lock`.
+    static ENV_LOCK: &tokio::sync::Mutex<()> = &OUTBOUND_POLICY_ENV_LOCK;
 
     /// Helper: assert that `validate_outbound_url(url, ...)` rejects with
     /// an error whose message contains both `label_part` (proving the
@@ -1434,7 +1451,7 @@ mod tests {
     /// Take the env lock and snapshot any allowlist-related vars so the
     /// test restores them on drop. Pattern matches `test_cgnat_block_when_opted_in`.
     struct AllowlistGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
         prev_allow: Option<String>,
         prev_webhook: Option<String>,
         prev_sso: Option<String>,
@@ -1444,7 +1461,7 @@ mod tests {
 
     impl AllowlistGuard {
         fn new() -> Self {
-            let lock = ENV_LOCK.lock().unwrap();
+            let lock = ENV_LOCK.blocking_lock();
             let g = Self {
                 _lock: lock,
                 prev_allow: std::env::var("UPSTREAM_ALLOW_PRIVATE_IPS").ok(),
