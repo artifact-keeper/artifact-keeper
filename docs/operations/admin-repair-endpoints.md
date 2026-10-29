@@ -24,16 +24,20 @@ Both share these rules:
 - **Safe on a live repository and idempotent.** Neither overwrites an existing
   row or takes a table lock, and a second run over a repaired repository does
   nothing.
-- **Audited.** Each call writes one audit row against the repository when it
-  returns, refusals (`409`, `422`) and failures included, with outcome
-  `failure` for those; a `404` for an unknown key is not audited. The action is
-  `STORAGE_REINDEX_RUN` or `DEBIAN_BACKFILL_RUN`, carrying `repository`,
-  `dry_run` and the report counts, or the `error`.
+- **Audited before the work starts.** Each call writes a `phase: "started"`
+  audit row before it touches any row or object, then a second row when it
+  returns: `completed` with the report counts, or `failed` with the `error`
+  for refusals (`404` unknown key, `409`, `422`) and failures. A call dropped
+  mid-run (request timeout, client disconnect) records `cancelled` instead.
+  `failed` and `cancelled` carry outcome `failure`. The action is
+  `STORAGE_REINDEX_RUN` or `DEBIAN_BACKFILL_RUN`; every row carries
+  `repository`, `dry_run`, `limit` (and `after` for the backfill), plus a
+  `run_id` shared by the rows of one call.
 - **Answered inside the request timeout.** These are ordinary requests, so
   `GLOBAL_REQUEST_TIMEOUT_SECS` (120 s by default) applies. A call cut off by
-  the timeout answers `503`; the rows it already wrote stay (each is its own
-  statement or transaction) and the lock is released, so the next call carries
-  on. Lower `limit` if a call comes near the timeout.
+  the timeout answers `503` and is audited as `cancelled`; the rows it
+  already wrote stay (each is its own statement or transaction) and the lock
+  is released, so the next call carries on. Lower `limit` if a call comes near the timeout.
 
 ## Storage reindex (Maven, Gradle)
 

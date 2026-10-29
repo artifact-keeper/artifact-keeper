@@ -18,9 +18,7 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::audit_export::Outcome;
-use crate::services::audit_service::{
-    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
-};
+use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
 use crate::services::debian_backfill_service::{DebianBackfillResult, DebianBackfillService};
 use crate::services::repository_service::RepositoryService;
 use crate::services::storage_reindex_service::{StorageReindexResult, StorageReindexService};
@@ -383,20 +381,52 @@ pub async fn reindex_repository_storage(
     Json(payload): Json<StorageReindexRequest>,
 ) -> Result<Json<StorageReindexResult>> {
     require_admin(auth.is_admin)?;
-    let repo = RepositoryService::new(state.db.clone())
-        .get_by_key(&key)
-        .await?;
     let limit = scrub_budget(payload.limit, DEFAULT_REINDEX_LIMIT, MAX_REINDEX_LIMIT);
+    let params = serde_json::json!({
+        "repository": key,
+        "dry_run": payload.dry_run,
+        "limit": limit,
+    });
+    let repo = match RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await
+    {
+        Ok(repo) => repo,
+        Err(e) => {
+            // An unknown key (or a lookup failure) is audited like the
+            // scrub's refusals, so probing repository keys leaves a trail.
+            let audit = RepairRunAudit::start(
+                state.db.clone(),
+                &auth,
+                AuditAction::StorageReindexRun,
+                None,
+                params,
+            )
+            .await;
+            audit.finish(Err(&e));
+            return Err(e);
+        }
+    };
+
+    // Audit BEFORE the work starts: the /admin request timeout can drop this
+    // future after rows were already registered. The guard records the
+    // outcome at the end, or `cancelled` when dropped.
+    let audit = RepairRunAudit::start(
+        state.db.clone(),
+        &auth,
+        AuditAction::StorageReindexRun,
+        Some(repo.id),
+        params,
+    )
+    .await;
     let outcome = StorageReindexService::new(state.db.clone(), state.storage_registry.clone())
         .reindex(&repo, payload.dry_run, limit, Some(auth.user_id))
         .await;
 
-    // Audited on success and on refusal/failure (409 lock held, 422 format or
+    // Recorded on success and on refusal/failure (409 lock held, 422 format or
     // backend unsupported, storage/DB errors).
-    let details = match &outcome {
-        Ok(result) => serde_json::json!({
-            "repository": key,
-            "dry_run": payload.dry_run,
+    match &outcome {
+        Ok(result) => audit.finish(Ok(serde_json::json!({
             "scanned": result.scanned,
             "registered": result.registered,
             "skipped": result.skipped,
@@ -404,22 +434,9 @@ pub async fn reindex_repository_storage(
             "skipped_unknown_age": result.skipped_unknown_age,
             "missing_objects": result.missing_objects,
             "errors": result.errors.len(),
-        }),
-        Err(e) => serde_json::json!({
-            "repository": key,
-            "dry_run": payload.dry_run,
-            "error": e.to_string(),
-        }),
-    };
-    let mut entry = AuditEntry::new(AuditAction::StorageReindexRun, ResourceType::Repository)
-        .user(auth.user_id)
-        .resource(repo.id)
-        .actor_name(&auth.username)
-        .details(details);
-    if outcome.is_err() {
-        entry = entry.outcome(Outcome::Failure);
+        }))),
+        Err(e) => audit.finish(Err(e)),
     }
-    audit_fire_and_forget(state.db.clone(), entry).await;
 
     outcome.map(Json)
 }
@@ -480,24 +497,53 @@ pub async fn backfill_debian_packages(
     Json(payload): Json<DebianBackfillRequest>,
 ) -> Result<Json<DebianBackfillResult>> {
     require_admin(auth.is_admin)?;
-    let repo = RepositoryService::new(state.db.clone())
-        .get_by_key(&key)
-        .await?;
     let limit = scrub_budget(
         payload.limit,
         DEFAULT_DEBIAN_BACKFILL_LIMIT,
         MAX_DEBIAN_BACKFILL_LIMIT,
     );
+    let params = serde_json::json!({
+        "repository": key,
+        "dry_run": payload.dry_run,
+        "limit": limit,
+        "after": payload.after,
+    });
+    let repo = match RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await
+    {
+        Ok(repo) => repo,
+        Err(e) => {
+            let audit = RepairRunAudit::start(
+                state.db.clone(),
+                &auth,
+                AuditAction::DebianBackfillRun,
+                None,
+                params,
+            )
+            .await;
+            audit.finish(Err(&e));
+            return Err(e);
+        }
+    };
+
+    // Audit BEFORE the work starts (see reindex_repository_storage).
+    let audit = RepairRunAudit::start(
+        state.db.clone(),
+        &auth,
+        AuditAction::DebianBackfillRun,
+        Some(repo.id),
+        params,
+    )
+    .await;
     let outcome = DebianBackfillService::new(state.db.clone(), state.storage_registry.clone())
         .backfill(&repo, payload.dry_run, limit, payload.after)
         .await;
 
-    // Audited on success and on refusal/failure (409 lock held, 422 the wrong
-    // repository kind, storage/DB errors).
-    let details = match &outcome {
-        Ok(result) => serde_json::json!({
-            "repository": key,
-            "dry_run": payload.dry_run,
+    // Recorded on success and on refusal/failure (409 lock held, 422 the
+    // wrong repository kind, storage/DB errors).
+    match &outcome {
+        Ok(result) => audit.finish(Ok(serde_json::json!({
             "artifacts_scanned": result.artifacts_scanned,
             "packages_registered": result.packages_registered,
             "packages_relocated": result.packages_relocated,
@@ -505,27 +551,128 @@ pub async fn backfill_debian_packages(
             "artifacts_failed": result.artifacts_failed,
             "dists_removed": result.dists_removed,
             "truncated": result.truncated,
-            "after": payload.after,
             "next_after": result.next_after,
             "errors": result.errors.len(),
-        }),
-        Err(e) => serde_json::json!({
-            "repository": key,
-            "dry_run": payload.dry_run,
-            "error": e.to_string(),
-        }),
-    };
-    let mut entry = AuditEntry::new(AuditAction::DebianBackfillRun, ResourceType::Repository)
-        .user(auth.user_id)
-        .resource(repo.id)
-        .actor_name(&auth.username)
-        .details(details);
-    if outcome.is_err() {
-        entry = entry.outcome(Outcome::Failure);
+        }))),
+        Err(e) => audit.finish(Err(e)),
     }
-    audit_fire_and_forget(state.db.clone(), entry).await;
 
     outcome.map(Json)
+}
+
+/// Start/end audit trail of one admin repair run (reindex-storage,
+/// backfill-debian), the same shape as [`ScrubRunAudit`].
+///
+/// [`RepairRunAudit::start`] writes a `phase: "started"` row (awaited, so it
+/// is durable before any row or object is touched) carrying a `run_id` and
+/// the request parameters; [`RepairRunAudit::finish`] writes `completed` with
+/// the report counts or `failed` with the error. If the run is dropped before
+/// `finish` (request timeout, client disconnect), `Drop` writes a `cancelled`
+/// row for the same `run_id`.
+///
+/// Every row keeps the flat `details` layout these actions always had
+/// (`repository`, `dry_run`, the counts or `error`), plus `run_id` and
+/// `phase`.
+pub(crate) struct RepairRunAudit {
+    db: sqlx::PgPool,
+    action: AuditAction,
+    user_id: uuid::Uuid,
+    username: String,
+    repository_id: Option<uuid::Uuid>,
+    run_id: uuid::Uuid,
+    params: serde_json::Value,
+    finished: bool,
+}
+
+impl RepairRunAudit {
+    pub(crate) async fn start(
+        db: sqlx::PgPool,
+        auth: &AuthExtension,
+        action: AuditAction,
+        repository_id: Option<uuid::Uuid>,
+        params: serde_json::Value,
+    ) -> Self {
+        let audit = Self {
+            db,
+            action,
+            user_id: auth.user_id,
+            username: auth.username.clone(),
+            repository_id,
+            run_id: uuid::Uuid::new_v4(),
+            params,
+            finished: false,
+        };
+        let entry = audit.entry("started", serde_json::Value::Null);
+        if let Err(e) = crate::services::audit_service::AuditService::new(audit.db.clone())
+            .log(entry)
+            .await
+        {
+            tracing::warn!(error = %e, "repair run start audit write failed");
+        }
+        audit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_id(&self) -> uuid::Uuid {
+        self.run_id
+    }
+
+    fn entry(&self, phase: &str, extra: serde_json::Value) -> AuditEntry {
+        let mut details = match &self.params {
+            serde_json::Value::Object(map) => map.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if let serde_json::Value::Object(extra) = extra {
+            details.extend(extra);
+        }
+        details.insert("run_id".into(), serde_json::json!(self.run_id));
+        details.insert("phase".into(), serde_json::json!(phase));
+        let mut entry = AuditEntry::new(self.action, ResourceType::Repository)
+            .user(self.user_id)
+            .actor_name(&self.username)
+            .details(serde_json::Value::Object(details));
+        if matches!(phase, "failed" | "cancelled") {
+            entry = entry.outcome(Outcome::Failure);
+        }
+        if let Some(id) = self.repository_id {
+            entry = entry.resource(id);
+        }
+        entry
+    }
+
+    fn spawn_log(&self, entry: AuditEntry) {
+        let db = self.db.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = crate::services::audit_service::AuditService::new(db)
+                    .log(entry)
+                    .await
+                {
+                    tracing::warn!(error = %e, "repair run audit write failed");
+                }
+            });
+        }
+    }
+
+    /// Record the end of the run: `Ok(counts)` as `completed`, `Err` as
+    /// `failed` with the error text.
+    pub(crate) fn finish(mut self, outcome: std::result::Result<serde_json::Value, &AppError>) {
+        self.finished = true;
+        let entry = match outcome {
+            Ok(counts) => self.entry("completed", counts),
+            Err(e) => self.entry("failed", serde_json::json!({ "error": e.to_string() })),
+        };
+        self.spawn_log(entry);
+    }
+}
+
+impl Drop for RepairRunAudit {
+    fn drop(&mut self) {
+        if !self.finished {
+            let entry = self.entry("cancelled", serde_json::Value::Null);
+            self.spawn_log(entry);
+        }
+    }
 }
 
 fn require_admin(is_admin: bool) -> Result<()> {
@@ -783,6 +930,7 @@ mod tests {
             let details: Option<serde_json::Value> = sqlx::query_scalar(
                 "SELECT details FROM audit_log \
                  WHERE action = 'DEBIAN_BACKFILL_RUN' AND details->>'repository' = $1 \
+                   AND details->>'phase' IN ('completed', 'failed') \
                  ORDER BY created_at DESC LIMIT 1",
             )
             .bind(repo_key)
@@ -841,6 +989,11 @@ mod tests {
         assert_eq!(details["repository"], f.repo_key);
         assert_eq!(details["packages_registered"], 1);
         assert_eq!(details["dry_run"], false);
+        assert_eq!(details["phase"], "completed");
+        // #5078: the start row was written under the same run_id.
+        let run_id = details["run_id"].as_str().expect("run_id").to_string();
+        let phases = repair_audit_phases(&f.pool, "DEBIAN_BACKFILL_RUN", &run_id, 2).await;
+        assert_eq!(phases, vec!["started".to_string(), "completed".to_string()]);
 
         let mut non_admin = auth;
         non_admin.is_admin = false;
@@ -892,6 +1045,189 @@ mod tests {
             .contains("Debian repositories"));
 
         f.teardown().await;
+    }
+
+    /// Poll `audit_log` for the phases one repair run recorded.
+    async fn repair_audit_phases(
+        pool: &sqlx::PgPool,
+        action: &str,
+        run_id: &str,
+        want: usize,
+    ) -> Vec<String> {
+        let mut phases = Vec::new();
+        for _ in 0..50 {
+            phases = sqlx::query_scalar(
+                "SELECT details->>'phase' FROM audit_log \
+                 WHERE action = $1 AND details->>'run_id' = $2 \
+                 ORDER BY created_at",
+            )
+            .bind(action)
+            .bind(run_id)
+            .fetch_all(pool)
+            .await
+            .expect("query audit_log");
+            if phases.len() >= want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        phases
+    }
+
+    /// #5078: a repair run dropped mid-way (the /admin request timeout, a
+    /// client disconnect) still leaves an audit trail: the start row exists
+    /// before any work, and the drop records `cancelled`, both carrying the
+    /// request parameters in the flat layout these actions use.
+    #[tokio::test]
+    async fn repair_audit_survives_a_dropped_run_5078() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth = admin_auth(&pool).await;
+        for (action, name) in [
+            (AuditAction::StorageReindexRun, "STORAGE_REINDEX_RUN"),
+            (AuditAction::DebianBackfillRun, "DEBIAN_BACKFILL_RUN"),
+        ] {
+            let audit = RepairRunAudit::start(
+                pool.clone(),
+                &auth,
+                action,
+                None,
+                serde_json::json!({"repository": "r", "dry_run": false, "limit": 5}),
+            )
+            .await;
+            let run_id = audit.run_id().to_string();
+            let started = repair_audit_phases(&pool, name, &run_id, 1).await;
+            assert_eq!(started, vec!["started".to_string()], "{name}");
+            drop(audit);
+            let phases = repair_audit_phases(&pool, name, &run_id, 2).await;
+            assert_eq!(
+                phases,
+                vec!["started".to_string(), "cancelled".to_string()],
+                "{name}"
+            );
+            let details: serde_json::Value = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE details->>'run_id' = $1 AND details->>'phase' = 'cancelled'",
+            )
+            .bind(&run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("cancelled row");
+            assert_eq!(details["repository"], "r");
+            assert_eq!(details["dry_run"], false);
+            assert_eq!(details["limit"], 5);
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(auth.user_id)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #5078: a finished repair run records `completed` with its counts
+    /// merged into the flat details, and no `cancelled` row.
+    #[tokio::test]
+    async fn repair_audit_records_completion_once_5078() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth = admin_auth(&pool).await;
+        let audit = RepairRunAudit::start(
+            pool.clone(),
+            &auth,
+            AuditAction::StorageReindexRun,
+            None,
+            serde_json::json!({"repository": "r", "dry_run": true}),
+        )
+        .await;
+        let run_id = audit.run_id().to_string();
+        audit.finish(Ok(serde_json::json!({"registered": 3})));
+        let phases = repair_audit_phases(&pool, "STORAGE_REINDEX_RUN", &run_id, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let again = repair_audit_phases(&pool, "STORAGE_REINDEX_RUN", &run_id, 2).await;
+        let details: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_log \
+             WHERE details->>'run_id' = $1 AND details->>'phase' = 'completed'",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("completed row");
+        assert_eq!(phases, vec!["started".to_string(), "completed".to_string()]);
+        assert_eq!(again.len(), 2, "no extra cancelled row: {again:?}");
+        assert_eq!(details["registered"], 3);
+        assert_eq!(details["repository"], "r");
+        assert_eq!(details["dry_run"], true);
+    }
+
+    /// #5078: a repair call for an unknown repository key is audited
+    /// (started, then failed) for both endpoints, not just answered 404.
+    #[tokio::test]
+    async fn repair_of_an_unknown_repository_is_audited_5078() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let auth = admin_auth(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/ak-repair-unknown-repo");
+        let reindex_key = format!("no-such-repo-{}", uuid::Uuid::new_v4());
+        let err = reindex_repository_storage(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Path(reindex_key.clone()),
+            Json(StorageReindexRequest {
+                dry_run: true,
+                limit: None,
+            }),
+        )
+        .await
+        .expect_err("unknown key");
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+        let backfill_key = format!("no-such-repo-{}", uuid::Uuid::new_v4());
+        let err = backfill_debian_packages(
+            State(state),
+            Extension(auth.clone()),
+            Path(backfill_key.clone()),
+            Json(DebianBackfillRequest {
+                dry_run: true,
+                limit: None,
+                after: None,
+            }),
+        )
+        .await
+        .expect_err("unknown key");
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+
+        for (action, key) in [
+            ("STORAGE_REINDEX_RUN", &reindex_key),
+            ("DEBIAN_BACKFILL_RUN", &backfill_key),
+        ] {
+            let mut phases = Vec::new();
+            for _ in 0..50 {
+                phases = sqlx::query_scalar::<_, String>(
+                    "SELECT details->>'phase' FROM audit_log \
+                     WHERE action = $1 AND details->>'repository' = $2 \
+                     ORDER BY created_at",
+                )
+                .bind(action)
+                .bind(key)
+                .fetch_all(&pool)
+                .await
+                .expect("audit rows");
+                if phases.len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                phases,
+                vec!["started".to_string(), "failed".to_string()],
+                "{action}"
+            );
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(auth.user_id)
+            .execute(&pool)
+            .await;
     }
 
     #[test]
