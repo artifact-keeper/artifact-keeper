@@ -33,6 +33,7 @@ instead of editing CHANGELOG.md (format: changes/README.md). CI-only changes nee
 
 ## API Changes
 - [ ] New endpoints have `#[utoipa::path]` annotations
+- [ ] New `/api/v1` endpoints declare their authorization (`x-required-permission`/`x-resource` or `x-auth-requirement`); see CONTRIBUTING.md
 - [ ] Request/response types have `#[derive(ToSchema)]`
 - [ ] OpenAPI spec validates: `cargo test --lib test_openapi_spec_is_valid`
 - [ ] Migration is reversible (if applicable)

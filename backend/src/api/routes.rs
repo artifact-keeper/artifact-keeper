@@ -2775,4 +2775,170 @@ mod tests {
         let (list_status, _) = tdh::send(app, tdh::get("/api/v1/webhooks".to_string())).await;
         assert_eq!(list_status, axum::http::StatusCode::UNAUTHORIZED);
     }
+
+    // -----------------------------------------------------------------------
+    // IAM route guard (openspec: iam-permission-catalog-and-route-guard).
+    // Non-enforcing: reads the OpenAPI declarations and the assembled router,
+    // and changes no request behavior.
+    // -----------------------------------------------------------------------
+    mod iam_route_guard {
+        use super::super::{api_v1_routes, build_login_rate_limit_state, UploadAdmission};
+        use crate::api::authz::registry::{
+            compare_with_live, RouteKey, RouteRegistry, API_V1_PREFIX,
+        };
+        use crate::api::authz::route_inventory::{assert_matches_baseline, enumerate_routes};
+        use crate::api::middleware::rate_limit::RateLimitExemptions;
+        use axum::{routing::get, Router};
+        use std::collections::{BTreeSet, HashMap};
+        use std::sync::Arc;
+
+        fn test_state() -> crate::api::SharedState {
+            let pool = sqlx::PgPool::connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+                .expect("connect_lazy");
+            let storage: Arc<dyn crate::storage::StorageBackend> = Arc::new(
+                crate::storage::filesystem::FilesystemStorage::new("/tmp/test-iam-route-guard"),
+            );
+            let registry = Arc::new(crate::storage::StorageRegistry::new(
+                HashMap::new(),
+                "filesystem".to_string(),
+            ));
+            Arc::new(crate::api::AppState::new(
+                crate::config::Config::test_config(),
+                pool,
+                storage,
+                registry,
+            ))
+        }
+
+        /// The `/api/v1` router exactly as `create_router` assembles and nests it.
+        fn api_v1_router() -> Router<crate::api::SharedState> {
+            let state = test_state();
+            let exemptions = Arc::new(RateLimitExemptions::with_cidrs(
+                state.config.rate_limit_exempt_usernames.clone(),
+                state.config.rate_limit_exempt_service_accounts,
+                state.config.rate_limit_trusted_cidrs.clone(),
+            ));
+            let trusted_proxies = Arc::new(state.config.rate_limit_trusted_proxy_cidrs.clone());
+            let login = build_login_rate_limit_state(&state.config, &exemptions, &trusted_proxies);
+            let upload_admission =
+                UploadAdmission::new(state.config.upload_max_in_flight_per_principal);
+            Router::new().nest(
+                API_V1_PREFIX,
+                api_v1_routes(state, exemptions, trusted_proxies, login, upload_admission),
+            )
+        }
+
+        fn live_api_v1_routes(router: &Router<crate::api::SharedState>) -> BTreeSet<RouteKey> {
+            enumerate_routes(router)
+                .into_iter()
+                .filter(|(_, path)| {
+                    path == API_V1_PREFIX
+                        || path
+                            .strip_prefix(API_V1_PREFIX)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .collect()
+        }
+
+        fn registry() -> RouteRegistry {
+            RouteRegistry::from_api_doc(&crate::api::openapi::build_openapi()).unwrap_or_else(
+                |errors| {
+                    let lines: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                    panic!("invalid authorization declarations:\n{}", lines.join("\n"))
+                },
+            )
+        }
+
+        /// The guard: declarations and the live router agree in both directions,
+        /// and the undeclared remainder is exactly the reviewed baseline.
+        #[tokio::test]
+        async fn api_v1_declarations_match_the_live_router() {
+            let router = api_v1_router();
+            let live = live_api_v1_routes(&router);
+            assert!(
+                live.len() >= 200,
+                "route enumeration found only {} /api/v1 routes",
+                live.len()
+            );
+            let coverage = compare_with_live(&registry(), &live);
+            assert!(
+                coverage.stale.is_empty(),
+                "declared operations with no live route: {:#?}",
+                coverage.stale
+            );
+            assert_matches_baseline(&coverage.uncovered);
+        }
+
+        #[tokio::test]
+        async fn declared_label_operations_are_live_and_covered() {
+            let live = live_api_v1_routes(&api_v1_router());
+            let registry = registry();
+            let declared = registry.declared_keys();
+            assert_eq!(declared.len(), 4, "{declared:?}");
+            assert!(declared.is_subset(&live), "{declared:?}");
+        }
+
+        #[tokio::test]
+        async fn an_added_route_is_detected_as_uncovered() {
+            let registry = registry();
+            let base = live_api_v1_routes(&api_v1_router());
+            let baseline = compare_with_live(&registry, &base).uncovered;
+
+            let extended = api_v1_router().route("/api/v1/zz-guard-probe", get(|| async {}));
+            let live = live_api_v1_routes(&extended);
+            let uncovered = compare_with_live(&registry, &live).uncovered;
+            let probe = ("GET".to_string(), "/api/v1/zz-guard-probe".to_string());
+            assert!(uncovered.contains(&probe));
+            assert!(!baseline.contains(&probe));
+            assert_ne!(uncovered, baseline);
+        }
+
+        #[tokio::test]
+        async fn a_stale_declaration_is_detected() {
+            let registry = registry();
+            // A router that serves none of the declared label routes.
+            let live: BTreeSet<RouteKey> =
+                [("GET".to_string(), "/api/v1/other".to_string())].into();
+            let coverage = compare_with_live(&registry, &live);
+            assert_eq!(coverage.stale, registry.declared_keys());
+        }
+
+        #[tokio::test]
+        async fn annotating_a_route_shrinks_the_uncovered_set() {
+            let live = live_api_v1_routes(&api_v1_router());
+            let with_declarations = compare_with_live(&registry(), &live).uncovered;
+
+            // Declare one more existing route, as an annotation would.
+            let target = with_declarations
+                .iter()
+                .next()
+                .expect("at least one uncovered route")
+                .clone();
+            let op = serde_json::json!({"x-auth-requirement": "authenticated"});
+            let doc = crate::api::openapi::build_openapi();
+            let value = serde_json::to_value(&doc).unwrap();
+            let mut ops: Vec<(String, String, serde_json::Value)> = Vec::new();
+            for (path, item) in value["paths"].as_object().unwrap() {
+                for (verb, o) in item.as_object().unwrap() {
+                    ops.push((verb.clone(), path.clone(), o.clone()));
+                }
+            }
+            // The route may already be documented without a declaration.
+            ops.retain(|(m, p, _)| {
+                (
+                    m.to_uppercase(),
+                    crate::api::authz::registry::normalize_template(p),
+                ) != target
+            });
+            ops.push((target.0.to_lowercase(), target.1.clone(), op));
+            let registry = RouteRegistry::from_operations(
+                ops.iter().map(|(m, p, o)| (m.as_str(), p.as_str(), o)),
+            )
+            .unwrap();
+            let shrunk = compare_with_live(&registry, &live).uncovered;
+            assert!(with_declarations.contains(&target));
+            assert!(!shrunk.contains(&target));
+            assert_eq!(shrunk.len() + 1, with_declarations.len());
+        }
+    }
 }
