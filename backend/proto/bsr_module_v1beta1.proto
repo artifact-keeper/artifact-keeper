@@ -7,10 +7,12 @@ syntax = "proto3";
 // them, and the server enforces what it needs in Rust. Field numbers and
 // types are the originals' -- they are the wire format.
 //
-// The CLI pushes and pulls over this beta package, not v1, so Upload and
-// Download live here. Its DigestType numbers B5 = 2, where v1 numbers B5 = 1:
-// a response built with v1's number tells the CLI "b4" and it rejects the
-// commit's digest.
+// Upload and Download exist in both packages and the CLI picks per call, so
+// both are served. This one is reached when a push's module depends on a
+// second registry (legacy federation) and when a pull asks for b4; the
+// single-registry push and the b5 pull go to v1. Its DigestType numbers
+// B5 = 2, where v1 numbers B5 = 1: a response built with v1's number tells
+// the CLI "b4" and it rejects the commit's digest.
 package buf.registry.module.v1beta1;
 
 import "google/protobuf/timestamp.proto";

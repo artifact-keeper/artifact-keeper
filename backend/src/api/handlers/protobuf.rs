@@ -70,12 +70,20 @@ pub fn router() -> Router<SharedState> {
             post(list_commits),
         )
         .route(
+            "/:repo_key/buf.registry.module.v1.UploadService/Upload",
+            post(upload_v1),
+        )
+        .route(
             "/:repo_key/buf.registry.module.v1beta1.UploadService/Upload",
-            post(upload),
+            post(upload_v1beta1),
+        )
+        .route(
+            "/:repo_key/buf.registry.module.v1.DownloadService/Download",
+            post(download_v1),
         )
         .route(
             "/:repo_key/buf.registry.module.v1beta1.DownloadService/Download",
-            post(download),
+            post(download_v1beta1),
         )
         .route(
             "/:repo_key/buf.registry.module.v1.LabelService/GetLabels",
@@ -95,6 +103,21 @@ pub fn router() -> Router<SharedState> {
         )
         .route("/:repo_key/*bsr_path", post(catch_all_bsr))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+}
+
+/// Which `buf.registry.module` package a push or pull arrived on.
+///
+/// The CLI chooses per call, not per registry: `buf push` uses v1beta1's
+/// Upload only when the module depends on a second registry (legacy
+/// federation), and Download is chosen by the digest type asked for. A
+/// repository answering b5 therefore has to serve both packages and answer
+/// each in its own, since the two differ in more than the package name --
+/// v1beta1 carries a registry per dependency and the pre-v2 buf.yaml and
+/// buf.lock of a module, and numbers its DigestType differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BsrApi {
+    V1,
+    V1Beta1,
 }
 
 async fn catch_all_bsr(
@@ -532,22 +555,112 @@ fn module_name_from_ref(module_ref: &ModuleRef) -> Result<String, Response> {
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn module_name_from_resource_ref(resource_ref: &ResourceRef) -> Result<String, Response> {
-    match (&resource_ref.owner, &resource_ref.module) {
-        (Some(owner), Some(module)) => Ok(format!("{}/{}", owner, module)),
-        _ => {
-            if let Some(id) = &resource_ref.id {
-                Ok(id.clone())
-            } else {
-                Err(connect_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_argument",
-                    "Resource reference must specify owner/module or id",
-                ))
-            }
-        }
+/// The module a `ModuleRef` names.
+///
+/// Like a commit id, a module id is a one-way function of the name
+/// (`protobuf_wire::ids`), so it is matched by deriving the id of each module
+/// the repository holds -- `buf dep update` asks for its dependency's module
+/// by id, and reading the id as a name answered "module <tuuid> not found".
+/// An id that matches nothing is left to mean a module name, which is what
+/// the JSON callers send.
+async fn resolve_module_ref(
+    state: &SharedState,
+    repo: &RepoInfo,
+    module_ref: &ModuleRef,
+) -> Result<String, Response> {
+    if let (Some(owner), Some(module)) = (&module_ref.owner, &module_ref.module) {
+        return Ok(format!("{}/{}", owner, module));
     }
+    let id = module_ref.id.as_deref().ok_or_else(|| {
+        connect_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Module reference must specify owner/module or id",
+        )
+    })?;
+
+    let names: Vec<String> = sqlx::query_scalar(
+        r#"SELECT DISTINCT name
+        FROM artifacts
+        WHERE repository_id = $1
+          AND version IS DISTINCT FROM '_labels'
+          AND is_deleted = false"#,
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+
+    Ok(names
+        .into_iter()
+        .find(|name| ids::module(name) == id)
+        .unwrap_or_else(|| id.to_string()))
+}
+
+/// The module and commit a `ResourceRef` names.
+///
+/// The CLI addresses a commit by the tuuid this repository derives, and that
+/// derivation is one-way, so an id is resolved through the `commitId`
+/// recorded next to the commit at push time rather than from any column --
+/// `buf dep update` asks for its dependency this way and was answered
+/// "Module '<tuuid>' not found" when the id was read as a module name. A
+/// `ref` is a label or a commit id and the CLI does not say which, so the
+/// label index is consulted first and the id second. An id that is neither
+/// is left to mean a module name, which is what the JSON callers send.
+async fn resolve_resource_ref(
+    state: &SharedState,
+    repo: &RepoInfo,
+    resource_ref: &ResourceRef,
+) -> Result<(String, Option<String>), Response> {
+    if let (Some(owner), Some(module)) = (&resource_ref.owner, &resource_ref.module) {
+        let module_name = format!("{}/{}", owner, module);
+        let digest = match &resource_ref.label {
+            Some(r) => match resolve_commit_by_label(&state.db, repo.id, &module_name, r).await {
+                Some(digest) => Some(digest),
+                None => commit_by_derived_id(state, repo, r)
+                    .await?
+                    .map(|(_, version)| version),
+            },
+            None => None,
+        };
+        return Ok((module_name, digest));
+    }
+
+    let id = resource_ref.id.as_deref().ok_or_else(|| {
+        connect_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Resource reference must specify owner/module or id",
+        )
+    })?;
+    if let Some((module_name, version)) = commit_by_derived_id(state, repo, id).await? {
+        return Ok((module_name, Some(version)));
+    }
+    Ok((id.to_string(), None))
+}
+
+/// The module name and stored digest of the commit a derived tuuid names.
+async fn commit_by_derived_id(
+    state: &SharedState,
+    repo: &RepoInfo,
+    commit_id: &str,
+) -> Result<Option<(String, String)>, Response> {
+    let row = sqlx::query(
+        r#"SELECT a.name, a.version
+        FROM artifacts a
+        JOIN artifact_metadata m ON m.artifact_id = a.id
+        WHERE a.repository_id = $1
+          AND a.is_deleted = false
+          AND m.metadata->>'commitId' = $2
+        LIMIT 1"#,
+    )
+    .bind(repo.id)
+    .bind(commit_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(connect_db_error)?;
+
+    Ok(row.map(|r| (r.get("name"), r.get("version"))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,14 +1175,23 @@ async fn get_modules(
     let mut modules = Vec::new();
 
     for module_ref in &body.module_refs {
-        let module_name = module_name_from_ref(module_ref)?;
+        let module_name = resolve_module_ref(&state, &repo, module_ref).await?;
 
+        // The label index is a real artifact row since #4889, sharing the
+        // module's `name` and written after the commit in the same push. So
+        // every latest-by-name query here answers with the index rather than
+        // a commit unless it excludes that `version`, and the index's
+        // storage object is a JSON document: `buf dep update` resolving a
+        // dependency came back 500 "invalid gzip header" from reading it as
+        // a commit bundle. `IS DISTINCT FROM` because `version` is nullable
+        // and `<>` would drop a NULL-version row along with the index.
         let row = sqlx::query(
             r#"SELECT DISTINCT ON (name)
                 id, name, created_at, updated_at, uploaded_by
             FROM artifacts
             WHERE repository_id = $1
               AND name = $2
+              AND version IS DISTINCT FROM '_labels'
               AND is_deleted = false
             ORDER BY name, created_at DESC
             LIMIT 1"#,
@@ -1086,8 +1208,20 @@ async fn get_modules(
             )
         })?;
 
-        if let Some(row) = row {
-            modules.push(build_module_info_from_row(&row));
+        match row {
+            Some(row) => modules.push(build_module_info_from_row(&row)),
+            // The CLI pairs refs with modules positionally and reports a short
+            // list as a bug in itself ("expected 1 Module, found 0"), and
+            // `buf push --create` decides to create the module from exactly
+            // this not_found. An empty list in place of the error strands
+            // both: nothing is created and the push cannot proceed.
+            None => {
+                return Err(connect_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("module {module_name} not found"),
+                ));
+            }
         }
     }
 
@@ -1171,14 +1305,8 @@ async fn get_commits(
     let mut commits = Vec::new();
 
     for resource_ref in &body.resource_refs {
-        let module_name = module_name_from_resource_ref(resource_ref)?;
-
-        // If a label is specified, resolve it to a commit digest first
-        let digest_filter = if let Some(label) = &resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            resource_ref.id.clone()
-        };
+        let (module_name, digest_filter) =
+            resolve_resource_ref(&state, &repo, resource_ref).await?;
 
         let row = if let Some(digest) = &digest_filter {
             sqlx::query(
@@ -1201,6 +1329,7 @@ async fn get_commits(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -1219,8 +1348,18 @@ async fn get_commits(
             )
         })?;
 
-        if let Some(row) = row {
-            commits.push(build_commit_info_from_row(&row));
+        match row {
+            Some(row) => commits.push(build_commit_info_from_row(&row)),
+            // Same positional contract as GetModules: `buf dep update`
+            // resolving a dependency rejects a short list outright
+            // ("expected 1 Commits, got 0") instead of reading it as absence.
+            None => {
+                return Err(connect_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("no commit for module {module_name}"),
+                ));
+            }
         }
     }
 
@@ -1266,6 +1405,7 @@ async fn list_commits(
         FROM artifacts
         WHERE repository_id = $1
           AND name = $2
+          AND version IS DISTINCT FROM '_labels'
           AND is_deleted = false
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4"#,
@@ -1305,15 +1445,39 @@ async fn list_commits(
 // POST Upload (buf push)
 // ---------------------------------------------------------------------------
 
+async fn upload_v1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    upload(state, auth, repo_key, headers, body, BsrApi::V1).await
+}
+
+async fn upload_v1beta1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    upload(state, auth, repo_key, headers, body, BsrApi::V1Beta1).await
+}
+
 async fn upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
+    api: BsrApi,
 ) -> Result<Response, Response> {
     let codec = Codec::from_headers(&headers);
-    let body: UploadRequest = codec.decode(&body, UploadRequest::from_pb)?;
+    let body: UploadRequest = match api {
+        BsrApi::V1 => codec.decode(&body, UploadRequest::from_pb_v1)?,
+        BsrApi::V1Beta1 => codec.decode(&body, UploadRequest::from_pb)?,
+    };
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
@@ -1586,6 +1750,11 @@ async fn upload(
         commits: result_commits,
     };
     if codec.is_proto() {
+        if api == BsrApi::V1 {
+            return Ok(wire::respond_proto(&pb1::UploadResponse {
+                commits: pb_commits(&state, &repo, &resp.commits).await?,
+            }));
+        }
         let mut commits = Vec::with_capacity(resp.commits.len());
         for commit in &resp.commits {
             let b5 = commit_b5(&state, &repo, &commit.module_id, &commit.digest.value).await?;
@@ -1600,6 +1769,29 @@ async fn upload(
 // POST Download (buf pull)
 // ---------------------------------------------------------------------------
 
+async fn download_v1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    download(state, auth, repo_key, ctx, headers, body, BsrApi::V1).await
+}
+
+async fn download_v1beta1(
+    state: State<SharedState>,
+    auth: Extension<Option<AuthExtension>>,
+    repo_key: Path<String>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Response> {
+    download(state, auth, repo_key, ctx, headers, body, BsrApi::V1Beta1).await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1607,22 +1799,20 @@ async fn download(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
     headers: HeaderMap,
     body: Bytes,
+    api: BsrApi,
 ) -> Result<Response, Response> {
     let codec = Codec::from_headers(&headers);
-    let body: DownloadRequest = codec.decode(&body, DownloadRequest::from_pb)?;
+    let body: DownloadRequest = match api {
+        BsrApi::V1 => codec.decode(&body, DownloadRequest::from_pb_v1)?,
+        BsrApi::V1Beta1 => codec.decode(&body, DownloadRequest::from_pb)?,
+    };
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     let mut contents = Vec::new();
 
     for value in &body.values {
-        let module_name = module_name_from_resource_ref(&value.resource_ref)?;
-
-        // Resolve commit digest: prefer label, then direct id, then latest
-        let commit_digest = if let Some(label) = &value.resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            value.resource_ref.id.clone()
-        };
+        let (module_name, commit_digest) =
+            resolve_resource_ref(&state, &repo, &value.resource_ref).await?;
 
         // Fetch the artifact
         let artifact_row = if let Some(digest) = &commit_digest {
@@ -1648,6 +1838,7 @@ async fn download(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -1809,6 +2000,26 @@ async fn download(
     }
 
     let resp = DownloadResponse { contents };
+    if codec.is_proto() && api == BsrApi::V1 {
+        let mut contents = Vec::with_capacity(resp.contents.len());
+        for content in &resp.contents {
+            let b5 = commit_b5(
+                &state,
+                &repo,
+                &content.commit.module_id,
+                &content.commit.digest.value,
+            )
+            .await?;
+            contents.push(pb1::download_response::Content {
+                commit: Some(pb_commit(&content.commit, &b5)),
+                files: decode_bundle_files(&content.files)?
+                    .into_iter()
+                    .map(|(path, content)| pb1::File { path, content })
+                    .collect(),
+            });
+        }
+        return Ok(wire::respond_proto(&pb1::DownloadResponse { contents }));
+    }
     if codec.is_proto() {
         let mut contents = Vec::with_capacity(resp.contents.len());
         for content in &resp.contents {
@@ -2001,14 +2212,8 @@ async fn get_graph(
     let mut edges = Vec::new();
 
     for resource_ref in &body.resource_refs {
-        let module_name = module_name_from_resource_ref(resource_ref)?;
-
-        // Resolve the target commit
-        let commit_digest = if let Some(label) = &resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            resource_ref.id.clone()
-        };
+        let (module_name, commit_digest) =
+            resolve_resource_ref(&state, &repo, resource_ref).await?;
 
         // Fetch the artifact and its metadata for dependency graph
         let row = if let Some(digest) = &commit_digest {
@@ -2036,6 +2241,7 @@ async fn get_graph(
                 LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
                 WHERE a.repository_id = $1
                   AND a.name = $2
+                  AND a.version IS DISTINCT FROM '_labels'
                   AND a.is_deleted = false
                 ORDER BY a.created_at DESC
                 LIMIT 1"#,
@@ -2092,14 +2298,8 @@ async fn get_resources(
     let mut resources = Vec::new();
 
     for resource_ref in &body.resource_refs {
-        let module_name = module_name_from_resource_ref(resource_ref)?;
-
-        // Resolve commit digest via label if provided
-        let commit_digest = if let Some(label) = &resource_ref.label {
-            resolve_commit_by_label(&state.db, repo.id, &module_name, label).await
-        } else {
-            resource_ref.id.clone()
-        };
+        let (module_name, commit_digest) =
+            resolve_resource_ref(&state, &repo, resource_ref).await?;
 
         let row = if let Some(digest) = &commit_digest {
             sqlx::query(
@@ -2122,6 +2322,7 @@ async fn get_resources(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -2432,6 +2633,29 @@ impl CreateOrUpdateLabelsRequest {
 }
 
 impl DownloadRequest {
+    /// v1's `DownloadRequest` has no `digest_type`: the package itself is the
+    /// answer, since the CLI only asks v1 for b5.
+    fn from_pb_v1(req: pb1::DownloadRequest) -> Self {
+        DownloadRequest {
+            values: req
+                .values
+                .into_iter()
+                .map(|v| DownloadValue {
+                    resource_ref: v
+                        .resource_ref
+                        .map(|r| ResourceRef::from_pb(r.value))
+                        .unwrap_or(ResourceRef {
+                            id: None,
+                            owner: None,
+                            module: None,
+                            label: None,
+                        }),
+                    file_types: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
     fn from_pb(req: pb1b::DownloadRequest) -> Self {
         DownloadRequest {
             values: req
@@ -2455,6 +2679,57 @@ impl DownloadRequest {
 }
 
 impl UploadRequest {
+    /// v1's dependencies are bare commit ids, where v1beta1 pairs each with
+    /// the registry that holds it. Without federation there is only the one
+    /// registry, so the id is the whole reference.
+    fn from_pb_v1(req: pb1::UploadRequest) -> Self {
+        let dep_refs: Vec<ModuleRef> = req
+            .dep_commit_ids
+            .into_iter()
+            .map(|commit_id| ModuleRef {
+                id: Some(commit_id),
+                owner: None,
+                module: None,
+            })
+            .collect();
+
+        UploadRequest {
+            contents: req
+                .contents
+                .into_iter()
+                .map(|c| UploadContent {
+                    module_ref: c
+                        .module_ref
+                        .map(|r| ModuleRef::from_pb_v1(r.value))
+                        .unwrap_or(ModuleRef {
+                            id: None,
+                            owner: None,
+                            module: None,
+                        }),
+                    files: c
+                        .files
+                        .into_iter()
+                        .map(|f| UploadFile {
+                            path: f.path,
+                            content: base64::engine::general_purpose::STANDARD.encode(&f.content),
+                        })
+                        .collect(),
+                    dep_refs: dep_refs.clone(),
+                    label_refs: c
+                        .scoped_label_refs
+                        .into_iter()
+                        .filter_map(|l| match l.value {
+                            Some(pb1::scoped_label_ref::Value::Name(name)) => {
+                                Some(LabelRef { name })
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
     /// The CLI's `UploadRequest` carries `dep_refs` once for the whole push
     /// and `scoped_label_refs` per content, where the JSON shape has both per
     /// content. The dep refs are therefore attached to every content, which is
@@ -2713,6 +2988,7 @@ async fn dep_b5(
             JOIN artifact_metadata m ON m.artifact_id = a.id
             WHERE a.repository_id = $1
               AND a.name = $2
+              AND a.version IS DISTINCT FROM '_labels'
               AND a.is_deleted = false
             ORDER BY a.created_at DESC
             LIMIT 1"#,
@@ -2842,6 +3118,7 @@ async fn dep_commit_digest(
         FROM artifacts
         WHERE repository_id = $1
           AND name = $2
+          AND version IS DISTINCT FROM '_labels'
           AND is_deleted = false
         ORDER BY created_at DESC
         LIMIT 1"#,
@@ -3412,43 +3689,6 @@ mod tests {
             module: Some("validate".to_string()),
         };
         assert_eq!(module_name_from_ref(&r).unwrap(), "buf/validate");
-    }
-
-    // -----------------------------------------------------------------------
-    // module_name_from_resource_ref
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_module_name_from_resource_ref_owner_and_module() {
-        let r = ResourceRef {
-            id: None,
-            owner: Some("org".to_string()),
-            module: Some("pkg".to_string()),
-            label: None,
-        };
-        assert_eq!(module_name_from_resource_ref(&r).unwrap(), "org/pkg");
-    }
-
-    #[test]
-    fn test_module_name_from_resource_ref_id_only() {
-        let r = ResourceRef {
-            id: Some("id-123".to_string()),
-            owner: None,
-            module: None,
-            label: None,
-        };
-        assert_eq!(module_name_from_resource_ref(&r).unwrap(), "id-123");
-    }
-
-    #[test]
-    fn test_module_name_from_resource_ref_no_fields() {
-        let r = ResourceRef {
-            id: None,
-            owner: None,
-            module: None,
-            label: None,
-        };
-        assert!(module_name_from_resource_ref(&r).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -4615,7 +4855,7 @@ mod catalog_registration_tests {
         // a coin flip.
         let digest: Option<String> = sqlx::query_scalar(
             "SELECT version FROM artifacts \
-             WHERE repository_id = $1 AND name = 'acme/widgets' AND version <> '_labels'",
+             WHERE repository_id = $1 AND name = 'acme/widgets' AND version IS DISTINCT FROM '_labels'",
         )
         .bind(fx.repo_id)
         .fetch_optional(&fx.pool)
@@ -4727,7 +4967,7 @@ pub(crate) mod integrity_tests {
         );
         sqlx::query_scalar(
             "SELECT version FROM artifacts \
-             WHERE repository_id = $1 AND name = 'acme/integrity' AND version <> '_labels'",
+             WHERE repository_id = $1 AND name = 'acme/integrity' AND version IS DISTINCT FROM '_labels'",
         )
         .bind(fx.repo_id)
         .fetch_one(&fx.pool)
