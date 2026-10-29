@@ -18,12 +18,13 @@ CREATE TABLE rpm_repodata_roots (
     -- (a package header could not be read back, #3801), a heal marker that
     -- falls due, or the back-off after a failed build.
     retry_at timestamptz,
-    -- Last revision number handed out. Revisions are never reused, so a
-    -- failed build's objects cannot be mistaken for a later build's.
+    -- Last revision number handed out. The row outlives an emptied root, so
+    -- revisions are never reused and a failed build's objects cannot be
+    -- mistaken for a later build's.
     next_revision bigint NOT NULL DEFAULT 0,
     built_revision bigint,
-    -- The revision served before `built_revision`, kept for clients that
-    -- are mid-refresh; older ones are deleted.
+    -- The revision served before `built_revision`, kept so a download in
+    -- flight during a swap completes; older ones are deleted.
     previous_revision bigint,
     -- Revisions below this are deleted from storage.
     gc_floor bigint NOT NULL DEFAULT 1,
@@ -55,9 +56,20 @@ LANGUAGE sql STABLE AS $$
     FROM (SELECT ak_rpm_repodata_depth(repo_id) AS d) depth
 $$;
 
+-- Advisory-lock key fencing the dirty flag of one root: writers hold it
+-- shared until they commit, the builder takes it exclusively for the moment
+-- it clears the flag (see `rpm_repodata_builder`).
+CREATE FUNCTION ak_rpm_repodata_fence(repo_id uuid, root text) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT hashtextextended('rpm-repodata:' || repo_id::text || ':' || root, 0)
+$$;
+
 -- Mark the root of `path` in `repo_id` dirty. Only hosted RPM repositories
 -- are tracked. A root that is already dirty is only read, never written, so
 -- the inserts of a bulk import into one root do not queue on its row lock.
+-- The shared fence makes the builder's clear wait for this transaction, so
+-- a write that skipped because the root was dirty is committed before the
+-- builder's snapshot is taken.
 CREATE FUNCTION ak_rpm_repodata_mark_dirty(repo_id uuid, path text) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -69,6 +81,7 @@ BEGIN
         RETURN;
     END IF;
     r := ak_rpm_repodata_root(repo_id, path);
+    PERFORM pg_advisory_xact_lock_shared(ak_rpm_repodata_fence(repo_id, r));
     IF EXISTS (SELECT 1 FROM rpm_repodata_roots
                WHERE repository_id = repo_id AND root = r AND dirty_since IS NOT NULL) THEN
         RETURN;
@@ -114,9 +127,11 @@ FOR EACH ROW WHEN ((OLD.path LIKE '%.rpm' OR NEW.path LIKE '%.rpm') AND (
     NEW.checksum_sha256, NEW.storage_key, NEW.updated_at, NEW.is_deleted))
 EXECUTE FUNCTION ak_rpm_repodata_artifact_changed();
 
+-- A hard delete of a row already soft-deleted changes nothing a document
+-- lists (the soft delete dirtied the root).
 CREATE TRIGGER rpm_repodata_artifact_deleted
 AFTER DELETE ON artifacts
-FOR EACH ROW WHEN (OLD.path LIKE '%.rpm')
+FOR EACH ROW WHEN (OLD.path LIKE '%.rpm' AND NOT OLD.is_deleted)
 EXECUTE FUNCTION ak_rpm_repodata_artifact_changed();
 
 -- Metadata feeds primary.xml (dependencies, descriptions, file lists). The
@@ -133,6 +148,12 @@ BEGIN
     IF TG_OP = 'DELETE' THEN artifact := OLD.artifact_id;
     ELSE artifact := NEW.artifact_id;
     END IF;
+    -- Cheap exit first: metadata of other formats never pays the jsonb
+    -- comparisons below.
+    SELECT a.repository_id, a.path INTO repo, p FROM artifacts a WHERE a.id = artifact;
+    IF NOT FOUND OR p NOT LIKE '%.rpm' THEN
+        RETURN NULL;
+    END IF;
     IF TG_OP = 'INSERT' AND ak_rpm_depth_heal_bookkeeping_only(NULL, NEW.metadata) THEN
         RETURN NULL;
     END IF;
@@ -142,10 +163,7 @@ BEGIN
        AND ak_rpm_depth_heal_bookkeeping_only(OLD.metadata, NEW.metadata) THEN
         RETURN NULL;
     END IF;
-    SELECT a.repository_id, a.path INTO repo, p FROM artifacts a WHERE a.id = artifact;
-    IF FOUND THEN
-        PERFORM ak_rpm_repodata_mark_dirty(repo, p);
-    END IF;
+    PERFORM ak_rpm_repodata_mark_dirty(repo, p);
     RETURN NULL;
 END
 $$;

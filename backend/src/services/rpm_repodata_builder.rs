@@ -29,15 +29,19 @@
 //!    same rows.
 //! 4. **Fallback and GC.** A root that has never been built renders on request
 //!    (once per state per replica, through the in-process cache) until its
-//!    first build. The previous revision is kept for clients mid-refresh;
-//!    older ones are deleted. A root with no packages is not stored at all.
+//!    first build. The previous revision is kept so a download in flight
+//!    during a swap completes; older ones are deleted. A root with no
+//!    packages is not stored at all.
 //!
 //! Consistency: the builder clears `dirty_since` before it opens its
-//! snapshot, so a write committed after that re-dirties the root. A write
-//! whose trigger ran while the root was still dirty, but which commits after
-//! the snapshot, is caught by comparing the built fingerprint with the live
-//! one after the swap and by [`reconcile`], which runs every
-//! [`BuilderSettings::maintenance_every`].
+//! snapshot, so a write committed after that re-dirties the root. Writers
+//! hold a shared advisory lock on the root (`ak_rpm_repodata_fence`) until
+//! they commit, and the builder clears the flag under the exclusive lock, so
+//! a write whose trigger saw the root still dirty has committed (and is in
+//! the snapshot) by the time the flag is cleared. The claim also sets
+//! `retry_at` to a deadline, so a build that dies before its swap is retried.
+//! As a safety net, [`reconcile`] compares built fingerprints with the live
+//! ones every [`BuilderSettings::maintenance_every`].
 //!
 //! Virtual repositories stay on request: their documents depend on which
 //! members the caller may read (#4346).
@@ -96,9 +100,11 @@ impl RepodataMode {
 
 /// SQL predicate (over `repositories r`) for a repository whose roots are
 /// precomputed: hosted RPM, no active curated publication (that serves its
-/// own frozen repodata), and not opted out.
+/// own frozen repodata), not being deleted (#4311), and not opted out.
 const PRECOMPUTED_REPO_SQL: &str = "r.format = 'rpm' AND r.repo_type = 'local' \
      AND r.active_publication_id IS NULL \
+     AND NOT EXISTS (SELECT 1 FROM repository_delete_jobs j \
+                     WHERE j.repository_id = r.id AND j.status IN ('pending', 'running')) \
      AND NOT EXISTS (SELECT 1 FROM repository_config c \
                      WHERE c.repository_id = r.id AND c.key = 'repodata_mode' \
                        AND c.value = 'on_request')";
@@ -122,6 +128,12 @@ pub struct BuilderSettings {
     pub failure_backoff: Duration,
     /// How often the fingerprint reconcile and the revision GC run.
     pub maintenance_every: Duration,
+    /// A claimed build that has not swapped by then (its replica died) is
+    /// retried.
+    pub build_deadline: Duration,
+    /// Longest the builder waits for in-flight writers of a root before it
+    /// clears the root's dirty flag; past it the root is skipped this tick.
+    pub fence_timeout: Duration,
     /// Roots looked at per tick.
     pub batch: i64,
 }
@@ -135,6 +147,8 @@ impl Default for BuilderSettings {
             retry_incomplete: Duration::from_secs(60),
             failure_backoff: Duration::from_secs(30),
             maintenance_every: Duration::from_secs(60),
+            build_deadline: Duration::from_secs(15 * 60),
+            fence_timeout: Duration::from_secs(5),
             batch: 16,
         }
     }
@@ -313,8 +327,8 @@ pub async fn build_waiting(
 pub async fn request_build(db: &PgPool, repo_id: Uuid, root: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO rpm_repodata_roots (repository_id, root, dirty_since) \
-         VALUES ($1, $2, '-infinity') \
-         ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = '-infinity', \
+         VALUES ($1, $2, 'epoch') \
+         ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = 'epoch', \
              retry_at = NULL, last_error = NULL",
     )
     .bind(repo_id)
@@ -377,14 +391,20 @@ async fn precomputed_location(db: &PgPool, repo_id: Uuid) -> Result<Option<Stora
     Ok(row.map(|(backend, path)| StorageLocation { backend, path }))
 }
 
-/// A spool file for one compressed document.
+/// A spool file for one compressed document, in the upload staging
+/// directory (`AK_UPLOAD_STAGING_DIR`, default `<STORAGE_PATH>/.incoming`):
+/// a deployment-sized disk, unlike a memory-backed `/tmp`.
 struct Spool {
     file: tempfile::NamedTempFile,
 }
 
 impl Spool {
-    fn new() -> Result<(Self, BufWriter<std::fs::File>)> {
-        let file = tempfile::NamedTempFile::new()
+    fn new(dir: &std::path::Path) -> Result<(Self, BufWriter<std::fs::File>)> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AppError::Internal(format!("repodata spool directory: {e}")))?;
+        let file = tempfile::Builder::new()
+            .prefix("ak-rpm-repodata-")
+            .tempfile_in(dir)
             .map_err(|e| AppError::Internal(format!("repodata spool file: {e}")))?;
         let writer = file
             .reopen()
@@ -408,6 +428,11 @@ async fn build_root(
         // A root of an earlier layout: the depth can only change once the
         // repository holds no artifacts, so nothing lives there any more.
         drop_root(state, repo_id, root).await?;
+        sqlx::query("DELETE FROM rpm_repodata_roots WHERE repository_id = $1 AND root = $2")
+            .bind(repo_id)
+            .bind(root)
+            .execute(&state.db)
+            .await?;
         return Ok(BuildOutcome::Empty);
     }
     let prefix = root_prefix(root);
@@ -421,31 +446,23 @@ async fn build_root(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    // 2. Claim a revision number and clear the dirty flag. A write that
-    //    commits from here on re-dirties the root. The storage location is
-    //    recorded now so the GC can find this revision's objects even if the
-    //    build fails before it becomes current.
-    let revision: i64 = sqlx::query_scalar(
-        "INSERT INTO rpm_repodata_roots \
-             (repository_id, root, next_revision, storage_backend, storage_path) \
-         VALUES ($1, $2, 1, $3, $4) \
-         ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = NULL, \
-             retry_at = NULL, next_revision = rpm_repodata_roots.next_revision + 1, \
-             storage_backend = COALESCE(rpm_repodata_roots.storage_backend, $3), \
-             storage_path = COALESCE(rpm_repodata_roots.storage_path, $4) \
-         RETURNING next_revision",
-    )
-    .bind(repo_id)
-    .bind(root)
-    .bind(&location.backend)
-    .bind(&location.path)
-    .fetch_one(&state.db)
-    .await?;
+    // 2. Claim a revision number and clear the dirty flag, under the
+    //    exclusive fence: writers whose trigger saw the root dirty (and so
+    //    did not touch the row) hold the shared fence until they commit, so
+    //    once the clear commits every such write is visible to the snapshot
+    //    below, and any later write re-dirties the root. `retry_at` is the
+    //    deadline after which a build that never swapped is retried. The
+    //    storage location is recorded now so the GC can find this revision's
+    //    objects even if the build fails before it becomes current.
+    let Some(revision) = claim(state, repo_id, root, &location, settings).await? else {
+        return Ok(BuildOutcome::Busy);
+    };
 
     // 3. Render one snapshot into spool files.
-    let (primary, primary_w) = Spool::new()?;
-    let (filelists, filelists_w) = Spool::new()?;
-    let (other, other_w) = Spool::new()?;
+    let spool_dir = crate::api::handlers::incus::staging_root(&state.config.storage_path);
+    let (primary, primary_w) = Spool::new(&spool_dir)?;
+    let (filelists, filelists_w) = Spool::new(&spool_dir)?;
+    let (other, other_w) = Spool::new(&spool_dir)?;
     let render = rpm::render_repodata_snapshot(
         state,
         &[repo_id],
@@ -546,12 +563,13 @@ async fn build_root(
         });
     };
 
-    // 6. A write that was in flight while the snapshot was taken (its
-    //    trigger saw the root still dirty) has committed by now or will be
-    //    found by `reconcile`.
+    // 6. Safety net: the fence already puts every write that skipped the
+    //    dirty mark into the snapshot; if the live fingerprint moved anyway,
+    //    build again.
     mark_dirty_if_moved(&state.db, repo_id, root).await?;
 
-    // 7. Keep the previous revision for clients mid-refresh; delete the rest.
+    // 7. Keep the previous revision so a download in flight during the swap
+    //    completes; delete the rest.
     let keep = previous.unwrap_or(revision);
     for old in gc_floor..revision {
         if Some(old) != previous {
@@ -583,6 +601,60 @@ async fn build_root(
     })
 }
 
+/// Step 2 of [`build_root`]: `None` when in-flight writers did not finish
+/// within [`BuilderSettings::fence_timeout`].
+async fn claim(
+    state: &SharedState,
+    repo_id: Uuid,
+    root: &str,
+    location: &StorageLocation,
+    settings: &BuilderSettings,
+) -> Result<Option<i64>> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL lock_timeout = '{}ms'",
+        settings.fence_timeout.as_millis().max(1)
+    )))
+    .execute(&mut *tx)
+    .await?;
+    let fenced = sqlx::query("SELECT pg_advisory_xact_lock(ak_rpm_repodata_fence($1, $2))")
+        .bind(repo_id)
+        .bind(root)
+        .execute(&mut *tx)
+        .await;
+    match fenced {
+        Ok(_) => {}
+        Err(e)
+            if e.as_database_error()
+                .and_then(|d| d.code())
+                .is_some_and(|c| c == "55P03" || c == "57014") =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let revision: i64 = sqlx::query_scalar(
+        "INSERT INTO rpm_repodata_roots \
+             (repository_id, root, next_revision, retry_at, storage_backend, storage_path) \
+         VALUES ($1, $2, 1, now() + make_interval(secs => $5), $3, $4) \
+         ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = NULL, \
+             retry_at = now() + make_interval(secs => $5), \
+             next_revision = rpm_repodata_roots.next_revision + 1, \
+             storage_backend = COALESCE(rpm_repodata_roots.storage_backend, $3), \
+             storage_path = COALESCE(rpm_repodata_roots.storage_path, $4) \
+         RETURNING next_revision",
+    )
+    .bind(repo_id)
+    .bind(root)
+    .bind(&location.backend)
+    .bind(&location.path)
+    .bind(settings.build_deadline.as_secs_f64())
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(revision))
+}
+
 /// Set `dirty_since` when the live fingerprint of the root no longer matches
 /// the one its current revision was built from.
 async fn mark_dirty_if_moved(db: &PgPool, repo_id: Uuid, root: &str) -> Result<()> {
@@ -606,12 +678,24 @@ const MOVED_SQL: &str = "rr.dirty_since IS NULL AND rr.built_revision IS NOT NUL
              AND starts_with(a.path, CASE WHEN rr.root = '' THEN '' ELSE rr.root || '/' END)) \
          IS DISTINCT FROM (rr.built_count, rr.built_latest)";
 
+/// SQL predicate (over `rpm_repodata_roots rr`): a clean root that has
+/// never been built (or was dropped while empty) but lists packages, with no
+/// build pending.
+const UNBUILT_POPULATED_SQL: &str = "rr.dirty_since IS NULL AND rr.built_revision IS NULL \
+     AND rr.retry_at IS NULL \
+     AND EXISTS (SELECT 1 FROM artifacts a \
+           WHERE a.repository_id = rr.repository_id AND a.is_deleted = false \
+             AND a.path LIKE '%.rpm' \
+             AND starts_with(a.path, CASE WHEN rr.root = '' THEN '' ELSE rr.root || '/' END))";
+
 /// Mark dirty every clean built root whose packages moved without the
-/// triggers marking it (a write whose trigger ran while the root was dirty
-/// but which committed after the build's snapshot). Returns the count.
+/// triggers marking it, and every unbuilt root that has packages. A safety
+/// net: the fence and the claim deadline already cover the known races.
+/// Returns the count.
 pub async fn reconcile(db: &PgPool) -> Result<u64> {
     let moved = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "UPDATE rpm_repodata_roots rr SET dirty_since = now() WHERE {MOVED_SQL}"
+        "UPDATE rpm_repodata_roots rr SET dirty_since = now() \
+          WHERE ({MOVED_SQL}) OR ({UNBUILT_POPULATED_SQL})"
     )))
     .execute(db)
     .await?
@@ -640,7 +724,8 @@ async fn delete_revision(
 }
 
 /// Stop serving a stored revision of `root` and delete every revision. The
-/// row goes too unless a write re-dirtied it meanwhile.
+/// row stays (it keeps `next_revision`, so numbers are never reused) and
+/// renders on request until the next build.
 async fn drop_root(state: &SharedState, repo_id: Uuid, root: &str) -> Result<()> {
     let row: Option<(i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
         "WITH old AS ( \
@@ -648,7 +733,7 @@ async fn drop_root(state: &SharedState, repo_id: Uuid, root: &str) -> Result<()>
               WHERE repository_id = $1 AND root = $2 FOR UPDATE) \
          UPDATE rpm_repodata_roots rr SET built_revision = NULL, previous_revision = NULL, \
              built_repomd = NULL, built_sizes = NULL, built_count = NULL, built_latest = NULL, \
-             gc_floor = rr.next_revision + 1 \
+             retry_at = NULL, gc_floor = rr.next_revision + 1 \
            FROM old WHERE rr.repository_id = old.repository_id AND rr.root = old.root \
           RETURNING old.gc_floor, rr.next_revision, rr.storage_backend, rr.storage_path",
     )
@@ -663,14 +748,6 @@ async fn drop_root(state: &SharedState, repo_id: Uuid, root: &str) -> Result<()>
             }
         }
     }
-    sqlx::query(
-        "DELETE FROM rpm_repodata_roots \
-          WHERE repository_id = $1 AND root = $2 AND dirty_since IS NULL",
-    )
-    .bind(repo_id)
-    .bind(root)
-    .execute(&state.db)
-    .await?;
     Ok(())
 }
 

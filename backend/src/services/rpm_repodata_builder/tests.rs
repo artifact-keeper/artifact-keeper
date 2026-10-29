@@ -199,7 +199,11 @@ async fn stored_revision_is_byte_identical_to_the_on_request_render_4544() {
     // The GC drops an opted-out repository's revisions.
     collect_garbage(&f.state).await.unwrap();
     assert!(!object_exists(&f, "", 1, "primary.xml.gz").await);
-    assert_eq!(row(&f, "").await.map(|r| r.1), None);
+    assert_eq!(
+        row(&f, "").await.map(|r| r.1),
+        Some(None),
+        "revision dropped, row kept"
+    );
     f.teardown().await;
 }
 
@@ -376,10 +380,15 @@ async fn depth_roots_build_independently_and_empty_roots_are_dropped_4544() {
     .await
     .unwrap();
     assert_eq!(build(&f, "el9").await, BuildOutcome::Empty);
-    assert!(
-        row(&f, "el9").await.is_none(),
+    assert_eq!(
+        row(&f, "el9").await.map(|r| r.1),
+        Some(None),
         "an empty root is not stored"
     );
+    assert!(stored_revision(&f.pool, f.repo_id, "el9")
+        .await
+        .unwrap()
+        .is_none());
     assert!(!object_exists(&f, "el9", 1, "primary.xml.gz").await);
     let (status, _) = get(&f, "el9/repodata/repomd.xml").await;
     assert_eq!(status, StatusCode::OK);
@@ -473,4 +482,54 @@ fn file_sinks_receive_the_in_memory_bytes_4544() {
             assert_eq!(doc.size, mem.size);
         }
     }
+}
+
+/// The claim waits for writers still holding the root's fence (their
+/// trigger saw the root dirty and skipped it), so their rows are in the
+/// snapshot; a writer that outlasts the fence timeout makes the root Busy
+/// for this tick, still dirty. A build that dies after its claim is retried
+/// once its deadline passes (#4544).
+#[tokio::test]
+async fn claim_waits_for_fenced_writers_and_crashed_builds_retry_4544() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    let mut writer = f.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(ak_rpm_repodata_fence($1, ''))")
+        .bind(f.repo_id)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let hasty = BuilderSettings {
+        fence_timeout: Duration::from_millis(100),
+        ..BuilderSettings::default()
+    };
+    let outcome = try_build(&f.state, f.repo_id, "", &hasty).await.unwrap();
+    assert_eq!(outcome, BuildOutcome::Busy);
+    assert!(row(&f, "").await.unwrap().0.is_some(), "still dirty");
+    writer.commit().await.unwrap();
+    assert!(matches!(build(&f, "").await, BuildOutcome::Built { .. }));
+
+    // A claim whose build never swapped: clean, deadline passed.
+    sqlx::query(
+        "UPDATE rpm_repodata_roots SET dirty_since = NULL, retry_at = now() - interval '1 second' \
+          WHERE repository_id = $1",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let patient = BuilderSettings {
+        quiet: Duration::from_secs(3600),
+        max_delay: Duration::from_secs(3600),
+        batch: 10_000,
+        ..BuilderSettings::default()
+    };
+    assert!(due_roots(&f.pool, &patient)
+        .await
+        .unwrap()
+        .iter()
+        .any(|(id, _)| *id == f.repo_id));
+    f.teardown().await;
 }
