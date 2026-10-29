@@ -495,8 +495,9 @@ const ANCESTOR_TAGGED_UNDER_IMAGE_SQL: &str = concat!(
 "#
 );
 
-/// Live manifest-shaped catalog rows of any index above `$2` (`$4` caps the
-/// count), for path attribution in Rust.
+/// Live manifest-shaped catalog rows of any index above `$2` whose path
+/// contains the image name `$5` (a cheap pre-filter; `$4` caps the count),
+/// for path attribution in Rust.
 const ANCESTOR_CATALOG_PATHS_SQL: &str = concat!(
     ancestor_indexes_cte!(),
     r#"
@@ -507,6 +508,7 @@ const ANCESTOR_CATALOG_PATHS_SQL: &str = concat!(
      AND a.checksum_sha256 = SUBSTRING(anc.digest FROM 8)::bpchar
     WHERE a.repository_id = $1
       AND a.is_deleted = false
+      AND strpos(a.path, $5) > 0
       AND "#,
     crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
     r#"
@@ -556,23 +558,33 @@ async fn digest_belongs_to_image(
         .bind(digest)
         .bind(MAX_OWNING_INDEX_DEPTH)
         .bind(MAX_ANCESTOR_CATALOG_ROWS)
+        .bind(image)
         .fetch_all(db)
         .await?;
     Ok(paths_attribute_to_image(&paths, repo_key, image))
 }
 
 /// Whether repository `repo_id` itself records manifest `digest`: its
-/// `oci_manifests` row, or any tag of the repository naming it (a manifest a
-/// pre-1.11 replica pushed before the row existed). Used for the children an
-/// index lists, which are read only when this repository holds them.
+/// `oci_manifests` row, any tag of the repository naming it (a manifest a
+/// pre-1.11 replica pushed before the row existed), or a live manifest-shaped
+/// catalog row with those bytes (migrated data before the backfill records
+/// it). Used for the children an index lists, which are read only when this
+/// repository holds them.
 async fn manifest_recorded_in_repository(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     digest: &str,
 ) -> Result<bool> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM oci_manifests WHERE repository_id = $1 AND digest = $2) \
-             OR EXISTS (SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2)",
+        concat!(
+            "SELECT EXISTS (SELECT 1 FROM oci_manifests WHERE repository_id = $1 AND digest = $2) \
+                 OR EXISTS (SELECT 1 FROM oci_tags WHERE repository_id = $1 AND manifest_digest = $2) \
+                 OR EXISTS (SELECT 1 FROM artifacts a WHERE a.repository_id = $1 \
+                     AND $2 LIKE 'sha256:%' AND a.is_deleted = false \
+                     AND a.checksum_sha256 = SUBSTRING($2 FROM 8)::bpchar AND ",
+            crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+            ")"
+        ),
     )
     .bind(repo_id)
     .bind(digest)

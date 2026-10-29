@@ -525,8 +525,8 @@ where
         })?;
         if !child_in_repository(choice.manifest_digest.clone()).await? {
             return Err(AppError::NotFound(format!(
-                "platform manifest {} is not in this repository",
-                choice.manifest_digest
+                "platform manifest is not in storage ({})",
+                manifest_storage_key(&choice.manifest_digest)
             )));
         }
         index_digest = Some(manifest_digest.to_string());
