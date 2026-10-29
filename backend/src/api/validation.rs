@@ -905,17 +905,21 @@ fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     crate::services::metrics_service::record_ssrf_block(surface);
 }
 
+/// Tests that mutate the process-wide private-address settings
+/// (`AK_SSRF_ALLOW_PRIVATE_CIDRS`, the per-context toggles) serialize on this
+/// lock, wherever they live: `cargo test` runs tests in parallel threads, so
+/// without it an env-mutating test can flip state under another test.
+#[cfg(test)]
+pub(crate) static OUTBOUND_POLICY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Tests that mutate process-wide env vars (the private-IP allowlist
-    /// toggles) must serialize to avoid racing parallel test threads.
-    /// `cargo test` runs tests in parallel; without this lock, an
-    /// env-var-mutating test can flip state under another test's nose.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// See [`OUTBOUND_POLICY_ENV_LOCK`].
+    static ENV_LOCK: &Mutex<()> = &OUTBOUND_POLICY_ENV_LOCK;
 
     /// Helper: assert that `validate_outbound_url(url, ...)` rejects with
     /// an error whose message contains both `label_part` (proving the

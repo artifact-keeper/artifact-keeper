@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5095]
+---
+- **A remote repository now applies the upstream outbound address policy to IP-literal destinations in every egress routing mode** (#5095). URLs a Remote reads from upstream content, such as the chart URLs in a Helm `index.yaml`, were checked against the policy only when the repository routed through an explicit egress proxy; with direct or inherited routing the connect-time resolver check was relied on, and an IP-literal host never reaches the resolver. Every upstream fetch now checks an IP-literal destination (including numeric, octal and hex IPv4 spellings, IPv6, and IPv4-mapped IPv6) against the same policy that validates a saved upstream URL before any request is sent, and refuses it the same way. The configured private-address exceptions (the private-CIDR allowlist and `UPSTREAM_ALLOW_PRIVATE_IPS`) apply as before; loopback, link-local and cloud metadata addresses stay refused. Host names keep the connect-time check, and explicit egress proxies are unchanged.
