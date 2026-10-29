@@ -302,7 +302,17 @@ fn idp_body_snippet(body: &[u8]) -> String {
     let end = body.len().min(IDP_ERROR_SNIPPET_BYTES);
     String::from_utf8_lossy(&body[..end])
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            // Control characters, line/paragraph separators and bidi
+            // overrides would split or reorder the log line.
+            if c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -335,25 +345,28 @@ pub async fn require_idp_success(
 /// OAuth error responses are JSON bodies on a 400 (`{"error": ...}`), which
 /// the caller reports, so a non-2xx JSON body is returned like a 2xx one.
 /// Only a non-2xx answer whose body is not JSON (a WAF or proxy error page)
-/// fails here: the status and a body snippet go to the server log, and the
-/// error names only `what` and the status.
+/// fails here, and the error names only `what` and the status. A non-2xx
+/// status is logged either way. The token request carries the client
+/// credentials, so the body snippet is logged at debug level only.
 pub async fn read_idp_token_response(
     response: reqwest::Response,
     what: &str,
 ) -> std::result::Result<serde_json::Value, String> {
     let status = response.status();
     let body = read_body_capped(response, MAX_OIDC_RESPONSE_BYTES).await?;
-    match serde_json::from_slice::<serde_json::Value>(&body) {
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body);
+    if !status.is_success() {
+        tracing::warn!(
+            %status,
+            json = parsed.is_ok(),
+            "{what} returned a non-success status"
+        );
+        tracing::debug!(%status, body = %idp_body_snippet(&body), "{what} error body");
+    }
+    match parsed {
         Ok(value) => Ok(value),
         Err(e) if status.is_success() => Err(format!("invalid JSON in response body: {e}")),
-        Err(_) => {
-            tracing::warn!(
-                %status,
-                body = %idp_body_snippet(&body),
-                "{what} returned a non-success status with a non-JSON body"
-            );
-            Err(format!("{what} returned HTTP {status}"))
-        }
+        Err(_) => Err(format!("{what} returned HTTP {status}")),
     }
 }
 
@@ -1749,9 +1762,14 @@ mod tests {
 
     #[test]
     fn test_idp_body_snippet_is_short_and_single_line_5036() {
-        let body = format!("<html>\n\r\t{}", "x".repeat(4096));
+        let body = format!("<html>\n\r\t\u{2028}\u{202E}{}", "x".repeat(4096));
         let snippet = super::idp_body_snippet(body.as_bytes());
-        assert_eq!(snippet.len(), super::IDP_ERROR_SNIPPET_BYTES);
+        assert!(
+            snippet.chars().count() <= super::IDP_ERROR_SNIPPET_BYTES,
+            "{snippet}"
+        );
+        assert!(snippet.ends_with("xxx"), "{snippet}");
         assert!(!snippet.chars().any(char::is_control), "{snippet}");
+        assert!(!snippet.contains(['\u{2028}', '\u{202E}']), "{snippet}");
     }
 }
