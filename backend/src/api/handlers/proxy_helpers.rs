@@ -2988,7 +2988,12 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
     name = "resolve_virtual_members",
     level = "info",
     skip_all,
-    fields(artifact_keeper.virtual.member_count = members.len())
+    // `usize` has no OpenTelemetry type and the tracing bridge exports it as
+    // a string, so keep the count numeric (#4931).
+    fields(
+        artifact_keeper.virtual.member_count =
+            i64::try_from(members.len()).unwrap_or(i64::MAX)
+    )
 )]
 pub(crate) async fn resolve_members_two_phase<'a, T, E, P, PFut, U, UFut>(
     members: &'a [Repository],
@@ -13361,6 +13366,32 @@ mod tests {
 
     fn two_members() -> Vec<Repository> {
         vec![test_local_member("m0"), test_local_member("m1")]
+    }
+
+    /// #4931: `member_count` must be an OTLP integer, not a string. The field
+    /// is a `usize`, which has no OpenTelemetry value type; converting it at
+    /// the span keeps dashboards able to aggregate it numerically.
+    #[tokio::test]
+    async fn resolve_virtual_members_exports_member_count_as_an_integer() {
+        use crate::testing::otel::{attr, otel_subscriber, ExportedSpans};
+
+        let exported = ExportedSpans::default();
+        let _guard = tracing::subscriber::set_default(otel_subscriber(&exported));
+        let members = two_members();
+        let out = resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |_m| async move { (MemberCacheClass::DefiniteMiss, None) },
+            |_m| async move { MemberResolveOutcome::Miss },
+        )
+        .await;
+        assert!(out.is_none());
+
+        let span = exported.one("resolve_virtual_members");
+        assert_eq!(
+            attr(&span, "artifact_keeper.virtual.member_count"),
+            Some(opentelemetry::Value::I64(2)),
+            "member_count must reach the exporter as an integer"
+        );
     }
 
     #[tokio::test]

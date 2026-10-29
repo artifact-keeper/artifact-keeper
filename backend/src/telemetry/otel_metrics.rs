@@ -67,6 +67,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use opentelemetry::metrics::{Meter, MeterProvider as _};
@@ -353,19 +354,35 @@ fn http_duration_view(instrument: &opentelemetry_sdk::metrics::Instrument) -> Op
 ///
 /// [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
 pub(crate) struct MetricsGuard {
-    provider: SdkMeterProvider,
+    provider: Option<SdkMeterProvider>,
 }
 
 impl MetricsGuard {
     pub(crate) fn new(provider: SdkMeterProvider) -> Self {
-        Self { provider }
+        Self {
+            provider: Some(provider),
+        }
+    }
+
+    /// Shut the meter provider down as part of the process-wide telemetry
+    /// deadline (#4931). The SDK's meter provider currently ignores the
+    /// timeout argument, but taking the guard here still prevents a second
+    /// shutdown from `Drop` and keeps all three signals on one deadline.
+    pub(crate) fn shutdown(mut self, timeout: Duration) {
+        if let Some(provider) = self.provider.take() {
+            if let Err(e) = provider.shutdown_with_timeout(timeout) {
+                eprintln!("Failed to shutdown OTel meter provider: {e:?}");
+            }
+        }
     }
 }
 
 impl Drop for MetricsGuard {
     fn drop(&mut self) {
-        if let Err(e) = self.provider.shutdown() {
-            eprintln!("Failed to shutdown OTel meter provider: {e:?}");
+        if let Some(provider) = self.provider.take() {
+            if let Err(e) = provider.shutdown() {
+                eprintln!("Failed to shutdown OTel meter provider: {e:?}");
+            }
         }
     }
 }

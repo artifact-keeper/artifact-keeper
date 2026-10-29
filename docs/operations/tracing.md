@@ -153,7 +153,7 @@ lost under `RUST_LOG=info`.
 | Span | When | Attributes |
 |---|---|---|
 | `authenticate` | Credential verification for a request that carries credentials. | none |
-| `resolve_virtual_members` | A virtual repository probes its members. | `artifact_keeper.virtual.member_count` (exported as a string) |
+| `resolve_virtual_members` | A virtual repository probes its members. | `artifact_keeper.virtual.member_count` (integer) |
 | `proxy_fetch` | A Remote repository fetches through its cache. | `artifact_keeper.repository.key`, `artifact_keeper.proxy.mode` (`buffered` or `streaming`) |
 
 ### Upstream requests (kind `CLIENT`)
