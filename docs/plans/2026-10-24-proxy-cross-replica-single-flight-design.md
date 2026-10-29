@@ -98,8 +98,21 @@ live key and writes the sidecar.
   must skip the spool and pass through as today, and an unknown length that
   trips the ceiling mid-stream must switch the leader's client to direct
   pass-through and mark the row `failed` so followers stop tailing.
-- **Scan-on-proxy**: the scanned path buffers the body and does not tee, so it
-  is unchanged. The scan gate continues to operate on the full object as today.
+- **Scan-on-proxy and commit-after-gate** (#4514, #5070): the scanned path
+  buffers the body and does not tee, so decoupling the fill does not change how
+  it reads upstream, and the gate still decides on the full object. Since #5070
+  the fill is not committed before the gate: it is held until
+  `gate_proxy_scan_serve` decides, then a served or `403` blocked body is
+  committed (a blocked body stays cached, and every reader of the scanning
+  Remote refuses it from its stored verdict), while a `fail_closed` `423`
+  (inconclusive) body is dropped and never cached. Today a request on another replica that lost the advisory
+  lock polls for the cache entry, so after a dropped fill it waits out the
+  65-second hydration wait before fetching the file itself. The row removes
+  that wait: a held fill stays `filling` while the gate decides, a committed
+  body (served or blocked) moves it to `published`, and a dropped body moves it
+  to `failed`, so followers fetch and gate the file themselves at once.
+  Followers never tail a scanned fill's spool; they wait for `published` and
+  read the committed entry through the gate, as today.
 
 ## Open questions
 
@@ -115,10 +128,8 @@ live key and writes the sidecar.
 2. **Heartbeat write rate.** Updating `bytes_committed` per chunk is too much
    write traffic; per N MiB or per second? (Proposal: every 1 s or 8 MiB,
    whichever comes first; tailing followers read the spool's size, not the row,
-   for progress. Heartbeats should also update on state transitions to
-   `published`/`failed`. Liveness is signaled by `heartbeat_at`; a dead leader
-   cannot write updates, so do not rely on "update on leader liveness changes"
-   as an action the leader takes.)
+   for progress. The transitions to `published` and `failed` also write the
+   row. A successor detects a dead leader only by a stale `heartbeat_at`.)
 3. **Does the in-process `BufferedCoordinator` stay** as a first layer (no DB
    round trip for the common single-replica case), with the row only for
    cross-replica election? (Proposal: yes.) The in-process fan-out and local
@@ -132,6 +143,17 @@ live key and writes the sidecar.
    as today). Of those variables, `PROXY_SINGLEFLIGHT_LOCK_POLL_INTERVAL_MS`
    and `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` are lock-specific; under a
    row-based coordinator they become no-ops unless there is still a lock-based
-   path, and the meaning of the remaining variables (e.g. wait timeouts used
-   by the fallback path) must be called out explicitly rather than assumed to
-   carry over unchanged.
+   path. The other two need an explicit answer rather than an assumption that
+   they carry over: does `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED` also turn
+   the row-based coordinator on, and does
+   `PROXY_SINGLEFLIGHT_LOCK_WAIT_TIMEOUT_SECS` (65 s) become a follower's wait
+   on a `filling` row?
+5. **Keeping an inconclusive body.** Since #5070 a `fail_closed` inconclusive
+   fill is dropped, so its next pull fetches it from the upstream again
+   (bounded by `PROXY_SCAN_MAX_BYTES`), and
+   `docs/security/proxy-cache-commit-after-gate.md` leaves keeping those bytes
+   for a retry to this spool. Should a dropped scanned fill keep its spool,
+   outside the live cache key, so the retry rescans it without a refetch?
+   (Proposal: not in the first cut. A kept spool must never be served or
+   committed without passing the gate again, and it needs the same retention
+   rule as question 1.)
