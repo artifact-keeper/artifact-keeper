@@ -25135,6 +25135,13 @@ mod proxy_download_recording_tests {
                 1,
             ),
             ("pypi.rs", "serve_file", "serve_scanned_pypi_file(", 2),
+            // The age gate's last-known-good substitute (#5075).
+            (
+                "pypi.rs",
+                "enforce_pypi_download_age_gate",
+                "serve_scanned_pypi_file(",
+                1,
+            ),
             (
                 "pypi.rs",
                 "serve_scanned_pypi_file",
