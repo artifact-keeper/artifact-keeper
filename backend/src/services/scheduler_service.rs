@@ -2030,10 +2030,6 @@ async fn run_curation_sync_cycle_for(
     // lookups instead of hammering the public stats APIs.
     let popularity_source =
         crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
-    let client = crate::services::http_client::base_client_builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
     // Repo-level ingest failures that must surface as a failed sync (#4427)
     // without aborting the rest of the sweep.
     let mut failures: Vec<String> = Vec::new();
@@ -2060,6 +2056,28 @@ async fn run_curation_sync_cycle_for(
             );
             break;
         }
+
+        // The client this Remote's fetches use, built the way the proxy reaches
+        // that upstream: the stored URL passes the upstream URL validation and
+        // the requests go out on the Remote's egress route.
+        let client = match curation_client_for(db, *remote_id, upstream_url).await {
+            Ok(CurationClient::Ready(client)) => client,
+            Ok(CurationClient::Refused(reason)) => {
+                // Skipped without a request and left unstamped, so a URL or
+                // allowlist fix takes effect on the next tick.
+                tracing::info!(
+                    staging_repo_id = %staging_id,
+                    remote_id = %remote_id,
+                    reason = %reason,
+                    "curation sync: upstream URL is not allowed; skipping"
+                );
+                continue;
+            }
+            Err(reason) => {
+                record_curation_failure(&mut failures, *staging_id, reason);
+                continue;
+            }
+        };
 
         let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, *remote_id)
             .await
@@ -2488,6 +2506,45 @@ async fn run_curation_sync_cycle_for(
     }
 }
 
+/// The client for one Remote's curation fetches, or why there is none.
+enum CurationClient {
+    Ready(reqwest::Client),
+    /// The stored upstream URL is refused by the upstream URL validation.
+    Refused(String),
+}
+
+/// Build the curation client for the Remote `remote_id` the way the proxy
+/// fetch path reaches its upstream (as the `test-upstream` probe does): the
+/// stored `upstream_url` must pass the upstream URL validation, and the client
+/// follows the Remote's egress configuration (`direct` / `explicit` proxy,
+/// else the process default). `Err` is a configuration or client-build
+/// failure, reported like a failed fetch.
+async fn curation_client_for(
+    db: &PgPool,
+    remote_id: uuid::Uuid,
+    upstream_url: &str,
+) -> Result<CurationClient, String> {
+    // Off the async worker: the validation may resolve the host.
+    let url = upstream_url.to_string();
+    let validation = tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&url, "Upstream URL")
+    })
+    .await
+    .map_err(|e| format!("upstream URL validation task failed: {e}"))?;
+    if let Err(e) = validation {
+        return Ok(CurationClient::Refused(e.to_string()));
+    }
+    let egress = crate::services::egress_proxy::load_egress_proxy(db, remote_id)
+        .await
+        .map_err(|e| format!("could not load the egress configuration: {e}"))?;
+    let client = crate::services::egress_proxy::repo_client_builder(&egress)
+        .map_err(|e| format!("could not build the egress client: {e}"))?
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("could not build the HTTP client: {e}"))?;
+    Ok(CurationClient::Ready(client))
+}
+
 /// Log one staging repo's RPM curation-sync failure and record it so the cycle
 /// reports failure (manual trigger: `succeeded: false`) once the rest of the
 /// sweep has run (#4427). The repo is left unstamped, so it retries next tick.
@@ -2772,14 +2829,32 @@ async fn verify_pypi_curation_row(
     // (`urls[].url`), so a hostile or compromised mirror chooses it. Send the
     // repository's configured upstream credentials ONLY when it stays on the
     // configured upstream's origin — same rule as the NuGet remote-search fix
-    // (#3130/#2925). Network-level SSRF is already refused at connect time by the
-    // shared DNS guard; this is specifically about not handing an operator's
-    // Basic/token header to whatever public host the mirror names.
+    // (#3130/#2925). This is specifically about not handing an operator's
+    // Basic/token header to whatever public host the mirror names; the
+    // destination itself is checked below.
     let dist_auth = if same_upstream_origin(upstream_url, &dist_url) {
         upstream_auth.clone()
     } else {
         None
     };
+    // The mirror names this host, so it gets the same upstream URL validation
+    // as the Remote's own URL before anything is sent: a client on an egress
+    // proxy hands the name to the proxy and never resolves it locally.
+    let check_url = dist_url.clone();
+    let allowed = tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&check_url, "Distribution URL").is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    if !allowed {
+        tracing::info!(
+            staging_repo_id = %pkg.staging_repo_id,
+            "curation sync: distribution URL is not allowed; attestation lookup skipped"
+        );
+        return AttestationVerdict::failure(
+            "attestation lookup skipped: the distribution URL is not allowed".to_string(),
+        );
+    }
     let Some(bytes) = bounded_download(client, &dist_auth, &dist_url).await else {
         return AttestationVerdict::failure(format!(
             "could not fetch distribution `{filename}` for attestation verification"
@@ -4123,7 +4198,9 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let server = wiremock::MockServer::start().await;
+        // The sweep refuses loopback upstreams, so the mock listens on a
+        // routable interface the test allowlists.
+        let (server, _allowlisted) = tdh::non_loopback_mock_server().await;
         let primary = r#"<?xml version="1.0" encoding="UTF-8"?>
 <metadata xmlns="http://linux.duke.edu/metadata/common" packages="2">
 <package type="rpm"><name>nginx</name><arch>x86_64</arch><version epoch="0" ver="1.24.0" rel="1.el9"/><checksum type="sha256" pkgid="YES">abc123</checksum><location href="Packages/nginx-1.24.0-1.el9.x86_64.rpm"/></package>
@@ -4191,6 +4268,262 @@ mod tests {
             .await;
     }
 
+    /// A Remote whose stored upstream URL the upstream URL validation refuses
+    /// (here loopback) is skipped without any request: no fetch reaches the
+    /// address, the repo is left unstamped, and the sweep does not fail.
+    #[tokio::test]
+    async fn test_curation_sync_skips_a_disallowed_upstream_url_without_a_request() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // On loopback, which the upstream URL validation always refuses.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let rpm_id = uuid::Uuid::new_v4();
+        let rpm_remote =
+            seed_rpm_curation_pair(&pool, rpm_id, &format!("{}/rpm", server.uri())).await;
+        let result = run_curation_sync_cycle_for(&pool, Some(&[rpm_id]), None).await;
+        let rpm_stamped = curation_last_synced_at(&pool, rpm_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![rpm_id, rpm_remote])
+            .execute(&pool)
+            .await;
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert!(
+            received.is_empty(),
+            "a disallowed upstream URL was contacted: {:?}",
+            received
+                .iter()
+                .map(|r| r.url.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.is_ok(),
+            "a refused URL is skipped, not a failure: {result:?}"
+        );
+        assert!(
+            rpm_stamped.is_none(),
+            "the refused rpm repo stays unstamped"
+        );
+    }
+
+    /// The sweep sends a Remote's index fetches on that Remote's egress
+    /// route: with an explicit proxy configured, the repomd.xml request
+    /// reaches the proxy (the upstream host itself does not resolve).
+    #[tokio::test]
+    async fn test_curation_sync_uses_the_remote_egress_proxy() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::egress_proxy::{
+            save_egress_proxy, EgressProxyConfig, EgressProxyMode,
+        };
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        // The "proxy": absolute-form requests land on it by path.
+        let proxy = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&proxy)
+            .await;
+
+        let staging_id = uuid::Uuid::new_v4();
+        let remote_id =
+            seed_rpm_curation_pair(&pool, staging_id, "http://curation-upstream.invalid/rpm").await;
+        save_egress_proxy(
+            &pool,
+            remote_id,
+            &EgressProxyConfig {
+                mode: EgressProxyMode::Explicit,
+                proxy_url: Some(proxy.uri()),
+                no_proxy: None,
+            },
+        )
+        .await
+        .expect("save explicit egress proxy");
+
+        let result = run_curation_sync_cycle_for(&pool, Some(&[staging_id]), None).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![staging_id, remote_id])
+            .execute(&pool)
+            .await;
+
+        let paths: Vec<String> = proxy
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "/rpm/repodata/repomd.xml"),
+            "the repomd.xml fetch did not go through the configured proxy: {paths:?}"
+        );
+        let err = result.expect_err("the proxy answers 503").to_string();
+        assert!(err.contains("repomd.xml fetch failed: 503"), "{err}");
+    }
+
+    /// The distribution URL comes from the mirror's JSON, so it gets the
+    /// upstream URL validation before the attestation download: a loopback
+    /// distribution URL fails the lookup and is never requested.
+    #[tokio::test]
+    async fn test_pypi_attestation_skips_a_disallowed_distribution_url() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::curation::attestation_verify::{
+            AttestationState, TrustRoot, DEFAULT_ISSUER_ALLOWLIST,
+        };
+        use crate::services::curation_service::CurationService;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let Some(trust) = TrustRoot::vendored().ok() else {
+            return;
+        };
+        let (server, _allowlisted) = tdh::non_loopback_mock_server().await;
+        let loopback = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"wheel bytes".to_vec()))
+            .mount(&loopback)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/integrity/demo/1.0.0/demo-1.0.0-py3-none-any.whl/provenance",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/demo/1.0.0/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "urls": [{
+                    "filename": "demo-1.0.0-py3-none-any.whl",
+                    "packagetype": "bdist_wheel",
+                    "digests": { "sha256": "abc123" },
+                    "url": format!("{}/files/demo-1.0.0-py3-none-any.whl", loopback.uri()),
+                }],
+            })))
+            .mount(&server)
+            .await;
+
+        let staging_id = uuid::Uuid::new_v4();
+        let remote_id = uuid::Uuid::new_v4();
+        let remote_key = format!("pypi-dist-remote-{}", remote_id.simple());
+        let staging_key = format!("pypi-dist-staging-{}", staging_id.simple());
+        let upstream = format!("{}/simple", server.uri());
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url) \
+             VALUES ($1, $2, $2, $3, 'remote', 'pypi'::repository_format, $4)",
+        )
+        .bind(remote_id)
+        .bind(&remote_key)
+        .bind(format!("/tmp/{remote_key}"))
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("insert pypi remote");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, \
+                                       curation_enabled, curation_source_repo_id) \
+             VALUES ($1, $2, $2, $3, 'staging', 'pypi'::repository_format, true, $4)",
+        )
+        .bind(staging_id)
+        .bind(&staging_key)
+        .bind(format!("/tmp/{staging_key}"))
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("insert pypi staging repo");
+
+        let curation = CurationService::new(pool.clone());
+        let metadata = serde_json::json!({
+            "_ak_dist": { "filename": "demo-1.0.0-py3-none-any.whl" }
+        });
+        curation
+            .upsert_package(
+                staging_id,
+                remote_id,
+                "pypi",
+                "demo",
+                "1.0.0",
+                None,
+                None,
+                None,
+                "demo-1.0.0-py3-none-any.whl",
+                &metadata,
+                None,
+            )
+            .await
+            .expect("seed curation package");
+        let pkg = curation
+            .list_pending_packages_by_format(staging_id, "pypi", 10)
+            .await
+            .expect("load pending row")
+            .into_iter()
+            .next()
+            .expect("the seeded row is pending");
+
+        let client = crate::services::http_client::base_client_builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client");
+        let allowlist: Vec<String> = DEFAULT_ISSUER_ALLOWLIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let verdict =
+            verify_pypi_curation_row(&client, &None, &upstream, &pkg, &allowlist, &trust).await;
+        let json_fetched = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.url.path() == "/pypi/demo/1.0.0/json");
+        let loopback_requests = loopback.received_requests().await.unwrap_or_default();
+
+        let _ = sqlx::query("DELETE FROM curation_packages WHERE staging_repo_id = $1")
+            .bind(staging_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![staging_id, remote_id])
+            .execute(&pool)
+            .await;
+
+        assert!(
+            json_fetched,
+            "the JSON API on the allowed upstream is fetched"
+        );
+        assert_eq!(
+            verdict.state,
+            AttestationState::Failed,
+            "{:?}",
+            verdict.error
+        );
+        assert!(
+            verdict
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("distribution URL is not allowed")),
+            "{:?}",
+            verdict.error
+        );
+        assert!(
+            loopback_requests.is_empty(),
+            "a disallowed distribution host must not be contacted"
+        );
+    }
+
     /// A curation index fetch that fails at the transport records its error
     /// without the request URL, so credentials in the upstream URL's userinfo
     /// stay out of the cycle's failure text (and the log line built from it).
@@ -4200,8 +4533,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // Only for its allowlisted interface: the refused port is bound there.
+        let (server, _allowlisted) = tdh::non_loopback_mock_server().await;
         let refused = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let listener = std::net::TcpListener::bind((server.address().ip(), 0)).expect("bind");
             format!(
                 "http://user:secret@{}/gone",
                 listener.local_addr().expect("addr")
