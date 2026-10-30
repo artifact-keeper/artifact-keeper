@@ -14,3 +14,39 @@ message OwnerRef {
     string name = 2;
   }
 }
+
+// Resolving a dependency the CLI holds only an id for ends here: it asks
+// `ModuleService/GetModules` for the module and `OwnerService/GetOwners` for
+// the owner, and composes the module's full name from the two. An owner here
+// is the first segment of a module name, which is a namespace rather than a
+// person, so it is answered as an organization.
+import "google/protobuf/timestamp.proto";
+
+message Organization {
+  string id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  google.protobuf.Timestamp update_time = 3;
+  string name = 4;
+}
+
+message User {
+  string id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  google.protobuf.Timestamp update_time = 3;
+  string name = 4;
+}
+
+message Owner {
+  oneof value {
+    User user = 1;
+    Organization organization = 2;
+  }
+}
+
+message GetOwnersRequest {
+  repeated OwnerRef owner_refs = 1;
+}
+
+message GetOwnersResponse {
+  repeated Owner owners = 1;
+}
