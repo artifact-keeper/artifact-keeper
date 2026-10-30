@@ -203,8 +203,16 @@ async fn stored_revision_is_byte_identical_to_the_on_request_render_4544() {
     );
     assert_eq!(documents(&f, "").await, on_request);
     assert_eq!(build(&f, "").await, BuildOutcome::NotPrecomputed);
-    // The GC drops an opted-out repository's revisions.
-    collect_garbage(&f.state).await.unwrap();
+    // The GC drops an opted-out repository's revisions. A concurrent test's
+    // GC may hold this root's lease: this pass then skips it and returns
+    // before that pass has deleted the revision, so retry until it is gone.
+    for _ in 0..20 {
+        collect_garbage(&f.state).await.unwrap();
+        if !object_exists(&f, "", 1, "primary.xml.gz").await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(!object_exists(&f, "", 1, "primary.xml.gz").await);
     assert_eq!(
         row(&f, "").await.map(|r| r.1),
@@ -275,6 +283,77 @@ async fn writes_dirty_the_root_and_old_revisions_are_collected_4544() {
     .unwrap();
     assert_eq!(documents(&f, "").await, stored);
     f.teardown().await;
+}
+
+/// A mark folded after the build that consumed it must not dirty the root
+/// again: it predates the revision's claim, so its write is already in the
+/// snapshot. A mark written after the claim still dirties the root (#5128).
+#[tokio::test]
+async fn fold_marks_drops_marks_predating_the_build_5128() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 1, .. }
+    ));
+    assert_eq!(row(&f, "").await.unwrap().0, None, "built clean");
+
+    // A fold that read the mark before the claim cleared it applies it after
+    // the swap; `marked_at` is before the claim, so it is already included.
+    sqlx::query(
+        "INSERT INTO rpm_repodata_dirty (repository_id, root, marked_at) \
+         VALUES ($1, '', now() - interval '1 hour')",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    // The fold is global, so assert on this root, not the returned count:
+    // other tests' marks may be folded in the same pass.
+    fold_marks_waiting(&f.pool).await.unwrap();
+    assert_eq!(row(&f, "").await.unwrap().0, None, "stale mark dropped");
+
+    // A write after the claim is not in the snapshot and must still build.
+    // Fold it together with a stale mark: the stale one is dropped per mark,
+    // so the fresh one must still dirty the root (filtering the whole group
+    // by its earliest mark would drop the fresh one too).
+    let fresh: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO rpm_repodata_dirty (repository_id, root) VALUES ($1, '') \
+         RETURNING marked_at",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO rpm_repodata_dirty (repository_id, root, marked_at) \
+         VALUES ($1, '', now() - interval '1 hour')",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    fold_marks_waiting(&f.pool).await.unwrap();
+    assert_eq!(
+        row(&f, "").await.unwrap().0,
+        Some(fresh),
+        "fresh mark kept alongside a stale one"
+    );
+    f.teardown().await;
+    // The root row outlives the repository for the GC; drop it so this
+    // test's orphan does not crowd the GC's LIMIT 64 for other tests.
+    sqlx::query("DELETE FROM rpm_repodata_dirty WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM rpm_repodata_roots WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
 }
 
 /// Heal bookkeeping does not dirty a root; any other metadata change does.
