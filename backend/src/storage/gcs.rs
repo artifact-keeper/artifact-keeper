@@ -417,7 +417,7 @@ impl GcsTokenProvider {
 /// metadata endpoint must always be dialed directly, never via an egress
 /// proxy.
 fn metadata_server_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::services::http_client::plain_client_builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()

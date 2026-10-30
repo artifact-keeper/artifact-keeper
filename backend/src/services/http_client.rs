@@ -16,6 +16,22 @@ use std::time::Duration;
 /// loops or pathological chains from tying up workers.
 const MAX_REDIRECTS: usize = 10;
 
+/// The `User-Agent` every outbound client sends unless a request overrides it
+/// (#5110). Web application firewalls often refuse requests without one, and
+/// it makes this backend's traffic identifiable in upstream logs.
+pub const DEFAULT_USER_AGENT: &str = concat!("artifact-keeper/", env!("CARGO_PKG_VERSION"));
+
+/// A bare [`ClientBuilder`] that already sends [`DEFAULT_USER_AGENT`].
+///
+/// The builders in this module start from it. Code that must not use the SSRF
+/// resolver (cloud metadata endpoints, presigned storage URLs, the AWS control
+/// plane) starts from it too, instead of `reqwest::Client::builder()`, so no
+/// outbound client goes without a User-Agent. A per-request `User-Agent`
+/// header, such as a repository's custom one, still takes precedence.
+pub fn plain_client_builder() -> ClientBuilder {
+    reqwest::Client::builder().user_agent(DEFAULT_USER_AGENT)
+}
+
 /// Log detected proxy environment variables once at startup so operators can
 /// confirm that `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are (or are not)
 /// reaching the backend process.
@@ -68,7 +84,7 @@ fn log_proxy_env() {
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = reqwest::Client::builder()
+    let builder = plain_client_builder()
         .redirect(ssrf_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
         // This crate's own `Cargo.toml` requests only `["json", "stream",
@@ -146,7 +162,7 @@ pub fn base_client_builder() -> ClientBuilder {
 pub fn internal_service_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = reqwest::Client::builder()
+    let builder = plain_client_builder()
         .redirect(ssrf_internal_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_internal());
 
@@ -166,7 +182,7 @@ pub fn internal_service_client_builder() -> ClientBuilder {
 pub fn webhook_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = reqwest::Client::builder()
+    let builder = plain_client_builder()
         .redirect(ssrf_webhook_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_webhook());
 
@@ -201,8 +217,7 @@ pub fn webhook_client() -> reqwest::Client {
 pub fn sso_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = reqwest::Client::builder()
-        .user_agent(SSO_USER_AGENT)
+    let builder = plain_client_builder()
         .redirect(ssrf_sso_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_sso());
 
@@ -210,7 +225,7 @@ pub fn sso_client_builder() -> ClientBuilder {
 }
 
 /// The `User-Agent` the SSO/OIDC-fetch client sends (#5036).
-pub const SSO_USER_AGENT: &str = concat!("artifact-keeper/", env!("CARGO_PKG_VERSION"));
+pub const SSO_USER_AGENT: &str = DEFAULT_USER_AGENT;
 
 /// Build and return a ready-to-use SSO/OIDC-fetch client (see
 /// [`sso_client_builder`]).
@@ -1669,6 +1684,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    // -------------------------------------------------------------------
+    // #5110: a default User-Agent on every outbound client
+    // -------------------------------------------------------------------
+
+    /// Every builder in this module sends `artifact-keeper/<version>`, and a
+    /// per-request header (a repository's custom User-Agent) still wins.
+    #[tokio::test]
+    async fn test_every_client_builder_sends_the_default_user_agent_5110() {
+        use wiremock::matchers::method;
+
+        let expected = format!("artifact-keeper/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(super::DEFAULT_USER_AGENT, expected);
+
+        let builders = [
+            ("base", base_client_builder()),
+            ("internal", internal_service_client_builder()),
+            ("webhook", webhook_client_builder()),
+            ("sso", sso_client_builder()),
+            ("plain", super::plain_client_builder()),
+            ("large_object", super::large_object_client_builder(true)),
+            (
+                "server_side_copy",
+                super::server_side_copy_client_builder(true),
+            ),
+        ];
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        for (name, builder) in builders {
+            let client = loopback_client_from(builder);
+            client.get(server.uri()).send().await.unwrap();
+            client
+                .get(server.uri())
+                .header(reqwest::header::USER_AGENT, "Custom/1.0")
+                .send()
+                .await
+                .unwrap();
+
+            let requests = server.received_requests().await.unwrap();
+            let sent: Vec<_> = requests
+                .iter()
+                .rev()
+                .take(2)
+                .map(|r| r.headers.get("user-agent").and_then(|v| v.to_str().ok()))
+                .collect();
+            assert_eq!(
+                sent,
+                [Some("Custom/1.0"), Some(expected.as_str())],
+                "{name} client must send the default User-Agent unless a request overrides it"
+            );
+        }
+    }
+
+    /// The clients that cannot use the SSRF-guarded builders (cloud metadata,
+    /// presigned storage URLs, AWS control plane) start from
+    /// [`super::plain_client_builder`]. A bare `reqwest::Client::builder()` or
+    /// `Client::new()` in production code sends no User-Agent, so fail when one
+    /// is added outside the tests of its file (#5110).
+    ///
+    /// The needles are assembled at runtime so this test does not match itself.
+    #[test]
+    fn test_production_code_builds_no_client_without_a_user_agent_5110() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let needles = [
+            format!("{}{}", "reqwest::Client::", "builder()"),
+            format!("{}{}", "reqwest::Client::", "new()"),
+            format!("{}{}", "reqwest::Client", "Builder::new()"),
+            format!("{}{}", "reqwest::", "get("),
+        ];
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src_dir, &mut files);
+
+        let mut offenders = Vec::new();
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "http_client.rs" || name.contains("tests") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let production = src.split("#[cfg(test)]").next().unwrap();
+            for needle in &needles {
+                if production.contains(needle.as_str()) {
+                    offenders.push(format!("{}: {needle}", path.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "outbound clients must start from `http_client::plain_client_builder()` or \
+             one of the SSRF-guarded builders so they send a User-Agent: {offenders:?}"
+        );
     }
 
     /// A 403 HTML page from a discovery or JWKS fetch is reported by its
