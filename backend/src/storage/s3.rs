@@ -1212,7 +1212,7 @@ async fn ec2_instance_profile_available() -> bool {
         .unwrap_or_else(|_| EC2_IMDS_DEFAULT_ENDPOINT.to_string());
     let url = format!("{}/latest/api/token", endpoint.trim_end_matches('/'));
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::services::http_client::plain_client_builder()
         .timeout(EC2_IMDS_PROBE_TIMEOUT)
         .connect_timeout(EC2_IMDS_PROBE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -1618,7 +1618,7 @@ impl S3Backend {
     /// SigV4-signed per-call with [`AwsAuthorizer`], reusing the store's
     /// credential chain.
     fn build_raw_http_client(config: &S3Config) -> Result<reqwest::Client> {
-        let mut builder = reqwest::Client::builder();
+        let mut builder = crate::services::http_client::plain_client_builder();
         if let Some(ca_path) = &config.ca_cert_path {
             let pem = std::fs::read(ca_path).map_err(|e| {
                 AppError::Config(format!("Failed to read CA cert '{}': {}", ca_path, e))
@@ -1645,6 +1645,9 @@ impl S3Backend {
         timeout: Option<Duration>,
     ) -> Result<AmazonS3> {
         let mut client_opts = object_store::ClientOptions::new()
+            .with_user_agent(http::HeaderValue::from_static(
+                crate::services::http_client::DEFAULT_USER_AGENT,
+            ))
             .with_pool_max_idle_per_host(config.pool_max_idle_per_host)
             .with_pool_idle_timeout(Duration::from_secs(config.pool_idle_timeout_secs));
 
@@ -2210,7 +2213,9 @@ impl S3Backend {
                 )
             })?;
 
-        let response = reqwest::Client::new()
+        let response = crate::services::http_client::plain_client_builder()
+            .build()
+            .map_err(|e| AppError::Storage(format!("Failed to build HTTP client: {}", e)))?
             .delete(presigned_url)
             .send()
             .await
