@@ -1,0 +1,299 @@
+syntax = "proto3";
+
+// A faithful subset of buf.registry.module.v1, transcribed from
+// buf.build/bufbuild/registry (Apache-2.0). Only the messages the hosted
+// protobuf handlers exchange with the buf CLI are declared, and the
+// protovalidate annotations of the originals are left out: prost ignores
+// them, and the server enforces what it needs in Rust. Field numbers and
+// types are the originals' -- they are the wire format.
+//
+// NOTE: this package's DigestType numbers B5 = 1, where the v1beta1 package
+// numbers B4 = 1 and B5 = 2. The two are not interchangeable: a reply built
+// with the wrong package's number names the wrong digest algorithm and the
+// CLI rejects the commit. See bsr_module_v1beta1.proto.
+package buf.registry.module.v1;
+
+import "google/protobuf/timestamp.proto";
+import "bsr_owner_v1.proto";
+
+enum DigestType {
+  DIGEST_TYPE_UNSPECIFIED = 0;
+  DIGEST_TYPE_B5 = 1;
+}
+
+message Digest {
+  DigestType type = 1;
+  bytes value = 2;
+}
+
+message Commit {
+  string id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  string owner_id = 3;
+  string module_id = 4;
+  Digest digest = 5;
+  string created_by_user_id = 6;
+  string source_control_url = 7;
+}
+
+enum ModuleVisibility {
+  MODULE_VISIBILITY_UNSPECIFIED = 0;
+  MODULE_VISIBILITY_PUBLIC = 1;
+  MODULE_VISIBILITY_PRIVATE = 2;
+}
+
+enum ModuleState {
+  MODULE_STATE_UNSPECIFIED = 0;
+  MODULE_STATE_ACTIVE = 1;
+  MODULE_STATE_DEPRECATED = 2;
+}
+
+message Module {
+  string id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  google.protobuf.Timestamp update_time = 3;
+  string name = 4;
+  string owner_id = 5;
+  ModuleVisibility visibility = 6;
+  ModuleState state = 7;
+  string description = 8;
+  string url = 9;
+  string default_label_name = 10;
+}
+
+message ModuleRef {
+  message Name {
+    string owner = 1;
+    string module = 2;
+  }
+  oneof value {
+    string id = 1;
+    Name name = 2;
+  }
+}
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_PROTO = 1;
+  FILE_TYPE_DOC = 2;
+  FILE_TYPE_LICENSE = 3;
+}
+
+message File {
+  string path = 1;
+  bytes content = 2;
+}
+
+enum CommitCheckStatus {
+  COMMIT_CHECK_STATUS_UNSPECIFIED = 0;
+  COMMIT_CHECK_STATUS_DISABLED = 1;
+  COMMIT_CHECK_STATUS_PASSED = 2;
+  COMMIT_CHECK_STATUS_PENDING = 3;
+  COMMIT_CHECK_STATUS_REJECTED = 4;
+  COMMIT_CHECK_STATUS_APPROVED = 5;
+}
+
+message CommitCheckState {
+  CommitCheckStatus status = 1;
+  google.protobuf.Timestamp update_time = 3;
+}
+
+message Label {
+  string id = 1;
+  google.protobuf.Timestamp create_time = 2;
+  google.protobuf.Timestamp update_time = 3;
+  google.protobuf.Timestamp archive_time = 4;
+  string name = 5;
+  string owner_id = 6;
+  string module_id = 7;
+  string commit_id = 8;
+  string updated_by_user_id = 9;
+  CommitCheckState commit_check_state = 10;
+}
+
+message LabelRef {
+  message Name {
+    string owner = 1;
+    string module = 2;
+    string label = 3;
+  }
+  oneof value {
+    string id = 1;
+    Name name = 2;
+  }
+}
+
+message ResourceRef {
+  message Name {
+    string owner = 1;
+    string module = 2;
+    oneof child {
+      string label_name = 3;
+      string ref = 4;
+    }
+  }
+  oneof value {
+    string id = 1;
+    Name name = 2;
+  }
+}
+
+message Resource {
+  oneof value {
+    Module module = 1;
+    Label label = 2;
+    Commit commit = 3;
+  }
+}
+
+message Graph {
+  message Node {
+    string commit_id = 1;
+  }
+  message Edge {
+    Node from_node = 1;
+    Node to_node = 2;
+  }
+  message RegistryCommitID {
+    string commit_id = 1;
+    string registry = 2;
+  }
+  repeated Commit commits = 1;
+  repeated Edge edges = 2;
+  repeated RegistryCommitID registry_commit_ids = 3;
+}
+
+message GetModulesRequest {
+  repeated ModuleRef module_refs = 1;
+}
+
+message GetModulesResponse {
+  repeated Module modules = 1;
+}
+
+message CreateModulesRequest {
+  message Value {
+    buf.registry.owner.v1.OwnerRef owner_ref = 1;
+    string name = 2;
+    ModuleVisibility visibility = 3;
+    string description = 4;
+    string url = 5;
+    string default_label_name = 6;
+  }
+  repeated Value values = 1;
+}
+
+message CreateModulesResponse {
+  repeated Module modules = 1;
+}
+
+message GetCommitsRequest {
+  repeated ResourceRef resource_refs = 1;
+}
+
+message GetCommitsResponse {
+  repeated Commit commits = 1;
+}
+
+message ListCommitsRequest {
+  enum Order {
+    ORDER_UNSPECIFIED = 0;
+    ORDER_CREATE_TIME_DESC = 1;
+    ORDER_CREATE_TIME_ASC = 2;
+  }
+  uint32 page_size = 1;
+  string page_token = 2;
+  ResourceRef resource_ref = 3;
+  Order order = 4;
+  string id_query = 5;
+}
+
+message ListCommitsResponse {
+  string next_page_token = 1;
+  repeated Commit commits = 2;
+}
+
+message GetLabelsRequest {
+  repeated LabelRef label_refs = 1;
+}
+
+message GetLabelsResponse {
+  repeated Label labels = 1;
+}
+
+message CreateOrUpdateLabelsRequest {
+  message Value {
+    LabelRef label_ref = 1;
+    string commit_id = 2;
+  }
+  repeated Value values = 1;
+}
+
+message CreateOrUpdateLabelsResponse {
+  repeated Label labels = 1;
+}
+
+message GetGraphRequest {
+  repeated ResourceRef resource_refs = 1;
+}
+
+message GetGraphResponse {
+  Graph graph = 1;
+}
+
+message GetResourcesRequest {
+  repeated ResourceRef resource_refs = 1;
+}
+
+message GetResourcesResponse {
+  repeated Resource resources = 1;
+}
+
+// A single-registry push and a b5 pull are served here, not on v1beta1: the
+// CLI chooses the package per call. `buf push` uses v1beta1's Upload only
+// when the module depends on a second registry (legacy federation), and
+// Download is chosen by digest type, so a repository answering b5 is asked
+// for its contents over v1.
+message ScopedLabelRef {
+  oneof value {
+    string id = 1;
+    string name = 2;
+  }
+}
+
+message UploadRequest {
+  message Content {
+    ModuleRef module_ref = 1;
+    repeated File files = 2;
+    repeated ScopedLabelRef scoped_label_refs = 3;
+    string source_control_url = 4;
+  }
+  repeated Content contents = 1;
+  // v1beta1 carries a registry alongside each dependency commit id; without
+  // federation there is only one registry, so this is the bare ids.
+  repeated string dep_commit_ids = 2;
+}
+
+message UploadResponse {
+  repeated Commit commits = 1;
+}
+
+message DownloadRequest {
+  message Value {
+    ResourceRef resource_ref = 1;
+    repeated FileType file_types = 2;
+    repeated string paths = 3;
+    bool paths_allow_not_exist = 4;
+  }
+  repeated Value values = 1;
+}
+
+message DownloadResponse {
+  // v1beta1's Content also carries the v1 buf.yaml and buf.lock of a module
+  // pushed before module v2; v1 has no such fields.
+  message Content {
+    Commit commit = 1;
+    repeated File files = 2;
+  }
+  repeated Content contents = 1;
+}
