@@ -134,11 +134,45 @@ export BUF_TOKEN="$TOKEN"
 REGISTRY="localhost:$BSR_PROXY_PORT"
 
 # --------------------------------------------------------------------------
-# Test 1: buf push
+# A module, a module that depends on it, and a consumer of that one. The
+# chain is the point: a dependency is recorded as a commit id, and resolving
+# the consumer's dependency walks the graph through the middle module, which
+# a single module with no dependencies never exercises.
 # --------------------------------------------------------------------------
-echo "==> Test 1: buf push --create..."
-mkdir -p "$WORK/module/acme/payments/v1"
-cat > "$WORK/module/acme/payments/v1/payments.proto" <<'EOF'
+write_module() {          # write_module <dir> <owner/module> <package> [dep]
+  local dir="$1" name="$2" pkg="$3" dep="${4:-}"
+  mkdir -p "$dir/$pkg"
+  {
+    echo "version: v2"
+    echo "modules:"
+    echo "  - path: ."
+    echo "    name: $REGISTRY/$name"
+    if [ -n "$dep" ]; then
+      echo "deps:"
+      echo "  - $REGISTRY/$dep"
+    fi
+  } > "$dir/buf.yaml"
+}
+
+push_module() {           # push_module <dir> <what> -> commit id on stdout
+  local dir="$1" what="$2" status=0 out=""
+  # Not `out=$(buf push)`: under `set -e` a failing command substitution
+  # aborts the script and buf's diagnosis -- the part worth reading -- is
+  # lost.
+  out=$( (cd "$dir" && buf push --create --create-visibility public 2>&1) ) || status=$?
+  echo "$out" | sed 's/^/    /' >&2
+  local commit
+  commit=$(printf '%s' "$out" | tail -n 1 | sed 's/.*://')
+  if [ "$status" -ne 0 ] || ! printf '%s' "$commit" | grep -Eq '^[0-9a-f]{32}$'; then
+    echo "ERROR: buf push of $what failed (exit $status); it reports no commit id (tuuid)" >&2
+    exit 1
+  fi
+  printf '%s' "$commit"
+}
+
+echo "==> Test 1: buf push --create (a module with no dependencies)..."
+write_module "$WORK/payments" acme/payments acme/payments/v1
+cat > "$WORK/payments/acme/payments/v1/payments.proto" <<'EOF'
 syntax = "proto3";
 
 package acme.payments.v1;
@@ -148,37 +182,12 @@ message PaymentRequest {
   int64 amount_cents = 2;
 }
 EOF
-cat > "$WORK/module/buf.yaml" <<EOF
-version: v2
-modules:
-  - path: .
-    name: $REGISTRY/acme/payments
-EOF
-# Not `PUSH_OUT=$(buf push)`: under `set -e` a failing command substitution
-# aborts the script and buf's diagnosis -- the part worth reading -- is lost.
-PUSH_STATUS=0
-PUSH_OUT=$( (cd "$WORK/module" && buf push --create --create-visibility public 2>&1) ) || PUSH_STATUS=$?
-echo "$PUSH_OUT" | sed 's/^/    /'
-COMMIT_ID=$(printf '%s' "$PUSH_OUT" | tail -n 1 | sed 's/.*://')
-if [ "$PUSH_STATUS" -ne 0 ] || ! printf '%s' "$COMMIT_ID" | grep -Eq '^[0-9a-f]{32}$'; then
-  echo "ERROR: buf push failed (exit $PUSH_STATUS); it reports no commit id (tuuid)"
-  exit 1
-fi
-echo "  Pushed commit: $COMMIT_ID"
+PAYMENTS_COMMIT=$(push_module "$WORK/payments" acme/payments)
+echo "  Pushed acme/payments: $PAYMENTS_COMMIT"
 
-# --------------------------------------------------------------------------
-# Test 2: buf dep update resolves it, and accepts its b5 digest
-# --------------------------------------------------------------------------
-echo "==> Test 2: buf dep update (b5 digest verification)..."
-mkdir -p "$WORK/consumer/acme/orders/v1"
-cat > "$WORK/consumer/buf.yaml" <<EOF
-version: v2
-modules:
-  - path: .
-deps:
-  - $REGISTRY/acme/payments
-EOF
-cat > "$WORK/consumer/acme/orders/v1/orders.proto" <<'EOF'
+echo "==> Test 2: buf dep update + push of a module that depends on it..."
+write_module "$WORK/orders" acme/orders acme/orders/v1 acme/payments
+cat > "$WORK/orders/acme/orders/v1/orders.proto" <<'EOF'
 syntax = "proto3";
 
 package acme.orders.v1;
@@ -190,28 +199,58 @@ message Order {
   acme.payments.v1.PaymentRequest payment = 2;
 }
 EOF
-(cd "$WORK/consumer" && buf dep update 2>&1 | sed 's/^/    /')
-if ! grep -q "commit: $COMMIT_ID" "$WORK/consumer/buf.lock"; then
-  echo "ERROR: buf.lock does not name the pushed commit"
-  cat "$WORK/consumer/buf.lock"
+(cd "$WORK/orders" && buf dep update 2>&1 | sed 's/^/    /')
+if ! grep -q "commit: $PAYMENTS_COMMIT" "$WORK/orders/buf.lock"; then
+  echo "ERROR: acme/orders did not pin the commit acme/payments was pushed as"
+  cat "$WORK/orders/buf.lock"
   exit 1
 fi
-# The digest is the CLI's own: it recomputes b5 over what it downloaded and
-# refuses the commit if the registry's digest disagrees, so reaching this line
-# means the two agree.
-if ! grep -q 'digest: b5:' "$WORK/consumer/buf.lock"; then
-  echo "ERROR: buf.lock carries no b5 digest"
-  cat "$WORK/consumer/buf.lock"
-  exit 1
-fi
-echo "  buf.lock pins the commit and its b5 digest"
+ORDERS_COMMIT=$(push_module "$WORK/orders" acme/orders)
+echo "  Pushed acme/orders: $ORDERS_COMMIT (dependency recorded as a commit id)"
 
-# --------------------------------------------------------------------------
-# Test 3: the dependency actually compiles
-# --------------------------------------------------------------------------
-echo "==> Test 3: buf build against the fetched dependency..."
+echo "==> Test 3: a consumer resolves the chain (b5 digest verification)..."
+mkdir -p "$WORK/consumer/acme/checkout/v1"
+cat > "$WORK/consumer/buf.yaml" <<EOF
+version: v2
+modules:
+  - path: .
+deps:
+  - $REGISTRY/acme/orders
+EOF
+cat > "$WORK/consumer/acme/checkout/v1/checkout.proto" <<'EOF'
+syntax = "proto3";
+
+package acme.checkout.v1;
+
+import "acme/orders/v1/orders.proto";
+
+message Checkout {
+  acme.orders.v1.Order order = 1;
+}
+EOF
+(cd "$WORK/consumer" && buf dep update 2>&1 | sed 's/^/    /')
+# Both the declared dependency and the one it brings in: resolving the chain
+# walks GetGraph, where a dependency recorded as a commit id has to resolve.
+for expected in "$ORDERS_COMMIT" "$PAYMENTS_COMMIT"; do
+  if ! grep -q "commit: $expected" "$WORK/consumer/buf.lock"; then
+    echo "ERROR: the consumer's buf.lock is missing commit $expected"
+    cat "$WORK/consumer/buf.lock"
+    exit 1
+  fi
+done
+# The digests are the CLI's own: it recomputes b5 over what it downloaded and
+# refuses a commit if the registry's digest disagrees, so reaching this line
+# means the two agree -- for both modules in the chain.
+if [ "$(grep -c 'digest: b5:' "$WORK/consumer/buf.lock")" -ne 2 ]; then
+  echo "ERROR: expected a b5 digest for each module in the chain"
+  cat "$WORK/consumer/buf.lock"
+  exit 1
+fi
+echo "  buf.lock pins both commits of the chain and their b5 digests"
+
+echo "==> Test 4: buf build against the fetched dependencies..."
 (cd "$WORK/consumer" && buf build 2>&1 | sed 's/^/    /')
-echo "  Consumer builds against the downloaded module"
+echo "  Consumer builds against the downloaded modules"
 
 echo ""
 echo "==> All buf CLI tests passed"

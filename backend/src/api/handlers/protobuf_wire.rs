@@ -71,12 +71,34 @@ impl Codec {
     /// The codec the `Content-Type` selects. Anything that is not a protobuf
     /// media type is treated as JSON, which is what the pre-#5066 endpoints
     /// assumed of every request.
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        if is_binary_protobuf(headers) {
-            Codec::Proto
-        } else {
-            Codec::Json
+    ///
+    /// Only `application/proto` is the bare message these handlers decode.
+    /// gRPC and Connect's streaming codecs (`application/connect+proto`,
+    /// `application/connect+json`) frame every message with a five-byte
+    /// envelope, which a bare decode would read as part of the message: a
+    /// misleading `invalid_argument`, or in rare cases a message that decodes
+    /// as something it is not. Those are refused as `unimplemented` instead.
+    /// The remote/virtual proxy still passes them through to an upstream that
+    /// does implement them, which is why [`is_binary_protobuf`] stays broad.
+    pub fn from_headers(headers: &HeaderMap) -> Result<Self, Response> {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if content_type.starts_with("application/proto") {
+            return Ok(Codec::Proto);
         }
+        if content_type.starts_with("application/grpc")
+            || content_type.starts_with("application/connect+")
+        {
+            return Err(connect_unimplemented(&format!(
+                "this registry serves unary Connect with the 'application/json' and \
+                 'application/proto' codecs; '{content_type}' is enveloped and is not implemented"
+            )));
+        }
+        Ok(Codec::Json)
     }
 
     /// Decode a request body into the handler's own request type.
@@ -127,9 +149,11 @@ pub fn respond_proto<P: Message>(proto: &P) -> Response {
         .unwrap()
 }
 
-/// A protobuf-codec request. `application/grpc` is included because a gRPC
-/// client reaching these routes is equally not sending JSON, and answering it
-/// a Connect error beats axum's bare 415.
+/// A protobuf-codec request, in any framing. The remote/virtual proxy uses
+/// this to decide whether to pass a body through to an upstream BSR
+/// unchanged, so the enveloped codecs belong here; [`Codec::from_headers`],
+/// which picks how the hosted handlers decode a body themselves, does not
+/// accept them.
 pub fn is_binary_protobuf(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
@@ -141,6 +165,17 @@ pub fn is_binary_protobuf(headers: &HeaderMap) -> bool {
                 || ct.starts_with("application/connect+proto")
         })
         .unwrap_or(false)
+}
+
+/// A Connect `unimplemented`, for a codec or method this registry does not
+/// serve. Connect maps the code to HTTP 501.
+fn connect_unimplemented(message: &str) -> Response {
+    let body = serde_json::json!({ "code": "unimplemented", "message": message });
+    Response::builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
 }
 
 fn connect_invalid_argument(message: &str) -> Response {
@@ -436,13 +471,51 @@ mod tests {
 
     #[test]
     fn codec_follows_content_type() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(Codec::from_headers(&headers), Codec::Json);
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        assert_eq!(Codec::from_headers(&headers), Codec::Json);
-        headers.insert(CONTENT_TYPE, "application/proto".parse().unwrap());
-        assert_eq!(Codec::from_headers(&headers), Codec::Proto);
-        headers.insert(CONTENT_TYPE, "application/connect+proto".parse().unwrap());
-        assert_eq!(Codec::from_headers(&headers), Codec::Proto);
+        let codec_of = |content_type: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(ct) = content_type {
+                headers.insert(CONTENT_TYPE, ct.parse().unwrap());
+            }
+            Codec::from_headers(&headers)
+        };
+
+        assert_eq!(codec_of(None).ok(), Some(Codec::Json));
+        assert_eq!(codec_of(Some("application/json")).ok(), Some(Codec::Json));
+        assert_eq!(codec_of(Some("application/proto")).ok(), Some(Codec::Proto));
+        // Unary Connect carries no charset here, but a client may still send
+        // parameters, and the codec is the media type.
+        assert_eq!(
+            codec_of(Some("Application/Proto; charset=utf-8")).ok(),
+            Some(Codec::Proto)
+        );
+    }
+
+    /// The enveloped codecs are not this registry's: each of their messages
+    /// carries a five-byte frame prefix, so decoding one as a bare message
+    /// reads the prefix as part of the message. Answering `unimplemented`
+    /// says so; treating them as `Proto` (which this did until #5117 review)
+    /// produces a misleading `invalid_argument` at best.
+    #[test]
+    fn enveloped_codecs_are_refused_not_decoded_as_bare_messages() {
+        // The last one is enveloped JSON, not protobuf: it is refused for
+        // its framing, which is what this test is about, and it is not one of
+        // the bodies the proxy recognises as protobuf.
+        for (content_type, proxy_passes_through) in [
+            ("application/grpc", true),
+            ("application/grpc+proto", true),
+            ("application/connect+proto", true),
+            ("application/connect+json", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, content_type.parse().unwrap());
+            let err = Codec::from_headers(&headers)
+                .expect_err(&format!("{content_type} must not decode as a bare message"));
+            assert_eq!(err.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                is_binary_protobuf(&headers),
+                proxy_passes_through,
+                "{content_type}"
+            );
+        }
     }
 }
