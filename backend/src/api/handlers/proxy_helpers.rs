@@ -5583,8 +5583,8 @@ pub(crate) async fn check_quarantine_row(
 
 /// Selector for the canonical local-artifact lookup. Each variant maps to a
 /// single `WHERE` shape over the `artifacts` table; the surrounding skeleton
-/// (quarantine check → storage resolution → `storage.get` → coordinated retry)
-/// is identical and lives in [`local_lookup_artifact`] / [`read_local_content`].
+/// (quarantine check → storage resolution → `storage.get_stream` → coordinated
+/// retry) is identical and lives in [`local_lookup_artifact`] / [`open_local_stream`].
 pub(crate) enum LocalLookup<'a> {
     /// Match on the exact stored `path`.
     Path(&'a str),
@@ -5713,39 +5713,14 @@ async fn local_lookup_artifact(
     Ok((artifact, storage))
 }
 
-/// Shared skeleton step 2: read the artifact's content from storage, falling
-/// back to the coordinated retry path on a `NotFound` miss.
-async fn read_local_content(
-    db: &PgPool,
-    artifact: &LocalArtifactRow,
-    storage: &dyn crate::storage::StorageBackend,
-) -> Result<Bytes, Response> {
-    let bytes = match storage.get(&artifact.storage_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::AppError::NotFound(_)) => {
-            coordinated_retry_get(db, artifact.id, &artifact.storage_key, storage).await?
-        }
-        Err(e) => return Err(map_storage_err(e)),
-    };
-    // #4323: never serve stored bytes that do not match their record.
-    crate::storage::verify::verify_stored_bytes(
-        &bytes,
-        &artifact.checksum_sha256,
-        &artifact.path,
-        artifact.size_bytes,
-        || artifact.path.clone(),
-    )?;
-    Ok(bytes)
-}
-
-/// Streaming sibling of [`read_local_content`]: open the artifact body as a
-/// byte stream (so large artifact bodies never buffer in memory) while keeping
-/// the exact same `NotFound` → coordinated-retry hydration fallback used by the
-/// buffered path. On a storage miss we still funnel through
-/// [`coordinated_retry_get`] (which buffers the small recovery read) and wrap
-/// the recovered `Bytes` back into a one-shot stream so callers see a uniform
-/// [`StreamingFetchResult`]. Returns the full [`StreamingFetchResult`] with the
-/// row's `content_type` and `size_bytes` (for an accurate `Content-Length`).
+/// Shared skeleton step 2: open the artifact body as a byte stream (so large
+/// artifact bodies never buffer in memory) while keeping the `NotFound` →
+/// coordinated-retry hydration fallback. On a storage miss we still funnel
+/// through [`coordinated_retry_get`] (which buffers the small recovery read)
+/// and wrap the recovered `Bytes` back into a one-shot stream so callers see a
+/// uniform [`StreamingFetchResult`]. Returns the full [`StreamingFetchResult`]
+/// with the row's `content_type` and `size_bytes` (for an accurate
+/// `Content-Length`).
 async fn read_local_stream(
     db: &PgPool,
     artifact: &LocalArtifactRow,
@@ -6083,14 +6058,13 @@ pub async fn local_fetch_or_redirect(
     // axum answers a HEAD by running the GET handler and the client would be
     // handed a signature it cannot use.
     //
-    // Answer the HEAD from the artifact row instead: `read_local_stream` carries
+    // Answer the HEAD from the artifact row instead: `open_local_stream` carries
     // the row's `content_type` and `size_bytes`, so the response advertises the
     // same `Content-Type`/`Content-Length` the GET would. The body is opened but
     // never polled — axum drops a HEAD response's body — so this costs a
-    // metadata round trip rather than a transfer, and (unlike falling through to
-    // the buffered `read_local_content` path below) it never pulls a multi-GiB
-    // artifact into memory just to answer a probe. Status parity with GET is
-    // preserved: a storage miss still errors here exactly as it would for a GET.
+    // metadata round trip rather than a transfer, and it never reads the object
+    // just to answer a probe. Status parity with GET is preserved: a storage
+    // miss still errors here exactly as it would for a GET.
     if ctx.is_head {
         let result = open_local_stream(db, &artifact, &*storage, false).await?;
         return stream_fetch_result(result, &artifact.content_type, None);
@@ -6142,8 +6116,8 @@ pub async fn local_fetch_or_redirect(
                 // needs the repo_key/path pair and is tracked separately. This
                 // change only removes the dead-redirect case.
                 //
-                // On a miss the buffered read below takes over. Note it does
-                // NOT simply return NotFound: it routes through
+                // On a miss the streaming fallback below takes over. Note it
+                // does NOT simply return NotFound: it routes through
                 // `coordinated_retry_get`, which takes a cluster-wide advisory
                 // lease (#1609) and returns 507 if the object is still absent.
                 // The self-heal comes from the sole caller (the PyPI
@@ -6153,8 +6127,8 @@ pub async fn local_fetch_or_redirect(
                 // An `Err` from the probe means "unknown", not "absent", so it
                 // is logged rather than swallowed — otherwise an object-store
                 // brownout silently converts every redirect on this path into a
-                // fully-buffered read through the backend, with no signal that
-                // it happened. We still fall through on `Err` (never sign a
+                // streamed read through the backend, with no signal that it
+                // happened. We still fall through on `Err` (never sign a
                 // redirect we could not verify); the log is what makes that
                 // transition visible.
                 let object_present = b.supports_redirect()
@@ -6165,7 +6139,7 @@ pub async fn local_fetch_or_redirect(
                                 storage_key = %artifact.storage_key,
                                 error = %e,
                                 "proxy-cache existence probe failed; treating as absent \
-                                 and falling through to the buffered read"
+                                 and falling through to the streaming read"
                             );
                             false
                         }
@@ -6188,14 +6162,13 @@ pub async fn local_fetch_or_redirect(
         }
     }
 
-    let content = read_local_content(db, &artifact, &*storage).await?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", &artifact.content_type)
-        .header("content-length", content.len().to_string())
-        .body(axum::body::Body::from(content))
-        .unwrap())
+    // #5126: stream the stored object, as the direct hosted download routes do.
+    // Reading it into memory here held a whole wheel/sdist per concurrent PyPI
+    // virtual-member serve on filesystem or non-presigning S3 deployments.
+    // `read_local_stream` keeps the #4323 integrity check: small objects are
+    // verified before the headers are sent, larger ones while they stream.
+    let result = read_local_stream(db, &artifact, &*storage).await?;
+    stream_fetch_result(result, &artifact.content_type, None)
 }
 
 /// Blob file extensions eligible for presigned-redirect offload (#1945).
@@ -20702,10 +20675,138 @@ mod tests {
         );
     }
 
+    /// #5126: when no presigned redirect is available, the shared hosted-member
+    /// serve used by PyPI virtuals must stream the stored object rather than
+    /// buffer it. `local_fetch_or_redirect_by_suffix` resolves the wheel path
+    /// and delegates to `local_fetch_or_redirect`; the fallback there used
+    /// `read_local_content`, which held the whole wheel/sdist in memory per
+    /// concurrent request. A backend that answers only `get_stream` (and counts
+    /// `get` calls) proves the streaming path is taken; on `main` the buffered
+    /// `get` increments the counter and this test fails.
+    #[tokio::test]
+    async fn test_local_fetch_or_redirect_streams_hosted_member_5126() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        struct StreamingOnlyStorage {
+            body: Bytes,
+            get_calls: StdArc<AtomicUsize>,
+            get_stream_calls: StdArc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::storage::StorageBackend for StreamingOnlyStorage {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                self.get_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.body.clone())
+            }
+            async fn get_stream(
+                &self,
+                _key: &str,
+            ) -> crate::error::Result<
+                futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            > {
+                self.get_stream_calls.fetch_add(1, Ordering::SeqCst);
+                let body = self.body.clone();
+                Ok(Box::pin(futures::stream::once(async move { Ok(body) })))
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(true)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                crate::storage::buffered_put_stream_fallback(self, key, stream).await
+            }
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _repo_key, _storage_dir) =
+            db_helpers::create_repo(&pool, "local", "pypi").await;
+
+        let body = Bytes::from_static(b"wheel-bytes-that-must-not-be-buffered");
+        let get_calls = StdArc::new(AtomicUsize::new(0));
+        let get_stream_calls = StdArc::new(AtomicUsize::new(0));
+        let storage = StdArc::new(StreamingOnlyStorage {
+            body: body.clone(),
+            get_calls: get_calls.clone(),
+            get_stream_calls: get_stream_calls.clone(),
+        });
+        // Presigned downloads are enabled, but this backend cannot redirect
+        // (`supports_redirect()` defaults to false), so the serve falls back.
+        let state = db_helpers::build_state_presigned(pool.clone(), "stream-test", storage);
+
+        let artifact_path = "packages/demo-1.0.0-py3-none-any.whl";
+        insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: artifact_path,
+                name: "demo",
+                version: "1.0.0",
+                size_bytes: body.len() as i64,
+                checksum_sha256: "test-seed",
+                content_type: "application/octet-stream",
+                storage_key: "artifact-keeper/cas/demo.whl",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("seed hosted artifact row");
+
+        let location = StorageLocation {
+            backend: "stream-test".to_string(),
+            path: String::new(),
+        };
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let result = super::local_fetch_or_redirect_by_suffix(
+            &pool,
+            &state,
+            repo_id,
+            &location,
+            "demo-1.0.0-py3-none-any.whl",
+            &ctx,
+        )
+        .await;
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+
+        let resp = result.expect("hosted member must serve by streaming");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("location").is_none(),
+            "no redirect is available, so the response must stream"
+        );
+        let served = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read streamed body");
+        assert_eq!(served, body, "the streamed bytes must be the stored object");
+        assert_eq!(
+            get_stream_calls.load(Ordering::SeqCst),
+            1,
+            "the stored object must be opened through get_stream"
+        );
+        assert_eq!(
+            get_calls.load(Ordering::SeqCst),
+            0,
+            "#5126: serving a hosted member must not buffer the whole object through get()"
+        );
+    }
+
     /// #3067/#3068: `supports_redirect() == true` alone must not be enough to
     /// sign a redirect — `exists()` returning false (a DB row surviving an
     /// out-of-band delete, e.g. a lifecycle rule) must fall through to the
-    /// buffered read instead of presigning. Complements the #1555 test above,
+    /// streaming read instead of presigning. Complements the #1555 test above,
     /// which only covers the `supports_redirect() == false` short-circuit.
     ///
     /// Runs both `exists()` outcomes so the `true` case is a positive
