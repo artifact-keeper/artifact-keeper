@@ -17000,6 +17000,21 @@ mod tests {
             assert!(!pin_agrees_with_content(&junk, &pin, filename), "{eco:?}");
         }
 
+        // #5140: a crate published without a README carries `readme = false`
+        // in its normalized manifest; it still declares its own identity.
+        let no_readme = Bytes::from(build_tar_gz(&[(
+            "parking_lot_core-0.9.12/Cargo.toml",
+            b"[package]\nedition = \"2021\"\nname = \"parking_lot_core\"\n\
+              version = \"0.9.12\"\nbuild = \"build.rs\"\nautobins = false\n\
+              readme = false\n"
+                .to_vec(),
+        )]));
+        assert!(pin_agrees_with_content(
+            &no_readme,
+            &ExpectedComponent::new(ComponentEcosystem::Cargo, "parking_lot_core", "0.9.12"),
+            "parking_lot_core-0.9.12.crate"
+        ));
+
         // Case folding follows each ecosystem's own rule, so a publisher's
         // spelling of their own id does not cost them the pin.
         let nupkg = nupkg_fixture("Newtonsoft.Json", "12.0.1");
