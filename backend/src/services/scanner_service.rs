@@ -24,7 +24,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -1865,7 +1865,10 @@ impl ScanWorkspace {
             // [`SCAN_PIN_SUBDIR`] where no shipped file can displace it. Unlike
             // npm there is no merge concern: a lockfile the archive happens to
             // ship stays exactly where it is and is graded on its own, and the
-            // pin-scoped `dedupe_findings` collapses the overlap.
+            // pin-scoped `dedupe_findings` collapses the overlap. Cargo is the
+            // exception: a crate's own `Cargo.lock` is removed first, because
+            // no consumer ever resolves against it (#5143, see
+            // [`Self::drop_bundled_cargo_locks`]).
             ComponentEcosystem::RubyGems => {
                 Self::write_pin_file(
                     workspace,
@@ -1875,6 +1878,7 @@ impl ScanWorkspace {
                 .await
             }
             ComponentEcosystem::Cargo => {
+                Self::drop_bundled_cargo_locks(extract_root).await;
                 Self::write_pin_file(
                     workspace,
                     &PathBuf::from(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME),
@@ -2086,6 +2090,57 @@ impl ScanWorkspace {
             })?;
         }
         Ok(())
+    }
+
+    /// Remove every `Cargo.lock` the crate itself ships, so a pinned `.crate`
+    /// is graded on its own coordinate and nothing else (#5143).
+    ///
+    /// Many published crates (every binary crate, and libraries whose authors
+    /// commit one) ship a `Cargo.lock`. Both engines catalog it, so the crate
+    /// used to be graded on every package in its author's build: a proxied
+    /// `async-ctrlc@1.2.0` was blocked for `crossbeam-deque@0.7.3`. Cargo
+    /// never reads a dependency's lockfile; a dependent resolves its whole
+    /// graph from its own. The one consumer that does read it,
+    /// `cargo install --locked`, downloads every locked crate through the
+    /// same registry, where each is graded on its own coordinate. Removing
+    /// the bundled lockfile therefore loses no coverage for what a consumer
+    /// installs. The crate's identity was already checked against its own
+    /// `Cargo.toml` ([`pin_agrees_with_content`]) before a pin exists, and
+    /// the pin is written right after this.
+    ///
+    /// Only the archive namespace ([`SCAN_ARCHIVE_SUBDIR`]) is walked, so the
+    /// pin under [`SCAN_PIN_SUBDIR`] is out of reach. Extraction never
+    /// materialises symlinks, and the walk does not follow them.
+    ///
+    /// A failure is logged and the scan goes on: a lockfile left behind is
+    /// graded as before this change, which can over-block but never under-
+    /// grade, while a hard error would turn into an inconclusive scan that a
+    /// `fail_open` remote serves ungraded.
+    async fn drop_bundled_cargo_locks(extract_root: &Path) {
+        let root = extract_root.to_path_buf();
+        let removed =
+            tokio::task::spawn_blocking(move || remove_files_named(&root, CARGO_LOCK_NAME)).await;
+        match removed {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => debug!(
+                "Removed {} bundled {} from {} before pinning (#5143)",
+                n,
+                CARGO_LOCK_NAME,
+                extract_root.display()
+            ),
+            Ok(Err(e)) => warn!(
+                "Failed to remove bundled {} from {}: {}; it will be graded",
+                CARGO_LOCK_NAME,
+                extract_root.display(),
+                e
+            ),
+            Err(e) => warn!(
+                "Bundled {} removal task failed for {}: {}; it will be graded",
+                CARGO_LOCK_NAME,
+                extract_root.display(),
+                e
+            ),
+        }
     }
 
     /// Write one pin file (creating parents), mapping IO failure onto the
@@ -2545,6 +2600,21 @@ fn widen_owner_modes(root: &Path) {
     }
 }
 
+/// Remove every regular file under `root` whose name is exactly `name`, at any
+/// depth, and return how many were removed. Symlinks are neither followed nor
+/// removed. Blocking; run it off the async workers.
+fn remove_files_named(root: &Path, name: &str) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.map_err(std::io::Error::from)?;
+        if entry.file_type().is_file() && entry.file_name() == name {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// The lockfile name the npm component pin is written under. syft catalogs
 /// this name at any depth, which is what makes both the merged root pin and
 /// the preserve-fallback subdirectory pin gradeable.
@@ -2572,7 +2642,8 @@ pub(crate) const SCAN_PIN_SUBDIR: &str = ".ak-scan-pin";
 pub(crate) const GEMFILE_LOCK_NAME: &str = "Gemfile.lock";
 
 /// The Rust lockfile the CVE engine catalogs from a directory. A published
-/// library `.crate` ships `Cargo.toml` but no `Cargo.lock` (#3603).
+/// library `.crate` usually ships `Cargo.toml` but no `Cargo.lock` (#3603);
+/// one that does ship it has it removed before the pin is written (#5143).
 pub(crate) const CARGO_LOCK_NAME: &str = "Cargo.lock";
 
 /// The .NET dependency manifest the CVE engine catalogs from a directory. The
@@ -2752,6 +2823,11 @@ pub(crate) fn gemfile_lock_pin(name: &str, version: &str) -> String {
 /// engine, so a hosted `smallvec@1.6.0` graded as nothing. `Cargo.lock` is
 /// what both read (syft's `rust-cargo-lock-cataloger`, Trivy's `cargo`
 /// analyzer).
+///
+/// Many crates do ship a `Cargo.lock` (every binary crate does). That file
+/// describes the author's build, which no consumer resolves against, so it is
+/// removed from the workspace and this pin is the crate's only gradeable
+/// component (#5143, [`ScanWorkspace::drop_bundled_cargo_locks`]).
 ///
 /// `checksum` is deliberately omitted: it is absent in real lockfiles for
 /// path/git sources and neither parser requires it, so inventing one would add
@@ -16520,6 +16596,146 @@ mod tests {
             .join("smallvec-1.6.0")
             .join("Cargo.toml")
             .exists());
+    }
+
+    /// The `Cargo.lock` that `cargo package` puts into a crate that commits
+    /// one: the author's resolved build, here listing a crate with a critical
+    /// advisory (CVE-2021-32810), as `async-ctrlc@1.2.0`'s does.
+    const BUNDLED_CARGO_LOCK: &str = "version = 3\n\n\
+        [[package]]\nname = \"async-ctrlc\"\nversion = \"1.2.0\"\n\n\
+        [[package]]\nname = \"crossbeam-deque\"\nversion = \"0.7.3\"\n";
+
+    /// Every path under `root` named `Cargo.lock`, relative to `root`.
+    fn cargo_locks_under(root: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_name() == CARGO_LOCK_NAME)
+            .map(|e| e.path().strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// #5143: a pinned `.crate` that ships its own `Cargo.lock` is graded on
+    /// its own coordinate only. Cargo never resolves a dependent against a
+    /// dependency's lockfile, so the bundled one (and any nested one) must not
+    /// reach either engine; the pin is the only `Cargo.lock` left. Everything
+    /// else the crate ships is untouched.
+    #[tokio::test]
+    async fn test_prepare_pinned_drops_bundled_cargo_lock_5143() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = "[package]\nname = \"async-ctrlc\"\nversion = \"1.2.0\"\n";
+        let content = Bytes::from(build_tar_gz(&[
+            ("async-ctrlc-1.2.0/Cargo.toml", manifest.as_bytes().to_vec()),
+            (
+                "async-ctrlc-1.2.0/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+            (
+                "async-ctrlc-1.2.0/fuzz/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+            (
+                "async-ctrlc-1.2.0/Cargo.lock.orig",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+            ("async-ctrlc-1.2.0/src/lib.rs", b"// lib\n".to_vec()),
+        ]));
+        let pin = ExpectedComponent::new(ComponentEcosystem::Cargo, "async-ctrlc", "1.2.0");
+        assert!(
+            pin_agrees_with_content(&content, &pin, "async-ctrlc-1.2.0.crate"),
+            "the fixture must be a crate the serve path would pin"
+        );
+
+        let workspace = pinned_workspace(
+            &tmp.path().join("ws"),
+            "async-ctrlc-1.2.0.crate",
+            &content,
+            &pin,
+        )
+        .await;
+
+        assert_eq!(
+            cargo_locks_under(&workspace),
+            vec![PathBuf::from(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME)],
+            "the pin must be the only Cargo.lock either engine can catalog"
+        );
+        let body = tokio::fs::read_to_string(workspace.join(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME))
+            .await
+            .expect("Cargo.lock pin");
+        let parsed: toml::Value = toml::from_str(&body).expect("valid TOML");
+        let packages = parsed["package"].as_array().expect("package array");
+        assert_eq!(packages.len(), 1, "{body}");
+        assert_eq!(packages[0]["name"].as_str(), Some("async-ctrlc"));
+        assert_eq!(packages[0]["version"].as_str(), Some("1.2.0"));
+        assert!(!body.contains("crossbeam-deque"), "{body}");
+
+        let crate_root = workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("async-ctrlc-1.2.0");
+        assert!(crate_root.join("Cargo.toml").exists());
+        assert!(crate_root.join("src").join("lib.rs").exists());
+        assert!(
+            crate_root.join("Cargo.lock.orig").exists(),
+            "only files named exactly Cargo.lock are removed"
+        );
+    }
+
+    /// #5143 scope: the bundled `Cargo.lock` is dropped ONLY for a Cargo pin.
+    /// An unpinned scan (no pin, or one the serve path dropped because the
+    /// crate disagreed with it) and an archive pinned as another ecosystem
+    /// keep grading whatever `Cargo.lock` they ship, exactly as before.
+    #[tokio::test]
+    async fn test_bundled_cargo_lock_kept_without_a_cargo_pin_5143() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = Bytes::from(build_tar_gz(&[
+            (
+                "async-ctrlc-1.2.0/Cargo.toml",
+                b"[package]\nname = \"async-ctrlc\"\nversion = \"1.2.0\"\n".to_vec(),
+            ),
+            (
+                "async-ctrlc-1.2.0/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+        ]));
+        let artifact = test_helpers::make_test_artifact(
+            "async-ctrlc-1.2.0.crate",
+            "application/octet-stream",
+            "async-ctrlc-1.2.0.crate",
+        );
+        let unpinned = ScanWorkspace::prepare_pinned(
+            tmp.path().join("unpinned").to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            None,
+        )
+        .await
+        .expect("prepare");
+        assert_eq!(
+            cargo_locks_under(&unpinned),
+            vec![PathBuf::from("async-ctrlc-1.2.0").join(CARGO_LOCK_NAME)]
+        );
+
+        let zip = Bytes::from(build_zip(&[
+            (
+                "example.com/m@v1.0.0/go.mod",
+                b"module example.com/m\n".to_vec(),
+            ),
+            (
+                "example.com/m@v1.0.0/rust/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+        ]));
+        let go =
+            ExpectedComponent::coordinate_pin(ComponentEcosystem::Go, "example.com/m", "v1.0.0")
+                .expect("a module path is pinnable");
+        let ws = pinned_workspace(&tmp.path().join("go"), "v1.0.0.zip", &zip, &go).await;
+        assert_eq!(
+            cargo_locks_under(&ws),
+            vec![PathBuf::from(SCAN_ARCHIVE_SUBDIR).join("example.com/m@v1.0.0/rust/Cargo.lock")]
+        );
     }
 
     /// #3603: a hosted `.nupkg` must leave a `*.deps.json`. The filename is
