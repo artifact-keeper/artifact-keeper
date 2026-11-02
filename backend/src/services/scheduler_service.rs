@@ -2728,7 +2728,7 @@ fn log_curation_filter_refusal(staging_id: uuid::Uuid, remote_key: &str, artifac
 
 /// The client for one Remote's curation fetches, or why there is none.
 enum CurationClient {
-    Ready(reqwest::Client),
+    Ready(crate::services::http_client::Client),
     /// The stored upstream URL is refused by the upstream URL validation.
     Refused(String),
 }
@@ -2820,7 +2820,7 @@ async fn evaluate_ondemand_curation(
     format: &str,
     upstream_url: &str,
     popularity_source: &dyn crate::services::curation::popularity_source::PopularitySource,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
 ) {
     use crate::services::curation::{attestation_verify, publisher_source};
@@ -2973,7 +2973,7 @@ async fn verify_pypi_curation_row(
     db: &PgPool,
     remote_id: uuid::Uuid,
     remote_key: &str,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
     upstream_url: &str,
     pkg: &crate::models::curation::CurationPackage,
@@ -3163,7 +3163,7 @@ fn pypi_base_url(upstream_url: &str) -> String {
 /// Bounded GET of a small JSON body (metadata / provenance). Returns `None` on
 /// any transport error, non-2xx, oversize body, or parse failure (fail-safe).
 async fn bounded_get_json(
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
     url: &str,
 ) -> Option<serde_json::Value> {
@@ -3196,7 +3196,7 @@ async fn bounded_get_json(
 /// the body exceeds [`MAX_VERIFY_DIST_BYTES`] (so a hostile/huge artifact cannot
 /// OOM the sync tick).
 async fn bounded_download(
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
     url: &str,
 ) -> Option<Vec<u8>> {

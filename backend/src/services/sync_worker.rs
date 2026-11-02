@@ -309,7 +309,7 @@ async fn run_stale_peer_detection(db: &PgPool, threshold_minutes: i32) {
 
 async fn run_peer_heartbeat_probes(
     db: &PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     request_timeout: Duration,
 ) {
     let peers: Vec<PeerHeartbeatRow> = match sqlx::query_as(
@@ -353,7 +353,7 @@ async fn run_peer_heartbeat_probes(
 }
 
 async fn probe_peer(
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     peer: &PeerHeartbeatRow,
     request_timeout: Duration,
 ) -> Result<(), String> {
@@ -889,7 +889,7 @@ async fn extend_sync_task_claim(db: &PgPool, task: &Claimed<TaskRow>, claim_ttl_
 /// Process all eligible peers and their pending sync tasks.
 async fn process_pending_tasks(
     db: &PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     storage_registry: Arc<StorageRegistry>,
     retry_policy: SyncRetryPolicy,
 ) -> Result<(), String> {
@@ -1094,7 +1094,7 @@ async fn process_pending_tasks(
 /// finalizer below re-asserts the claim token before writing.
 async fn execute_transfer(
     db: &PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     storage_registry: Arc<StorageRegistry>,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
@@ -1408,7 +1408,7 @@ async fn child_manifest_content_type(db: &PgPool, repo_id: Uuid, digest: &str) -
 /// by the peer, so a partially transferred image never becomes pullable.
 async fn execute_oci_transfer(
     db: &PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     storage_registry: &StorageRegistry,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
@@ -1603,7 +1603,7 @@ fn oci_manifest_replication_headers(
 /// artifact row + storage object on completion.
 async fn execute_chunked_transfer(
     db: &PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     storage_registry: &StorageRegistry,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
@@ -1794,7 +1794,7 @@ async fn execute_chunked_transfer(
 /// Execute a delete task: tell the remote peer to remove an artifact.
 async fn execute_delete(
     db: &PgPool,
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     task: &Claimed<TaskRow>,
     peer_endpoint: &str,
     peer_api_key: &str,
@@ -2670,7 +2670,7 @@ pub(crate) fn build_content_range(byte_offset: i64, byte_length: i32, total_size
 }
 
 async fn cancel_chunked_upload_session(
-    client: &reqwest::Client,
+    client: &crate::services::http_client::Client,
     peer_endpoint: &str,
     peer_api_key: &str,
     session_id: &Uuid,
@@ -5443,7 +5443,7 @@ mod tests {
         ));
         execute_transfer(
             &f.pool,
-            &reqwest::Client::new(),
+            &crate::services::http_client::Client::new(),
             registry,
             &claimed[0],
             &server.uri(),

@@ -358,7 +358,7 @@ fn not_a_base_error(feed_url: &Url) -> AppError {
 /// (the `npm-replicate` engine rejects CouchDB's long-poll controls) and
 /// bootstraps the head cursor from the feed root's `update_seq`.
 pub struct NpmReplicationFeedAdapter {
-    http: reqwest::Client,
+    http: crate::services::http_client::Client,
     url: Url,
     feed_key: String,
 }

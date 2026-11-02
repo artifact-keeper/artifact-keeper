@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use moka::future::Cache;
 
+use crate::services::http_client::Client;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::{BoxStream, StreamExt};
@@ -17,7 +18,7 @@ use regex::Regex;
 use reqwest::header::{
     ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, USER_AGENT, WWW_AUTHENTICATE,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::sync::{RwLock, Semaphore};
