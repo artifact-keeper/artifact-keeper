@@ -9561,6 +9561,23 @@ pub(crate) fn scan_pending_locked_response(filename: &str) -> Response {
         .into_response()
 }
 
+/// Identity rejection is terminal for these bytes under the current probe
+/// limits. Keep 423 as a terminal refusal in virtual-member walks, but never
+/// describe this pre-scan rejection as an in-progress scan (#5148).
+pub(crate) fn scan_identity_unestablished_response(filename: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_identity_unestablished",
+        "file": filename,
+        "reason": "artifact identity could not be established; package metadata or identity-probe limits must be corrected before retrying",
+    });
+    (
+        StatusCode::LOCKED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
 /// Classify a buffered-fetch error as the byte-cap-exceeded case (vs a genuine
 /// upstream 404 / 5xx). Over-cap is the only error the fail-open/closed
 /// inconclusive branch handles specially; every other error is propagated as-is
@@ -10371,7 +10388,9 @@ async fn decide_proxy_scan_serve(
                         "cannot establish what these bytes are served as; \
                          fail-closed -> withholding rather than reporting clean"
                     );
-                    return ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename));
+                    return ProxyScanServeOutcome::Deny(scan_identity_unestablished_response(
+                        filename,
+                    ));
                 }
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,

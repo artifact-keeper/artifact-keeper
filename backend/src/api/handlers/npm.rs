@@ -5469,10 +5469,29 @@ fn npm_version_from_tarball_filename(package_name: &str, filename: &str) -> Opti
 /// shape. Every one of those is "this tarball does not state a usable
 /// identity", which the caller must treat as inconclusive, never clean.
 fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
-    let body = crate::util::bounded_archive::read_metadata_from_tar_gz(&tarball[..], |path| {
-        path == std::path::Path::new("package/package.json")
-    })
-    .ok()??;
+    use crate::util::bounded_archive as bounded;
+
+    // Identity lookup does not create files. Large npm packages can put
+    // package.json well after the ingestion walk's 10,000-entry default.
+    // Keep a separate finite entry budget, and retain BOTH byte limits.
+    let max_entries = std::env::var("MAX_NPM_IDENTITY_ARCHIVE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100_000);
+    let body = match bounded::read_metadata_from_tar_gz_limited(
+        &tarball[..],
+        |path| path == std::path::Path::new("package/package.json"),
+        bounded::max_ingest_decompressed_bytes(),
+        max_entries,
+        bounded::MAX_INGEST_METADATA_ENTRY_BYTES,
+    ) {
+        Ok(body) => body?,
+        Err(error) => {
+            tracing::warn!(%error, "npm identity metadata probe failed");
+            return None;
+        }
+    };
     let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let name = v.get("name")?.as_str()?.trim().to_string();
     let version = v.get("version")?.as_str()?.trim().to_string();
@@ -18292,6 +18311,35 @@ mod proxy_scan_block_tests {
         assert!(npm_claimed_identity(&crafted_tgz(Some(b"nope"))).is_none());
     }
 
+    /// The identity reader must reach valid metadata after the ingestion
+    /// reader's default entry cap, while retaining the bounded tar reader.
+    #[test]
+    fn test_npm_claimed_identity_late_metadata_5148() {
+        use crate::services::archive_entry_paths::test_support::tar_gz_with;
+        use crate::util::bounded_archive as bounded;
+
+        let names: Vec<String> = (0..10_001).map(|i| format!("package/file-{i}")).collect();
+        let mut entries: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+        entries.push((
+            "package/package.json",
+            br#"{"name":"foo","version":"1.0.0"}"#,
+        ));
+        let bytes = Bytes::from(tar_gz_with(&entries));
+        assert!(bounded::read_metadata_from_tar_gz_limited(
+            &bytes[..],
+            |path| path == std::path::Path::new("package/package.json"),
+            bounded::DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES,
+            bounded::DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES,
+            bounded::MAX_INGEST_METADATA_ENTRY_BYTES,
+        )
+        .is_err());
+        assert_eq!(
+            npm_claimed_identity(&bytes),
+            Some(("foo".into(), "1.0.0".into()))
+        );
+    }
+
     /// #3003 (red-team shape a): a tarball whose package.json was rewritten to
     /// a benign identity does NOT agree with the coordinate it is served at.
     #[test]
@@ -18393,11 +18441,17 @@ mod proxy_scan_block_tests {
                      as must be withheld under fail_closed, got {}",
                     r.status()
                 ),
-                Err(resp) => assert_eq!(
-                    resp.status(),
-                    StatusCode::LOCKED,
-                    "{label}: expected 423 (inconclusive), not a clean serve"
-                ),
+                Err(resp) => {
+                    assert_eq!(resp.status(), StatusCode::LOCKED, "{label}");
+                    assert!(resp.headers().get("Retry-After").is_none());
+                    let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+                        .await
+                        .expect("identity refusal body");
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&body).expect("identity refusal JSON");
+                    assert_eq!(json["error"], "scan_identity_unestablished", "{label}");
+                    assert!(!json["reason"].as_str().unwrap().contains("being scanned"));
+                }
             }
         }
     }
