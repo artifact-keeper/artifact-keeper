@@ -76,19 +76,6 @@ impl DependencyTrackService {
         project
     }
 
-    /// HTTP-only test entry point; production also takes the database lock.
-    #[cfg(all(test, ak_test_shard = "services-1"))]
-    async fn get_or_create_maven_project(
-        &self,
-        coordinates: &MavenCoordinates,
-        legacy_name: &str,
-        description: &str,
-    ) -> Result<DtProject> {
-        let _guard = self.maven_provisioning.lock().await;
-        self.provision_maven_project(coordinates, legacy_name, description)
-            .await
-    }
-
     /// Provisioning runs only after the scanner's classifier eligibility check.
     /// No local scan state is read or written by this method.
     async fn provision_maven_project(
@@ -469,12 +456,27 @@ fn maven_purl(coordinates: &MavenCoordinates, versioned: bool) -> String {
     purl
 }
 
-#[cfg(all(test, ak_test_shard = "services-1"))]
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    impl DependencyTrackService {
+        /// HTTP-only test entry point; production also takes the database lock.
+        async fn get_or_create_maven_project(
+            &self,
+            coordinates: &MavenCoordinates,
+            legacy_name: &str,
+            description: &str,
+        ) -> Result<DtProject> {
+            let _guard = self.maven_provisioning.lock().await;
+            self.provision_maven_project(coordinates, legacy_name, description)
+                .await
+        }
+    }
 
     fn service(url: &str, collections: bool, csv: &str) -> DependencyTrackService {
         DependencyTrackService {

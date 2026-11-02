@@ -34184,6 +34184,7 @@ tonic-build = "0.12"
 
 /// Vulnerability-database provenance parsing (#3014). Fixtures are verbatim
 /// output of grype 0.118.0 and trivy 0.71.2.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod vuln_db_provenance_tests {
     use super::*;

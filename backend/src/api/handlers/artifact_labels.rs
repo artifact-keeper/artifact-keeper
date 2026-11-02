@@ -799,6 +799,7 @@ mod tests {
 // database is configured; `AK_TESTS_REQUIRE_DB=1` turns an unreachable
 // database into a hard failure rather than a silent skip.
 // ---------------------------------------------------------------------------
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod label_write_authz_4193 {
     use super::*;

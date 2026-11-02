@@ -4028,6 +4028,7 @@ mod tests {
 ///   AK_STREAMED_ASSEMBLY_LIVE=s3 S3_BUCKET=ak-test S3_REGION=us-east-1 \
 ///   S3_ENDPOINT=http://127.0.0.1:39000 S3_ACCESS_KEY_ID=... \
 ///   S3_SECRET_ACCESS_KEY=... cargo test streamed_assembly_live -- --ignored
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod streamed_assembly_live {
     use super::*;

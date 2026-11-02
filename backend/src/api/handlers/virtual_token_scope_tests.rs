@@ -25,6 +25,7 @@
 // The whole module is a `#[cfg(test)] mod` block so that
 // `scripts/ci/check-token-mint-surface.sh` (#1315) recognises its
 // `generate_api_token` calls as test-only.
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
