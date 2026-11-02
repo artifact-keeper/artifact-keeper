@@ -6001,7 +6001,20 @@ async fn enforce_blob_scan_reblock(
         // member set, so the virtual cannot become the lax route around a
         // stricter member.
         ref_owners.push((repo.repo_type.as_str(), repo.id));
-        let severity_gate = blob_severity_gate(&scan_cfg, &ref_owners).await;
+        // A hosted member pins block-on-any only for blobs it actually
+        // references. Keep every proxy policy (including the virtual's) in
+        // scope, and keep the full owner set for staleness/referrer checks.
+        let severity_owners = blob_severity_owners(&state.db, &ref_owners, lookup_digest)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "blob reference lookup failed; withholding");
+                oci_error(
+                    StatusCode::LOCKED,
+                    "DENIED",
+                    "blob scan status is unavailable; retry shortly",
+                )
+            })?;
+        let severity_gate = blob_severity_gate(&scan_cfg, &severity_owners).await;
         scope_gate = severity_gate;
         let status =
             blob_vulnerable_verdict_status_any(state, &gated_ids, lookup_digest, severity_gate)
@@ -10549,8 +10562,8 @@ async fn blob_reblock_applies(
 /// ([`proxy_helpers::stricter_scan_policy`]) but over a WIDER population:
 /// the manifest gate combines only the virtual and the ONE member that
 /// resolved the manifest, while this gate combines every owner in
-/// `ref_owners` (for a virtual: every gated member plus the virtual itself,
-/// because a blob digest is not tied to one member). It is record-only exactly
+/// `ref_owners` (for a virtual: every gated proxy member plus the virtual
+/// itself, and hosted members that reference this blob). It is record-only exactly
 /// when every owner with scanning enabled chose `record_only` and no owner is
 /// fail-closed. On a direct Remote, or a virtual whose members all agree, a
 /// layer of an image served `recorded` therefore serves too. On a virtual that
@@ -10592,6 +10605,37 @@ async fn blob_severity_gate(
         return ProxySeverityGate::RecordOnly;
     }
     gate.unwrap_or(ProxySeverityGate::BlockOnAny)
+}
+
+/// Scope hosted block-on-any to owners with an actual edge to this blob.
+/// Proxy owners are retained even without an edge: the virtual/remote
+/// stricter-policy rule is independent of hosted ownership (#5146).
+async fn blob_severity_owners<'a>(
+    db: &sqlx::PgPool,
+    owners: &[(&'a str, Uuid)],
+    blob_digest: &str,
+) -> Result<Vec<(&'a str, Uuid)>, sqlx::Error> {
+    let hosted: Vec<Uuid> = owners
+        .iter()
+        .filter(|(t, _)| *t == RepositoryType::Local || *t == RepositoryType::Staging)
+        .map(|(_, id)| *id)
+        .collect();
+    if hosted.is_empty() {
+        return Ok(owners.to_vec());
+    }
+    let referencing: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT repository_id FROM manifest_blob_refs \
+         WHERE repository_id = ANY($1) AND blob_digest = $2",
+    )
+    .bind(&hosted)
+    .bind(blob_digest)
+    .fetch_all(db)
+    .await?;
+    Ok(owners
+        .iter()
+        .copied()
+        .filter(|(_, id)| !hosted.contains(id) || referencing.contains(id))
+        .collect())
 }
 
 /// One manifest in scope that references a blob, with whatever verdict its
@@ -40370,6 +40414,75 @@ mod virtual_scan_gate_tests {
             StatusCode::OK,
             "a clean image's blob through the virtual must still serve (no over-block)"
         );
+    }
+
+    /// An empty hosted member must not tighten a remote-only blob's threshold.
+    /// Once it references that blob, hosted block-on-any must still apply.
+    #[tokio::test]
+    async fn virtual_blob_empty_local_preserves_proxy_threshold_5146() {
+        let Some(fx) = VirtualBlobFixture::setup("remote", "empty-local").await else {
+            return;
+        };
+        for id in [fx.member_id, fx.virt_id] {
+            enable_proxy_scan(&fx.pool, id, "fail_closed").await;
+        }
+        sqlx::query(
+            "UPDATE scan_configs SET block_on_policy_violation = true, severity_threshold = 'high' \
+             WHERE repository_id = ANY($1)",
+        )
+        .bind(&[fx.member_id, fx.virt_id][..])
+        .execute(&fx.pool)
+        .await
+        .expect("set proxy thresholds");
+        sqlx::query(
+            "UPDATE proxy_scan_results SET max_severity = 'medium' WHERE checksum_sha256 = $1",
+        )
+        .bind(fx.vuln_mdigest.strip_prefix("sha256:").unwrap())
+        .execute(&fx.pool)
+        .await
+        .expect("seed below-threshold verdict");
+        let remote_only = fx.get_blob(&fx.vuln_cfg).await;
+        let (hosted_id, _) = insert_member(&fx.pool, "local", None).await;
+        link_member(&fx.pool, fx.virt_id, hosted_id).await;
+        let empty_hosted = fx.get_blob(&fx.vuln_cfg).await;
+
+        sqlx::query(
+            "UPDATE scan_configs SET severity_threshold = 'low' WHERE repository_id = $1",
+        )
+        .bind(fx.virt_id)
+        .execute(&fx.pool)
+        .await
+        .expect("tighten virtual policy");
+        let stricter_virtual = fx.get_blob(&fx.vuln_cfg).await;
+        sqlx::query(
+            "UPDATE scan_configs SET severity_threshold = 'high' WHERE repository_id = $1",
+        )
+        .bind(fx.virt_id)
+        .execute(&fx.pool)
+        .await
+        .expect("restore virtual policy");
+        sqlx::query(
+            "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
+             VALUES ($1, $2, $3, 'config')",
+        )
+        .bind(&fx.vuln_mdigest)
+        .bind(&fx.vuln_cfg)
+        .bind(hosted_id)
+        .execute(&fx.pool)
+        .await
+        .expect("hosted image references the same blob");
+        let referenced_hosted = fx.get_blob(&fx.vuln_cfg).await;
+        cleanup(&fx.pool, &[hosted_id], &[]).await;
+        fx.teardown().await;
+
+        assert_eq!(remote_only, StatusCode::OK);
+        assert_eq!(
+            empty_hosted,
+            StatusCode::OK,
+            "empty member must not tighten the gate"
+        );
+        assert_eq!(stricter_virtual, StatusCode::FORBIDDEN);
+        assert_eq!(referenced_hosted, StatusCode::FORBIDDEN);
     }
 
     /// The OR, direction 1 (#3025 stricter-of-two): `scan_on_proxy` on the
