@@ -455,6 +455,15 @@ fn request_error(operation: &str, e: reqwest::Error) -> AppError {
 // Azure Blob Storage backend
 // ---------------------------------------------------------------------------
 
+/// How [`AzureBackend::copy_reporting_path`] moved the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AzureCopyPath {
+    /// Azure copied the blob server-side with Put Blob From URL.
+    PutBlobFromUrl,
+    /// This process streamed the blob through a block upload.
+    BlockUpload,
+}
+
 /// Azure Blob Storage backend
 pub struct AzureBackend {
     config: AzureConfig,
@@ -1477,16 +1486,92 @@ impl AzureBackend {
         Self::content_length_from_head(&response, key)
     }
 
-    async fn copy_via_stream(&self, source: &str, dest: &str) -> Result<()> {
+    async fn copy_via_stream(&self, source: &str, dest: &str) -> Result<AzureCopyPath> {
         let stream = self.get_stream(source).await?;
         self.put_stream(dest, stream).await?;
-        Ok(())
+        Ok(AzureCopyPath::BlockUpload)
     }
 
     /// Server-side copy of blob `source` onto `dest` (the [`StorageBackend`]
     /// copy), reachable as an inherent method for the storage facade wrapper.
     pub async fn copy(&self, source: &str, dest: &str) -> Result<()> {
         <Self as StorageBackend>::copy(self, source, dest).await
+    }
+
+    /// The [`StorageBackend`] copy, answering which path moved the bytes. A
+    /// successful copy looks the same either way, so the live test (#4963) needs
+    /// this to tell a working Put Blob From URL from its block-upload fallback.
+    pub async fn copy_reporting_path(&self, source: &str, dest: &str) -> Result<AzureCopyPath> {
+        let size = match self.size(source).await {
+            Ok(size) => size,
+            Err(AppError::NotFound(_)) if self.path_format.has_fallback() => {
+                return self.copy_via_stream(source, dest).await;
+            }
+            Err(e) => return Err(e),
+        };
+        if size > AZURE_PUT_BLOB_FROM_URL_MAX_SIZE {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                size,
+                "Azure source is too large for Put Blob From URL; streaming through block upload"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+
+        // Azure reads the source while the request is open, so the source SAS
+        // must outlive the request rather than expire part-way through it.
+        let timeout = put_blob_from_url_timeout(size, self.config.copy_timeout_floor);
+        let source_url = self.read_url(
+            source,
+            Duration::from_secs(300).max(timeout + Duration::from_secs(60)),
+        )?;
+        if source_url.len() > AZURE_COPY_SOURCE_URL_MAX_LEN {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                source_url_len = source_url.len(),
+                "Azure source URL is too long for Put Blob From URL; streaming through block upload"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+
+        // #4320: in Shared Key mode the destination is authorized with a
+        // signed Authorization header rather than a SAS in its URL. Azure
+        // accepts either. An endpoint that rejects the SAS form with an error
+        // of its own (the Azurite emulator answers 500) reports a missing API
+        // as 501 under Shared Key, which the fallback below handles; and the
+        // header keeps a signed URL out of the request line besides.
+        let dest_url = match &self.auth {
+            AzureAuthMode::SharedKey { .. } => self.blob_url(dest),
+            AzureAuthMode::TokenCredential { .. } => self.write_url(dest)?,
+        };
+        let response = self
+            .authorized_put_blob_from_url(&dest_url, dest, &source_url, timeout)
+            .await?;
+        // #4320: an Azure-compatible endpoint that does not implement Put
+        // Blob From URL at all (the Azurite emulator answers 501) gets the
+        // streamed copy instead. 501 is "this API does not exist here", never
+        // a transient failure of one that does, so a real Azure copy error
+        // still surfaces below.
+        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
+            tracing::debug!(
+                source = %source,
+                dest = %dest,
+                "Azure endpoint does not implement Put Blob From URL; streaming the copy"
+            );
+            return self.copy_via_stream(source, dest).await;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
+                source, dest, status, body
+            )));
+        }
+
+        Ok(AzureCopyPath::PutBlobFromUrl)
     }
 
     /// List the blob names under `prefix` (#4320), following `NextMarker`
@@ -1887,76 +1972,7 @@ impl StorageBackend for AzureBackend {
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "copy"))]
     async fn copy(&self, source: &str, dest: &str) -> Result<()> {
-        let size = match self.size(source).await {
-            Ok(size) => size,
-            Err(AppError::NotFound(_)) if self.path_format.has_fallback() => {
-                return self.copy_via_stream(source, dest).await;
-            }
-            Err(e) => return Err(e),
-        };
-        if size > AZURE_PUT_BLOB_FROM_URL_MAX_SIZE {
-            tracing::debug!(
-                source = %source,
-                dest = %dest,
-                size,
-                "Azure source is too large for Put Blob From URL; streaming through block upload"
-            );
-            return self.copy_via_stream(source, dest).await;
-        }
-
-        // Azure reads the source while the request is open, so the source SAS
-        // must outlive the request rather than expire part-way through it.
-        let timeout = put_blob_from_url_timeout(size, self.config.copy_timeout_floor);
-        let source_url = self.read_url(
-            source,
-            Duration::from_secs(300).max(timeout + Duration::from_secs(60)),
-        )?;
-        if source_url.len() > AZURE_COPY_SOURCE_URL_MAX_LEN {
-            tracing::debug!(
-                source = %source,
-                dest = %dest,
-                source_url_len = source_url.len(),
-                "Azure source URL is too long for Put Blob From URL; streaming through block upload"
-            );
-            return self.copy_via_stream(source, dest).await;
-        }
-
-        // #4320: in Shared Key mode the destination is authorized with a
-        // signed Authorization header rather than a SAS in its URL. Azure
-        // accepts either. An endpoint that rejects the SAS form with an error
-        // of its own (the Azurite emulator answers 500) reports a missing API
-        // as 501 under Shared Key, which the fallback below handles; and the
-        // header keeps a signed URL out of the request line besides.
-        let dest_url = match &self.auth {
-            AzureAuthMode::SharedKey { .. } => self.blob_url(dest),
-            AzureAuthMode::TokenCredential { .. } => self.write_url(dest)?,
-        };
-        let response = self
-            .authorized_put_blob_from_url(&dest_url, dest, &source_url, timeout)
-            .await?;
-        // #4320: an Azure-compatible endpoint that does not implement Put
-        // Blob From URL at all (the Azurite emulator answers 501) gets the
-        // streamed copy instead. 501 is "this API does not exist here", never
-        // a transient failure of one that does, so a real Azure copy error
-        // still surfaces below.
-        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
-            tracing::debug!(
-                source = %source,
-                dest = %dest,
-                "Azure endpoint does not implement Put Blob From URL; streaming the copy"
-            );
-            return self.copy_via_stream(source, dest).await;
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
-                source, dest, status, body
-            )));
-        }
-
-        Ok(())
+        self.copy_reporting_path(source, dest).await.map(|_| ())
     }
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists_at_exact_key"))]
