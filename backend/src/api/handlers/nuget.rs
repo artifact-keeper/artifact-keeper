@@ -3870,8 +3870,12 @@ async fn virtual_member_download(
         let vname = package_id_lower.to_string();
         let vversion = version.to_string();
         async move {
-            proxy_helpers::local_fetch_by_name_version(
-                &db, &state, member_id, &location, &vname, &vversion,
+            proxy_helpers::local_fetch_by_lookup(
+                &db,
+                &state,
+                member_id,
+                &location,
+                proxy_helpers::LocalLookup::NameVersionCaseInsensitive(&vname, &vversion),
             )
             .await
         }
@@ -11109,6 +11113,64 @@ mod virtual_federation_tests {
             HOSTED_BYTES,
             "the higher-priority hosted member must serve the coordinate it holds"
         );
+    }
+
+    /// Imported rows retain their original case. A local-only virtual must
+    /// resolve both client spellings without changing the stored path (#5147).
+    #[tokio::test]
+    async fn virtual_download_resolves_mixed_case_stored_name_5147() {
+        use sha2::{Digest, Sha256};
+
+        const BYTES: &[u8] = b"imported nupkg";
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        seed_local_version(&fx.pool, member_id, "Foo.Bar", "1.0.2", fx.user_id).await;
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha256 = $1, size_bytes = $2 WHERE repository_id = $3",
+        )
+        .bind(format!("{:x}", Sha256::digest(BYTES)))
+        .bind(BYTES.len() as i64)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("record real package checksum");
+        let blob = member_dir.join("Foo.Bar/1.0.2/Foo.Bar.1.0.2.nupkg");
+        std::fs::create_dir_all(blob.parent().unwrap()).expect("member blob dir");
+        std::fs::write(&blob, BYTES).expect("member blob");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let app = tdh::router_with_auth(super::router(), state, auth);
+        for name in ["foo.bar", "Foo.Bar"] {
+            let (status, body) = tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/{}/v3/flatcontainer/{name}/1.0.2/{name}.1.0.2.nupkg",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "client spelling {name}");
+            assert_eq!(&body[..], BYTES);
+        }
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/foo.bar/9.9.9/foo.bar.9.9.9.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// The reported topology: a private hosted member and a remote member, both

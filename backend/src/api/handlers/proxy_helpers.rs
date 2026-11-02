@@ -5590,6 +5590,9 @@ pub(crate) enum LocalLookup<'a> {
     Path(&'a str),
     /// Match on `name` + `version`.
     NameVersion(&'a str, &'a str),
+    /// NuGet IDs are case-insensitive, including existing imported names.
+    /// The caller supplies the normalized lowercase ID; version stays exact.
+    NameVersionCaseInsensitive(&'a str, &'a str),
     /// Match on `name` + `version` constrained to a trailing `path LIKE`
     /// pattern (e.g. `%.zip` vs `%.mod`). Needed by the Go proxy where a
     /// single `(name, version)` pair owns *both* the module `.zip` and the
@@ -5622,6 +5625,12 @@ impl LocalLookup<'_> {
                  WHERE repository_id = $1 AND name = $2 AND version = $3 AND path LIKE $4 AND is_deleted = false \
                  LIMIT 1"
             }
+            LocalLookup::NameVersionCaseInsensitive(_, _) => {
+                "SELECT id, storage_key, content_type, size_bytes, quarantine_status, quarantine_until, checksum_sha256, path \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND LOWER(name) = $2 AND version = $3 AND is_deleted = false \
+                 LIMIT 1"
+            }
         }
     }
 
@@ -5633,7 +5642,10 @@ impl LocalLookup<'_> {
             .bind(repo_id);
         let query = match self {
             LocalLookup::Path(path) => query.bind(*path),
-            LocalLookup::NameVersion(name, version) => query.bind(*name).bind(*version),
+            LocalLookup::NameVersion(name, version)
+            | LocalLookup::NameVersionCaseInsensitive(name, version) => {
+                query.bind(*name).bind(*version)
+            }
             LocalLookup::NameVersionSuffix(name, version, suffix) => {
                 query.bind(*name).bind(*version).bind(*suffix)
             }
@@ -5848,14 +5860,26 @@ pub async fn local_fetch_by_name_version(
     name: &str,
     version: &str,
 ) -> Result<StreamingFetchResult, Response> {
-    let (artifact, storage) = local_lookup_artifact(
+    local_fetch_by_lookup(
         db,
         state,
         repo_id,
         location,
         LocalLookup::NameVersion(name, version),
     )
-    .await?;
+    .await
+}
+
+/// Stream a selected local artifact through the shared download gate and
+/// storage resolver. Selectors change matching only, never enforcement.
+pub(crate) async fn local_fetch_by_lookup(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    lookup: LocalLookup<'_>,
+) -> Result<StreamingFetchResult, Response> {
+    let (artifact, storage) = local_lookup_artifact(db, state, repo_id, location, lookup).await?;
     read_local_stream(db, &artifact, &*storage).await
 }
 
