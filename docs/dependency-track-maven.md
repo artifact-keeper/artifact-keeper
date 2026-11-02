@@ -100,6 +100,8 @@ for simultaneous collection creation with a null version. Independent AK
 installations sharing DT should coordinate ownership: they do not share this
 lock. A creation HTTP 409 triggers bounded exact lookups and full-detail
 validation of the winning project.
+Requests queue on the client mutex before acquiring a database connection, so
+an upstream outage holds at most one pool connection per client for DT work.
 Parent assignment re-reads the child and never deliberately replaces a different
 parent. DT 4.14 does not offer compare-and-set parent updates; coordinate manual
 hierarchy edits with automated provisioning to avoid a concurrent operator edit
