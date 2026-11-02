@@ -37,9 +37,44 @@ impl DependencyTrackService {
         self.config.auto_collections
     }
 
+    /// Serialize all AK replicas sharing a database. DT 4.14 checks name/version
+    /// before creation but does not guarantee a database uniqueness constraint
+    /// for that pair (notably for null versions). A client mutex alone cannot
+    /// prevent two replicas from creating the same collection concurrently.
+    pub async fn get_or_create_maven_project_with_db(
+        &self,
+        db: &sqlx::PgPool,
+        coordinates: &MavenCoordinates,
+        legacy_name: &str,
+        description: &str,
+    ) -> Result<DtProject> {
+        if self.excludes_maven_classifier(coordinates) {
+            return Err(AppError::Validation("Excluded Maven classifier".into()));
+        }
+        let mut transaction = db.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '30s'")
+            .execute(&mut *transaction)
+            .await?;
+        // PostgreSQL hashes the entire identity; collisions only serialize
+        // unrelated artifacts and never change how projects are matched.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "dependency-track:maven:{}:{}",
+                coordinates.group_id, coordinates.artifact_id
+            ))
+            .execute(&mut *transaction)
+            .await?;
+        let project = self
+            .get_or_create_maven_project(coordinates, legacy_name, description)
+            .await;
+        // No local state was written. Release even when the upstream failed.
+        transaction.rollback().await?;
+        project
+    }
+
     /// Provisioning runs only after the scanner's classifier eligibility check.
     /// No local scan state is read or written by this method.
-    pub async fn get_or_create_maven_project(
+    async fn get_or_create_maven_project(
         &self,
         coordinates: &MavenCoordinates,
         legacy_name: &str,
@@ -504,6 +539,7 @@ mod tests {
     #[derive(Default)]
     struct Portfolio {
         projects: Vec<Value>,
+        allow_duplicates: bool,
         conflict_once: bool,
         fault: Option<(String, String, u16)>,
         uploads: Vec<String>,
@@ -533,9 +569,14 @@ mod tests {
                         summary
                     })
                     .collect();
-                return ResponseTemplate::new(200)
+                let response = ResponseTemplate::new(200)
                     .insert_header("X-Total-Count", projects.len().to_string())
                     .set_body_json(projects);
+                return if state.allow_duplicates {
+                    response.set_delay(Duration::from_millis(30))
+                } else {
+                    response
+                };
             }
             if method == "GET" && path == "/api/v1/project/lookup" {
                 let query: std::collections::HashMap<_, _> = req.url.query_pairs().collect();
@@ -568,10 +609,11 @@ mod tests {
             }
             if method == "PUT" && path == "/api/v1/project" {
                 let mut body: Value = serde_json::from_slice(&req.body).unwrap();
-                if state
-                    .projects
-                    .iter()
-                    .any(|p| p["name"] == body["name"] && p["version"] == body["version"])
+                if !state.allow_duplicates
+                    && state
+                        .projects
+                        .iter()
+                        .any(|p| p["name"] == body["name"] && p["version"] == body["version"])
                 {
                     return ResponseTemplate::new(409);
                 }
@@ -880,5 +922,38 @@ mod tests {
         assert_eq!(state.projects.len(), 2);
         assert_eq!(state.uploads.len(), 2);
         assert_eq!(state.uploads[0], state.uploads[1]);
+    }
+
+    #[tokio::test]
+    async fn database_lock_serializes_replicas_and_releases_after_errors() {
+        let Some(db) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let (_server, state, svc) = api(Portfolio {
+            allow_duplicates: true,
+            fault: Some(("GET".into(), "/api/v1/project".into(), 503)),
+            ..Default::default()
+        })
+        .await;
+        let a = coordinates("1.0");
+        let b = coordinates("2.0");
+        assert!(svc
+            .get_or_create_maven_project_with_db(&db, &a, "core", "repo")
+            .await
+            .is_err());
+        state.lock().unwrap().fault = None;
+        let other = service(&svc.config.base_url, true, "");
+        let (first, second, repeated) = tokio::join!(
+            svc.get_or_create_maven_project_with_db(&db, &a, "core", "repo"),
+            other.get_or_create_maven_project_with_db(&db, &b, "core", "repo"),
+            other.get_or_create_maven_project_with_db(&db, &a, "core", "repo"),
+        );
+        let first = first.unwrap();
+        assert_eq!(first.uuid, repeated.unwrap().uuid);
+        assert_eq!(
+            first.parent.unwrap().uuid,
+            second.unwrap().parent.unwrap().uuid
+        );
+        assert_eq!(state.lock().unwrap().projects.len(), 3);
     }
 }

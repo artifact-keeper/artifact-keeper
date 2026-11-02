@@ -328,8 +328,8 @@ pub struct DependencyTrackService {
     /// Cache for a file-sourced API key; unused when the key is provided
     /// directly via `DEPENDENCY_TRACK_API_KEY`.
     cached_file_key: std::sync::Mutex<CachedFileKey>,
-    /// Serializes this client's Maven provisioning. DT's unique name/version
-    /// constraint and conflict recovery also cover independent AK instances.
+    /// Serializes this client's Maven provisioning; PostgreSQL advisory locks
+    /// cover independent AK replicas, and HTTP 409s trigger exact lookups.
     maven_provisioning: tokio::sync::Mutex<()>,
 }
 
