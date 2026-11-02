@@ -5472,9 +5472,7 @@ fn npm_version_from_tarball_filename(package_name: &str, filename: &str) -> Opti
 fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
     use crate::util::bounded_archive as bounded;
 
-    // Identity lookup does not create files. Large npm packages can put
-    // package.json well after the ingestion walk's 10,000-entry default.
-    // Keep a separate finite entry budget, and retain BOTH byte limits.
+    // Late metadata needs a separate entry budget; both byte limits still apply (#5148).
     let max_entries = std::env::var("MAX_NPM_IDENTITY_ARCHIVE_ENTRIES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -5498,10 +5496,8 @@ fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
     (!name.is_empty() && !version.is_empty()).then_some((name, version))
 }
 
-/// Keep canonical metadata's existing precedence regardless of archive order.
-/// An alternative root is accepted only after the bounded walk completes and
-/// confirms a single top-level directory. Nested dependency manifests and
-/// ambiguous roots must never become the package's claimed identity.
+/// Prefer `package/package.json`; accept another root only after a bounded
+/// full walk confirms a single top-level directory (#5149).
 fn npm_identity_metadata_limited(
     tarball: &[u8],
     max_total: u64,
@@ -18385,8 +18381,7 @@ mod proxy_scan_block_tests {
         assert!(npm_claimed_identity(&crafted_tgz(Some(b"nope"))).is_none());
     }
 
-    /// The identity reader must reach valid metadata after the ingestion
-    /// reader's default entry cap, while retaining the bounded tar reader.
+    /// Metadata past the ingest entry cap remains reachable by the identity probe (#5148).
     #[test]
     fn test_npm_claimed_identity_late_metadata_5148() {
         use crate::services::archive_entry_paths::test_support::tar_gz_with;

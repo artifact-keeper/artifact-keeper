@@ -9561,9 +9561,7 @@ pub(crate) fn scan_pending_locked_response(filename: &str) -> Response {
         .into_response()
 }
 
-/// Identity rejection is terminal for these bytes under the current probe
-/// limits. Keep 423 as a terminal refusal in virtual-member walks, but never
-/// describe this pre-scan rejection as an in-progress scan (#5148).
+/// Identity failure is not a pending scan. Keep 423 terminal in virtual walks (#5148).
 pub(crate) fn scan_identity_unestablished_response(filename: &str) -> Response {
     let body = serde_json::json!({
         "error": "scan_identity_unestablished",
