@@ -6001,9 +6001,7 @@ async fn enforce_blob_scan_reblock(
         // member set, so the virtual cannot become the lax route around a
         // stricter member.
         ref_owners.push((repo.repo_type.as_str(), repo.id));
-        // A hosted member pins block-on-any only for blobs it actually
-        // references. Keep every proxy policy (including the virtual's) in
-        // scope, and keep the full owner set for staleness/referrer checks.
+        // Only referencing hosted members tighten severity. Other gates keep all owners.
         let severity_owners = blob_severity_owners(&state.db, &ref_owners, lookup_digest)
             .await
             .map_err(|e| {
@@ -10547,8 +10545,7 @@ async fn blob_reblock_applies(
 
 /// The severity gate the blob re-block applies to referencing `vulnerable`
 /// verdicts (#3243 stage 3), derived from the repositories whose refs are in
-/// scope (`ref_owners`, same population `stale_blob_verdicts_still_withhold`
-/// consults).
+/// scope. Virtuals exclude non-referencing hosted members from this gate only.
 ///
 /// Hosted (`Local`/`Staging`) owners pin the gate to block-on-any: the
 /// severity threshold is a proxy-gate knob (`scan_configs` is proxy-shaped and
@@ -10563,8 +10560,8 @@ async fn blob_reblock_applies(
 /// the manifest gate combines only the virtual and the ONE member that
 /// resolved the manifest, while this gate combines every owner in
 /// `ref_owners` (for a virtual: every gated proxy member plus the virtual
-/// itself, and hosted members that reference this blob). It is record-only exactly
-/// when every owner with scanning enabled chose `record_only` and no owner is
+/// itself, and referencing hosted members). It is record-only when every
+/// owner with scanning enabled chose `record_only` and no owner is
 /// fail-closed. On a direct Remote, or a virtual whose members all agree, a
 /// layer of an image served `recorded` therefore serves too. On a virtual that
 /// mixes a record-only member with an enforcing one, the blob seam can still
@@ -10607,9 +10604,7 @@ async fn blob_severity_gate(
     gate.unwrap_or(ProxySeverityGate::BlockOnAny)
 }
 
-/// Scope hosted block-on-any to owners with an actual edge to this blob.
-/// Proxy owners are retained even without an edge: the virtual/remote
-/// stricter-policy rule is independent of hosted ownership (#5146).
+/// Retain all proxy policies, but only hosted owners that reference this blob (#5146).
 async fn blob_severity_owners<'a>(
     db: &sqlx::PgPool,
     owners: &[(&'a str, Uuid)],
@@ -40416,8 +40411,7 @@ mod virtual_scan_gate_tests {
         );
     }
 
-    /// An empty hosted member must not tighten a remote-only blob's threshold.
-    /// Once it references that blob, hosted block-on-any must still apply.
+    /// Hosted members tighten severity only when they reference the blob (#5146).
     #[tokio::test]
     async fn virtual_blob_empty_local_preserves_proxy_threshold_5146() {
         let Some(fx) = VirtualBlobFixture::setup("remote", "empty-local").await else {
