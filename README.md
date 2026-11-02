@@ -301,6 +301,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
 - **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
 - **[Proxy cache freshness](docs/proxy-cache-freshness.md)** — How mutable metadata and immutable artifacts expire on different schedules, and why an upstream yank surfaces as a resolution failure while the artifact still serves
+- **[Custom CA rotation](docs/operations/custom-ca-rotation.md)** — Reload timing, mount requirements, and behavior of existing connections
 
 ## Project Structure
 
