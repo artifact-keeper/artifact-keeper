@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 New entries go in [`changes/unreleased/`](changes/unreleased/), one file per PR; see [`changes/README.md`](changes/README.md).
 
+## [1.11.11] - 2026-11-02
+
+### Sponsors
+
+Thank you to our sponsors for supporting ongoing development of Artifact Keeper.
+
+**Backers**
+
+- **Advailo, SIA** ([@advailo](https://github.com/advailo))
+- **Ash A.** ([@dragonpaw](https://github.com/dragonpaw))
+- **Mike** ([@huylv95](https://github.com/huylv95))
+- **Gabriel Rodriguez** ([@injectedfusion](https://github.com/injectedfusion))
+- **Narek Engibaryan** ([@narek01](https://github.com/narek01))
+- and one sponsor who chose to stay private
+
+[Become a sponsor](https://github.com/sponsors/artifact-keeper) to support the project and get your name listed here.
+
+### Thank You
+
+- **[@DevasiaThomas](https://github.com/DevasiaThomas)** for reporting that OIDC discovery failed behind a WAF because the SSO client sent no User-Agent and did not check the HTTP status (#5036).
+- **[@kemocca](https://github.com/kemocca)** for reporting that the npm version route answered 404 for the `latest` dist-tag on a proxy repository (#5063).
+
+### Fixed
+
+- **SSO and CI OIDC requests send a User-Agent and report identity-provider HTTP errors** (#5036, #5114, #5122). Requests to identity providers (SSO discovery, token, JWKS and userinfo; CI OIDC discovery and JWKS) now carry `User-Agent: artifact-keeper/<version>`, so a web application firewall that refuses requests without one (such as the AWS WAF core rule set) no longer blocks them. A non-2xx answer from discovery or JWKS is now recorded in the server log as `... returned HTTP <status>` instead of an invalid JSON error, and so is a token endpoint answer that is non-2xx and not JSON (OAuth JSON error responses are handled as before). Login responses still show only a generic error; the start of the response body is written to the server log only (at debug level for the token endpoint).
+
+- **npm: the version route resolves dist-tags** (#5063, #5113, #5124). `GET /npm/{repo}/{package}/{version}` (and the scoped form) answered 404 for a dist-tag such as `latest` or `next`, on Local, Remote and Virtual repositories. When no version of that name exists, the segment is now resolved through the package's `dist-tags`, as the npm registry does; an exact version still wins over a tag of the same name, and an unknown tag is still 404. On a Local or Staging repository the stored tags are used, with `latest` derived from the versions when none is stored. On an age-gated Remote or Virtual repository a tag resolves through the gated `dist-tags`, as the package document serves them, so `latest` names the newest version old enough to download.
+
+- **Google Cloud Storage error messages no longer carry the request URL** (#5093, #5094, #5125). When a GCS request failed in transport (for example a refused connection or an unresolvable `GCS_ENDPOINT`), the storage error, the `/health` storage check message and API error bodies repeated the full request URL, naming the endpoint host, the bucket and the object key. They now name only the operation and the transport error, as #4866 did for Azure. A few S3 error paths that printed the raw object-store error are trimmed the same way, and the health check strips any URL left in a backend's message.
+
+- **A remote repository now applies the upstream outbound address policy to IP-literal destinations in every egress routing mode** (#5095, #5100, #5106). URLs a Remote reads from upstream content, such as the chart URLs in a Helm `index.yaml`, were checked against the policy only when the repository routed through an explicit egress proxy; with direct or inherited routing the connect-time resolver check was relied on, and an IP-literal host never reaches the resolver. Every upstream fetch now checks an IP-literal destination (including numeric, octal and hex IPv4 spellings, IPv6, IPv4-mapped IPv6 and NAT64 `64:ff9b::/96` addresses) against the same policy that validates a saved upstream URL before any request is sent, and a refused destination answers `502` with code `UPSTREAM_DESTINATION_REFUSED`. The configured private-address exceptions (the private-CIDR allowlist, also accepted as `UPSTREAM_PRIVATE_IP_ALLOWLIST`, and `UPSTREAM_ALLOW_PRIVATE_IPS`) apply as they do when an upstream URL is saved; loopback, link-local and cloud metadata addresses stay refused. Host names keep the connect-time check, and explicit egress proxies are unchanged. The VS Code gallery query (a JSON POST) now also goes through the repository's egress routing, and the CI OIDC token exchange checks the JWKS URL the issuer's discovery document names.
+
+  **Upgrade note:** a Remote whose stored upstream URL is a private IP literal saved before upstream URLs were validated stops fetching until that address is admitted by the private-CIDR allowlist or `UPSTREAM_ALLOW_PRIVATE_IPS`. A stored loopback or link-local upstream (for example a sidecar mirror on `127.0.0.1`) cannot be admitted; point it at a non-loopback address. When the CIDR allowlist is set, it takes precedence over `UPSTREAM_ALLOW_PRIVATE_IPS` for upstream fetches, as it already did when saving an upstream URL.
+
+- **Image inspect and base-image info resolve a digest only within the requested repository and image** (#5096, #5098, #5102). `GET /api/v1/repositories/{key}/image-inspect` and `GET /api/v1/repositories/{key}/image-builds/base-info` resolved a tag through the image's tags but accepted any `sha256:` digest as given and read the manifest, config and provenance by digest. On storage shared by several repositories, that described a manifest stored for another repository or image. A digest now resolves when a tag of the image names it (a push by digest records one), when the image's catalog records it, or when the repository holds it and it is a platform or attestation child of an index that belongs to the image. The platform manifest and attestation an index lists are likewise read only when the repository holds them. Any other digest answers exactly like one that does not exist: 404 for inspect, `found: false` for base-info. A Virtual repository records no manifests of its own, so inspecting one by digest now answers 404, as inspecting one by tag already did.
+
+- **OCI scan-on-proxy withholds a manifest it cannot classify under `fail_closed` instead of serving it unscanned** (#5097, #5099, #5104). The inline scan gate on a Remote OCI repository skipped every manifest it did not recognise as a runnable image, including ones it could not parse or classify. Container clients decode manifests more leniently than the server (case-insensitive keys, last duplicate key wins), so such a manifest could still run on the client. The gate now classifies positively: a manifest skips the scan only when no container runtime would run it (an index or manifest list, an artifact manifest, no config, no layers, the empty config, or no layer a runtime would unpack, which covers Helm charts, cosign signatures and attestations, SBOMs, in-toto, WASM and Flux artifacts). A manifest that does not parse, uses case-variant, non-ASCII or duplicate field names, or pairs a config that is not a recognised image config with a layer a runtime could unpack, is handled like an inconclusive scan: `423` under `fail_closed`, served with `X-AK-Scan: pending` under `fail_open` and record-only, and counted under its own `unclassifiable` verdict label. The same applies to a Remote member served through a Virtual repository, which now also refuses Docker schema1 manifests under scan-on-proxy as the Remote itself does. The scanner applicability check likewise keeps such manifests scannable. An artifact that pairs its own config with OCI image layers (a BuildKit registry cache exported with `image-manifest=true`, or an artifact pushed by older ORAS releases with `application/vnd.unknown.config.v1+json` over `application/vnd.oci.image.layer.v1.tar`) is in that last group, so a `fail_closed` scanning Remote now withholds it; proxy such artifacts through a Remote without scan-on-proxy, or with `fail_open`. Dashboards or alerts that enumerate the verdict label of the proxy scan verdict metric should add `unclassifiable`.
+
+- **Image inspect reads config and provenance only from the requesting repository** (#5111, #5112, #5120). `GET /api/v1/repositories/{key}/image-inspect` and `GET /api/v1/repositories/{key}/image-builds/base-info` read the config blob and the provenance attestation layer that a manifest names by digest alone. A manifest can name any blob digest, so on storage shared by several repositories that could describe a blob recorded only for another repository. Both blobs are now read only when the repository records them, as its hosted blob downloads require: an unrecorded config answers exactly like a missing one (404 for inspect, `found: false` for base-info), and unrecorded provenance is left out like missing provenance. A missing object's 404 message no longer carries the storage backend's error text.
+
+### Security
+
+- **libz-sys moved to 1.1.31 for RUSTSEC-2026-0418** (#5107, #5108, #5116). The advisory concerns the crate's build script output when it is built with `cc` 1.6.0 or later; the backend builds with `cc` 1.2.55, so this clears the audit finding rather than a runtime exposure.
+
+- **wasmtime moved to 36.0.20 for RUSTSEC-2026-0424, pulldown-cmark to 0.13.6 for RUSTSEC-2026-0433, and RUSTSEC-2026-0429 ignored on utoipa-swagger-ui's build-time zip** (#5162, #5164, #5172). The wasmtime advisory lets a component that receives a borrow of a resource it defines itself grow host memory that is never charged to the store, so it bypasses the plugin host's store limits; AK's plugin host runs component-model plugins with WASI, so an installed plugin could have exhausted backend memory. Installing a plugin requires an administrator. All `wasmtime-*`, `cranelift-*`, `pulley-*`, `wiggle-*` and `winch-codegen` crates move together. pulldown-cmark is a build-time dependency (via `prost-build`) and is not linked into the backend. zip 2.4.2 is only a build dependency of utoipa-swagger-ui 8.1.0, whose build script unpacks the bundled Swagger UI with its own `by_index` loop and never calls `ZipArchive::extract`; the backend's own zip is 9.x.
+
 ## [1.11.10] - 2026-10-29
 
 ### Fixed
