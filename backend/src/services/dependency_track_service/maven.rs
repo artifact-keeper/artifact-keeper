@@ -2,7 +2,7 @@
 //!
 //! API contract verified against /api/openapi.json from the official 4.14.0
 //! executable (PUT /project, GET /project/{uuid}, PATCH /project/{uuid}).
-//! PATCH sends only parent, never a serialized GET response: POST replaces fields.
+//! PATCH sends parent and unchanged state flags, never a serialized GET response.
 
 use super::*;
 use crate::formats::maven::{MavenCoordinates, MavenHandler};
@@ -324,6 +324,12 @@ impl DependencyTrackService {
     async fn attach_maven_parent(&self, child: DtProject, parent: &DtProject) -> Result<DtProject> {
         // Re-read before assignment, including after a concurrent create conflict.
         let mut child = self.maven_project_details(&child.uuid).await?;
+        if is_collection(&child) {
+            return Err(ambiguous(
+                &child.name,
+                "child became a collection during provisioning",
+            ));
+        }
         if let Some(existing) = child.parent.as_ref() {
             if existing.uuid != parent.uuid {
                 warn!(project_uuid = %child.uuid, parent_uuid = %existing.uuid,
@@ -340,6 +346,14 @@ impl DependencyTrackService {
             let Some(next) = ancestor.parent else { break };
             ancestor = self.maven_project_details(&next.uuid).await?;
         }
+        // DT 4.14 deserializes PATCH into Project with primitive defaults:
+        // active=true, isLatest=false, collectionLogic=NONE. Omitting these
+        // would silently reactivate an inactive child or clear its latest flag.
+        let (Some(active), Some(is_latest)) = (child.active, child.is_latest) else {
+            return Err(AppError::BadGateway(
+                "Dependency-Track full project response omitted active/isLatest; refusing parent update".into(),
+            ));
+        };
         let endpoint = format!(
             "{}/api/v1/project/{}",
             self.config.base_url,
@@ -349,7 +363,12 @@ impl DependencyTrackService {
             .client
             .patch(&endpoint)
             .header("X-Api-Key", self.api_key()?)
-            .json(&serde_json::json!({"parent": {"uuid": parent.uuid}}))
+            .json(&serde_json::json!({
+                "parent": {"uuid": parent.uuid},
+                "active": active,
+                "isLatest": is_latest,
+                "collectionLogic": child.collection_logic.as_deref().unwrap_or("NONE"),
+            }))
             .send()
             .await
             .map_err(|e| dt_transport_err("Maven parent assignment", e))?;
@@ -442,15 +461,20 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn service(url: &str, collections: bool, csv: &str) -> DependencyTrackService {
-        DependencyTrackService::new(DependencyTrackConfig {
-            base_url: url.into(),
-            api_key: Some("test-key".into()),
-            api_key_file: None,
-            enabled: true,
-            auto_collections: collections,
-            maven_excluded_classifiers: DependencyTrackConfig::parse_excluded_classifiers(csv),
-        })
-        .unwrap()
+        DependencyTrackService {
+            client: Client::new(),
+            config: DependencyTrackConfig {
+                base_url: url.into(),
+                api_key: Some("test-key".into()),
+                api_key_file: None,
+                enabled: true,
+                auto_collections: collections,
+                maven_excluded_classifiers: DependencyTrackConfig::parse_excluded_classifiers(csv),
+            },
+            page_size: DT_PAGE_SIZE,
+            cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
+            maven_provisioning: tokio::sync::Mutex::new(()),
+        }
     }
 
     fn coordinates(version: &str) -> MavenCoordinates {
@@ -599,10 +623,18 @@ mod tests {
                         let body: Value = serde_json::from_slice(&req.body).unwrap();
                         assert_eq!(
                             body.as_object().unwrap().len(),
-                            1,
-                            "partial update preserves project fields"
+                            4,
+                            "partial update contains parent and unchanged primitive flags only"
                         );
                         project["parent"] = body["parent"].clone();
+                        // Model DT's actual PATCH primitive defaults so a
+                        // parent-only request would fail the preservation test.
+                        project["active"] = body.get("active").cloned().unwrap_or(json!(true));
+                        project["isLatest"] = body.get("isLatest").cloned().unwrap_or(json!(false));
+                        project["collectionLogic"] = body
+                            .get("collectionLogic")
+                            .cloned()
+                            .unwrap_or(json!("NONE"));
                     }
                     return ResponseTemplate::new(200).set_body_json(project.clone());
                 }
@@ -618,6 +650,8 @@ mod tests {
                     return ResponseTemplate::new(409);
                 }
                 body["uuid"] = json!(uuid::Uuid::new_v4().to_string());
+                body["active"] = json!(true);
+                body["isLatest"] = json!(false);
                 state.projects.push(body.clone());
                 if state.conflict_once {
                     state.conflict_once = false;
@@ -655,7 +689,7 @@ mod tests {
 
     fn child(parent: Option<&str>) -> Value {
         let mut p = json!({"uuid": "child", "name": "core", "version": "1.0", "group": "ru.molnet",
-            "description": "operator description", "collectionLogic": "NONE"});
+            "description": "operator description", "collectionLogic": "NONE", "active": false, "isLatest": true});
         if let Some(uuid) = parent {
             p["parent"] = json!({"uuid": uuid});
         }
@@ -710,6 +744,8 @@ mod tests {
             .any(|r| r.method.as_str() == "PUT" && r.url.path() == "/api/v1/project"));
         let state = state.lock().unwrap();
         assert_eq!(state.projects[1]["description"], "operator description");
+        assert_eq!(state.projects[1]["active"], false);
+        assert_eq!(state.projects[1]["isLatest"], true);
         assert_eq!(state.projects[1]["parent"]["uuid"], "parent");
         assert_eq!(state.uploads.len(), 2);
     }

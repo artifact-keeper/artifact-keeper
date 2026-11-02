@@ -349,6 +349,9 @@ pub struct DtProject {
     pub parent: Option<DtProjectParent>,
     #[serde(rename = "collectionLogic")]
     pub collection_logic: Option<String>,
+    pub active: Option<bool>,
+    #[serde(rename = "isLatest")]
+    pub is_latest: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
