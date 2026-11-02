@@ -5590,8 +5590,7 @@ pub(crate) enum LocalLookup<'a> {
     Path(&'a str),
     /// Match on `name` + `version`.
     NameVersion(&'a str, &'a str),
-    /// NuGet IDs are case-insensitive, including existing imported names.
-    /// The caller supplies the normalized lowercase ID; version stays exact.
+    /// Match a lowercase NuGet ID case-insensitively; version stays exact.
     NameVersionCaseInsensitive(&'a str, &'a str),
     /// Match on `name` + `version` constrained to a trailing `path LIKE`
     /// pattern (e.g. `%.zip` vs `%.mod`). Needed by the Go proxy where a
@@ -5870,8 +5869,7 @@ pub async fn local_fetch_by_name_version(
     .await
 }
 
-/// Stream a selected local artifact through the shared download gate and
-/// storage resolver. Selectors change matching only, never enforcement.
+/// Stream a local artifact selected by `lookup` through the shared download gate.
 pub(crate) async fn local_fetch_by_lookup(
     db: &PgPool,
     state: &AppState,

@@ -11115,8 +11115,7 @@ mod virtual_federation_tests {
         );
     }
 
-    /// Imported rows retain their original case. A local-only virtual must
-    /// resolve both client spellings without changing the stored path (#5147).
+    /// A virtual must resolve imported mixed-case names in both URL spellings (#5147).
     #[tokio::test]
     async fn virtual_download_resolves_mixed_case_stored_name_5147() {
         use sha2::{Digest, Sha256};
