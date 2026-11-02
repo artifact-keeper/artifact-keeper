@@ -349,14 +349,23 @@ services:
         condition: service_healthy
       pki:
         condition: service_healthy
+    # Throwaway e2e admin credential: ADMIN_PASSWORD / ADMIN_PASS, defined
+    # ONCE in .env.test and nowhere else (#3490). NOT for deployment.
+    env_file:
+      - .env.test
     environment:
       REGISTRY_URL: http://backend:8080
+      ADMIN_USER: admin
       CA_CERT: /pki/ca.crt
     volumes:
       - ./scripts/native-tests:/scripts:ro
       - ./.assets:/assets:ro
       - pki-data:/pki:ro
-    command: ["sh", "-c", "apk add --no-cache bash curl >/dev/null 2>&1 && bash /scripts/test-helm.sh"]
+    # alpine/helm's ENTRYPOINT is `helm`; without this override the command
+    # below is parsed as `helm sh -c ...` and the suite never runs. Same
+    # reason as the terraform test services above.
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["apk add --no-cache bash curl >/dev/null 2>&1 && bash /scripts/test-helm.sh"]
     networks:
       - e2e-test-network
     profiles: ["helm", "all"]
