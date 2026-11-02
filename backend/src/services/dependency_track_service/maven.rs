@@ -51,6 +51,10 @@ impl DependencyTrackService {
         if self.excludes_maven_classifier(coordinates) {
             return Err(AppError::Validation("Excluded Maven classifier".into()));
         }
+        // Queue locally before acquiring a pool connection. An upstream outage
+        // must not fill the publication pool with transactions waiting on this
+        // client's mutex: at most one connection per client is held for DT.
+        let _guard = self.maven_provisioning.lock().await;
         let mut transaction = db.begin().await?;
         sqlx::query("SET LOCAL lock_timeout = '30s'")
             .execute(&mut *transaction)
@@ -65,16 +69,29 @@ impl DependencyTrackService {
             .execute(&mut *transaction)
             .await?;
         let project = self
-            .get_or_create_maven_project(coordinates, legacy_name, description)
+            .provision_maven_project(coordinates, legacy_name, description)
             .await;
         // No local state was written. Release even when the upstream failed.
         transaction.rollback().await?;
         project
     }
 
+    /// HTTP-only test entry point; production also takes the database lock.
+    #[cfg(all(test, ak_test_shard = "services-1"))]
+    async fn get_or_create_maven_project(
+        &self,
+        coordinates: &MavenCoordinates,
+        legacy_name: &str,
+        description: &str,
+    ) -> Result<DtProject> {
+        let _guard = self.maven_provisioning.lock().await;
+        self.provision_maven_project(coordinates, legacy_name, description)
+            .await
+    }
+
     /// Provisioning runs only after the scanner's classifier eligibility check.
     /// No local scan state is read or written by this method.
-    async fn get_or_create_maven_project(
+    async fn provision_maven_project(
         &self,
         coordinates: &MavenCoordinates,
         legacy_name: &str,
@@ -84,7 +101,6 @@ impl DependencyTrackService {
         if self.excludes_maven_classifier(coordinates) {
             return Err(AppError::Validation("Excluded Maven classifier".into()));
         }
-        let _guard = self.maven_provisioning.lock().await;
         let identity = format!("{}:{}", coordinates.group_id, coordinates.artifact_id);
         let projects = self.list_projects().await?;
         let mut collections = Vec::new();
@@ -453,7 +469,7 @@ fn maven_purl(coordinates: &MavenCoordinates, versioned: bool) -> String {
     purl
 }
 
-#[cfg(test)]
+#[cfg(all(test, ak_test_shard = "services-1"))]
 mod tests {
     use super::*;
     use serde_json::{json, Value};
