@@ -68,7 +68,10 @@ identity, then rescan. The integration does not guess ownership or create a
 duplicate as a fallback for ambiguous legacy data.
 
 An existing child without a parent is attached using a partial PATCH containing
-only the parent UUID. A child already linked to the correct parent needs no
+the parent UUID and the child's unchanged `active`, `isLatest` and
+`collectionLogic` values. DT 4.14 applies primitive defaults even to omitted
+PATCH fields, so these values must be carried forward to preserve project state.
+A child already linked to the correct parent needs no
 update. A different existing parent is preserved, logged and remains the child's
 parent; the child's normal SBOM upload continues. No project is deleted,
 recreated, converted to a collection or stripped of its existing fields/history.
