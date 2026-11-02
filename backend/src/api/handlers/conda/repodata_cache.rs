@@ -106,11 +106,13 @@ pub(crate) struct SubdirDocs {
     pub zst: Prepared,
     /// Rendered from `zst` by the first `.bz2` request of the revision and
     /// kept with it (#4882): bzip2 is the slowest encoding by far and the
-    /// one modern clients ask for least.
+    /// one modern clients ask for least. Already filled for a subdir no row
+    /// has ever named, whose document is tiny (#5167).
     pub bz2: tokio::sync::OnceCell<Prepared>,
     pub current: Prepared,
     pub run_exports: Prepared,
-    /// The stored JLAP whose footer names `json`'s hash (#4175).
+    /// The stored JLAP, whose footer names `json`'s hash (#4175) unless
+    /// another render of this revision was recorded first (#5167).
     pub jlap: Prepared,
 }
 
@@ -391,10 +393,11 @@ pub(crate) async fn hosted_subdir_docs(
 fn empty_subdir_docs(subdir: &str) -> Result<SubdirDocs, Response> {
     let rendered = super::repodata_render::render_empty(subdir)?;
     let jlap = super::build_bootstrap_jlap(&rendered.json);
+    let bz2 = super::RepodataEncoding::Bz2.transcode_zst(&rendered.zst)?;
     Ok(SubdirDocs {
         json: Prepared::new(rendered.json),
         zst: Prepared::new(rendered.zst),
-        bz2: tokio::sync::OnceCell::new(),
+        bz2: tokio::sync::OnceCell::new_with(Some(Prepared::new(bz2))),
         current: Prepared::new(rendered.current),
         run_exports: Prepared::new(rendered.run_exports),
         jlap: Prepared::new(jlap),
@@ -432,7 +435,8 @@ pub(crate) async fn with_bz2(docs: Arc<SubdirDocs>) -> Result<Arc<SubdirDocs>, R
 /// catalog ([`super::repodata_render`]), deciding visibility at `now`, and
 /// record the new `repodata.json` in the subdir's stored JLAP before any of
 /// them is kept or served ([`super::jlap_store::record`]), so the JLAP served
-/// with a revision's `repodata.json` always ends at that document.
+/// with a revision's `repodata.json` ends at that document, or at the render
+/// of the revision recorded before it.
 async fn render_subdir_docs(
     db: PgPool,
     repo_id: Uuid,
