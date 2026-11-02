@@ -798,9 +798,11 @@ jobs:
       # Restore only (#4927). A cache saved here lands on the tag's own ref,
       # which no later tag can read, so it was about 950 MB per target of
       # wasted space. release-cli-caches.yml, dispatched by the Release
-      # Candidate for this commit, saves the same `shared-key` on main, where
-      # this step can restore it. `No cache found.` here means that run did
-      # not happen on main or its caches were evicted, and the build is cold.
+      # Candidate, builds main's tip and saves the same `shared-key` on main,
+      # where this step can restore it. `full match: false` means this commit's
+      # dependencies differ from that build's and only the difference
+      # recompiles; `No cache found.` means the caches were evicted or never
+      # saved, and the build is cold.
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:

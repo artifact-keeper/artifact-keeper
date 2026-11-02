@@ -11,24 +11,42 @@ name: Release CLI Caches
 # because ci.yml only builds the native Linux target.
 #
 # This workflow runs the same `cargo auditable build` for the same five targets
-# on the commit about to be released, ON MAIN, so the caches it saves live in
-# main's scope where the tag run can restore them. It packages, signs and
-# uploads nothing; the only thing it leaves behind is the cache.
+# ON MAIN, so the caches it saves live in main's scope where the tag run can
+# restore them. It packages, signs and uploads nothing; the only thing it
+# leaves behind is the cache.
+#
+# IT BUILDS MAIN'S TIP AND NOTHING ELSE: NO INPUT, NO `ref:`
+#   release.yml restores these caches into the binaries it signs, so whatever
+#   executes here decides what those binaries link. `cargo build` executes the
+#   checked-out tree's build scripts and proc macros, and a job's `permissions:`
+#   do not limit that: the cache token is not governed by them, so code in this
+#   run can write any key in main's scope. Building in a job without the save
+#   step would not help either, because what gets saved is still the output of
+#   that code. What keeps this safe is that nobody can choose the code. A
+#   dispatch names a ref, and the checkout below takes the commit the run was
+#   started on, so the run on main executes main's tip, the same reviewed code
+#   and the same cache scope as ci.yml on a push to main. A dispatch on any
+#   other ref runs that ref's code but saves in that ref's own scope, which no
+#   release reads. Do not add a sha input back, however it is validated.
+#   scripts/ci/test-resolve-certified-ref.sh fails CI on that shape.
+#
+# WHY MAIN'S TIP IS ENOUGH
+#   The cache holds dependency artifacts only (rust-cache cleans the workspace
+#   crates before saving), and its key depends on the lockfile and the
+#   manifests rather than on the commit. Any commit with the same Cargo.lock
+#   and manifests hits it exactly, and a version bump changes neither hash
+#   (see below). A tag whose dependencies differ from main's tip takes the
+#   prefix match on the restore key and recompiles only what changed.
 #
 # WHO DISPATCHES IT
-#   release-candidate.yml's `warm-cli-caches` job, right after `resolve`, with
-#   `-f sha=<the candidate commit>`. It is a separate workflow rather than a job
-#   in the candidate on purpose: the candidate runs no code from the certified
-#   commit (RELEASING.md, "What runs from the certified commit"; pinned by
-#   scripts/ci/test-resolve-certified-ref.sh), and a cargo build of the commit
-#   runs its build scripts and proc macros. Here it runs under this workflow's
-#   own identity, with `contents: read` and no secrets, and the candidate's
-#   certification does not wait for it or depend on it. The `resolve` job
-#   refuses any commit the release flow could not certify (main's
-#   scripts/ci/resolve-certified-ref.sh), so only code merged to main or to a
-#   protected release/X.Y.x line ever writes these caches. It can also be
-#   dispatched by hand:
-#     gh workflow run release-cli-caches.yml --ref main -f sha=<40-hex>
+#   release-candidate.yml's `warm-cli-caches` job, right after `resolve`. It is
+#   a separate workflow rather than a job in the candidate on purpose: the
+#   candidate runs no code from a checkout other than main's tooling
+#   (RELEASING.md, "What runs from the certified commit"; pinned by
+#   scripts/ci/test-resolve-certified-ref.sh) and holds the signing identity,
+#   and the candidate's certification does not wait for this run or depend on
+#   it. It can also be dispatched by hand:
+#     gh workflow run release-cli-caches.yml --ref main
 #
 # THE KEY (Swatinem/rust-cache at the pinned commit, src/config.ts)
 #   `shared-key` replaces both `key` and the job id, so the key is the same in
@@ -46,16 +64,11 @@ name: Release CLI Caches
 
 on:
   workflow_dispatch:
-    inputs:
-      sha:
-        description: 'Commit to build: a full 40-hex sha on main, or on the release/X.Y.x line its Cargo.toml names.'
-        required: true
-        type: string
 
 permissions: {}
 
 concurrency:
-  group: release-cli-caches-${{ inputs.sha }}
+  group: release-cli-caches-${{ github.sha }}
   cancel-in-progress: false
 
 env:
@@ -63,17 +76,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  resolve:
-    name: Resolve the commit
+  # Not the security boundary (a dispatch on another ref runs that ref's copy
+  # of this file): it says why such a run is useless instead of spending five
+  # builds on caches no release can read.
+  require-main:
+    name: Require a dispatch on main
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
-    outputs:
-      sha: ${{ steps.resolve.outputs.sha }}
     steps:
-      # The caches must land in main's scope, the only branch scope a tag run
-      # can read. A run on any other ref would save where no release looks.
       - name: Refuse a dispatch that is not on main
         run: |
           set -euo pipefail
@@ -81,59 +91,11 @@ jobs:
             echo "::error title=Not dispatched on main::Release CLI Caches was dispatched on ${GITHUB_REF}. Its caches are only visible to a release tag when saved on main; dispatch it with --ref main."
             exit 1
           fi
-
-      - name: Checkout main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/heads/main
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Fetch the maintenance lines
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
-
-      # Only reviewed commits write to main's cache scope, because
-      # release.yml restores these caches into the binaries it signs. The
-      # commit must be one the release flow could certify: an ancestor of
-      # main, or of the protected release/<X>.<Y>.x line its own Cargo.toml
-      # names, decided by main's scripts/ci/resolve-certified-ref.sh, the
-      # resolver the candidate and the promote use. A `release/*` wildcard
-      # would also admit unprotected working branches such as
-      # `release/notes-fix` (RELEASING.md, "release/1.9.1-prep is not a
-      # release line"), which anyone with write access can push to.
-      - name: Resolve
-        id: resolve
-        env:
-          INPUT_SHA: ${{ inputs.sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=Not a full sha::'${INPUT_SHA}' is not a 40-character commit sha."
-            exit 1
-          fi
-          if ! git cat-file -e "${INPUT_SHA}^{commit}" 2>/dev/null; then
-            echo "::error title=Unknown commit::${INPUT_SHA} is not a commit in this repository."
-            exit 1
-          fi
-          rc=0
-          resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$INPUT_SHA")" || rc=$?
-          if [[ "$rc" -ne 0 ]]; then
-            echo "::error title=Commit not on a release line::${INPUT_SHA} is on neither main nor the release/X.Y.x line its Cargo.toml names (resolver exit ${rc}; its message is above). No cache was written."
-            exit 1
-          fi
-          CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
-          BRANCH="${CERTIFIED_REF#refs/heads/}"
-          git merge-base --is-ancestor "$INPUT_SHA" "refs/remotes/origin/${BRANCH}" \
-            || { echo "::error title=Ancestry disagreement::${INPUT_SHA} resolves to ${CERTIFIED_REF} over the API but is not reachable from origin/${BRANCH} in this checkout. Failing closed."; exit 1; }
-          echo "Warming the CLI build caches for ${INPUT_SHA} (${BRANCH})"
-          echo "sha=${INPUT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Warming the CLI build caches from main's tip, ${GITHUB_SHA}"
 
   warm:
     name: Warm ${{ matrix.target }}
-    needs: resolve
+    needs: require-main
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     permissions:
@@ -156,10 +118,10 @@ jobs:
             os: ubuntu-latest
 
     steps:
+      # No `ref:`, deliberately: this is the commit the dispatch started on.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
           persist-credentials: false
 
       - name: Setup Rust
@@ -197,10 +159,9 @@ jobs:
         with:
           tool: cargo-auditable,cargo-cyclonedx,cargo-audit
 
-      # No "Set version from tag" step: the release prep PR already set
-      # Cargo.toml to the version being released, so the tag run's edit
-      # rewrites the same bytes and the dependency graph built here is the
-      # one the tag builds.
+      # No "Set version from tag" step: the workspace crates are not saved, and
+      # the cache key normalises their versions, so the version main's tip
+      # carries makes no difference to what the tag restores.
       - name: Build
         env:
           SQLX_OFFLINE: true

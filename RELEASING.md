@@ -315,15 +315,19 @@ names the same commit.
    rebuilt and nothing gets a name.
 
    The candidate also warms the CLI binary build caches on `main`: its
-   `warm-cli-caches` job dispatches `release-cli-caches.yml` on `main` for
-   the commit, which compiles the five release targets and saves the
+   `warm-cli-caches` job dispatches `release-cli-caches.yml` on `main`, which
+   compiles main's tip for the five release targets and saves the
    `rust-cache` entries the tag run's `build-binaries` restores (#4927); let
-   that run finish before the promote. A tag run whose `Cache Cargo` step
-   logs `No cache found.` means the candidate for that sha was not run from
-   `main` or the caches were evicted (7-day GitHub retention), and the build
-   will be cold. A patch from a `release/X.Y.x` line gets the same caches,
-   but its tag runs the line's own `release.yml`, which restores them only
-   once that copy carries the `shared-key: cli-<target>` `Cache Cargo` step.
+   that run finish before the promote. The key follows `Cargo.lock` and the
+   workspace manifests rather than the commit, with package versions
+   normalised, so a tag with the same dependencies as main's tip logs
+   `full match: true`. One whose dependencies differ logs `full match: false`
+   and recompiles only the difference. That is the normal case for a patch
+   from a `release/X.Y.x` line, whose tag runs the line's own `release.yml`,
+   which restores anything only once that copy carries the
+   `shared-key: cli-<target>` `Cache Cargo` step. `No cache found.` means the
+   caches were evicted (7-day GitHub retention) or the run never finished, and
+   the build will be cold.
 
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
@@ -810,13 +814,14 @@ about what the *promote* runs later at the tag, not about this run. A self-test
 (`scripts/ci/test-resolve-certified-ref.sh`) pins all of this structurally, so
 a future checkout of the certified sha fails CI.
 
-The CLI build cache warm-up does compile the commit, which is why it is its
-own workflow (`release-cli-caches.yml`, `contents: read`, no secrets) that the
-candidate only dispatches and never waits for (#4927). Its caches land in
-main's scope and the tag run restores them into the binaries it signs, so it
-builds only a commit `scripts/ci/resolve-certified-ref.sh` accepts: one on
-`main` or on the protected `release/X.Y.x` line its `Cargo.toml` names, never
-a working branch that merely lives under `release/`.
+The CLI build cache warm-up (`release-cli-caches.yml`, #4927) is not given the
+certified commit at all. Its caches land in main's scope and the tag run
+restores them into the binaries it signs, and `cargo build` executes the tree's
+build scripts and proc macros in a run that can write any key in that scope,
+whatever its `permissions:` say. So it has no input and no checkout `ref:`: a
+dispatch on `main` builds main's tip, the same code and the same cache scope as
+`ci.yml` on a push to main. A self-test
+(`scripts/ci/test-resolve-certified-ref.sh`) fails CI if that changes.
 
 **Downstream of the tag is a different story, deliberately.** The promote
 dispatches `release.yml` and `docker-publish.yml` on the tag, which runs the
