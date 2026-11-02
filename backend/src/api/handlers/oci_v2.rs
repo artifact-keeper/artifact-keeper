@@ -40446,21 +40446,17 @@ mod virtual_scan_gate_tests {
         link_member(&fx.pool, fx.virt_id, hosted_id).await;
         let empty_hosted = fx.get_blob(&fx.vuln_cfg).await;
 
-        sqlx::query(
-            "UPDATE scan_configs SET severity_threshold = 'low' WHERE repository_id = $1",
-        )
-        .bind(fx.virt_id)
-        .execute(&fx.pool)
-        .await
-        .expect("tighten virtual policy");
+        sqlx::query("UPDATE scan_configs SET severity_threshold = 'low' WHERE repository_id = $1")
+            .bind(fx.virt_id)
+            .execute(&fx.pool)
+            .await
+            .expect("tighten virtual policy");
         let stricter_virtual = fx.get_blob(&fx.vuln_cfg).await;
-        sqlx::query(
-            "UPDATE scan_configs SET severity_threshold = 'high' WHERE repository_id = $1",
-        )
-        .bind(fx.virt_id)
-        .execute(&fx.pool)
-        .await
-        .expect("restore virtual policy");
+        sqlx::query("UPDATE scan_configs SET severity_threshold = 'high' WHERE repository_id = $1")
+            .bind(fx.virt_id)
+            .execute(&fx.pool)
+            .await
+            .expect("restore virtual policy");
         sqlx::query(
             "INSERT INTO manifest_blob_refs (manifest_digest, blob_digest, repository_id, kind) \
              VALUES ($1, $2, $3, 'config')",
