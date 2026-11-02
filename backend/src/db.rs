@@ -383,6 +383,26 @@ mod tests {
         }
     }
 
+    /// #5168: a real `40P01` that reaches a client, past any retry, answers a
+    /// retryable 503 with Retry-After in both the typed and stringified forms.
+    #[tokio::test]
+    async fn real_deadlock_answers_503_with_retry_after_5168() {
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+        let Some(pool) = crate::testing::try_pool_with(4).await else {
+            return;
+        };
+        let err = provoke_deadlock(&pool).await;
+        let flattened = AppError::Database(err.to_string());
+        for response in [
+            AppError::Sqlx(err).into_response(),
+            flattened.into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response.headers().contains_key(header::RETRY_AFTER));
+        }
+    }
+
     /// #4004: a real `40P01` is classified as retryable in both the typed and
     /// the already-stringified form, and [`retry_on_deadlock`] re-runs the
     /// loser a bounded number of times.

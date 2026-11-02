@@ -407,7 +407,14 @@ enum DeleteJournal {
     /// `orphan_key` selects the pre-delete re-check: the orphan-key sweep's
     /// own semantics ([`ORPHAN_KEY_REFERENCED_SQL`]) for a key it claimed,
     /// the candidate sweep's ([`OCI_GC_CANDIDATE_REFERENCED_SQL`]) otherwise.
-    Candidate { id: i64, orphan_key: bool },
+    ///
+    /// `leased_at` is the lease this claim stamped (migration 302), so a failed
+    /// delete can release its own lease and no one else's.
+    Candidate {
+        id: i64,
+        orphan_key: bool,
+        leased_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// A tombstoned `oci_upload_cleanup_keys` row under a live claim (blob
     /// sweep). The push path refuses to commit an `oci_blobs` row for a key
     /// tombstoned this way (#3187/#3851), which is what closes the window
@@ -1859,7 +1866,7 @@ impl StorageGcService {
                     return None;
                 }
             };
-            for (key, id) in journal {
+            for (key, id, leased_at) in journal {
                 let is_base = key == storage_key;
                 claimed.push(ClaimedDelete {
                     sweep: GcSweep::OrphanKeys,
@@ -1869,6 +1876,7 @@ impl StorageGcService {
                     journal: DeleteJournal::Candidate {
                         id,
                         orphan_key: true,
+                        leased_at,
                     },
                     bytes: if is_base { bytes } else { 0 },
                     counts_as_key: is_base,
@@ -2046,22 +2054,44 @@ impl StorageGcService {
         Ok(())
     }
 
-    /// Leave a failed claimed delete retryable. A candidate row simply stays
-    /// (the candidate sweep retries it after the grace window). A cleanup-key
-    /// tombstone has its claim lapsed with the error recorded, so pushes of
-    /// the digest are no longer refused and the unreferenced cleanup-key sweep
-    /// retries the object.
+    /// Leave a failed claimed delete retryable. A candidate row stays (the
+    /// candidate sweep retries it after the grace window, which `recorded_at`
+    /// still measures) with its lease cleared, so the upload commit guard stops
+    /// refusing this content for the rest of the lease window (#5168). A
+    /// cleanup-key tombstone has its claim lapsed with the error recorded, so
+    /// pushes of the digest are no longer refused and the unreferenced
+    /// cleanup-key sweep retries the object.
+    ///
+    /// The candidate's lease is cleared only if it is still the one this claim
+    /// stamped. Another GC claim or a repository-delete purge can take the slot
+    /// over while this delete runs; its delete may be about to land, and
+    /// clearing its lease would let an upload commit a row for the bytes it is
+    /// removing. A failure to clear leaves the lease to age out, which only
+    /// holds uploads up.
     async fn release_journal(&self, c: &ClaimedDelete, error: &str) {
-        if let DeleteJournal::CleanupKey { id, token } = c.journal {
-            let _ = sqlx::query(
-                "UPDATE oci_upload_cleanup_keys SET last_error = $3, claim_expires_at = NOW() \
-                 WHERE id = $1 AND claim_token = $2",
-            )
-            .bind(id)
-            .bind(token)
-            .bind(error)
-            .execute(&self.db)
-            .await;
+        match c.journal {
+            DeleteJournal::Candidate { id, leased_at, .. } => {
+                let _ = sqlx::query(
+                    "UPDATE oci_gc_candidates SET leased_at = NULL \
+                     WHERE id = $1 AND leased_at = $2",
+                )
+                .bind(id)
+                .bind(leased_at)
+                .execute(&self.db)
+                .await;
+            }
+            DeleteJournal::CleanupKey { id, token } => {
+                let _ = sqlx::query(
+                    "UPDATE oci_upload_cleanup_keys SET last_error = $3, claim_expires_at = NOW() \
+                     WHERE id = $1 AND claim_token = $2",
+                )
+                .bind(id)
+                .bind(token)
+                .bind(error)
+                .execute(&self.db)
+                .await;
+            }
+            DeleteJournal::External => {}
         }
     }
 
@@ -3957,11 +3987,14 @@ impl StorageGcService {
                 tx.commit()
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
-                Ok(journal.into_iter().next().map(|(_, id)| id))
+                Ok(journal
+                    .into_iter()
+                    .next()
+                    .map(|(_, id, leased_at)| (id, leased_at)))
             }
             .await;
             match claim {
-                Ok(Some(id)) => {
+                Ok(Some((id, leased_at))) => {
                     meter.charge(0);
                     claimed.push(ClaimedDelete {
                         sweep: GcSweep::MavenFlat,
@@ -3971,6 +4004,7 @@ impl StorageGcService {
                         journal: DeleteJournal::Candidate {
                             id,
                             orphan_key: false,
+                            leased_at,
                         },
                         bytes: 0,
                         counts_as_key: true,
@@ -4137,7 +4171,7 @@ impl StorageGcService {
                 .claim_oci_gc_candidate(id, &storage_key, &location)
                 .await
             {
-                Ok(CandidateClaim::Claimed) => {
+                Ok(CandidateClaim::Claimed { leased_at }) => {
                     meter.charge(0);
                     claimed.push(ClaimedDelete {
                         sweep: GcSweep::OciCandidates,
@@ -4147,6 +4181,7 @@ impl StorageGcService {
                         journal: DeleteJournal::Candidate {
                             id,
                             orphan_key: false,
+                            leased_at,
                         },
                         bytes: 0,
                         counts_as_key: true,
@@ -4220,22 +4255,24 @@ impl StorageGcService {
             return Ok(CandidateClaim::Gone);
         }
         let referenced = candidate_is_still_referenced(&mut *tx, storage_key, location).await?;
-        let (sql, outcome) = if referenced {
-            (
-                "DELETE FROM oci_gc_candidates WHERE id = $1",
-                CandidateClaim::Dropped,
-            )
+        let outcome = if referenced {
+            sqlx::query("DELETE FROM oci_gc_candidates WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            CandidateClaim::Dropped
         } else {
-            (
-                "UPDATE oci_gc_candidates SET recorded_at = NOW() WHERE id = $1",
-                CandidateClaim::Claimed,
+            let leased_at = sqlx::query_scalar(
+                "UPDATE oci_gc_candidates SET recorded_at = NOW() WHERE id = $1 \
+                 RETURNING leased_at",
             )
-        };
-        sqlx::query(sql)
             .bind(id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await
             .map_err(db_err)?;
+            CandidateClaim::Claimed { leased_at }
+        };
         tx.commit().await.map_err(db_err)?;
         Ok(outcome)
     }
@@ -4439,13 +4476,13 @@ async fn journal_gc_candidates(
     tx: &mut Transaction<'_, Postgres>,
     scope: &StorageLocation,
     keys: &[String],
-) -> Result<Vec<(String, i64)>> {
+) -> Result<Vec<(String, i64, Option<chrono::DateTime<chrono::Utc>>)>> {
     let rows = sqlx::query(
         "INSERT INTO oci_gc_candidates (storage_key, storage_backend, storage_path) \
          SELECT k, $2, $3 FROM UNNEST($1::TEXT[]) AS k \
          ON CONFLICT (storage_backend, storage_path, storage_key) \
              DO UPDATE SET recorded_at = NOW() \
-         RETURNING id, storage_key",
+         RETURNING id, storage_key, leased_at",
     )
     .bind(keys)
     .bind(&scope.backend)
@@ -4459,6 +4496,8 @@ async fn journal_gc_candidates(
                 r.try_get::<String, _>("storage_key")
                     .map_err(|e| AppError::Database(e.to_string()))?,
                 r.try_get::<i64, _>("id")
+                    .map_err(|e| AppError::Database(e.to_string()))?,
+                r.try_get("leased_at")
                     .map_err(|e| AppError::Database(e.to_string()))?,
             ))
         })
@@ -4515,8 +4554,11 @@ async fn is_maven_flat_object_still_orphan(
 /// Outcome of [`StorageGcService::claim_oci_gc_candidate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateClaim {
-    /// Unreferenced and leased to this pass: delete its object.
-    Claimed,
+    /// Unreferenced and leased to this pass: delete its object. `leased_at` is
+    /// the lease the claim stamped.
+    Claimed {
+        leased_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// Still referenced: the row was dropped and the object is kept.
     Dropped,
     /// Consumed or leased by another pass since the scan.
@@ -14066,6 +14108,141 @@ mod tests {
         );
         assert!(!held_after_retry, "the candidate sweep retries the delete");
         assert_eq!(journal_after_retry, 0);
+    }
+
+    /// Claim the single orphan `key` of `rig`'s repository, as a sweep would.
+    async fn claim_seeded_orphan(
+        rig: &ProbeRig,
+        gc: &StorageGcService,
+        key: &str,
+    ) -> Vec<ClaimedDelete> {
+        let page = gc
+            .select_orphans_page(Some(rig.fx.repo_id), &OrphanKeyCursor::default())
+            .await
+            .unwrap();
+        let row = page
+            .iter()
+            .find(|r| r.try_get::<String, _>("storage_key").ok().as_deref() == Some(key))
+            .expect("seeded key is a candidate");
+        gc.claim_orphan_key(row, &mut empty_gc_result(false))
+            .await
+            .expect("claimed")
+    }
+
+    /// The `(recorded_at, leased_at)` of `key`'s journal row.
+    async fn journal_lease(
+        rig: &ProbeRig,
+        key: &str,
+    ) -> (
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        sqlx::query_as(
+            "SELECT recorded_at, leased_at FROM oci_gc_candidates WHERE storage_key = $1",
+        )
+        .bind(key)
+        .fetch_one(&rig.fx.pool)
+        .await
+        .expect("journal row")
+    }
+
+    /// #5168: a failed storage delete clears the journal row's lease, so the
+    /// upload commit guard accepts this content at once instead of refusing it
+    /// with a 503 for 15 minutes. The object is still there, and the row and its
+    /// `recorded_at` stay, so the candidate sweep still retries the delete
+    /// after the grace window.
+    #[tokio::test]
+    async fn failed_delete_releases_its_lease_for_uploads_5168() {
+        let _gc_guard = storage_gc_test_guard().await;
+        let _blob_gc_guard = crate::api::handlers::test_db_helpers::blob_gc_serial_lock().await;
+        let Some(rig) = ProbeRig::setup("generic").await else {
+            return;
+        };
+        let keys = rig.seed_orphans(1).await;
+        rig.storage
+            .fail_deletes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let gc = rig.service();
+        let claimed = claim_seeded_orphan(&rig, &gc, &keys[0]).await;
+        let (recorded_at, lease_held) = journal_lease(&rig, &keys[0]).await;
+
+        let mut result = empty_gc_result(false);
+        gc.finish_claimed_deletes(claimed, &mut result).await;
+
+        let (recorded_after, lease_after) = journal_lease(&rig, &keys[0]).await;
+        let held = rig.storage.holds(&keys[0]);
+        let location = StorageLocation {
+            backend: rig.backend.clone(),
+            path: sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
+                .bind(rig.fx.repo_id)
+                .fetch_one(&rig.fx.pool)
+                .await
+                .unwrap(),
+        };
+        let mut tx = rig.fx.pool.begin().await.unwrap();
+        let guard = crate::services::artifact_service::guard_cas_key_for_commit(
+            &mut tx,
+            rig.storage.as_ref(),
+            &location,
+            &keys[0],
+        )
+        .await
+        .expect("guard");
+        tx.rollback().await.unwrap();
+        rig.teardown().await;
+
+        assert!(lease_held.is_some(), "the claim took a lease");
+        assert_eq!(lease_after, None, "the failed delete released its lease");
+        assert_eq!(
+            recorded_after, recorded_at,
+            "the retry's grace window must not move"
+        );
+        assert!(held, "the delete failed, so the object is still stored");
+        assert!(
+            matches!(guard, crate::services::artifact_service::CasKeyGuard::Clear),
+            "an upload of this content must not be refused"
+        );
+    }
+
+    /// #5168: a failed delete releases only its own lease. If another claim
+    /// took the slot over while this delete ran, that claim's delete may still
+    /// land, so its lease must keep holding uploads off. Clearing it would let
+    /// an upload commit a row for bytes that are about to be deleted.
+    #[tokio::test]
+    async fn failed_delete_keeps_a_newer_claims_lease_5168() {
+        let _gc_guard = storage_gc_test_guard().await;
+        let _blob_gc_guard = crate::api::handlers::test_db_helpers::blob_gc_serial_lock().await;
+        let Some(rig) = ProbeRig::setup("generic").await else {
+            return;
+        };
+        let keys = rig.seed_orphans(1).await;
+        rig.storage
+            .fail_deletes
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let gc = rig.service();
+        let claimed = claim_seeded_orphan(&rig, &gc, &keys[0]).await;
+        let (_, first_lease) = journal_lease(&rig, &keys[0]).await;
+
+        // A second claim takes the slot, as `journal_gc_candidates` and the
+        // repository-delete purge do: the trigger moves the lease with it.
+        sqlx::query("UPDATE oci_gc_candidates SET recorded_at = NOW() WHERE storage_key = $1")
+            .bind(&keys[0])
+            .execute(&rig.fx.pool)
+            .await
+            .unwrap();
+        let (_, second_lease) = journal_lease(&rig, &keys[0]).await;
+
+        let mut result = empty_gc_result(false);
+        gc.finish_claimed_deletes(claimed, &mut result).await;
+        let (_, lease_after) = journal_lease(&rig, &keys[0]).await;
+        rig.teardown().await;
+
+        assert_ne!(first_lease, second_lease, "the slot changed hands");
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("injected delete failure")));
+        assert_eq!(lease_after, second_lease, "the newer lease must survive");
     }
 
     /// #2524: the storage phase re-checks a claimed key just before deleting
