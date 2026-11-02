@@ -167,7 +167,7 @@ wasmtime-wasi.workspace = true
 git2.workspace = true
 
 # Base64 encoding
-base64 = "0.22"
+base64 = "0.23"
 totp-rs = { version = "5", features = ["qr", "gen_secret"] }
 
 # Ed25519 signature verification for plugin supply-chain trust.

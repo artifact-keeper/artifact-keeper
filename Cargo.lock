@@ -247,7 +247,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "axum-test",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bcrypt",
  "bergshamra",
  "blake2 0.10.6",
@@ -4823,7 +4823,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -5407,7 +5407,7 @@ dependencies = [
  "aes-gcm",
  "aes-kw",
  "argon2",
- "base64 0.22.1",
+ "base64 0.21.7",
  "bitfield",
  "block-padding",
  "blowfish 0.9.1",
