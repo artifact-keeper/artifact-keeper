@@ -23,7 +23,10 @@ name: Release CLI Caches
 #   scripts/ci/test-resolve-certified-ref.sh), and a cargo build of the commit
 #   runs its build scripts and proc macros. Here it runs under this workflow's
 #   own identity, with `contents: read` and no secrets, and the candidate's
-#   certification does not wait for it or depend on it. It can also be
+#   certification does not wait for it or depend on it. The `resolve` job
+#   refuses any commit the release flow could not certify (main's
+#   scripts/ci/resolve-certified-ref.sh), so only code merged to main or to a
+#   protected release/X.Y.x line ever writes these caches. It can also be
 #   dispatched by hand:
 #     gh workflow run release-cli-caches.yml --ref main -f sha=<40-hex>
 #
@@ -45,7 +48,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Commit to build: a full 40-hex sha reachable from main or from a release/X.Y.x branch.'
+        description: 'Commit to build: a full 40-hex sha on main, or on the release/X.Y.x line its Cargo.toml names.'
         required: true
         type: string
 
@@ -86,15 +89,27 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Only reviewed commits write to main's cache scope: the commit must be
-      # reachable from main or from a release/X.Y.x maintenance line.
+      - name: Fetch the maintenance lines
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+
+      # Only reviewed commits write to main's cache scope, because
+      # release.yml restores these caches into the binaries it signs. The
+      # commit must be one the release flow could certify: an ancestor of
+      # main, or of the protected release/<X>.<Y>.x line its own Cargo.toml
+      # names, decided by main's scripts/ci/resolve-certified-ref.sh, the
+      # resolver the candidate and the promote use. A `release/*` wildcard
+      # would also admit unprotected working branches such as
+      # `release/notes-fix` (RELEASING.md, "release/1.9.1-prep is not a
+      # release line"), which anyone with write access can push to.
       - name: Resolve
         id: resolve
         env:
           INPUT_SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin '+refs/heads/release/*:refs/remotes/origin/release/*'
           if [[ ! "$INPUT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error title=Not a full sha::'${INPUT_SHA}' is not a 40-character commit sha."
             exit 1
@@ -103,18 +118,17 @@ jobs:
             echo "::error title=Unknown commit::${INPUT_SHA} is not a commit in this repository."
             exit 1
           fi
-          line=""
-          for ref in refs/remotes/origin/main $(git for-each-ref --format='%(refname)' 'refs/remotes/origin/release/'); do
-            if git merge-base --is-ancestor "$INPUT_SHA" "$ref"; then
-              line="$ref"
-              break
-            fi
-          done
-          if [[ -z "$line" ]]; then
-            echo "::error title=Commit not on a release line::${INPUT_SHA} is reachable from neither main nor a release/X.Y.x branch."
+          rc=0
+          resolved="$(GITHUB_OUTPUT='' scripts/ci/resolve-certified-ref.sh "$INPUT_SHA")" || rc=$?
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error title=Commit not on a release line::${INPUT_SHA} is on neither main nor the release/X.Y.x line its Cargo.toml names (resolver exit ${rc}; its message is above). No cache was written."
             exit 1
           fi
-          echo "Warming the CLI build caches for ${INPUT_SHA} (${line#refs/remotes/})"
+          CERTIFIED_REF="$(sed -n 's/^certified_ref=//p' <<<"$resolved" | head -1)"
+          BRANCH="${CERTIFIED_REF#refs/heads/}"
+          git merge-base --is-ancestor "$INPUT_SHA" "refs/remotes/origin/${BRANCH}" \
+            || { echo "::error title=Ancestry disagreement::${INPUT_SHA} resolves to ${CERTIFIED_REF} over the API but is not reachable from origin/${BRANCH} in this checkout. Failing closed."; exit 1; }
+          echo "Warming the CLI build caches for ${INPUT_SHA} (${BRANCH})"
           echo "sha=${INPUT_SHA}" >> "$GITHUB_OUTPUT"
 
   warm:

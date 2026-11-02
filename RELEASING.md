@@ -321,7 +321,9 @@ names the same commit.
    that run finish before the promote. A tag run whose `Cache Cargo` step
    logs `No cache found.` means the candidate for that sha was not run from
    `main` or the caches were evicted (7-day GitHub retention), and the build
-   will be cold.
+   will be cold. A patch from a `release/X.Y.x` line gets the same caches,
+   but its tag runs the line's own `release.yml`, which restores them only
+   once that copy carries the `shared-key: cli-<target>` `Cache Cargo` step.
 
    On green it records a **certification**: a signed attestation
    (`actions/attest`, Sigstore via GitHub OIDC) on each image's digest whose
@@ -810,7 +812,11 @@ a future checkout of the certified sha fails CI.
 
 The CLI build cache warm-up does compile the commit, which is why it is its
 own workflow (`release-cli-caches.yml`, `contents: read`, no secrets) that the
-candidate only dispatches and never waits for (#4927).
+candidate only dispatches and never waits for (#4927). Its caches land in
+main's scope and the tag run restores them into the binaries it signs, so it
+builds only a commit `scripts/ci/resolve-certified-ref.sh` accepts: one on
+`main` or on the protected `release/X.Y.x` line its `Cargo.toml` names, never
+a working branch that merely lives under `release/`.
 
 **Downstream of the tag is a different story, deliberately.** The promote
 dispatches `release.yml` and `docker-publish.yml` on the tag, which runs the
