@@ -89,9 +89,14 @@ The API key's team needs `VIEW_PORTFOLIO` for list, lookup and full-detail reads
 `VIEW_VULNERABILITY` and `VIEW_POLICY_VIOLATION`. `PROJECT_CREATION_UPLOAD` alone
 does not authorize explicit project creation or parent assignment.
 
-Maven provisioning is serialized within one client. Separate AK instances use
-the same deterministic name/version identities; a creation HTTP 409 triggers
-bounded exact lookups and full-detail validation of the winning project.
+Maven provisioning is serialized within one client and across AK replicas sharing
+PostgreSQL using a transaction-scoped advisory lock on the full Maven identity.
+The lock times out after 30 seconds and is released after upstream errors too;
+it writes no local scan state. This avoids relying on DT to enforce uniqueness
+for simultaneous collection creation with a null version. Independent AK
+installations sharing DT should coordinate ownership: they do not share this
+lock. A creation HTTP 409 triggers bounded exact lookups and full-detail
+validation of the winning project.
 Parent assignment re-reads the child and never deliberately replaces a different
 parent. DT 4.14 does not offer compare-and-set parent updates; coordinate manual
 hierarchy edits with automated provisioning to avoid a concurrent operator edit
