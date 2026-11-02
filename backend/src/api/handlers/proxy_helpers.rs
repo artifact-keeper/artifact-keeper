@@ -14,7 +14,8 @@ use crate::api::AppState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
+    is_deleting_key, ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 use crate::services::proxy_scan_service::CacheScanGate;
@@ -388,6 +389,12 @@ pub async fn resolve_repo_by_key(
     expected_formats: &[&str],
     format_label: &str,
 ) -> Result<RepoInfo, Response> {
+    // A repository whose delete job renamed it to `~deleting~<job id>` is
+    // being torn down; treat it as absent on every format route, exactly like
+    // `RepositoryService::get_by_key`.
+    if is_deleting_key(repo_key) {
+        return Err((StatusCode::NOT_FOUND, "Repository not found").into_response());
+    }
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
@@ -7801,6 +7808,47 @@ pub async fn put_artifact_stream(
     // `staged` drops here -> scratch file removed.
 }
 
+/// Write a [`GenericStagedBody`](super::repositories::GenericStagedBody) to
+/// `storage_key`, from local scratch or by copying the body the repository's
+/// backend already staged (#4990). Runs the same quota preflight and
+/// cross-repository write guard as [`put_artifact_stream`], then releases the
+/// staging copy.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn put_staged_body(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    at: super::publish_quota::PublishAt<'_>,
+    storage_key: &str,
+    staged: super::repositories::GenericStagedBody,
+    digests: &crate::services::artifact_service::ContentDigests,
+) -> Result<crate::storage::PutStreamResult, Response> {
+    let size_bytes = staged.size_bytes();
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, at, size_bytes).await?;
+    guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    let write = staged.prepare_write().await?;
+    write
+        .write(storage.as_ref(), storage_key)
+        .await
+        .map_err(|e| {
+            super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    crate::api::handlers::storage_err_message(&e),
+                )
+                    .into_response()
+            })
+        })?;
+    staged.discard().await;
+    Ok(crate::storage::PutStreamResult {
+        checksum_sha256: digests.sha256.clone(),
+        bytes_written: size_bytes.max(0) as u64,
+    })
+}
+
 /// Open a staged scratch file as a `'static` byte stream ready to feed
 /// `StorageBackend::put_stream`. A buffered `ReaderStream` keeps the
 /// disk->backend copy bounded to `STREAM_STAGE_CHUNK`.
@@ -7987,7 +8035,7 @@ fn upload_body_error_response<E: std::error::Error + 'static>(
 /// quota is `507` + `Retry-After`, any other I/O failure `503` +
 /// `Retry-After`, both logged at `error` with the cause. Previously a bare
 /// `500` that echoed the OS error (and the scratch path) to the client.
-fn spool_error(label: &str, e: &std::io::Error) -> Response {
+pub(crate) fn spool_error(label: &str, e: &std::io::Error) -> Response {
     super::upload_body::spool_write_error(label, e).into_response()
 }
 

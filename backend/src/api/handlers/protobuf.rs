@@ -454,7 +454,7 @@ pub(crate) async fn resolve_protobuf_repo(
     use sqlx::Row;
     let row = sqlx::query(
         r#"SELECT id, key, storage_backend, storage_path, format::text AS format, repo_type::text AS repo_type, upstream_url, promotion_only
-        FROM repositories WHERE key = $1"#,
+        FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'"#,
     )
     .bind(repo_key)
     .fetch_optional(db)

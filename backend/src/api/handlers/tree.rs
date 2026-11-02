@@ -227,12 +227,13 @@ pub async fn get_tree(
     };
 
     // Verify repository exists and check visibility
-    let repo_row: Option<(Uuid, crate::models::repository::RepositoryVisibility)> =
-        sqlx::query_as("SELECT id, visibility FROM repositories WHERE key = $1")
-            .bind(&repo_key)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+    let repo_row: Option<(Uuid, crate::models::repository::RepositoryVisibility)> = sqlx::query_as(
+        "SELECT id, visibility FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
+    )
+    .bind(&repo_key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
     let (repo_id, visibility) = repo_row
         .ok_or_else(|| AppError::NotFound(format!("Repository '{}' not found", repo_key)))?;
@@ -387,7 +388,7 @@ pub async fn get_content(
         String,
         String,
     )> = sqlx::query_as(
-        "SELECT id, visibility, storage_backend, storage_path FROM repositories WHERE key = $1",
+        "SELECT id, visibility, storage_backend, storage_path FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
     )
     .bind(&params.repository_key)
     .fetch_optional(&state.db)

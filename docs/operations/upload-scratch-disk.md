@@ -58,11 +58,18 @@ with bounded memory):
 - OCI/Docker blob uploads, which are staged under `oci-uploads/` on the
   repository's backend.
 - Maven deploys (`PUT /maven/{key}/{path}`: jars, POMs, checksum sidecars,
-  `maven-metadata.xml`) into S3-, GCS- and Azure-backed repositories (#4990).
-  The body streams into a `generic-upload-staging/<uuid>` object on the
-  repository's backend, with SHA-256, SHA-1 and MD5 computed on the way, and
-  is copied server-side to its Maven key once the publish holds its lock; a
-  POM is read back from the staging object for its metadata.
+  `maven-metadata.xml`) and the format-native single-PUT routes for NuGet,
+  PyPI, Terraform, JetBrains, Swift, Git LFS, Helm, Ansible, Chef and Pub into
+  S3-, GCS- and Azure-backed repositories (#4990, #5002). The body streams into
+  a `generic-upload-staging/<uuid>` object on the repository's backend, with
+  SHA-256, SHA-1 and MD5 computed on the way, and is copied server-side to its
+  final key (for NuGet and PyPI, promoted to the content-addressed key) once
+  the publish holds its lock.
+  A route that has to open the archive to parse it — a NuGet `.nuspec`, a
+  wheel or sdist, a Terraform module archive or provider manifest, a Swift
+  manifest fallback, a Helm `Chart.yaml`, an Ansible collection manifest, a Pub
+  `pubspec.yaml` — downloads the staged object to one temporary file just for
+  that read, then removes it. The artifact itself is never staged locally.
 
 Whether a repository's uploads stage on its backend is decided by the
 backend's native streaming capability (S3, GCS and Azure have it), the same
@@ -92,10 +99,12 @@ capability the chunked completion uses, not by the backend's name.
   S3/GCS/Azure without such a format, completion instead assembles on the
   backend and uses no local scratch.
 - Incus/LXC image uploads (monolithic and chunked).
-- Git LFS object uploads (`PUT /lfs/{key}/objects/{oid}`), up to `MAX_UPLOAD_SIZE` each.
-- Format-native publish routes that stream to staging: Ansible, Chef, Helm,
-  JetBrains, NuGet, Pub, PyPI, Swift and Terraform, and Maven into a
-  filesystem-backed repository.
+- Format-native publish routes into a **filesystem-backed** repository, or into
+  a backend without native streaming: Ansible, Chef, Helm, JetBrains, NuGet,
+  Pub, PyPI, Swift and Terraform, plus Git LFS objects and Maven. The same
+  routes into an S3-, GCS- or Azure-backed repository stage on the backend (see
+  the previous list); only a route that parses the archive takes a transient
+  local copy for that read.
 
 Other format-native publish routes (npm, Cargo, Debian, RubyGems and similar)
 read the request body into memory instead of onto disk, bounded by
@@ -176,9 +185,10 @@ Practical guidance:
 
 - With every repository on object storage and uploads going through the
   generic API, scratch only has to cover RPM packages, Incus/Debian finalizes,
-  chunked completions whose format needs a local file, and the spooling format
-  routes above. Size for the largest of those you expect and the number you
-  expect at once.
+  chunked completions whose format needs a local file, and one transient parse
+  copy for a format-native route that opens the archive (NuGet, PyPI,
+  Terraform, the Swift manifest fallback, Helm, Ansible and Pub). Size for the
+  largest of those you expect and the number you expect at once.
 - When `STORAGE_PATH` is an `emptyDir` with a `sizeLimit`, exceeding the limit
   evicts the pod mid-upload. Leave headroom over the estimate. Pointing
   `AK_UPLOAD_STAGING_DIR` at a separate volume moves single-request staging

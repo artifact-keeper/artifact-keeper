@@ -292,6 +292,17 @@ const MIN_CHUNK_SIZE: i64 = 1_048_576; // 1 MB
 const MAX_CHUNK_SIZE: i64 = 268_435_456; // 256 MB
 const DEFAULT_CHUNK_SIZE: i32 = 8_388_608; // 8 MB
 pub const COMMIT_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
+/// Completion-lease lifetime for the `Prefer: respond-async` path (#5002).
+///
+/// The background commit is tracked only in this replica's task. If that
+/// replica restarts, the session stays `committing` until its lease lapses,
+/// and the client polls/cannot re-issue completion until then. Six hours is a
+/// reasonable bound for an in-request commit guarded by a live renewal loop,
+/// but far too long when the guard is a detached task: a crash would strand
+/// the client for the rest of the day. Ten minutes keeps the same crash
+/// recovery contract as other cluster work while still covering a large
+/// package finalize (the renewal loop extends it while the task runs).
+pub const ASYNC_COMMIT_LEASE_TTL_SECS: f64 = 10.0 * 60.0;
 
 // ---------------------------------------------------------------------------
 // Service
@@ -753,6 +764,21 @@ impl UploadService {
         session_id: Uuid,
         user_id: Uuid,
     ) -> Result<UploadSession, UploadError> {
+        Self::complete_session_with_lease(db, session_id, user_id, COMMIT_LEASE_TTL_SECS).await
+    }
+
+    /// [`Self::complete_session`] with an explicit completion-lease lifetime.
+    ///
+    /// The async (`Prefer: respond-async`) path uses the shorter
+    /// [`ASYNC_COMMIT_LEASE_TTL_SECS`] so a replica restart does not strand the
+    /// client behind the six-hour in-request lease; the renewal loop extends
+    /// the lease with the same TTL while the detached commit is alive.
+    pub async fn complete_session_with_lease(
+        db: &PgPool,
+        session_id: Uuid,
+        user_id: Uuid,
+        lease_ttl_secs: f64,
+    ) -> Result<UploadSession, UploadError> {
         // Pre-read for ownership and precise error mapping.
         let session = Self::get_session(db, session_id, Some(user_id)).await?;
 
@@ -786,7 +812,7 @@ impl UploadService {
         .bind(session_id)
         .bind(user_id)
         .bind(Uuid::new_v4())
-        .bind(COMMIT_LEASE_TTL_SECS)
+        .bind(lease_ttl_secs)
         .fetch_optional(db)
         .await?;
 
@@ -981,22 +1007,27 @@ impl UploadService {
         db: PgPool,
         session: &UploadSession,
     ) -> crate::services::cluster_work::RenewalGuard {
+        Self::spawn_commit_lease_renewal_for(db, session, COMMIT_LEASE_TTL_SECS)
+    }
+
+    /// [`Self::spawn_commit_lease_renewal`] with an explicit TTL, so the async
+    /// completion path renews with the same shorter lease it claimed.
+    pub fn spawn_commit_lease_renewal_for(
+        db: PgPool,
+        session: &UploadSession,
+        ttl_secs: f64,
+    ) -> crate::services::cluster_work::RenewalGuard {
         let session_id = session.id;
         let state_token = session.state_token;
         crate::services::cluster_work::spawn_renewal_loop(
             format!("upload session commit {session_id}"),
-            COMMIT_LEASE_TTL_SECS,
+            ttl_secs,
             move || {
                 let db = db.clone();
                 async move {
-                    Self::renew_commit_lease_by_token(
-                        &db,
-                        session_id,
-                        state_token,
-                        COMMIT_LEASE_TTL_SECS,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())
+                    Self::renew_commit_lease_by_token(&db, session_id, state_token, ttl_secs)
+                        .await
+                        .map_err(|e| e.to_string())
                 }
             },
         )
@@ -3040,6 +3071,58 @@ mod tests {
             .await
             .expect("finalize query ok"));
         assert_eq!(session_status(&f.pool, f.session_id).await, "completed");
+
+        teardown_lease_fixture(&f).await;
+    }
+
+    /// The async completion path can claim a shorter lease than the six-hour
+    /// in-request lease, so a replica restart only strands the client for the
+    /// short TTL (#5002).
+    #[tokio::test]
+    async fn complete_session_with_lease_uses_the_requested_short_ttl() {
+        let Some(f) = setup_lease_fixture().await else {
+            return;
+        };
+
+        let session = UploadService::complete_session_with_lease(
+            &f.pool,
+            f.session_id,
+            f.user_id,
+            ASYNC_COMMIT_LEASE_TTL_SECS,
+        )
+        .await
+        .expect("claim with the async lease");
+        assert_eq!(session.status, "committing");
+
+        let (_, _, expires) = session_claim_state(&f.pool, f.session_id).await;
+        let remaining = expires
+            .expect("lease expiry")
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            remaining <= ASYNC_COMMIT_LEASE_TTL_SECS as i64,
+            "async lease must not use the six-hour default, remaining {remaining}s"
+        );
+        assert!(
+            remaining > 0,
+            "async lease must still be live, remaining {remaining}s"
+        );
+
+        // Renewal uses the same short TTL, not the six-hour default.
+        assert!(
+            UploadService::renew_commit_lease(&f.pool, &session, ASYNC_COMMIT_LEASE_TTL_SECS)
+                .await
+                .expect("renew query ok")
+        );
+        let (_, _, renewed) = session_claim_state(&f.pool, f.session_id).await;
+        let renewed_remaining = renewed
+            .expect("renewed expiry")
+            .signed_duration_since(chrono::Utc::now())
+            .num_seconds();
+        assert!(
+            renewed_remaining <= ASYNC_COMMIT_LEASE_TTL_SECS as i64,
+            "renewal must extend with the short TTL, remaining {renewed_remaining}s"
+        );
 
         teardown_lease_fixture(&f).await;
     }

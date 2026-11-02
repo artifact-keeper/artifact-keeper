@@ -13,7 +13,10 @@ the repository `admin` action), records the job, and renames the repository to
 no longer resolves (every format route and API call for it answers 404, except
 a repeated `DELETE`, below), the repository disappears from
 `GET /api/v1/repositories`, it leaves every virtual repository that included it,
-and a new repository can be created under the same key. The answer is
+and a new repository can be created under the same key. The `~deleting~` key
+itself is unreachable through every by-key resolver, the auth visibility
+middleware, repository listings and search, so a job that failed halfway cannot
+expose a repository that is still being deleted (#5002). The answer is
 `202 Accepted`:
 
 ```json

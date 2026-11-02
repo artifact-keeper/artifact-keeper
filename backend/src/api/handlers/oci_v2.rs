@@ -3287,7 +3287,7 @@ async fn resolve_repo_inner(
         sqlx::query(
             "SELECT id, key, storage_backend, storage_path, format::text as format, \
              repo_type::text as repo_type, upstream_url, visibility \
-             FROM repositories WHERE key = $1",
+             FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
         )
         .bind(key)
         .fetch_optional(db)

@@ -2313,12 +2313,14 @@ pub async fn backfill_packages(
     let repository_id = match query.repository_key.as_deref() {
         None => None,
         Some(key) => Some(
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM repositories WHERE key = $1")
-                .bind(key)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
-                .ok_or_else(|| AppError::NotFound(format!("Repository '{key}' not found")))?,
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
+            )
+            .bind(key)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound(format!("Repository '{key}' not found")))?,
         ),
     };
 

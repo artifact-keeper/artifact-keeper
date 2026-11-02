@@ -24,9 +24,14 @@ nothing is stored; the session is failed.
 | Incus, LXC | `{product}/{version}/{file}` | image metadata (arch, os, release) | `streams/v1/images.json` |
 | Debian | `pool/{component}/...` packages | the control file, which must agree with the file name, and maintainer scripts | `Packages` |
 
-Other formats, and paths a format's native route would not index, keep the
-generic behaviour: the artifact is named after its file and its version comes
-from the session or the path.
+Other formats still get a format dispatch on completion (#5002): the
+completion runs the format handler's `parse_metadata` against the artifact
+path, with an empty body, and records the document it returns. A handler that
+does not recognise the path, and the generic handler whose document is only the
+path, record nothing and keep the generic behaviour: the artifact is named
+after its file and its version comes from the session or the path. Paths a
+native format's route would not index (a Maven checksum sidecar, an RPM file
+that is not a package) stay generic too.
 
 A trusted replication session (an administrator or service account sending the
 replication header with source metadata) keeps the metadata the source
@@ -45,6 +50,28 @@ native route, to index it.
 On an S3-, GCS- or Azure-backed repository a Maven POM or npm tarball is parsed
 from the staged chunks; RPM, PyPI, Incus and Debian packages are assembled into
 a local scratch file first (see `docs/operations/upload-scratch-disk.md`).
+
+## Incus native chunked uploads (deprecated)
+
+Incus clients can still start, continue and finish an image through the
+format's own chunked endpoints:
+
+- `POST /incus/{repo_key}/images/{product}/{version}/{filename}/uploads`
+- `PATCH`, `PUT`, `GET` and `DELETE /incus/{repo_key}/uploads/{uuid}`
+
+These endpoints predate `/api/v1/uploads` and keep their own session and
+staging state. They are deprecated in favour of the shared resumable API, and
+every response now carries the RFC 9745 and RFC 8288 headers:
+
+```http
+Deprecation: @1793404800
+Link: </api/v1/uploads>; rel="successor-version"
+```
+
+The headers are added even to error responses, so a client or an intermediary
+can surface the migration without parsing the body. The native routes remain
+functional until a future removal; use `/api/v1/uploads` with an Incus
+repository for new integrations.
 
 ## Asynchronous completion
 
@@ -66,7 +93,11 @@ Without the header the completion answers in the request, as before.
 
 The background commit runs on the replica that accepted the request. It does
 not survive a restart of that replica: the session then stays `committing`
-until its completion lease lapses (six hours after the last renewal), after
+until its completion lease lapses (ten minutes after the last renewal), after
 which the same completion request can be sent again; the staged chunks are
-kept until then. A `Prefer` header without `respond-async` (or with an
-unrecognised preference) is ignored and the completion answers in the request.
+kept until then. The renewal loop extends the lease every few minutes while the
+commit is alive, so a slow parse or a large server-side copy keeps it; a
+crashed replica stops renewing and the session becomes retryable in ten
+minutes rather than six hours. A `Prefer` header without `respond-async` (or
+with an unrecognised preference) is ignored and the completion answers in the
+request.

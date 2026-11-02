@@ -1047,9 +1047,12 @@ const MAX_RELEASE_METADATA_BYTES: usize = 1024 * 1024;
 /// The parts of an SE-0292 `multipart/form-data` publish request that this
 /// handler acts on.
 struct PublishParts {
-    /// The required `source-archive` part, spooled to a bounded scratch file.
-    /// Never held whole in memory (Core Invariant (1), #1608).
-    staged: proxy_helpers::StagedUpload,
+    /// The required `source-archive` part, staged on the repository's backend
+    /// when it streams natively, else in local scratch. Never held whole in
+    /// memory (Core Invariant (1), #1608, #4990).
+    staged: super::repositories::GenericStagedBody,
+    /// The SHA-256/SHA-1/MD5 computed while the archive was staged.
+    digests: crate::services::artifact_service::ContentDigests,
     /// The optional `metadata` part, parsed as JSON.
     metadata: Option<serde_json::Value>,
     /// Names of the optional signature parts that were present. The bytes are
@@ -1067,8 +1070,10 @@ struct PublishParts {
 ///
 /// Parsing is delegated to `multer` driven straight off the request-body
 /// stream -- the shape the nuget push handler already uses -- so the archive
-/// part goes to a scratch file through
-/// [`proxy_helpers::stage_stream_content_addressed`] instead of being buffered.
+/// part is staged on the repository's backend when it streams natively, else in
+/// bounded local scratch, through
+/// [`super::repositories::GenericStagedBody::stage_for_repo`] instead of being
+/// buffered.
 /// That stager is also what enforces `MAX_UPLOAD_SIZE` on the archive (413
 /// mid-stream); the `whole_stream` constraint here keeps the same ceiling on
 /// the envelope as a whole, which is what the route's `DefaultBodyLimit`
@@ -1076,6 +1081,7 @@ struct PublishParts {
 /// ceiling is a 413, not a "malformed" 400 (#4023).
 async fn stage_publish_multipart(
     state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
     content_type: &str,
     body: Body,
 ) -> Result<PublishParts, Response> {
@@ -1100,7 +1106,8 @@ async fn stage_publish_multipart(
         swift_error_response(status, &message)
     };
 
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged: Option<super::repositories::GenericStagedBody> = None;
+    let mut staged_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut metadata: Option<serde_json::Value> = None;
     let mut signatures: Vec<String> = Vec::new();
     while let Some(mut field) = multipart.next_field().await.map_err(bad_request)? {
@@ -1114,9 +1121,11 @@ async fn stage_publish_multipart(
                         "Publish request carries more than one source-archive part",
                     ));
                 }
-                let (archive, _digests) =
-                    proxy_helpers::stage_stream_content_addressed(state, field).await?;
+                let (archive, digests) =
+                    super::repositories::GenericStagedBody::stage_for_repo(state, repo, field)
+                        .await?;
                 staged = Some(archive);
+                staged_digests = Some(digests);
             }
             "metadata" => {
                 // Chunked rather than read whole so the cap is enforced as the
@@ -1157,9 +1166,16 @@ async fn stage_publish_multipart(
             "Publish request is missing the required source-archive part",
         )
     })?;
+    let digests = staged_digests.ok_or_else(|| {
+        swift_error_response(
+            StatusCode::BAD_REQUEST,
+            "Publish request is missing the required source-archive part",
+        )
+    })?;
 
     Ok(PublishParts {
         staged,
+        digests,
         metadata,
         signatures,
     })
@@ -1215,12 +1231,17 @@ async fn publish_release(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let parts = if request_content_type.contains("multipart/form-data") {
-        stage_publish_multipart(&state, request_content_type, body).await?
+        stage_publish_multipart(&state, &repo, request_content_type, body).await?
     } else {
-        let (staged, _digests) =
-            proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+        let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+            &state,
+            &repo,
+            body.into_data_stream(),
+        )
+        .await?;
         PublishParts {
             staged,
+            digests,
             metadata: None,
             signatures: Vec::new(),
         }
@@ -1265,8 +1286,8 @@ async fn publish_release(
     // the uploaded zip when the header is absent. Without the fallback, raw
     // `PUT ... application/zip` uploads fail SwiftPM dependency resolution
     // because the manifest endpoint returns 404 even though the archive is
-    // perfectly valid (issue #1100). Read from the staged file, before
-    // `put_artifact_stream` consumes it.
+    // perfectly valid (issue #1100). Read from the staged body, before
+    // `put_staged_body` consumes it.
     let manifest = match headers
         .get("X-Swift-Package-Manifest")
         .and_then(|v| v.to_str().ok())
@@ -1275,26 +1296,39 @@ async fn publish_release(
         Some(m) => Some(m),
         // #2561: permit-scoped decode, fast-fail 503 on saturation. Only taken
         // when the header fallback actually needs to decode the uploaded zip.
-        None => crate::util::bounded_archive::with_ingest_extraction_async(|| {
-            extract_manifest_from_staged(parts.staged.path())
-        })
-        .await
-        .map_err(|e| e.into_response())?
-        .map_err(|e| {
-            swift_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Manifest parse task failed: {}", e),
-            )
-        })?,
+        None => {
+            let local =
+                super::repositories::materialize_staged_for_repo(&state, &repo, &parts.staged)
+                    .await?;
+            crate::util::bounded_archive::with_ingest_extraction_async(|| {
+                extract_manifest_from_staged(local.path())
+            })
+            .await
+            .map_err(|e| e.into_response())?
+            .map_err(|e| {
+                swift_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Manifest parse task failed: {}", e),
+                )
+            })?
+        }
     };
 
-    // Stream the staged archive into storage, which computes SHA-256 as it
-    // copies. The checksum is over the ARCHIVE, not the multipart envelope --
-    // SwiftPM verifies the source archive's checksum, and this same value is
-    // what the release-metadata `checksum` and the download `Digest` header
-    // report (#3595).
+    // Stream the staged archive into storage, from local scratch or by copying
+    // the object the repository's backend already staged (#4990). The checksum
+    // is over the ARCHIVE, not the multipart envelope -- SwiftPM verifies the
+    // source archive's checksum, and this same value is what the release-metadata
+    // `checksum` and the download `Digest` header report (#3595).
     let storage_key = format!("swift/{}/{}/{}/{}.zip", scope, name, version, name);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, parts.staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        parts.staged,
+        &parts.digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
     let size_bytes = put.bytes_written as i64;
 
@@ -2346,6 +2380,27 @@ mod multipart_publish_tests {
         Bytes::from(body)
     }
 
+    /// The filesystem repository the multipart-staging cases upload into.
+    /// `stages_on_backend` keeps a filesystem repository on local scratch, so
+    /// these tests exercise the self-hosted path.
+    fn staging_repo(dir: &std::path::Path) -> super::RepoInfo {
+        super::RepoInfo {
+            id: uuid::Uuid::new_v4(),
+            key: "swift-test".to_string(),
+            storage_path: dir.to_str().unwrap().to_string(),
+            storage_backend: "filesystem".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: None,
+            format: "swift".to_string(),
+            promotion_only: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 7,
+            age_gate_mode: "upstream_publish_time".to_string(),
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+        }
+    }
+
     /// An envelope over `max_upload_size_bytes` is 413, not a "malformed" 400,
     /// whether the ceiling is crossed before the first part (the parser
     /// reports it) or mid-archive (it surfaces inside the stager) (#4023).
@@ -2356,6 +2411,7 @@ mod multipart_publish_tests {
         let state = tdh::build_state_with(tdh::lazy_pool(), dir.to_str().unwrap(), |cfg| {
             cfg.max_upload_size_bytes = 512
         });
+        let repo = staging_repo(&dir);
         let archive = vec![0xABu8; 4096];
         let envelope = publish_envelope(&[("source-archive", "application/zip", &archive)]);
         let content_type = format!("multipart/form-data; boundary={}", BOUNDARY);
@@ -2364,13 +2420,18 @@ mod multipart_publish_tests {
             .map(|c| Ok(Bytes::copy_from_slice(c)))
             .collect();
 
-        let whole =
-            super::stage_publish_multipart(&state, &content_type, Body::from(envelope.clone()))
-                .await
-                .err()
-                .map(|resp| resp.status());
+        let whole = super::stage_publish_multipart(
+            &state,
+            &repo,
+            &content_type,
+            Body::from(envelope.clone()),
+        )
+        .await
+        .err()
+        .map(|resp| resp.status());
         let chunked = super::stage_publish_multipart(
             &state,
+            &repo,
             &content_type,
             Body::from_stream(futures::stream::iter(pieces)),
         )

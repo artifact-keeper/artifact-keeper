@@ -1656,17 +1656,22 @@ async fn upload_module(
             .into_response());
     }
 
-    // Stream the request body to a bounded scratch file, computing the content
-    // digests in one pass — never buffering the module archive in memory
-    // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stream the request body to the repository's backend when it supports
+    // native streaming, else to local scratch, computing the content digests in
+    // one pass — never buffering the module archive in memory (#2517, #4990).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
 
     // #4590: the archive type decides the hint `X-Terraform-Get` advertises,
     // so it is detected from the bytes now and recorded with the artifact.
-    let archive = sniff_staged_module_archive(staged.path()).await?;
+    let local = super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+    let archive = sniff_staged_module_archive(local.path()).await?;
 
     let artifact_path = build_module_artifact_path(&namespace, &name, &provider, &version);
     let storage_key = build_module_storage_key(&namespace, &name, &provider, &version);
@@ -1678,10 +1683,18 @@ async fn upload_module(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Store the file, streamed from the staged scratch file.
-    // `put_artifact_stream` runs the cross-repo write guard (#2584) before
-    // writing, then streams the object to storage.
-    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    // Store the file, from local scratch or by copying the object the
+    // repository's backend already staged. `put_staged_body` runs the
+    // cross-repo write guard (#2584) and the quota preflight before writing.
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
@@ -2411,11 +2424,15 @@ async fn upload_provider(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Stream the request body to a bounded scratch file, computing the content
-    // digests in one pass — never buffering the provider archive in memory
-    // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    // Stream the request body to the repository's backend when it supports
+    // native streaming, else to local scratch, computing the content digests in
+    // one pass — never buffering the provider archive in memory (#2517, #4990).
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
     let checksum = digests.sha256.clone();
     let size_bytes = staged.size_bytes();
 
@@ -2424,15 +2441,27 @@ async fn upload_provider(
     // is recorded and the package keeps the legacy default.
     let protocols = match declared_protocols {
         Some(p) => Some(p),
-        None => read_manifest_protocols(staged.path().to_path_buf()).await,
+        None => {
+            let local =
+                super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+            read_manifest_protocols(local.path().to_path_buf()).await
+        }
     };
 
     let storage_key = build_provider_storage_key(&namespace, &type_name, &version, &platform);
 
-    // Store the file, streamed from the staged scratch file.
-    // `put_artifact_stream` runs the cross-repo write guard (#2584) before
-    // writing, then streams the object to storage.
-    proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    // Store the file, from local scratch or by copying the object the
+    // repository's backend already staged. `put_staged_body` runs the
+    // cross-repo write guard (#2584) and the quota preflight before writing.
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(

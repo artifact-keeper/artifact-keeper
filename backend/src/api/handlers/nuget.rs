@@ -5120,7 +5120,8 @@ async fn push_package(
         .unwrap_or("");
     let (staged, digests) = if content_type.contains("multipart/form-data") {
         // Streaming-multipart branch: parse the envelope off the body stream
-        // (no full-body buffer) and spool the first file part.
+        // (no full-body buffer) and stage the first file part on the
+        // repository's backend when it streams natively (#4990).
         let boundary = multer::parse_boundary(content_type)
             .map_err(|_| (StatusCode::BAD_REQUEST, "Missing multipart boundary").into_response())?;
         let mut multipart = multer::Multipart::new(body.into_data_stream(), boundary);
@@ -5135,43 +5136,54 @@ async fn push_package(
                     .into_response()
             })?
             .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid multipart body").into_response())?;
-        proxy_helpers::stage_stream_content_addressed(&state, field).await?
+        super::repositories::GenericStagedBody::stage_for_repo(&state, &repo, field).await?
     } else {
         // Raw-binary branch: the entire body is the .nupkg.
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?
+        super::repositories::GenericStagedBody::stage_for_repo(
+            &state,
+            &repo,
+            body.into_data_stream(),
+        )
+        .await?
     };
 
     if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty package body").into_response());
     }
 
-    // Parse .nuspec from the SEEKABLE staged file (the ZIP reader needs
-    // Read + Seek); run the blocking archive read off the async runtime.
-    // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
-    let staged_path = staged.path().to_path_buf();
-    let nuspec = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&staged_path)
-                .map_err(|e| format!("Cannot open staged package: {e}"))?;
-            parse_nuspec_from_reader(file)
+    // Parse .nuspec from the staged body (the ZIP reader needs Read + Seek);
+    // run the blocking archive read off the async runtime. A backend-staged
+    // body is materialized to a temporary local file just for the parse
+    // (#4990). #2561: permit held across the blocking decode, fast-fail 503 on
+    // saturation.
+    let nuspec = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        let staged_path = local.path().to_path_buf();
+        crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&staged_path)
+                    .map_err(|e| format!("Cannot open staged package: {e}"))?;
+                parse_nuspec_from_reader(file)
+            })
         })
-    })
-    .await
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("nuspec parse task failed: {e}"),
-        )
-            .into_response()
-    })?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Failed to read .nuspec from package: {e}"),
-        )
-            .into_response()
-    })?;
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("nuspec parse task failed: {e}"),
+            )
+                .into_response()
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read .nuspec from package: {e}"),
+            )
+                .into_response()
+        })?
+    };
 
     let package_id = nuspec.id.to_lowercase();
     let version = nuspec.version.clone();
@@ -5216,26 +5228,27 @@ async fn push_package(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
-    let content_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
+    let content = staged.upload_content().await?;
     let artifact = artifact_service
-        .upload_stream_with_sync_options(
+        .upload_content_with_sync_options(
             repo.id,
             &artifact_path,
             &package_id,
             Some(&version),
             "application/octet-stream",
-            content_stream,
+            content,
             digests,
             size_bytes,
             Some(user_id),
             // #4889: queue after the metadata write below, not before it.
             false,
             Some(&catalog_name),
+            None,
         )
         .await
         .map_err(|e| e.into_response())?;
-    // Scratch file no longer needed once the service has consumed the stream.
-    drop(staged);
+    // The staging copy is no longer needed once the service has consumed it.
+    staged.discard().await;
 
     // Build metadata JSON.
     let metadata = build_nuget_push_metadata(&nuspec);

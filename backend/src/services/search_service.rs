@@ -368,6 +368,7 @@ impl SearchService {
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
+                  AND r.key NOT LIKE '~deleting~%'
                   AND {q_match}
                   AND ($2::text IS NULL OR r.format::text = $2)
                   AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
@@ -409,6 +410,7 @@ impl SearchService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
+              AND r.key NOT LIKE '~deleting~%'
               AND {q_match}
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
@@ -447,6 +449,7 @@ impl SearchService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.is_deleted = false
+              AND r.key NOT LIKE '~deleting~%'
               AND ($1::uuid[] IS NULL OR r.id = ANY($1))
               AND ($2 = false OR r.visibility = 'public')
             GROUP BY {expr}
@@ -507,6 +510,7 @@ impl SearchService {
             FROM artifacts a
             JOIN repositories r ON r.id = a.repository_id
             WHERE a.name ILIKE $1 ESCAPE '\' AND a.is_deleted = false
+              AND r.key NOT LIKE '~deleting~%'
               AND ($3::uuid[] IS NULL OR r.id = ANY($3))
               AND ($4 = false OR r.visibility = 'public')
             ORDER BY a.name
@@ -554,6 +558,7 @@ impl SearchService {
                 LEFT JOIN download_statistics ds ON ds.artifact_id = a.id
                     AND ds.downloaded_at >= NOW() - make_interval(days => $1)
                 WHERE a.is_deleted = false
+                  AND r.key NOT LIKE '~deleting~%'
                   AND ($4::uuid[] IS NULL OR r.id = ANY($4))
                   AND ($3 = false OR r.visibility = 'public')
                 GROUP BY a.id, r.id
@@ -599,6 +604,7 @@ impl SearchService {
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.is_deleted = false
+                  AND r.key NOT LIKE '~deleting~%'
                   AND ($3::uuid[] IS NULL OR r.id = ANY($3))
                   AND ($2 = false OR r.visibility = 'public')
                 ORDER BY a.created_at DESC
