@@ -30,21 +30,23 @@ ignore = [
     # zip extraction batch (RUSTSEC-2026-0367: SUID/SGID bits preserved on
     # extraction; -0368: ZipArchive::extract creates symlinks pointing outside
     # the destination; -0369: extract() applies Unix permissions through
-    # symlinks; all fixed in zip >= 9.0.0). Our DIRECT zip dependency and the
-    # one rattler_package_streaming pulls are both 9.0.4 (#4705), and the
-    # backend never calls extract(): it reads entries by index and writes with
-    # ZipWriter. The ONLY remaining pre-9 instance is zip 2.4.2, a
-    # BUILD-dependency of utoipa-swagger-ui 8.1.0 (`cargo tree -i zip@2.4.2
-    # -e normal` prints nothing): its build.rs unpacks the swagger-ui
-    # distribution vendored inside the crate with its own by_index loop, at
-    # build time, and nothing from it is linked into the shipped binary. No
-    # utoipa-swagger-ui release depends on zip 9 yet (10.0.1 still requires
-    # ^8.6 and needs utoipa 6), so it cannot be upgraded out today. Remove
-    # these three once utoipa-swagger-ui builds with zip 9 or the backend moves
-    # to utoipa 6 (#4705).
+    # symlinks; -0429: extract() aborts the process on a symlink entry with a
+    # large declared size; all fixed in zip >= 9.0.0). Our DIRECT zip
+    # dependency and the one rattler_package_streaming pulls are both 9.x
+    # (#4705), and the backend never calls extract(): it reads entries by
+    # index and writes with ZipWriter. The ONLY remaining pre-9 instance is
+    # zip 2.4.2, a BUILD-dependency of utoipa-swagger-ui 8.1.0 (`cargo tree -i
+    # zip@2.4.2 -e normal` prints nothing): its build.rs unpacks the
+    # swagger-ui distribution vendored inside the crate with its own by_index
+    # loop and never calls extract(), at build time, and nothing from it is
+    # linked into the shipped binary. No utoipa-swagger-ui release depends on
+    # zip 9 yet (10.0.1 still requires ^8.6 and needs utoipa 6), so it cannot
+    # be upgraded out today. Remove these four once utoipa-swagger-ui builds
+    # with zip 9 or the backend moves to utoipa 6 (#4705, #5162).
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
 
     # crypto-bigint timing variability (RUSTSEC-2026-0387, patched only in
     # >= 0.7.6). The 0.7.x copy (via kryptering under bergshamra) is on 0.7.6.
