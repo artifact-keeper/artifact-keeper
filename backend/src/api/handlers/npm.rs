@@ -5535,7 +5535,10 @@ fn npm_identity_metadata_limited(
         }
 
         let mut components = path.components().filter(|c| *c != Component::CurDir);
-        if components.clone().any(|c| !matches!(c, Component::Normal(_))) {
+        if components
+            .clone()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        {
             ambiguous = true;
             continue;
         }
