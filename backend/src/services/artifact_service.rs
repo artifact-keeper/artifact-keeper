@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -74,6 +74,14 @@ pub struct ContentDigests {
     pub sha1: String,
     /// Lowercase-hex MD5.
     pub md5: String,
+    /// Lowercase-hex SHA-512.
+    ///
+    /// No row persists this. It rides in the one staging pass because the
+    /// NuGet V2 protocol advertises `PackageHash`/`PackageHashAlgorithm`, and
+    /// Chocolatey clients verify the downloaded `.nupkg` against it; computing
+    /// it here costs a hash of bytes already in hand instead of a second read
+    /// of the staged package.
+    pub sha512: String,
 }
 
 /// Where the body of a streaming upload comes from (#3916).
@@ -85,17 +93,18 @@ pub enum UploadContent {
     StagedObject(String),
 }
 
-/// Incremental SHA-256 + SHA-1 + MD5 accumulator.
+/// Incremental SHA-256 + SHA-1 + MD5 + SHA-512 accumulator.
 ///
 /// Feed chunks with [`MultiHasher::update`], then [`MultiHasher::finalize`] into
 /// a [`ContentDigests`]. Extracted as a pure, side-effect-free helper so the
 /// streaming ingest path and its unit tests share one hashing implementation and
-/// the three-way finalize is covered without a live storage backend.
+/// the multi-way finalize is covered without a live storage backend.
 #[derive(Default)]
 pub struct MultiHasher {
     sha256: Sha256,
     sha1: sha1::Sha1,
     md5: md5::Md5,
+    sha512: Sha512,
 }
 
 impl MultiHasher {
@@ -104,11 +113,12 @@ impl MultiHasher {
         Self::default()
     }
 
-    /// Fold `data` into all three running digests.
+    /// Fold `data` into every running digest.
     pub fn update(&mut self, data: &[u8]) {
         Digest::update(&mut self.sha256, data);
         sha1::Digest::update(&mut self.sha1, data);
         md5::Digest::update(&mut self.md5, data);
+        sha2::Digest::update(&mut self.sha512, data);
     }
 
     /// Finish hashing and produce the lowercase-hex [`ContentDigests`].
@@ -117,6 +127,7 @@ impl MultiHasher {
             sha256: format!("{:x}", self.sha256.finalize()),
             sha1: format!("{:x}", sha1::Digest::finalize(self.sha1)),
             md5: format!("{:x}", md5::Digest::finalize(self.md5)),
+            sha512: format!("{:x}", sha2::Digest::finalize(self.sha512)),
         }
     }
 }
