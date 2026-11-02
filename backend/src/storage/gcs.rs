@@ -211,6 +211,15 @@ fn map_status_error(status: u16, context: &str, body: &str) -> AppError {
     }
 }
 
+/// Map a reqwest error to a storage error without the request URL. A
+/// transport error names the URL it was sending to, which carries the
+/// endpoint host, the bucket and the object key; that text reaches API
+/// responses and the health check, so only the operation and the error kind
+/// are kept.
+fn request_error(operation: &str, e: reqwest::Error) -> AppError {
+    AppError::Storage(format!("{}: {}", operation, e.without_url()))
+}
+
 /// Check that an HTTP response indicates success; return an error with context otherwise.
 async fn require_success(
     response: reqwest::Response,
@@ -360,15 +369,13 @@ impl GcsTokenProvider {
             ])
             .send()
             .await
-            .map_err(|e| {
-                AppError::Storage(format!("Failed to exchange JWT for access token: {}", e))
-            })?;
+            .map_err(|e| request_error("Failed to exchange JWT for access token", e))?;
 
         let response = require_success(response, "Google token endpoint error").await?;
         let token_resp: TokenResponse = response
             .json()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to parse token response: {}", e)))?;
+            .map_err(|e| request_error("Failed to parse token response", e))?;
 
         Ok((token_resp.access_token, token_resp.expires_in))
     }
@@ -381,13 +388,13 @@ impl GcsTokenProvider {
             .header("Metadata-Flavor", "Google")
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to fetch GCP access token: {}", e)))?;
+            .map_err(|e| request_error("Failed to fetch GCP access token", e))?;
 
         let response = require_success(response, "GCP metadata server error").await?;
         let token_resp: TokenResponse = response
             .json()
             .await
-            .map_err(|e| AppError::Storage(format!("Failed to parse GCP token response: {}", e)))?;
+            .map_err(|e| request_error("Failed to parse GCP token response", e))?;
 
         Ok((token_resp.access_token, token_resp.expires_in))
     }
@@ -803,7 +810,7 @@ impl GcsBackend {
             .body(content)
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))
+            .map_err(|e| request_error("GCS upload failed", e))
     }
 
     /// GET request with bearer auth. Caller provides the full URL.
@@ -815,7 +822,7 @@ impl GcsBackend {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+            .map_err(|e| request_error("GCS request failed", e))
     }
 
     /// GET request on the long-timeout streaming client. Used only by
@@ -829,7 +836,7 @@ impl GcsBackend {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS request failed: {}", e)))
+            .map_err(|e| request_error("GCS request failed", e))
     }
 
     /// Ranged GET request with bearer auth. Caller provides the full URL.
@@ -846,7 +853,7 @@ impl GcsBackend {
             .header(reqwest::header::RANGE, range_header)
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS ranged request failed: {}", e)))
+            .map_err(|e| request_error("GCS ranged request failed", e))
     }
 
     /// DELETE request with bearer auth via the JSON API metadata URL.
@@ -859,7 +866,7 @@ impl GcsBackend {
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS delete failed: {}", e)))
+            .map_err(|e| request_error("GCS delete failed", e))
     }
 
     // ---- Fallback helpers ----
@@ -901,7 +908,7 @@ impl GcsBackend {
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                    .map_err(|e| request_error("Failed to read response", e))?;
                 return Ok(Some(bytes));
             }
         }
@@ -934,7 +941,7 @@ impl GcsBackend {
                 let bytes = response
                     .bytes()
                     .await
-                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+                    .map_err(|e| request_error("Failed to read response", e))?;
                 return Ok(Some(bytes));
             }
         }
@@ -1026,12 +1033,13 @@ impl GcsBackend {
                 .header("Authorization", format!("Bearer {}", token))
                 .send()
                 .await
-                .map_err(|e| AppError::Storage(format!("GCS list failed: {}", e)))?;
+                .map_err(|e| request_error("GCS list failed", e))?;
 
             let response = require_success(response, "GCS list failed").await?;
-            let list_response: GcsListResponse = response.json().await.map_err(|e| {
-                AppError::Storage(format!("Failed to parse GCS list response: {}", e))
-            })?;
+            let list_response: GcsListResponse = response
+                .json()
+                .await
+                .map_err(|e| request_error("Failed to parse GCS list response", e))?;
 
             all_keys.extend(list_response.items.into_iter().map(|o| {
                 super::ListedKey {
@@ -1069,7 +1077,7 @@ impl GcsBackend {
             .header("Content-Length", "0")
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS rewrite failed: {}", e)))
+            .map_err(|e| request_error("GCS rewrite failed", e))
     }
 
     /// Copy an object within the same bucket.
@@ -1109,9 +1117,10 @@ impl GcsBackend {
             }
 
             let response = require_success(response, "GCS rewrite failed").await?;
-            let rewrite: RewriteResponse = response.json().await.map_err(|e| {
-                AppError::Storage(format!("Failed to parse GCS rewrite response: {}", e))
-            })?;
+            let rewrite: RewriteResponse = response
+                .json()
+                .await
+                .map_err(|e| request_error("Failed to parse GCS rewrite response", e))?;
 
             match interpret_rewrite_step(rewrite)? {
                 RewriteStep::Done => return Ok(()),
@@ -1140,9 +1149,10 @@ impl GcsBackend {
         }
         let response = require_success(response, "GCS size request failed").await?;
 
-        let metadata: GcsObjectMetadata = response.json().await.map_err(|e| {
-            AppError::Storage(format!("Failed to parse GCS object metadata: {}", e))
-        })?;
+        let metadata: GcsObjectMetadata = response
+            .json()
+            .await
+            .map_err(|e| request_error("Failed to parse GCS object metadata", e))?;
 
         metadata
             .size
@@ -1266,7 +1276,7 @@ impl GcsBackend {
             .body(Vec::<u8>::new())
             .send()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS resumable initiate failed: {}", e)))?;
+            .map_err(|e| request_error("GCS resumable initiate failed", e))?;
 
         if !init_response.status().is_success() {
             let status = init_response.status().as_u16();
@@ -1742,7 +1752,7 @@ impl StorageBackend for GcsBackend {
             return response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)));
+                .map_err(|e| request_error("Failed to read response", e));
         }
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1773,7 +1783,7 @@ impl StorageBackend for GcsBackend {
             return response
                 .bytes()
                 .await
-                .map_err(|e| AppError::Storage(format!("Failed to read range response: {}", e)));
+                .map_err(|e| request_error("Failed to read range response", e));
         }
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1806,9 +1816,9 @@ impl StorageBackend for GcsBackend {
         let response = self.authorized_get_stream(&url).await?;
 
         if response.status().is_success() {
-            let stream = response.bytes_stream().map(|r| {
-                r.map_err(|e| AppError::Storage(format!("GCS stream chunk read failed: {}", e)))
-            });
+            let stream = response
+                .bytes_stream()
+                .map(|r| r.map_err(|e| request_error("GCS stream chunk read failed", e)));
             return Ok(Box::pin(stream));
         }
 
@@ -1888,7 +1898,7 @@ impl StorageBackend for GcsBackend {
         let meta: ObjectMeta = response
             .json()
             .await
-            .map_err(|e| AppError::Storage(format!("GCS head_etag: parse metadata json: {}", e)))?;
+            .map_err(|e| request_error("GCS head_etag: parse metadata json", e))?;
         Ok(meta.etag)
     }
 
@@ -4404,6 +4414,90 @@ mod tests {
                 !message.contains("upload_id"),
                 "error message must not carry the session URL: {message}"
             );
+        }
+    }
+
+    /// A transport error names the URL it was sending to: the endpoint host,
+    /// the bucket and the object key. The returned error reaches the health
+    /// check and API error bodies, so it must name only the operation.
+    #[tokio::test]
+    async fn test_request_errors_omit_the_request_url() {
+        let bucket = "url-redaction-probe-bucket";
+        let key = "oci-uploads/url-redaction-probe-key";
+        // Port 1 on loopback has no listener, so every request fails in
+        // transport, the way a dead or mistyped GCS_ENDPOINT does.
+        let backend = GcsBackend::new(GcsConfig {
+            bucket: bucket.to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: false,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+        })
+        .await
+        .expect("backend builds");
+
+        let mut messages = vec![
+            backend
+                .put(key, Bytes::from_static(b"x"))
+                .await
+                .expect_err("put fails")
+                .to_string(),
+            backend.get(key).await.expect_err("get fails").to_string(),
+            backend
+                .get_range(key, 0, 1)
+                .await
+                .expect_err("get_range fails")
+                .to_string(),
+            backend
+                .exists(key)
+                .await
+                .expect_err("exists fails")
+                .to_string(),
+            backend
+                .delete(key)
+                .await
+                .expect_err("delete fails")
+                .to_string(),
+            backend
+                .copy(key, "oci-uploads/url-redaction-probe-dest")
+                .await
+                .expect_err("copy fails")
+                .to_string(),
+            backend
+                .list_keys("oci-uploads/")
+                .await
+                .expect_err("list fails")
+                .to_string(),
+            backend
+                .health_check()
+                .await
+                .expect_err("health check fails")
+                .to_string(),
+        ];
+        match backend.get_stream(key).await {
+            Ok(_) => panic!("get_stream must fail"),
+            Err(e) => messages.push(e.to_string()),
+        }
+        let chunk: BoxStream<'static, Result<Bytes>> =
+            futures::stream::iter(vec![Ok(Bytes::from_static(b"x"))]).boxed();
+        messages.push(
+            backend
+                .put_stream(key, chunk)
+                .await
+                .expect_err("put_stream fails")
+                .to_string(),
+        );
+
+        for message in messages {
+            for secret in ["127.0.0.1", bucket, "url-redaction-probe", "http://"] {
+                assert!(
+                    !message.contains(secret),
+                    "error message must not carry the request URL ({secret}): {message}"
+                );
+            }
         }
     }
 }
