@@ -78,7 +78,7 @@ pub fn ecosystem_for_format(format: &str) -> Option<&'static str> {
 /// production use so repeated evaluations of the same package do not hammer
 /// the public APIs.
 pub struct HttpPopularitySource {
-    client: reqwest::Client,
+    client: crate::services::http_client::Client,
     pypistats_base: String,
     npm_base: String,
 }
