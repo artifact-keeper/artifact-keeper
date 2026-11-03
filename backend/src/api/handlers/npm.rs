@@ -5462,21 +5462,110 @@ fn npm_version_from_tarball_filename(package_name: &str, filename: &str) -> Opti
 }
 
 /// The `name`/`version` an npm tarball claims for ITSELF, read from the
-/// `package/package.json` that `npm pack` always writes (#3003).
+/// root `package.json`. Prefer `package/`, but also accept a single differently
+/// named top-level directory, as used by DefinitelyTyped (#5149).
 ///
 /// Returns `None` when the entry is absent, unparseable, or carries a
 /// non-string / empty name or version — including the JSON-number version
 /// shape. Every one of those is "this tarball does not state a usable
 /// identity", which the caller must treat as inconclusive, never clean.
 fn npm_claimed_identity(tarball: &Bytes) -> Option<(String, String)> {
-    let body = crate::util::bounded_archive::read_metadata_from_tar_gz(&tarball[..], |path| {
-        path == std::path::Path::new("package/package.json")
-    })
-    .ok()??;
+    use crate::util::bounded_archive as bounded;
+
+    // Late metadata needs a separate entry budget; both byte limits still apply (#5148).
+    let max_entries = std::env::var("MAX_NPM_IDENTITY_ARCHIVE_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100_000);
+    let body = match npm_identity_metadata_limited(
+        &tarball[..],
+        bounded::max_ingest_decompressed_bytes(),
+        max_entries,
+        bounded::MAX_INGEST_METADATA_ENTRY_BYTES,
+    ) {
+        Ok(body) => body?,
+        Err(error) => {
+            tracing::warn!(%error, "npm identity metadata probe failed");
+            return None;
+        }
+    };
     let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let name = v.get("name")?.as_str()?.trim().to_string();
     let version = v.get("version")?.as_str()?.trim().to_string();
     (!name.is_empty() && !version.is_empty()).then_some((name, version))
+}
+
+/// Prefer `package/package.json`; accept another root only after a bounded
+/// full walk confirms a single top-level directory (#5149).
+fn npm_identity_metadata_limited(
+    tarball: &[u8],
+    max_total: u64,
+    max_entries: u64,
+    max_entry: u64,
+) -> crate::error::Result<Option<Vec<u8>>> {
+    use crate::util::bounded_archive as bounded;
+    use std::path::{Component, Path};
+
+    let decoded = flate2::read::GzDecoder::new(tarball);
+    let mut archive = tar::Archive::new(bounded::budgeted_to(decoded, max_total));
+    let invalid = |error: std::io::Error| {
+        AppError::Validation(format!("Invalid npm identity archive: {error}"))
+    };
+    let mut root = None;
+    let mut ambiguous = false;
+    let mut fallback = None;
+    for (index, entry) in archive.entries().map_err(invalid)?.enumerate() {
+        if index as u64 >= max_entries {
+            return Err(AppError::Validation(format!(
+                "npm identity archive exceeds {max_entries} entries"
+            )));
+        }
+        let mut entry = entry.map_err(invalid)?;
+        let path = entry.path().map_err(invalid)?.into_owned();
+        if path == Path::new("package/package.json") {
+            if !entry.header().entry_type().is_file() {
+                return Ok(None);
+            }
+            return bounded::read_capped(&mut entry, max_entry, "npm package.json").map(Some);
+        }
+
+        let mut components = path.components().filter(|c| *c != Component::CurDir);
+        if components
+            .clone()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            ambiguous = true;
+            continue;
+        }
+        let Some(Component::Normal(first)) = components.next() else {
+            ambiguous = true;
+            continue;
+        };
+        match &root {
+            Some(previous) if previous != first => ambiguous = true,
+            None => root = Some(first.to_os_string()),
+            _ => {}
+        }
+        let second = components.next();
+        if second.is_none() && !entry.header().entry_type().is_dir() {
+            ambiguous = true;
+        }
+        if second == Some(Component::Normal(std::ffi::OsStr::new("package.json")))
+            && components.next().is_none()
+        {
+            if fallback.is_some() || !entry.header().entry_type().is_file() {
+                ambiguous = true;
+                continue;
+            }
+            fallback = Some(bounded::read_capped(
+                &mut entry,
+                max_entry,
+                "npm package.json",
+            )?);
+        }
+    }
+    Ok(if ambiguous { None } else { fallback })
 }
 
 /// Whether the identity a tarball claims for itself agrees with the coordinate
@@ -5682,7 +5771,7 @@ impl proxy_helpers::ScannedProxyFile for NpmScannedTarball<'_> {
     ///
     /// The coordinate comes from the REQUEST (route package name + the
     /// registry's invariant `{basename}-{version}.tgz` filename), never from
-    /// bytes the upstream controls, and the tarball's own `package/package.json`
+    /// bytes the upstream controls, and the tarball's own root `package.json`
     /// must agree with it. A tarball that states a different identity, states
     /// none, or states an unusable one (missing/empty/non-string version) is
     /// unassessable: any scan of it would grade something other than the
@@ -18292,6 +18381,108 @@ mod proxy_scan_block_tests {
         assert!(npm_claimed_identity(&crafted_tgz(Some(b"nope"))).is_none());
     }
 
+    /// Metadata past the ingest entry cap remains reachable by the identity probe (#5148).
+    #[test]
+    fn test_npm_claimed_identity_late_metadata_5148() {
+        use crate::services::archive_entry_paths::test_support::tar_gz_with;
+        use crate::util::bounded_archive as bounded;
+
+        let names: Vec<String> = (0..10_001).map(|i| format!("package/file-{i}")).collect();
+        let mut entries: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+        entries.push((
+            "package/package.json",
+            br#"{"name":"foo","version":"1.0.0"}"#,
+        ));
+        let bytes = Bytes::from(tar_gz_with(&entries));
+        assert!(bounded::read_metadata_from_tar_gz_limited(
+            &bytes[..],
+            |path| path == std::path::Path::new("package/package.json"),
+            bounded::DEFAULT_MAX_INGEST_DECOMPRESSED_BYTES,
+            bounded::DEFAULT_MAX_INGEST_ARCHIVE_ENTRIES,
+            bounded::MAX_INGEST_METADATA_ENTRY_BYTES,
+        )
+        .is_err());
+        assert_eq!(
+            npm_claimed_identity(&bytes),
+            Some(("foo".into(), "1.0.0".into()))
+        );
+    }
+
+    #[test]
+    fn test_npm_claimed_identity_alternative_root_5149() {
+        use crate::services::archive_entry_paths::test_support::tar_gz_with;
+
+        for (root, name) in [("node", "@types/node"), ("react", "@types/react")] {
+            let path = format!("{root}/package.json");
+            let body = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+            let bytes = Bytes::from(tar_gz_with(&[(path.as_str(), body.as_bytes())]));
+            let claimed = npm_claimed_identity(&bytes).expect("alternative root identity");
+            assert_eq!(claimed, (name.into(), "1.0.0".into()));
+            assert!(npm_identity_agrees(name, "1.0.0", &claimed));
+            assert!(!npm_identity_agrees(name, "2.0.0", &claimed));
+            assert!(!npm_identity_agrees("another-package", "1.0.0", &claimed));
+        }
+    }
+
+    #[test]
+    fn test_npm_identity_root_selection_5149() {
+        use crate::services::archive_entry_paths::test_support::tar_gz_with;
+
+        let canonical = br#"{"name":"foo","version":"1.0.0"}"#;
+        let alternative = br#"{"name":"@types/node","version":"1.0.0"}"#;
+        for entries in [
+            vec![
+                ("node/package.json", &alternative[..]),
+                ("package/package.json", &canonical[..]),
+            ],
+            vec![
+                ("package/package.json", &canonical[..]),
+                ("node/package.json", &alternative[..]),
+            ],
+        ] {
+            assert_eq!(
+                npm_claimed_identity(&Bytes::from(tar_gz_with(&entries))),
+                Some(("foo".into(), "1.0.0".into()))
+            );
+        }
+        for entries in [
+            vec![
+                ("node/package.json", &alternative[..]),
+                ("react/index.d.ts", &b""[..]),
+            ],
+            vec![
+                ("node/package.json", &alternative[..]),
+                ("react/package.json", &canonical[..]),
+            ],
+            vec![("node/dependency/package.json", &alternative[..])],
+            vec![("package.json", &alternative[..])],
+            vec![("node/package.json", &b"not json"[..])],
+            vec![
+                ("node/package.json", &alternative[..]),
+                ("package/package.json", &b"not json"[..]),
+            ],
+        ] {
+            assert!(npm_claimed_identity(&Bytes::from(tar_gz_with(&entries))).is_none());
+        }
+    }
+
+    #[test]
+    fn test_npm_alternative_root_limits_5149() {
+        use crate::services::archive_entry_paths::test_support::tar_gz_with;
+
+        let body = br#"{"name":"@types/node","version":"1.0.0"}"#;
+        let archive = tar_gz_with(&[("node/package.json", body), ("node/index.d.ts", b"")]);
+        assert_eq!(
+            npm_identity_metadata_limited(&archive, 4096, 2, 1024).unwrap(),
+            Some(body.to_vec())
+        );
+        // Fallback is provisional until EOF; an exceeded budget must discard it.
+        assert!(npm_identity_metadata_limited(&archive, 4096, 1, 1024).is_err());
+        assert!(npm_identity_metadata_limited(&archive, 512, 2, 1024).is_err());
+        assert!(npm_identity_metadata_limited(&archive, 4096, 2, 8).is_err());
+    }
+
     /// #3003 (red-team shape a): a tarball whose package.json was rewritten to
     /// a benign identity does NOT agree with the coordinate it is served at.
     #[test]
@@ -18393,11 +18584,17 @@ mod proxy_scan_block_tests {
                      as must be withheld under fail_closed, got {}",
                     r.status()
                 ),
-                Err(resp) => assert_eq!(
-                    resp.status(),
-                    StatusCode::LOCKED,
-                    "{label}: expected 423 (inconclusive), not a clean serve"
-                ),
+                Err(resp) => {
+                    assert_eq!(resp.status(), StatusCode::LOCKED, "{label}");
+                    assert!(resp.headers().get("Retry-After").is_none());
+                    let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+                        .await
+                        .expect("identity refusal body");
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&body).expect("identity refusal JSON");
+                    assert_eq!(json["error"], "scan_identity_unestablished", "{label}");
+                    assert!(!json["reason"].as_str().unwrap().contains("being scanned"));
+                }
             }
         }
     }
