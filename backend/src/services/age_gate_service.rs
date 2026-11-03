@@ -2224,6 +2224,34 @@ type PypiSimpleIndexParseResult = (Vec<PypiAnchorSpan>, Vec<(String, Option<Date
 
 /// First pass over PyPI simple-index HTML: locate anchors and dedupe versions.
 pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexParseResult {
+    parse_pypi_index_anchors_where(html, |_| true)
+}
+
+/// The versions in a simple index that come from files named for `project`
+/// (its PEP 503 form). A link to anything else on the page says nothing about
+/// this project's releases.
+pub(crate) fn parse_pypi_project_index_anchors(
+    html: &str,
+    project: &str,
+) -> Vec<(String, Option<DateTime<Utc>>)> {
+    parse_pypi_index_anchors_where(html, |anchor| {
+        extract_href_filename(anchor).is_some_and(|f| pypi_filename_names_project(&f, project))
+    })
+    .1
+}
+
+/// Whether a distribution filename names `project` (its PEP 503 form).
+pub(crate) fn pypi_filename_names_project(filename: &str, project: &str) -> bool {
+    crate::formats::pypi::PypiHandler::parse_filename(filename)
+        .ok()
+        .and_then(|info| info.name)
+        .is_some_and(|name| crate::formats::pypi::PypiHandler::normalize_name(&name) == project)
+}
+
+fn parse_pypi_index_anchors_where(
+    html: &str,
+    keep_version: impl Fn(&str) -> bool,
+) -> PypiSimpleIndexParseResult {
     let mut spans: Vec<PypiAnchorSpan> = Vec::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut versions: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
@@ -2236,7 +2264,7 @@ pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexPars
         let end = start + end_rel + 4;
         let anchor = &html[start..end];
         let version = pypi_anchor_version(anchor);
-        if let Some(ref ver) = version {
+        if let Some(ver) = version.as_ref().filter(|_| keep_version(anchor)) {
             // A version is as old as its earliest file, as in the PEP 691 walk.
             let index = *seen.entry(ver.clone()).or_insert_with(|| {
                 versions.push((ver.clone(), None));
@@ -2306,9 +2334,11 @@ pub(crate) fn pypi_publish_time(
         .max()
 }
 
-/// Attach publish times to parsed simple-index versions. The upstream's JSON
-/// API wins, the order the download path reads them in, and an anchor's own
-/// time stays where the API has nothing.
+/// Attach publish times to the versions of an HTML simple index. In this
+/// listing the upstream's JSON API wins, the same order the download path reads
+/// them in, and an anchor's own time stays where the API has nothing. The PEP
+/// 691 listing is the other way round: [`AgeGateService::filter_pypi_simple_json`]
+/// keeps the document's `upload-time` and only falls back to the API.
 pub(crate) fn attach_pypi_publish_times(
     versions: &mut [(String, Option<DateTime<Utc>>)],
     publish_times: &std::collections::HashMap<String, DateTime<Utc>>,

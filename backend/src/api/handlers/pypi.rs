@@ -2523,13 +2523,26 @@ async fn filter_pypi_simple_html_response(
 /// is the one with PEP 700 `upload-time`, and HTML is every upstream's floor.
 const PYPI_GATE_INDEX_ACCEPT: &str = "application/vnd.pypi.simple.v1+json, text/html;q=0.9";
 
+/// PEP 629's marker, the one thing a simple-index HTML page carries when it
+/// has no files to identify it by.
+const PEP629_REPOSITORY_VERSION_META: &str = "pypi:repository-version";
+
 /// Read one version's evidence out of an upstream simple-index body.
 ///
-/// HTML goes through the same rebuild the listing path uses, so the two read
-/// the same anchors. An HTML page with no distribution anchors (a login page,
-/// a captive proxy) is no answer rather than an empty project. The filename
-/// check is a backstop: a file named in the body but missed by the parse is
-/// listed, not absent.
+/// Only a document that is about this project can say "not hosted", because a
+/// 200 from an upstream may be a login page or a captive proxy whose links
+/// happen to parse as distribution filenames. So only files named for this
+/// project count, and the document has to show it is this project's index:
+///
+/// - a file of this project with a PEP 440 version, or
+/// - no files at all and an identifying mark: PEP 691's `name`, or PEP 629's
+///   meta tag on a page with no anchors. A bare empty page has neither, so it
+///   stays no answer and fails closed.
+///
+/// A filename mentioned anywhere else in the body (a yank reason, a file the
+/// parse could not read) is also no answer. The name is the client's, so it
+/// must not count as a listing or it could start a `first_seen` clock on a
+/// version nobody published.
 fn pypi_index_version_evidence(
     body: &[u8],
     repo_key: &str,
@@ -2537,34 +2550,55 @@ fn pypi_index_version_evidence(
     filename: &str,
     version: &str,
 ) -> UpstreamVersionEvidence {
-    let versions = match sniff_simple_index(body) {
+    use crate::services::age_gate_service::{
+        collect_pypi_simple_json_versions, parse_pypi_project_index_anchors,
+        parse_pypi_simple_index_anchors, pypi_filename_names_project, pypi_listed_version,
+    };
+
+    let text = String::from_utf8_lossy(body);
+    let (versions, identified_empty) = match sniff_simple_index(body) {
         SniffedSimpleIndex::Json => {
-            let Ok(doc) = serde_json::from_slice::<serde_json::Value>(body) else {
+            let Ok(mut doc) = serde_json::from_slice::<serde_json::Value>(body) else {
                 return UpstreamVersionEvidence::Unknown;
             };
-            if !doc.get("files").is_some_and(|files| files.is_array()) {
+            let name = doc
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(PypiHandler::normalize_name);
+            if name.as_deref().is_some_and(|name| name != project) {
                 return UpstreamVersionEvidence::Unknown;
             }
-            crate::services::age_gate_service::collect_pypi_simple_json_versions(&doc)
+            let Some(files) = doc.get_mut("files").and_then(|f| f.as_array_mut()) else {
+                return UpstreamVersionEvidence::Unknown;
+            };
+            let identified_empty = files.is_empty() && name.is_some();
+            files.retain(|file| {
+                file.get("filename")
+                    .and_then(|f| f.as_str())
+                    .is_some_and(|f| pypi_filename_names_project(f, project))
+            });
+            (collect_pypi_simple_json_versions(&doc), identified_empty)
         }
         SniffedSimpleIndex::Html => {
-            let html = rewrite_upstream_urls(&String::from_utf8_lossy(body), repo_key, project);
-            let (_, versions) =
-                crate::services::age_gate_service::parse_pypi_simple_index_anchors(&html);
-            if versions.is_empty() {
-                return UpstreamVersionEvidence::Unknown;
-            }
-            versions
+            let html = rewrite_upstream_urls(&text, repo_key, project);
+            let (anchors, _) = parse_pypi_simple_index_anchors(&html);
+            (
+                parse_pypi_project_index_anchors(&html, project),
+                anchors.is_empty() && text.contains(PEP629_REPOSITORY_VERSION_META),
+            )
         }
         SniffedSimpleIndex::Binary => return UpstreamVersionEvidence::Unknown,
     };
-    match crate::services::age_gate_service::pypi_listed_version(&versions, version) {
-        Some(published_at) => UpstreamVersionEvidence::Listed(published_at),
-        None if String::from_utf8_lossy(body).contains(filename) => {
-            UpstreamVersionEvidence::Listed(None)
-        }
-        None => UpstreamVersionEvidence::NotHosted,
+    if let Some(published_at) = pypi_listed_version(&versions, version) {
+        return UpstreamVersionEvidence::Listed(published_at);
     }
+    let lists_a_release = versions
+        .iter()
+        .any(|(listed, _)| PypiHandler::pep440_sort_key(listed).is_some());
+    if text.contains(filename) || !(lists_a_release || identified_empty) {
+        return UpstreamVersionEvidence::Unknown;
+    }
+    UpstreamVersionEvidence::NotHosted
 }
 
 /// What a Remote's upstream says about `version`.
@@ -2574,7 +2608,8 @@ fn pypi_index_version_evidence(
 /// such endpoint answers 404 or 403 for projects it hosts (#5151). The simple
 /// index is the document every PyPI upstream serves, so it dates the version
 /// when it can and is the only source of "not hosted" (#5150). It is read from
-/// the upstream as of now, with the Remote's configured credentials.
+/// the upstream itself, with the Remote's configured credentials, and never
+/// from the proxy cache; see [`proxy_helpers::age_gate_upstream_evidence`].
 async fn pypi_version_evidence(
     state: &SharedState,
     repo: &RepoInfo,
@@ -2604,22 +2639,16 @@ async fn pypi_version_evidence(
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
     let (effective_upstream, upstream_path) =
         pypi_upstream_url_and_path(upstream_url, &format!("{}/", project.as_str()), &index_path);
-    match proxy_helpers::proxy_fetch_uncached_metadata_budgeted(
+    proxy_helpers::age_gate_upstream_evidence(
         proxy,
         repo.id,
         &repo.key,
         &effective_upstream,
         &upstream_path,
         Some(PYPI_GATE_INDEX_ACCEPT),
+        |body| pypi_index_version_evidence(body, &repo.key, project.as_str(), filename, version),
     )
     .await
-    {
-        Ok((body, _budget_permit)) => {
-            pypi_index_version_evidence(&body, &repo.key, project.as_str(), filename, version)
-        }
-        Err(resp) if resp.status() == StatusCode::NOT_FOUND => UpstreamVersionEvidence::NotHosted,
-        Err(_) => UpstreamVersionEvidence::Unknown,
-    }
 }
 
 async fn apply_pypi_download_age_gate(
@@ -23758,6 +23787,354 @@ mod age_gate_upstream_evidence_tests {
         teardown(fx, members).await;
 
         assert_451(status, &body, None);
+    }
+
+    /// A body that only mentions the filename (a yank reason here) is not a
+    /// listing. The name is the client's, so it must start no `first_seen`
+    /// clock: otherwise a client could pre-age a version not yet published.
+    #[tokio::test]
+    async fn filename_mentioned_outside_a_listing_starts_no_clock_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let other = a.file_url("gated-0.1.0-py3-none-any.whl");
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "<a href=\"{other}\" data-yanked=\"use {WHEEL} instead\">\
+                     gated-0.1.0-py3-none-any.whl</a>"
+                ),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        let Some(fx) = direct_remote(&a.url(), 7, "first_seen").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let observations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM age_gate_version_observations WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count observations");
+        fx.teardown().await;
+
+        assert_451(status, &body, None);
+        assert_eq!(observations, 0, "no clock from a mere mention");
+    }
+
+    /// A 200 page that is not about this project says nothing about it, even
+    /// when its links happen to parse as distribution filenames.
+    #[tokio::test]
+    async fn page_about_something_else_is_not_a_miss_5150() {
+        for page in [
+            "<html><a href=\"/client-setup.zip\">Get the client</a></html>",
+            "<html><a href=\"/gated-setup.zip\">Get the client</a></html>",
+            "<a href=\"/f/other-0.1.0-py3-none-any.whl\">other-0.1.0-py3-none-any.whl</a>",
+        ] {
+            let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+                return;
+            };
+            let (server, guard) = tdh::non_loopback_mock_server().await;
+            let a = Upstream {
+                server: &server,
+                prefix: "a",
+            };
+            let b = Upstream {
+                server: &server,
+                prefix: "b",
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/a/simple/{PROJECT}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(page, "text/html"))
+                .mount(&server)
+                .await;
+            b.hosting_old_wheel(b"wheel-from-b").await;
+            let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+            let state = state_for(&fx);
+
+            let (status, body) = download(&state, &fx, WHEEL).await;
+            teardown(fx, members).await;
+            drop(guard);
+
+            assert_451(status, &body, None);
+        }
+    }
+
+    /// Another project's file carrying the requested version is not a listing
+    /// of this project, so it starts no clock either.
+    #[tokio::test]
+    async fn another_projects_file_starts_no_clock_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<a href=\"/client-1.0.0.zip\">Get the client</a>",
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        let Some(fx) = direct_remote(&a.url(), 7, "first_seen").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// A project page with no files is a real answer when it identifies itself
+    /// as a simple index: PEP 629's meta tag in HTML, `name` in PEP 691.
+    #[tokio::test]
+    async fn empty_index_that_identifies_itself_steps_aside_5150() {
+        let pages = [
+            (
+                "<!DOCTYPE html><html><head>\
+                 <meta name=\"pypi:repository-version\" content=\"1.0\"/>\
+                 </head><body></body></html>"
+                    .to_string(),
+                "text/html",
+            ),
+            (
+                serde_json::json!({
+                    "meta": {"api-version": "1.1"}, "name": PROJECT, "files": []
+                })
+                .to_string(),
+                PEP691_JSON_CONTENT_TYPE,
+            ),
+        ];
+        for (page, content_type) in pages {
+            let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+                return;
+            };
+            let (server, guard) = tdh::non_loopback_mock_server().await;
+            let a = Upstream {
+                server: &server,
+                prefix: "a",
+            };
+            let b = Upstream {
+                server: &server,
+                prefix: "b",
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/a/simple/{PROJECT}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(page, content_type))
+                .mount(&server)
+                .await;
+            b.hosting_old_wheel(b"wheel-from-b").await;
+            let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+            let state = state_for(&fx);
+
+            let (status, body) = download(&state, &fx, WHEEL).await;
+            teardown(fx, members).await;
+            drop(guard);
+
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(&body[..], b"wheel-from-b");
+        }
+    }
+
+    /// The classification on its own, for the shapes a route test would only
+    /// repeat. Only a document about this project may say "not hosted".
+    #[test]
+    fn index_evidence_needs_a_document_about_this_project_5150() {
+        use UpstreamVersionEvidence::{Listed, NotHosted, Unknown};
+        let check = |body: &str, project: &str, filename: &str, version: &str| {
+            super::pypi_index_version_evidence(body.as_bytes(), "key", project, filename, version)
+        };
+        let html = |name: &str| format!("<a href=\"/f/{name}\">{name}</a>");
+        let json = |doc: serde_json::Value| doc.to_string();
+        let (file, ver) = ("foo_bar-1.0.0-py3-none-any.whl", "1.0.0");
+
+        // HTML: every PEP 503 spelling of the project name counts.
+        for other in [
+            "foo_bar-0.1.0-py3-none-any.whl",
+            "Foo.Bar-0.1.0.tar.gz",
+            "foo-bar-0.1.0.zip",
+        ] {
+            assert_eq!(
+                check(&html(other), "foo-bar", file, ver),
+                NotHosted,
+                "{other}"
+            );
+        }
+        assert_eq!(
+            check(&html("foo-bar-1.0.tar.gz"), "foo-bar", file, ver),
+            Listed(None),
+            "a PEP 440-equal spelling is the same version"
+        );
+        assert_eq!(
+            check(&html("foo-baz-0.1.0.tar.gz"), "foo-bar", file, ver),
+            Unknown
+        );
+        assert_eq!(check("<html></html>", "foo-bar", file, ver), Unknown);
+        // An empty page with the PEP 629 marker but a stray link is not empty.
+        assert_eq!(
+            check(
+                "<meta name=\"pypi:repository-version\" content=\"1.0\"><a href=\"/x\">x</a>",
+                "foo-bar",
+                file,
+                ver
+            ),
+            Unknown
+        );
+        // A non-PEP 440 spelling the name filter keeps but the lookup misses.
+        assert_eq!(
+            check(&html("foo-bar-custom.tar.gz"), "foo-bar", file, ver),
+            Unknown
+        );
+
+        // PEP 691.
+        let doc = |name: Option<&str>, files: Vec<&str>| {
+            let files: Vec<_> = files
+                .iter()
+                .map(|f| serde_json::json!({"filename": f, "url": "x"}))
+                .collect();
+            let mut doc = serde_json::json!({"meta": {"api-version": "1.1"}, "files": files});
+            if let Some(name) = name {
+                doc["name"] = serde_json::json!(name);
+            }
+            json(doc)
+        };
+        let some = Some("Foo_Bar");
+        assert_eq!(check(&doc(some, vec![]), "foo-bar", file, ver), NotHosted);
+        assert_eq!(check(&doc(None, vec![]), "foo-bar", file, ver), Unknown);
+        assert_eq!(
+            check(&doc(Some("baz"), vec![]), "foo-bar", file, ver),
+            Unknown
+        );
+        assert_eq!(
+            check(
+                &doc(some, vec!["foo_bar-0.1.0.tar.gz"]),
+                "foo-bar",
+                file,
+                ver
+            ),
+            NotHosted
+        );
+        assert_eq!(
+            check(
+                &doc(some, vec!["foo_bar-1.0.0.tar.gz"]),
+                "foo-bar",
+                file,
+                ver
+            ),
+            Listed(None)
+        );
+        assert_eq!(
+            check(&doc(some, vec!["baz-1.0.0.tar.gz"]), "foo-bar", file, ver),
+            Unknown
+        );
+        assert_eq!(
+            check(
+                &doc(Some("baz"), vec!["foo_bar-0.1.0.tar.gz"]),
+                "foo-bar",
+                file,
+                ver
+            ),
+            Unknown
+        );
+        // A yank reason naming the file: mentioned, not listed.
+        let mut yanked = serde_json::json!({
+            "meta": {"api-version": "1.1"}, "name": "foo-bar",
+            "files": [{"filename": "foo_bar-0.1.0.tar.gz", "url": "x", "yanked": file}]
+        });
+        assert_eq!(check(&json(yanked.take()), "foo-bar", file, ver), Unknown);
+    }
+
+    /// Reads of one member's index coalesce, so requests for one project cost
+    /// one upstream read however they arrive within the window (#5150).
+    #[tokio::test]
+    async fn repeated_requests_share_one_index_read_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.simple_html(&[("gated-0.1.0-py3-none-any.whl", None)])
+            .await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let concurrent = futures::future::join_all((0..4).map(|_| download(&state, &fx, WHEEL)));
+        let statuses: Vec<StatusCode> = concurrent.await.into_iter().map(|(s, _)| s).collect();
+        let (again, _) = download(&state, &fx, WHEEL).await;
+        let reads = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == format!("/a/simple/{PROJECT}/"))
+            .count();
+        teardown(fx, members).await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::OK),
+            "{statuses:?}"
+        );
+        assert_eq!(again, StatusCode::OK);
+        assert_eq!(reads, 1);
+    }
+
+    /// The window is what a "not hosted" answer can outlive the publish by.
+    /// Once it passes, a version published since blocks as it should.
+    #[tokio::test]
+    async fn not_hosted_does_not_outlive_its_window_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let now = young();
+        a.simple_html(&[(WHEEL, Some(now.as_str()))]).await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (first, _) = download(&state, &fx, WHEEL).await;
+        tokio::time::sleep(
+            proxy_helpers::AGE_GATE_UPSTREAM_READ_TTL + std::time::Duration::from_millis(500),
+        )
+        .await;
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_451(status, &body, Some(0));
     }
 
     /// Direct Remote with `gate`, on a fixture of its own.

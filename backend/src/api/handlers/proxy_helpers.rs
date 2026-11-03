@@ -2695,28 +2695,104 @@ pub async fn proxy_fetch_uncached(
     .await
 }
 
-/// Read a metadata document from upstream as of now, bypassing the proxy cache
-/// and holding the metadata memory budget like every other buffered read. The
-/// age gate reads this before it treats a member as not hosting a version
-/// (#5150): a cached copy older than the publish cannot say that.
-pub(crate) async fn proxy_fetch_uncached_metadata_budgeted(
+/// How long the age gate may reuse one upstream read. This is the longest a
+/// "not hosted" answer can outlive a publish, so it stays in seconds: long
+/// enough that a burst for one project costs one read, short enough that it is
+/// no real window for a version to fall through (#5150).
+pub(crate) const AGE_GATE_UPSTREAM_READ_TTL: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Total size of the bodies [`AGE_GATE_UPSTREAM_READS`] may hold. A larger
+/// document is still shared by concurrent readers but not kept.
+const AGE_GATE_UPSTREAM_READS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `(repository, upstream URL, path, Accept)`. The URL is part of the key so a
+/// repointed Remote never reads an answer from its previous upstream.
+type AgeGateUpstreamReadKey = (Uuid, String, String, Option<String>);
+
+/// One successful read: the document, or the upstream's 404/410. A failure is
+/// never kept, so an outage is asked about again on the next request.
+#[derive(Clone)]
+enum AgeGateUpstreamRead {
+    Document(Bytes),
+    Missing,
+}
+
+/// Recent age-gate reads of upstream metadata (#5150). Besides reusing a read
+/// for [`AGE_GATE_UPSTREAM_READ_TTL`], `try_get_with` makes concurrent requests
+/// for one key share a single upstream read.
+static AGE_GATE_UPSTREAM_READS: std::sync::LazyLock<
+    moka::future::Cache<AgeGateUpstreamReadKey, AgeGateUpstreamRead>,
+> = std::sync::LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(AGE_GATE_UPSTREAM_READS_MAX_BYTES)
+        // The key is client-influenced, so an empty answer still has to weigh
+        // something or a flood of names would not be bounded by the capacity.
+        .weigher(|key: &AgeGateUpstreamReadKey, read: &AgeGateUpstreamRead| {
+            let body = match read {
+                AgeGateUpstreamRead::Document(body) => body.len(),
+                AgeGateUpstreamRead::Missing => 0,
+            };
+            u32::try_from(body + key.1.len() + key.2.len() + 64).unwrap_or(u32::MAX)
+        })
+        .time_to_live(AGE_GATE_UPSTREAM_READ_TTL)
+        .build()
+});
+
+/// What the upstream itself says about a version, for an answer the proxy cache
+/// cannot give: a cached copy older than the publish does not list a version
+/// the upstream now has, so it must not read as "not hosted" (#5150).
+///
+/// A 404 or 410 is [`UpstreamVersionEvidence::NotHosted`], any other failure
+/// [`UpstreamVersionEvidence::Unknown`], and a document is left to `read`.
+/// While a read is in flight it holds the metadata budget for the full cap, as
+/// its size is not known yet; `read` then holds it for the actual size.
+pub(crate) async fn age_gate_upstream_evidence(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
     upstream_url: &str,
     path: &str,
     accept: Option<&str>,
-) -> Result<(Bytes, OwnedSemaphorePermit), Response> {
-    let permit = proxy_metadata_budget()
-        .reserve(LARGE_METADATA_MAX_BYTES)
+    read: impl FnOnce(&[u8]) -> crate::services::age_gate_service::UpstreamVersionEvidence,
+) -> crate::services::age_gate_service::UpstreamVersionEvidence {
+    use crate::services::age_gate_service::UpstreamVersionEvidence;
+
+    let key = (
+        repo_id,
+        upstream_url.to_string(),
+        path.to_string(),
+        accept.map(str::to_string),
+    );
+    let fetched = AGE_GATE_UPSTREAM_READS
+        .try_get_with(key, async {
+            let _permit = proxy_metadata_budget()
+                .reserve(LARGE_METADATA_MAX_BYTES)
+                .await;
+            let fetched =
+                with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+                    proxy_service
+                        .fetch_upstream_direct_with_accept(&repo, path, accept)
+                        .await
+                })
+                .await;
+            match fetched {
+                Ok(body) => Ok(AgeGateUpstreamRead::Document(body)),
+                Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                    Ok(AgeGateUpstreamRead::Missing)
+                }
+                Err(resp) => Err(resp.status()),
+            }
+        })
         .await;
-    let content = with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
-        proxy_service
-            .fetch_upstream_direct_with_accept(&repo, path, accept)
-            .await
-    })
-    .await?;
-    Ok((content, permit))
+    match fetched {
+        Ok(AgeGateUpstreamRead::Document(body)) => {
+            let _permit = proxy_metadata_budget().reserve(body.len()).await;
+            read(&body)
+        }
+        Ok(AgeGateUpstreamRead::Missing) => UpstreamVersionEvidence::NotHosted,
+        Err(_) => UpstreamVersionEvidence::Unknown,
+    }
 }
 
 /// Fetch from upstream directly, preserving the upstream `Link` header.

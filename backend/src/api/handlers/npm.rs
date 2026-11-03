@@ -4475,13 +4475,6 @@ async fn npm_version_evidence(
         return UpstreamVersionEvidence::Unknown;
     };
     let encoded_name = encode_package_name_for_upstream(package_name);
-    let from_status = |resp: Response| {
-        if resp.status() == StatusCode::NOT_FOUND {
-            UpstreamVersionEvidence::NotHosted
-        } else {
-            UpstreamVersionEvidence::Unknown
-        }
-    };
     // Capped like every other buffered packument read (#2181): this runs on
     // the tarball download path, where an unbounded upstream metadata body
     // must not be able to balloon memory.
@@ -4503,24 +4496,22 @@ async fn npm_version_evidence(
     .await
     {
         Ok((content, _, _budget_permit)) => npm_packument_version_evidence(&content, version),
-        Err(resp) => from_status(resp),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => UpstreamVersionEvidence::NotHosted,
+        Err(_) => UpstreamVersionEvidence::Unknown,
     };
     if !confirm_miss || cached != UpstreamVersionEvidence::NotHosted {
         return cached;
     }
-    match proxy_helpers::proxy_fetch_uncached_metadata_budgeted(
+    proxy_helpers::age_gate_upstream_evidence(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &encoded_name,
         None,
+        |content| npm_packument_version_evidence(content, version),
     )
     .await
-    {
-        Ok((content, _budget_permit)) => npm_packument_version_evidence(&content, version),
-        Err(resp) => from_status(resp),
-    }
 }
 
 async fn apply_npm_download_age_gate(
@@ -21122,6 +21113,37 @@ mod age_gate_member_miss_5150_tests {
         rig.teardown().await;
 
         assert_451(status, &body, Some(0));
+    }
+
+    /// Confirming a miss costs one upstream read per project within the window,
+    /// however many requests ask, on top of the ordinary packument read.
+    #[tokio::test]
+    async fn repeated_misses_share_one_confirming_read_5150() {
+        let other = MockServer::start().await;
+        mount_packument(&other, packument("9.9.9", Some(OLD))).await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&other, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+        // The ordinary cached read, so everything after it counts confirmations.
+        let (first, _) = rig.download().await;
+        let baseline = other.received_requests().await.unwrap_or_default().len();
+
+        let results = futures::future::join_all((0..4).map(|_| rig.download())).await;
+        let after = other.received_requests().await.unwrap_or_default().len();
+        rig.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert!(results.iter().all(|(s, _)| *s == StatusCode::OK));
+        assert_eq!(
+            after, baseline,
+            "served from the window: {baseline} -> {after}"
+        );
     }
 
     /// A direct Remote has no sibling to defer to: its answer is unchanged.
