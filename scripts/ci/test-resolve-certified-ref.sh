@@ -3,7 +3,8 @@
 # Self-test for scripts/ci/resolve-certified-ref.sh and for the parts of
 # .github/workflows/release-candidate.yml that CI must pin: the dispatch-ref
 # guard, the audit that no code from the certified commit runs, and the
-# certification predicate (extracted and EXECUTED).
+# certification predicate (extracted and EXECUTED). Also the audit that
+# release-cli-caches.yml cannot be pointed at a chosen commit.
 #
 # WHY THIS EXISTS
 #   The resolver decides WHICH COMMITS main's Release Candidate may certify.
@@ -494,6 +495,47 @@ else
     fi
   fi
 fi
+
+# ── release-cli-caches.yml builds main's tip, and nobody can choose otherwise ──
+# It writes main-scoped caches that release.yml restores into the binaries it
+# signs, and a cargo build executes the checked-out tree. A way to name the
+# commit, even a validated one, brings cache poisoning back (#4927). Absent on
+# a release line that predates the file, which is safe: nothing runs.
+CACHE_WORKFLOW="${HERE}/../../.github/workflows/release-cli-caches.yml"
+audit_cache_warm() { # <workflow>; prints what lets someone pick the code
+  grep -vE '^[[:space:]]*#' "$1" | grep -nE \
+    '^[[:space:]]*(ref|repository|inputs):|\bgit[[:space:]].*(fetch|checkout|switch|restore|archive|worktree|read-tree|pull|clone)|\bgh[[:space:]]+(repo|pr)[[:space:]]+|tarball|zipball' \
+    || true
+}
+echo "release-cli-caches.yml builds only the dispatched ref"
+if [ -f "$CACHE_WORKFLOW" ]; then
+  problems="$(audit_cache_warm "$CACHE_WORKFLOW")"
+  if [ -z "$problems" ]; then
+    pass "no input, ref or git command can put another commit's tree on disk"
+  else
+    fail "release-cli-caches.yml can build a commit its dispatcher chooses:"
+    printf '%s\n' "$problems" | sed 's/^/          /'
+  fi
+fi
+for bad in \
+  '      - uses: actions/checkout@abc
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}' \
+  'on:
+  workflow_dispatch:
+    inputs:
+      sha:' \
+  '      - run: git fetch origin "$SHA" && git checkout --force "$SHA"' \
+  '      - run: gh api "repos/$GITHUB_REPOSITORY/tarball/$SHA" | tar xz'
+do
+  f="$WORK/cache-warm.yml"
+  printf '%s\n' "$bad" > "$f"
+  if [ -n "$(audit_cache_warm "$f")" ]; then
+    pass "the audit catches: ${bad##*$'\n'}"
+  else
+    fail "the audit MISSES: ${bad##*$'\n'}"
+  fi
+done
 
 if [ "$fails" -eq 0 ]; then echo "all resolve-certified-ref.sh cases passed"; exit 0; fi
 echo "${fails} resolve-certified-ref.sh case(s) FAILED"; exit 1

@@ -389,7 +389,6 @@ impl NpmReplicationFeedAdapter {
         // redirect policy every outbound client in the app uses.
         let http = crate::services::http_client::base_client_builder()
             .timeout(NPM_FEED_HTTP_TIMEOUT)
-            .user_agent(concat!("artifact-keeper/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| AppError::Config(format!("building npm feed HTTP client: {e}")))?;
         Ok(Self {
