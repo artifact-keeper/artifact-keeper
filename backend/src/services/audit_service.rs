@@ -268,6 +268,9 @@ pub enum AuditAction {
     /// A promotion copied an acknowledgement into the target repository. The
     /// actor is the promoter; the decision stays that of its original author.
     FindingAcknowledgementCarried,
+    /// A promotion left an acknowledgement behind, because the promoter could not
+    /// acknowledge in the target. The finding is open there.
+    FindingAcknowledgementNotCarried,
     /// An acknowledgement reached its expiry and stopped applying.
     FindingAcknowledgementExpired,
 }
@@ -341,6 +344,7 @@ impl AuditAction {
             AuditAction::FindingAcknowledged => "FINDING_ACKNOWLEDGED",
             AuditAction::FindingAcknowledgementRevoked => "FINDING_ACKNOWLEDGEMENT_REVOKED",
             AuditAction::FindingAcknowledgementCarried => "FINDING_ACKNOWLEDGEMENT_CARRIED",
+            AuditAction::FindingAcknowledgementNotCarried => "FINDING_ACKNOWLEDGEMENT_NOT_CARRIED",
             AuditAction::FindingAcknowledgementExpired => "FINDING_ACKNOWLEDGEMENT_EXPIRED",
             AuditAction::QuarantineReleased => "QUARANTINE_RELEASED",
             AuditAction::QuarantineRejected => "QUARANTINE_REJECTED",
@@ -2040,6 +2044,11 @@ mod tests {
             (
                 AuditAction::FindingAcknowledgementCarried,
                 "FINDING_ACKNOWLEDGEMENT_CARRIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementNotCarried,
+                "FINDING_ACKNOWLEDGEMENT_NOT_CARRIED",
                 Outcome::Success,
             ),
             (

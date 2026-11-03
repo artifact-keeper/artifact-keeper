@@ -22,8 +22,8 @@ use crate::models::security::ScanResult;
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::finding_acknowledgements::{
-    AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope, FindingAcknowledgement,
-    FindingAcknowledgementService,
+    severity_for_rank, AckActor, AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope,
+    FindingAcknowledgement, FindingAcknowledgementService,
 };
 use crate::services::policy_service::PolicyService;
 use crate::services::proxy_catalog;
@@ -468,8 +468,10 @@ impl ScanResponse {
         // second artifact must resolve to the same scan_id as the first. The
         // row's own (placeholder) id is internal bookkeeping; clients that need
         // the findings hit `GET /security/scans/{id}` which works against the
-        // source id because the findings live there. `source_scan_id` is still
-        // exposed verbatim below for provenance.
+        // source id because the findings live there too. A caller acting on what
+        // they read has to say which repository they mean: see
+        // `AcknowledgeRequest::repository_id` and `ListFindingsQuery::artifact_id`
+        // (#5153). `source_scan_id` is still exposed verbatim below for provenance.
         let reported_id = match (s.is_reused, s.source_scan_id) {
             (true, Some(source_id)) => source_id,
             _ => s.id,
@@ -715,6 +717,10 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ListFindingsQuery {
+    /// The artifact whose copy of this scan to list. A scan listing reports a
+    /// reused row under its source's id, so this names which copy is meant, and
+    /// the rows returned are that artifact's, in that artifact's repository.
+    pub artifact_id: Option<Uuid>,
     /// Restrict the listing to one severity (#3410).
     ///
     /// Validated against [`KNOWN_SEVERITIES`]; an unrecognized token is a
@@ -810,6 +816,20 @@ pub struct AcknowledgeRequest {
     /// that holds them or later receives them.
     #[serde(default)]
     pub scope: AcknowledgementScopeParam,
+    /// The repository this decision applies in. It must hold these bytes.
+    /// Omitted: the finding's own repository, unless the finding's scan has copies
+    /// in other repositories, which answers 409 and asks for this field: a scan
+    /// listing reports a copy under its source's id, so the finding may not belong
+    /// to the repository the caller is looking at.
+    #[serde(default)]
+    pub repository_id: Option<Uuid>,
+}
+
+/// Which repository's decision a revoke by finding is about.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct RevokeAcknowledgementQuery {
+    /// As `repository_id` on the acknowledge request.
+    pub repository_id: Option<Uuid>,
 }
 
 /// Where an acknowledgement applies (#5153).
@@ -825,6 +845,7 @@ impl From<&AcknowledgeRequest> for AcknowledgeOptions {
     fn from(body: &AcknowledgeRequest) -> Self {
         Self {
             expires_at: body.expires_at,
+            repository_id: body.repository_id,
             scope: match body.scope {
                 AcknowledgementScopeParam::Repository => AcknowledgementScope::Repository,
                 AcknowledgementScopeParam::AllRepositories => AcknowledgementScope::AllRepositories,
@@ -891,17 +912,6 @@ impl From<FindingAcknowledgement> for AcknowledgementResponse {
             revoked_reason: d.revoked_reason,
             state: d.state,
         }
-    }
-}
-
-/// The severity name of a `finding_severity_rank` (migration 312).
-fn severity_for_rank(rank: i16) -> &'static str {
-    match rank {
-        4 => "critical",
-        3 => "high",
-        2 => "medium",
-        1 => "low",
-        _ => "info",
     }
 }
 
@@ -1614,13 +1624,8 @@ async fn get_scan(
     let svc = ScanResultService::new(state.db.clone());
     let s = svc.get_scan(id).await?;
 
-    // Cross-repo authorization (#2439): resolve the scan's owning artifact,
-    // then apply the canonical visibility gate (existence-hiding 404) before
-    // returning any scan detail. Normalize the no-access 404 body to the same
-    // message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db, "read")
-        .await
-        .map_err(unify_scan_not_found)?;
+    // Cross-repo authorization (#2439): see `scan_visible_to`.
+    let s = scan_visible_to(&state.db, &auth, s, None).await?;
 
     let mut items = enrich_scans(&state.db, vec![s]).await?;
     Ok(Json(items.remove(0)))
@@ -1629,6 +1634,47 @@ async fn get_scan(
 // ---------------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------------
+
+/// The row of `scan` this caller may read: the canonical visibility gate
+/// (existence-hiding 404) on the scan's owning artifact, unless `artifact_id` names
+/// another artifact's copy of it.
+///
+/// `ScanResponse.id` reports a reused row under its source's id (#1373), so a caller
+/// who can see only the copy is handed an id whose owner they cannot see. That
+/// caller gets their copy (#5153). The no-access 404 body is normalized to the one
+/// an absent id produces, so this is not an existence oracle.
+async fn scan_visible_to(
+    db: &PgPool,
+    auth: &AuthExtension,
+    scan: ScanResult,
+    artifact_id: Option<Uuid>,
+) -> Result<ScanResult> {
+    let caller = Some(auth.clone());
+    let svc = ScanResultService::new(db.clone());
+    if let Some(artifact_id) = artifact_id {
+        let row = svc
+            .scan_for_artifact(scan.id, artifact_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(SCAN_NOT_FOUND_MSG.to_string()))?;
+        check_artifact_visibility(&caller, row.artifact_id, db, "read")
+            .await
+            .map_err(unify_scan_not_found)?;
+        return Ok(row);
+    }
+    let refusal = match check_artifact_visibility(&caller, scan.artifact_id, db, "read").await {
+        Ok(_) => return Ok(scan),
+        Err(refusal) => refusal,
+    };
+    for copy in svc.copies_of_scan(scan.id).await? {
+        if check_artifact_visibility(&caller, copy.artifact_id, db, "read")
+            .await
+            .is_ok()
+        {
+            return Ok(copy);
+        }
+    }
+    Err(unify_scan_not_found(refusal))
+}
 
 #[utoipa::path(
     get,
@@ -1660,13 +1706,8 @@ async fn list_findings(
     // scan with zero findings" without this pre-check.
     let scan = svc.get_scan(scan_id).await?;
 
-    // Cross-repo authorization (#2439): resolve the scan's owning artifact and
-    // apply the canonical visibility gate (existence-hiding 404) before
-    // returning any CVE finding for it. Normalize the no-access 404 body to the
-    // same message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db, "read")
-        .await
-        .map_err(unify_scan_not_found)?;
+    // Cross-repo authorization (#2439): see `scan_visible_to`.
+    let scan = scan_visible_to(&state.db, &auth, scan, query.artifact_id).await?;
 
     let filters = query.validated_filters()?;
     let page = query.page.unwrap_or(1);
@@ -1674,7 +1715,7 @@ async fn list_findings(
     let offset = (page - 1) * per_page;
 
     let (findings, total) = svc
-        .list_findings(scan_id, &filters, offset, per_page)
+        .list_findings(scan.id, &filters, offset, per_page)
         .await?;
 
     let items: Vec<FindingResponse> = findings.into_iter().map(FindingResponse::from).collect();
@@ -2083,6 +2124,7 @@ async fn ingest_external_findings(
     responses(
         (status = 200, description = "Finding acknowledged. The decision covers this advisory, component and version on these bytes, in every scan, until it is revoked or expires. A scan-policy hold with no other open finding is released.", body = FindingResponse),
         (status = 400, description = "expires_at is not in the future", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "The finding's scan has copies in other repositories and repository_id was not given", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
@@ -2099,16 +2141,11 @@ async fn acknowledge_finding(
     // counts. No per-user repo-membership model exists; admin gate
     // matches the dashboard gate in #1034. See #1032.
     auth.require_admin()?;
-    // A credential scoped to some repositories cannot decide for all of them.
-    if body.scope == AcknowledgementScopeParam::AllRepositories {
-        require_unrestricted_credential(&auth, "acknowledge a finding for every repository")?;
-    }
-
     let svc = ScanResultService::new(state.db.clone());
-    let user_id = auth.user_id;
+    let actor = AckActor::new(auth.user_id, auth.access_scope());
 
     let f = svc
-        .acknowledge_finding(finding_id, user_id, &body.reason, (&body).into())
+        .acknowledge_finding(finding_id, &actor, &body.reason, (&body).into())
         .await?;
 
     Ok(Json(FindingResponse::from(f)))
@@ -2120,7 +2157,8 @@ async fn acknowledge_finding(
     context_path = "/api/v1/security",
     tag = "security",
     params(
-        ("id" = Uuid, Path, description = "Finding ID")
+        ("id" = Uuid, Path, description = "Finding ID"),
+        RevokeAcknowledgementQuery,
     ),
     responses(
         (status = 200, description = "The decisions covering this finding are revoked, with the copies promotion made of them", body = FindingResponse),
@@ -2133,6 +2171,7 @@ async fn revoke_acknowledgment(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(finding_id): Path<Uuid>,
+    Query(query): Query<RevokeAcknowledgementQuery>,
 ) -> Result<Json<FindingResponse>> {
     // Symmetric gate with acknowledge_finding (#1032): both write to the
     // same row. Allowing un-privileged un-acknowledge would let an attacker
@@ -2141,23 +2180,12 @@ async fn revoke_acknowledgment(
     auth.require_admin()?;
 
     let svc = ScanResultService::new(state.db.clone());
-    let f = svc.revoke_acknowledgment(finding_id, auth.user_id).await?;
+    let actor = AckActor::new(auth.user_id, auth.access_scope());
+    let f = svc
+        .revoke_acknowledgment(finding_id, query.repository_id, &actor)
+        .await?;
 
     Ok(Json(FindingResponse::from(f)))
-}
-
-/// A decision can reach repositories a repository-scoped credential does not
-/// cover, so such a credential cannot make or undo one on that footing.
-fn require_unrestricted_credential(auth: &AuthExtension, action: &str) -> Result<()> {
-    if matches!(
-        auth.allowed_repo_ids,
-        crate::models::access_scope::AccessScope::Restricted(_)
-    ) {
-        return Err(AppError::Authorization(format!(
-            "Repository-scoped tokens cannot {action}"
-        )));
-    }
-    Ok(())
 }
 
 #[utoipa::path(
@@ -2178,6 +2206,10 @@ async fn list_acknowledgements(
     Query(query): Query<ListAcknowledgementsQuery>,
 ) -> Result<Json<AcknowledgementListResponse>> {
     auth.require_unscoped_admin("the acknowledgement list")?;
+    // Every repository's decisions: for a caller who may act everywhere.
+    FindingAcknowledgementService::new(state.db.clone())
+        .authorize_every_repository(&AckActor::new(auth.user_id, auth.access_scope()))
+        .await?;
     let page = i64::from(query.page.unwrap_or(1).max(1));
     let per_page = i64::from(query.per_page.unwrap_or(50).clamp(1, 200));
     let (rows, total) = FindingAcknowledgementService::new(state.db.clone())
@@ -2219,9 +2251,8 @@ async fn revoke_acknowledgement_by_id(
     Path(id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode> {
     auth.require_admin()?;
-    require_unrestricted_credential(&auth, "revoke an acknowledgement by id")?;
     FindingAcknowledgementService::new(state.db.clone())
-        .revoke(id, Some(auth.user_id))
+        .revoke(id, &AckActor::new(auth.user_id, auth.access_scope()))
         .await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -9026,6 +9057,15 @@ mod tests {
         .await
         .expect("finding");
 
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, fx.user_id).await;
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id) \
+             SELECT $1, r.id FROM roles r WHERE r.name = 'admin'",
+        )
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("global admin role");
         let mut admin = tdh::make_auth(fx.user_id, &fx.username);
         admin.is_admin = true;
         let plain = tdh::make_auth(fx.user_id, &fx.username);
@@ -9034,6 +9074,7 @@ mod tests {
             reason: "accepted".to_string(),
             expires_at: Some(expires_at),
             scope: AcknowledgementScopeParam::Repository,
+            repository_id: None,
         };
 
         assert!(matches!(
@@ -9070,7 +9111,7 @@ mod tests {
         };
         let mut scoped = admin.clone();
         scoped.allowed_repo_ids =
-            crate::models::access_scope::AccessScope::Restricted(vec![fx.repo_id]);
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
         assert!(matches!(
             acknowledge_finding(
                 State(fx.state.clone()),
@@ -9137,11 +9178,266 @@ mod tests {
             State(fx.state.clone()),
             Extension(admin.clone()),
             Path(finding_id),
+            Query(RevokeAcknowledgementQuery::default()),
         )
         .await
         .expect("idempotent revoke");
         assert!(!row.is_acknowledged);
         fx.teardown().await;
+    }
+
+    /// One request through the real router, as `auth`. Status and JSON body.
+    async fn security_call(
+        state: &SharedState,
+        auth: &AuthExtension,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let app = crate::api::handlers::test_db_helpers::router_with_auth_ext(
+            router(),
+            state.clone(),
+            auth.clone(),
+        );
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, request).await;
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// #5153: the scan listing reports a copy under its source's id, so a caller
+    /// looking at `dev` is shown `prod`'s rows. Acting on one must not decide for
+    /// `prod`, open its gate and release its hold while `dev` stays blocked.
+    #[tokio::test]
+    async fn test_acknowledging_through_a_copys_view_decides_for_the_viewed_repository_5153() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (reader_id, reader_name) = tdh::create_user(&pool).await;
+        let (prod, _, prod_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (dev, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), prod_dir.to_str().unwrap());
+        let svc = ScanResultService::new(pool.clone());
+        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+        let mut artifacts = Vec::new();
+        for repo in [prod, dev] {
+            sqlx::query(
+                "UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1",
+            )
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("private");
+            sqlx::query(
+                "INSERT INTO scan_policies (name, repository_id, max_severity, is_enabled) \
+                 VALUES ($1, $2, 'high', true)",
+            )
+            .bind(format!("view-{repo}"))
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("policy");
+            tdh::grant_repo_access(&pool, repo, admin_id).await;
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                        content_type, storage_key) \
+                 VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(format!("view/{id}"))
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("artifact");
+            artifacts.push(id);
+        }
+        let (prod_artifact, dev_artifact) = (artifacts[0], artifacts[1]);
+        tdh::grant_repo_role(&pool, dev, reader_id, "reader").await;
+
+        let source = svc
+            .create_scan_result_with_checksum(prod_artifact, prod, "dependency", Some(&digest))
+            .await
+            .expect("scan");
+        let raw = crate::models::security::RawFinding {
+            severity: crate::models::security::Severity::High,
+            title: "t".to_string(),
+            description: None,
+            cve_id: Some("CVE-2031-5153".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        };
+        svc.create_findings(source.id, prod_artifact, &[raw])
+            .await
+            .expect("findings");
+        svc.complete_scan(
+            source.id,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            Some("t"),
+            chrono::Utc::now(),
+            "complete",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("complete");
+        svc.copy_scan_results(source.id, dev_artifact, dev, "dependency", &digest, None)
+            .await
+            .expect("copy");
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_source = 'scan_policy' \
+             WHERE id = $1",
+        )
+        .bind(prod_artifact)
+        .execute(&pool)
+        .await
+        .expect("hold");
+
+        let allowed = |artifact: Uuid, repo: Uuid| {
+            let pool = pool.clone();
+            async move {
+                PolicyService::new(pool)
+                    .evaluate_artifact(artifact, repo)
+                    .await
+                    .expect("evaluate")
+                    .allowed
+            }
+        };
+        let mut admin = tdh::make_auth(admin_id, &admin_name);
+        admin.is_admin = true;
+        let reader = tdh::make_auth(reader_id, &reader_name);
+        let scan_findings = format!("/scans/{}/findings", source.id);
+
+        // A viewer who can see only the copy gets the copy, under the id the
+        // listing gave them.
+        let (status, body) = security_call(
+            &state,
+            &reader,
+            "GET",
+            &format!("/scans/{}", source.id),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["artifact_id"], dev_artifact.to_string());
+        let (status, body) = security_call(&state, &reader, "GET", &scan_findings, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"][0]["artifact_id"], dev_artifact.to_string());
+
+        // An administrator who sees both can ask for the copy's rows.
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "GET",
+            &format!("{scan_findings}?artifact_id={dev_artifact}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"][0]["artifact_id"], dev_artifact.to_string());
+        let dev_finding: Uuid =
+            serde_json::from_value(body["items"][0]["id"].clone()).expect("copy's finding");
+
+        // The source's row is ambiguous without saying where the caller is.
+        let (_, body) = security_call(&state, &admin, "GET", &scan_findings, None).await;
+        assert_eq!(body["items"][0]["artifact_id"], prod_artifact.to_string());
+        let prod_finding: Uuid =
+            serde_json::from_value(body["items"][0]["id"].clone()).expect("source's finding");
+        let acknowledge = format!("/findings/{prod_finding}/acknowledge");
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "POST",
+            &acknowledge,
+            Some(serde_json::json!({ "reason": "accepted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!allowed(prod_artifact, prod).await);
+
+        // Naming the repository decides for that one, and only that one.
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "POST",
+            &acknowledge,
+            Some(serde_json::json!({ "reason": "accepted", "repository_id": dev })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(allowed(dev_artifact, dev).await, "dev is what was decided");
+        assert!(!allowed(prod_artifact, prod).await, "prod was not");
+        let (hold,): (Option<String>,) =
+            sqlx::query_as("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(prod_artifact)
+                .fetch_one(&pool)
+                .await
+                .expect("hold");
+        assert_eq!(hold.as_deref(), Some("quarantined"), "prod's hold stands");
+
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "DELETE",
+            &format!("{acknowledge}?repository_id={dev}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!allowed(dev_artifact, dev).await);
+
+        // A credential scoped to the copy acts on the copy's row, and cannot
+        // reach the source's.
+        let mut scoped = admin.clone();
+        scoped.allowed_repo_ids = AccessScope::Restricted(vec![dev]);
+        let (status, _) = security_call(
+            &state,
+            &scoped,
+            "POST",
+            &acknowledge,
+            Some(serde_json::json!({ "reason": "out of scope" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = security_call(
+            &state,
+            &scoped,
+            "POST",
+            &format!("/findings/{dev_finding}/acknowledge"),
+            Some(serde_json::json!({ "reason": "accepted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(allowed(dev_artifact, dev).await);
+        assert!(!allowed(prod_artifact, prod).await);
+
+        for repo in [prod, dev] {
+            tdh::cleanup_member_repo(&pool, repo, &std::env::temp_dir().join("none")).await;
+        }
     }
 
     #[test]

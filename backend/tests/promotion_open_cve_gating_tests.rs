@@ -20,7 +20,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use artifact_keeper_backend::models::sbom::PolicyAction;
-use artifact_keeper_backend::services::finding_acknowledgements::FindingAcknowledgementService;
+use artifact_keeper_backend::services::finding_acknowledgements::{
+    AckActor, FindingAcknowledgementService,
+};
 use artifact_keeper_backend::services::promotion_policy_service::PromotionPolicyService;
 use artifact_keeper_backend::services::sbom_service::SbomService;
 
@@ -118,7 +120,12 @@ async fn insert_scan_with_cve_at(
         .await
         .expect("find scan_finding");
         FindingAcknowledgementService::new(pool.clone())
-            .acknowledge_finding(finding_id, None, Some("accepted"), Default::default())
+            .acknowledge_finding(
+                finding_id,
+                &AckActor::system(),
+                Some("accepted"),
+                Default::default(),
+            )
             .await
             .expect("acknowledge");
     }

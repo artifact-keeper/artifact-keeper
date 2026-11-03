@@ -1189,6 +1189,7 @@ impl SbomService {
         reason: Option<&str>,
         scope: AccessScope,
     ) -> Result<CveHistoryEntry> {
+        let scope_for_decision = scope.clone();
         let curated = sqlx::query_as::<_, CveHistoryEntry>(
             r#"
             UPDATE cve_history SET
@@ -1216,7 +1217,14 @@ impl SbomService {
         // from `scan_findings` and resolve it back to (artifact_id, cve_id).
         if let Some((artifact_id, cve_id)) = self.resolve_synth_cve_id(id, scope).await? {
             return self
-                .update_cve_status_by_artifact_cve(artifact_id, &cve_id, status, user_id, reason)
+                .update_cve_status_by_artifact_cve(
+                    artifact_id,
+                    &cve_id,
+                    status,
+                    user_id,
+                    reason,
+                    scope_for_decision,
+                )
                 .await;
         }
 
@@ -1312,6 +1320,7 @@ impl SbomService {
         status: CveStatus,
         user_id: Option<Uuid>,
         reason: Option<&str>,
+        credential: AccessScope,
     ) -> Result<CveHistoryEntry> {
         // `scan_findings` only models a binary acknowledge state. `fixed`
         // has no representation; refuse rather than silently coerce.
@@ -1330,14 +1339,18 @@ impl SbomService {
             crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
                 self.db.clone(),
             );
+        let actor = crate::services::finding_acknowledgements::AckActor {
+            user_id,
+            credential,
+        };
         let found = if acknowledge {
             acknowledgements
-                .acknowledge_advisory(artifact_id, cve_id, user_id, reason, Default::default())
+                .acknowledge_advisory(artifact_id, cve_id, &actor, reason, Default::default())
                 .await?
                 > 0
         } else {
             acknowledgements
-                .revoke_advisory(artifact_id, cve_id, user_id)
+                .revoke_advisory(artifact_id, cve_id, &actor)
                 .await?
                 .is_some()
         };
@@ -4720,6 +4733,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("triaged: not exploitable"),
+                AccessScope::Admin,
             )
             .await
             .expect("acknowledge happy path");
@@ -4761,6 +4775,7 @@ mod tests {
                 CveStatus::FalsePositive,
                 None,
                 Some("false positive: code path not reachable"),
+                AccessScope::Admin,
             )
             .await
             .expect("false_positive happy path");
@@ -4794,7 +4809,12 @@ mod tests {
 
         // Pre-acknowledge so we can verify Open clears the state.
         crate::services::finding_acknowledgements::FindingAcknowledgementService::new(pool.clone())
-            .acknowledge_finding(finding_id, None, Some("pre-ack"), Default::default())
+            .acknowledge_finding(
+                finding_id,
+                &crate::services::finding_acknowledgements::AckActor::system(),
+                Some("pre-ack"),
+                Default::default(),
+            )
             .await
             .expect("pre-acknowledge");
 
@@ -4806,6 +4826,7 @@ mod tests {
                 CveStatus::Open,
                 None,
                 None,
+                AccessScope::Admin,
             )
             .await
             .expect("open happy path");
@@ -4846,6 +4867,7 @@ mod tests {
                 CveStatus::Fixed,
                 None,
                 None,
+                AccessScope::Admin,
             )
             .await
             .expect_err("fixed must be rejected");
@@ -4889,6 +4911,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("won't match"),
+                AccessScope::Admin,
             )
             .await
             .expect_err("no matching rows must 404");
@@ -4924,6 +4947,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("case-insensitive match"),
+                AccessScope::Admin,
             )
             .await
             .expect("case-insensitive match must succeed");
@@ -4961,6 +4985,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("ack both rows"),
+                AccessScope::Admin,
             )
             .await
             .expect("multi-row acknowledge");

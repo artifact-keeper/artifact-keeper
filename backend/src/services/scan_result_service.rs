@@ -711,12 +711,25 @@ macro_rules! reusable_scan_filters {
 
 /// [`ScanResultService::find_reusable_scan`]: the newest ORIGINAL scan
 /// (`source_scan_id IS NULL`, #4425). Served by `idx_scan_results_dedup_local`.
+/// `NOT is_reused` as well, because `source_scan_id` is cleared when the source is
+/// deleted (#5153) and a copy must not then pass as an original: its `completed_at`
+/// can be the time it was copied, which would restart the age limit.
 pub(crate) const FIND_REUSABLE_SCAN_SQL: &str = concat!(
     "SELECT ",
     scan_result_columns!(),
     " FROM scan_results WHERE ",
     reusable_scan_filters!(),
-    " AND source_scan_id IS NULL ORDER BY completed_at DESC LIMIT 1"
+    " AND source_scan_id IS NULL AND NOT is_reused ORDER BY completed_at DESC LIMIT 1"
+);
+
+/// Whether one row of an artifact's own scans is a complete verdict a dedup could
+/// reuse: the same filters, so a promotion cannot accept what a byte-identical
+/// upload would refuse. `partial` is excluded on top of them, because a promoted
+/// copy has no rescan coming and a partial verdict would read as a scanned artifact.
+pub(crate) const FIND_CARRYABLE_SCAN_SQL: &str = concat!(
+    "SELECT EXISTS (SELECT 1 FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND scan_completeness = 'complete' AND artifact_id = $6 AND id = $7)"
 );
 
 /// [`ScanResultService::find_own_reusable_scan`]: the same filters on one
@@ -1544,7 +1557,34 @@ impl ScanResultService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        let new_scan = Self::copy_scan_results_in_tx(
+            &mut tx,
+            source_scan_id,
+            artifact_id,
+            repository_id,
+            scan_type,
+            checksum_sha256,
+            pin_identity,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok(new_scan)
+    }
+
+    /// [`Self::copy_scan_results`] inside a caller's transaction, for a caller
+    /// copying several scans that must land together.
+    pub(crate) async fn copy_scan_results_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        source_scan_id: Uuid,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        checksum_sha256: &str,
+        pin_identity: Option<&str>,
+    ) -> Result<ScanResult> {
         let source = sqlx::query_as!(
             ScanResult,
             r#"
@@ -1559,7 +1599,7 @@ impl ScanResultService {
             "#,
             source_scan_id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
@@ -1620,7 +1660,7 @@ impl ScanResultService {
             source.vuln_db_version,
             source.vuln_db_published_at,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1642,15 +1682,47 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
         Ok(new_scan)
+    }
+
+    /// The reused rows pointing at `scan_id`, for a caller who can see a copy of
+    /// a scan and not its source: the scan listing reports a copy under its
+    /// source's id. Bounded: a caller who sees none of these gets a 404.
+    pub async fn copies_of_scan(&self, scan_id: Uuid) -> Result<Vec<ScanResult>> {
+        let sql = concat!(
+            "SELECT ",
+            scan_result_columns!(),
+            " FROM scan_results WHERE source_scan_id = $1 ORDER BY created_at LIMIT 200"
+        );
+        sqlx::query_as::<_, ScanResult>(sql)
+            .bind(scan_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// The one artifact's copy of `scan_id`, or `scan_id` itself if it is theirs.
+    pub async fn scan_for_artifact(
+        &self,
+        scan_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Option<ScanResult>> {
+        let sql = concat!(
+            "SELECT ",
+            scan_result_columns!(),
+            " FROM scan_results WHERE artifact_id = $2 AND (id = $1 OR source_scan_id = $1) \
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        sqlx::query_as::<_, ScanResult>(sql)
+            .bind(scan_id)
+            .bind(artifact_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Convert a pre-allocated `running` scan_result row into a reused row
@@ -2434,14 +2506,14 @@ impl ScanResultService {
     pub async fn acknowledge_finding(
         &self,
         finding_id: Uuid,
-        user_id: Uuid,
+        actor: &crate::services::finding_acknowledgements::AckActor,
         reason: &str,
         options: crate::services::finding_acknowledgements::AcknowledgeOptions,
     ) -> Result<ScanFinding> {
         crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
             self.db.clone(),
         )
-        .acknowledge_finding(finding_id, Some(user_id), Some(reason), options)
+        .acknowledge_finding(finding_id, actor, Some(reason), options)
         .await?;
         self.get_finding(finding_id).await
     }
@@ -2489,12 +2561,13 @@ impl ScanResultService {
     pub async fn revoke_acknowledgment(
         &self,
         finding_id: Uuid,
-        user_id: Uuid,
+        repository_id: Option<Uuid>,
+        actor: &crate::services::finding_acknowledgements::AckActor,
     ) -> Result<ScanFinding> {
         crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
             self.db.clone(),
         )
-        .revoke_finding(finding_id, Some(user_id))
+        .revoke_finding(finding_id, repository_id, actor)
         .await?;
         self.get_finding(finding_id).await
     }
@@ -4931,9 +5004,18 @@ mod tests {
             let admin = crate::api::handlers::test_db_helpers::create_user(&pool)
                 .await
                 .0;
-            svc.acknowledge_finding(finding_id, admin, "not reachable", Default::default())
-                .await
-                .expect("acknowledge");
+            crate::api::handlers::test_db_helpers::grant_repo_access(&pool, repo_id, admin).await;
+            svc.acknowledge_finding(
+                finding_id,
+                &crate::services::finding_acknowledgements::AckActor::new(
+                    admin,
+                    crate::models::access_scope::AccessScope::Admin,
+                ),
+                "not reachable",
+                Default::default(),
+            )
+            .await
+            .expect("acknowledge");
             assert_agree(
                 "after acknowledging CVE-2026-0002",
                 &views().await,

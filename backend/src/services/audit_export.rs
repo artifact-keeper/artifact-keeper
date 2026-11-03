@@ -164,6 +164,7 @@ impl AuditAction {
             | AuditAction::FindingAcknowledged
             | AuditAction::FindingAcknowledgementRevoked
             | AuditAction::FindingAcknowledgementCarried
+            | AuditAction::FindingAcknowledgementNotCarried
             | AuditAction::FindingAcknowledgementExpired
             | AuditAction::QuarantineRejected
             | AuditAction::PromotionApprovalGranted

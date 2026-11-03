@@ -573,18 +573,17 @@ impl PromotionRuleService {
     async fn get_latest_scan(&self, artifact_id: Uuid) -> Result<Option<ScanCountsRow>> {
         let row: Option<ScanCountsRow> = sqlx::query_as::<_, ScanCountsRow>(
             r#"
-            WITH latest_per_type AS (
-                SELECT DISTINCT ON (scan_type)
-                       critical_count, high_count, medium_count, low_count
+            WITH current_completed AS (
+                SELECT critical_count, high_count, medium_count, low_count
                 FROM scan_results
                 WHERE artifact_id = $1 AND status = 'completed'
-                ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
+                  AND id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
             )
             SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
                    COALESCE(MAX(high_count), 0)::int     AS high_count,
                    COALESCE(MAX(medium_count), 0)::int   AS medium_count,
                    COALESCE(MAX(low_count), 0)::int      AS low_count
-            FROM latest_per_type
+            FROM current_completed
             HAVING COUNT(*) > 0
             "#,
         )

@@ -173,8 +173,10 @@ struct ScanRow {
     findings_count: i32,
 }
 
-/// SQL for an artifact's severity counts, taken across the latest completed scan
-/// of EVERY scanner rather than the single most recently completed row.
+/// SQL for an artifact's severity counts, taken across the scans the download gate
+/// grades (`artifact_current_scan_ids`, #5153) rather than the single most recently
+/// completed row, so a later scan that could not assess the artifact does not clear
+/// a complete scan's verdict at this gate either.
 ///
 /// The old form was `ORDER BY created_at DESC LIMIT 1` over all completed rows
 /// regardless of `scan_type`, so whichever engine happened to finish last
@@ -192,19 +194,18 @@ struct ScanRow {
 /// signal: an aggregate with no `GROUP BY` would otherwise always return one
 /// all-zeros row, turning "never scanned" into "scanned and clean".
 const LATEST_SCAN_COUNTS_SQL: &str = r#"
-    WITH latest_per_type AS (
-        SELECT DISTINCT ON (scan_type)
-               critical_count, high_count, medium_count, low_count, findings_count
+    WITH current_completed AS (
+        SELECT critical_count, high_count, medium_count, low_count, findings_count
         FROM scan_results
         WHERE artifact_id = $1 AND status = 'completed'
-        ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
+          AND id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
     )
     SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
            COALESCE(MAX(high_count), 0)::int     AS high_count,
            COALESCE(MAX(medium_count), 0)::int   AS medium_count,
            COALESCE(MAX(low_count), 0)::int      AS low_count,
            COALESCE(MAX(findings_count), 0)::int AS findings_count
-    FROM latest_per_type
+    FROM current_completed
     HAVING COUNT(*) > 0
 "#;
 
@@ -215,21 +216,16 @@ const LATEST_SCAN_COUNTS_SQL: &str = r#"
 /// `cve_history` read was always empty, so a "block on open CVEs" gate silently
 /// passed (#1620; data source also addresses #1561).
 ///
-/// Scoped to the latest completed scan of EVERY scanner, for the same reason as
+/// Scoped to the scans the download gate grades, for the same reason as
 /// [`LATEST_SCAN_COUNTS_SQL`]: joining findings to one single latest row hid the
 /// open CVEs of every other engine. `SELECT DISTINCT` already collapses a CVE
 /// that several engines report, so widening the join cannot produce duplicates.
 const OPEN_CVES_SQL: &str = r#"
-    WITH latest_scans AS (
-        SELECT DISTINCT ON (scan_type) id
-        FROM scan_results
-        WHERE artifact_id = $1 AND status = 'completed'
-        ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
-    )
     SELECT DISTINCT sf.cve_id
     FROM scan_findings_effective sf
-    JOIN latest_scans ls ON sf.scan_result_id = ls.id
-    WHERE sf.cve_id IS NOT NULL
+    WHERE sf.artifact_id = $1
+      AND sf.scan_result_id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+      AND sf.cve_id IS NOT NULL
       AND NOT sf.is_acknowledged
 "#;
 
@@ -1037,7 +1033,7 @@ mod tests {
         assert!(OPEN_CVES_SQL.contains("FROM scan_findings_effective"));
         assert!(OPEN_CVES_SQL.contains("NOT sf.is_acknowledged"));
         assert!(OPEN_CVES_SQL.contains("sf.cve_id IS NOT NULL"));
-        assert!(OPEN_CVES_SQL.contains("status = 'completed'"));
+        assert!(OPEN_CVES_SQL.contains("artifact_current_scan_ids"));
         assert!(!OPEN_CVES_SQL.contains("cve_history"));
     }
 
@@ -1050,7 +1046,7 @@ mod tests {
         // completed after a critical-bearing one silently unblocked promotion.
         for sql in [LATEST_SCAN_COUNTS_SQL, OPEN_CVES_SQL] {
             assert!(
-                sql.contains("DISTINCT ON (scan_type)"),
+                sql.contains("artifact_current_scan_ids"),
                 "query must window per scanner, not take one global latest row"
             );
             assert!(

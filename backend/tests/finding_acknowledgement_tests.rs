@@ -18,13 +18,16 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use artifact_keeper_backend::error::AppError;
+use artifact_keeper_backend::models::access_scope::AccessScope;
 use artifact_keeper_backend::models::sbom::CveStatus;
 use artifact_keeper_backend::models::security::{FindingClass, RawFinding, ScanResult, Severity};
 use artifact_keeper_backend::services::finding_acknowledgements::{
-    AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope, FindingAcknowledgementService,
+    AckActor, AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope, CarryPrincipal,
+    FindingAcknowledgementService,
 };
 use artifact_keeper_backend::services::open_findings::{severity_counts, FindingScope};
 use artifact_keeper_backend::services::policy_service::PolicyService;
+use artifact_keeper_backend::services::promotion_policy_service::PromotionPolicyService;
 use artifact_keeper_backend::services::quarantine_service::enforce_download_gate;
 use artifact_keeper_backend::services::sbom_service::SbomService;
 use artifact_keeper_backend::services::scan_result_service::{
@@ -58,11 +61,30 @@ impl Fx {
         .execute(&pool)
         .await
         .expect("insert admin");
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id) \
+             SELECT $1, r.id FROM roles r WHERE r.name = 'admin'",
+        )
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .expect("grant the global admin role");
         Self {
             svc: ScanResultService::new(pool.clone()),
             pool,
             admin,
             repos: Vec::new(),
+        }
+    }
+
+    fn actor(&self) -> AckActor {
+        AckActor::new(self.admin, AccessScope::Admin)
+    }
+
+    fn admin_principal(&self) -> CarryPrincipal {
+        CarryPrincipal {
+            user_id: self.admin,
+            may_acknowledge: true,
         }
     }
 
@@ -185,7 +207,7 @@ impl Fx {
     async fn ack_scan(&self, scan: Uuid) {
         for id in self.finding_ids(scan).await {
             self.svc
-                .acknowledge_finding(id, self.admin, "accepted: SEC-421", Default::default())
+                .acknowledge_finding(id, &self.actor(), "accepted: SEC-421", Default::default())
                 .await
                 .expect("acknowledge");
         }
@@ -249,6 +271,11 @@ impl Fx {
             .execute(&self.pool)
             .await
             .expect("remove repositories");
+        sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(self.admin)
+            .execute(&self.pool)
+            .await
+            .expect("remove role");
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(self.admin)
             .execute(&self.pool)
@@ -470,7 +497,7 @@ async fn a_cross_repository_dedup_copy_is_covered_only_when_the_operator_said_so
     fx.svc
         .acknowledge_finding(
             id,
-            fx.admin,
+            &fx.actor(),
             "accepted everywhere: SEC-421",
             AcknowledgeOptions {
                 scope: AcknowledgementScope::AllRepositories,
@@ -484,7 +511,7 @@ async fn a_cross_repository_dedup_copy_is_covered_only_when_the_operator_said_so
 
     // And the widened decision is revoked as one thing.
     fx.svc
-        .revoke_acknowledgment(id, fx.admin)
+        .revoke_acknowledgment(id, None, &fx.actor())
         .await
         .expect("revoke");
     assert!(!fx.allowed(prod, in_prod).await);
@@ -522,7 +549,7 @@ async fn acknowledgement_survives_promotion_and_the_verdict_travels_with_it() {
         "before the carry the promoted row has no scan on record"
     );
     FindingAcknowledgementService::new(fx.pool.clone())
-        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .carry_to_promoted_artifact(original, promoted, fx.admin_principal())
         .await
         .expect("carry");
     assert!(
@@ -573,7 +600,7 @@ async fn the_source_of_a_carried_verdict_can_still_be_deleted() {
     fx.ack_scan(source).await;
     let promoted = fx.artifact(release, "a.tgz", &d).await;
     FindingAcknowledgementService::new(fx.pool.clone())
-        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .carry_to_promoted_artifact(original, promoted, fx.admin_principal())
         .await
         .expect("carry");
 
@@ -618,7 +645,7 @@ async fn promotion_does_not_invent_a_decision_for_an_open_finding() {
     .await;
     let promoted = fx.artifact(release, "a.tgz", &d).await;
     FindingAcknowledgementService::new(fx.pool.clone())
-        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .carry_to_promoted_artifact(original, promoted, fx.admin_principal())
         .await
         .expect("carry");
     assert!(
@@ -652,7 +679,7 @@ async fn revoke_applies_everywhere_the_decision_reached() {
         .expect("copy");
     let promoted = fx.artifact(target, "a.tgz", &d).await;
     FindingAcknowledgementService::new(fx.pool.clone())
-        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .carry_to_promoted_artifact(original, promoted, fx.admin_principal())
         .await
         .expect("carry");
     assert!(fx.allowed(repo, original).await);
@@ -663,7 +690,7 @@ async fn revoke_applies_everywhere_the_decision_reached() {
     let oldest = fx.finding_ids(first).await[0];
     let revoked = fx
         .svc
-        .revoke_acknowledgment(oldest, fx.admin)
+        .revoke_acknowledgment(oldest, None, &fx.actor())
         .await
         .expect("revoke");
     assert!(!revoked.is_acknowledged);
@@ -689,7 +716,18 @@ async fn revoke_applies_everywhere_the_decision_reached() {
 
     // A later acknowledgement in the source is a new decision. It does not bring
     // the revoked copy in the target back.
-    fx.ack_scan(rescan).await;
+    fx.svc
+        .acknowledge_finding(
+            fx.finding_ids(rescan).await[0],
+            &fx.actor(),
+            "accepted again",
+            AcknowledgeOptions {
+                repository_id: Some(repo),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledge again");
     assert!(fx.allowed(repo, original).await);
     assert!(
         !fx.allowed(target, promoted).await,
@@ -715,16 +753,28 @@ async fn re_acknowledging_keeps_the_reach_of_a_revoke() {
     fx.ack_scan(scan).await;
     let promoted = fx.artifact(target, "a.tgz", &d).await;
     FindingAcknowledgementService::new(fx.pool.clone())
-        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .carry_to_promoted_artifact(original, promoted, fx.admin_principal())
         .await
         .expect("carry");
-    fx.ack_scan(scan).await;
+    let id = fx.finding_ids(scan).await[0];
+    fx.svc
+        .acknowledge_finding(
+            id,
+            &fx.actor(),
+            "accepted again",
+            AcknowledgeOptions {
+                repository_id: Some(repo),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledge again");
     assert!(fx.allowed(repo, original).await);
     assert!(fx.allowed(target, promoted).await);
 
     let id = fx.finding_ids(scan).await[0];
     fx.svc
-        .revoke_acknowledgment(id, fx.admin)
+        .revoke_acknowledgment(id, None, &fx.actor())
         .await
         .expect("revoke");
     assert!(!fx.allowed(repo, original).await);
@@ -744,11 +794,14 @@ async fn revoking_a_finding_with_no_decision_changes_nothing_and_succeeds() {
     let id = fx.finding_ids(scan).await[0];
     let f = fx
         .svc
-        .revoke_acknowledgment(id, fx.admin)
+        .revoke_acknowledgment(id, None, &fx.actor())
         .await
         .expect("idempotent revoke");
     assert!(!f.is_acknowledged);
-    let missing = fx.svc.revoke_acknowledgment(Uuid::new_v4(), fx.admin).await;
+    let missing = fx
+        .svc
+        .revoke_acknowledgment(Uuid::new_v4(), None, &fx.actor())
+        .await;
     assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
     fx.cleanup().await;
 }
@@ -781,9 +834,7 @@ async fn decisions_are_listed_and_revoked_by_id() {
     assert_eq!(rows[0].max_severity_rank, 3);
 
     assert_eq!(
-        svc.revoke(rows[0].id, Some(fx.admin))
-            .await
-            .expect("revoke"),
+        svc.revoke(rows[0].id, &fx.actor()).await.expect("revoke"),
         1
     );
     assert!(!fx.allowed(repo, artifact).await);
@@ -804,7 +855,7 @@ async fn decisions_are_listed_and_revoked_by_id() {
     assert_eq!(all[0].revoked_by, Some(fx.admin));
     assert_eq!(all[0].revoked_reason.as_deref(), Some("revoked"));
 
-    let missing = svc.revoke(Uuid::new_v4(), Some(fx.admin)).await;
+    let missing = svc.revoke(Uuid::new_v4(), &fx.actor()).await;
     assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
     fx.cleanup().await;
 }
@@ -828,7 +879,7 @@ async fn an_expired_acknowledgement_stops_covering_without_any_sweep() {
         .svc
         .acknowledge_finding(
             id,
-            fx.admin,
+            &fx.actor(),
             "until the upgrade",
             AcknowledgeOptions {
                 expires_at: Some(expires_at),
@@ -884,7 +935,7 @@ async fn an_expiry_in_the_past_is_refused() {
         .svc
         .acknowledge_finding(
             id,
-            fx.admin,
+            &fx.actor(),
             "already over",
             AcknowledgeOptions {
                 expires_at: Some(Utc::now() - Duration::hours(1)),
@@ -1046,6 +1097,7 @@ async fn the_security_tab_path_records_the_same_decision() {
         CveStatus::Acknowledged,
         Some(fx.admin),
         Some("not reachable"),
+        AccessScope::Admin,
     )
     .await
     .expect("acknowledge");
@@ -1062,9 +1114,16 @@ async fn the_security_tab_path_records_the_same_decision() {
     .expect("effective rows");
     assert_eq!(ack_rows, 2);
 
-    sbom.update_cve_status_by_artifact_cve(artifact, CVE_A, CveStatus::Open, Some(fx.admin), None)
-        .await
-        .expect("revoke");
+    sbom.update_cve_status_by_artifact_cve(
+        artifact,
+        CVE_A,
+        CveStatus::Open,
+        Some(fx.admin),
+        None,
+        AccessScope::Admin,
+    )
+    .await
+    .expect("revoke");
     assert_eq!(fx.open_count(artifact).await, 2);
 
     let unknown = sbom
@@ -1074,6 +1133,7 @@ async fn the_security_tab_path_records_the_same_decision() {
             CveStatus::Acknowledged,
             Some(fx.admin),
             None,
+            AccessScope::Admin,
         )
         .await;
     assert!(matches!(unknown, Err(AppError::NotFound(_))), "{unknown:?}");
@@ -1093,12 +1153,12 @@ async fn acknowledge_revoke_and_lapse_are_audited() {
     let needle = cve.to_uppercase();
     let id = fx.finding_ids(scan).await[0];
     fx.svc
-        .acknowledge_finding(id, fx.admin, "accepted", Default::default())
+        .acknowledge_finding(id, &fx.actor(), "accepted", Default::default())
         .await
         .expect("ack");
     assert_eq!(fx.audit_count("FINDING_ACKNOWLEDGED", &needle).await, 1);
     fx.svc
-        .revoke_acknowledgment(id, fx.admin)
+        .revoke_acknowledgment(id, None, &fx.actor())
         .await
         .expect("revoke");
     assert_eq!(
@@ -1109,7 +1169,7 @@ async fn acknowledge_revoke_and_lapse_are_audited() {
     fx.svc
         .acknowledge_finding(
             id,
-            fx.admin,
+            &fx.actor(),
             "short",
             AcknowledgeOptions {
                 expires_at: Some(Utc::now() + Duration::milliseconds(300)),
@@ -1172,7 +1232,7 @@ async fn acknowledging_the_last_finding_releases_a_scan_policy_hold() {
     let ids = fx.finding_ids(scan).await;
 
     fx.svc
-        .acknowledge_finding(ids[0], fx.admin, "accepted", Default::default())
+        .acknowledge_finding(ids[0], &fx.actor(), "accepted", Default::default())
         .await
         .expect("first");
     assert_eq!(
@@ -1183,7 +1243,7 @@ async fn acknowledging_the_last_finding_releases_a_scan_policy_hold() {
     assert!(enforce_download_gate(&fx.pool, artifact).await.is_err());
 
     fx.svc
-        .acknowledge_finding(ids[1], fx.admin, "accepted", Default::default())
+        .acknowledge_finding(ids[1], &fx.actor(), "accepted", Default::default())
         .await
         .expect("second");
     assert_eq!(
@@ -1211,7 +1271,7 @@ async fn acknowledging_the_last_finding_releases_a_scan_policy_hold() {
 
     // A revoke reopens the block through the live policy half of the gate.
     fx.svc
-        .revoke_acknowledgment(ids[1], fx.admin)
+        .revoke_acknowledgment(ids[1], None, &fx.actor())
         .await
         .expect("revoke");
     assert!(matches!(
@@ -1252,7 +1312,8 @@ async fn acknowledging_never_releases_a_hold_that_is_not_a_scan_policy_hold() {
 // Migration
 // ---------------------------------------------------------------------------
 
-fn migration_backfill_sql() -> String {
+/// The migration whose file name ends in `suffix`, whatever its number.
+fn migration_file(suffix: &str) -> String {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let file = std::fs::read_dir(&dir)
         .expect("migrations dir")
@@ -1261,10 +1322,14 @@ fn migration_backfill_sql() -> String {
         .find(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with("_finding_acknowledgements.sql"))
+                .is_some_and(|n| n.ends_with(suffix))
         })
-        .expect("the #5153 migration exists");
-    let sql = std::fs::read_to_string(file).expect("read migration");
+        .unwrap_or_else(|| panic!("no migration ending in {suffix}"));
+    std::fs::read_to_string(file).expect("read migration")
+}
+
+fn migration_backfill_sql() -> String {
+    let sql = migration_file("_finding_acknowledgements_backfill.sql");
     let start = sql
         .find("-- BEGIN backfill")
         .expect("backfill start marker");
@@ -1396,10 +1461,635 @@ async fn the_migration_carries_current_acknowledgements_and_nothing_else() {
     // The frozen flags no longer speak: a revoke leaves the legacy column as
     // it was and the finding is open anyway.
     fx.svc
-        .revoke_acknowledgment(fx.finding_ids(s1).await[0], fx.admin)
+        .revoke_acknowledgment(fx.finding_ids(s1).await[0], None, &fx.actor())
         .await
         .expect("revoke");
     assert!(!fx.allowed(repo, a1).await);
 
     fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Promotion must never serve what the source's gate would block
+// ---------------------------------------------------------------------------
+
+/// A source and target with the same strict policy, and a promoted copy row.
+async fn promotion_rig(fx: &mut Fx) -> (Uuid, Uuid, Uuid, Uuid, String) {
+    let source_repo = fx.repo().await;
+    let target_repo = fx.repo().await;
+    sqlx::query(
+        "UPDATE scan_policies SET block_unscanned = true, block_on_fail = true \
+         WHERE repository_id = ANY($1)",
+    )
+    .bind(vec![source_repo, target_repo])
+    .execute(&fx.pool)
+    .await
+    .expect("strict policies");
+    let d = digest();
+    let source = fx.artifact(source_repo, "a.tgz", &d).await;
+    let target = fx.artifact(target_repo, "a.tgz", &d).await;
+    (source_repo, target_repo, source, target, d)
+}
+
+async fn carry(fx: &Fx, source: Uuid, target: Uuid) -> artifact_keeper_backend::error::Result<()> {
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(source, target, fx.admin_principal())
+        .await
+}
+
+async fn scans_on(fx: &Fx, artifact: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1")
+        .bind(artifact)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("scan count")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceState {
+    NotCatalogedRescan,
+    PartialRescan,
+    FailedRescanBesideCleanScanner,
+    RunningRescanWithFindings,
+    CrashedRescanWithFindings,
+}
+
+/// Findings of a complete scan, then a later row that must not hide them.
+async fn build_source_state(fx: &Fx, repo: Uuid, artifact: Uuid, state: SourceState) {
+    let high = [finding(CVE_A, LODASH, "1")];
+    match state {
+        SourceState::NotCatalogedRescan | SourceState::PartialRescan => {
+            fx.scan(repo, artifact, "dependency", &high).await;
+            let blind = fx.unfinished_scan(repo, artifact).await;
+            let completeness = match state {
+                SourceState::PartialRescan => "partial",
+                _ => "not_cataloged",
+            };
+            fx.complete(blind.id, 0, completeness).await;
+        }
+        SourceState::FailedRescanBesideCleanScanner => {
+            fx.scan(repo, artifact, "dependency", &[]).await;
+            fx.scan(repo, artifact, "image", &[]).await;
+            let failed = fx.unfinished_scan(repo, artifact).await;
+            fx.svc
+                .fail_scan(failed.id, "scanner crashed", None, Utc::now())
+                .await
+                .expect("fail");
+        }
+        SourceState::RunningRescanWithFindings | SourceState::CrashedRescanWithFindings => {
+            fx.scan(repo, artifact, "dependency", &[]).await;
+            let late = fx.unfinished_scan(repo, artifact).await;
+            fx.svc
+                .create_findings(late.id, artifact, &high)
+                .await
+                .expect("findings");
+            if matches!(state, SourceState::CrashedRescanWithFindings) {
+                fx.svc
+                    .fail_scan(late.id, "crashed", None, Utc::now())
+                    .await
+                    .expect("fail");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_target_never_serves_what_the_sources_gate_would_block() {
+    for state in [
+        SourceState::NotCatalogedRescan,
+        SourceState::PartialRescan,
+        SourceState::FailedRescanBesideCleanScanner,
+        SourceState::RunningRescanWithFindings,
+        SourceState::CrashedRescanWithFindings,
+    ] {
+        let mut fx = Fx::new().await;
+        let (source_repo, target_repo, source, target, _) = promotion_rig(&mut fx).await;
+        build_source_state(&fx, source_repo, source, state).await;
+        assert!(
+            !fx.allowed(source_repo, source).await,
+            "{state:?}: the source must be blocked for this to prove anything"
+        );
+
+        carry(&fx, source, target).await.expect("carry");
+
+        assert!(
+            !fx.allowed(target_repo, target).await,
+            "{state:?}: the target served what the source's gate blocks"
+        );
+        fx.cleanup().await;
+    }
+}
+
+/// All or nothing: a failure on the second scan type leaves nothing from the
+/// first, because a partial carry reads as a clean scanned artifact.
+#[tokio::test]
+#[ignore]
+async fn a_failed_carry_leaves_nothing_behind() {
+    let mut fx = Fx::new().await;
+    let (source_repo, target_repo, source, target, _) = promotion_rig(&mut fx).await;
+    fx.scan(source_repo, source, "dependency", &[]).await;
+    let bad = finding("CVE-2031-0001", "boom-5153", "1");
+    let image = fx.scan(source_repo, source, "image", &[bad]).await;
+    fx.ack_scan(image).await;
+    assert!(fx.allowed(source_repo, source).await);
+
+    let trigger = format!("fail_5153_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS \
+           $f$ BEGIN RAISE EXCEPTION 'injected'; END $f$; \
+         CREATE TRIGGER {trigger} BEFORE INSERT ON scan_findings FOR EACH ROW \
+           WHEN (NEW.affected_component = 'boom-5153' AND NEW.artifact_id = '{target}') \
+           EXECUTE FUNCTION {trigger}();"
+    )))
+    .execute(&fx.pool)
+    .await
+    .expect("install failure");
+    let result = carry(&fx, source, target).await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER {trigger} ON scan_findings; DROP FUNCTION {trigger}();"
+    )))
+    .execute(&fx.pool)
+    .await
+    .expect("remove failure");
+
+    assert!(result.is_err());
+    assert_eq!(scans_on(&fx, target).await, 0, "no partial verdict");
+    let decisions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM finding_acknowledgements WHERE repository_id = $1",
+    )
+    .bind(target_repo)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("decisions");
+    assert_eq!(decisions, 0, "the whole carry is one transaction");
+    assert!(!fx.allowed(target_repo, target).await, "unscanned, refused");
+    fx.cleanup().await;
+}
+
+/// The dedup safeguards apply: a verdict a byte-identical upload could not reuse
+/// cannot satisfy `block_unscanned` on the target either.
+#[tokio::test]
+#[ignore]
+async fn a_verdict_dedup_would_not_reuse_is_not_carried() {
+    for (label, update) in [
+        (
+            "a clean verdict past the zero-findings limit",
+            "completed_at = NOW() - INTERVAL '2 days'",
+        ),
+        (
+            "a verdict from another pin",
+            "pin_identity = 'npm:someone-else@1.0.0'",
+        ),
+        ("an imported verdict", "origin = 'imported'"),
+    ] {
+        let mut fx = Fx::new().await;
+        let (source_repo, target_repo, source, target, _) = promotion_rig(&mut fx).await;
+        fx.scan(source_repo, source, "dependency", &[]).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE scan_results SET {update} WHERE artifact_id = $1"
+        )))
+        .bind(source)
+        .execute(&fx.pool)
+        .await
+        .expect("age the verdict");
+
+        carry(&fx, source, target).await.expect("carry");
+
+        assert_eq!(scans_on(&fx, target).await, 0, "{label}");
+        assert!(!fx.allowed(target_repo, target).await, "{label}");
+        fx.cleanup().await;
+    }
+}
+
+/// #5: only someone who could acknowledge in the target carries a decision past
+/// its policy. The verdict still travels, so the finding is open there.
+#[tokio::test]
+#[ignore]
+async fn a_principal_who_could_not_acknowledge_carries_the_verdict_and_no_decision() {
+    let mut fx = Fx::new().await;
+    let (source_repo, target_repo, source, target, d) = promotion_rig(&mut fx).await;
+    let cve = format!("CVE-2032-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let scan = fx
+        .scan(
+            source_repo,
+            source,
+            "dependency",
+            &[finding(&cve, LODASH, "1")],
+        )
+        .await;
+    fx.ack_scan(scan).await;
+    assert!(fx.allowed(source_repo, source).await);
+
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(
+            source,
+            target,
+            CarryPrincipal {
+                user_id: fx.admin,
+                may_acknowledge: false,
+            },
+        )
+        .await
+        .expect("carry");
+
+    assert_eq!(scans_on(&fx, target).await, 1, "the verdict travels");
+    assert!(
+        !fx.allowed(target_repo, target).await,
+        "the finding must be open on the target"
+    );
+    let in_target: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM finding_acknowledgements \
+         WHERE repository_id = $1 AND checksum_sha256 = $2",
+    )
+    .bind(target_repo)
+    .bind(&d)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("decisions");
+    assert_eq!(in_target, 0);
+    assert_eq!(
+        fx.audit_count("FINDING_ACKNOWLEDGEMENT_NOT_CARRIED", &cve.to_uppercase())
+            .await,
+        1,
+        "what was left behind is on the record"
+    );
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// External scanners
+// ---------------------------------------------------------------------------
+
+fn external(cve: &str, vendor: &str, severity: Severity, class: FindingClass) -> RawFinding {
+    RawFinding {
+        severity,
+        title: format!("{cve} from {vendor}"),
+        description: None,
+        cve_id: Some(cve.to_string()),
+        affected_component: Some(LODASH.to_string()),
+        affected_version: Some("1".to_string()),
+        fixed_version: None,
+        source: Some(vendor.to_string()),
+        source_url: None,
+        finding_class: class,
+    }
+}
+
+async fn ingest(fx: &Fx, repo: Uuid, artifact: Uuid, findings: &[RawFinding]) {
+    let critical = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Critical)
+        .count() as i32;
+    let counts = [critical, 0, 0, 0, 0];
+    fx.svc
+        .create_completed_scan_with_findings(
+            artifact,
+            repo,
+            "external",
+            counts,
+            Some("v1"),
+            findings,
+        )
+        .await
+        .expect("ingest");
+}
+
+/// Every external vendor writes `scan_type = 'external'`, so one vendor's clean
+/// submission must not read as a rescan of another's verdict.
+#[tokio::test]
+#[ignore]
+async fn one_vendors_clean_submission_does_not_clear_another_vendors_verdict() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    ingest(
+        &fx,
+        repo,
+        artifact,
+        &[external(
+            "MAL-2031-1",
+            "vendor-a",
+            Severity::Critical,
+            FindingClass::Malicious,
+        )],
+    )
+    .await;
+    assert!(!fx.allowed(repo, artifact).await);
+
+    ingest(&fx, repo, artifact, &[]).await;
+
+    assert!(
+        !fx.allowed(repo, artifact).await,
+        "a malware verdict must survive another vendor's clean submission"
+    );
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The promotion gate reads what the download gate reads
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn a_blind_rescan_does_not_clear_the_promotion_gate() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let critical = finding_from(CVE_A, LODASH, "1", "grype", Severity::Critical);
+    let baseline = fx.scan(repo, artifact, "dependency", &[critical]).await;
+    sqlx::query("UPDATE scan_results SET critical_count = 1, high_count = 0 WHERE id = $1")
+        .bind(baseline)
+        .execute(&fx.pool)
+        .await
+        .expect("counts");
+    let blind = fx.unfinished_scan(repo, artifact).await;
+    fx.complete(blind.id, 0, "not_cataloged").await;
+
+    let summary = PromotionPolicyService::new(fx.pool.clone())
+        .evaluate_artifact(artifact, repo)
+        .await
+        .expect("evaluate")
+        .cve_summary
+        .expect("summary");
+    assert_eq!(summary.critical_count, 1, "the baseline's counts remain");
+    assert_eq!(summary.open_cves, vec![CVE_A.to_string()]);
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// A copied verdict and its deleted source
+// ---------------------------------------------------------------------------
+
+/// A copy outlives its source with `source_scan_id` cleared and, through
+/// `convert_to_reused`, a fresh `completed_at`. It must not then read as an
+/// original scan with a restarted age limit.
+#[tokio::test]
+#[ignore]
+async fn a_copy_whose_source_was_deleted_is_not_a_dedup_source() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(repo, "a.tgz", &d).await;
+    let source = fx
+        .scan(repo, original, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let copy = fx.artifact(repo, "b.tgz", &d).await;
+    let placeholder = fx
+        .svc
+        .create_scan_result_with_checksum(copy, repo, "dependency", Some(&d))
+        .await
+        .expect("placeholder");
+    fx.svc
+        .convert_to_reused(placeholder.id, source, copy, None)
+        .await
+        .expect("convert");
+    assert_eq!(reusable(&fx, &d).await, Some(source));
+
+    sqlx::query("DELETE FROM artifacts WHERE id = $1")
+        .bind(original)
+        .execute(&fx.pool)
+        .await
+        .expect("the source can go");
+
+    assert_eq!(reusable(&fx, &d).await, None);
+    fx.cleanup().await;
+}
+
+async fn reusable(fx: &Fx, d: &str) -> Option<Uuid> {
+    fx.svc
+        .find_reusable_scan(d, "dependency", 30, 1, None)
+        .await
+        .expect("find")
+        .map(|s| s.id)
+}
+
+// ---------------------------------------------------------------------------
+// Credentials, and the trail
+// ---------------------------------------------------------------------------
+
+/// Service-level pin of who may decide what; the HTTP surface is in `security.rs`.
+#[tokio::test]
+#[ignore]
+async fn a_scoped_credential_stays_inside_its_scope() {
+    let mut fx = Fx::new().await;
+    let inside = fx.repo().await;
+    let outside = fx.repo().await;
+    let d = digest();
+    let a = fx.artifact(inside, "a.tgz", &d).await;
+    let b = fx.artifact(outside, "a.tgz", &digest()).await;
+    let in_scan = fx
+        .scan(inside, a, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let out_scan = fx
+        .scan(outside, b, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let scoped = AckActor::new(fx.admin, AccessScope::Restricted(vec![inside]));
+
+    let finding_b = fx.finding_ids(out_scan).await[0];
+    let refused = fx
+        .svc
+        .acknowledge_finding(finding_b, &scoped, "no", Default::default())
+        .await;
+    assert!(matches!(refused, Err(AppError::NotFound(_))), "{refused:?}");
+    assert!(!fx.allowed(outside, b).await);
+
+    // Revoking something that reaches past the credential.
+    let finding_a = fx.finding_ids(in_scan).await[0];
+    fx.svc
+        .acknowledge_finding(
+            finding_a,
+            &fx.actor(),
+            "everywhere",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("widen");
+    let refused = fx.svc.revoke_acknowledgment(finding_a, None, &scoped).await;
+    assert!(
+        matches!(refused, Err(AppError::Authorization(_))),
+        "{refused:?}"
+    );
+    assert!(fx.allowed(inside, a).await, "the decision stands");
+
+    // A lineage reaching another repository.
+    fx.svc
+        .revoke_acknowledgment(finding_a, None, &fx.actor())
+        .await
+        .expect("revoke");
+    fx.ack_scan(in_scan).await;
+    let promoted = fx.artifact(outside, "c.tgz", &d).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(a, promoted, fx.admin_principal())
+        .await
+        .expect("carry");
+    let refused = fx.svc.revoke_acknowledgment(finding_a, None, &scoped).await;
+    assert!(
+        matches!(refused, Err(AppError::Authorization(_))),
+        "{refused:?}"
+    );
+    fx.cleanup().await;
+}
+
+/// An admin holding grants elsewhere and none here does not decide for this
+/// private repository.
+#[tokio::test]
+#[ignore]
+async fn a_tenant_admin_cannot_decide_for_another_tenant() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    sqlx::query("UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1")
+        .bind(repo)
+        .execute(&fx.pool)
+        .await
+        .expect("private");
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let tenant_admin = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+         VALUES ($1, $2, $3, 'unused', 'local', true, true)",
+    )
+    .bind(tenant_admin)
+    .bind(format!("ack-tenant-{tenant_admin}"))
+    .bind(format!("ack-tenant-{tenant_admin}@test.local"))
+    .execute(&fx.pool)
+    .await
+    .expect("tenant admin");
+    let id = fx.finding_ids(scan).await[0];
+    let refused = fx
+        .svc
+        .acknowledge_finding(
+            id,
+            &AckActor::new(tenant_admin, AccessScope::Admin),
+            "not mine",
+            Default::default(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(AppError::Authorization(_))),
+        "{refused:?}"
+    );
+    assert!(!fx.allowed(repo, artifact).await);
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(tenant_admin)
+        .execute(&fx.pool)
+        .await
+        .expect("remove tenant admin");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_audit_trail_names_the_ceiling_and_records_a_supersede() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let cve = format!("CVE-2033-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(&cve, LODASH, "1")])
+        .await;
+    let needle = cve.to_uppercase();
+    fx.ack_scan(scan).await;
+    assert_eq!(fx.audit_count("FINDING_ACKNOWLEDGED", &needle).await, 1);
+    let details: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM audit_log WHERE action = 'FINDING_ACKNOWLEDGED' \
+         AND details::text LIKE $1",
+    )
+    .bind(format!("%{needle}%"))
+    .fetch_one(&fx.pool)
+    .await
+    .expect("details");
+    assert_eq!(details["max_severity"], "high");
+
+    fx.ack_scan(scan).await;
+    assert_eq!(
+        fx.audit_count("FINDING_ACKNOWLEDGEMENT_REVOKED", &needle)
+            .await,
+        1,
+        "the replaced decision leaves a row"
+    );
+    fx.cleanup().await;
+}
+
+/// On a rollback, or a 1.11 replica during a rolling upgrade, the frozen flag is
+/// what is read. A revoked or lapsed decision must not read as acknowledged there.
+#[tokio::test]
+#[ignore]
+async fn revoke_and_expiry_clear_the_frozen_flag() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let id = fx.finding_ids(scan).await[0];
+    let flag = |pool: PgPool| async move {
+        let flagged: bool =
+            sqlx::query_scalar("SELECT is_acknowledged FROM scan_findings WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("flag");
+        flagged
+    };
+    legacy_ack(&fx, id, "legacy").await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(migration_backfill_sql()))
+        .execute(&fx.pool)
+        .await
+        .expect("backfill");
+    assert!(flag(fx.pool.clone()).await);
+    fx.svc
+        .revoke_acknowledgment(id, None, &fx.actor())
+        .await
+        .expect("revoke");
+    assert!(!flag(fx.pool.clone()).await, "after a revoke");
+
+    legacy_ack(&fx, id, "legacy").await;
+    fx.svc
+        .acknowledge_finding(
+            id,
+            &fx.actor(),
+            "short",
+            AcknowledgeOptions {
+                expires_at: Some(Utc::now() + Duration::milliseconds(200)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ack");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .record_expired()
+        .await
+        .expect("sweep");
+    assert!(!flag(fx.pool.clone()).await, "after the lapse is recorded");
+    fx.cleanup().await;
+}
+
+/// #7: nothing that holds a lock a download waits on may be held across the
+/// backfill, which scans `scan_findings`.
+#[tokio::test]
+#[ignore]
+async fn the_backfill_does_not_share_a_transaction_with_any_blocking_ddl() {
+    let backfill = migration_file("_finding_acknowledgements_backfill.sql");
+    let upper = backfill.to_uppercase();
+    for forbidden in [
+        "ALTER TABLE",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "CREATE UNIQUE INDEX",
+    ] {
+        assert!(
+            !upper.contains(forbidden),
+            "{forbidden} in the backfill migration"
+        );
+    }
+    let schema = migration_file("_finding_acknowledgements.sql");
+    assert!(!schema.to_uppercase().contains("ALTER TABLE SCAN_RESULTS"));
 }

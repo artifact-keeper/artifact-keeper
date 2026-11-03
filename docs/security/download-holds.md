@@ -82,7 +82,7 @@ finding: a rescan, a dedup copy and a promotion all keep it.
 | Part of the decision | What it means |
 | --- | --- |
 | The bytes | The artifact's SHA-256. A re-upload of the same bytes is covered; a new build under the same version is not. |
-| The repository | The finding's own repository. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, or they got there by promotion. |
+| The repository | The finding's own repository, or the one named by `repository_id`, which must hold these bytes. If the finding's scan has copies in other repositories and `repository_id` is omitted, the request answers `409`: a scan listing reports a copy under its source's id, so the row may belong to a repository other than the one you are looking at. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, which takes an unrestricted credential and an instance-wide role, or a promotion carried the decision. |
 | Advisory, component, component version, finding class | A new CVE, or the same CVE on another component or version, stays open. The engine that reported it does not matter: one decision covers every engine reporting the same component. |
 | Severity | The severity of the row acknowledged. If the finding is re-graded above it, it reopens. Acknowledging it again accepts the new severity. |
 | `expires_at` (optional) | The finding reopens at this time, with no further action. Without it, the decision lasts until revoked. |
@@ -93,24 +93,51 @@ audit row. It does not release an administrator's hold, an upload-period hold, a
 rejection, or a hold with no recorded source (written before 1.12.0): those need
 `POST /api/v1/quarantine/{id}/release`.
 
-A promotion copies the source's verdict (the latest completed scan of each
-type, with its provenance) and its live decisions into the target repository,
-where the target's own policy grades the findings. `GET /api/v1/security/acknowledgements`
-lists decisions, and `include_inactive=true` adds expired and revoked ones.
+A promotion copies the source's verdict only if the target would grade what the
+source grades: every scan the source's gate reads must be a complete verdict a
+dedup could reuse (within its age limit, under the artifact's pin, not imported, no
+crashed, running or incomplete scan after it, no external submission). Otherwise
+nothing is copied and the target sees an unscanned artifact, as it did before
+1.12.0: a target policy with `block_unscanned` refuses it, and one without it serves
+it. The target's own policy grades whatever is copied. The source's live decisions
+go with it only if the promoter could acknowledge in the target, so a
+`promote:artifacts` token carries none: the finding is open there and the target's
+policy decides. Each decision left behind writes a
+`FINDING_ACKNOWLEDGEMENT_NOT_CARRIED` audit row.
 
-`DELETE /api/v1/security/findings/{id}/acknowledge` or
-`DELETE /api/v1/security/acknowledgements/{id}` revokes a decision, and with it
-every copy a promotion made of it. A decision made independently in another
+An administrator flag does not cross a tenant: deciding for a private repository
+needs a grant on it, as promoting into one does. A credential scoped to some
+repositories can decide only inside them, and cannot revoke a decision that reaches
+past them. `GET /api/v1/security/acknowledgements` lists decisions for instance
+administrators, and `include_inactive=true` adds expired and revoked ones.
+
+`GET /api/v1/security/scans/{id}/findings?artifact_id=` lists one artifact's own rows
+of a reused scan. A caller who can see only a copy gets the copy's rows without it.
+
+`DELETE /api/v1/security/findings/{id}/acknowledge` (optionally
+`?repository_id=`) or `DELETE /api/v1/security/acknowledgements/{id}` revokes a
+decision, and with it every copy a promotion made of it. A decision made independently in another
 repository for the same bytes stays. After a revoke the scan policy refuses the
 artifact again (`403`); the hold is not written back.
 
 The download gate grades each artifact's current scans: per scan type, the latest
 complete scan and anything after it. A finding only an older scan reported no
 longer blocks. A later scan that crashed, or that could not assess the artifact
-(`partial`, `not_cataloged`), does not clear what the complete scan reported.
+(`partial`, `not_cataloged`), does not clear what the complete scan reported. The
+promotion gate and `max_cve_severity` rules read the same scans. Every external
+scanner shares one scan type and a clean submission names no vendor, so external
+submissions never supersede each other: all of them are graded, and a finding a
+vendor stops reporting stays until it is acknowledged.
 
 Upgrading to 1.12.0 turns an acknowledged row into a decision only when every row
 of that finding in the artifact's current scans is acknowledged. A finding
 acknowledged only in an older scan, or by one engine while another's row is open,
 stays open and is acknowledged again. Proxied files have no acknowledgement
 (#5152).
+
+During a rolling upgrade a 1.11 replica, and after a rollback the older version,
+read the old flags on the finding rows and not the decisions. A revoke, or a lapse
+once the five-minute task has recorded it, clears those flags, so an undone decision
+does not read as acknowledged there. Until that task runs, a lapsed decision that
+was migrated from a flag still does. A decision made after the upgrade is not visible
+there, which fails closed.

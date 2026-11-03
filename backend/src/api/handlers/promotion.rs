@@ -933,27 +933,44 @@ fn screen_bulk_item(
     }
 }
 
-/// Give a promoted copy its source's scan verdict and acknowledgements (#5153).
+/// Give a promoted copy its source's scan verdict and, when the promoter could
+/// acknowledge in the target, its acknowledgements (#5153).
 ///
 /// The bytes are already in the target and the promotion is already recorded, so
-/// a failure here does not undo it. It leaves the copy unscanned and its findings
-/// unacknowledged, which is the fail-closed state a target policy refuses.
+/// a failure here does not undo it. The carry is one transaction, so a failure
+/// leaves the copy with no scan rows and its findings unacknowledged: a target
+/// policy with `block_unscanned` refuses it, and one without serves it, as for any
+/// promotion before verdicts travelled.
 pub(super) async fn carry_scan_state_to_promoted(
     db: &sqlx::PgPool,
     source_artifact_id: Uuid,
     new_artifact_id: Uuid,
-    promoted_by: Uuid,
+    target_repo_id: Uuid,
+    auth: &AuthExtension,
 ) {
-    if let Err(e) =
-        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(db.clone())
-            .carry_to_promoted_artifact(source_artifact_id, new_artifact_id, promoted_by)
+    use crate::services::finding_acknowledgements::{
+        AckActor, CarryPrincipal, FindingAcknowledgementService,
+    };
+    let service = FindingAcknowledgementService::new(db.clone());
+    let actor = AckActor::new(auth.user_id, auth.access_scope());
+    let may_acknowledge = auth.is_admin
+        && service
+            .authorize_repository(&actor, target_repo_id)
             .await
+            .is_ok();
+    let principal = CarryPrincipal {
+        user_id: auth.user_id,
+        may_acknowledge,
+    };
+    if let Err(e) = service
+        .carry_to_promoted_artifact(source_artifact_id, new_artifact_id, principal)
+        .await
     {
         tracing::warn!(
             source_artifact = %source_artifact_id,
             new_artifact = %new_artifact_id,
             error = %e,
-            "Promoted copy did not receive its scan state; it stays unscanned until scanned"
+            "Promoted copy did not receive its scan state; it has no scan on record"
         );
     }
 }
@@ -1417,7 +1434,14 @@ pub async fn promote_artifact(
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
 
-    carry_scan_state_to_promoted(&state.db, artifact_id, new_artifact_id, auth.user_id).await;
+    carry_scan_state_to_promoted(
+        &state.db,
+        artifact_id,
+        new_artifact_id,
+        target_repo.id,
+        &auth,
+    )
+    .await;
 
     // #3939: the copy is a new artifact in the target repository, written
     // with raw SQL rather than through `finalize_upload`, so the promotion
@@ -1854,7 +1878,14 @@ pub async fn promote_artifacts_bulk(
         )
         .await;
 
-        carry_scan_state_to_promoted(&state.db, *artifact_id, new_artifact_id, auth.user_id).await;
+        carry_scan_state_to_promoted(
+            &state.db,
+            *artifact_id,
+            new_artifact_id,
+            target_repo.id,
+            &auth,
+        )
+        .await;
 
         // #3939: same per-copy event as the single-promote path.
         state
@@ -4772,8 +4803,9 @@ mod tests {
         ) -> Uuid {
             let scan: Uuid = sqlx::query_scalar(
                 "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
-                                           findings_count, high_count, completed_at) \
-                 VALUES ($1, $2, 'dependency', 'completed', 1, 1, NOW()) RETURNING id",
+                                           findings_count, high_count, completed_at, checksum_sha256) \
+                 SELECT $1, $2, 'dependency', 'completed', 1, 1, NOW(), checksum_sha256 \
+                 FROM artifacts WHERE id = $1 RETURNING id",
             )
             .bind(artifact)
             .bind(repo)
@@ -4793,7 +4825,15 @@ mod tests {
             crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
                 pool.clone(),
             )
-            .acknowledge_finding(finding, Some(by), Some("accepted"), Default::default())
+            .acknowledge_finding(
+                finding,
+                &crate::services::finding_acknowledgements::AckActor::new(
+                    by,
+                    crate::models::access_scope::AccessScope::Admin,
+                ),
+                Some("accepted"),
+                Default::default(),
+            )
             .await
             .expect("acknowledge");
             scan
@@ -4887,6 +4927,125 @@ mod tests {
                 assert_eq!((rows, acknowledged), (1, 1));
             }
 
+            cleanup(&pool, &[src, tgt], user).await;
+        }
+
+        /// #5153 finding 5: `promote:artifacts` does not include deciding for the
+        /// target. The verdict travels and the finding is open there; the audit
+        /// log says what stayed behind.
+        #[tokio::test]
+        async fn test_a_promote_scoped_token_carries_no_acknowledgement_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153n-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153n-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "n5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "n5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let admin = make_admin(&pool, "n5153a").await;
+            let promoter = make_tenant_admin(&pool, "n5153p").await;
+            grant_repo(&pool, promoter, src).await;
+            grant_repo(&pool, promoter, tgt).await;
+            sqlx::query(
+                "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                            block_on_fail, is_enabled) \
+                 VALUES ($1, $2, 'high', true, false, true)",
+            )
+            .bind(format!("n5153-{tgt}"))
+            .bind(tgt)
+            .execute(&pool)
+            .await
+            .expect("target policy");
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "n5153").await;
+            seed_acknowledged_scan(&pool, src, artifact, admin).await;
+
+            let mut token = admin_ext(promoter);
+            token.is_admin = false;
+            token.is_api_token = true;
+            token.scopes = Some(vec!["promote:artifacts".to_string()]);
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(token),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote");
+            assert!(res.0.promoted, "{:?}", res.0.message);
+
+            let copy: Uuid =
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(tgt)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("copy");
+            let result = crate::services::policy_service::PolicyService::new(pool.clone())
+                .evaluate_artifact(copy, tgt)
+                .await
+                .expect("evaluate");
+            assert!(
+                !result.allowed,
+                "the finding must be open in the target: {:?}",
+                result.violations
+            );
+            assert!(result
+                .violations
+                .iter()
+                .any(|v| v.contains("findings at or above")));
+            cleanup(&pool, &[src, tgt], admin).await;
+        }
+
+        /// #5153 finding 1: a blind rescan on top of a critical baseline must not
+        /// pass a `max_cve_severity` rule.
+        #[tokio::test]
+        async fn test_a_blind_rescan_does_not_pass_a_cve_rule_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153r-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153r-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "r5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "r5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "r5153").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "r5153").await;
+            make_rule(&pool, src, tgt, Some("high"), Some(0)).await;
+            sqlx::query(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                     findings_count, critical_count, completed_at, scan_completeness) \
+                 VALUES ($1, $2, 'dependency', 'completed', 1, 1, NOW() - INTERVAL '1 hour', 'complete'), \
+                        ($1, $2, 'dependency', 'completed', 0, 0, NOW(), 'not_cataloged')",
+            )
+            .bind(artifact)
+            .bind(src)
+            .execute(&pool)
+            .await
+            .expect("scans");
+
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote answers");
+            assert!(!res.0.promoted, "the critical baseline still counts");
             cleanup(&pool, &[src, tgt], user).await;
         }
 

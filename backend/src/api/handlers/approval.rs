@@ -1053,7 +1053,8 @@ pub async fn approve_promotion(
         &state.db,
         artifact.id,
         new_artifact_id,
-        auth.user_id,
+        target_repo.id,
+        &auth,
     )
     .await;
 
@@ -3138,8 +3139,9 @@ mod tests {
             // #5153: the third promote path hands over the verdict too.
             let source_scan: Uuid = sqlx::query_scalar(
                 "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
-                                           completed_at) \
-                 VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+                                           completed_at, checksum_sha256) \
+                 SELECT $1, $2, 'dependency', 'completed', NOW(), checksum_sha256 \
+                 FROM artifacts WHERE id = $1 RETURNING id",
             )
             .bind(artifact)
             .bind(src)
