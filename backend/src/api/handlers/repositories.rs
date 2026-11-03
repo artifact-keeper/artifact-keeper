@@ -11083,6 +11083,7 @@ pub(crate) fn ranged_stream_response_advertised(
         .map(|expected_sha256| ServeVerification {
             expected_sha256,
             label: format!("sha256:{}", hex::encode(expected_sha256)),
+            on_stream_mismatch: None,
         });
     ranged_stream_response_verified(range_header, total, body, base_headers, verify)
 }
@@ -11113,8 +11114,14 @@ pub(crate) async fn ranged_stream_response_checked(
 ) -> Result<Response> {
     let (body, verify) = match verify {
         Some(v) if !is_head && range_is_whole_object(range_header, total) => (
-            crate::storage::verify::verify_before_serve(body, v.expected_sha256, total, v.label)
-                .await?,
+            crate::storage::verify::verify_before_serve_with_hook(
+                body,
+                v.expected_sha256,
+                total,
+                v.label,
+                v.on_stream_mismatch,
+            )
+            .await?,
             None,
         ),
         other => (body, other),
@@ -11127,6 +11134,9 @@ pub(crate) async fn ranged_stream_response_checked(
 pub(crate) struct ServeVerification {
     pub expected_sha256: [u8; 32],
     pub label: String,
+    /// Runs when the bytes turn out corrupt after the status went out, so the
+    /// transfer can only be aborted (#5169). `None` for most serves.
+    pub on_stream_mismatch: Option<crate::storage::verify::MismatchHook>,
 }
 
 /// Build the verification for an artifact row's recorded checksum, or `None`
@@ -11144,6 +11154,7 @@ pub(crate) fn serve_verification(
         ServeVerification {
             expected_sha256,
             label: label(),
+            on_stream_mismatch: None,
         }
     })
 }
@@ -11181,11 +11192,12 @@ pub(crate) fn ranged_stream_response_verified(
         RangeOutcome::Unsatisfiable => false,
     };
     let body = match verify {
-        Some(v) if whole_object => crate::storage::verify::verify_sha256_stream(
+        Some(v) if whole_object => crate::storage::verify::verify_sha256_stream_with_hook(
             body,
             v.expected_sha256,
             Some(total),
             v.label,
+            v.on_stream_mismatch,
         ),
         _ => body,
     };

@@ -202,6 +202,7 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
     );
     sweep_spool_files(
         &crate::api::handlers::incus::staging_root(&state.config.storage_path),
+        SPOOL_PREFIX,
         settings.build_deadline,
     );
     tokio::spawn(async move {
@@ -227,17 +228,14 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
     });
 }
 
-/// Delete spool files a build left behind when its process died: older
-/// than any build may run. Best effort.
-fn sweep_spool_files(dir: &std::path::Path, older_than: Duration) {
+/// Delete spool files named `prefix*` that a process left behind when it died:
+/// older than any writer may run. Best effort.
+pub(crate) fn sweep_spool_files(dir: &std::path::Path, prefix: &str, older_than: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let stale = entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(SPOOL_PREFIX)
+        let stale = entry.file_name().to_string_lossy().starts_with(prefix)
             && entry
                 .metadata()
                 .and_then(|m| m.modified())
