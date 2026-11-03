@@ -1754,6 +1754,11 @@ jobs:
       - name: Check the docs/CI drift gate catches what it must
         run: bash scripts/ci/test-check-docs-test-command.sh
 
+      # The hook is not run by CI, so nothing else notices when it stops being
+      # able to pass on a clean checkout, which is what #5182 was.
+      - name: Check the pre-push hook runs what it documents
+        run: bash scripts/ci/test-pre-push-hook.sh
+
       # Six STEP-level `continue-on-error: true` on `Generate artifact
       # attestation` and `Attach VEX attestations` meant a failed provenance
       # push left the merge job GREEN and published the image anyway, with no

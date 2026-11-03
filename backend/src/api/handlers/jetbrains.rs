@@ -1338,7 +1338,7 @@ mod tests {
     /// The binary round trip without a database: the parser alone, fed the
     /// same invalid-UTF-8 fixture the router test uses, must stage bytes
     /// identical to the file part. The router-level check needs
-    /// `DATABASE_URL`, so this is the one that runs in the pre-push hook.
+    /// `DATABASE_URL`, so this is the one that runs without a database.
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_stages_binary_zip_verbatim() {
         use sha2::Digest;

@@ -1572,6 +1572,7 @@ async fn download(
                 FROM artifacts
                 WHERE repository_id = $1
                   AND name = $2
+                  AND version IS DISTINCT FROM '_labels'
                   AND is_deleted = false
                 ORDER BY created_at DESC
                 LIMIT 1"#,
@@ -3777,5 +3778,138 @@ pub(crate) mod integrity_tests {
         assert_eq!(res.corrupt + res.missing + res.repaired, 0, "{res:?}");
         assert!(res.unverifiable >= 1, "{res:?}");
         assert_eq!(findings, 0);
+    }
+}
+
+/// #5197: a `Download` naming a module but no commit or label means "latest
+/// commit". The `_labels` index shares the module's `name`, so the latest-row
+/// query has to skip it.
+#[cfg(test)]
+mod download_latest_commit_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// Push `proto` to `acme/latest` through the real upload route.
+    async fn push(fx: &tdh::Fixture, proto: &str) {
+        use base64::Engine;
+        let body = serde_json::json!({
+            "contents": [{
+                "moduleRef": { "owner": "acme", "module": "latest" },
+                "files": [{
+                    "path": "acme/latest/v1/thing.proto",
+                    "content": base64::engine::general_purpose::STANDARD.encode(proto),
+                }],
+            }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.UploadService/Upload",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "upload failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    /// `Download` naming the module with neither a commit nor a label.
+    async fn download_latest(fx: &tdh::Fixture) -> (StatusCode, serde_json::Value, String) {
+        let body = serde_json::json!({
+            "values": [{ "resourceRef": { "owner": "acme", "module": "latest" } }],
+        });
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!(
+                    "/{}/buf.registry.module.v1beta1.DownloadService/Download",
+                    fx.repo_key
+                ),
+                "application/json",
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            ),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&resp).into_owned();
+        (
+            status,
+            serde_json::from_slice(&resp).unwrap_or(serde_json::Value::Null),
+            text,
+        )
+    }
+
+    /// The module's rows, newest `created_at` first: `(version, id)`.
+    async fn rows_newest_first(fx: &tdh::Fixture) -> Vec<(String, uuid::Uuid)> {
+        sqlx::query_as(
+            "SELECT version, id FROM artifacts \
+             WHERE repository_id = $1 AND name = 'acme/latest' AND is_deleted = false \
+             ORDER BY created_at DESC",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read module rows")
+    }
+
+    fn file_content(resp: &serde_json::Value) -> Vec<u8> {
+        use base64::Engine;
+        let content = resp["contents"][0]["files"][0]["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no file in {resp}"));
+        base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .expect("base64 file content")
+    }
+
+    /// One commit: the `_labels` row written right after it is the newest row.
+    #[tokio::test]
+    async fn download_without_ref_returns_the_only_commit_5197() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push(&fx, "syntax = \"proto3\";\nmessage One {}\n").await;
+        let rows = rows_newest_first(&fx).await;
+        let (status, resp, text) = download_latest(&fx).await;
+        fx.teardown().await;
+
+        // The premise of the bug: this ordering is what the query walks.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, "_labels", "{rows:?}");
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(resp["contents"][0]["commit"]["id"], rows[1].1.to_string());
+        assert_eq!(
+            file_content(&resp),
+            b"syntax = \"proto3\";\nmessage One {}\n"
+        );
+    }
+
+    /// A second distinct commit is newer than the `_labels` row, whose upsert
+    /// keeps its `created_at`. Latest must still mean that second commit.
+    #[tokio::test]
+    async fn download_without_ref_returns_the_newest_of_two_commits_5197() {
+        let Some(fx) = tdh::Fixture::setup("local", "protobuf").await else {
+            return;
+        };
+        push(&fx, "syntax = \"proto3\";\nmessage One {}\n").await;
+        push(&fx, "syntax = \"proto3\";\nmessage Two {}\n").await;
+        let rows = rows_newest_first(&fx).await;
+        let (status, resp, text) = download_latest(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_ne!(rows[0].0, "_labels", "{rows:?}");
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(resp["contents"][0]["commit"]["id"], rows[0].1.to_string());
+        assert_eq!(
+            file_content(&resp),
+            b"syntax = \"proto3\";\nmessage Two {}\n"
+        );
     }
 }

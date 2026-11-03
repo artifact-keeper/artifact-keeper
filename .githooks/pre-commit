@@ -6,7 +6,7 @@
 #   git config core.hooksPath .githooks
 #
 # This stage is intentionally cheap so commits stay instant. The heavier
-# checks (cargo check + unit tests) run on `git push` via .githooks/pre-push.
+# check (cargo check) runs on `git push` via .githooks/pre-push.
 #
 # Bypass in an emergency with `git commit --no-verify`. CI is the real
 # enforcement; this is just fast local feedback.
