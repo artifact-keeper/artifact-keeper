@@ -252,6 +252,18 @@ fn validate_key_type_for_repo_format(
     Ok(())
 }
 
+/// The key a signing config update must prove capable, if any: one the request
+/// names, or the bound one when the request turns metadata signing on. Any other
+/// update on a repository that already has an incapable key bound goes through,
+/// so an operator can always turn signing off.
+fn key_needing_capability_check(
+    requested_key: Option<Uuid>,
+    requested_sign_metadata: Option<bool>,
+    current_key: Option<Uuid>,
+) -> Option<Uuid> {
+    requested_key.or(current_key.filter(|_| requested_sign_metadata == Some(true)))
+}
+
 /// Get a signing key by ID.
 #[utoipa::path(
     get,
@@ -474,8 +486,9 @@ async fn get_repo_signing_config(
     request_body = UpdateSigningConfigPayload,
     responses(
         (status = 200, description = "Updated signing configuration", body = RepositorySigningConfig),
+        (status = 400, description = "The key cannot sign this repository's metadata", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::api::openapi::ErrorResponse),
-        (status = 404, description = "Repository not found", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Repository or signing key not found", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -491,6 +504,19 @@ async fn update_repo_signing_config(
     // Get existing config to merge with updates
     let existing = svc.get_signing_config(repo_id).await?;
     let (cur_key, cur_meta, cur_pkg, cur_req) = signing_config_fields(existing.as_ref());
+
+    // #5198: the same refusal as key creation (#2651), which a global key or one
+    // made before that check never met.
+    if let Some(key_id) =
+        key_needing_capability_check(payload.signing_key_id, payload.sign_metadata, cur_key)
+    {
+        let repo = RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await?;
+        let key = svc.get_key(key_id).await?;
+        validate_key_type_for_repo_format(&repo.format, &key.key_type)
+            .map_err(AppError::Validation)?;
+    }
 
     let config = svc
         .update_signing_config(
@@ -1644,5 +1670,177 @@ mod tests {
         value
             .as_deref()
             .map_or(serde_json::Value::Null, serde_json::Value::from)
+    }
+}
+
+/// #5198: the config route is the other way a key reaches a repository, so it
+/// refuses what key creation refuses (#2651), while leaving an operator able to
+/// turn signing off on a repository that already has such a key bound.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod config_route_key_capability_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::signing_service::{SigningService, ED25519_ALGORITHM};
+    use axum::body::Bytes;
+    use axum::http::StatusCode;
+
+    async fn new_key(f: &tdh::Fixture, key_type: &str) -> Uuid {
+        let (key_type_owned, algorithm) = match key_type {
+            "gpg" => ("gpg".to_string(), ED25519_ALGORITHM.to_string()),
+            other => (other.to_string(), "rsa2048".to_string()),
+        };
+        SigningService::new(f.pool.clone(), &f.state.config.jwt_secret)
+            .create_key(CreateKeyRequest {
+                repository_id: None,
+                name: format!("cfg-5198-{}", Uuid::new_v4()),
+                key_type: key_type_owned,
+                algorithm,
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key")
+            .id
+    }
+
+    async fn post_config(
+        f: &tdh::Fixture,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = tdh::router_with_auth_ext(
+            super::router(),
+            f.state.clone(),
+            tdh::admin_auth(f.user_id, &f.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::post(
+                format!("/repositories/{}/config", f.repo_id),
+                "application/json",
+                Bytes::from(body.to_string()),
+            ),
+        )
+        .await;
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn bound_key(f: &tdh::Fixture) -> Option<Uuid> {
+        sqlx::query_scalar(
+            "SELECT signing_key_id FROM repository_signing_config WHERE repository_id = $1",
+        )
+        .bind(f.repo_id)
+        .fetch_optional(&f.pool)
+        .await
+        .expect("read binding")
+        .flatten()
+    }
+
+    async fn delete_keys(f: &tdh::Fixture, keys: &[Uuid]) {
+        sqlx::query("DELETE FROM repository_signing_config WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing config");
+        sqlx::query("DELETE FROM signing_keys WHERE id = ANY($1)")
+            .bind(keys)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing keys");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_non_openpgp_key_on_every_openpgp_format_5198() {
+        for format in ["debian", "rpm", "pacman"] {
+            let Some(f) = tdh::Fixture::setup("local", format).await else {
+                return;
+            };
+            let rsa = new_key(&f, "rsa").await;
+            let (status, body) = post_config(
+                &f,
+                serde_json::json!({"signing_key_id": rsa, "sign_metadata": true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{format}: {body}");
+            assert!(
+                body.to_string().contains("key_type='gpg'"),
+                "{format}: the refusal must name the key type that works: {body}"
+            );
+            assert_eq!(bound_key(&f).await, None, "{format}: nothing was bound");
+
+            let gpg = new_key(&f, "gpg").await;
+            let (status, body) = post_config(
+                &f,
+                serde_json::json!({"signing_key_id": gpg, "sign_metadata": true}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{format}: {body}");
+            assert_eq!(bound_key(&f).await, Some(gpg), "{format}");
+
+            delete_keys(&f, &[rsa, gpg]).await;
+            f.teardown().await;
+        }
+    }
+
+    /// A format whose signatures are not OpenPGP keeps accepting an rsa key.
+    #[tokio::test]
+    async fn still_accepts_an_rsa_key_on_a_format_that_can_use_it_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let rsa = new_key(&f, "rsa").await;
+        let (status, body) = post_config(
+            &f,
+            serde_json::json!({"signing_key_id": rsa, "sign_metadata": true}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(bound_key(&f).await, Some(rsa));
+        delete_keys(&f, &[rsa]).await;
+        f.teardown().await;
+    }
+
+    /// An existing bad binding must not lock the operator out: signing can be
+    /// turned off and other flags changed, but it cannot be turned back on, and
+    /// the same key cannot be named again.
+    #[tokio::test]
+    async fn existing_rsa_binding_can_be_switched_off_but_not_on_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let rsa = new_key(&f, "rsa").await;
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        svc.update_signing_config(f.repo_id, Some(rsa), true, false, false)
+            .await
+            .expect("seed a binding from before the route's check");
+
+        let (status, body) = post_config(&f, serde_json::json!({"sign_metadata": false})).await;
+        assert_eq!(status, StatusCode::OK, "switching off: {body}");
+        let (status, body) =
+            post_config(&f, serde_json::json!({"require_signatures": false})).await;
+        assert_eq!(status, StatusCode::OK, "unrelated flag: {body}");
+
+        let (status, body) = post_config(&f, serde_json::json!({"sign_metadata": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "switching on: {body}");
+        let (status, body) = post_config(&f, serde_json::json!({"signing_key_id": rsa})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "naming it again: {body}");
+
+        delete_keys(&f, &[rsa]).await;
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_is_not_found_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (status, body) =
+            post_config(&f, serde_json::json!({"signing_key_id": Uuid::new_v4()})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        f.teardown().await;
     }
 }
