@@ -172,6 +172,16 @@ impl FilesystemStorage {
     }
 }
 
+/// Whether `name` is an atomic-write staging file of this backend: `.tmp.<uuid>`
+/// ([`temp_path_for_dest`]) or `<name>.tmp.<uuid>` (`put`), with the UUID in the
+/// hyphenated form both write. Any other name holding `.tmp.`, such as a Maven
+/// `x.tmp.jar`, is a real object (#5168).
+fn is_atomic_write_staging_name(name: &str) -> bool {
+    name.rsplit_once(".tmp.").is_some_and(|(_, suffix)| {
+        Uuid::try_parse(suffix).is_ok_and(|id| id.hyphenated().to_string() == suffix)
+    })
+}
+
 /// Blocking directory walk behind [`FilesystemStorage::list_keys`]: every
 /// regular file under `dir` as `{prefix}/{relative path}`, skipping atomic-write
 /// temp files. A missing directory is an empty namespace.
@@ -186,7 +196,7 @@ fn list_files_under(dir: &Path, prefix: &str) -> Result<Vec<super::ListedKey>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy();
-        if name.contains(".tmp.") {
+        if is_atomic_write_staging_name(&name) {
             continue;
         }
         let Ok(rel) = entry.path().strip_prefix(dir) else {
@@ -733,6 +743,80 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("'my-key'"), "got: {msg}");
         assert!(!msg.contains("path /"), "got: {msg}");
+    }
+
+    /// #5168: only the exact staging suffix marks a staging file.
+    #[test]
+    fn test_is_atomic_write_staging_name_5168() {
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        for staging in [format!(".tmp.{id}"), format!("x-1.0.jar.tmp.{id}")] {
+            assert!(is_atomic_write_staging_name(&staging), "{staging}");
+        }
+        for object in [
+            "x.tmp.jar".to_string(),
+            "x-1.0.tmp.jar.sha1".to_string(),
+            ".tmp.".to_string(),
+            "x.tmp.".to_string(),
+            "x.tmp".to_string(),
+            format!("x.tmp.{id}.jar"),
+            format!("x.tmp.{id}.tmp.jar"),
+            // Not the form `Uuid`'s Display writes.
+            format!("x.tmp.{}", id.replace('-', "")),
+            format!("x.tmp.{}", id.to_uppercase()),
+            format!("x.tmp.{{{id}}}"),
+            format!("x.tmp.urn:uuid:{id}"),
+        ] {
+            assert!(!is_atomic_write_staging_name(&object), "{object}");
+        }
+    }
+
+    /// #5168: the listing behind reindex finds an object whose name merely
+    /// holds `.tmp.`, and still hides the files both atomic writers stage.
+    #[tokio::test]
+    async fn test_list_keys_skips_only_atomic_write_staging_files_5168() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+        let dir_key = "maven/com/acme/x/1.0";
+        storage
+            .put(
+                &format!("{dir_key}/x-1.0.tmp.jar"),
+                Bytes::from_static(b"real object"),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                &format!("{dir_key}/x-1.0.jar"),
+                Bytes::from_static(b"plain object"),
+            )
+            .await
+            .unwrap();
+        let dir = storage.key_to_path(&format!("{dir_key}/x-1.0.jar"));
+        let dir = dir.parent().unwrap();
+        let dest = dir.join("y-1.0.jar");
+        let id = Uuid::new_v4();
+        let staged = temp_path_for_dest(&dest, "k", id).unwrap();
+        std::fs::write(&staged, b"in flight").unwrap();
+        let mut put_staged = dest.as_os_str().to_os_string();
+        put_staged.push(format!(".tmp.{id}"));
+        std::fs::write(&put_staged, b"in flight").unwrap();
+
+        let listed: Vec<String> = storage
+            .list_keys("maven/com")
+            .await
+            .unwrap()
+            .expect("the filesystem backend lists")
+            .into_iter()
+            .map(|l| l.key)
+            .collect();
+
+        assert_eq!(
+            listed,
+            vec![
+                format!("{dir_key}/x-1.0.jar"),
+                format!("{dir_key}/x-1.0.tmp.jar"),
+            ]
+        );
     }
 
     #[test]

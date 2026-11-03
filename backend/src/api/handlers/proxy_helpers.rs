@@ -15130,12 +15130,6 @@ mod tests {
     fn test_map_proxy_error_does_not_warn_for_anonymous_refusal_4526() {
         use crate::api::handlers::test_db_helpers::LogCapture;
         let url = "https://registry-1.docker.io/v2/library/missing/manifests/latest";
-        // With a single registered dispatcher, tracing-core computes a new
-        // callsite's interest from the REGISTERING thread's default, so a
-        // sibling test reaching these lines first (no subscriber on its
-        // thread) would cache "never" for them. A second live dispatcher makes
-        // registration consult every one.
-        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let capture = LogCapture::default();
         let guard = capture.install(tracing::Level::DEBUG);
         let anonymous = map_proxy_error(

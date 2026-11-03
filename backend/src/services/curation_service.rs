@@ -1934,8 +1934,7 @@ mod tests {
     // `RowNotFound` (update). These tests are DB-backed and skip silently when
     // `DATABASE_URL` is unset so offline `cargo test --lib` stays usable.
     async fn try_service() -> Option<CurationService> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let pool = crate::testing::try_pool_with(5).await?;
         Some(CurationService::new(pool))
     }
 

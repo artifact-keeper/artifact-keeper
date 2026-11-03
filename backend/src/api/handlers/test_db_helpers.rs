@@ -2151,15 +2151,17 @@ pub async fn subscribe_push_peer(pool: &PgPool, repo_id: Uuid, label: &str) -> U
 }
 
 /// #4725: the artifact paths in `repo_id` that have a queued `push` sync task
-/// for `peer_id`, ordered by path. A native-format hosted upload that forgot
-/// to queue replication yields an empty vector.
+/// for `peer_id`, in byte order of the path (#5011: not the database's
+/// collation, under which `en_US.UTF-8` sorts `commits/...` before `_labels`).
+/// A native-format hosted upload that forgot to queue replication yields an
+/// empty vector.
 pub async fn queued_push_paths(pool: &PgPool, peer_id: Uuid, repo_id: Uuid) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT a.path FROM sync_tasks st \
          JOIN artifacts a ON a.id = st.artifact_id \
          WHERE st.peer_instance_id = $1 AND st.task_type = 'push' \
            AND a.repository_id = $2 AND a.is_deleted = false \
-         ORDER BY a.path",
+         ORDER BY a.path COLLATE \"C\"",
     )
     .bind(peer_id)
     .bind(repo_id)
@@ -3504,17 +3506,53 @@ pub fn admin_auth_ext() -> Option<AuthExtension> {
     Some(admin_auth(Uuid::new_v4(), "tdh-resolver-admin"))
 }
 
-/// Collects `tracing` output written while a subscriber built with it as the
-/// writer is the thread default (`tracing::subscriber::set_default`). Clone
-/// it into the subscriber and read the text back with [`LogCapture::text`].
+/// Keeps a capturing subscriber installed as the thread default; see
+/// [`set_capture_default`].
+pub struct CaptureGuard {
+    _default: tracing::subscriber::DefaultGuard,
+    _second_dispatcher: tracing::Dispatch,
+}
+
+/// Install `subscriber` as this thread's default so that no other thread can
+/// switch off the log lines it is there to see (#4803).
+///
+/// While only one dispatcher is registered, tracing-core computes a new
+/// callsite's interest from the default of whichever thread reaches the
+/// callsite first. A sibling test or a spawned worker with no subscriber then
+/// caches "never" for that line, and the capture silently misses it. A second
+/// live dispatcher makes every computation consult all live dispatchers, so
+/// one is held for as long as the guard lives. The rebuild picks up callsites
+/// whose registration was in flight while the dispatchers were being added.
+///
+/// Only events on this thread reach the subscriber, so run the code under test
+/// on it (the default current-thread `#[tokio::test]` runtime does).
+pub fn set_capture_default<S>(subscriber: S) -> CaptureGuard
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    let second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    let default = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+    CaptureGuard {
+        _default: default,
+        _second_dispatcher: second_dispatcher,
+    }
+}
+
+/// Collects `tracing` output emitted on this thread while the guard returned
+/// by [`LogCapture::install`] lives; read it back with [`LogCapture::text`].
+///
+/// A test asserting that a line is ABSENT must also assert that a control line
+/// from the same capture is PRESENT. Without one, a capture that saw nothing
+/// at all passes the assertion.
 #[derive(Clone, Default)]
 pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl LogCapture {
     /// Install a thread-default subscriber at `level` writing into this
     /// capture; logs are captured until the returned guard drops.
-    pub fn install(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
+    pub fn install(&self, level: tracing::Level) -> CaptureGuard {
+        set_capture_default(
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
                 .with_max_level(level)
@@ -3546,6 +3584,26 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
     fn make_writer(&self) -> Self::Writer {
         self.clone()
     }
+}
+
+#[test]
+fn log_capture_sees_a_line_another_thread_reached_first_4803() {
+    fn line_under_test() {
+        tracing::debug!("4803 line under test");
+    }
+    let capture = LogCapture::default();
+    let _guard = capture.install(tracing::Level::DEBUG);
+    // A thread with no subscriber registers the callsite first, as a sibling
+    // test or a spawned worker does.
+    std::thread::spawn(line_under_test)
+        .join()
+        .expect("sibling thread");
+    line_under_test();
+    assert!(
+        capture.text().contains("4803 line under test"),
+        "a thread with no subscriber must not switch the line off: {:?}",
+        capture.text()
+    );
 }
 
 /// A transient failure of the virtual-member AUTHORIZATION query alone, for
