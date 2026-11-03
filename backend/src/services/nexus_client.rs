@@ -1165,29 +1165,6 @@ mod tests {
         assert_eq!(body, b"payload");
     }
 
-    /// Collects `tracing` output emitted on this thread while the guard lives.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[tokio::test]
     async fn test_retry_warnings_redact_source_credentials() {
         let server = MockServer::start().await;
@@ -1197,20 +1174,15 @@ mod tests {
             .mount(&server)
             .await;
 
-        let capture = LogCapture::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_max_level(tracing::Level::WARN)
-                .finish(),
-        );
+        let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
+        let _guard = capture.install(tracing::Level::WARN);
 
         // `source_connections.url` is accepted with userinfo, so the retry
         // warnings must never echo it verbatim (#2926).
         let client = retrying_client(server.uri().replace("http://", "http://svc:hunter2@"), 1);
         let _ = client.download_artifact("repo", "dir/file.bin").await;
 
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
         assert!(
             logs.contains("Nexus request failed"),
             "expected a retry warning, got {logs:?}"
