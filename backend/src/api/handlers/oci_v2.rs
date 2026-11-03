@@ -3072,7 +3072,7 @@ fn validate_oci_repository_format(repo_key: &str, format: &str) -> Result<(), Re
 /// Build an [`OciRepoInfo`] for a virtual repo's resolving MEMBER so the scan
 /// gate runs in the member's context (its id/key/upstream/storage), while the
 /// `image` path stays the pull's image name (#3023). Used only on the virtual
-/// manifest seam; the direct-Remote path keeps its own `resolve_repo`-built
+/// seams; the direct-Remote path keeps its own `resolve_repo`-built
 /// `OciRepoInfo`.
 fn oci_repo_info_from_member(
     member: &crate::models::repository::Repository,
@@ -6345,12 +6345,17 @@ async fn handle_head_blob(
 /// its last chunk, so a client never receives a complete-looking corrupt
 /// layer. A range pull is served unverified (only the whole object can be
 /// checked). `DOWNLOAD_VERIFY_CHECKSUMS=false` turns the check off.
+///
+/// The `502` carries [`crate::storage::verify::IntegrityFailure`];
+/// `on_stream_mismatch` runs when a larger blob is the one found corrupt, after
+/// its status has gone out.
 async fn serve_stored_blob(
     range_header: Option<&str>,
     total: u64,
     stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
     digest: &str,
     repo_key: &str,
+    on_stream_mismatch: Option<crate::storage::verify::MismatchHook>,
 ) -> Response {
     let base_headers = vec![
         (
@@ -6366,6 +6371,7 @@ async fn serve_stored_blob(
             |expected_sha256| crate::api::handlers::repositories::ServeVerification {
                 expected_sha256,
                 label: format!("{repo_key} blob {digest}"),
+                on_stream_mismatch,
             },
         );
     match crate::api::handlers::repositories::ranged_stream_response_checked(
@@ -6380,13 +6386,264 @@ async fn serve_stored_blob(
     {
         Ok(resp) => resp,
         Err(crate::error::AppError::CodedBadGateway { code, message }) => {
-            oci_error(StatusCode::BAD_GATEWAY, code, &message)
+            let mut response = oci_error(StatusCode::BAD_GATEWAY, code, &message);
+            if code == crate::storage::verify::STORED_OBJECT_INTEGRITY_CODE {
+                response
+                    .extensions_mut()
+                    .insert(crate::storage::verify::IntegrityFailure);
+            }
+            response
         }
         Err(e) => oci_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             &e.to_string(),
         ),
+    }
+}
+
+/// File name prefix of the spool a blob repair holds its upstream bytes in.
+const BLOB_REPAIR_SPOOL_PREFIX: &str = "oci-blob-repair-";
+
+/// A spool older than this was left by a process that died mid-repair.
+const BLOB_REPAIR_SPOOL_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The corrupt stored blob of a Remote repository, and where to refetch it
+/// (#5169). Owned so a repair can outlive the pull that found the corruption.
+#[derive(Clone)]
+struct BlobRepair {
+    repo_id: Uuid,
+    repo_key: String,
+    location: crate::storage::StorageLocation,
+    upstream_url: String,
+    upstream_path: String,
+    storage_key: String,
+    /// Canonical `sha256:<hex>`: an upper-case pull is looked up by this form.
+    digest: String,
+    expected_sha256: [u8; 32],
+    size_bytes: u64,
+}
+
+impl BlobRepair {
+    /// `None` when there is nothing to repair from (a hosted repository, or a
+    /// Remote without an upstream URL) or to check the new bytes against (a
+    /// digest that is not SHA-256).
+    fn for_remote(repo: &OciRepoInfo, storage_key: &str, digest: &str, total: u64) -> Option<Self> {
+        let digest = canonical_blob_lookup_digest(digest);
+        let expected_sha256 =
+            crate::storage::verify::parse_sha256_hex(digest.strip_prefix("sha256:")?)?;
+        Some(Self {
+            repo_id: repo.id,
+            repo_key: repo.key.clone(),
+            location: repo.location.clone(),
+            upstream_url: repo.upstream_url.clone()?,
+            upstream_path: remote_blob_cache_path(repo, &digest)?,
+            storage_key: storage_key.to_string(),
+            digest,
+            expected_sha256,
+            size_bytes: total,
+        })
+    }
+
+    /// Refetch the blob and overwrite the stored object. The bytes are spooled
+    /// and checked against the digest and the recorded size first, so nothing
+    /// is written unless they are the blob; the write itself replaces the
+    /// object atomically on every backend.
+    ///
+    /// The fetch is the Remote's ordinary one (origin policy, age gate,
+    /// upstream authentication, single-flight), digest-gated so wrong bytes
+    /// cannot enter the proxy cache. It may answer from that cache, which
+    /// spares the upstream, but the plain pull-through commits there without a
+    /// digest gate, so a cached copy can be wrong itself and would otherwise
+    /// pin the `502` for its effectively infinite lifetime: such a copy is
+    /// evicted and the upstream asked once.
+    async fn run(&self, state: &SharedState) -> crate::error::Result<()> {
+        use crate::error::AppError;
+
+        let proxy = state
+            .proxy_service
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("no proxy service".to_string()))?;
+        let storage = state.storage_for_repo(&self.location)?;
+        let spool_dir = crate::api::handlers::incus::staging_root(&state.config.storage_path);
+        tokio::fs::create_dir_all(&spool_dir)
+            .await
+            .map_err(|e| AppError::Storage(format!("blob repair spool directory: {e}")))?;
+        crate::services::rpm_repodata_builder::sweep_spool_files(
+            &spool_dir,
+            BLOB_REPAIR_SPOOL_PREFIX,
+            BLOB_REPAIR_SPOOL_MAX_AGE,
+        );
+
+        let mut cache_may_answer = proxy
+            .is_cache_fresh(&self.repo_key, &self.upstream_path)
+            .await;
+        let spool = loop {
+            let spool = tempfile::Builder::new()
+                .prefix(BLOB_REPAIR_SPOOL_PREFIX)
+                .tempfile_in(&spool_dir)
+                .map_err(|e| AppError::Storage(format!("blob repair spool file: {e}")))?;
+            // UNRECORDED-PROXY-SERVE: a blob, not a pull (#2260), and these
+            // bytes are not served: the pull is answered from the store.
+            let fetched = proxy_helpers::proxy_fetch_streaming_with_cache_key_verified(
+                proxy,
+                self.repo_id,
+                &self.repo_key,
+                &self.upstream_url,
+                &self.upstream_path,
+                &self.upstream_path,
+                self.digest.strip_prefix("sha256:").map(str::to_string),
+                RepositoryFormat::Docker,
+            )
+            .await
+            .map_err(|response| {
+                AppError::BadGateway(format!("upstream answered {}", response.status()))
+            })?;
+            let (intact, _) = crate::storage::verify::spool_and_verify(
+                fetched.body,
+                &spool,
+                &self.expected_sha256,
+                Some(self.size_bytes),
+            )
+            .await?;
+            if intact {
+                break spool;
+            }
+            if !cache_may_answer {
+                return Err(AppError::BadGateway(
+                    "upstream bytes do not match the digest".to_string(),
+                ));
+            }
+            cache_may_answer = false;
+            proxy
+                .invalidate_cache_by_key(&self.repo_key, &self.upstream_path)
+                .await?;
+        };
+
+        // A row deleted or re-pointed during the fetch must not be resurrected.
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM oci_blobs \
+             WHERE repository_id = $1 AND digest = $2 AND storage_key = $3)",
+        )
+        .bind(self.repo_id)
+        .bind(&self.digest)
+        .bind(&self.storage_key)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if !live {
+            return Err(AppError::Internal(
+                "the blob's row went away during the repair".to_string(),
+            ));
+        }
+        storage.put_file(&self.storage_key, spool.path()).await
+    }
+
+    /// [`Self::run`] with its outcome logged, for the operator who has to find
+    /// out that this object went bad. Returns whether the object was repaired.
+    async fn run_logged(&self, state: &SharedState) -> bool {
+        match self.run(state).await {
+            Ok(()) => {
+                info!(repo = %self.repo_key, digest = %self.digest, storage_key = %self.storage_key, "Repaired a corrupt stored blob from upstream");
+                true
+            }
+            Err(e) => {
+                warn!(repo = %self.repo_key, digest = %self.digest, storage_key = %self.storage_key, "Could not repair a corrupt stored blob from upstream: {}", e);
+                false
+            }
+        }
+    }
+
+    /// The repair to run when the corruption shows only after the `200` went
+    /// out. It cannot help that pull, so it runs detached for the client's
+    /// retry, one at a time per blob: every pull that streams this object to
+    /// its end finds the same corruption.
+    fn detached(self, state: SharedState) -> crate::storage::verify::MismatchHook {
+        Box::new(move || {
+            let Some(claim) = BlobRepairClaim::take(self.repo_id, &self.digest) else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _claim = claim;
+                self.run_logged(&state).await;
+            });
+        })
+    }
+}
+
+/// The blobs a detached repair is running for, held by [`BlobRepairClaim`].
+static BLOB_REPAIRS_RUNNING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(Uuid, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// One running detached repair of a blob; dropping it frees the blob.
+struct BlobRepairClaim((Uuid, String));
+
+impl BlobRepairClaim {
+    fn take(repo_id: Uuid, digest: &str) -> Option<Self> {
+        let key = (repo_id, digest.to_string());
+        let mut running = BLOB_REPAIRS_RUNNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        running.insert(key.clone()).then_some(Self(key))
+    }
+}
+
+impl Drop for BlobRepairClaim {
+    fn drop(&mut self) {
+        BLOB_REPAIRS_RUNNING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// [`serve_stored_blob`], for a Remote treating corruption as a cache miss
+/// (#5169): a blob that fails verification before the headers is refetched,
+/// and when the new bytes hash to the digest the corrupt object is overwritten
+/// and the pull answered from the store, verified again like any other serve.
+/// Otherwise the pull keeps the `502`. Upstream bytes are never served directly
+/// from here.
+///
+/// A larger blob is only found corrupt after its `200` went out, so that pull
+/// is aborted as on a hosted repository and the repair runs behind it, for the
+/// retry. Hosted repositories have no upstream and keep the plain serve. A
+/// sub-range is not verified, so it cannot start a repair; HEAD and a presigned
+/// redirect read nothing here and cannot either.
+#[allow(clippy::too_many_arguments)]
+async fn serve_stored_blob_or_repair(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+    size_bytes: i64,
+    range_header: Option<&str>,
+    stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    digest: &str,
+) -> Response {
+    let total = size_bytes.max(0) as u64;
+    let Some(repair) = BlobRepair::for_remote(repo, storage_key, digest, total) else {
+        return serve_stored_blob(range_header, total, stream, digest, &repo.key, None).await;
+    };
+    let on_stream_mismatch = repair.clone().detached(state.clone());
+    let served = serve_stored_blob(
+        range_header,
+        total,
+        stream,
+        digest,
+        &repo.key,
+        Some(on_stream_mismatch),
+    )
+    .await;
+    if !crate::storage::verify::is_integrity_failure(&served) || !repair.run_logged(state).await {
+        return served;
+    }
+    match storage.get_stream(storage_key).await {
+        Ok(stream) => serve_stored_blob(range_header, total, stream, digest, &repo.key, None).await,
+        Err(e) => {
+            warn!(repo = %repo.key, digest = %digest, storage_key = %storage_key, "GET blob: storage.get_stream failed after the repair: {}", e);
+            served
+        }
     }
 }
 
@@ -6509,12 +6766,15 @@ async fn handle_get_blob(
                     // #3586: range-aware streaming so an interrupted pull can
                     // resume (OCI Distribution Spec "resumable pull"). The
                     // window is sliced at chunk boundaries, never buffered.
-                    return serve_stored_blob(
+                    return serve_stored_blob_or_repair(
+                        state,
+                        &repo,
+                        storage.as_ref(),
+                        &b.storage_key,
+                        b.size_bytes,
                         range_header,
-                        b.size_bytes.max(0) as u64,
                         stream,
                         digest,
-                        &repo.key,
                     )
                     .await;
                 }
@@ -6570,12 +6830,15 @@ async fn handle_get_blob(
                     // Stream rather than buffer the resolved member blob. (#1528)
                     match storage.get_stream(&storage_key).await {
                         Ok(stream) => {
-                            serve_stored_blob(
+                            serve_stored_blob_or_repair(
+                                state,
+                                &oci_repo_info_from_member(&member, &repo.image),
+                                storage.as_ref(),
+                                &storage_key,
+                                size_bytes,
                                 range_header,
-                                size_bytes.max(0) as u64,
                                 stream,
                                 digest,
-                                &member.key,
                             )
                             .await
                         }
@@ -19226,6 +19489,466 @@ mod blob_pull_streaming_tests {
             collected.is_err(),
             "a corrupt blob must not be served to completion"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5169: on a Remote, a stored blob that fails verification is a cache miss.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod remote_blob_repair_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const GOOD: &[u8] = b"the layer the upstream registry publishes";
+
+    /// A repository wired to a wiremock upstream, holding (once `seed` ran) a
+    /// stored object that does not hash to its digest.
+    struct Corrupt {
+        fx: tdh::Fixture,
+        server: MockServer,
+        state: SharedState,
+        cache_dir: tempfile::TempDir,
+        good: Vec<u8>,
+        corrupt: Vec<u8>,
+        digest: String,
+        key: String,
+    }
+
+    impl Corrupt {
+        /// `None` without a database. The object is not stored yet; `seed` does
+        /// that, so a test can drive the upstream first.
+        async fn unseeded(repo_type: &str, good: Vec<u8>) -> Option<Self> {
+            let fx = tdh::Fixture::setup(repo_type, "docker").await?;
+            sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+                .bind(fx.repo_id)
+                .execute(&fx.pool)
+                .await
+                .expect("make repo public");
+            let server = MockServer::start().await;
+            let (state, cache_dir) = tdh::rewire_remote_proxy(&fx, &server.uri()).await;
+            let digest = compute_sha256(&good);
+            // Same length, one byte different: bit rot in the stored object.
+            let mut corrupt = good.clone();
+            let last = corrupt.len() - 1;
+            corrupt[last] ^= 0x01;
+            let key = format!("oci-blobs/{digest}");
+            Some(Self {
+                fx,
+                server,
+                state,
+                cache_dir,
+                good,
+                corrupt,
+                digest,
+                key,
+            })
+        }
+
+        async fn new(repo_type: &str, good: Vec<u8>) -> Option<Self> {
+            let this = Self::unseeded(repo_type, good).await?;
+            this.seed().await;
+            Some(this)
+        }
+
+        async fn seed(&self) {
+            self.storage()
+                .put(&self.key, Bytes::from(self.corrupt.clone()))
+                .await
+                .expect("write corrupt object");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(self.fx.repo_id)
+            .bind(&self.digest)
+            .bind(self.good.len() as i64)
+            .bind(&self.key)
+            .execute(&self.fx.pool)
+            .await
+            .expect("insert oci_blobs row");
+        }
+
+        fn storage(&self) -> Arc<dyn crate::storage::StorageBackend> {
+            self.state
+                .storage_for_repo(&crate::storage::StorageLocation {
+                    backend: "filesystem".to_string(),
+                    path: self.fx.storage_dir.to_string_lossy().into_owned(),
+                })
+                .expect("resolve storage")
+        }
+
+        async fn stored(&self) -> Bytes {
+            self.storage().get(&self.key).await.expect("read object")
+        }
+
+        fn upstream_path(&self) -> String {
+            format!("/v2/myimage/blobs/{}", self.digest)
+        }
+
+        /// Answer the blob GET with `response`, at most `hits` times.
+        async fn upstream(&self, response: ResponseTemplate, hits: impl Into<wiremock::Times>) {
+            Mock::given(method("GET"))
+                .and(path(self.upstream_path()))
+                .respond_with(response)
+                .expect(hits)
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn pull_from(
+            &self,
+            verb: &str,
+            repo_key: &str,
+            range: Option<&str>,
+        ) -> axum::response::Response {
+            let mut req = Request::builder()
+                .method(verb)
+                .uri(format!("/{repo_key}/myimage/blobs/{}", self.digest))
+                .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"));
+            if let Some(range) = range {
+                req = req.header(RANGE, range);
+            }
+            tdh::router_anon(router(None), self.state.clone())
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .expect("oneshot")
+        }
+
+        async fn pull(&self, range: Option<&str>) -> axum::response::Response {
+            self.pull_from("GET", &self.fx.repo_key, range).await
+        }
+
+        async fn assert_keeps_502(&self, what: &str) {
+            let (status, body, _) = tdh::collect_response(self.pull(None).await).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{what}");
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains(crate::storage::verify::STORED_OBJECT_INTEGRITY_CODE),
+                "{what}: error body: {text}"
+            );
+            assert_eq!(
+                &self.stored().await[..],
+                &self.corrupt[..],
+                "{what}: the stored object must be left alone"
+            );
+        }
+    }
+
+    fn body_of(bytes: &[u8]) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/octet-stream")
+            .set_body_bytes(bytes.to_vec())
+    }
+
+    /// FAILS ON MAIN (502): the corrupt copy is the answer on every pull.
+    #[tokio::test]
+    async fn remote_repairs_a_corrupt_blob_and_serves_the_next_pull_from_the_store_5169() {
+        let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 1).await;
+
+        let (status, body, headers) = tdh::collect_response(t.pull(None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], GOOD);
+        assert_eq!(
+            headers
+                .get("Docker-Content-Digest")
+                .and_then(|v| v.to_str().ok()),
+            Some(t.digest.as_str())
+        );
+        assert_eq!(&t.stored().await[..], GOOD, "corrupt object overwritten");
+
+        // Next pull: answered from the store. `expect(1)` above fails on drop
+        // if it went upstream again.
+        let (status, body, _) = tdh::collect_response(t.pull(None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], GOOD);
+
+        t.fx.teardown().await;
+    }
+
+    /// An upper-case pull resolves the row by its canonical digest, so the
+    /// repair must fetch and check that same canonical digest.
+    ///
+    /// FAILS ON MAIN (502).
+    #[tokio::test]
+    async fn remote_repairs_on_a_pull_naming_the_digest_in_upper_case_5169() {
+        let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 1).await;
+        let upper = format!(
+            "sha256:{}",
+            t.digest.trim_start_matches("sha256:").to_uppercase()
+        );
+        let req = Request::builder()
+            .uri(format!("/{}/myimage/blobs/{upper}", t.fx.repo_key))
+            .header(AUTHORIZATION, format!("Bearer {ANONYMOUS_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = tdh::router_anon(router(None), t.state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let (status, body, _) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], GOOD);
+        assert_eq!(&t.stored().await[..], GOOD);
+        t.fx.teardown().await;
+    }
+
+    /// The upstream failing leaves nothing better than the `502`.
+    #[tokio::test]
+    async fn remote_keeps_502_when_the_upstream_fails_5169() {
+        for upstream_status in [404u16, 500] {
+            let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+                return;
+            };
+            t.upstream(ResponseTemplate::new(upstream_status), 1..)
+                .await;
+            t.assert_keeps_502(&format!("upstream {upstream_status}"))
+                .await;
+            t.fx.teardown().await;
+        }
+    }
+
+    /// A Remote the serve cannot reach an upstream through at all.
+    #[tokio::test]
+    async fn remote_keeps_502_without_a_proxy_service_5169() {
+        let Some(t) = Corrupt::unseeded("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        let bare = Corrupt {
+            state: t.fx.state.clone(),
+            ..t
+        };
+        bare.seed().await;
+        bare.assert_keeps_502("no proxy service").await;
+        bare.fx.teardown().await;
+    }
+
+    /// Bytes that do not hash to the digest are neither served nor stored, and
+    /// do not stick: the next pull asks again and repairs.
+    #[tokio::test]
+    async fn remote_keeps_502_and_does_not_overwrite_when_the_upstream_lies_5169() {
+        let same_len = vec![b'x'; GOOD.len()];
+        let longer = vec![b'y'; GOOD.len() * 2];
+        for wrong in [same_len, longer] {
+            let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+                return;
+            };
+            t.upstream(body_of(&wrong), 1..).await;
+            let resp = t.pull(None).await;
+            let (status, body, _) = tdh::collect_response(resp).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(
+                !body.windows(8).any(|w| w == &wrong[..8]),
+                "unverified upstream bytes must not be served"
+            );
+            assert_eq!(&t.stored().await[..], &t.corrupt[..], "not overwritten");
+
+            t.server.reset().await;
+            t.upstream(body_of(GOOD), 1).await;
+            let (status, body, _) = tdh::collect_response(t.pull(None).await).await;
+            assert_eq!(status, StatusCode::OK, "the lie must not be remembered");
+            assert_eq!(&body[..], GOOD);
+            assert_eq!(&t.stored().await[..], GOOD);
+            t.fx.teardown().await;
+        }
+    }
+
+    /// A proxy-cache copy that does not hash to the digest would otherwise pin
+    /// the `502` for its effectively infinite lifetime: the plain Remote
+    /// pull-through commits to the cache without a digest gate.
+    ///
+    /// FAILS ON MAIN (502).
+    #[tokio::test]
+    async fn remote_repair_gets_past_a_corrupt_proxy_cache_entry_5169() {
+        let Some(t) = Corrupt::unseeded("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        let wrong = vec![b'x'; GOOD.len()];
+        t.upstream(body_of(&wrong), 1).await;
+        let (status, body, _) = tdh::collect_response(t.pull(None).await).await;
+        assert_eq!(status, StatusCode::OK, "no row: plain pull-through");
+        assert_eq!(&body[..], &wrong[..]);
+        tdh::wait_for_cache_commit(t.cache_dir.path(), wrong.len() as u64).await;
+
+        t.seed().await;
+        t.server.reset().await;
+        t.upstream(body_of(GOOD), 1).await;
+        let (status, body, _) = tdh::collect_response(t.pull(None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], GOOD);
+        assert_eq!(&t.stored().await[..], GOOD);
+        t.fx.teardown().await;
+    }
+
+    /// Hosted repositories have no upstream to repair from, even when their row
+    /// happens to carry an upstream URL.
+    #[tokio::test]
+    async fn hosted_keeps_502_5169() {
+        for repo_type in ["local", "staging"] {
+            let Some(t) = Corrupt::new(repo_type, GOOD.to_vec()).await else {
+                return;
+            };
+            t.upstream(body_of(GOOD), 0).await;
+            t.assert_keeps_502(repo_type).await;
+            t.fx.teardown().await;
+        }
+    }
+
+    /// `bytes=0-` delivers every byte, so it is verified, repaired, and still
+    /// answered as the range it asked for.
+    ///
+    /// FAILS ON MAIN (502).
+    #[tokio::test]
+    async fn remote_repairs_on_a_whole_object_range_and_answers_206_5169() {
+        let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 1).await;
+        let (status, body, headers) = tdh::collect_response(t.pull(Some("bytes=0-")).await).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], GOOD);
+        assert_eq!(
+            tdh::header_str(&headers, axum::http::header::CONTENT_RANGE),
+            Some(format!("bytes 0-{}/{}", GOOD.len() - 1, GOOD.len()))
+        );
+        assert_eq!(&t.stored().await[..], GOOD);
+        t.fx.teardown().await;
+    }
+
+    /// A proper sub-range cannot be checked against a whole-object digest, so
+    /// it keeps being served from the store and starts no refetch; HEAD reads
+    /// nothing and answers from the row. Neither touches the object.
+    #[tokio::test]
+    async fn remote_sub_range_and_head_do_not_refetch_5169() {
+        let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 0).await;
+
+        let (status, body, _) = tdh::collect_response(t.pull(Some("bytes=0-3")).await).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &GOOD[..4]);
+
+        let resp = t.pull_from("HEAD", &t.fx.repo_key, None).await;
+        let (status, body, headers) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(
+            tdh::header_str(&headers, CONTENT_LENGTH),
+            Some(GOOD.len().to_string())
+        );
+        assert_eq!(&t.stored().await[..], &t.corrupt[..]);
+        t.fx.teardown().await;
+    }
+
+    /// A blob too large to verify before the headers has its `200` on the wire
+    /// when the mismatch shows, so that pull can only be aborted; the object is
+    /// repaired behind it and the client's retry succeeds.
+    ///
+    /// FAILS ON MAIN: the object is never repaired.
+    #[tokio::test]
+    async fn remote_large_corrupt_blob_aborts_then_is_repaired_for_the_retry_5169() {
+        let size = crate::storage::verify::VERIFY_BEFORE_HEADERS_MAX_BYTES as usize + 64 * 1024;
+        let good: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let Some(t) = Corrupt::new("remote", good.clone()).await else {
+            return;
+        };
+        t.upstream(body_of(&good), 1).await;
+
+        let resp = t.pull(None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "sent before the end");
+        assert!(
+            axum::body::to_bytes(resp.into_body(), 64 * 1024 * 1024)
+                .await
+                .is_err(),
+            "a corrupt blob must not be served to completion"
+        );
+
+        let mut repaired = false;
+        for _ in 0..1200 {
+            if t.stored().await[..] == good[..] {
+                repaired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(repaired, "the object must be repaired behind the abort");
+
+        let (status, body, _) = tdh::collect_response(t.pull(None).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &good[..]);
+        t.fx.teardown().await;
+    }
+
+    /// The same blob held by a Remote member, pulled through a Virtual.
+    ///
+    /// FAILS ON MAIN (502).
+    #[tokio::test]
+    async fn virtual_repairs_a_remote_members_corrupt_blob_5169() {
+        let Some(t) = Corrupt::new("remote", GOOD.to_vec()).await else {
+            return;
+        };
+        t.upstream(body_of(GOOD), 1).await;
+        let (virtual_id, virtual_key, _) = tdh::create_repo(&t.fx.pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&t.fx.pool)
+            .await
+            .expect("make virtual public");
+        tdh::link_virtual_member(&t.fx.pool, virtual_id, t.fx.repo_id, 1).await;
+
+        let resp = t.pull_from("GET", &virtual_key, None).await;
+        let (status, body, _) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], GOOD);
+        assert_eq!(&t.stored().await[..], GOOD);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&t.fx.pool)
+            .await;
+        t.fx.teardown().await;
+    }
+
+    /// A Virtual's hosted member keeps the `502`.
+    #[tokio::test]
+    async fn virtual_keeps_502_for_a_hosted_members_corrupt_blob_5169() {
+        let Some(t) = Corrupt::new("local", GOOD.to_vec()).await else {
+            return;
+        };
+        let (virtual_id, virtual_key, _) = tdh::create_repo(&t.fx.pool, "virtual", "docker").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&t.fx.pool)
+            .await
+            .expect("make virtual public");
+        tdh::link_virtual_member(&t.fx.pool, virtual_id, t.fx.repo_id, 1).await;
+
+        let resp = t.pull_from("GET", &virtual_key, None).await;
+        let (status, _, _) = tdh::collect_response(resp).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(&t.stored().await[..], &t.corrupt[..]);
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(virtual_id)
+            .execute(&t.fx.pool)
+            .await;
+        t.fx.teardown().await;
     }
 }
 

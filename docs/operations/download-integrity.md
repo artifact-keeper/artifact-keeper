@@ -16,11 +16,12 @@ as a clean response under its original digest (#3919, #4323).
   VS Code extensions and sbt.
 - Incus image downloads, checked against the `X-Checksum-Sha256` the
   response advertises (a mismatch aborts the transfer before its last bytes).
-- OCI blob pulls (`GET /v2/<name>/blobs/<digest>`) served from a hosted
-  repository's stored blobs or a Virtual's hosted member, checked against the
-  blob's digest (`Docker-Content-Digest`). The error body is the OCI error
-  shape, `{"errors": [{"code": "STORED_OBJECT_INTEGRITY", ...}]}`. Blobs
-  streamed from an upstream on a proxy miss are not checked.
+- OCI blob pulls (`GET /v2/<name>/blobs/<digest>`) served from a repository's
+  stored blobs or a Virtual's local member, checked against the blob's digest
+  (`Docker-Content-Digest`). The error body is the OCI error shape,
+  `{"errors": [{"code": "STORED_OBJECT_INTEGRITY", ...}]}`. A Remote repairs
+  what it finds (see below). Blobs streamed from an upstream on a proxy miss
+  are not checked.
 
 Not yet covered: the Maven, npm, PyPI, Cargo, NuGet and
 Helm hosted download handlers, which read storage through their own paths. Protobuf commit bundles are never
@@ -44,6 +45,36 @@ the stored bundle.
 - A `HEAD` on the generic route, including one a virtual repository answers
   from a hosted member there (#4989), or one the shared hosted fetch answers
   from the artifact row, reads no body and is not checked.
+
+## Repair on a Remote OCI repository
+
+A Remote can hold a stored copy of a blob (for example a layer staged for the
+inline proxy scan), and it has an upstream to replace a corrupt copy from
+(#5169), directly or as a member of a Virtual:
+
+- A blob of at most 4 MiB that fails the check is treated as a cache miss. It
+  is fetched again through the Remote's usual gates. Once the new bytes hash to
+  the digest and match the recorded size they overwrite the stored object, and
+  the pull is answered from the store, `200` (or `206` for a range covering
+  the whole object).
+- If the fetch fails or its bytes do not match, the pull keeps the `502` and
+  the stored object is not touched. A proxy-cache copy that does not match is
+  evicted, and the upstream is asked once.
+- A larger blob, or a small one that had no room in the verification budget,
+  is only found corrupt after the `200` went out. That transfer is aborted as
+  above and the object is repaired in the background, so the client's retry
+  succeeds.
+- The new bytes are spooled in the upload staging directory
+  (`AK_UPLOAD_STAGING_DIR`, default `<STORAGE_PATH>/.incoming`) while they are
+  checked, so a repair needs free space there for one copy of the blob.
+- A `HEAD`, a range for part of the object and a presigned redirect
+  (`PRESIGNED_DOWNLOADS_ENABLED`) read no whole object here, so they do not
+  detect corruption and do not start a repair.
+
+Hosted (local and staging) repositories have no upstream and keep the `502`.
+
+Each repair logs its outcome at `info` (`Repaired a corrupt stored blob from
+upstream`) or `warn` (`Could not repair a corrupt stored blob from upstream`).
 
 ## Cost
 

@@ -109,7 +109,13 @@ struct VerifyState {
     len: u64,
     pending: Option<Bytes>,
     done: bool,
+    on_mismatch: Option<MismatchHook>,
 }
+
+/// Runs once when a streaming verification finds that the bytes do not match
+/// their record (#5169). A storage read error or a client that went away
+/// before the end is not a mismatch and does not run it.
+pub type MismatchHook = Box<dyn FnOnce() + Send + 'static>;
 
 /// Wrap `body` so it is verified against `expected` (and `expected_len`)
 /// while streaming.
@@ -125,12 +131,25 @@ pub fn verify_sha256_stream(
     expected_len: Option<u64>,
     label: String,
 ) -> BoxStream<'static, Result<Bytes>> {
+    verify_sha256_stream_with_hook(body, expected, expected_len, label, None)
+}
+
+/// [`verify_sha256_stream`] that also runs `on_mismatch` when it aborts the
+/// stream over a mismatch.
+pub fn verify_sha256_stream_with_hook(
+    body: BoxStream<'static, Result<Bytes>>,
+    expected: [u8; 32],
+    expected_len: Option<u64>,
+    label: String,
+    on_mismatch: Option<MismatchHook>,
+) -> BoxStream<'static, Result<Bytes>> {
     let state = VerifyState {
         inner: body,
         hasher: Sha256::new(),
         len: 0,
         pending: None,
         done: false,
+        on_mismatch,
     };
     futures::stream::unfold(state, move |mut st| {
         let label = label.clone();
@@ -160,6 +179,9 @@ pub fn verify_sha256_stream(
                                 expected_len = ?expected_len,
                                 "stored object is longer than its record; aborting response"
                             );
+                            if let Some(hook) = st.on_mismatch.take() {
+                                hook();
+                            }
                             return Some((
                                 Err(AppError::Storage(format!(
                                     "stored object for {label} is longer than recorded"
@@ -195,6 +217,9 @@ pub fn verify_sha256_stream(
                                     "stored object failed integrity verification on serve; aborting response"
                                 );
                                 st.pending = None;
+                                if let Some(hook) = st.on_mismatch.take() {
+                                    hook();
+                                }
                                 return Some((
                                     Err(AppError::Storage(format!(
                                         "stored object for {label} failed SHA-256 verification"
@@ -311,6 +336,40 @@ fn held_body(
     .boxed()
 }
 
+/// Stream `body` into `spool` while hashing it. Returns whether the bytes hash
+/// to `expected` (and match `expected_len`, when given), with the number of
+/// bytes read. Reading stops as soon as the body is longer than `expected_len`,
+/// so a body that never ends cannot fill the disk. Memory stays at one chunk. A
+/// caller must not use the spool unless this returned `true`.
+pub async fn spool_and_verify(
+    mut body: BoxStream<'static, Result<Bytes>>,
+    spool: &tempfile::NamedTempFile,
+    expected: &[u8; 32],
+    expected_len: Option<u64>,
+) -> Result<(bool, u64)> {
+    use tokio::io::AsyncWriteExt;
+
+    let spool_error = |e: std::io::Error| AppError::Storage(format!("spool file: {e}"));
+    let mut file = tokio::fs::File::create(spool.path())
+        .await
+        .map_err(spool_error)?;
+    let mut hasher = Sha256::new();
+    let mut read = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        read += chunk.len() as u64;
+        if expected_len.is_some_and(|l| read > l) {
+            return Ok((false, read));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(spool_error)?;
+    }
+    file.flush().await.map_err(spool_error)?;
+    let intact =
+        verdict(expected, expected_len, &hasher.finalize(), read) == IntegrityVerdict::Intact;
+    Ok((intact, read))
+}
+
 /// Machine-readable `code` of the `502` a failed verification answers with.
 pub const STORED_OBJECT_INTEGRITY_CODE: &str = "STORED_OBJECT_INTEGRITY";
 
@@ -390,21 +449,59 @@ pub async fn verify_before_serve(
     total: u64,
     label: String,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
-    verify_before_serve_with_budget(serve_verify_buffer_budget(), body, expected, total, label)
-        .await
+    verify_before_serve_with_hook(body, expected, total, label, None).await
+}
+
+/// [`verify_before_serve`] that runs `on_mismatch` if the object ends up
+/// verified while streaming and fails there (#5169). A mismatch found before
+/// the headers is the returned `Err`, and the hook does not run.
+pub async fn verify_before_serve_with_hook(
+    body: BoxStream<'static, Result<Bytes>>,
+    expected: [u8; 32],
+    total: u64,
+    label: String,
+    on_mismatch: Option<MismatchHook>,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
+    verify_against_budget(
+        serve_verify_buffer_budget(),
+        body,
+        expected,
+        total,
+        label,
+        on_mismatch,
+    )
+    .await
 }
 
 /// [`verify_before_serve`] against an explicit budget, so a test can exhaust
 /// one of its own without touching the process-wide budget other serves use.
+#[cfg(test)]
 pub(crate) async fn verify_before_serve_with_budget(
+    budget: &'static ByteBudget,
+    body: BoxStream<'static, Result<Bytes>>,
+    expected: [u8; 32],
+    total: u64,
+    label: String,
+) -> Result<BoxStream<'static, Result<Bytes>>> {
+    verify_against_budget(budget, body, expected, total, label, None).await
+}
+
+async fn verify_against_budget(
     budget: &'static ByteBudget,
     mut body: BoxStream<'static, Result<Bytes>>,
     expected: [u8; 32],
     total: u64,
     label: String,
+    on_mismatch: Option<MismatchHook>,
 ) -> Result<BoxStream<'static, Result<Bytes>>> {
     if total > VERIFY_BEFORE_HEADERS_MAX_BYTES {
-        return Ok(verify_sha256_stream(body, expected, Some(total), label));
+        return Ok(verify_sha256_stream_with_hook(
+            body,
+            expected,
+            Some(total),
+            label,
+            on_mismatch,
+        ));
     }
     let Some(hold) = VerifyBufferHold::try_reserve(budget, total) else {
         crate::services::metrics_service::record_serve_verify_buffer_fallback();
@@ -413,7 +510,13 @@ pub(crate) async fn verify_before_serve_with_budget(
             total,
             "verification buffer budget has no room; verifying while streaming instead (#4989)"
         );
-        return Ok(verify_sha256_stream(body, expected, Some(total), label));
+        return Ok(verify_sha256_stream_with_hook(
+            body,
+            expected,
+            Some(total),
+            label,
+            on_mismatch,
+        ));
     };
     let mut hasher = Sha256::new();
     let mut held = Vec::new();
@@ -595,6 +698,106 @@ mod tests {
         let (bytes, err) = collect(s).await;
         assert!(matches!(err, Some(AppError::Storage(_))), "got {err:?}");
         assert_eq!(bytes, b"hello ", "the last chunk must be withheld");
+    }
+
+    fn counting_hook() -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, MismatchHook) {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ran.clone();
+        let hook: MismatchHook = Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        (ran, hook)
+    }
+
+    /// #5169: the hook is how a Remote learns that a transfer it could only
+    /// abort found corruption, for a digest mismatch and for an overlong
+    /// object alike, and for nothing else.
+    #[tokio::test]
+    async fn mismatch_hook_runs_once_on_a_mismatch_only_5169() {
+        let digest = sha(b"abc");
+        let hook_runs = |body: BoxStream<'static, Result<Bytes>>| async move {
+            let (ran, hook) = counting_hook();
+            let s = verify_sha256_stream_with_hook(body, digest, Some(3), "t".into(), Some(hook));
+            collect(s).await;
+            ran.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        assert_eq!(hook_runs(chunks(&[b"abd"])).await, 1, "wrong bytes");
+        assert_eq!(hook_runs(chunks(&[b"ab"])).await, 1, "short");
+        assert_eq!(hook_runs(chunks(&[b"abc", b"d"])).await, 1, "long");
+        assert_eq!(hook_runs(chunks(&[b"a", b"bc"])).await, 0, "intact");
+        let read_error = futures::stream::iter(vec![Err(AppError::Storage("io".into()))]).boxed();
+        assert_eq!(hook_runs(read_error).await, 0, "a read error");
+    }
+
+    /// #5169: above the before-headers limit the hook reaches the streaming
+    /// verifier; a mismatch found before the headers is the `Err` instead.
+    #[tokio::test]
+    async fn verify_before_serve_hands_the_hook_to_the_streaming_verifier_5169() {
+        let (ran, hook) = counting_hook();
+        let err = verify_before_serve_with_hook(
+            chunks(&[b"abd"]),
+            sha(b"abc"),
+            3,
+            "t".into(),
+            Some(hook),
+        )
+        .await;
+        assert!(err.is_err());
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (ran, hook) = counting_hook();
+        let total = VERIFY_BEFORE_HEADERS_MAX_BYTES + 1;
+        let s = verify_before_serve_with_hook(
+            chunks(&[b"x"]),
+            sha(b"x"),
+            total,
+            "t".into(),
+            Some(hook),
+        )
+        .await
+        .expect("streamed, not checked yet");
+        collect(s).await;
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// #5169: the spool says yes only for the exact bytes, and stops reading a
+    /// body that outgrows the record.
+    #[tokio::test]
+    async fn spool_and_verify_accepts_only_the_exact_bytes_5169() {
+        let spool = tempfile::NamedTempFile::new().unwrap();
+        let expected = sha(b"abc");
+        let (ok, read) = spool_and_verify(chunks(&[b"a", b"bc"]), &spool, &expected, Some(3))
+            .await
+            .unwrap();
+        assert!(ok);
+        assert_eq!(read, 3);
+        assert_eq!(std::fs::read(spool.path()).unwrap(), b"abc");
+
+        for (body, what) in [
+            (chunks(&[b"abd"]), "wrong bytes"),
+            (chunks(&[b"ab"]), "short"),
+            (chunks(&[b"abc", b"d"]), "long"),
+        ] {
+            let spool = tempfile::NamedTempFile::new().unwrap();
+            let (ok, _) = spool_and_verify(body, &spool, &expected, Some(3))
+                .await
+                .unwrap();
+            assert!(!ok, "{what}");
+        }
+
+        // Without a recorded length only the digest decides.
+        let spool = tempfile::NamedTempFile::new().unwrap();
+        let (ok, read) = spool_and_verify(chunks(&[b"abc"]), &spool, &expected, None)
+            .await
+            .unwrap();
+        assert!(ok);
+        assert_eq!(read, 3);
+
+        let spool = tempfile::NamedTempFile::new().unwrap();
+        let failing = futures::stream::iter(vec![Err(AppError::Storage("io".into()))]).boxed();
+        assert!(spool_and_verify(failing, &spool, &expected, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
