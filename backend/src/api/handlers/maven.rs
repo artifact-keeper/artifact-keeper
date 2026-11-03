@@ -9378,7 +9378,10 @@ mod tests {
         let counter = connects.clone();
         let faulty = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .acquire_timeout(std::time::Duration::from_millis(500))
+            // sqlx retries a failed `after_connect` until this runs out, so the
+            // injected fault always costs the full timeout. It also has to
+            // cover the first real connect on a loaded runner (#5214).
+            .acquire_timeout(std::time::Duration::from_secs(5))
             .after_connect(move |_conn, _meta| {
                 let n = counter.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move {
