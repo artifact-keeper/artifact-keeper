@@ -2452,12 +2452,7 @@ mod tests {
     // =======================================================================
 
     async fn sig_test_pool() -> Option<PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .ok()
+        crate::testing::try_pool_with(4).await
     }
 
     async fn seed_repo(pool: &PgPool) -> Uuid {

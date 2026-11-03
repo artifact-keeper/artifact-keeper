@@ -359,6 +359,11 @@ impl AppError {
             // `POST /api/v1/auth/login` (#4756). Query and data errors stay
             // 500 below.
             e if e.is_db_unavailable() => (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_UNAVAILABLE"),
+            // Postgres broke a lock cycle by rolling this transaction back, so
+            // it changed nothing and running it again succeeds (#5168). The
+            // log line stays at error: a deadlock that reaches a client is
+            // still a lock-order bug somebody should look at.
+            e if e.is_deadlock() => (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_DEADLOCK"),
             Self::Database(_) | Self::Sqlx(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR")
             }
@@ -461,6 +466,9 @@ impl AppError {
             }
             e if e.is_db_unavailable() => {
                 "Database is temporarily unavailable, retry shortly".to_string()
+            }
+            e if e.is_deadlock() => {
+                "Database transaction was rolled back by a lock conflict, retry shortly".to_string()
             }
             Self::Database(_) | Self::Sqlx(_) => "Database operation failed".to_string(),
             Self::Migration(_) => "Database migration failed".to_string(),
@@ -787,6 +795,28 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// #5168: a deadlock Postgres broke by rolling the transaction back is a
+    /// retryable 503 with Retry-After, not a 500. Most call sites flatten DB
+    /// errors to `Database(e.to_string())`; the typed form is pinned against a
+    /// real 40P01 in `db.rs`.
+    #[test]
+    fn test_deadlock_maps_to_503_with_retry_after_5168() {
+        let err = AppError::Database("error returned from database: deadlock detected".to_string());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_DEADLOCK")
+        );
+        let msg = err.user_message();
+        assert!(msg.contains("retry"), "{msg}");
+        assert!(!msg.contains("deadlock detected"), "details leak: {msg}");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER).unwrap(),
+            RETRY_AFTER_SECS_ON_503
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ This document covers the testing infrastructure for Artifact Keeper, including u
 ### Run All Tests Locally
 
 ```bash
-# Backend unit tests (no database needed)
+# Backend unit tests (needs a migrated database; see "Pre-push Quality Checklist" in CLAUDE.md)
 cargo nextest run --workspace --lib --test-threads 8
 
 # E2E tests with Docker (fully automated, no human in the loop)
