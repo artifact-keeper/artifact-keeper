@@ -264,12 +264,21 @@ fn record_header_read_timeout() {
     crate::services::metrics_service::record_http_header_read_timeout();
 }
 
-/// Accept one connection. Mirrors `axum::serve`: per-connection errors are
-/// skipped, anything else (e.g. `EMFILE`) is logged and retried after a
-/// second so a full fd table does not spin the loop.
+/// Accept one connection with `TCP_NODELAY` set. Mirrors `axum::serve`:
+/// per-connection errors are skipped, anything else (e.g. `EMFILE`) is logged
+/// and retried after a second so a full fd table does not spin the loop.
 async fn accept(listener: &TcpListener) -> Option<(TcpStream, SocketAddr)> {
     match listener.accept().await {
-        Ok(conn) => Some(conn),
+        Ok((stream, remote_addr)) => {
+            // Without this, the second of two small writes (a response head,
+            // then a small streamed body) waits for the peer's delayed ACK of
+            // the first, about 40 ms on Linux (#5139). Serving still works if
+            // the option cannot be set, so the connection is kept.
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!("failed to set TCP_NODELAY for {remote_addr}: {e}");
+            }
+            Some((stream, remote_addr))
+        }
         Err(e) => {
             if matches!(
                 e.kind(),
@@ -589,6 +598,24 @@ mod tests {
             .expect("serve returns after the shutdown signal")
             .unwrap()
             .unwrap();
+    }
+
+    /// #5139: every accepted socket has Nagle off. A response head and a small
+    /// streamed body go out as two writes; with Nagle on, the second waits for
+    /// the ACK of the first, which the peer delays by ~40 ms. The latency itself
+    /// depends on the peer's delayed-ACK state and is too timing-sensitive to
+    /// assert here, so this pins the socket option that removes it.
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle_5139() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = accept(&listener).await.expect("connection accepted");
+        assert!(
+            stream.nodelay().unwrap(),
+            "accepted connections must set TCP_NODELAY"
+        );
     }
 
     #[test]

@@ -479,6 +479,58 @@ mod db_tests {
     use bytes::Bytes;
     use sha2::Digest;
 
+    /// #5168: a filesystem object whose name holds `.tmp.` is an object like
+    /// any other: reindex recovers it, while a staging file of an atomic write
+    /// next to it stays invisible.
+    #[tokio::test]
+    async fn reindex_recovers_object_named_with_tmp_infix_5168() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".into(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        let path = "com/example/tmpname/1.0/tmpname-1.0.tmp.jar";
+        storage
+            .put(&format!("maven/{path}"), Bytes::from_static(b"real-bytes"))
+            .await
+            .expect("put object");
+        let staging_key = format!(
+            "maven/com/example/tmpname/1.0/tmpname-1.0.jar.tmp.{}",
+            Uuid::new_v4()
+        );
+        storage
+            .put(&staging_key, Bytes::from_static(b"in-flight"))
+            .await
+            .expect("put staging file");
+
+        let repo = crate::services::repository_service::RepositoryService::new(fx.pool.clone())
+            .get_by_key(&fx.repo_key)
+            .await
+            .expect("repo");
+        let svc = StorageReindexService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let later = Utc::now() + chrono::Duration::minutes(10);
+        let run = svc
+            .reindex_at(&repo, false, 100, Some(fx.user_id), later)
+            .await
+            .expect("reindex");
+        let registered: Vec<String> = sqlx::query_scalar(
+            "SELECT path FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .unwrap();
+        fx.teardown().await;
+
+        assert_eq!(run.scanned, 1, "the staging file is not listed: {run:?}");
+        assert_eq!(registered, vec![path.to_string()]);
+    }
+
     /// #1570: an object stored under the repository's namespace with no row
     /// (a ghost) is registered with its real checksum; a dry run registers
     /// nothing; a re-run is a no-op; row-less sidecars are skipped; a live

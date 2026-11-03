@@ -41828,9 +41828,6 @@ mod remote_pull_through_cache_tests {
         let state = tdh::build_state_with_proxy(pool.clone(), tmp.to_str().unwrap(), proxy);
         let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
 
-        // A second live dispatcher, so the captures below see callsites a
-        // sibling test registered first on a thread without a subscriber.
-        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let mut seen = Vec::new();
         for (key, credentialed) in [(&repo_key, true), (&anon_key, false)] {
             for name in ["private", "basic401", "basic403"] {

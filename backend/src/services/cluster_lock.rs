@@ -745,12 +745,6 @@ mod tests {
             .expect("acquired");
 
         let capture = tdh::LogCapture::default();
-        // With a single registered dispatcher, tracing-core computes a new
-        // callsite's interest from the REGISTERING thread's default, so a
-        // sibling test reaching `acquire_blocking` first (no subscriber on its
-        // thread) would cache "never" for the very lines asserted below. A
-        // second live dispatcher makes registration consult every one.
-        let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
         let _guard = capture.install(tracing::Level::TRACE);
         // Past sqlx's default 1 s slow-statement threshold, once while the
         // wait expires and once while it is granted on release.

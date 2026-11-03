@@ -552,15 +552,17 @@ pub(crate) enum CasKeyGuard {
 /// How long an upload waits, in total, for a storage GC delete of its key to
 /// finish before it gives up with a retryable 503 (#4980). GC deletes a
 /// claimed key right after its claim, so the wait normally ends in
-/// milliseconds; it only runs out when a GC delete failed and its journal
-/// lease has not lapsed yet.
+/// milliseconds; it only runs out when a GC pass stopped between its claim and
+/// its delete and the journal lease has not lapsed yet. A delete that failed
+/// clears its own lease (#5168).
 pub(crate) const CAS_COMMIT_GC_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long after a storage GC pass took an `oci_gc_candidates` row as a lease
 /// (`leased_at`, migration 302) the upload commit guard assumes its delete may
 /// still be in flight (#4980). GC deletes a claimed key right after claiming it,
-/// so a lease older than this belongs to a delete that failed or a pass that
-/// stopped; the candidate sweep retries those with a fresh re-check. The same
+/// so a lease older than this belongs to a pass that stopped (a delete that
+/// failed clears its lease, #5168); the candidate sweep retries those with a
+/// fresh re-check. The same
 /// 15 minutes the OCI blob sweep's delete claim lasts.
 const GC_DELETE_LEASE_SQL: &str = "INTERVAL '15 minutes'";
 
@@ -589,8 +591,9 @@ const GC_DELETE_LEASE_SQL: &str = "INTERVAL '15 minutes'";
 ///
 /// A slot this upload created is deleted again in the same transaction, so a
 /// commit leaves no journal row behind. A row that is not leased (a candidate a
-/// repository delete recorded, waiting out `BLOB_GC_MIN_AGE_SECS`) or whose
-/// lease is older (a failed delete) is left to the candidate sweep, which
+/// repository delete recorded, waiting out `BLOB_GC_MIN_AGE_SECS`, or a delete
+/// that failed and cleared its lease) or whose lease is older (a pass that
+/// stopped) is left to the candidate sweep, which
 /// re-checks after this commit and keeps the object.
 /// The presence check then runs while the slot is held: GC can no longer
 /// start a delete this commit does not see, and no delete is in flight, so an
