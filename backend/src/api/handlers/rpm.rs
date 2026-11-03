@@ -1910,6 +1910,65 @@ pub(crate) async fn record_rpm_metadata(
     result
 }
 
+/// [`record_rpm_metadata`] inside a caller-owned transaction (#5002).
+///
+/// The insert runs behind a savepoint so a value too large to store can be
+/// retried with the unparseable marker without aborting the artifact-row
+/// transaction. Any other error propagates and rolls the whole commit back,
+/// which is the point: an indexed RPM must not exist without its metadata.
+pub(crate) async fn record_rpm_metadata_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    artifact_id: uuid::Uuid,
+    repo_id: uuid::Uuid,
+    metadata: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SAVEPOINT rpm_metadata")
+        .execute(&mut **tx)
+        .await?;
+    let first = sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+         VALUES ($1, 'rpm', $2) \
+         ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(&mut **tx)
+    .await;
+    match first {
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT rpm_metadata")
+                .execute(&mut **tx)
+                .await?;
+        }
+        Err(e) if is_size_limit_error(&e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT rpm_metadata")
+                .execute(&mut **tx)
+                .await?;
+            let mut smaller = metadata.clone();
+            smaller[RPM_REPODATA_KEY] =
+                unparseable_block(&format!("repodata block too large to store: {e}"));
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'rpm', $2) \
+                 ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2",
+            )
+            .bind(artifact_id)
+            .bind(&smaller)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query("RELEASE SAVEPOINT rpm_metadata")
+                .execute(&mut **tx)
+                .await?;
+        }
+        Err(e) => return Err(e),
+    }
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repo_id)
+        .execute(&mut **tx)
+        .await;
+    Ok(())
+}
+
 /// Why a stored package's header could not be read back.
 #[derive(Debug)]
 enum HeaderRead {

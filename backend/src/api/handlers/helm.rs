@@ -968,34 +968,50 @@ async fn upload_chart(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Spool the .tgz straight to a bounded scratch file instead of buffering
-    // the whole archive in memory. See proxy_helpers::stage_upload_field.
+    // Stage the .tgz on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole archive in
+    // memory. See repositories::stage_upload_field_for_repo.
     //
     // #2635: the `prov` part is staged too rather than being dropped on the
     // floor. The loop no longer breaks on `chart` because ChartMuseum clients
     // may send the parts in either order, and a part that is never read is a
     // part that gets silently discarded.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
-    let mut staged_prov: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
+    let mut staged_prov: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
-            "chart" => staged = Some(proxy_helpers::stage_upload_field(&state, field).await?),
-            "prov" => staged_prov = Some(proxy_helpers::stage_upload_field(&state, field).await?),
+            "chart" => {
+                staged = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                )
+            }
+            "prov" => {
+                staged_prov = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                )
+            }
             _ => {}
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
 
     // Validate the provenance before the chart is committed, so a bad prov
     // fails the whole upload instead of leaving a chart that advertises
     // provenance it cannot serve.
-    if let Some(prov) = staged_prov.as_ref() {
-        let head = read_prov_head(prov.path()).await?;
+    if let Some((prov, _prov_digests)) = staged_prov.as_ref() {
+        let local = super::repositories::materialize_staged_for_repo(&state, &repo, prov).await?;
+        let head = read_prov_head(local.path()).await?;
         validate_prov_bytes(&head).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1005,21 +1021,25 @@ async fn upload_chart(
         })?;
     }
 
-    // Extract and validate Chart.yaml from the staged archive on disk, reading
-    // only the Chart.yaml entry (bounded memory) rather than the whole package.
+    // Extract and validate Chart.yaml from the staged archive, reading only the
+    // Chart.yaml entry (bounded memory) rather than the whole package.
     // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
-    let chart_yaml = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        extract_chart_yaml_from_staged(staged.path())
-    })
-    .await
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid chart package: {}", e),
-        )
-            .into_response()
-    })?;
+    let chart_yaml = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            extract_chart_yaml_from_staged(local.path())
+        })
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chart package: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     let chart_name = &chart_yaml.name;
     let chart_version = &chart_yaml.version;
@@ -1071,10 +1091,18 @@ async fn upload_chart(
     // by that retry -- the storage key is fully determined by chart name and
     // version.
 
-    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash pass).
+    // Stream the staged archive into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     let size_bytes = put.bytes_written as i64;
@@ -1086,9 +1114,17 @@ async fn upload_chart(
     // serve.
     let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
     let prov_put = match staged_prov {
-        Some(prov) => {
-            Some(proxy_helpers::put_artifact_stream(&state, &repo, &prov_storage_key, prov).await?)
-        }
+        Some((prov, prov_digests)) => Some(
+            proxy_helpers::put_staged_body(
+                &state,
+                &repo,
+                super::publish_quota::PublishAt::StorageKey(&prov_storage_key),
+                &prov_storage_key,
+                prov,
+                &prov_digests,
+            )
+            .await?,
+        ),
         None => None,
     };
 

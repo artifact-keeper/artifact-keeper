@@ -35,7 +35,9 @@
 //! 4. **Fallback and GC.** A root that has never been built renders on request
 //!    (once per state per replica, through the in-process cache) until its
 //!    first build. The previous revision is kept so a download in flight
-//!    during a swap completes; older ones are deleted. A root with no
+//!    during a swap completes; older ones are deleted, each through the
+//!    storage location it was written to (`rpm_repodata_revisions`, #5072),
+//!    so changing a repository's location strands nothing. A root with no
 //!    packages is not stored at all.
 //!
 //! Consistency: the builder clears `dirty_since` before it opens its
@@ -51,7 +53,7 @@
 //! Virtual repositories stay on request: their documents depend on which
 //! members the caller may read (#4346).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::time::Duration;
 
@@ -202,6 +204,7 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
     );
     sweep_spool_files(
         &crate::api::handlers::incus::staging_root(&state.config.storage_path),
+        SPOOL_PREFIX,
         settings.build_deadline,
     );
     tokio::spawn(async move {
@@ -227,17 +230,14 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
     });
 }
 
-/// Delete spool files a build left behind when its process died: older
-/// than any build may run. Best effort.
-fn sweep_spool_files(dir: &std::path::Path, older_than: Duration) {
+/// Delete spool files named `prefix*` that a process left behind when it died:
+/// older than any writer may run. Best effort.
+pub(crate) fn sweep_spool_files(dir: &std::path::Path, prefix: &str, older_than: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let stale = entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(SPOOL_PREFIX)
+        let stale = entry.file_name().to_string_lossy().starts_with(prefix)
             && entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -632,8 +632,8 @@ async fn build_root(
     //    once the clear commits every such write is visible to the snapshot
     //    below, and any later write re-dirties the root. `retry_at` is the
     //    deadline after which a build that never swapped is retried. The
-    //    storage location is recorded now so the GC can find this revision's
-    //    objects even if the build fails before it becomes current.
+    //    claim records where this revision is written, so the GC can find
+    //    its objects even if the build fails before it becomes current.
     let Some(revision) = claim(state, repo_id, root, &location, settings).await? else {
         // An upsert: a root whose marks have not been folded yet has no row,
         // and its back-off must not be lost.
@@ -765,11 +765,15 @@ async fn build_root(
     // 7. Keep the previous revision so a download in flight during the swap
     //    completes; delete the rest.
     let keep = previous.unwrap_or(revision);
-    for old in gc_floor..revision {
-        if Some(old) != previous {
-            delete_revision(storage.as_ref(), repo_id, root, old).await;
-        }
-    }
+    collect_revisions(
+        state,
+        repo_id,
+        root,
+        revision,
+        previous,
+        Some((gc_floor, &location)),
+    )
+    .await?;
     sqlx::query(
         "UPDATE rpm_repodata_roots SET gc_floor = GREATEST(gc_floor, $3) \
           WHERE repository_id = $1 AND root = $2",
@@ -882,6 +886,18 @@ async fn claim(
     .bind(built_from_at)
     .fetch_one(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO rpm_repodata_revisions \
+             (repository_id, root, revision, storage_backend, storage_path) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(repo_id)
+    .bind(root)
+    .bind(revision)
+    .bind(&location.backend)
+    .bind(&location.path)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(Some(revision))
 }
@@ -941,21 +957,91 @@ pub async fn reconcile(db: &PgPool) -> Result<u64> {
     Ok(moved)
 }
 
-/// Delete one revision's objects. Best effort: an object already gone is
-/// fine, and a failure only leaves an unreachable object behind.
+/// Delete one revision's objects. An object already gone is fine. Returns
+/// whether every object is gone; a failure only leaves an unreachable object
+/// behind.
 async fn delete_revision(
     storage: &dyn crate::storage::StorageBackend,
     repo_id: Uuid,
     root: &str,
     revision: i64,
-) {
+) -> bool {
     let prefix = revision_prefix(repo_id, root, revision);
+    let mut deleted = true;
     for file in crate::services::rpm_repodata_cache::STORED_REPODATA_FILES {
         match storage.delete(&format!("{prefix}/{file}")).await {
             Ok(()) | Err(AppError::NotFound(_)) => {}
-            Err(e) => warn!(%repo_id, root, revision, error = %e, "RPM repodata GC: delete failed"),
+            Err(e) => {
+                deleted = false;
+                warn!(%repo_id, root, revision, error = %e, "RPM repodata GC: delete failed");
+            }
         }
     }
+    deleted
+}
+
+/// Delete the revisions of `root` below `end`, except `keep`, each through
+/// the location its claim recorded (#5072). A revision whose delete fails
+/// stays recorded and is retried by the next collection.
+///
+/// `untracked` is a floor and a location for revisions with no record: a
+/// replica that has not been upgraded yet claims without recording, and
+/// writes to the repository's current location.
+async fn collect_revisions(
+    state: &SharedState,
+    repo_id: Uuid,
+    root: &str,
+    end: i64,
+    keep: Option<i64>,
+    untracked: Option<(i64, &StorageLocation)>,
+) -> Result<()> {
+    let tracked: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT revision, storage_backend, storage_path FROM rpm_repodata_revisions \
+          WHERE repository_id = $1 AND root = $2 AND revision < $3 \
+            AND revision IS DISTINCT FROM $4",
+    )
+    .bind(repo_id)
+    .bind(root)
+    .bind(end)
+    .bind(keep)
+    .fetch_all(&state.db)
+    .await?;
+
+    if let Some((floor, location)) = untracked {
+        let known: HashSet<i64> = tracked.iter().map(|(revision, ..)| *revision).collect();
+        match state.storage_for_repo(location) {
+            Ok(storage) => {
+                for revision in floor..end {
+                    if Some(revision) != keep && !known.contains(&revision) {
+                        delete_revision(storage.as_ref(), repo_id, root, revision).await;
+                    }
+                }
+            }
+            Err(e) => warn!(%repo_id, root, error = %e, "RPM repodata GC: no storage backend"),
+        }
+    }
+
+    for (revision, backend, path) in tracked {
+        let storage = match state.storage_for_repo(&StorageLocation { backend, path }) {
+            Ok(storage) => storage,
+            Err(e) => {
+                warn!(%repo_id, root, revision, error = %e, "RPM repodata GC: no storage backend");
+                continue;
+            }
+        };
+        if delete_revision(storage.as_ref(), repo_id, root, revision).await {
+            sqlx::query(
+                "DELETE FROM rpm_repodata_revisions \
+                  WHERE repository_id = $1 AND root = $2 AND revision = $3",
+            )
+            .bind(repo_id)
+            .bind(root)
+            .bind(revision)
+            .execute(&state.db)
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Stop serving a stored revision of `root` and delete every revision. The
@@ -976,12 +1062,19 @@ async fn drop_root(state: &SharedState, repo_id: Uuid, root: &str) -> Result<()>
     .bind(root)
     .fetch_optional(&state.db)
     .await?;
-    if let Some((old_floor, last, Some(backend), Some(path))) = row {
-        if let Ok(storage) = state.storage_for_repo(&StorageLocation { backend, path }) {
-            for revision in old_floor..=last {
-                delete_revision(storage.as_ref(), repo_id, root, revision).await;
-            }
-        }
+    if let Some((old_floor, last, backend, path)) = row {
+        let recorded = backend
+            .zip(path)
+            .map(|(backend, path)| StorageLocation { backend, path });
+        collect_revisions(
+            state,
+            repo_id,
+            root,
+            last + 1,
+            None,
+            recorded.as_ref().map(|location| (old_floor, location)),
+        )
+        .await?;
     }
     Ok(())
 }

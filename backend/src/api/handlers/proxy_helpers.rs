@@ -14,7 +14,8 @@ use crate::api::AppState;
 use crate::error::AppError;
 use crate::formats::pypi::PypiHandler;
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
+    is_deleting_key, ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    RepositoryVisibility,
 };
 use crate::services::proxy_hydration::{Coordinator, HydrationCoordinator};
 use crate::services::proxy_scan_service::CacheScanGate;
@@ -388,6 +389,12 @@ pub async fn resolve_repo_by_key(
     expected_formats: &[&str],
     format_label: &str,
 ) -> Result<RepoInfo, Response> {
+    // A repository whose delete job renamed it to `~deleting~<job id>` is
+    // being torn down; treat it as absent on every format route, exactly like
+    // `RepositoryService::get_by_key`.
+    if is_deleting_key(repo_key) {
+        return Err((StatusCode::NOT_FOUND, "Repository not found").into_response());
+    }
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
@@ -2686,6 +2693,106 @@ pub async fn proxy_fetch_uncached(
         proxy_service.fetch_upstream_direct(&repo, path).await
     })
     .await
+}
+
+/// How long the age gate may reuse one upstream read. This is the longest a
+/// "not hosted" answer can outlive a publish, so it stays in seconds: long
+/// enough that a burst for one project costs one read, short enough that it is
+/// no real window for a version to fall through (#5150).
+pub(crate) const AGE_GATE_UPSTREAM_READ_TTL: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Total size of the bodies [`AGE_GATE_UPSTREAM_READS`] may hold. A larger
+/// document is still shared by concurrent readers but not kept.
+const AGE_GATE_UPSTREAM_READS_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `(repository, upstream URL, path, Accept)`. The URL is part of the key so a
+/// repointed Remote never reads an answer from its previous upstream.
+type AgeGateUpstreamReadKey = (Uuid, String, String, Option<String>);
+
+/// One successful read: the document, or the upstream's 404/410. A failure is
+/// never kept, so an outage is asked about again on the next request.
+#[derive(Clone)]
+enum AgeGateUpstreamRead {
+    Document(Bytes),
+    Missing,
+}
+
+/// Recent age-gate reads of upstream metadata (#5150). Besides reusing a read
+/// for [`AGE_GATE_UPSTREAM_READ_TTL`], `try_get_with` makes concurrent requests
+/// for one key share a single upstream read.
+static AGE_GATE_UPSTREAM_READS: std::sync::LazyLock<
+    moka::future::Cache<AgeGateUpstreamReadKey, AgeGateUpstreamRead>,
+> = std::sync::LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(AGE_GATE_UPSTREAM_READS_MAX_BYTES)
+        // The key is client-influenced, so an empty answer still has to weigh
+        // something or a flood of names would not be bounded by the capacity.
+        .weigher(|key: &AgeGateUpstreamReadKey, read: &AgeGateUpstreamRead| {
+            let body = match read {
+                AgeGateUpstreamRead::Document(body) => body.len(),
+                AgeGateUpstreamRead::Missing => 0,
+            };
+            u32::try_from(body + key.1.len() + key.2.len() + 64).unwrap_or(u32::MAX)
+        })
+        .time_to_live(AGE_GATE_UPSTREAM_READ_TTL)
+        .build()
+});
+
+/// What the upstream itself says about a version, for an answer the proxy cache
+/// cannot give: a cached copy older than the publish does not list a version
+/// the upstream now has, so it must not read as "not hosted" (#5150).
+///
+/// A 404 or 410 is [`UpstreamVersionEvidence::NotHosted`], any other failure
+/// [`UpstreamVersionEvidence::Unknown`], and a document is left to `read`.
+/// While a read is in flight it holds the metadata budget for the full cap, as
+/// its size is not known yet; `read` then holds it for the actual size.
+pub(crate) async fn age_gate_upstream_evidence(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    accept: Option<&str>,
+    read: impl FnOnce(&[u8]) -> crate::services::age_gate_service::UpstreamVersionEvidence,
+) -> crate::services::age_gate_service::UpstreamVersionEvidence {
+    use crate::services::age_gate_service::UpstreamVersionEvidence;
+
+    let key = (
+        repo_id,
+        upstream_url.to_string(),
+        path.to_string(),
+        accept.map(str::to_string),
+    );
+    let fetched = AGE_GATE_UPSTREAM_READS
+        .try_get_with(key, async {
+            let _permit = proxy_metadata_budget()
+                .reserve(LARGE_METADATA_MAX_BYTES)
+                .await;
+            let fetched =
+                with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+                    proxy_service
+                        .fetch_upstream_direct_with_accept(&repo, path, accept)
+                        .await
+                })
+                .await;
+            match fetched {
+                Ok(body) => Ok(AgeGateUpstreamRead::Document(body)),
+                Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                    Ok(AgeGateUpstreamRead::Missing)
+                }
+                Err(resp) => Err(resp.status()),
+            }
+        })
+        .await;
+    match fetched {
+        Ok(AgeGateUpstreamRead::Document(body)) => {
+            let _permit = proxy_metadata_budget().reserve(body.len()).await;
+            read(&body)
+        }
+        Ok(AgeGateUpstreamRead::Missing) => UpstreamVersionEvidence::NotHosted,
+        Err(_) => UpstreamVersionEvidence::Unknown,
+    }
 }
 
 /// Fetch from upstream directly, preserving the upstream `Link` header.
@@ -7796,6 +7903,47 @@ pub async fn put_artifact_stream(
     // `staged` drops here -> scratch file removed.
 }
 
+/// Write a [`GenericStagedBody`](super::repositories::GenericStagedBody) to
+/// `storage_key`, from local scratch or by copying the body the repository's
+/// backend already staged (#4990). Runs the same quota preflight and
+/// cross-repository write guard as [`put_artifact_stream`], then releases the
+/// staging copy.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn put_staged_body(
+    state: &crate::api::SharedState,
+    repo: &RepoInfo,
+    at: super::publish_quota::PublishAt<'_>,
+    storage_key: &str,
+    staged: super::repositories::GenericStagedBody,
+    digests: &crate::services::artifact_service::ContentDigests,
+) -> Result<crate::storage::PutStreamResult, Response> {
+    let size_bytes = staged.size_bytes();
+    super::publish_quota::preflight_publish_quota(&state.db, repo.id, at, size_bytes).await?;
+    guard_cross_repo_write(state, repo.id, &repo.storage_backend, storage_key).await?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+
+    let write = staged.prepare_write().await?;
+    write
+        .write(storage.as_ref(), storage_key)
+        .await
+        .map_err(|e| {
+            super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    crate::api::handlers::storage_err_message(&e),
+                )
+                    .into_response()
+            })
+        })?;
+    staged.discard().await;
+    Ok(crate::storage::PutStreamResult {
+        checksum_sha256: digests.sha256.clone(),
+        bytes_written: size_bytes.max(0) as u64,
+    })
+}
+
 /// Open a staged scratch file as a `'static` byte stream ready to feed
 /// `StorageBackend::put_stream`. A buffered `ReaderStream` keeps the
 /// disk->backend copy bounded to `STREAM_STAGE_CHUNK`.
@@ -7982,7 +8130,7 @@ fn upload_body_error_response<E: std::error::Error + 'static>(
 /// quota is `507` + `Retry-After`, any other I/O failure `503` +
 /// `Retry-After`, both logged at `error` with the cause. Previously a bare
 /// `500` that echoed the OS error (and the scratch path) to the client.
-fn spool_error(label: &str, e: &std::io::Error) -> Response {
+pub(crate) fn spool_error(label: &str, e: &std::io::Error) -> Response {
     super::upload_body::spool_write_error(label, e).into_response()
 }
 
@@ -9408,6 +9556,60 @@ pub async fn enforce_age_gate(
     }
 }
 
+/// What the download age gate decided for one Remote.
+#[derive(Debug)]
+pub(crate) enum AgeGateOutcome<T> {
+    /// Keep serving the requested file.
+    Allowed,
+    /// Withheld, and a last-known-good version answers instead.
+    Substitute(T),
+    /// A Virtual member's upstream does not host the version (#5150). The
+    /// member has nothing to refuse and is out of this request: it writes no
+    /// review, and the walk must not ask it for bytes either, since its gate
+    /// has not cleared them.
+    NotHosted,
+}
+
+/// The download age gate of a Remote, given what its upstream says about the
+/// version. `as_virtual_member` allows [`AgeGateOutcome::NotHosted`]; a direct
+/// Remote has no sibling to defer to and always takes the ordinary decision.
+/// `Err` is [`enforce_age_gate`]'s terminal answer.
+pub(crate) async fn decide_download_age_gate(
+    svc: Option<&crate::services::age_gate_service::AgeGateService>,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+    evidence: crate::services::age_gate_service::UpstreamVersionEvidence,
+    as_virtual_member: bool,
+) -> Result<AgeGateOutcome<AgeGateSubstitution>, Response> {
+    use crate::services::age_gate_service::UpstreamVersionEvidence;
+
+    let published_at = evidence.published_at();
+    let basis = match svc {
+        Some(svc) => {
+            if as_virtual_member
+                && evidence == UpstreamVersionEvidence::NotHosted
+                && svc
+                    .member_may_step_aside(params, package, version)
+                    .await
+                    .map_err(|e| e.into_response())?
+            {
+                return Ok(AgeGateOutcome::NotHosted);
+            }
+            svc.download_basis(params, package, version, published_at, evidence.is_listed())
+                .await
+                .map_err(|e| e.into_response())?
+        }
+        None => published_at,
+    };
+    Ok(
+        match enforce_age_gate(svc, params, package, version, basis).await? {
+            Some(blocked) => AgeGateOutcome::Substitute(blocked),
+            None => AgeGateOutcome::Allowed,
+        },
+    )
+}
+
 /// Build a minimal `Repository` model for proxy operations.
 ///
 /// Visible to other handler modules so they can construct a stand-in
@@ -9547,6 +9749,21 @@ pub(crate) fn scan_pending_locked_response(filename: &str) -> Response {
         "error": "scan_pending",
         "file": filename,
         "reason": "artifact is being scanned; retry shortly",
+    });
+    (
+        StatusCode::LOCKED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Identity failure is not a pending scan. Keep 423 terminal in virtual walks (#5148).
+pub(crate) fn scan_identity_unestablished_response(filename: &str) -> Response {
+    let body = serde_json::json!({
+        "error": "scan_identity_unestablished",
+        "file": filename,
+        "reason": "artifact identity could not be established; package metadata or identity-probe limits must be corrected before retrying",
     });
     (
         StatusCode::LOCKED,
@@ -10366,7 +10583,9 @@ async fn decide_proxy_scan_serve(
                         "cannot establish what these bytes are served as; \
                          fail-closed -> withholding rather than reporting clean"
                     );
-                    return ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename));
+                    return ProxyScanServeOutcome::Deny(scan_identity_unestablished_response(
+                        filename,
+                    ));
                 }
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,

@@ -53,27 +53,62 @@ use crate::formats::incus::IncusHandler;
 const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
 const INCUS_FINALIZE_LEASE_TTL_SECS: f64 = 6.0 * 3600.0;
 
+/// RFC 9745 `Deprecation` value for Incus's native chunked upload endpoints
+/// (#1846 remainder, #5002): an RFC 9651 structured-field Date naming when the
+/// endpoints became deprecated (1793404800 = 2026-10-31).
+///
+/// The endpoints stay functional. New clients should use the shared
+/// `/api/v1/uploads` session API, which every other format's resumable upload
+/// already uses and which keeps one crash-recovery, quota and authorization
+/// path. No `Sunset` is sent: no removal date has been decided.
+const INCUS_CHUNKED_DEPRECATION: &str = "@1793404800";
+
+/// RFC 8288 `Link` sent with [`INCUS_CHUNKED_DEPRECATION`].
+const INCUS_CHUNKED_SUCCESSOR_LINK: &str = "</api/v1/uploads>; rel=\"successor-version\"";
+
+/// Add the deprecation headers to an Incus native chunked upload response.
+fn incus_chunked_deprecation_layer(router: Router<SharedState>) -> Router<SharedState> {
+    router.layer(axum::middleware::map_response(
+        |mut response: Response| async move {
+            let headers = response.headers_mut();
+            if let Ok(value) = INCUS_CHUNKED_DEPRECATION.parse() {
+                headers.insert("Deprecation", value);
+            }
+            if let Ok(value) = INCUS_CHUNKED_SUCCESSOR_LINK.parse() {
+                headers.insert("Link", value);
+            }
+            response
+        },
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 pub fn router() -> Router<SharedState> {
+    // The native chunked endpoints predate the shared session API and are kept
+    // only for existing Incus clients; mark them deprecated on every response,
+    // including errors, so a client or proxy can surface the successor (#5002).
+    let chunked = incus_chunked_deprecation_layer(
+        Router::new()
+            .route(
+                "/:repo_key/images/:product/:version/:filename/uploads",
+                post(start_chunked_upload),
+            )
+            .route(
+                "/:repo_key/uploads/:uuid",
+                patch(upload_chunk)
+                    .put(complete_chunked_upload)
+                    .delete(cancel_chunked_upload)
+                    .get(get_upload_progress),
+            ),
+    );
     Router::new()
         // SimpleStreams discovery endpoints
         .route("/:repo_key/streams/v1/index.json", get(streams_index))
         .route("/:repo_key/streams/v1/images.json", get(streams_images))
-        // Chunked / resumable upload endpoints (more-specific routes first)
-        .route(
-            "/:repo_key/images/:product/:version/:filename/uploads",
-            post(start_chunked_upload),
-        )
-        .route(
-            "/:repo_key/uploads/:uuid",
-            patch(upload_chunk)
-                .put(complete_chunked_upload)
-                .delete(cancel_chunked_upload)
-                .get(get_upload_progress),
-        )
+        .merge(chunked)
         // Image file operations (monolithic upload via PUT)
         .route(
             "/:repo_key/images/:product/:version/:filename",
@@ -319,6 +354,12 @@ pub(crate) fn storage_path_for_key(storage_base: &str, key: &str) -> PathBuf {
 /// staging files and to recognise crash-orphans during the age-based sweep.
 const STAGING_FILE_PREFIX: &str = "ak-incus-upload-";
 
+/// Prefix for a temporary local copy a format parser materializes from a
+/// backend-staged upload (#5002). Same staging volume as the upload spools, and
+/// recognised by [`is_staging_file`] so a crash-orphaned copy is reaped by the
+/// age-based sweep.
+pub(crate) const STAGED_PARSE_FILE_PREFIX: &str = "ak-staged-parse-";
+
 /// Resolve the base directory used to stage in-progress uploads (#1573).
 ///
 /// Resolution order:
@@ -364,7 +405,7 @@ pub(crate) fn temp_upload_path(storage_path: &str, session_id: &Uuid) -> PathBuf
 /// orphan sweep so it only ever reaps files this handler created, never
 /// anything else that may share the staging volume.
 pub(crate) fn is_staging_file(file_name: &str) -> bool {
-    file_name.starts_with(STAGING_FILE_PREFIX)
+    file_name.starts_with(STAGING_FILE_PREFIX) || file_name.starts_with(STAGED_PARSE_FILE_PREFIX)
 }
 
 /// RAII guard that best-effort removes a staged temp file when dropped,
@@ -788,7 +829,7 @@ async fn resolve_incus_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Res
     use sqlx::Row;
     let repo = sqlx::query(
         r#"SELECT id, key, storage_backend, storage_path, format::text as format, repo_type::text as repo_type, upstream_url, promotion_only
-        FROM repositories WHERE key = $1"#,
+        FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'"#,
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -3113,6 +3154,7 @@ mod tests {
         assert!(is_staging_file(
             "ak-incus-upload-550e8400-e29b-41d4-a716-446655440000"
         ));
+        assert!(is_staging_file("ak-staged-parse-AbCdEf"));
         assert!(!is_staging_file("img.tar.xz"));
         assert!(!is_staging_file(".keep"));
         assert!(!is_staging_file("ak-other-upload-123"));

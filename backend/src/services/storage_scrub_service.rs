@@ -38,17 +38,16 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{ClusterLock, PgAdvisoryLock};
-use crate::storage::verify::{checksum_is_content_digest, hash_stream, parse_sha256_hex};
+use crate::storage::verify::{
+    checksum_is_content_digest, hash_stream, parse_sha256_hex, spool_and_verify,
+};
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
 /// Advisory-lock class for the scrub (one runner cluster-wide).
@@ -829,29 +828,9 @@ async fn spool_verified(
 ) -> Result<(Option<tempfile::NamedTempFile>, u64)> {
     let spool = tempfile::NamedTempFile::new()
         .map_err(|e| AppError::Storage(format!("scrub spool file: {e}")))?;
-    let mut file = tokio::fs::File::create(spool.path())
-        .await
-        .map_err(|e| AppError::Storage(format!("scrub spool file: {e}")))?;
-    let mut stream = source.get_stream(key).await?;
-    let mut hasher = Sha256::new();
-    let mut read = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        read += chunk.len() as u64;
-        hasher.update(&chunk);
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| AppError::Storage(format!("scrub spool write: {e}")))?;
-    }
-    file.flush()
-        .await
-        .map_err(|e| AppError::Storage(format!("scrub spool write: {e}")))?;
-    drop(file);
-    if hasher.finalize().as_slice() == expected.as_slice() {
-        Ok((Some(spool), read))
-    } else {
-        Ok((None, read))
-    }
+    let stream = source.get_stream(key).await?;
+    let (intact, read) = spool_and_verify(stream, &spool, expected, None).await?;
+    Ok((intact.then_some(spool), read))
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -889,7 +868,7 @@ mod db_tests {
     use bytes::Bytes;
 
     fn sha_hex(b: &[u8]) -> String {
-        hex::encode(Sha256::digest(b))
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b))
     }
 
     /// Seed a live artifact with a real recorded SHA-256 of `original`, while

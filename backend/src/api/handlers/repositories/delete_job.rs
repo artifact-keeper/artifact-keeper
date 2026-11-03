@@ -36,6 +36,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::models::repository::{is_deleting_key, DELETING_PREFIX};
 use crate::storage::{StorageBackend, StorageLocation};
 
 /// Rows deleted (and keys journaled) per batch transaction.
@@ -56,9 +57,8 @@ const RESUME_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Prefix of the key a repository is renamed to while its delete job runs.
 /// `~` is not a legal character of a repository key
 /// (`validate_repository_key`), so no repository can be created under it.
-const DELETING_PREFIX: &str = "~deleting~";
-
-/// The key a repository is renamed to while its delete job runs.
+/// Defined once in [`crate::models::repository`] and re-used by every by-key
+/// resolution site so the delete rename and its central guard cannot drift.
 pub(crate) fn deleting_key(job_id: Uuid) -> String {
     format!("{DELETING_PREFIX}{job_id}")
 }
@@ -211,7 +211,7 @@ pub(crate) async fn enqueue(
     // A repository a failed job left renamed keeps the key it had when its
     // delete was first requested, so the new job still purges that key's
     // proxy-cache subtree and still answers a `DELETE` of that key.
-    let original_key = if repo.key.starts_with(DELETING_PREFIX) {
+    let original_key = if is_deleting_key(&repo.key) {
         sqlx::query_scalar::<_, String>(
             "SELECT repository_key FROM repository_delete_jobs \
               WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -1039,6 +1039,20 @@ mod tests {
             .get_by_key(&fx.repo_key)
             .await;
         assert!(matches!(lookup, Err(AppError::NotFound(_))), "{lookup:?}");
+
+        // The temporary key the job renames the repository to is not a
+        // back door: every by-key resolution treats it as absent (#5002).
+        let renamed = deleting_key(job_id);
+        let renamed_lookup = fx
+            .state
+            .create_repository_service()
+            .get_by_key(&renamed)
+            .await;
+        assert!(
+            matches!(renamed_lookup, Err(AppError::NotFound(_))),
+            "{renamed_lookup:?}"
+        );
+        assert!(is_deleting_key(&renamed));
 
         let job = run_to_completion(&fx.state, job_id).await;
         assert_eq!(job.status, "completed", "{job:?}");

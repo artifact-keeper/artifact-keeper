@@ -1347,7 +1347,7 @@ async fn resolve_cargo_repo(
          (SELECT value FROM repository_config \
           WHERE repository_id = repositories.id \
           AND key = 'index_upstream_url') AS index_upstream_url \
-         FROM repositories WHERE key = $1",
+         FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
     )
     .bind(repo_key)
     .fetch_optional(db)

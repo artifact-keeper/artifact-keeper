@@ -30,7 +30,7 @@ use crate::api::{
 };
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
-use crate::models::repository::RepositoryVisibility;
+use crate::models::repository::{is_deleting_key, RepositoryVisibility};
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
 use crate::services::metrics_service::{
@@ -2799,6 +2799,15 @@ pub async fn repo_visibility_middleware(
         return not_found_response();
     }
 
+    // A repository whose delete job renamed it to `~deleting~<job id>` is
+    // being torn down. Answer the same existence-hiding 404 as a key that
+    // names no repository, without a DB query, so the temporary key is
+    // unreachable on every format route during the job. The lookup below also
+    // excludes the prefix as defense in depth (#5002).
+    if is_deleting_key(&repo_key) {
+        return not_found_response();
+    }
+
     // Check the shared repo cache first to avoid a DB round-trip on every
     // request.  The cache is populated with full repo metadata so that
     // format-handler resolvers (e.g. resolve_cargo_repo) can reuse it
@@ -2846,7 +2855,7 @@ pub async fn repo_visibility_middleware(
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
-                 FROM repositories WHERE key = $1",
+                 FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
             )
             .bind(&*repo_key)
             .fetch_optional(&vis_state.db)

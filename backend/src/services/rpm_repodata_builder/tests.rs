@@ -486,16 +486,8 @@ async fn depth_roots_build_independently_and_empty_roots_are_dropped_4544() {
     f.teardown().await;
 }
 
-/// A deleted repository's revisions are deleted by the GC, then its rows.
-#[tokio::test]
-async fn deleted_repository_revisions_are_collected_4544() {
-    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
-        return;
-    };
-    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
-    assert!(matches!(build(&f, "").await, BuildOutcome::Built { .. }));
-    let loc = location(&f).await;
-    assert!(stored_at(&f, &loc, "", 1, "repomd.xml").await);
+/// Delete the fixture's repository and run the GC until its root is gone.
+async fn delete_repository_and_collect(f: &tdh::Fixture) {
     sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
         .bind(f.repo_id)
         .execute(&f.pool)
@@ -532,8 +524,245 @@ async fn deleted_repository_revisions_are_collected_4544() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(remaining, 0, "the deleted repository's root was collected");
+}
+
+/// A deleted repository's revisions are deleted by the GC, then its rows.
+#[tokio::test]
+async fn deleted_repository_revisions_are_collected_4544() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    assert!(matches!(build(&f, "").await, BuildOutcome::Built { .. }));
+    let loc = location(&f).await;
+    assert!(stored_at(&f, &loc, "", 1, "repomd.xml").await);
+    delete_repository_and_collect(&f).await;
     assert!(!stored_at(&f, &loc, "", 1, "repomd.xml").await);
     assert!(row(&f, "").await.is_none());
+    f.teardown().await;
+}
+
+/// Point the repository at a new filesystem location under `dir`.
+async fn move_storage(f: &tdh::Fixture, dir: &std::path::Path) -> StorageLocation {
+    let moved = StorageLocation {
+        backend: location(f).await.backend,
+        path: dir.to_string_lossy().into_owned(),
+    };
+    sqlx::query("UPDATE repositories SET storage_path = $1 WHERE id = $2")
+        .bind(&moved.path)
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    moved
+}
+
+/// Build revision 1, move the repository to `dir`, build revision 2. Returns
+/// the two locations.
+async fn built_in_two_locations(
+    f: &tdh::Fixture,
+    dir: &std::path::Path,
+) -> (StorageLocation, StorageLocation) {
+    let old = location(f).await;
+    upload(f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    assert!(matches!(
+        build(f, "").await,
+        BuildOutcome::Built { revision: 1, .. }
+    ));
+    let new = move_storage(f, dir).await;
+    upload(f, "packages/two-1.0-1.noarch.rpm", "two", "1.0").await;
+    assert!(matches!(
+        build(f, "").await,
+        BuildOutcome::Built { revision: 2, .. }
+    ));
+    (old, new)
+}
+
+/// Revisions written before the repository's storage location changed are
+/// deleted from the location they were written to once they are no longer
+/// current or previous (#5072).
+#[tokio::test]
+async fn revisions_in_a_previous_storage_location_are_collected_5072() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let old = location(&f).await;
+    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 1, .. }
+    ));
+    upload(&f, "packages/two-1.0-1.noarch.rpm", "two", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 2, .. }
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let new = move_storage(&f, dir.path()).await;
+    upload(&f, "packages/three-1.0-1.noarch.rpm", "three", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 3, .. }
+    ));
+    for file in crate::services::rpm_repodata_cache::STORED_REPODATA_FILES {
+        assert!(
+            !stored_at(&f, &old, "", 1, file).await,
+            "{file} of rev 1 is collected from the previous location"
+        );
+    }
+    assert!(
+        stored_at(&f, &old, "", 2, "primary.xml.gz").await,
+        "the previous revision is kept where it was written"
+    );
+    assert!(stored_at(&f, &new, "", 3, "primary.xml.gz").await);
+    documents(&f, "").await;
+
+    upload(&f, "packages/four-1.0-1.noarch.rpm", "four", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 4, .. }
+    ));
+    assert!(
+        !stored_at(&f, &old, "", 2, "primary.xml.gz").await,
+        "rev 2 is collected once it is no longer previous"
+    );
+    assert!(stored_at(&f, &new, "", 3, "primary.xml.gz").await);
+    assert!(stored_at(&f, &new, "", 4, "primary.xml.gz").await);
+    documents(&f, "").await;
+    f.teardown().await;
+}
+
+/// A build that died after writing to the location it claimed leaves objects
+/// there. They are found even when later builds write somewhere else (#5072).
+#[tokio::test]
+async fn abandoned_build_in_another_location_is_collected_5072() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 1, .. }
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let abandoned = StorageLocation {
+        backend: location(&f).await.backend,
+        path: dir.path().to_string_lossy().into_owned(),
+    };
+    let settings = BuilderSettings::default();
+    let revision = claim(&f.state, f.repo_id, "", &abandoned, &settings)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision, 2);
+    f.state
+        .storage_for_repo(&abandoned)
+        .unwrap()
+        .put(
+            &format!("{}/repomd.xml", revision_prefix(f.repo_id, "", revision)),
+            Bytes::from_static(b"partial"),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 3, .. }
+    ));
+    assert!(
+        !stored_at(&f, &abandoned, "", 2, "repomd.xml").await,
+        "the abandoned build's object is deleted from where it was written"
+    );
+    f.teardown().await;
+}
+
+/// A revision that could not be deleted stays recorded, so the next build
+/// tries again; one that was deleted is forgotten (#5072).
+#[tokio::test]
+async fn failed_revision_delete_stays_recorded_5072() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "packages/one-1.0-1.noarch.rpm", "one", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 1, .. }
+    ));
+    // Revision 0 is never handed out, so this row only tests the bookkeeping.
+    sqlx::query(
+        "INSERT INTO rpm_repodata_revisions \
+             (repository_id, root, revision, storage_backend, storage_path) \
+         VALUES ($1, '', 0, 'no-such-backend', '/nowhere')",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    upload(&f, "packages/two-1.0-1.noarch.rpm", "two", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 2, .. }
+    ));
+    upload(&f, "packages/three-1.0-1.noarch.rpm", "three", "1.0").await;
+    assert!(matches!(
+        build(&f, "").await,
+        BuildOutcome::Built { revision: 3, .. }
+    ));
+
+    let recorded: Vec<i64> = sqlx::query_scalar(
+        "SELECT revision FROM rpm_repodata_revisions \
+          WHERE repository_id = $1 AND root = '' ORDER BY revision",
+    )
+    .bind(f.repo_id)
+    .fetch_all(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        recorded,
+        vec![0, 2, 3],
+        "rev 1 was deleted and forgotten; the undeletable one stays"
+    );
+    f.teardown().await;
+}
+
+/// An emptied root drops its revisions from every location that holds one
+/// (#5072).
+#[tokio::test]
+async fn emptied_root_drops_revisions_in_every_location_5072() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (old, new) = built_in_two_locations(&f, dir.path()).await;
+    assert!(stored_at(&f, &old, "", 1, "primary.xml.gz").await);
+
+    sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(build(&f, "").await, BuildOutcome::Empty);
+    assert!(!stored_at(&f, &old, "", 1, "primary.xml.gz").await);
+    assert!(!stored_at(&f, &new, "", 2, "primary.xml.gz").await);
+    f.teardown().await;
+}
+
+/// Deleting a repository collects its revisions from every location that
+/// holds one, not only the last one recorded on the root (#5072).
+#[tokio::test]
+async fn deleted_repository_revisions_in_every_location_are_collected_5072() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (old, new) = built_in_two_locations(&f, dir.path()).await;
+
+    delete_repository_and_collect(&f).await;
+    assert!(!stored_at(&f, &old, "", 1, "primary.xml.gz").await);
+    assert!(!stored_at(&f, &new, "", 2, "primary.xml.gz").await);
     f.teardown().await;
 }
 

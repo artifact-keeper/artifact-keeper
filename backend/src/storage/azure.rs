@@ -1784,6 +1784,10 @@ fn commit_lost_to_concurrent_writer(error: &AppError) -> bool {
 
 #[async_trait]
 impl StorageBackend for AzureBackend {
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        AzureBackend::size(self, key).await.map(Some)
+    }
+
     /// `exists` also probes the Artifactory fallback key in migration mode.
     fn exists_may_match_fallback_key(&self) -> bool {
         self.path_format.has_fallback()
