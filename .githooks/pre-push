@@ -2,12 +2,24 @@
 #
 # Artifact Keeper pre-push hook.
 #
-# Runs the same fast checks CI gates on, before code leaves your machine,
-# so compile errors and unit-test failures are caught locally instead of in
-# a red PR. Mirrors CI's "Check Rust" (compile) and "Backend Unit Tests".
+# Runs `cargo check --workspace --all-targets`, so a compile error is caught
+# here instead of in a red PR. SQLX_OFFLINE=true matches CI and uses the
+# committed .sqlx/ query cache. This needs cargo and nothing else, and it passes
+# on a clean checkout.
 #
-# SQLX_OFFLINE=true matches CI and uses the committed .sqlx/ query cache, so
-# no database is required.
+# The unit tests are opt-in, and CI runs them on every PR either way:
+#
+#   AK_PRE_PUSH_TESTS=1 git push
+#
+# They are not on by default because they cannot pass without setup (#5182).
+# They need cargo-nextest, since many of them rely on its one process per test,
+# and a migrated throwaway database, since the presigned-redirect tests fail
+# closed without one. A full test build also peaks around 20 GB of rustc memory,
+# which is too much to spend on every push. See "Git hooks" in CONTRIBUTING.md.
+#
+# Clippy (-D warnings), the 70% new-line coverage gate, and the 3% duplication
+# gate are also enforced in CI and are not run here. Run clippy manually before
+# large changes: cargo clippy --workspace --all-targets -- -D warnings
 #
 # Bypass in an emergency with `git push --no-verify`.
 
@@ -26,16 +38,39 @@ if ! cargo check --workspace --all-targets; then
     exit 1
 fi
 
-echo "pre-push: cargo test --workspace --lib"
-if ! cargo test --workspace --lib; then
+if [ "${AK_PRE_PUSH_TESTS:-}" != "1" ]; then
+    echo "pre-push: unit tests not run here (CI runs them). To run them first, see \"Git hooks\" in CONTRIBUTING.md."
+    exit 0
+fi
+
+if ! cargo nextest --version >/dev/null 2>&1; then
     echo >&2
-    echo "Unit tests failed. Fix them before pushing." >&2
+    echo "AK_PRE_PUSH_TESTS=1 needs cargo-nextest, which is not installed." >&2
+    echo "Install it with: cargo install cargo-nextest --locked" >&2
     exit 1
 fi
 
-# Note: clippy (-D warnings), the 70% new-line coverage gate, and the 3%
-# duplication gate are also enforced in CI. They are not run here to keep
-# push times reasonable. Run clippy manually before large changes:
-#   cargo clippy --workspace --all-targets -- -D warnings
+if [ -z "${DATABASE_URL:-}" ]; then
+    echo >&2
+    echo "AK_PRE_PUSH_TESTS=1 needs DATABASE_URL set to a migrated throwaway database." >&2
+    echo "The tests create and delete rows across the schema, so never use a live instance." >&2
+    echo "Start one with './scripts/dev.sh start', then: set -a; . ./.env.local-dev; set +a" >&2
+    exit 1
+fi
+
+# Without this a database that cannot be reached makes the DB-backed tests skip
+# and report success. JWT_SECRET is what the auth tests sign with; any value of
+# at least 32 bytes does, and CI sets one of its own the same way.
+export AK_TESTS_REQUIRE_DB=1
+export JWT_SECRET="${JWT_SECRET:-pre-push-hook-secret-at-least-32-bytes-long}"
+
+echo "pre-push: cargo nextest run --workspace --lib --test-threads 8"
+if ! cargo nextest run --workspace --lib --test-threads 8; then
+    echo >&2
+    echo "Unit tests failed. Fix them before pushing." >&2
+    echo "If many fail at once, check that the database in DATABASE_URL is migrated:" >&2
+    echo "  sqlx migrate run --source backend/migrations" >&2
+    exit 1
+fi
 
 exit 0

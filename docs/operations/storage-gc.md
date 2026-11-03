@@ -64,11 +64,14 @@ stored:
   final key no longer holds it and answers `503` instead. A chunked completion
   releases its lease and answers `503`; retrying the completion writes the
   object again from the staged chunks.
-- If the lease outlives the wait, which happens when a GC delete failed less
-  than 15 minutes ago, the upload is answered `503 SERVICE_UNAVAILABLE`
-  ("retry the upload") and commits nothing. A retry after the lease ages out
-  succeeds; the candidate sweep later re-checks the record and keeps the
-  object.
+- A GC delete that fails clears its own lease, so it does not hold uploads up.
+  The record stays for the candidate sweep, which re-checks it and keeps an
+  object an upload has committed since.
+- If the lease outlives the wait, which happens when a GC process stopped
+  between its claim and its delete less than 15 minutes ago, the upload is
+  answered `503 SERVICE_UNAVAILABLE` ("retry the upload") and commits nothing.
+  A retry after the lease ages out succeeds; the candidate sweep later
+  re-checks the record and keeps the object.
 
 A repository delete hands its objects to the same record and re-checks
 references before each delete (#4311): every storage key the deleted

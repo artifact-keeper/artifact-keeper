@@ -16,7 +16,9 @@
 //!    already marked, so writers never lock a shared row: a bulk import does
 //!    not queue, and two writers touching two roots in opposite order cannot
 //!    deadlock. The builder folds the marks into
-//!    `rpm_repodata_roots.dirty_since` ([`fold_marks`]).
+//!    `rpm_repodata_roots.dirty_since` ([`fold_marks`]), dropping marks that
+//!    predate the current revision's claim: they are already in its
+//!    snapshot, and applying them late would ask for a redundant rebuild.
 //! 2. **Debounced builder.** Every replica ticks; a dirty root is built once
 //!    it has been quiet for [`BuilderSettings::quiet`] or dirty for
 //!    [`BuilderSettings::max_delay`], under a [`ClusterLock`] lease per root
@@ -279,7 +281,10 @@ const FOLD_LOCK_KEY: i64 = 0x4544_0309;
 /// 309) into `rpm_repodata_roots.dirty_since`. Writers never lock a root
 /// row, so two uploads touching two roots in opposite order cannot
 /// deadlock; the builder takes the row locks here instead, one replica at a
-/// time and in key order. Returns the roots marked.
+/// time and in key order. Marks at or before the current revision's claim
+/// (`built_from_at`) are dropped: that build's snapshot already includes
+/// them, and applying one late would ask for a redundant rebuild (#5128).
+/// Returns the roots marked.
 pub async fn fold_marks(db: &PgPool) -> Result<u64> {
     fold_marks_inner(db, false).await
 }
@@ -312,12 +317,42 @@ async fn fold_marks_inner(db: &PgPool, wait: bool) -> Result<u64> {
     sqlx::query("SET LOCAL lock_timeout = '1s'")
         .execute(&mut *tx)
         .await?;
-    let folded = sqlx::query(
+    // Consume the queue first, then lock the roots: a build's claim deletes
+    // marks and then updates the root, in the same order, so neither can
+    // deadlock the other. Park the marks in a transaction-local table so the
+    // next statement can read each root's latest `built_from_at` after
+    // waiting for a claim that is already in progress. Filtering in the same
+    // statement as the DELETE would use the pre-claim snapshot, see the
+    // previous build's instant, and re-dirty a root the claim just cleared
+    // (#5128).
+    sqlx::query(
+        "CREATE TEMP TABLE ak_rpm_repodata_fold \
+             (repository_id uuid NOT NULL, root text NOT NULL, \
+              marked_at timestamptz NOT NULL) ON COMMIT DROP",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
         "WITH moved AS (DELETE FROM rpm_repodata_dirty \
                          RETURNING repository_id, root, marked_at) \
+         INSERT INTO ak_rpm_repodata_fold SELECT repository_id, root, marked_at FROM moved",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let folded = sqlx::query(
+        "WITH locked AS ( \
+             SELECT rr.repository_id, rr.root, rr.built_from_at \
+               FROM rpm_repodata_roots rr \
+              WHERE (rr.repository_id, rr.root) IN \
+                    (SELECT repository_id, root FROM ak_rpm_repodata_fold) \
+              ORDER BY rr.repository_id, rr.root FOR UPDATE) \
          INSERT INTO rpm_repodata_roots (repository_id, root, dirty_since) \
-         SELECT repository_id, root, MIN(marked_at) FROM moved \
-          GROUP BY repository_id, root ORDER BY repository_id, root \
+         SELECT f.repository_id, f.root, MIN(f.marked_at) \
+           FROM ak_rpm_repodata_fold f \
+           LEFT JOIN locked l \
+             ON l.repository_id = f.repository_id AND l.root = f.root \
+          WHERE l.built_from_at IS NULL OR f.marked_at >= l.built_from_at \
+          GROUP BY f.repository_id, f.root ORDER BY f.repository_id, f.root \
          ON CONFLICT (repository_id, root) DO UPDATE \
             SET dirty_since = COALESCE(rpm_repodata_roots.dirty_since, EXCLUDED.dirty_since)",
     )
@@ -761,7 +796,8 @@ async fn build_root(
 }
 
 /// Step 2 of [`build_root`]: `None` when in-flight writers did not finish
-/// within [`BuilderSettings::fence_timeout`].
+/// within [`BuilderSettings::fence_timeout`]. Returns the claimed revision;
+/// the claim instant is recorded as `built_from_at` on the root row.
 async fn claim(
     state: &SharedState,
     repo_id: Uuid,
@@ -792,6 +828,20 @@ async fn claim(
         }
         Err(e) => return Err(e.into()),
     }
+    // Taken after the exclusive fence: every writer that queued a mark has
+    // committed by now, so its `marked_at` is at or before this instant and
+    // the build's snapshot will include it. `fold_marks` uses this to drop a
+    // mark that a concurrent fold read before the claim cleared the queue
+    // (#5128). `now()` would be the transaction start, before the fence
+    // wait, and could discard a write that committed while we waited.
+    //
+    // Stored with the claim, not at the swap: a fold that races the build
+    // must see it as soon as the claim commits. If it were written only when
+    // the revision became current, the fold could compare against the
+    // previous build and re-dirty the row the claim just cleared.
+    let built_from_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *tx)
+        .await?;
     // Queued marks first, then the row: the same order as `fold_marks`, so
     // the two never wait on each other in a cycle.
     let consumed =
@@ -813,13 +863,15 @@ async fn claim(
     }
     let revision: i64 = sqlx::query_scalar(
         "INSERT INTO rpm_repodata_roots \
-             (repository_id, root, next_revision, retry_at, storage_backend, storage_path) \
-         VALUES ($1, $2, 1, now() + make_interval(secs => $5), $3, $4) \
+             (repository_id, root, next_revision, retry_at, storage_backend, storage_path, \
+              built_from_at) \
+         VALUES ($1, $2, 1, now() + make_interval(secs => $5), $3, $4, $6) \
          ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = NULL, \
              retry_at = now() + make_interval(secs => $5), \
              next_revision = rpm_repodata_roots.next_revision + 1, \
              storage_backend = COALESCE(rpm_repodata_roots.storage_backend, $3), \
-             storage_path = COALESCE(rpm_repodata_roots.storage_path, $4) \
+             storage_path = COALESCE(rpm_repodata_roots.storage_path, $4), \
+             built_from_at = $6 \
          RETURNING next_revision",
     )
     .bind(repo_id)
@@ -827,6 +879,7 @@ async fn claim(
     .bind(&location.backend)
     .bind(&location.path)
     .bind(settings.build_deadline.as_secs_f64())
+    .bind(built_from_at)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -849,7 +902,11 @@ async fn mark_dirty_if_moved(db: &PgPool, repo_id: Uuid, root: &str) -> Result<(
 
 /// SQL predicate (over `rpm_repodata_roots rr`): a clean, built root whose
 /// live `.rpm` count or latest `updated_at` differs from its build's.
-const MOVED_SQL: &str = "rr.dirty_since IS NULL AND rr.built_revision IS NOT NULL \
+/// `retry_at` excludes a root whose build is in flight (the claim sets it)
+/// or already scheduled: its snapshot is not current yet, so "moved" only
+/// means the build has not swapped (#5128).
+const MOVED_SQL: &str = "rr.dirty_since IS NULL AND rr.retry_at IS NULL \
+     AND rr.built_revision IS NOT NULL \
      AND (SELECT (COUNT(*), MAX(a.updated_at)) FROM artifacts a \
            WHERE a.repository_id = rr.repository_id AND a.is_deleted = false \
              AND a.path LIKE '%.rpm' \

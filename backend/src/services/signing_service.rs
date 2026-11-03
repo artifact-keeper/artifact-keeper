@@ -2101,18 +2101,6 @@ created_at:{created_at}\n",
         None
     }
 
-    /// The OpenPGP public key(s) a repository's metadata currently verifies
-    /// against: the active key, plus any rotation predecessor still in its
-    /// overlap window, as a single armored keyring (#1329). Outside a window
-    /// this is exactly [`Self::get_repo_public_key`].
-    pub async fn get_repo_public_keyring(&self, repo_id: Uuid) -> Result<Option<String>> {
-        let Some(active) = self.get_active_key_for_repo(repo_id).await? else {
-            return Ok(None);
-        };
-        let signers = self.openpgp_signers(active).await?;
-        openpgp_public_keyring(&signers).map(Some)
-    }
-
     /// Get or create signing configuration for a repository.
     pub async fn get_signing_config(
         &self,
@@ -2754,6 +2742,18 @@ mod tests {
     use chrono::Utc;
     use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey, EncodePublicKey};
     use uuid::Uuid;
+
+    /// The keyring a repository's metadata verifies against, built the way the
+    /// Debian and RPM public key routes build it.
+    async fn repo_public_keyring(service: &SigningService, repo: Uuid) -> String {
+        let active = service
+            .get_active_key_for_repo(repo)
+            .await
+            .unwrap()
+            .expect("active key");
+        let signers = service.openpgp_signers(active).await.unwrap();
+        openpgp_public_keyring(&signers).unwrap()
+    }
 
     /// Generate a real RSA key pair, encrypt the private key with the given
     /// passphrase, and return a SigningKey model struct suitable for sign_with_key.
@@ -3817,12 +3817,7 @@ mod tests {
     const TEST_PASSPHRASE: &str = "signing-rotation-atomic-test-passphrase";
 
     async fn rotation_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(8)
-            .connect(&url)
-            .await
-            .ok()
+        crate::testing::try_pool_with(8).await
     }
 
     fn rotation_test_service(pool: sqlx::PgPool) -> SigningService {
@@ -5214,11 +5209,7 @@ mod tests {
         assert!(audit[0]["overlap_ends_at"].is_string());
 
         assert_eq!(signer_ids(&service, repo).await, vec![b, a]);
-        let ring = service
-            .get_repo_public_keyring(repo)
-            .await
-            .unwrap()
-            .unwrap();
+        let ring = repo_public_keyring(&service, repo).await;
         assert_eq!(
             pgp::SignedPublicKey::from_string_many(&ring)
                 .unwrap()
@@ -5248,11 +5239,7 @@ mod tests {
         let a = bound_key(&service, repo, "gpg", ED25519_ALGORITHM).await;
         let b = service.rotate_key(a, None).await.unwrap().id;
         assert_eq!(signer_ids(&service, repo).await, vec![b]);
-        let ring = service
-            .get_repo_public_keyring(repo)
-            .await
-            .unwrap()
-            .unwrap();
+        let ring = repo_public_keyring(&service, repo).await;
         assert_eq!(ring, load_key(&pool, b).await.public_key_pem);
     }
 
@@ -5401,11 +5388,7 @@ mod tests {
         assert_eq!(audit[0]["overlap_skipped"], "public key is not OpenPGP");
 
         assert_eq!(signer_ids(&service, repo).await, vec![new.id]);
-        let ring = service
-            .get_repo_public_keyring(repo)
-            .await
-            .unwrap()
-            .unwrap();
+        let ring = repo_public_keyring(&service, repo).await;
         assert_eq!(
             ring, new.public_key_pem,
             "gpg-key.asc serves the single new key"
