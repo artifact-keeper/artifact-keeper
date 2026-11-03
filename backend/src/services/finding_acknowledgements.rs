@@ -79,7 +79,7 @@ pub struct AcknowledgeOptions {
 /// Who is making or undoing a decision.
 #[derive(Debug, Clone)]
 pub struct AckActor {
-    /// `None` only for a caller with no user identity: see [`Self::system`].
+    /// `None` only for [`Self::system`].
     pub user_id: Option<Uuid>,
     /// The repositories the credential covers.
     pub credential: AccessScope,
@@ -93,8 +93,8 @@ impl AckActor {
         }
     }
 
-    /// A caller already authorized outside this service, with no user to name:
-    /// the gRPC surface, whose principal carries scopes and no identity.
+    /// A caller with no user to name, authorized outside this service. No request
+    /// path uses this: REST and gRPC both name their user.
     pub fn system() -> Self {
         Self {
             user_id: None,
@@ -187,13 +187,18 @@ const HELD_ARTIFACTS_SQL: &str = "SELECT id, repository_id FROM artifacts \
        AND quarantine_status = 'quarantined' AND quarantine_until IS NULL \
        AND quarantine_source = 'scan_policy'";
 
+/// Whether the scan a finding belongs to has a copy in this repository.
+const COPY_IN_REPOSITORY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_findings sf \
+     JOIN scan_results copy ON copy.source_scan_id = sf.scan_result_id \
+     WHERE sf.id = $1 AND copy.repository_id = $2)";
+
 const REPOSITORY_HOLDS_BYTES_SQL: &str = "SELECT EXISTS (SELECT 1 FROM artifacts \
      WHERE repository_id = $1 AND checksum_sha256 = $2::bpchar AND NOT is_deleted)";
 
 /// Clears the frozen `scan_findings` flag of the rows a decision covered. A 1.11
-/// replica during a rolling upgrade, and this version's predecessor after a
-/// rollback, read that flag, so without this a revoked or lapsed decision that
-/// was migrated from a flag would read as acknowledged again there.
+/// replica still running during a rolling upgrade reads that flag, so without this
+/// a revoked or lapsed decision that was migrated from a flag would read as
+/// acknowledged again there.
 const CLEAR_FROZEN_FLAG_SQL: &str = "UPDATE scan_findings sf \
      SET is_acknowledged = false, acknowledged_by = NULL, \
          acknowledged_reason = NULL, acknowledged_at = NULL \
@@ -205,6 +210,59 @@ const CLEAR_FROZEN_FLAG_SQL: &str = "UPDATE scan_findings sf \
        AND finding_advisory_key(sf.cve_id, sf.title) = $4 \
        AND finding_component_key(sf.affected_component) = $5 \
        AND finding_component_key(sf.affected_version) = $6";
+
+/// A user holding repository grants, directly or through a group, and no
+/// instance-wide role: see `FindingAcknowledgementService::may_act_in`.
+const TENANT_BOUND_SQL: &str = "SELECT \
+     NOT EXISTS (SELECT 1 FROM role_assignments \
+                 WHERE user_id = $1 AND repository_id IS NULL) \
+     AND (EXISTS (SELECT 1 FROM role_assignments \
+                  WHERE user_id = $1 AND repository_id IS NOT NULL) \
+          OR EXISTS (SELECT 1 FROM permissions p \
+                     WHERE p.target_type IN ('repository', 'project') \
+                       AND p.actions <> '{}' \
+                       AND ((p.principal_type IN ('user', 'service_account') \
+                             AND p.principal_id = $1) \
+                            OR (p.principal_type = 'group' AND p.principal_id IN \
+                                (SELECT group_id FROM user_group_members \
+                                 WHERE user_id = $1)))))";
+
+/// The one answer for a finding that does not exist and one the caller cannot
+/// reach, so the first request cannot be used to tell them apart.
+fn not_found() -> AppError {
+    AppError::NotFound("Finding not found".to_string())
+}
+
+/// What a revoke did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct RevokeOutcome {
+    pub revoked: usize,
+    /// Copies of the decision left effective, in repositories the caller has no
+    /// authority over.
+    pub left_effective: i64,
+}
+
+/// What a promotion carried.
+#[derive(Debug, Clone, Default)]
+pub struct CarryOutcome {
+    pub verdict_carried: bool,
+    /// Why not, when it was not.
+    pub verdict_not_carried_reason: Option<String>,
+    pub acknowledgements_carried: usize,
+    pub acknowledgements_left_behind: usize,
+}
+
+/// The decision covering a finding in one repository, for answering about that
+/// repository when the row asked through belongs to another.
+#[derive(Debug, Clone, FromRow)]
+pub struct DecisionInRepository {
+    pub id: Uuid,
+    pub acknowledged_by: Option<Uuid>,
+    pub reason: Option<String>,
+    pub acknowledged_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub max_severity_rank: i16,
+}
 
 /// The severity name of a `finding_severity_rank`.
 pub(crate) fn severity_for_rank(rank: i16) -> &'static str {
@@ -306,7 +364,10 @@ fn carry_plan(graded: &[(GradedScan, bool)]) -> std::result::Result<Vec<&GradedS
         }
         if !reusable {
             return Err(format!(
-                "the {} scan {} is not a complete verdict a dedup could reuse",
+                "the {} scan {} is not a complete verdict a dedup could reuse: it is \
+                 incomplete, or past its age limit (1 day for a clean verdict, 30 for one \
+                 with findings), or under another pin, or followed by a scan that did not \
+                 finish",
                 scan.scan_type, scan.id
             ));
         }
@@ -335,38 +396,58 @@ impl FindingAcknowledgementService {
     // Authority
     // -----------------------------------------------------------------------
 
-    /// Whether `actor` may decide for one repository: the credential covers it,
-    /// and the user holds a grant there unless it is public. The second half is
-    /// the tenant gate promotion applies (`require_promotion_tenant_access`): the
-    /// `is_admin` flag is a capability and does not cross a tenant.
+    /// Every caller of this service has already established the `is_admin`
+    /// capability: the REST routes with `require_admin`, the by-CVE route with
+    /// `enforce_admin_audited`, the gRPC plane in its interceptor, promotion before
+    /// it asks. What is decided here is where that capability reaches.
     ///
-    /// A credential that does not cover the repository is told it does not exist
-    /// (404), like every other route. A tenant miss is a 403, like promotion's.
-    pub async fn authorize_repository(&self, actor: &AckActor, repository_id: Uuid) -> Result<()> {
+    /// * The credential must cover the repository.
+    /// * `is_admin` with no repository grants, or with an instance-wide role, has no
+    ///   tenant to stay inside: `POST /users` creates admins with no role row at all,
+    ///   and they could always triage any repository.
+    /// * `is_admin` holding repository grants and no instance-wide role is what this
+    ///   codebase calls a tenant admin. It needs a grant on the repository, public
+    ///   or not: public read access is not authority to accept a risk for someone
+    ///   else's repository.
+    ///
+    /// There is no tenant column, so binding is inferred from the grants, and a
+    /// tenant admin who has been given no grant yet reads as unbound.
+    async fn may_act_in(&self, actor: &AckActor, repository_id: Uuid) -> Result<bool> {
         if !actor.credential.grants(repository_id) {
-            return Err(AppError::NotFound("Finding not found".to_string()));
+            return Ok(false);
         }
-        self.require_tenant(actor, repository_id).await
+        let Some(user_id) = actor.user_id else {
+            return Ok(true);
+        };
+        if !self.is_tenant_bound(user_id).await? {
+            return Ok(true);
+        }
+        // TENANT-GATE-ONLY (#3331). The question here is literally tenant ownership:
+        // does a tenant-bound admin hold any grant on this repository. The capability
+        // is `is_admin`, established by every caller, so this carries no action, and
+        // it fronts a decision rather than a repository's contents.
+        RepositoryService::new(self.db.clone())
+            .user_can_access_repo(repository_id, user_id, RepoAccess::TenantOnly)
+            .await
     }
 
-    async fn require_tenant(&self, actor: &AckActor, repository_id: Uuid) -> Result<()> {
-        let Some(user_id) = actor.user_id else {
-            return Ok(());
-        };
-        let is_public: bool =
-            sqlx::query_scalar("SELECT is_public FROM repositories WHERE id = $1")
-                .bind(repository_id)
-                .fetch_optional(&self.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?
-                .unwrap_or(false);
-        if is_public {
-            return Ok(());
+    /// Whether this user holds repository grants and no instance-wide role.
+    async fn is_tenant_bound(&self, user_id: Uuid) -> Result<bool> {
+        sqlx::query_scalar(TENANT_BOUND_SQL)
+            .bind(user_id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Whether `actor` may decide for one repository. A credential that does not
+    /// cover it is told it does not exist (404), like every other route. A tenant
+    /// miss is a 403, like promotion's.
+    pub async fn authorize_repository(&self, actor: &AckActor, repository_id: Uuid) -> Result<()> {
+        if !actor.credential.grants(repository_id) {
+            return Err(not_found());
         }
-        let granted = RepositoryService::new(self.db.clone())
-            .user_can_access_repo(repository_id, user_id, RepoAccess::TenantOnly)
-            .await?;
-        if granted {
+        if self.may_act_in(actor, repository_id).await? {
             Ok(())
         } else {
             Err(AppError::Authorization(
@@ -376,59 +457,78 @@ impl FindingAcknowledgementService {
     }
 
     /// Whether `actor` may make or undo a decision for every repository: an
-    /// unrestricted credential held by a user with an instance-wide role.
+    /// unrestricted credential, not bound to a tenant.
     pub async fn authorize_every_repository(&self, actor: &AckActor) -> Result<()> {
-        if !matches!(actor.credential, AccessScope::Admin) {
+        if !self.may_act_everywhere(actor).await? {
             return Err(AppError::Authorization(
-                "Repository-scoped tokens cannot decide for every repository".to_string(),
+                "Deciding for every repository needs an unrestricted credential \
+                 and no tenant binding"
+                    .to_string(),
             ));
         }
-        let Some(user_id) = actor.user_id else {
-            return Ok(());
-        };
-        let instance_wide: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM role_assignments \
-             WHERE user_id = $1 AND repository_id IS NULL)",
-        )
-        .bind(user_id)
-        .fetch_one(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        if instance_wide {
-            Ok(())
-        } else {
-            Err(AppError::Authorization(
-                "Deciding for every repository needs an instance-wide role".to_string(),
-            ))
+        Ok(())
+    }
+
+    async fn may_act_everywhere(&self, actor: &AckActor) -> Result<bool> {
+        if !matches!(actor.credential, AccessScope::Admin) {
+            return Ok(false);
+        }
+        match actor.user_id {
+            None => Ok(true),
+            Some(user_id) => Ok(!self.is_tenant_bound(user_id).await?),
         }
     }
 
-    /// A revoke undoes a whole lineage, so it needs authority over everything the
-    /// lineage reaches, not only the repository it was asked through.
-    async fn authorize_reach(&self, actor: &AckActor, lineages: &[Uuid]) -> Result<()> {
-        let reach: Vec<Option<Uuid>> = sqlx::query_scalar(
-            "SELECT DISTINCT repository_id FROM finding_acknowledgements \
+    /// Split what a revoke would undo into what `actor` may undo and how much it
+    /// may not.
+    ///
+    /// A caller withdrawing a risk in their own repository is not stopped by a copy
+    /// a promotion made somewhere they have no authority: the copy stays, and the
+    /// answer says so (`acknowledgements_left_effective`), so nobody believes it is
+    /// gone. The exception is a decision that also applies where the caller is
+    /// asking (`applies_in_request`): an every-repository decision the caller cannot
+    /// undo would leave the finding acknowledged in their own repository, which is
+    /// the thing they asked to end, so that is refused rather than half-done.
+    async fn partition_reach(
+        &self,
+        actor: &AckActor,
+        lineages: &[Uuid],
+        applies_in_request: &[Uuid],
+    ) -> Result<(Vec<Uuid>, i64)> {
+        #[derive(FromRow)]
+        struct Reach {
+            id: Uuid,
+            repository_id: Option<Uuid>,
+        }
+        let reach: Vec<Reach> = sqlx::query_as(
+            "SELECT id, repository_id FROM finding_acknowledgements \
              WHERE lineage_id = ANY($1) AND revoked_at IS NULL",
         )
         .bind(lineages)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        for repository_id in reach {
-            match repository_id {
-                None => self.authorize_every_repository(actor).await?,
-                Some(repository_id) => {
-                    if !actor.credential.grants(repository_id) {
-                        return Err(AppError::Authorization(
-                            "This decision reaches a repository the credential does not cover"
-                                .to_string(),
-                        ));
-                    }
-                    self.require_tenant(actor, repository_id).await?;
-                }
+        let mut allowed = Vec::with_capacity(reach.len());
+        let mut left_effective = 0;
+        for row in reach {
+            let may = match row.repository_id {
+                Some(repository_id) => self.may_act_in(actor, repository_id).await?,
+                None => self.may_act_everywhere(actor).await?,
+            };
+            if may {
+                allowed.push(row.id);
+            } else if applies_in_request.contains(&row.id) {
+                return Err(AppError::Authorization(
+                    "This finding is covered by a decision for every repository, which this \
+                     credential cannot revoke, so it would stay acknowledged here. Ask an \
+                     administrator with an unrestricted credential to revoke it"
+                        .to_string(),
+                ));
+            } else {
+                left_effective += 1;
             }
         }
-        Ok(())
+        Ok((allowed, left_effective))
     }
 
     // -----------------------------------------------------------------------
@@ -445,17 +545,15 @@ impl FindingAcknowledgementService {
         reason: Option<&str>,
         options: AcknowledgeOptions,
     ) -> Result<FindingAcknowledgement> {
-        let mut key = self
-            .finding_key(finding_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
+        let mut key = self.finding_key(finding_id).await?.ok_or_else(not_found)?;
         match options.scope {
             AcknowledgementScope::AllRepositories => {
+                self.authorize_repository(actor, key.repository_id).await?;
                 self.authorize_every_repository(actor).await?;
             }
             AcknowledgementScope::Repository => {
                 key.repository_id = self
-                    .decision_repository(finding_id, &key, actor, options.repository_id)
+                    .request_repository(finding_id, &key, actor, options.repository_id)
                     .await?;
             }
         }
@@ -467,21 +565,39 @@ impl FindingAcknowledgementService {
             .ok_or_else(|| AppError::Internal("acknowledgement was not recorded".to_string()))
     }
 
-    /// The repository a repository-scoped decision from this finding applies in.
+    /// The repository a request about this finding row means.
     ///
     /// `ScanResponse.id` reports a reused row under its source's id, so a caller
-    /// looking at one repository is handed the rows of another. Deciding for the
-    /// row's repository would open a gate the caller was not looking at and leave
-    /// theirs shut, so when the row's scan has copies elsewhere the caller has to
-    /// say which one they mean.
-    async fn decision_repository(
+    /// looking at one repository is handed the rows of another. Acting on the row's
+    /// repository would open or close a gate the caller was not looking at, so when
+    /// the row's scan has copies elsewhere the caller has to say which one they mean.
+    ///
+    /// A named repository need not be the row's, which is the point, but the caller
+    /// must be able to reach the row through it: it holds a copy of the row's scan,
+    /// or the caller may act where the row is. Anything else answers as if the
+    /// finding did not exist.
+    async fn request_repository(
         &self,
         finding_id: Uuid,
         key: &FindingKey,
         actor: &AckActor,
         requested: Option<Uuid>,
     ) -> Result<Uuid> {
+        let copy_in = |repository_id: Uuid| async move {
+            sqlx::query_scalar::<_, bool>(COPY_IN_REPOSITORY_SQL)
+                .bind(finding_id)
+                .bind(repository_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))
+        };
         if let Some(repository_id) = requested {
+            if repository_id != key.repository_id
+                && !copy_in(repository_id).await?
+                && !self.may_act_in(actor, key.repository_id).await?
+            {
+                return Err(not_found());
+            }
             self.authorize_repository(actor, repository_id).await?;
             let holds: bool = sqlx::query_scalar(REPOSITORY_HOLDS_BYTES_SQL)
                 .bind(repository_id)
@@ -490,9 +606,7 @@ impl FindingAcknowledgementService {
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
             if !holds {
-                return Err(AppError::NotFound(
-                    "That repository does not hold these bytes".to_string(),
-                ));
+                return Err(not_found());
             }
             return Ok(repository_id);
         }
@@ -510,11 +624,42 @@ impl FindingAcknowledgementService {
         if copied_elsewhere {
             return Err(AppError::Conflict(
                 "This finding's scan has copies in other repositories; \
-                 say which one this decision is for with repository_id"
+                 say which one is meant with repository_id"
                     .to_string(),
             ));
         }
         Ok(key.repository_id)
+    }
+
+    /// The decision covering this finding's identity in `repository_id`, if one is
+    /// live, under the same rule the view applies.
+    pub async fn decision_in_repository(
+        &self,
+        finding_id: Uuid,
+        repository_id: Uuid,
+    ) -> Result<Option<DecisionInRepository>> {
+        let key = self.finding_key(finding_id).await?.ok_or_else(not_found)?;
+        sqlx::query_as(
+            "SELECT id, acknowledged_by, reason, acknowledged_at, expires_at, max_severity_rank \
+             FROM finding_acknowledgements \
+             WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()) \
+               AND (repository_id = $1 OR repository_id IS NULL) \
+               AND checksum_sha256 = $2::bpchar AND finding_class = $3 AND advisory_key = $4 \
+               AND component_key = $5 AND component_version_key = $6 \
+             ORDER BY (repository_id IS NULL), acknowledged_at DESC LIMIT 1",
+        )
+        .bind(repository_id)
+        .bind(&key.checksum_sha256)
+        .bind(&key.finding_class)
+        .bind(&key.advisory_key)
+        .bind(&key.component_key)
+        .bind(&key.component_version_key)
+        .fetch_optional(&self.db)
+        .await
+        .map(|decision: Option<DecisionInRepository>| {
+            decision.filter(|d| i32::from(d.max_severity_rank) >= key.severity_rank)
+        })
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Record a decision for one advisory on one artifact, across the components
@@ -743,26 +888,24 @@ impl FindingAcknowledgementService {
     // Revoke
     // -----------------------------------------------------------------------
 
-    /// Revoke every decision covering this finding's identity in `repository_id`
-    /// (default: the finding's own repository), and each of their lineages.
-    /// Returns the number of decisions revoked; revoking a finding with no
-    /// decision is a no-op. `NotFound` when the finding does not exist or the
-    /// credential does not cover the repository. `Authorization` when a lineage
-    /// reaches past what the actor may undo.
+    /// Revoke every decision covering this finding's identity in `repository_id`,
+    /// and each of their lineages as far as the actor has authority: see
+    /// [`Self::partition_reach`]. With no `repository_id`, the finding's own
+    /// repository, which like an acknowledgement is refused when the finding's scan
+    /// has copies elsewhere. Revoking a finding with no decision is a no-op.
+    /// `NotFound` when the finding does not exist or the actor cannot reach it.
     pub async fn revoke_finding(
         &self,
         finding_id: Uuid,
         repository_id: Option<Uuid>,
         actor: &AckActor,
-    ) -> Result<usize> {
-        let key = self
-            .finding_key(finding_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
-        let repository_id = repository_id.unwrap_or(key.repository_id);
-        self.authorize_repository(actor, repository_id).await?;
-        let lineages: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT DISTINCT lineage_id FROM finding_acknowledgements \
+    ) -> Result<RevokeOutcome> {
+        let key = self.finding_key(finding_id).await?.ok_or_else(not_found)?;
+        let repository_id = self
+            .request_repository(finding_id, &key, actor, repository_id)
+            .await?;
+        let covering: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, lineage_id FROM finding_acknowledgements \
              WHERE revoked_at IS NULL \
                AND (repository_id = $1 OR repository_id IS NULL) \
                AND checksum_sha256 = $2::bpchar AND finding_class = $3 AND advisory_key = $4 \
@@ -777,8 +920,7 @@ impl FindingAcknowledgementService {
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        self.authorize_reach(actor, &lineages).await?;
-        self.revoke_lineages(&lineages, actor.user_id).await
+        self.revoke_covering(&covering, actor).await
     }
 
     /// Revoke every decision on one advisory of one artifact's bytes in its
@@ -789,14 +931,14 @@ impl FindingAcknowledgementService {
         artifact_id: Uuid,
         cve_id: &str,
         actor: &AckActor,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<RevokeOutcome>> {
         let keys = self.advisory_keys(artifact_id, cve_id).await?;
         let Some(key) = keys.first() else {
             return Ok(None);
         };
         self.authorize_repository(actor, key.repository_id).await?;
-        let lineages: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT DISTINCT lineage_id FROM finding_acknowledgements \
+        let covering: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, lineage_id FROM finding_acknowledgements \
              WHERE revoked_at IS NULL \
                AND (repository_id = $1 OR repository_id IS NULL) \
                AND checksum_sha256 = $2::bpchar AND advisory_key = $3",
@@ -807,13 +949,13 @@ impl FindingAcknowledgementService {
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        self.authorize_reach(actor, &lineages).await?;
-        Ok(Some(self.revoke_lineages(&lineages, actor.user_id).await?))
+        Ok(Some(self.revoke_covering(&covering, actor).await?))
     }
 
-    /// Revoke one decision by id, and its lineage. For a decision with no finding
-    /// row to reach it through. `NotFound` when the decision does not exist.
-    pub async fn revoke(&self, id: Uuid, actor: &AckActor) -> Result<usize> {
+    /// Revoke one decision by id, and its lineage as far as the actor has authority.
+    /// For a decision with no finding row to reach it through. The decision named
+    /// must itself be one the actor may undo. `NotFound` when it does not exist.
+    pub async fn revoke(&self, id: Uuid, actor: &AckActor) -> Result<RevokeOutcome> {
         let lineage: Option<Uuid> =
             sqlx::query_scalar("SELECT lineage_id FROM finding_acknowledgements WHERE id = $1")
                 .bind(id)
@@ -822,30 +964,58 @@ impl FindingAcknowledgementService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
         let lineage =
             lineage.ok_or_else(|| AppError::NotFound("Acknowledgement not found".into()))?;
-        self.authorize_reach(actor, &[lineage]).await?;
-        self.revoke_lineages(&[lineage], actor.user_id).await
+        let (allowed, left_effective) = self.partition_reach(actor, &[lineage], &[]).await?;
+        if !allowed.contains(&id) && left_effective > 0 {
+            return Err(AppError::Authorization(
+                "This decision applies in a repository this credential does not cover".to_string(),
+            ));
+        }
+        self.revoke_ids(&allowed, left_effective, actor.user_id)
+            .await
     }
 
-    async fn revoke_lineages(&self, lineages: &[Uuid], actor: Option<Uuid>) -> Result<usize> {
-        if lineages.is_empty() {
-            return Ok(0);
+    async fn revoke_covering(
+        &self,
+        covering: &[(Uuid, Uuid)],
+        actor: &AckActor,
+    ) -> Result<RevokeOutcome> {
+        let (ids, lineages): (Vec<Uuid>, Vec<Uuid>) = covering.iter().copied().unzip();
+        let (allowed, left_effective) = self.partition_reach(actor, &lineages, &ids).await?;
+        self.revoke_ids(&allowed, left_effective, actor.user_id)
+            .await
+    }
+
+    async fn revoke_ids(
+        &self,
+        ids: &[Uuid],
+        left_effective: i64,
+        actor: Option<Uuid>,
+    ) -> Result<RevokeOutcome> {
+        if ids.is_empty() {
+            return Ok(RevokeOutcome {
+                revoked: 0,
+                left_effective,
+            });
         }
         let sql = format!(
             "UPDATE finding_acknowledgements \
              SET revoked_at = NOW(), revoked_by = $2, revoked_reason = 'revoked' \
-             WHERE lineage_id = ANY($1) AND revoked_at IS NULL \
+             WHERE id = ANY($1) AND revoked_at IS NULL \
              RETURNING {ACKNOWLEDGEMENT_COLUMNS}"
         );
         let revoked: Vec<FindingAcknowledgement> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(lineages)
+            .bind(ids)
             .bind(actor)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
         for decision in &revoked {
+            let mut details = decision_audit_details(decision);
+            details["left_effective"] = serde_json::json!(left_effective);
             audit_fire_and_forget(
                 self.db.clone(),
-                decision_audit_entry(AuditAction::FindingAcknowledgementRevoked, decision, actor),
+                decision_audit_entry(AuditAction::FindingAcknowledgementRevoked, decision, actor)
+                    .details(details),
             )
             .await;
             self.clear_frozen_flag(decision).await;
@@ -854,11 +1024,14 @@ impl FindingAcknowledgementService {
             self.apply_change(&decision.checksum_sha256, decision.repository_id)
                 .await;
         }
-        Ok(revoked.len())
+        Ok(RevokeOutcome {
+            revoked: revoked.len(),
+            left_effective,
+        })
     }
 
     /// See [`CLEAR_FROZEN_FLAG_SQL`]. Best-effort: nothing in this version reads
-    /// the flag, so a failure costs only the rollback case it exists for.
+    /// the flag, so a failure costs only the case it exists for.
     async fn clear_frozen_flag(&self, decision: &FindingAcknowledgement) {
         if let Err(e) = sqlx::query(CLEAR_FROZEN_FLAG_SQL)
             .bind(&decision.checksum_sha256)
@@ -937,13 +1110,14 @@ impl FindingAcknowledgementService {
     ///   risk acceptance past a stricter target. What stays behind is audited, and
     ///   the finding is then open there. A decision live on the target stays.
     ///
-    /// A failure leaves the target with neither.
+    /// A failure leaves the target with neither. A clean verdict inherits the 1-day
+    /// limit dedup gives it, so one older than that is not carried: the answer says so.
     pub async fn carry_to_promoted_artifact(
         &self,
         source_artifact_id: Uuid,
         new_artifact_id: Uuid,
         principal: CarryPrincipal,
-    ) -> Result<()> {
+    ) -> Result<CarryOutcome> {
         #[derive(FromRow)]
         struct CopyRow {
             id: Uuid,
@@ -1065,6 +1239,7 @@ impl FindingAcknowledgementService {
                 .map_err(|e| AppError::Database(e.to_string()))?;
             judged.push((scan, reusable));
         }
+        let mut verdict_not_carried_reason = None;
         match carry_plan(&judged) {
             Ok(plan) => {
                 for scan in plan {
@@ -1087,6 +1262,7 @@ impl FindingAcknowledgementService {
                     %reason,
                     "Promoted copy takes no verdict: the target sees it as unscanned"
                 );
+                verdict_not_carried_reason = Some(reason);
             }
         }
 
@@ -1118,7 +1294,12 @@ impl FindingAcknowledgementService {
 
         self.apply_change(&target.checksum_sha256, Some(target.repository_id))
             .await;
-        Ok(())
+        Ok(CarryOutcome {
+            verdict_carried: verdict_not_carried_reason.is_none(),
+            verdict_not_carried_reason,
+            acknowledgements_carried: carried.len(),
+            acknowledgements_left_behind: left_behind.len(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1393,5 +1574,107 @@ mod tests {
         assert_eq!(json["max_severity"], "high");
         assert_eq!(json["revoked_reason"], "superseded");
         assert!(json["repository_id"].is_null());
+    }
+
+    /// #5153: a decision stays inside the token's repository restriction, and the
+    /// audit trail names who acted.
+    #[tokio::test]
+    async fn test_update_cve_status_honours_the_token_5153() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::grpc::auth_interceptor::GrpcPrincipal;
+        use crate::grpc::generated::cve_history_service_server::CveHistoryService;
+        use crate::grpc::generated::UpdateCveStatusRequest;
+        use crate::grpc::sbom_server::CveHistoryGrpcServer;
+        use crate::models::access_scope::AccessScope;
+        use tonic::Request;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (inside, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let (outside, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let mut seeded = Vec::new();
+        for repo in [inside, outside] {
+            let artifact = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                        content_type, storage_key) \
+                 VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+            )
+            .bind(artifact)
+            .bind(repo)
+            .bind(format!("grpc/{artifact}"))
+            .bind(format!("{:064x}", artifact.as_u128()))
+            .execute(&pool)
+            .await
+            .expect("artifact");
+            let scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+                 VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+            )
+            .bind(artifact)
+            .bind(repo)
+            .fetch_one(&pool)
+            .await
+            .expect("scan");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id) \
+                 VALUES ($1, $2, 'high', 't', 'CVE-2031-5153')",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .expect("finding");
+            seeded.push(artifact);
+        }
+        let (in_artifact, out_artifact) = (seeded[0], seeded[1]);
+        let server = CveHistoryGrpcServer::new(pool.clone());
+        let call = |artifact: Uuid| {
+            let mut request = Request::new(UpdateCveStatusRequest {
+                id: crate::services::sbom_service::synth_cve_id(artifact, "CVE-2031-5153")
+                    .to_string(),
+                status: crate::grpc::generated::CveStatus::Acknowledged as i32,
+                reason: "accepted".to_string(),
+            });
+            request.extensions_mut().insert(GrpcPrincipal {
+                is_admin: true,
+                scopes: None,
+                user_id,
+                allowed_repo_ids: AccessScope::Restricted(vec![inside]),
+            });
+            request
+        };
+
+        assert!(
+            server.update_cve_status(call(out_artifact)).await.is_err(),
+            "a token restricted to one repository cannot decide for another"
+        );
+        let decided: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM finding_acknowledgements WHERE repository_id = $1",
+        )
+        .bind(outside)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(decided, 0);
+
+        server
+            .update_cve_status(call(in_artifact))
+            .await
+            .expect("inside the token");
+        let (by,): (Option<Uuid>,) = sqlx::query_as(
+            "SELECT acknowledged_by FROM finding_acknowledgements WHERE repository_id = $1",
+        )
+        .bind(inside)
+        .fetch_one(&pool)
+        .await
+        .expect("decision");
+        assert_eq!(by, Some(user_id), "the decision names who made it");
+
+        for repo in [inside, outside] {
+            tdh::cleanup_member_repo(&pool, repo, &std::env::temp_dir().join("none")).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
     }
 }

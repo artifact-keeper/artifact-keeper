@@ -609,6 +609,7 @@ impl From<crate::models::security::ScanFinding> for FindingResponse {
             acknowledged_at: f.acknowledged_at,
             acknowledgement_id: f.acknowledgement_id,
             acknowledgement_expires_at: f.acknowledgement_expires_at,
+            acknowledgements_left_effective: f.acknowledgements_left_effective,
             created_at: f.created_at,
             finding_class: f.finding_class,
         }
@@ -796,6 +797,9 @@ pub struct FindingResponse {
     pub acknowledgement_id: Option<Uuid>,
     /// When that decision stops applying; null means until revoked.
     pub acknowledgement_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// After a revoke: how many copies of the decision stay effective in
+    /// repositories this caller has no authority over. Null on any other read.
+    pub acknowledgements_left_effective: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// What kind of finding this is (#3013): `vulnerability` (a known
     /// weakness), `malicious` (the package itself is known to be hostile,
@@ -828,7 +832,8 @@ pub struct AcknowledgeRequest {
 /// Which repository's decision a revoke by finding is about.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct RevokeAcknowledgementQuery {
-    /// As `repository_id` on the acknowledge request.
+    /// The repository whose decision is meant. Omitted: the finding's own, unless
+    /// its scan has copies in other repositories, which answers 409.
     pub repository_id: Option<Uuid>,
 }
 
@@ -928,6 +933,16 @@ pub struct ListAcknowledgementsQuery {
     pub include_inactive: bool,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
+}
+
+/// What a revoke did (#5153).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RevokeResponse {
+    /// Decisions revoked.
+    pub revoked: usize,
+    /// Copies of the decision that stay effective, in repositories this credential
+    /// has no authority over.
+    pub left_effective: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2161,7 +2176,8 @@ async fn acknowledge_finding(
         RevokeAcknowledgementQuery,
     ),
     responses(
-        (status = 200, description = "The decisions covering this finding are revoked, with the copies promotion made of them", body = FindingResponse),
+        (status = 200, description = "The decisions covering this finding are revoked, with the copies promotion made of them that this credential has authority over. acknowledgements_left_effective counts the rest", body = FindingResponse),
+        (status = 409, description = "The finding's scan has copies in other repositories and repository_id was not given", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
@@ -2239,7 +2255,7 @@ async fn list_acknowledgements(
         ("id" = Uuid, Path, description = "Acknowledgement ID")
     ),
     responses(
-        (status = 204, description = "The decision is revoked, with the copies promotion made of it"),
+        (status = 200, description = "The decision is revoked, with the copies promotion made of it that this credential has authority over. left_effective counts the rest", body = RevokeResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Acknowledgement not found", body = crate::api::openapi::ErrorResponse),
     ),
@@ -2249,12 +2265,15 @@ async fn revoke_acknowledgement_by_id(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-) -> Result<axum::http::StatusCode> {
+) -> Result<Json<RevokeResponse>> {
     auth.require_admin()?;
-    FindingAcknowledgementService::new(state.db.clone())
+    let outcome = FindingAcknowledgementService::new(state.db.clone())
         .revoke(id, &AckActor::new(auth.user_id, auth.access_scope()))
         .await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(Json(RevokeResponse {
+        revoked: outcome.revoked,
+        left_effective: outcome.left_effective,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3795,6 +3814,7 @@ async fn rescan_proxy_cached_path(
         AcknowledgementScopeParam,
         AcknowledgementResponse,
         AcknowledgementListResponse,
+        RevokeResponse,
         ExternalFindingInput,
         IngestExternalFindingsRequest,
         IngestExternalFindingsResponse,
@@ -8035,6 +8055,7 @@ mod tests {
             acknowledged_at: None,
             acknowledgement_id: None,
             acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
             finding_class: "malicious".to_string(),
         };
@@ -9123,7 +9144,7 @@ mod tests {
                 }),
             )
             .await,
-            Err(AppError::Authorization(_))
+            Err(AppError::NotFound(_))
         ));
         assert!(matches!(
             revoke_acknowledgement_by_id(
@@ -9163,7 +9184,8 @@ mod tests {
         )
         .await
         .expect("revoke");
-        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(status.0.revoked, 1);
+        assert_eq!(status.0.left_effective, 0);
         let Json(listed) = list_acknowledgements(
             State(fx.state.clone()),
             Extension(admin.clone()),
@@ -9389,6 +9411,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["is_acknowledged"], true,
+            "the answer is the state of the repository that was decided"
+        );
         assert!(allowed(dev_artifact, dev).await, "dev is what was decided");
         assert!(!allowed(prod_artifact, prod).await, "prod was not");
         let (hold,): (Option<String>,) =
@@ -9398,6 +9424,11 @@ mod tests {
                 .await
                 .expect("hold");
         assert_eq!(hold.as_deref(), Some("quarantined"), "prod's hold stands");
+
+        // The row's id says nothing about which repository is meant.
+        let (status, body) = security_call(&state, &admin, "DELETE", &acknowledge, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(allowed(dev_artifact, dev).await, "nothing was revoked");
 
         let (status, body) = security_call(
             &state,
@@ -9854,6 +9885,7 @@ mod tests {
             acknowledged_at: None,
             acknowledgement_id: None,
             acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: now,
             finding_class: "vulnerability".to_string(),
         };
@@ -9888,6 +9920,7 @@ mod tests {
             acknowledged_at: Some(now),
             acknowledgement_id: None,
             acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: now,
             finding_class: "vulnerability".to_string(),
         };

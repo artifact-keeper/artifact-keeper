@@ -2502,7 +2502,7 @@ impl ScanResultService {
 
     /// Acknowledge a finding (accept risk): record a decision about its identity
     /// (#5153, [`crate::services::finding_acknowledgements`]) and return the row
-    /// as the readers now see it.
+    /// with the state of the repository decided, which need not be the row's own.
     pub async fn acknowledge_finding(
         &self,
         finding_id: Uuid,
@@ -2510,12 +2510,39 @@ impl ScanResultService {
         reason: &str,
         options: crate::services::finding_acknowledgements::AcknowledgeOptions,
     ) -> Result<ScanFinding> {
-        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
-            self.db.clone(),
-        )
-        .acknowledge_finding(finding_id, actor, Some(reason), options)
-        .await?;
-        self.get_finding(finding_id).await
+        let decision =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            )
+            .acknowledge_finding(finding_id, actor, Some(reason), options)
+            .await?;
+        self.get_finding_as_decided(finding_id, decision.repository_id)
+            .await
+    }
+
+    /// The row, with its acknowledged fields as they stand in `repository_id`.
+    /// `None`, an every-repository decision, is the row's own state.
+    async fn get_finding_as_decided(
+        &self,
+        finding_id: Uuid,
+        repository_id: Option<Uuid>,
+    ) -> Result<ScanFinding> {
+        let mut finding = self.get_finding(finding_id).await?;
+        if let Some(repository_id) = repository_id {
+            let decision =
+                crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                    self.db.clone(),
+                )
+                .decision_in_repository(finding_id, repository_id)
+                .await?;
+            finding.is_acknowledged = decision.is_some();
+            finding.acknowledgement_id = decision.as_ref().map(|d| d.id);
+            finding.acknowledged_by = decision.as_ref().and_then(|d| d.acknowledged_by);
+            finding.acknowledged_reason = decision.as_ref().and_then(|d| d.reason.clone());
+            finding.acknowledged_at = decision.as_ref().map(|d| d.acknowledged_at);
+            finding.acknowledgement_expires_at = decision.as_ref().and_then(|d| d.expires_at);
+        }
+        Ok(finding)
     }
 
     /// One finding with its effective acknowledged state.
@@ -2557,19 +2584,26 @@ impl ScanResultService {
         }
     }
 
-    /// Revoke the decision covering a finding, wherever it reached (#5153).
+    /// Revoke the decision covering a finding, as far as the actor has authority
+    /// (#5153), and return the row with the state of the repository asked about.
+    /// `acknowledgements_left_effective` counts what stayed.
     pub async fn revoke_acknowledgment(
         &self,
         finding_id: Uuid,
         repository_id: Option<Uuid>,
         actor: &crate::services::finding_acknowledgements::AckActor,
     ) -> Result<ScanFinding> {
-        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
-            self.db.clone(),
-        )
-        .revoke_finding(finding_id, repository_id, actor)
-        .await?;
-        self.get_finding(finding_id).await
+        let outcome =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            )
+            .revoke_finding(finding_id, repository_id, actor)
+            .await?;
+        let mut finding = self
+            .get_finding_as_decided(finding_id, repository_id)
+            .await?;
+        finding.acknowledgements_left_effective = Some(outcome.left_effective);
+        Ok(finding)
     }
 
     // -----------------------------------------------------------------------
@@ -4022,6 +4056,7 @@ mod tests {
             acknowledged_at: None,
             acknowledgement_id: None,
             acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
             finding_class: "vulnerability".to_string(),
         };
@@ -4051,6 +4086,7 @@ mod tests {
             acknowledged_at: Some(chrono::Utc::now()),
             acknowledgement_id: None,
             acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
             finding_class: "vulnerability".to_string(),
         };

@@ -571,21 +571,9 @@ impl PromotionRuleService {
     /// cannot weaken a "greater than allowed" threshold. `HAVING COUNT(*) > 0`
     /// preserves the `None` = "no completed scan" signal the caller falls back on.
     async fn get_latest_scan(&self, artifact_id: Uuid) -> Result<Option<ScanCountsRow>> {
+        // The same open findings the policy gate and the download gate read (#5153).
         let row: Option<ScanCountsRow> = sqlx::query_as::<_, ScanCountsRow>(
-            r#"
-            WITH current_completed AS (
-                SELECT critical_count, high_count, medium_count, low_count
-                FROM scan_results
-                WHERE artifact_id = $1 AND status = 'completed'
-                  AND id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
-            )
-            SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
-                   COALESCE(MAX(high_count), 0)::int     AS high_count,
-                   COALESCE(MAX(medium_count), 0)::int   AS medium_count,
-                   COALESCE(MAX(low_count), 0)::int      AS low_count
-            FROM current_completed
-            HAVING COUNT(*) > 0
-            "#,
+            crate::services::promotion_policy_service::OPEN_FINDING_COUNTS_SQL,
         )
         .bind(artifact_id)
         .fetch_optional(&self.db)

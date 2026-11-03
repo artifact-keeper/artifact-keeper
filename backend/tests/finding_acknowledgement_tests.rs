@@ -22,8 +22,8 @@ use artifact_keeper_backend::models::access_scope::AccessScope;
 use artifact_keeper_backend::models::sbom::CveStatus;
 use artifact_keeper_backend::models::security::{FindingClass, RawFinding, ScanResult, Severity};
 use artifact_keeper_backend::services::finding_acknowledgements::{
-    AckActor, AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope, CarryPrincipal,
-    FindingAcknowledgementService,
+    AckActor, AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope, CarryOutcome,
+    CarryPrincipal, FindingAcknowledgementService,
 };
 use artifact_keeper_backend::services::open_findings::{severity_counts, FindingScope};
 use artifact_keeper_backend::services::policy_service::PolicyService;
@@ -511,7 +511,7 @@ async fn a_cross_repository_dedup_copy_is_covered_only_when_the_operator_said_so
 
     // And the widened decision is revoked as one thing.
     fx.svc
-        .revoke_acknowledgment(id, None, &fx.actor())
+        .revoke_acknowledgment(id, Some(dev), &fx.actor())
         .await
         .expect("revoke");
     assert!(!fx.allowed(prod, in_prod).await);
@@ -774,7 +774,7 @@ async fn re_acknowledging_keeps_the_reach_of_a_revoke() {
 
     let id = fx.finding_ids(scan).await[0];
     fx.svc
-        .revoke_acknowledgment(id, None, &fx.actor())
+        .revoke_acknowledgment(id, Some(repo), &fx.actor())
         .await
         .expect("revoke");
     assert!(!fx.allowed(repo, original).await);
@@ -834,7 +834,10 @@ async fn decisions_are_listed_and_revoked_by_id() {
     assert_eq!(rows[0].max_severity_rank, 3);
 
     assert_eq!(
-        svc.revoke(rows[0].id, &fx.actor()).await.expect("revoke"),
+        svc.revoke(rows[0].id, &fx.actor())
+            .await
+            .expect("revoke")
+            .revoked,
         1
     );
     assert!(!fx.allowed(repo, artifact).await);
@@ -1491,7 +1494,11 @@ async fn promotion_rig(fx: &mut Fx) -> (Uuid, Uuid, Uuid, Uuid, String) {
     (source_repo, target_repo, source, target, d)
 }
 
-async fn carry(fx: &Fx, source: Uuid, target: Uuid) -> artifact_keeper_backend::error::Result<()> {
+async fn carry(
+    fx: &Fx,
+    source: Uuid,
+    target: Uuid,
+) -> artifact_keeper_backend::error::Result<CarryOutcome> {
     FindingAcknowledgementService::new(fx.pool.clone())
         .carry_to_promoted_artifact(source, target, fx.admin_principal())
         .await
@@ -1926,10 +1933,17 @@ async fn a_scoped_credential_stays_inside_its_scope() {
         .carry_to_promoted_artifact(a, promoted, fx.admin_principal())
         .await
         .expect("carry");
-    let refused = fx.svc.revoke_acknowledgment(finding_a, None, &scoped).await;
+    let withdrawn = fx
+        .svc
+        .revoke_acknowledgment(finding_a, Some(inside), &scoped)
+        .await
+        .expect("a caller can withdraw in their own repository");
+    assert_eq!(withdrawn.acknowledgements_left_effective, Some(1));
+    assert!(!withdrawn.is_acknowledged);
+    assert!(!fx.allowed(inside, a).await, "gone where the caller asked");
     assert!(
-        matches!(refused, Err(AppError::Authorization(_))),
-        "{refused:?}"
+        fx.allowed(outside, promoted).await,
+        "the copy the credential does not cover stays, and the answer said so"
     );
     fx.cleanup().await;
 }
@@ -1950,17 +1964,7 @@ async fn a_tenant_admin_cannot_decide_for_another_tenant() {
     let scan = fx
         .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
         .await;
-    let tenant_admin = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
-         VALUES ($1, $2, $3, 'unused', 'local', true, true)",
-    )
-    .bind(tenant_admin)
-    .bind(format!("ack-tenant-{tenant_admin}"))
-    .bind(format!("ack-tenant-{tenant_admin}@test.local"))
-    .execute(&fx.pool)
-    .await
-    .expect("tenant admin");
+    let tenant_admin = bound_admin(&fx).await;
     let id = fx.finding_ids(scan).await[0];
     let refused = fx
         .svc
@@ -1976,6 +1980,11 @@ async fn a_tenant_admin_cannot_decide_for_another_tenant() {
         "{refused:?}"
     );
     assert!(!fx.allowed(repo, artifact).await);
+    sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+        .bind(tenant_admin)
+        .execute(&fx.pool)
+        .await
+        .expect("remove grant");
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(tenant_admin)
         .execute(&fx.pool)
@@ -2092,4 +2101,330 @@ async fn the_backfill_does_not_share_a_transaction_with_any_blocking_ddl() {
     }
     let schema = migration_file("_finding_acknowledgements.sql");
     assert!(!schema.to_uppercase().contains("ALTER TABLE SCAN_RESULTS"));
+}
+
+// ---------------------------------------------------------------------------
+// Authority
+// ---------------------------------------------------------------------------
+
+/// An `is_admin` user with one repository grant and no instance-wide role: what
+/// this codebase calls a tenant admin. The grant is on a repository of its own.
+async fn bound_admin(fx: &Fx) -> Uuid {
+    let id = plain_admin(fx).await;
+    let own: Uuid = sqlx::query_scalar(
+        "INSERT INTO repositories (key, name, storage_path, repo_type, format) \
+         VALUES ($1, $1, $2, 'local', 'generic') RETURNING id",
+    )
+    .bind(format!("ack-tenant-{id}"))
+    .bind(format!("/tmp/ack-tenant-{id}"))
+    .fetch_one(&fx.pool)
+    .await
+    .expect("own repository");
+    sqlx::query(
+        "INSERT INTO role_assignments (user_id, role_id, repository_id) \
+         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'admin'",
+    )
+    .bind(id)
+    .bind(own)
+    .execute(&fx.pool)
+    .await
+    .expect("repository grant");
+    id
+}
+
+/// An `is_admin` user with no role row, as `POST /users` creates one.
+async fn plain_admin(fx: &Fx) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+         VALUES ($1, $2, $3, 'unused', 'local', true, true)",
+    )
+    .bind(id)
+    .bind(format!("ack-plain-{id}"))
+    .bind(format!("ack-plain-{id}@test.local"))
+    .execute(&fx.pool)
+    .await
+    .expect("admin");
+    id
+}
+
+async fn make_private(fx: &Fx, repo: Uuid) {
+    sqlx::query("UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1")
+        .bind(repo)
+        .execute(&fx.pool)
+        .await
+        .expect("private");
+}
+
+#[tokio::test]
+#[ignore]
+async fn an_admin_with_no_role_row_can_decide_and_withdraw_on_a_private_repository() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    make_private(&fx, repo).await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let id = fx.finding_ids(scan).await[0];
+    let admin = AckActor::new(plain_admin(&fx).await, AccessScope::Admin);
+    fx.svc
+        .acknowledge_finding(id, &admin, "accepted", Default::default())
+        .await
+        .expect("decide");
+    assert!(fx.allowed(repo, artifact).await);
+    fx.svc
+        .revoke_acknowledgment(id, None, &admin)
+        .await
+        .expect("withdraw");
+    assert!(!fx.allowed(repo, artifact).await);
+    fx.svc
+        .acknowledge_finding(
+            id,
+            &admin,
+            "everywhere",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("an unbound admin can decide for every repository");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn public_read_access_is_not_authority_to_decide() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+        .bind(repo)
+        .execute(&fx.pool)
+        .await
+        .expect("public");
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let id = fx.finding_ids(scan).await[0];
+    fx.ack_scan(scan).await;
+    let tenant_admin = AckActor::new(bound_admin(&fx).await, AccessScope::Admin);
+    let revoke = fx.svc.revoke_acknowledgment(id, None, &tenant_admin).await;
+    assert!(
+        matches!(revoke, Err(AppError::Authorization(_))),
+        "{revoke:?}"
+    );
+    assert!(fx.allowed(repo, artifact).await, "the decision stands");
+    fx.svc
+        .revoke_acknowledgment(id, None, &fx.actor())
+        .await
+        .expect("revoke");
+    let decide = fx
+        .svc
+        .acknowledge_finding(id, &tenant_admin, "not mine", Default::default())
+        .await;
+    assert!(
+        matches!(decide, Err(AppError::Authorization(_))),
+        "{decide:?}"
+    );
+    assert!(!fx.allowed(repo, artifact).await);
+    fx.cleanup().await;
+}
+
+/// The id a listing hands out does not say which repository the caller is in, so
+/// a revoke needs to be told as an acknowledge does, and each answers with the
+/// state of the repository that was named.
+#[tokio::test]
+#[ignore]
+async fn a_row_with_copies_elsewhere_needs_the_repository_named_and_answers_for_it() {
+    let mut fx = Fx::new().await;
+    let prod = fx.repo().await;
+    let dev = fx.repo().await;
+    let d = digest();
+    let in_prod = fx.artifact(prod, "a.tgz", &d).await;
+    let in_dev = fx.artifact(dev, "a.tgz", &d).await;
+    let source = fx
+        .scan(prod, in_prod, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    fx.svc
+        .copy_scan_results(source, in_dev, dev, "dependency", &d, None)
+        .await
+        .expect("copy");
+    let id = fx.finding_ids(source).await[0];
+    let in_repo = |repository_id| AcknowledgeOptions {
+        repository_id: Some(repository_id),
+        ..Default::default()
+    };
+
+    for repo in [prod, dev] {
+        let answered = fx
+            .svc
+            .acknowledge_finding(id, &fx.actor(), "accepted", in_repo(repo))
+            .await
+            .expect("decide");
+        assert!(
+            answered.is_acknowledged,
+            "the state of the repository named"
+        );
+    }
+    assert!(fx.allowed(prod, in_prod).await && fx.allowed(dev, in_dev).await);
+
+    let ambiguous = fx.svc.revoke_acknowledgment(id, None, &fx.actor()).await;
+    assert!(
+        matches!(ambiguous, Err(AppError::Conflict(_))),
+        "{ambiguous:?}"
+    );
+    assert!(fx.allowed(prod, in_prod).await, "nothing was revoked");
+
+    let answered = fx
+        .svc
+        .revoke_acknowledgment(id, Some(dev), &fx.actor())
+        .await
+        .expect("revoke dev");
+    assert!(
+        !answered.is_acknowledged,
+        "dev's state, though the row is prod's and prod's decision stands"
+    );
+    assert!(!fx.allowed(dev, in_dev).await);
+    assert!(fx.allowed(prod, in_prod).await);
+    fx.cleanup().await;
+}
+
+/// A credential that does not cover a finding learns nothing about it: the same
+/// answer as for an id that does not exist, whatever else the request names.
+#[tokio::test]
+#[ignore]
+async fn a_finding_outside_the_credential_reads_as_no_finding() {
+    let mut fx = Fx::new().await;
+    let inside = fx.repo().await;
+    let outside = fx.repo().await;
+    let d = digest();
+    fx.artifact(inside, "a.tgz", &d).await;
+    let foreign = fx.artifact(outside, "a.tgz", &d).await;
+    let scan = fx
+        .scan(
+            outside,
+            foreign,
+            "dependency",
+            &[finding(CVE_A, LODASH, "1")],
+        )
+        .await;
+    let other_bytes = fx.artifact(outside, "b.tgz", &digest()).await;
+    let scan2 = fx
+        .scan(
+            outside,
+            other_bytes,
+            "dependency",
+            &[finding(CVE_B, LODASH, "1")],
+        )
+        .await;
+    let scoped = AckActor::new(fx.admin, AccessScope::Restricted(vec![inside]));
+    let in_inside = AcknowledgeOptions {
+        repository_id: Some(inside),
+        ..Default::default()
+    };
+    let absent = format!(
+        "{:?}",
+        fx.svc
+            .acknowledge_finding(Uuid::new_v4(), &scoped, "x", in_inside)
+            .await
+            .expect_err("absent")
+    );
+    assert!(absent.contains("NotFound"), "{absent}");
+    for (label, id) in [
+        ("the same bytes, no copy", fx.finding_ids(scan).await[0]),
+        ("other bytes", fx.finding_ids(scan2).await[0]),
+    ] {
+        for options in [in_inside, AcknowledgeOptions::default()] {
+            let answer = format!(
+                "{:?}",
+                fx.svc
+                    .acknowledge_finding(id, &scoped, "x", options)
+                    .await
+                    .expect_err(label)
+            );
+            assert_eq!(answer, absent, "{label}");
+        }
+        let answer = format!(
+            "{:?}",
+            fx.svc
+                .revoke_acknowledgment(id, Some(inside), &scoped)
+                .await
+                .expect_err(label)
+        );
+        assert_eq!(answer, absent, "{label} revoke");
+    }
+    assert!(!fx.allowed(outside, foreign).await);
+    fx.cleanup().await;
+}
+
+/// `max_cve_severity` and the promotion thresholds read open findings, as the
+/// download gate does, so a retracted false positive that was acknowledged does
+/// not block promotion for ever.
+#[tokio::test]
+#[ignore]
+async fn the_promotion_gate_honours_an_acknowledged_external_finding() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    ingest(
+        &fx,
+        repo,
+        artifact,
+        &[external(
+            CVE_A,
+            "vendor-a",
+            Severity::Critical,
+            FindingClass::Vulnerability,
+        )],
+    )
+    .await;
+    ingest(&fx, repo, artifact, &[]).await;
+    let summary = |pool: PgPool| async move {
+        PromotionPolicyService::new(pool)
+            .evaluate_artifact(artifact, repo)
+            .await
+            .expect("evaluate")
+            .cve_summary
+            .expect("summary")
+    };
+    assert_eq!(
+        summary(fx.pool.clone()).await.critical_count,
+        1,
+        "open: it counts"
+    );
+    let open = severity_counts(&fx.pool, FindingScope::Artifact(artifact))
+        .await
+        .expect("counts");
+    assert_eq!(open.critical, 1, "the tiles agree with the gate about it");
+
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM scan_findings WHERE artifact_id = $1")
+        .bind(artifact)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("finding");
+    fx.svc
+        .acknowledge_finding(
+            id,
+            &fx.actor(),
+            "retracted by the vendor",
+            Default::default(),
+        )
+        .await
+        .expect("acknowledge");
+    let after = summary(fx.pool.clone()).await;
+    assert_eq!(after.critical_count, 0, "acknowledged: it does not");
+    assert!(after.open_cves.is_empty());
+    assert!(fx.allowed(repo, artifact).await, "the download gate agrees");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_foreign_key_migration_bounds_its_lock() {
+    let sql = migration_file("_scan_results_source_scan_fk.sql");
+    let set = sql.find("SET LOCAL lock_timeout").expect("a lock timeout");
+    let alter = sql.find("ALTER TABLE").expect("the change");
+    assert!(set < alter, "set before the lock is taken");
 }

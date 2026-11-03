@@ -173,40 +173,38 @@ struct ScanRow {
     findings_count: i32,
 }
 
-/// SQL for an artifact's severity counts, taken across the scans the download gate
-/// grades (`artifact_current_scan_ids`, #5153) rather than the single most recently
-/// completed row, so a later scan that could not assess the artifact does not clear
-/// a complete scan's verdict at this gate either.
+/// SQL for an artifact's OPEN findings by severity, through the view the download
+/// gate reads (#5153), over the same scans. One finding per identity, at the highest
+/// severity any scan reported, so two engines reporting a CVE count once.
 ///
-/// The old form was `ORDER BY created_at DESC LIMIT 1` over all completed rows
-/// regardless of `scan_type`, so whichever engine happened to finish last
-/// supplied the entire CVE verdict and every other engine's findings were
-/// invisible to the gate. With more than one scanner enabled that is a silent
-/// fail-open: a clean-but-later scan hides an earlier scan's criticals.
+/// It used to read the counts stored on `scan_results`, which know nothing about
+/// acknowledgements, so a finding the download gate let through still blocked
+/// promotion. And because external submissions never leave the graded window, a
+/// vendor's retracted and acknowledged false positive blocked promotion for ever.
+/// A finding reported by a scan that did not finish counts, as at the download gate.
 ///
-/// Counts are combined with a per-severity `MAX`, not `SUM`: the per-scanner
-/// aggregates describe overlapping finding sets, so summing would double-count a
-/// CVE that two engines both report. `MAX` cannot weaken the gate — the
-/// thresholds in [`evaluate_cve_thresholds`] only test "greater than the allowed
-/// number", and a severity is non-zero here whenever any engine reported it.
-///
-/// `HAVING COUNT(*) > 0` preserves the caller's "no completed scan at all"
-/// signal: an aggregate with no `GROUP BY` would otherwise always return one
-/// all-zeros row, turning "never scanned" into "scanned and clean".
-const LATEST_SCAN_COUNTS_SQL: &str = r#"
-    WITH current_completed AS (
-        SELECT critical_count, high_count, medium_count, low_count, findings_count
-        FROM scan_results
-        WHERE artifact_id = $1 AND status = 'completed'
-          AND id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+/// The `HAVING` preserves the caller's "no completed scan at all" signal: an
+/// aggregate with no `GROUP BY` would otherwise always return one all-zeros row,
+/// turning "never scanned" into "scanned and clean".
+pub(crate) const OPEN_FINDING_COUNTS_SQL: &str = r#"
+    WITH open_findings AS (
+        SELECT MAX(finding_severity_rank(sf.severity)) AS severity_rank
+        FROM scan_findings_effective sf
+        WHERE sf.artifact_id = $1
+          AND sf.scan_result_id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+          AND NOT sf.is_acknowledged
+        GROUP BY sf.finding_class,
+                 finding_advisory_key(sf.cve_id, sf.title),
+                 finding_component_key(sf.affected_component),
+                 finding_component_key(sf.affected_version)
     )
-    SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
-           COALESCE(MAX(high_count), 0)::int     AS high_count,
-           COALESCE(MAX(medium_count), 0)::int   AS medium_count,
-           COALESCE(MAX(low_count), 0)::int      AS low_count,
-           COALESCE(MAX(findings_count), 0)::int AS findings_count
-    FROM current_completed
-    HAVING COUNT(*) > 0
+    SELECT (COUNT(*) FILTER (WHERE severity_rank = 4))::int AS critical_count,
+           (COUNT(*) FILTER (WHERE severity_rank = 3))::int AS high_count,
+           (COUNT(*) FILTER (WHERE severity_rank = 2))::int AS medium_count,
+           (COUNT(*) FILTER (WHERE severity_rank = 1))::int AS low_count,
+           COUNT(*)::int AS findings_count
+    FROM open_findings
+    HAVING EXISTS (SELECT 1 FROM scan_results WHERE artifact_id = $1 AND status = 'completed')
 "#;
 
 /// SQL for an artifact's open CVEs, sourced from `scan_findings` (the populated
@@ -217,7 +215,7 @@ const LATEST_SCAN_COUNTS_SQL: &str = r#"
 /// passed (#1620; data source also addresses #1561).
 ///
 /// Scoped to the scans the download gate grades, for the same reason as
-/// [`LATEST_SCAN_COUNTS_SQL`]: joining findings to one single latest row hid the
+/// [`OPEN_FINDING_COUNTS_SQL`]: joining findings to one single latest row hid the
 /// open CVEs of every other engine. `SELECT DISTINCT` already collapses a CVE
 /// that several engines report, so widening the join cannot produce duplicates.
 const OPEN_CVES_SQL: &str = r#"
@@ -796,7 +794,7 @@ impl PromotionPolicyService {
     }
 
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
-        let scan: Option<ScanRow> = sqlx::query_as(LATEST_SCAN_COUNTS_SQL)
+        let scan: Option<ScanRow> = sqlx::query_as(OPEN_FINDING_COUNTS_SQL)
             .bind(artifact_id)
             .fetch_optional(&self.db)
             .await?;
@@ -1044,7 +1042,7 @@ mod tests {
         // engines enabled, whichever finished last supplied the entire CVE verdict
         // and the others' findings never reached the gate — so a clean scan that
         // completed after a critical-bearing one silently unblocked promotion.
-        for sql in [LATEST_SCAN_COUNTS_SQL, OPEN_CVES_SQL] {
+        for sql in [OPEN_FINDING_COUNTS_SQL, OPEN_CVES_SQL] {
             assert!(
                 sql.contains("artifact_current_scan_ids"),
                 "query must window per scanner, not take one global latest row"
@@ -1058,30 +1056,19 @@ mod tests {
         // an unfiltered aggregate always returns a row, which the caller would read
         // as a clean scan instead of `None`.
         assert!(
-            LATEST_SCAN_COUNTS_SQL.contains("HAVING COUNT(*) > 0"),
+            OPEN_FINDING_COUNTS_SQL.contains("HAVING EXISTS"),
             "no completed scan must still yield zero rows"
         );
-        // MAX, not SUM: per-scanner aggregates cover overlapping finding sets, so
-        // summing would double-count a CVE that two engines both report. Pin
-        // every count column -- leaving one un-aggregated would silently narrow
-        // the verdict back to a single scanner for that severity.
-        for col in [
-            "critical_count",
-            "high_count",
-            "medium_count",
-            "low_count",
-            "findings_count",
-        ] {
-            assert!(
-                LATEST_SCAN_COUNTS_SQL.contains(&format!("MAX({col})")),
-                "{col} must be aggregated across scanners"
-            );
-        }
-        assert!(!LATEST_SCAN_COUNTS_SQL.contains("SUM("));
+        // One finding per identity at its highest severity, not a row count: two
+        // engines reporting a CVE are one finding.
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("MAX(finding_severity_rank(sf.severity))"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("GROUP BY sf.finding_class"));
+        assert!(!OPEN_FINDING_COUNTS_SQL.contains("SUM("));
 
-        // The counts query feeds the same latest-completed-scan contract.
-        assert!(LATEST_SCAN_COUNTS_SQL.contains("FROM scan_results"));
-        assert!(LATEST_SCAN_COUNTS_SQL.contains("status = 'completed'"));
+        // Open findings, through the view the download gate reads (#5153).
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("FROM scan_findings_effective"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("NOT sf.is_acknowledged"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("status = 'completed'"));
     }
 
     // =======================================================================
@@ -2527,10 +2514,23 @@ mod tests {
             .await
             .expect("failed to insert scan_finding");
         }
+        // The counts come from open findings (#5153), so seed the highs as rows.
+        for i in 0..high {
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, source) \
+                 VALUES ($1, $2, 'high', $3, 'test')",
+            )
+            .bind(scan_id)
+            .bind(artifact)
+            .bind(format!("seeded high {i}"))
+            .execute(pool)
+            .await
+            .expect("failed to insert a high finding");
+        }
         scan_id
     }
 
-    /// Executes the rewritten `LATEST_SCAN_COUNTS_SQL` and `OPEN_CVES_SQL`
+    /// Executes the rewritten `OPEN_FINDING_COUNTS_SQL` and `OPEN_CVES_SQL`
     /// against a real database with TWO scanners.
     ///
     /// The sibling test in this module pins the SQL *strings*, which guards

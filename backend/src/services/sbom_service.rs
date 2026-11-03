@@ -248,6 +248,7 @@ fn scan_finding_to_history_entry(row: ScanFindingCveRow) -> CveHistoryEntry {
         acknowledged_by: None,
         acknowledged_at: None,
         acknowledged_reason: None,
+        acknowledgements_left_effective: None,
         created_at: row.first_detected_at,
         updated_at: row.last_detected_at,
     }
@@ -1343,16 +1344,19 @@ impl SbomService {
             user_id,
             credential,
         };
-        let found = if acknowledge {
-            acknowledgements
+        let (found, left_effective) = if acknowledge {
+            let decided = acknowledgements
                 .acknowledge_advisory(artifact_id, cve_id, &actor, reason, Default::default())
-                .await?
-                > 0
+                .await?;
+            (decided > 0, None)
         } else {
-            acknowledgements
+            match acknowledgements
                 .revoke_advisory(artifact_id, cve_id, &actor)
                 .await?
-                .is_some()
+            {
+                Some(outcome) => (true, Some(outcome.left_effective)),
+                None => (false, None),
+            }
         };
 
         if !found {
@@ -1374,6 +1378,10 @@ impl SbomService {
         entries
             .into_iter()
             .find(|e| e.cve_id.to_ascii_uppercase() == cve_upper)
+            .map(|mut entry| {
+                entry.acknowledgements_left_effective = left_effective;
+                entry
+            })
             .ok_or_else(|| {
                 AppError::NotFound(format!(
                     "Updated scan_findings rows but could not re-read aggregate \
@@ -3572,6 +3580,7 @@ mod tests {
             acknowledged_by: None,
             acknowledged_at: None,
             acknowledged_reason: None,
+            acknowledgements_left_effective: None,
             created_at: first_detected_at,
             updated_at: first_detected_at,
         }

@@ -19,8 +19,11 @@
 //! The shared definition:
 //!
 //! 1. **Which scans.** For each artifact that is not deleted, the latest
-//!    completed scan of each scan type. A rescan that no longer reports a
-//!    vulnerability removes it.
+//!    completed scan of each scan type, and every external submission. A rescan
+//!    that no longer reports a vulnerability removes it. The download gate also
+//!    keeps a complete scan's verdict past a later incomplete or crashed scan
+//!    (`artifact_current_scan_ids`); these counts do not, so in that one case a
+//!    tile can read clear while the gate refuses.
 //! 2. **What is counted.** One vulnerability per (artifact, advisory). The
 //!    advisory is the CVE id, case-insensitively, or the finding title when a
 //!    scanner reported no CVE id (GHSA/OSV-only advisories, OpenSCAP rules).
@@ -81,13 +84,15 @@ pub(crate) const ADVISORY_KEY_SQL: &str = "COALESCE(NULLIF(UPPER(BTRIM(sf.cve_id
 pub fn vulnerabilities_cte(scope: FindingScope) -> String {
     format!(
         r#"WITH latest_scans AS (
-    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type,
+                        CASE WHEN sr.scan_type = 'external' THEN sr.id END) sr.id
     FROM scan_results sr
     JOIN artifacts a ON a.id = sr.artifact_id
     WHERE sr.status = 'completed'
       AND NOT a.is_deleted
       {filter}
     ORDER BY sr.artifact_id, sr.scan_type,
+             CASE WHEN sr.scan_type = 'external' THEN sr.id END,
              sr.completed_at DESC NULLS LAST, sr.created_at DESC
 ),
 vulnerabilities AS (
@@ -171,10 +176,13 @@ mod tests {
     #[test]
     fn counts_come_from_the_latest_completed_scan_per_artifact_and_scan_type() {
         let sql = severity_counts_sql(FindingScope::All);
-        assert!(sql.contains("DISTINCT ON (sr.artifact_id, sr.scan_type)"));
+        assert!(sql.contains("DISTINCT ON (sr.artifact_id, sr.scan_type,"));
         assert!(sql.contains("sr.status = 'completed'"));
         assert!(sql.contains("NOT a.is_deleted"));
         assert!(sql.contains("sr.completed_at DESC NULLS LAST, sr.created_at DESC"));
+        // Every external submission counts, as at the download gate: they share
+        // one scan type and one vendor's cannot supersede another's (#5153).
+        assert!(sql.contains("CASE WHEN sr.scan_type = 'external' THEN sr.id END"));
     }
 
     #[test]

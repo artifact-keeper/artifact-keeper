@@ -470,6 +470,11 @@ pub struct ScanFinding {
     /// When that decision stops applying; `None` means until revoked.
     #[serde(default)]
     pub acknowledgement_expires_at: Option<DateTime<Utc>>,
+    /// After a revoke: how many copies of the decision stay effective in
+    /// repositories the caller has no authority over. `None` on any other read.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub acknowledgements_left_effective: Option<i64>,
     pub created_at: DateTime<Utc>,
     /// `vulnerability`, `malicious` or `policy` (#3013). See [`FindingClass`].
     pub finding_class: String,

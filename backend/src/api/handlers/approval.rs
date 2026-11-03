@@ -1049,7 +1049,7 @@ pub async fn approve_promotion(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    super::promotion::carry_scan_state_to_promoted(
+    let scan_state = super::promotion::carry_scan_state_to_promoted(
         &state.db,
         artifact.id,
         new_artifact_id,
@@ -1134,6 +1134,7 @@ pub async fn approve_promotion(
             "requested_by": approval.requested_by,
             "promoted_artifact_id": new_artifact_id,
             "promotion_id": promotion_id,
+            "scan_state": scan_state,
             "skip_policy_check": req.skip_policy_check,
             "notes": req.notes,
         })),

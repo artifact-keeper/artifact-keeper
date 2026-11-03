@@ -10,11 +10,10 @@
 -- way as an old one and an expiry needs no sweep to take effect.
 --
 -- `scan_findings.is_acknowledged`, `acknowledged_by`, `acknowledged_reason` and
--- `acknowledged_at` are frozen, not dropped: a 1.11 replica still reads them
--- during a rolling upgrade, and a rollback finds the state it left behind.
--- Nothing in this version reads them. A revoke or a recorded lapse clears them,
--- so a decision undone here does not read as acknowledged there. Removing them is
--- a follow-up.
+-- `acknowledged_at` are frozen, not dropped: a 1.11 replica still running during a
+-- rolling upgrade reads them. Nothing in this version reads them. A revoke or a
+-- recorded lapse clears them, so a decision undone here does not read as
+-- acknowledged there. Removing them is a follow-up.
 --
 -- The backfill and the change to `scan_results` are migrations of their own, each
 -- its own transaction, so no lock taken here is held across the backfill's scan of
@@ -239,7 +238,7 @@ COMMENT ON TABLE finding_acknowledgements IS
 COMMENT ON COLUMN scan_findings.is_acknowledged IS
     'FROZEN (#5153): no longer read, and only ever cleared. Acknowledged state comes '
     'from finding_acknowledgements through scan_findings_effective. Kept for rolling '
-    'upgrades and rollback; to be dropped in a later release.';
+    'upgrades; to be dropped in a later release.';
 COMMENT ON COLUMN scan_findings.acknowledged_by IS 'FROZEN (#5153): see is_acknowledged.';
 COMMENT ON COLUMN scan_findings.acknowledged_reason IS 'FROZEN (#5153): see is_acknowledged.';
 COMMENT ON COLUMN scan_findings.acknowledged_at IS 'FROZEN (#5153): see is_acknowledged.';
