@@ -268,15 +268,30 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// This is [`Self::copy`] for a caller that gives the source up: a backend
     /// may move it, so afterwards `source` may or may not exist, and the caller
-    /// must not read it and must accept `NotFound` when deleting it. A failure
-    /// leaves `dest` unpublished by this call. Never pass an object a retry may
-    /// need again, such as a registered upload-session part.
+    /// must not read it and must accept `NotFound` when deleting it. Never pass
+    /// an object a retry may need again, such as a registered upload-session
+    /// part.
+    ///
+    /// `Err` does not mean `dest` is untouched: the filesystem backend can fail
+    /// on its directory sync after the rename, with the bytes already at `dest`
+    /// and `source` gone. Callers must therefore journal `dest` first and publish
+    /// nothing naming it on `Err`, leaving the object for the journal sweep. That
+    /// is safe because `source` holds verified bytes under a content-addressed
+    /// `dest`, so a live object there is only ever replaced by identical bytes.
     ///
     /// The default is `copy`, whose own default streams through `get_stream()`
     /// and `put_stream()`, so any backend gets a working promote and object
     /// stores keep their server-side copy.
     async fn promote(&self, source: &str, dest: &str) -> Result<()> {
         self.copy(source, dest).await
+    }
+
+    /// The stored size of `key` from object metadata, without reading its bytes.
+    ///
+    /// `Ok(None)` means this backend cannot say cheaply, which is the default, so
+    /// a caller skips any check it would use this for. `NotFound` when absent.
+    async fn stored_size(&self, _key: &str) -> Result<Option<u64>> {
+        Ok(None)
     }
 
     /// Check if this backend supports redirect downloads via presigned URLs
@@ -705,6 +720,12 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, "dest-key");
         assert_eq!(writes[0].1.as_ref(), b"copied bytes");
+    }
+
+    /// #5133: a backend with no metadata lookup answers "unknown", not a size.
+    #[tokio::test]
+    async fn default_stored_size_is_unknown_5133() {
+        assert_eq!(TestBackend.stored_size("any-key").await.unwrap(), None);
     }
 
     #[tokio::test]

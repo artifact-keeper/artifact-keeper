@@ -8,8 +8,8 @@ takes depends on how the client uploaded the layer and on the storage backend:
 
 | Upload | After the last body byte | Grows with layer size? |
 |---|---|---|
-| `POST`, then one `PUT` carrying the whole layer (containerd) | No read-back: the digest was computed while streaming. Filesystem renames; object stores copy server-side | Filesystem: no (unless staging and blobs are on different mounts). Object stores: yes, by the copy |
-| `POST ?digest=` carrying the whole layer | Same | Same |
+| `POST`, then one `PUT` carrying the whole layer (containerd) | No read-back: the digest was computed while streaming. The stored size is checked from metadata. Filesystem renames; object stores copy server-side | Filesystem: only by the final `fsync` of the streamed body, which still runs before the response; the rename itself does not, unless rename is unavailable (for example staging and blobs on different mounts) and it falls back to a copy. Object stores: yes, by the copy |
+| `POST ?digest=` carrying the whole layer | As above, without the stored-size check | Same |
 | `POST`, one `PATCH`, empty `PUT` | Copy of the session part. Filesystem copies unless the volume supports reflinks | Yes, by the copy |
 | `POST`, several `PATCH`es, `PUT` | Re-reads every part to verify the digest, writes one object, then moves it | Yes, by the read, hash and write |
 

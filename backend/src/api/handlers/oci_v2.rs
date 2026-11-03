@@ -8866,6 +8866,35 @@ async fn complete_claimed_oci_upload(job: OciUploadCompletionJob) -> Response {
             );
             return abandon("whole body digest mismatch", response).await;
         }
+        // #4646: a stored object shorter than what was streamed is a storage
+        // fault, and it must not replace a good object at the blob key. The body
+        // is not read back here, so this metadata lookup is the whole check: it
+        // catches a short write, not bytes corrupted at the right length.
+        let stored_length_fault = match storage.stored_size(&final_part_key).await {
+            Ok(None) => None,
+            Ok(Some(stored)) if stored == whole_blob.size_bytes as u64 => None,
+            Ok(Some(stored)) => {
+                tracing::error!(
+                    storage_key = %final_part_key,
+                    expected_bytes = whole_blob.size_bytes,
+                    stored_bytes = stored,
+                    "OCI upload part length in storage does not match the length streamed"
+                );
+                Some(AppError::Storage(format!(
+                    "upload part {} holds {} bytes, expected {}",
+                    final_part_key, stored, whole_blob.size_bytes
+                )))
+            }
+            Err(e) => Some(e),
+        };
+        if let Some(e) = stored_length_fault {
+            let response = oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_UNKNOWN",
+                &e.to_string(),
+            );
+            return abandon("whole body stored length check failed", response).await;
+        }
         if !completion_heartbeat.lease_is_valid() {
             delete_storage_key_best_effort(
                 &storage,
@@ -24160,6 +24189,9 @@ mod oci_blob_upload_streaming_tests {
         delete_keys: Mutex<Vec<String>>,
         get_errors: Mutex<HashSet<String>>,
         delete_error_prefixes: Mutex<Vec<String>>,
+        /// Store only this many bytes of writes to keys with this prefix, while
+        /// `put_stream` still reports the full stream: a short write (#4646).
+        truncate_writes: Mutex<Option<(String, usize)>>,
     }
 
     impl RecordingStorage {
@@ -24203,11 +24235,24 @@ mod oci_blob_upload_streaming_tests {
     impl StorageBackend for RecordingStorage {
         async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
             self.put_keys.lock().unwrap().push(key.to_string());
+            let content = match self.truncate_writes.lock().unwrap().as_ref() {
+                Some((prefix, keep)) if key.starts_with(prefix) => content.slice(0..*keep),
+                _ => content,
+            };
             self.objects
                 .lock()
                 .unwrap()
                 .insert(key.to_string(), content);
             Ok(())
+        }
+
+        async fn stored_size(&self, key: &str) -> crate::error::Result<Option<u64>> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|content| Some(content.len() as u64))
+                .ok_or_else(|| AppError::NotFound(format!("Storage key not found: {}", key)))
         }
 
         async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
@@ -28283,6 +28328,10 @@ mod oci_blob_upload_streaming_tests {
             self.inner.delete(key).await
         }
 
+        async fn stored_size(&self, key: &str) -> crate::error::Result<Option<u64>> {
+            self.inner.stored_size(key).await
+        }
+
         async fn get_stream(
             &self,
             key: &str,
@@ -28576,6 +28625,64 @@ mod oci_blob_upload_streaming_tests {
 
         let (status, _, body) = send(app, whole_body_put(&f, upload_uuid, &digest, &content)).await;
         assert_eq!(status, StatusCode::CREATED, "{:?}", body);
+        assert_eq!(oci_blob_count(&f, &digest).await, 1);
+
+        f.teardown().await;
+    }
+
+    /// #4646 kept on the #5133 fast path: a stored body shorter than what was
+    /// streamed is refused before it can replace a good object at the blob key,
+    /// the part is removed and the same PUT works once storage behaves.
+    ///
+    /// FAILS WITHOUT THE STORED-LENGTH CHECK: the digest of the stream matches, so
+    /// the short object was promoted over the good one and answered 201.
+    #[tokio::test]
+    async fn whole_body_put_short_stored_write_is_refused_5133() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let (storage, app) = recording_app(&f).await;
+        let content = unique_layer("short write layer");
+        let digest = compute_sha256(&content);
+        let blob_key = blob_storage_key(&digest);
+        storage.put(&blob_key, content.clone()).await.unwrap();
+        let upload_uuid = open_empty_session(&f, &app).await;
+        let final_prefix = format!("{}.part.2147483647.", upload_storage_key(&upload_uuid));
+        *storage.truncate_writes.lock().unwrap() = Some((final_prefix.clone(), 3));
+
+        let (status, _, body) = send(
+            app.clone(),
+            whole_body_put(&f, upload_uuid, &digest, &content),
+        )
+        .await;
+        *storage.truncate_writes.lock().unwrap() = None;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{:?}", body);
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(body_text.contains("BLOB_UPLOAD_UNKNOWN"), "{body_text}");
+        assert!(
+            body_text.contains(&format!("holds 3 bytes, expected {}", content.len())),
+            "{body_text}"
+        );
+        assert_eq!(storage.copy_keys(), Vec::<(String, String)>::new());
+        assert_eq!(
+            storage.get(&blob_key).await.unwrap(),
+            content,
+            "the good object must survive"
+        );
+        assert!(
+            storage.keys().iter().all(|k| !k.starts_with(&final_prefix)),
+            "the short part must be removed: {:?}",
+            storage.keys()
+        );
+        assert_eq!(oci_blob_count(&f, &digest).await, 0);
+        assert_eq!(
+            session_row_state(&f, upload_uuid).await.as_deref(),
+            Some("open")
+        );
+
+        let (status, _, body) = send(app, whole_body_put(&f, upload_uuid, &digest, &content)).await;
+        assert_eq!(status, StatusCode::CREATED, "retry: {:?}", body);
         assert_eq!(oci_blob_count(&f, &digest).await, 1);
 
         f.teardown().await;

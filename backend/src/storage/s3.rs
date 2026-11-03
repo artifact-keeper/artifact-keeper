@@ -2397,6 +2397,10 @@ impl super::StorageBackend for S3Backend {
         S3Backend::copy(self, source, dest).await
     }
 
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        S3Backend::size(self, key).await.map(Some)
+    }
+
     // Note: `put_file` is intentionally NOT overridden — the trait default in
     // storage/mod.rs already streams the file through `put_stream` with a
     // 256 KiB ReaderStream (memory-bounded), so a bespoke S3 override would only
@@ -7072,6 +7076,13 @@ mod tests {
             .await;
 
         let backend = mock_s3_backend(&server.uri(), false).await;
+        assert_eq!(
+            crate::storage::StorageBackend::stored_size(&backend, "staged")
+                .await
+                .unwrap(),
+            Some(5),
+            "the stored size comes from the HEAD"
+        );
         crate::storage::StorageBackend::promote(&backend, "staged", "blob")
             .await
             .unwrap();
