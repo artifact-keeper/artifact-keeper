@@ -40,7 +40,7 @@ use sqlx::PgPool;
 use tracing::info;
 use xz2::read::XzDecoder;
 
-use crate::api::handlers::error_helpers::require_signing_key;
+use crate::api::handlers::error_helpers::{require_openpgp_capable_key, require_signing_key};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::{SharedState, SignedReleaseCacheEntry, SIGNED_RELEASE_CACHE_MAX_ENTRIES};
@@ -58,7 +58,8 @@ use crate::services::package_analysis_service::{
 use crate::services::package_service::PackageService;
 use crate::services::proxy_service::{ProxyService, DEFAULT_DISTS_INDEX_TTL_SECS};
 use crate::services::signing_service::{
-    signed_cache_entry_is_fresh, signed_cache_max_age, signer_set_fingerprint, SigningService,
+    openpgp_public_keyring, signed_cache_entry_is_fresh, signed_cache_max_age,
+    signer_set_fingerprint, SigningService,
 };
 
 const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
@@ -2030,11 +2031,25 @@ async fn require_active_signing_key(
 /// overlap window, plus the signer-set fingerprint for the signed-Release cache
 /// key. Outside an overlap window that is just the active key and its
 /// fingerprint, so the cache keys are unchanged.
+///
+/// A key that can never produce OpenPGP (`key_type=rsa`, the default) is a 409
+/// with a WARN (#5198), as on RPM. These routes are anonymous, so a 500 would
+/// let any client drive ERROR logs and 500-rate alerts over an operator's config
+/// mistake. `route` names the requested file in that WARN.
 async fn release_signers(
     signing_svc: &SigningService,
     repo_id: uuid::Uuid,
+    route: &'static str,
 ) -> Result<(Vec<SigningKey>, String), Response> {
     let key = require_active_signing_key(signing_svc, repo_id).await?;
+    let key = require_openpgp_capable_key(key).inspect_err(|_resp| {
+        tracing::warn!(
+            repo_id = %repo_id,
+            route,
+            "Debian signed metadata requested but the repository's active signing key cannot \
+             produce an OpenPGP signature (requires key_type='gpg')",
+        );
+    })?;
     let signers = signing_svc.openpgp_signers(key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2426,7 +2441,7 @@ async fn in_release_file(
     // none is configured and (b) include the fingerprint in the cache key.
     // The previous `.unwrap_or(release)` fallback silently served unsigned
     // bytes, which is a security footgun (#1236 review).
-    let (signers, fingerprint) = release_signers(&signing_svc, repo.id).await?;
+    let (signers, fingerprint) = release_signers(&signing_svc, repo.id, "InRelease").await?;
     let cache_key =
         signed_release_cache_key(SignedReleaseVariant::InRelease, &release, &fingerprint);
 
@@ -2488,7 +2503,7 @@ async fn release_gpg(
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret)
         .with_signature_expiry(state.config.signature_expiry_seconds);
-    let (signers, fingerprint) = release_signers(&signing_svc, repo.id).await?;
+    let (signers, fingerprint) = release_signers(&signing_svc, repo.id, "Release.gpg").await?;
     let cache_key =
         signed_release_cache_key(SignedReleaseVariant::ReleaseGpg, &release, &fingerprint);
 
@@ -2531,30 +2546,24 @@ async fn gpg_key_asc(
 
     let signing_svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
     // #1329: during a rotation overlap window this is a keyring holding the
-    // new and the previous key, matching the dual-signed InRelease.
-    let public_key = signing_svc
-        .get_repo_public_keyring(repo.id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
-            )
-                .into_response()
-        })?;
-
-    match public_key {
-        Some(pem) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/pgp-keys")
-            .body(Body::from(pem))
-            .unwrap()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            "No signing key configured for this repository",
+    // new and the previous key, matching the dual-signed InRelease. #5198: any
+    // other key type holds an X.509 SPKI PEM, which is not what this route's
+    // `application/pgp-keys` claims and which `apt` cannot use, so it gets the
+    // same 409 as InRelease rather than a 200 with those bytes.
+    let (signers, _) = release_signers(&signing_svc, repo.id, "gpg-key.asc").await?;
+    let keyring = openpgp_public_keyring(&signers).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            crate::api::handlers::internal_err_message("Failed to retrieve public key", &e),
         )
-            .into_response()),
-    }
+            .into_response()
+    })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/pgp-keys")
+        .body(Body::from(keyring))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -6190,7 +6199,12 @@ mod upload_db_tests {
         gzip_compress(&tar_bytes).expect("gzip data.tar")
     }
 
-    fn minimal_deb(package: &str, version: &str, architecture: &str, description: &str) -> Vec<u8> {
+    pub(super) fn minimal_deb(
+        package: &str,
+        version: &str,
+        architecture: &str,
+        description: &str,
+    ) -> Vec<u8> {
         let control = format!(
             "Package: {package}\n\
              Version: {version}\n\
@@ -9129,5 +9143,271 @@ mod flat_repository_tests {
         assert_eq!(&body[..], &up.in_release[..]);
         assert_eq!(deb_status, StatusCode::OK);
         assert_eq!(&deb[..], &up.deb[..]);
+    }
+}
+
+/// #5198: a repository whose active signing key cannot produce OpenPGP is an
+/// operator's config mistake, and these routes are anonymous, so it is a 409
+/// (as on RPM), never a 500. Keys are bound through the service, not the config
+/// route, because that is what a binding from before the route's check looks
+/// like (`signing.rs` covers the route refusing a new one).
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod signing_key_capability_tests {
+    use super::upload_db_tests::minimal_deb;
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::signing_service::CreateKeyRequest;
+    use uuid::Uuid;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Every anonymous route that can only serve OpenPGP.
+    const OPENPGP_ROUTES: [&str; 4] = [
+        "dists/stable/InRelease",
+        "dists/stable/Release.gpg",
+        "gpg-key.asc",
+        "dists/stable/gpg-key.asc",
+    ];
+
+    /// Create a global key of `key_type` and bind it to `repo_id`. `key_type`
+    /// `rsa` is what `POST /api/v1/signing/keys` makes when it is not told
+    /// otherwise.
+    async fn bind_new_key(f: &tdh::Fixture, repo_id: Uuid, key_type: &str) -> Uuid {
+        let svc = SigningService::new(f.pool.clone(), &f.state.config.jwt_secret);
+        let key = svc
+            .create_key(CreateKeyRequest {
+                repository_id: None,
+                name: format!("deb-5198-{}", Uuid::new_v4()),
+                key_type: key_type.to_string(),
+                algorithm: match key_type {
+                    "gpg" => crate::services::signing_service::ED25519_ALGORITHM.to_string(),
+                    _ => "rsa2048".to_string(),
+                },
+                uid_name: None,
+                uid_email: None,
+                created_by: None,
+            })
+            .await
+            .expect("create signing key");
+        svc.update_signing_config(repo_id, Some(key.id), true, false, false)
+            .await
+            .expect("bind signing key");
+        key.id
+    }
+
+    async fn delete_key(f: &tdh::Fixture, repo_id: Uuid, key_id: Uuid) {
+        sqlx::query("DELETE FROM repository_signing_config WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing config");
+        sqlx::query("DELETE FROM signing_keys WHERE id = $1")
+            .bind(key_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete signing key");
+    }
+
+    async fn anon_get(state: &SharedState, repo_key: &str, path: &str) -> (StatusCode, String) {
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{repo_key}/{path}")),
+        )
+        .await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn assert_all_conflict(state: &SharedState, repo_key: &str) {
+        for path in OPENPGP_ROUTES {
+            let (status, body) = anon_get(state, repo_key, path).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+            assert!(
+                body.contains("key_type='gpg'"),
+                "{path}: the 409 must name the key type that would work: {body}"
+            );
+        }
+    }
+
+    /// Mount an upstream that serves `stable`'s release documents, and return
+    /// the marker its bodies carry.
+    async fn mount_upstream_release(server: &MockServer) -> &'static str {
+        const MARKER: &str = "Origin: upstream-5198\n";
+        for name in ["InRelease", "Release", "Release.gpg"] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/dists/stable/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(MARKER))
+                .mount(server)
+                .await;
+        }
+        MARKER
+    }
+
+    /// Insert a Remote Debian repository and return its id.
+    async fn insert_remote_member(f: &tdh::Fixture, upstream_url: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("deb-5198-mem-{}", id.simple());
+        sqlx::query(
+            "INSERT INTO repositories \
+             (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote'::repository_type, 'debian'::repository_format, \
+             $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&*f.storage_dir.to_string_lossy())
+        .bind(upstream_url)
+        .execute(&f.pool)
+        .await
+        .expect("insert remote member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(f.repo_id)
+        .bind(id)
+        .execute(&f.pool)
+        .await
+        .expect("insert virtual member");
+        id
+    }
+
+    #[tokio::test]
+    async fn hosted_repo_with_rsa_key_is_conflict_with_or_without_packages_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+        assert_all_conflict(&f.state, &f.repo_key).await;
+
+        let deb = minimal_deb("ak-5198", "1.0-1", "amd64", "signing capability test");
+        let uri = format!(
+            "/{}/pool/main/a/ak-5198/ak-5198_1.0-1_amd64.deb",
+            f.repo_key
+        );
+        let app = f.router_with_auth(super::router());
+        let (status, _) = tdh::send(app, tdh::put(uri, Bytes::from(deb))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_all_conflict(&f.state, &f.repo_key).await;
+
+        // The unsigned document does not need the key and stays available.
+        let (status, _) = anon_get(&f.state, &f.repo_key, "dists/stable/Release").await;
+        assert_eq!(status, StatusCode::OK);
+
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
+    }
+
+    /// The other side of the distinction: a key that claims `gpg` but cannot be
+    /// used is a server fault and stays loud. A 409 here would hide it.
+    #[tokio::test]
+    async fn gpg_key_with_broken_secret_material_stays_500_5198() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "gpg").await;
+        let (status, body) = anon_get(&f.state, &f.repo_key, "dists/stable/InRelease").await;
+        assert_eq!(status, StatusCode::OK, "control: {body}");
+
+        sqlx::query("UPDATE signing_keys SET private_key_enc = '\\x00' WHERE id = $1")
+            .bind(key_id)
+            .execute(&f.pool)
+            .await
+            .expect("break key material");
+        // A different dist, so the signed-Release cache cannot answer.
+        let (status, body) = anon_get(&f.state, &f.repo_key, "dists/testing/InRelease").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
+    }
+
+    /// A Virtual repo with nothing upstream to serve signs its own `Release`
+    /// with its own key, so it reaches the same path as a hosted repo.
+    #[tokio::test]
+    async fn virtual_repo_signing_locally_with_rsa_key_is_conflict_5198() {
+        let Some(f) = tdh::Fixture::setup("virtual", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+
+        // No members at all, and no proxy service.
+        assert_all_conflict(&f.state, &f.repo_key).await;
+
+        // A Remote member that does not have the dist: the walk falls through.
+        let server = MockServer::start().await;
+        let member = insert_remote_member(&f, &server.uri()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        assert_all_conflict(&state, &f.repo_key).await;
+
+        delete_key(&f, f.repo_id, key_id).await;
+        tdh::cleanup_member_repo(&f.pool, member, &f.storage_dir).await;
+        f.teardown().await;
+    }
+
+    /// A Virtual repo whose Remote member has the dist serves the member's own
+    /// signed bytes. It never signs, so its key is not consulted for those
+    /// routes; only the public key route still depends on it.
+    #[tokio::test]
+    async fn virtual_repo_serving_a_remote_member_does_not_need_its_key_5198() {
+        let Some(f) = tdh::Fixture::setup("virtual", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+        let server = MockServer::start().await;
+        let marker = mount_upstream_release(&server).await;
+        let member = insert_remote_member(&f, &server.uri()).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        for path in ["dists/stable/InRelease", "dists/stable/Release.gpg"] {
+            let (status, body) = anon_get(&state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body, marker, "{path} must be the upstream's bytes");
+        }
+
+        delete_key(&f, f.repo_id, key_id).await;
+        tdh::cleanup_member_repo(&f.pool, member, &f.storage_dir).await;
+        f.teardown().await;
+    }
+
+    /// A Remote repo answers every release route from upstream, whatever the
+    /// upstream says, so a bound key never reaches the signing path.
+    #[tokio::test]
+    async fn remote_repo_with_upstream_never_consults_its_key_5198() {
+        let Some(f) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+
+        let server = MockServer::start().await;
+        let marker = mount_upstream_release(&server).await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        for path in ["dists/stable/InRelease", "dists/stable/Release.gpg"] {
+            let (status, body) = anon_get(&state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            assert_eq!(body, marker, "{path} must be the upstream's bytes");
+        }
+
+        // The upstream lacks the dist: its 404, not the key's 409.
+        for path in ["dists/absent/InRelease", "dists/absent/Release.gpg"] {
+            let (status, body) = anon_get(&state, &f.repo_key, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        }
+
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
+    }
+
+    /// A Remote repo with no way to reach upstream falls through to signing
+    /// locally, so it must get the 409 too.
+    #[tokio::test]
+    async fn remote_repo_without_proxy_service_is_conflict_5198() {
+        let Some(f) = tdh::Fixture::setup("remote", "debian").await else {
+            return;
+        };
+        let key_id = bind_new_key(&f, f.repo_id, "rsa").await;
+        assert_all_conflict(&f.state, &f.repo_key).await;
+        delete_key(&f, f.repo_id, key_id).await;
+        f.teardown().await;
     }
 }
