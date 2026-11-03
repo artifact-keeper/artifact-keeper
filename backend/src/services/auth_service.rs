@@ -6467,8 +6467,7 @@ mod tests {
     async fn invalidation_test_service_with_db(
         user_id: Uuid,
     ) -> Option<(AuthService, Arc<Config>, sqlx::PgPool)> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let pool = crate::testing::try_pool_with(5).await?;
         let username = format!("invtest_{}", &Uuid::new_v4().to_string()[..8]);
         // `privileges_changed_at` (migration 131, DEFAULT NOW()) joins the
         // watermark GREATEST; without this backdate the 120s aging of the
@@ -8673,8 +8672,7 @@ mod tests {
     /// Connect to the throwaway test database, or signal "skip" like every
     /// other DB-backed test in this file.
     async fn login_test_service() -> Option<(sqlx::PgPool, AuthService)> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::PgPool::connect(&url).await.ok()?;
+        let pool = crate::testing::try_pool_with(5).await?;
         let svc = AuthService::new(pool.clone(), make_test_config());
         Some((pool, svc))
     }

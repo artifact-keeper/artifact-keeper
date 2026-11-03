@@ -769,11 +769,11 @@ mod tests {
     /// pool whose connections are pinned to it, together with the resolved
     /// `DATABASE_URL` and schema name (both needed for `drop_isolation_schema`
     /// cleanup). Returns `None` when `DATABASE_URL` is unset or the database
-    /// is unreachable, so the DB-backed tests skip silently (local `cargo test
-    /// --lib` without a Postgres just no-ops).
+    /// is unreachable, so local `cargo test --lib` without a Postgres no-ops;
+    /// under `AK_TESTS_REQUIRE_DB` either case fails loud instead (#4801).
     async fn setup_isolated_pool(prefix: &str) -> Option<(String, String, PgPool)> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let bootstrap = PgPool::connect(&url).await.ok()?;
+        let url = crate::testing::require_db_url()?;
+        let bootstrap = crate::testing::on_connect_result(PgPool::connect(&url).await)?;
         let schema = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
         create_isolation_schema(&bootstrap, &schema).await;
         drop(bootstrap);
@@ -1203,17 +1203,20 @@ mod tests {
     /// the other tests use: a couple of migrations hard-code the `public`
     /// schema, so the real `sqlx::migrate!` chain only replays cleanly in a
     /// dedicated database. Returns `None` when `DATABASE_URL` is unset or
-    /// unreachable so `cargo test --lib` without a Postgres skips silently.
+    /// unreachable so `cargo test --lib` without a Postgres skips; under
+    /// `AK_TESTS_REQUIRE_DB` either case fails loud instead (#4801).
     async fn setup_scratch_database(prefix: &str) -> Option<(String, String, PgPool)> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let admin = PgPool::connect(&url).await.ok()?;
+        let url = crate::testing::require_db_url()?;
+        let admin = crate::testing::on_connect_result(PgPool::connect(&url).await)?;
         let name = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(sqlx::AssertSqlSafe(&*format!("CREATE DATABASE \"{name}\"")))
-            .execute(&admin)
-            .await
-            .ok()?;
+        crate::testing::on_connect_result(
+            sqlx::query(sqlx::AssertSqlSafe(&*format!("CREATE DATABASE \"{name}\"")))
+                .execute(&admin)
+                .await,
+        )?;
         admin.close().await;
-        let pool = PgPool::connect(&with_database(&url, &name)).await.ok()?;
+        let pool =
+            crate::testing::on_connect_result(PgPool::connect(&with_database(&url, &name)).await)?;
         Some((url, name, pool))
     }
 

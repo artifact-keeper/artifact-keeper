@@ -1503,29 +1503,6 @@ mod tests {
         assert!(VIRTUAL_QUARANTINE_UNSUPPORTED.contains("member remote"));
         assert!(VIRTUAL_QUARANTINE_UNSUPPORTED.contains("release"));
     }
-    /// Collects `tracing` output emitted on this thread while the guard lives.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// DB-backed: a row that already has `quarantine_enabled = true` on a
     /// Virtual repository (written before the enable-time gate existed) is
     /// reported by the startup audit with a WARN naming the repository, and the
@@ -1538,14 +1515,9 @@ mod tests {
         };
         enable_quarantine(&fx.pool, fx.repo_id, 60).await;
 
-        let capture = LogCapture::default();
+        let capture = crate::api::handlers::test_db_helpers::LogCapture::default();
         let warned = {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_max_level(tracing::Level::WARN)
-                    .finish(),
-            );
+            let _guard = capture.install(tracing::Level::WARN);
             warn_unsupported_virtual_quarantine(&fx.pool).await
         };
 
@@ -1553,7 +1525,7 @@ mod tests {
             warned.contains(&fx.repo_key),
             "the audit must report the enabled virtual repo, got {warned:?}"
         );
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let logs = capture.text();
         assert!(
             logs.contains(&fx.repo_key) && logs.contains("#3647"),
             "the WARN must name the repository and the issue, got {logs:?}"

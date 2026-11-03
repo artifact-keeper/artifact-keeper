@@ -511,3 +511,51 @@ async fn a_never_named_subdir_is_served_without_a_render_4176() {
         .await
         .is_none());
 }
+
+/// #5167: `.bz2` of a subdir no row has ever named is answered with every
+/// regeneration permit taken, like its other encodings, and holds the same
+/// document.
+#[tokio::test]
+async fn a_never_named_subdir_answers_bz2_without_a_permit_5167() {
+    let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+        return;
+    };
+    upload(&fx, "noarch", "empty-bz2", "1.0").await;
+
+    let permits = repodata_cache::parse_regen_concurrency(
+        std::env::var(repodata_cache::REGEN_CONCURRENCY_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let mut release = Vec::new();
+    for _ in 0..permits {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(repodata_cache::regen_gate().run(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        }));
+        started_rx.await.unwrap();
+        release.push(release_tx);
+    }
+
+    let (status, bz2, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        get(&fx, "osx-arm64/repodata.json.bz2"),
+    )
+    .await
+    .expect("answered while every permit is taken");
+    drop(release);
+    assert_eq!(status, StatusCode::OK);
+
+    let mut plain = Vec::new();
+    bzip2::bufread::BzDecoder::new(&bz2[..])
+        .read_to_end(&mut plain)
+        .unwrap();
+    let (status, json, _) = get(&fx, "osx-arm64/repodata.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&plain).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&json).unwrap()
+    );
+}
