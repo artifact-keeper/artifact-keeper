@@ -447,6 +447,72 @@ fn request_error(operation: &str, e: reqwest::Error) -> AppError {
     AppError::Storage(format!("{}: {}", operation, e.without_url()))
 }
 
+/// Longest Azure error code or request id kept in an error message.
+const AZURE_ERROR_TOKEN_MAX_LEN: usize = 64;
+
+/// True for the shape of an Azure error code or request id: letters, digits
+/// and hyphens. A value outside it is dropped rather than quoted, because the
+/// message it would land in reaches API clients and the logs.
+fn is_azure_error_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= AZURE_ERROR_TOKEN_MAX_LEN
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// One diagnostic field of a failed Azure response: the response header, or
+/// failing that the body's XML element, when it has the shape of a token.
+fn azure_error_field(
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    header: &str,
+    element: &str,
+) -> Option<String> {
+    let from_header = headers.get(header).and_then(|value| value.to_str().ok());
+    let from_body = || {
+        let open = format!("<{element}>");
+        let close = format!("</{element}>");
+        let rest = &body[body.find(&open)? + open.len()..];
+        Some(rest[..rest.find(&close)?].trim())
+    };
+    from_header
+        .or_else(from_body)
+        .filter(|value| is_azure_error_token(value))
+        .map(str::to_string)
+}
+
+/// What an error message may say about a failed Azure response (#5181): the
+/// error code, the copy source's code and status, and the request id.
+///
+/// Everything else is withheld, not filtered. When Azure refuses a signature,
+/// `AuthenticationErrorDetail` quotes the string it signed, which on Put Blob
+/// From URL holds the source URL and its SAS, and a query parameter error
+/// quotes the value it rejected. A SAS grants read access until it expires, and
+/// these messages reach API clients and the logs. The HTTP status comes from
+/// the caller, and the code and request id are enough to look up the rest in
+/// the Azure documentation and diagnostics logs.
+fn azure_error_detail_from(headers: &reqwest::header::HeaderMap, body: &str) -> String {
+    let field = |header, element| azure_error_field(headers, body, header, element);
+    let mut parts =
+        vec![field("x-ms-error-code", "Code").unwrap_or_else(|| "no Azure error code".to_string())];
+    if let Some(code) = field("x-ms-copy-source-error-code", "CopySourceErrorCode") {
+        parts.push(format!("copy source code {code}"));
+    }
+    if let Some(status) = field("x-ms-copy-source-status-code", "CopySourceStatusCode") {
+        parts.push(format!("copy source status {status}"));
+    }
+    if let Some(id) = field("x-ms-request-id", "RequestId") {
+        parts.push(format!("request id {id}"));
+    }
+    parts.join(", ")
+}
+
+/// [`azure_error_detail_from`] for a response, consuming its body.
+async fn azure_error_detail(response: reqwest::Response) -> String {
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    azure_error_detail_from(&headers, &body)
+}
+
 // ---------------------------------------------------------------------------
 // Azure Blob Storage backend
 // ---------------------------------------------------------------------------
@@ -653,10 +719,10 @@ impl AzureBackend {
         }
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let detail = azure_error_detail(response).await;
         Err(AppError::Storage(format!(
             "Azure fallback ranged download failed with status {} for {} ({}): {}",
-            status, key, range_header, body
+            status, key, range_header, detail
         )))
     }
 
@@ -1208,10 +1274,10 @@ impl AzureBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure Put Block for '{}' failed with status {}: {}",
-                key, status, body
+                key, status, detail
             )));
         }
 
@@ -1235,10 +1301,10 @@ impl AzureBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure Put Block List for '{}' failed with status {}: {}",
-                key, status, body
+                key, status, detail
             )));
         }
 
@@ -1336,10 +1402,10 @@ impl AzureBackend {
         }
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure HEAD for '{}' failed with status {}: {}",
-                key, status, body
+                key, status, detail
             )));
         }
         Self::content_length_from_head(&response, key)
@@ -1379,10 +1445,10 @@ impl StorageBackend for AzureBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure upload failed with status {}: {}",
-                status, body
+                status, detail
             )));
         }
 
@@ -1427,10 +1493,10 @@ impl StorageBackend for AzureBackend {
                 }
                 return Err(AppError::NotFound(format!("Blob not found: {}", key)));
             }
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure download failed with status {}: {}",
-                status, body
+                status, detail
             )));
         }
 
@@ -1471,10 +1537,10 @@ impl StorageBackend for AzureBackend {
         }
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let detail = azure_error_detail(response).await;
         Err(AppError::Storage(format!(
             "Azure ranged download failed with status {} for {} ({}): {}",
-            status, key, range_header, body
+            status, key, range_header, detail
         )))
     }
 
@@ -1509,10 +1575,10 @@ impl StorageBackend for AzureBackend {
                     return Err(AppError::NotFound(format!("Blob not found: {}", key)));
                 }
             } else {
-                let body = response.text().await.unwrap_or_default();
+                let detail = azure_error_detail(response).await;
                 return Err(AppError::Storage(format!(
                     "Azure download failed with status {}: {}",
-                    status, body
+                    status, detail
                 )));
             }
         }
@@ -1660,10 +1726,10 @@ impl StorageBackend for AzureBackend {
             .await?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
-                source, dest, status, body
+                source, dest, status, detail
             )));
         }
 
@@ -1685,10 +1751,10 @@ impl StorageBackend for AzureBackend {
         // object instead of taking their retryable storage-error path.
         if response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure HEAD for '{}' failed with status {}: {}",
-                key, status, body
+                key, status, detail
             )));
         }
 
@@ -1708,10 +1774,10 @@ impl StorageBackend for AzureBackend {
                 }
                 if fallback_response.status() != reqwest::StatusCode::NOT_FOUND {
                     let status = fallback_response.status();
-                    let body = fallback_response.text().await.unwrap_or_default();
+                    let detail = azure_error_detail(fallback_response).await;
                     return Err(AppError::Storage(format!(
                         "Azure fallback HEAD for '{}' failed with status {}: {}",
-                        fallback_key, status, body
+                        fallback_key, status, detail
                     )));
                 }
             }
@@ -1727,10 +1793,10 @@ impl StorageBackend for AzureBackend {
 
         if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure delete failed with status {}: {}",
-                status, body
+                status, detail
             )));
         }
 
@@ -1865,10 +1931,10 @@ impl StorageBackend for AzureBackend {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             return Err(AppError::Storage(format!(
                 "Azure upload failed with status {}: {}",
-                status, body
+                status, detail
             )));
         }
 
@@ -1897,10 +1963,10 @@ impl StorageBackend for AzureBackend {
                 status
             )))
         } else {
-            let body = response.text().await.unwrap_or_default();
+            let detail = azure_error_detail(response).await;
             Err(AppError::Storage(format!(
                 "Azure health check failed (status {}): {}",
-                status, body
+                status, detail
             )))
         }
     }
@@ -3195,7 +3261,13 @@ mod tests {
             "http://{}/testaccount",
             listener.local_addr().expect("local addr")
         );
-        let mut backend = create_test_backend_with_endpoint(&endpoint).await;
+        create_shared_key_backend_at(&endpoint).await
+    }
+
+    /// Shared Key backend on `endpoint`, with the clients `AzureBackend::new`
+    /// builds minus any proxy from the environment.
+    async fn create_shared_key_backend_at(endpoint: &str) -> AzureBackend {
+        let mut backend = create_test_backend_with_endpoint(endpoint).await;
         backend.client = crate::services::http_client::large_object_client_builder(true)
             .no_proxy()
             .build()
@@ -3205,6 +3277,449 @@ mod tests {
             .build()
             .expect("build copy client");
         backend
+    }
+
+    // -----------------------------------------------------------------------
+    // #5181: Azure's error bodies quote signed strings, so they stay out of
+    // every error message and log line.
+    // -----------------------------------------------------------------------
+
+    /// A signature no request carries, so it can only reach an error by way
+    /// of the response body.
+    const REFUSED_BODY_SIGNATURE: &str = "c2VjcmV0LXNpZ25hdHVyZS01MTgx";
+
+    /// Azure's refusal of a signature: `AuthenticationErrorDetail` quotes the
+    /// string it signed, here `quoted` plus a marker SAS and the rejected
+    /// query parameter elements a malformed SAS gets back.
+    fn refused_signature_body(quoted: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>AuthenticationFailed</Code>\
+             <Message>Server failed to authenticate the request.\nRequestId:r-1</Message>\
+             <QueryParameterName>sig</QueryParameterName>\
+             <QueryParameterValue>{REFUSED_BODY_SIGNATURE}</QueryParameterValue>\
+             <AuthenticationErrorDetail>The MAC signature found in the HTTP request \
+             'bWFj' is not the same as any computed signature. Server used following \
+             string to sign: 'PUT\n\nx-ms-copy-source:https://acct.blob.core.windows.net/\
+             c/src?sv=2021-06-08&amp;se=2099-01-01&amp;sr=b&amp;sp=r&amp;\
+             sig={REFUSED_BODY_SIGNATURE}\n{quoted}'.</AuthenticationErrorDetail></Error>"
+        )
+    }
+
+    /// Answers every request with `status` and a refusal that echoes back the
+    /// signed parts of that very request, as Azure's string to sign does.
+    struct RefusingAzure(u16);
+
+    impl wiremock::Respond for RefusingAzure {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let source = request
+                .headers
+                .get("x-ms-copy-source")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let quoted = format!("{source}\n{}", request.url);
+            wiremock::ResponseTemplate::new(self.0)
+                .insert_header("x-ms-error-code", "AuthenticationFailed")
+                .insert_header("x-ms-request-id", "11111111-2222-3333-4444-555555555555")
+                .set_body_string(refused_signature_body(&quoted))
+        }
+    }
+
+    /// The `sig` value of a signed URL or query string.
+    fn sas_signature(signed: &str) -> Option<String> {
+        signed
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("sig="))
+            .map(str::to_string)
+    }
+
+    /// Every SAS signature the mock was actually sent, in the request's URL or
+    /// in its copy source, in both the encoded and the decoded spelling.
+    async fn signatures_sent_to(server: &wiremock::MockServer) -> Vec<String> {
+        let mut signatures = Vec::new();
+        for request in server.received_requests().await.unwrap_or_default() {
+            let source = request
+                .headers
+                .get("x-ms-copy-source")
+                .and_then(|value| value.to_str().ok())
+                .and_then(sas_signature);
+            let url = request.url.query().and_then(sas_signature);
+            for signature in [source, url].into_iter().flatten() {
+                let decoded = urlencoding::decode(&signature)
+                    .expect("signature decodes")
+                    .into_owned();
+                signatures.push(decoded);
+                signatures.push(signature);
+            }
+        }
+        signatures
+    }
+
+    /// Fails if `text` holds a signature, or the signed text Azure quotes.
+    fn assert_no_refused_signature(text: &str, sent: &[String]) {
+        for secret in [
+            REFUSED_BODY_SIGNATURE,
+            "sig=",
+            "QueryParameterValue",
+            "AuthenticationErrorDetail",
+            "string to sign",
+            "x-ms-copy-source",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked into: {text}");
+        }
+        for signature in sent {
+            assert!(!text.contains(signature), "SAS {signature} in: {text}");
+        }
+    }
+
+    /// Collects what a subscriber writes at every level, as the log output.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        /// Installs this buffer as the thread's subscriber until the guard
+        /// drops. `#[tokio::test]` polls on one thread, so the backend's spans
+        /// and events all land here.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    #[test]
+    fn azure_error_detail_keeps_the_code_and_withholds_the_body_5181() {
+        let detail = azure_error_detail_from(
+            &reqwest::header::HeaderMap::new(),
+            &refused_signature_body(""),
+        );
+        assert_eq!(detail, "AuthenticationFailed");
+        assert_no_refused_signature(&detail, &[]);
+    }
+
+    #[test]
+    fn azure_error_detail_reports_the_copy_source_fields_5181() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("x-ms-error-code", "CannotVerifyCopySource"),
+            ("x-ms-copy-source-error-code", "AuthorizationFailure"),
+            ("x-ms-copy-source-status-code", "403"),
+            ("x-ms-request-id", "11111111-2222-3333"),
+        ] {
+            headers.insert(name, value.parse().expect("header value"));
+        }
+        assert_eq!(
+            azure_error_detail_from(&headers, "<Error/>"),
+            "CannotVerifyCopySource, copy source code AuthorizationFailure, \
+             copy source status 403, request id 11111111-2222-3333"
+        );
+        assert_eq!(
+            azure_error_detail_from(
+                &reqwest::header::HeaderMap::new(),
+                "<Error><Code>CannotVerifyCopySource</Code>\
+                 <CopySourceErrorCode>AuthorizationFailure</CopySourceErrorCode>\
+                 <CopySourceStatusCode>403</CopySourceStatusCode></Error>"
+            ),
+            "CannotVerifyCopySource, copy source code AuthorizationFailure, copy source status 403"
+        );
+    }
+
+    /// A body that is not Azure's XML, or a "code" that is not a code, says so
+    /// instead of being quoted.
+    #[test]
+    fn azure_error_detail_drops_what_is_not_a_token_5181() {
+        let none = reqwest::header::HeaderMap::new();
+        for body in [
+            "",
+            "upstream connect error sig=abc",
+            "<Error><Code>sig=abc</Code></Error>",
+            "<Error><Code>https://a/c/k?sv=1&amp;sig=abc</Code></Error>",
+            "<Error><Code></Code></Error>",
+            "<Error><Code>AuthenticationFailed",
+        ] {
+            assert_eq!(azure_error_detail_from(&none, body), "no Azure error code");
+        }
+        let long = "A".repeat(AZURE_ERROR_TOKEN_MAX_LEN + 1);
+        assert_eq!(
+            azure_error_detail_from(&none, &format!("<Code>{long}</Code>")),
+            "no Azure error code"
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ms-error-code", "sig=abc".parse().expect("header value"));
+        assert_eq!(azure_error_detail_from(&headers, ""), "no Azure error code");
+    }
+
+    /// #5181 as it was seen: Azure refuses Put Blob From URL, its body quotes
+    /// the source SAS, and the copy error and the logs must carry the status
+    /// and code and no signature, in both auth modes.
+    #[tokio::test]
+    async fn refused_copy_keeps_the_source_sas_out_of_errors_and_logs_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for shared_key in [true, false] {
+            let logs = CapturedLogs::default();
+            let _subscriber = logs.install();
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(200).insert_header("content-length", "1024"))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(header_exists("x-ms-copy-source"))
+                .respond_with(RefusingAzure(403))
+                .mount(&server)
+                .await;
+            let backend = if shared_key {
+                create_shared_key_backend_at(&server.uri()).await
+            } else {
+                create_cached_rbac_backend_with_endpoint(server.uri())
+            };
+
+            let error = StorageBackendTrait::copy(&backend, "staging/blob", "final/blob")
+                .await
+                .expect_err("a refused signature fails the copy");
+
+            let sent = signatures_sent_to(&server).await;
+            if shared_key {
+                assert!(!sent.is_empty(), "the copy source must be a signed URL");
+            }
+            let message = error.to_string();
+            assert!(message.contains("403"), "status is kept: {message}");
+            assert!(
+                message.contains("AuthenticationFailed"),
+                "the Azure code is kept: {message}"
+            );
+            assert!(
+                message.contains("'staging/blob' to 'final/blob'"),
+                "the blob keys are kept: {message}"
+            );
+            assert_no_refused_signature(&message, &sent);
+            assert_no_refused_signature(&format!("{error:?}"), &sent);
+
+            let logged = logs.text();
+            assert!(
+                logged.contains("AuthenticationFailed"),
+                "the span's `err` record must reach the capture, or this proves nothing: {logged}"
+            );
+            assert_no_refused_signature(&logged, &sent);
+        }
+    }
+
+    /// Every operation that used to quote a response body, against an endpoint
+    /// that refuses each request and echoes its signed URL back. 403 and 500
+    /// because the health check only reads the body on the latter.
+    #[tokio::test]
+    async fn every_azure_operation_withholds_the_refused_body_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::{Mock, MockServer};
+
+        for status in [403, 500] {
+            let logs = CapturedLogs::default();
+            let _subscriber = logs.install();
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(RefusingAzure(status))
+                .mount(&server)
+                .await;
+            let backend = create_shared_key_backend_at(&server.uri()).await;
+            let backend = &backend;
+
+            let errors: Vec<(&str, String)> = vec![
+                (
+                    "put",
+                    StorageBackendTrait::put(backend, "k", Bytes::from_static(b"x"))
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "get",
+                    StorageBackendTrait::get(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "get_range",
+                    StorageBackendTrait::get_range(backend, "k", 0, 1)
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "get_stream",
+                    StorageBackendTrait::get_stream(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "put_stream",
+                    StorageBackendTrait::put_stream(
+                        backend,
+                        "k",
+                        Box::pin(stream::iter([Ok(Bytes::from_static(b"x"))])),
+                    )
+                    .await
+                    .map(drop)
+                    .unwrap_err()
+                    .to_string(),
+                ),
+                (
+                    "exists",
+                    StorageBackendTrait::exists(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "delete",
+                    StorageBackendTrait::delete(backend, "k")
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+                (
+                    "size",
+                    backend.size("k").await.map(drop).unwrap_err().to_string(),
+                ),
+                (
+                    "health_check",
+                    StorageBackendTrait::health_check(backend)
+                        .await
+                        .map(drop)
+                        .unwrap_err()
+                        .to_string(),
+                ),
+            ];
+
+            let sent = signatures_sent_to(&server).await;
+            assert!(!sent.is_empty(), "the reads must use a signed URL");
+            for (operation, message) in &errors {
+                assert!(
+                    message.contains(&status.to_string()),
+                    "{operation} keeps the status: {message}"
+                );
+                if !(*operation == "health_check" && status == 403) {
+                    assert!(
+                        message.contains("AuthenticationFailed"),
+                        "{operation} keeps the Azure code: {message}"
+                    );
+                }
+                assert_no_refused_signature(message, &sent);
+            }
+            assert_no_refused_signature(&logs.text(), &sent);
+        }
+    }
+
+    /// The commit step of a streamed upload, past a Put Block that succeeded.
+    #[tokio::test]
+    async fn refused_block_list_commit_withholds_the_body_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use futures::stream;
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let logs = CapturedLogs::default();
+        let _subscriber = logs.install();
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "block"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("comp", "blocklist"))
+            .respond_with(RefusingAzure(403))
+            .mount(&server)
+            .await;
+        let backend = create_shared_key_backend_at(&server.uri()).await;
+
+        let message = StorageBackendTrait::put_stream(
+            &backend,
+            "k",
+            Box::pin(stream::iter([Ok(Bytes::from_static(b"x"))])),
+        )
+        .await
+        .map(drop)
+        .unwrap_err()
+        .to_string();
+
+        let sent = signatures_sent_to(&server).await;
+        assert!(message.contains("Put Block List"), "{message}");
+        assert!(message.contains("AuthenticationFailed"), "{message}");
+        assert_no_refused_signature(&message, &sent);
+        assert_no_refused_signature(&logs.text(), &sent);
+    }
+
+    /// The migration-mode fallback probes, which report on a second URL: the
+    /// primary path misses and the fallback path is refused.
+    #[tokio::test]
+    async fn refused_fallback_probes_withhold_the_body_5181() {
+        use crate::storage::StorageBackend as StorageBackendTrait;
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let checksum = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let key = format!("repos/generic/{checksum}");
+        let server = MockServer::start().await;
+        Mock::given(path(format!("/testcontainer/{key}")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/testcontainer/ab/{checksum}")))
+            .respond_with(RefusingAzure(403))
+            .mount(&server)
+            .await;
+        let backend = create_cached_rbac_backend_with_endpoint_and_path_format(
+            server.uri(),
+            StoragePathFormat::Migration,
+        );
+
+        for message in [
+            StorageBackendTrait::exists(&backend, &key)
+                .await
+                .map(drop)
+                .unwrap_err()
+                .to_string(),
+            StorageBackendTrait::get_range(&backend, &key, 0, 1)
+                .await
+                .map(drop)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(message.contains("fallback"), "{message}");
+            assert!(message.contains("AuthenticationFailed"), "{message}");
+            assert_no_refused_signature(&message, &[]);
+        }
     }
 
     fn assert_no_sas_query(message: &str) {
