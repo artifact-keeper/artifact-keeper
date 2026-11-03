@@ -29064,26 +29064,43 @@ mod oci_blob_upload_streaming_tests {
             return;
         };
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        // The 300ms only exists to make the exhausted request below fail fast,
+        // but `connect_with` runs under it too, and a loaded runner can take
+        // longer than that to open a connection (#5214). A lazy pool with
+        // `min_connections` connects in the background on its own 300s budget;
+        // sqlx only starts that task when neither reaper timeout is set.
+        // Skipping the idle ping means taking the idle connection does no I/O.
         let tiny_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
             .acquire_timeout(std::time::Duration::from_millis(300))
-            .connect_with(sqlx::postgres::PgConnectOptions::from_str(&url).unwrap())
-            .await
-            .expect("connect single-connection pool");
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::from_str(&url).unwrap());
+        let patience = std::time::Duration::from_secs(60);
+        let connecting = std::time::Instant::now();
+        while tiny_pool.num_idle() == 0 {
+            assert!(
+                connecting.elapsed() < patience,
+                "single-connection pool did not connect within {patience:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let mut state = (*f.inner.state).clone();
         state.db = tiny_pool.clone();
         let app = router(None).with_state(Arc::new(state));
-        let start = || {
+        let post = |authorization: &str| {
             request(
                 Method::POST,
                 format!("/{}/image/blobs/uploads/", f.inner.repo_key),
-                &f.authorization,
+                authorization,
                 Bytes::new(),
             )
         };
 
         let held = tiny_pool.acquire().await.expect("hold the only connection");
-        let (status, headers, body) = send(app.clone(), start()).await;
+        let (status, headers, body) = send(app.clone(), post(&f.authorization)).await;
         drop(held);
         assert_eq!(
             status,
@@ -29098,20 +29115,27 @@ mod oci_blob_upload_streaming_tests {
             Some("1")
         );
 
-        let (status, _, body) = send(app.clone(), start()).await;
+        // The pool is free from here on, but each acquire still has only 300ms,
+        // and a returned connection is pinged before it can be reused. On a
+        // slow runner one acquire can miss that and answer 5xx, so retry those
+        // as a client would. Any other answer is final, and a pool that stays
+        // unusable fails on the last status once `patience` runs out.
+        let settled = async |authorization: &str| {
+            let retrying = std::time::Instant::now();
+            loop {
+                let (status, _, body) = send(app.clone(), post(authorization)).await;
+                if !status.is_server_error() || retrying.elapsed() >= patience {
+                    return (status, body);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        let (status, body) = settled(&f.authorization).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{:?}", body);
 
-        let (status, _, _) = send(
-            app.clone(),
-            request(
-                Method::POST,
-                format!("/{}/image/blobs/uploads/", f.inner.repo_key),
-                "Bearer not-a-valid-token",
-                Bytes::new(),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = settled("Bearer not-a-valid-token").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{:?}", body);
 
         tiny_pool.close().await;
         f.teardown().await;
