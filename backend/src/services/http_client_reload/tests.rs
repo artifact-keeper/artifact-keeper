@@ -520,3 +520,133 @@ fn last_known_good_survives_a_period_with_no_live_clients() {
     assert_eq!(later.state.read().unwrap().bundle.digest, expected);
     let _client = register(&later);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_https_requests_continue_during_atomic_rotations() {
+    let a = TestCa::new();
+    let b = TestCa::new();
+    let server_a = TlsServer::start(&a).await;
+    let server_b = TlsServer::start(&b).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    publish(&path, &a.pem);
+    let manager = manager(path.clone());
+    let client = register(&manager);
+    let barrier = Arc::new(tokio::sync::Barrier::new(5));
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        let barrier = barrier.clone();
+        let url = server_a.url();
+        workers.spawn(async move {
+            for _ in 0..20 {
+                barrier.wait().await;
+                let response = client.get(&url).send().await.unwrap();
+                assert_eq!(response.text().await.unwrap(), "ok");
+                barrier.wait().await;
+            }
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for revision in 0..20 {
+            barrier.wait().await;
+            let manager = manager.clone();
+            let path = path.clone();
+            let pem = if revision % 2 == 0 {
+                format!("{}{}", a.pem, b.pem)
+            } else {
+                a.pem.clone()
+            };
+            tokio::task::spawn_blocking(move || {
+                publish(&path, &pem);
+                assert!(manager.refresh());
+            })
+            .await
+            .unwrap();
+            barrier.wait().await;
+        }
+        while let Some(result) = workers.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("concurrent requests and rotation must not deadlock");
+
+    publish(&path, &b.pem);
+    assert!(manager.refresh());
+    assert!(!succeeds(&client, &server_a).await);
+    assert!(succeeds(&client, &server_b).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn projected_volume_symlink_rotation_reopens_the_configured_path() {
+    let a = TestCa::new();
+    let b = TestCa::new();
+    let server_a = TlsServer::start(&a).await;
+    let server_b = TlsServer::start(&b).await;
+    let dir = tempfile::tempdir().unwrap();
+    for (revision, pem) in [("revision-a", &a.pem), ("revision-b", &b.pem)] {
+        std::fs::create_dir(dir.path().join(revision)).unwrap();
+        std::fs::write(dir.path().join(revision).join("ca.pem"), pem).unwrap();
+    }
+    std::os::unix::fs::symlink("revision-a", dir.path().join("..data")).unwrap();
+    std::os::unix::fs::symlink("..data/ca.pem", dir.path().join("ca.pem")).unwrap();
+    let manager = manager(dir.path().join("ca.pem"));
+    let client = register(&manager);
+    assert!(succeeds(&client, &server_a).await);
+    assert!(!succeeds(&client, &server_b).await);
+
+    std::os::unix::fs::symlink("revision-b", dir.path().join("..data-next")).unwrap();
+    std::fs::rename(dir.path().join("..data-next"), dir.path().join("..data")).unwrap();
+    assert!(manager.refresh());
+    assert!(!succeeds(&client, &server_a).await);
+    assert!(succeeds(&client, &server_b).await);
+}
+
+#[test]
+fn revision_logs_report_activations_and_throttle_unchanged_failures() {
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogWriter(output.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let a = TestCa::new();
+    let b = TestCa::new();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    publish(&path, &a.pem);
+    let manager = manager(path.clone());
+    assert!(!manager.refresh());
+    publish(&path, "invalid");
+    assert!(!manager.refresh());
+    assert!(!manager.refresh());
+    publish(&path, &b.pem);
+    assert!(manager.refresh());
+    assert!(!manager.refresh());
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("Activated custom CA revision").count(), 2);
+    assert_eq!(logs.matches("Custom CA reload failed").count(), 1);
+    assert_eq!(logs.matches("count=1").count(), 2);
+    for pem in [&a.pem, &b.pem] {
+        let digest = hex::encode(Sha256::digest(pem.as_bytes()));
+        assert_eq!(logs.matches(&digest).count(), 1);
+    }
+    assert!(!logs.contains(path.to_str().unwrap()));
+    assert!(!logs.contains("BEGIN CERTIFICATE"));
+}
