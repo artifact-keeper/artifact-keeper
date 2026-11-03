@@ -2616,22 +2616,14 @@ mod tests {
     // DB-backed tests: valid create persists; unknown connection id -> 404.
     //
     // These run only when DATABASE_URL is set (a migrated throwaway Postgres);
-    // they skip cleanly otherwise so offline `cargo test` / CI without a DB do
-    // not fail. The harness verifies them against a throwaway DB on :5513.
+    // they skip otherwise so offline `cargo test` does not fail, and fail loud
+    // under AK_TESTS_REQUIRE_DB when the database is missing or unreachable
+    // (`tdh::try_pool`, #4801).
     // -----------------------------------------------------------------------
-
-    async fn test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .ok()
-    }
 
     #[tokio::test]
     async fn test_create_migration_job_persists_with_valid_connection() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2696,7 +2688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_migration_job_unknown_connection_maps_to_not_found() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2858,7 +2850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_user_get_connection_returns_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2887,7 +2879,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_user_delete_connection_returns_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2920,7 +2912,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_user_get_and_start_job_returns_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -2973,7 +2965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_isolates_per_user() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3033,7 +3025,7 @@ mod tests {
     // unfiltered row count (and `total_pages` derived from it).
     #[tokio::test]
     async fn test_list_migrations_status_filter_applies_to_total_4800() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3119,7 +3111,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_self_create_then_access_stamps_owner() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3193,7 +3185,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_admin_sees_and_gets_across_users() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3299,7 +3291,7 @@ mod tests {
     // counted all of them.
     #[tokio::test]
     async fn test_list_items_applies_status_and_item_type_filters_4778() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3384,7 +3376,7 @@ mod tests {
     #[tokio::test]
     async fn test_report_counts_failed_items_omitted_by_cap_4778() {
         use crate::services::migration_service::REPORT_FAILED_ITEMS_CAP;
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3425,7 +3417,7 @@ mod tests {
     // migration (previously 404), and re-reading must not duplicate the row.
     #[tokio::test]
     async fn test_completed_job_report_synthesized_and_idempotent() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3481,7 +3473,7 @@ mod tests {
     // lazy synthesis only applies to terminal jobs.
     #[tokio::test]
     async fn test_non_terminal_job_report_is_404() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3513,7 +3505,7 @@ mod tests {
     // The cancel path must still materialise a report (preserved behaviour).
     #[tokio::test]
     async fn test_cancel_then_report_available() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };
@@ -3554,7 +3546,7 @@ mod tests {
     // credentials) must surface as a typed 4xx, not a generic 500.
     #[tokio::test]
     async fn test_list_source_repositories_bad_config_returns_4xx() {
-        let Some(pool) = test_pool().await else {
+        let Some(pool) = tdh::try_pool().await else {
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };

@@ -39,7 +39,7 @@
 //! - One backfill per repository at a time (advisory lock). Each package is
 //!   its own short statement or transaction; no table lock is taken.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -186,6 +186,13 @@ impl DebianBackfillService {
         let mut examined = 0u64;
         // Dry run only: destinations this call would have moved a row into.
         let mut dry_run_moves: HashMap<String, String> = HashMap::new();
+        // Destination rows a merge has registered (or, on a dry run, would
+        // have). A later candidate page no longer selects them on a real run,
+        // and a page already read still lists them, so each is passed over
+        // here: the package counts once wherever the page boundary falls, and
+        // the dry run counts what the real run does (#5088). It lasts one
+        // call: a dry run resumed with `after` no longer knows them.
+        let mut merged: HashSet<Uuid> = HashSet::new();
         'walk: loop {
             let rows: Vec<Candidate> = sqlx::query_as(
                 r#"
@@ -217,6 +224,10 @@ impl DebianBackfillService {
             }
 
             for row in rows {
+                if merged.contains(&row.id) {
+                    cursor = row.id;
+                    continue;
+                }
                 if examined >= limit {
                     result.truncated = true;
                     result.next_after = Some(cursor);
@@ -257,13 +268,16 @@ impl DebianBackfillService {
                     // does, so a taken destination is reported as a failure
                     // here too instead of as a registration.
                     if relocate {
-                        if let Err(reason) = self
+                        match self
                             .dry_run_destination(repo.id, &row, &target_path, &mut dry_run_moves)
                             .await
                         {
-                            result.artifacts_failed += 1;
-                            push_sample(&mut result.errors, &format!("{}: {reason}", row.path));
-                            continue;
+                            Ok(destination) => merged.extend(destination),
+                            Err(reason) => {
+                                result.artifacts_failed += 1;
+                                push_sample(&mut result.errors, &format!("{}: {reason}", row.path));
+                                continue;
+                            }
                         }
                         result.packages_relocated += 1;
                     }
@@ -313,6 +327,9 @@ impl DebianBackfillService {
                     deb_head,
                 )
                 .await;
+                if artifact_id != row.id {
+                    merged.insert(artifact_id);
+                }
                 result.packages_registered += 1;
                 if relocate {
                     result.packages_relocated += 1;
@@ -390,42 +407,45 @@ impl DebianBackfillService {
     /// (no lock, no write) and apply the same verdict. `planned` holds the
     /// destinations earlier candidates of this dry run would have moved into,
     /// with their checksums, so two misfiled rows aimed at one destination are
-    /// judged as the real run would judge them.
+    /// judged as the real run would judge them. Returns the existing row a
+    /// merge would register, if any.
     async fn dry_run_destination(
         &self,
         repo_id: Uuid,
         row: &Candidate,
         target_path: &str,
         planned: &mut HashMap<String, String>,
-    ) -> std::result::Result<(), String> {
-        let verdict = if let Some(checksum) = planned.get(target_path) {
+    ) -> std::result::Result<Option<Uuid>, String> {
+        if let Some(checksum) = planned.get(target_path) {
+            // The row planned to hold the destination is behind the walk, so
+            // there is nothing to pass over later.
             destination_verdict(
                 Some((row.id, false, checksum.as_str())),
                 &row.checksum_sha256,
                 target_path,
-            )?
-        } else {
-            let existing: Option<(Uuid, bool, String)> = sqlx::query_as(
-                "SELECT id, is_deleted, checksum_sha256 FROM artifacts \
-                 WHERE repository_id = $1 AND path = $2",
-            )
-            .bind(repo_id)
-            .bind(target_path)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(|e| format!("could not check {target_path}: {e}"))?;
-            destination_verdict(
-                existing
-                    .as_ref()
-                    .map(|(id, deleted, checksum)| (*id, *deleted, checksum.as_str())),
-                &row.checksum_sha256,
-                target_path,
-            )?
-        };
+            )?;
+            return Ok(None);
+        }
+        let existing: Option<(Uuid, bool, String)> = sqlx::query_as(
+            "SELECT id, is_deleted, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(target_path)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| format!("could not check {target_path}: {e}"))?;
+        let verdict = destination_verdict(
+            existing
+                .as_ref()
+                .map(|(id, deleted, checksum)| (*id, *deleted, checksum.as_str())),
+            &row.checksum_sha256,
+            target_path,
+        )?;
         if verdict.is_none() {
             planned.insert(target_path.to_string(), row.checksum_sha256.clone());
         }
-        Ok(())
+        Ok(verdict)
     }
 
     /// Drop the source's `dists/` copies from the artifact list. On a hosted
@@ -1038,6 +1058,129 @@ mod tests {
         );
         assert_eq!(metadata_count(&f.pool, behind_trash).await, 0);
 
+        f.teardown().await;
+    }
+
+    /// A misfiled row with a lower id than its same-bytes destination row,
+    /// both without a control document, with `fillers` other candidates
+    /// (rows whose bytes are missing, so they fail fast) between the two ids.
+    /// Returns (misfiled, destination).
+    async fn seed_merge_across(f: &tdh::Fixture, fillers: i64) -> (Uuid, Uuid) {
+        let info = f.repo_info("local", None);
+        let seed = |path: &'static str| {
+            let info = &info;
+            async move {
+                tdh::seed_artifact_with_checksum(
+                    &f.state,
+                    &f.pool,
+                    info,
+                    &format!("debian-backfill-{}", Uuid::new_v4()),
+                    path,
+                    "dup",
+                    "1.0",
+                    "application/vnd.debian.binary-package",
+                    Bytes::from(minimal_deb("dup", "1.0", "amd64", "dup")),
+                    f.user_id,
+                    "same",
+                )
+                .await
+            }
+        };
+        let misfiled = seed("pool/d/dup/dup_1.0_amd64.deb").await;
+        let destination = seed("pool/main/d/dup/dup_1.0_amd64.deb").await;
+
+        // Fix the walk order: misfiled, the fillers, then the destination.
+        let run = Uuid::new_v4().simple().to_string();
+        let id_at = |n: i64| format!("{}-0000-4000-8000-{n:012}", &run[..8]);
+        let (low, high) = (id_at(0), id_at(fillers + 1));
+        for (old, new) in [(misfiled, &low), (destination, &high)] {
+            sqlx::query("UPDATE artifacts SET id = $2::uuid WHERE id = $1")
+                .bind(old)
+                .bind(new)
+                .execute(&f.pool)
+                .await
+                .expect("set walk order");
+        }
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key) \
+             SELECT (left($2, 24) || lpad(n::text, 12, '0'))::uuid, $1, \
+                    'pool/main/f/filler/filler' || n || '_1.0_amd64.deb', 'filler', 1, \
+                    repeat('0', 64), 'application/vnd.debian.binary-package', \
+                    'debian-backfill-missing-' || $2 || '-' || n \
+             FROM generate_series(1, $3::bigint) n",
+        )
+        .bind(f.repo_id)
+        .bind(&low)
+        .bind(fillers)
+        .execute(&f.pool)
+        .await
+        .expect("seed filler candidates");
+        (low.parse().unwrap(), high.parse().unwrap())
+    }
+
+    /// A dry run registers a merged package once, like the real run, when the
+    /// destination row comes up on a later candidate page (#5088).
+    #[tokio::test]
+    async fn dry_run_counts_a_merge_once_across_candidate_pages_5088() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let repo = fixture_repository(&f).await;
+        let (misfiled, destination) = seed_merge_across(&f, CANDIDATE_PAGE).await;
+        let service = DebianBackfillService::new(f.pool.clone(), f.state.storage_registry.clone());
+
+        let dry = service
+            .backfill(&repo, true, 10_000, None)
+            .await
+            .expect("dry run succeeds");
+        assert_eq!(metadata_count(&f.pool, destination).await, 0);
+        let real = service
+            .backfill(&repo, false, 10_000, None)
+            .await
+            .expect("backfill succeeds");
+
+        assert_eq!(real.packages_registered, 1, "{:?}", real.registered_paths);
+        assert_eq!(real.packages_relocated, 1);
+        assert_eq!(dry.packages_registered, real.packages_registered);
+        assert_eq!(dry.packages_relocated, real.packages_relocated);
+        assert_eq!(dry.artifacts_scanned, real.artifacts_scanned);
+        assert_eq!(dry.artifacts_failed, real.artifacts_failed);
+        assert_eq!(dry.registered_paths, real.registered_paths);
+        assert!(is_deleted(&f.pool, misfiled).await);
+        assert_eq!(metadata_count(&f.pool, destination).await, 1);
+        f.teardown().await;
+    }
+
+    /// The count does not depend on where the page boundary falls: with the
+    /// destination later on the same page, both runs register the merged
+    /// package once (#5088).
+    #[tokio::test]
+    async fn merge_is_counted_once_on_the_same_candidate_page_5088() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let repo = fixture_repository(&f).await;
+        let (misfiled, destination) = seed_merge_across(&f, 0).await;
+        let service = DebianBackfillService::new(f.pool.clone(), f.state.storage_registry.clone());
+
+        let dry = service
+            .backfill(&repo, true, 100, None)
+            .await
+            .expect("dry run succeeds");
+        let real = service
+            .backfill(&repo, false, 100, None)
+            .await
+            .expect("backfill succeeds");
+
+        assert_eq!(
+            (dry.packages_registered, real.packages_registered),
+            (1, 1),
+            "registered by the dry run and the real run"
+        );
+        assert_eq!((dry.artifacts_scanned, real.artifacts_scanned), (1, 1));
+        assert!(is_deleted(&f.pool, misfiled).await);
+        assert_eq!(metadata_count(&f.pool, destination).await, 1);
         f.teardown().await;
     }
 

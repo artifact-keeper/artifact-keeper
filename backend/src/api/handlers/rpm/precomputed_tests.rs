@@ -166,6 +166,60 @@ async fn rebuild_wait_serves_the_write_and_matches_on_request_bytes_4544() {
     f.teardown().await;
 }
 
+/// A mark a concurrent fold read before the build's claim cleared the queue,
+/// but applied after the swap, predates the revision's snapshot. It must not
+/// make `rebuild?wait=true` build a redundant revision (#5128).
+#[tokio::test]
+async fn rebuild_wait_ignores_a_mark_predating_the_build_5128() {
+    let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+        return;
+    };
+    upload(&f, "alpha").await;
+    let (status, body) = rebuild(&f, "?wait=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 1);
+
+    // The upload's mark was consumed by the build. Put back an equivalent
+    // one, as the racing fold would have read it before the claim, and fold
+    // it after the swap.
+    sqlx::query(
+        "INSERT INTO rpm_repodata_dirty (repository_id, root, marked_at) \
+         VALUES ($1, '', now() - interval '1 hour')",
+    )
+    .bind(f.repo_id)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    crate::services::rpm_repodata_builder::fold_marks_waiting(&f.pool)
+        .await
+        .unwrap();
+    let dirty: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT dirty_since FROM rpm_repodata_roots WHERE repository_id = $1 AND root = ''",
+    )
+    .bind(f.repo_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(dirty, None, "a mark predating the claim is in the snapshot");
+
+    let (status, body) = rebuild(&f, "?wait=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["revision"], 1, "nothing changed: no redundant build");
+    f.teardown().await;
+    // The root row outlives the repository for the GC; drop it so this
+    // test's orphan does not crowd the GC's LIMIT 64 for other tests.
+    sqlx::query("DELETE FROM rpm_repodata_dirty WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM rpm_repodata_roots WHERE repository_id = $1")
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+}
+
 /// Without `wait` the build is only requested (202), and the next builder
 /// tick picks the root up without the debounce. Bad roots are refused.
 #[tokio::test]

@@ -12501,9 +12501,11 @@ mod tests {
     struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
     impl LogCapture {
-        fn install(&self) -> tracing::subscriber::DefaultGuard {
+        fn install(&self) -> crate::api::handlers::test_db_helpers::CaptureGuard {
             use tracing_subscriber::layer::SubscriberExt;
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+            crate::api::handlers::test_db_helpers::set_capture_default(
+                tracing_subscriber::registry().with(self.clone()),
+            )
         }
         fn contains(&self, needle: &str) -> bool {
             self.0.lock().unwrap().iter().any(|l| l.contains(needle))

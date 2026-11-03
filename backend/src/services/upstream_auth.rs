@@ -204,7 +204,7 @@ pub async fn load_upstream_auth(db: &PgPool, repo_id: Uuid) -> Result<Option<Ups
 fn aws_api_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::services::http_client::plain_client_builder()
             .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
             .build()
             .unwrap_or_default()

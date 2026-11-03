@@ -3870,8 +3870,12 @@ async fn virtual_member_download(
         let vname = package_id_lower.to_string();
         let vversion = version.to_string();
         async move {
-            proxy_helpers::local_fetch_by_name_version(
-                &db, &state, member_id, &location, &vname, &vversion,
+            proxy_helpers::local_fetch_by_lookup(
+                &db,
+                &state,
+                member_id,
+                &location,
+                proxy_helpers::LocalLookup::NameVersionCaseInsensitive(&vname, &vversion),
             )
             .await
         }
@@ -11111,6 +11115,63 @@ mod virtual_federation_tests {
         );
     }
 
+    /// A virtual must resolve imported mixed-case names in both URL spellings (#5147).
+    #[tokio::test]
+    async fn virtual_download_resolves_mixed_case_stored_name_5147() {
+        use sha2::{Digest, Sha256};
+
+        const BYTES: &[u8] = b"imported nupkg";
+        let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "nuget").await;
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, member_id, 1).await;
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        seed_local_version(&fx.pool, member_id, "Foo.Bar", "1.0.2", fx.user_id).await;
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha256 = $1, size_bytes = $2 WHERE repository_id = $3",
+        )
+        .bind(format!("{:x}", Sha256::digest(BYTES)))
+        .bind(BYTES.len() as i64)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("record real package checksum");
+        let blob = member_dir.join("Foo.Bar/1.0.2/Foo.Bar.1.0.2.nupkg");
+        std::fs::create_dir_all(blob.parent().unwrap()).expect("member blob dir");
+        std::fs::write(&blob, BYTES).expect("member blob");
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage_path, proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let app = tdh::router_with_auth(super::router(), state, auth);
+        for name in ["foo.bar", "Foo.Bar"] {
+            let (status, body) = tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/{}/v3/flatcontainer/{name}/1.0.2/{name}.1.0.2.nupkg",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "client spelling {name}");
+            assert_eq!(&body[..], BYTES);
+        }
+        let (status, _) = tdh::send(
+            app,
+            tdh::get(format!(
+                "/{}/v3/flatcontainer/foo.bar/9.9.9/foo.bar.9.9.9.nupkg",
+                fx.repo_key
+            )),
+        )
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     /// The reported topology: a private hosted member and a remote member, both
     /// holding the same package id. The flat-container version list must carry
     /// both members' versions — it returned the hosted member's only, so
@@ -12187,29 +12248,6 @@ mod remote_discovery_tests {
         assert!(body.contains(&format!("/{}/v3/flatcontainer/serilog/", fx.repo_key)));
     }
 
-    /// Collects `tracing` output emitted on this thread while the guard lives.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// #3899: a registration page the upstream does not serve reached the log
     /// only as the request's final 404. The failing step, the upstream it was
     /// resolved against and the redacted fetch target are now recorded.
@@ -12227,15 +12265,9 @@ mod remote_discovery_tests {
         set_upstream(&fx.pool, fx.repo_id, &upstream).await;
         let app = app(&fx);
 
-        let capture = LogCapture::default();
+        let capture = tdh::LogCapture::default();
         let status = {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::INFO)
-                    .finish(),
-            );
+            let _guard = capture.install(tracing::Level::INFO);
             let (status, _) = tdh::send(
                 app.clone(),
                 tdh::get(format!(
@@ -12246,7 +12278,7 @@ mod remote_discovery_tests {
             .await;
             status
         };
-        let first_phase = capture.0.lock().unwrap().len();
+        let first_phase = capture.text().len();
 
         // An upstream configured with `user:pass@` credentials never reaches
         // these log lines unredacted.
@@ -12258,13 +12290,7 @@ mod remote_discovery_tests {
             .await
             .expect("set credentialed upstream");
         {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::INFO)
-                    .finish(),
-            );
+            let _guard = capture.install(tracing::Level::INFO);
             tdh::send(
                 app,
                 tdh::get(format!(
@@ -12276,7 +12302,7 @@ mod remote_discovery_tests {
         }
         fx.teardown().await;
 
-        let all = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let all = capture.text();
         let credentialed: Vec<&str> = all[first_phase..]
             .lines()
             .filter(|l| l.contains("NuGet upstream resolution step"))
@@ -12289,7 +12315,7 @@ mod remote_discovery_tests {
         }
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let logs = String::from_utf8(capture.0.lock().unwrap()[..first_phase].to_vec()).unwrap();
+        let logs = &all[..first_phase];
         let line = logs
             .lines()
             .find(|l| l.contains("step=\"registration_page\""))
