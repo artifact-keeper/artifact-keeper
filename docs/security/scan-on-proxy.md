@@ -354,6 +354,93 @@ pull is scanned and recorded, and no pull is withheld. An object over the
 200 MiB cap is never buffered. Under `fail_closed` it is `423`. Otherwise it
 streams unscanned with `X-AK-Scan: pending`.
 
+### When scans queue
+
+A first install asks for many never-seen files at once, and only
+`MAX_CONCURRENT_SCAN_EXTRACTIONS` scans (default 4, shared with upload scans)
+run at a time, so most of them queue. A file scan runs in a task of its own and
+requests wait on it:
+
+| Limit | Value | What happens at the limit |
+| --- | --- | --- |
+| A `fail_closed` request waiting for its scan to start | 60 seconds, `AK_PROXY_SCAN_QUEUE_WAIT_SECS` | `423 scan_pending`. The scan keeps its place in the queue. |
+| A `fail_closed` request waiting for a running scan | 30 seconds from when the scan started, or from when the request arrived if that is later | `423 scan_pending`. The scan keeps running. |
+| Any `fail_closed` wait | Three quarters of `GLOBAL_REQUEST_TIMEOUT_SECS` after the request arrived, including the time spent fetching the file (90 seconds at the default of 120) | `423 scan_pending`, in place of the router's `503`. The scan carries on as above. |
+| A queued `fail_closed` scan with no request waiting on it | 30 seconds after the last request went, whether it was refused or hung up | The scan leaves the queue without running. The next pull starts it again. |
+| A running scan, with or without a request waiting | 120 seconds | The scan is killed and the file has no verdict. The next pull scans it again. |
+| Writing a scan's verdict, and then its inventory and CVE detail | 30 seconds each | A verdict not written in time is inconclusive. Detail not written in time is left out, and the verdict stands. |
+
+A scan's permit is free once it has run, before any of those writes, and waiting
+requests are answered once the verdict row is written.
+
+The scans waiting and the requests waiting on them are limited too, because each
+holds memory or a router slot:
+
+| Limit | Overall | Per repository |
+| --- | --- | --- |
+| Scans in flight, queued and running | 4,096 | 1,024 |
+| Bytes held in memory | 1 GiB, `AK_PROXY_SCAN_QUEUE_BUDGET_BYTES` (never below 400 MiB) | Half of the overall value |
+| Requests waiting | | 256, and 16 on any one scan |
+
+The bytes count each file being scanned and the separate copy held by a request
+that joined a scan. A file or request past one of these limits gets no scan for
+now: `423` under `fail_closed`, served `pending` otherwise, with no verdict until
+a later pull finds room. Each one counts in
+[`ak_proxy_scan_queue_refused_total`](../operations/detection-metrics.md#proxy-scans),
+labelled with the limit, and one dropped from the queue counts in
+`ak_proxy_scan_abandoned_total`.
+
+A `423 scan_pending` therefore means what its body says: retry shortly. A retry
+to the same backend while the scan runs joins it, and one after the scan ends gets
+its verdict: the file is served, or `403` if the verdict blocks it. A
+`fail_closed` repository still serves no byte without a verdict. If another verdict
+is recorded for the same bytes while a scan runs, that one stands, and requests
+waiting on the scan get `423`, then that verdict on their retry.
+
+The table of scans belongs to one backend process:
+
+- A retry that reaches another replica starts a second scan there. Both record a
+  verdict for the digest, and whichever finishes second gets `423` and reads the
+  first one's verdict on retry.
+- A restart loses whatever was queued or running, and the next pull starts it
+  again. Scans do not hold up a shutdown; a request still waiting on one does, for
+  as long as its wait lasts, as any in-flight request does.
+
+Under `fail_open` and `record_only` the response does not wait for any of this, so
+an install can finish well before its verdicts do. Those scans are not dropped from
+the queue. A file past the limits has no verdict until a later pull, so check
+`ak_proxy_scan_queue_refused_total` after a first install of more than 1,024 unique
+files, which is the likely way to reach them.
+
+One repository cannot take the whole table, but this is not fair sharing. Two
+repositories at their byte limit fill the overall limit, and a repository's backlog
+makes that repository's own new files wait: a large `record_only` install can make a
+`fail_closed` pull from the same repository wait, and get `423` past the limits
+above. How fast a backlog drains depends on the scan permits, which are shared
+with upload scans.
+
+Image manifests are not part of this: a manifest scan runs on its request with a
+budget of 120 seconds, and its wait for a permit counts against that budget.
+
+### Timeouts in front of the gate
+
+A `fail_closed` request can wait up to 90 seconds with no bytes on the wire, so
+what sits in front of the backend needs to allow for it:
+
+| In front of the backend | Default | What happens past it |
+| --- | --- | --- |
+| nginx, ingress-nginx `proxy_read_timeout` | 60 s | The client gets `504`. The scan carries on for the retry. |
+| npm `fetch-timeout` | 300 s | No effect at these limits. npm retries a `504` but not a `423`. |
+| pip `--timeout` | 15 s | pip retries, joining the scan. |
+| cargo `http.timeout` | 30 s | cargo retries, joining the scan. |
+| apt `Acquire::http::Timeout` | 120 s | No effect at these limits. |
+
+To keep the `423`, set the proxy's read timeout above 90 seconds on the package
+routes, or lower `AK_PROXY_SCAN_QUEUE_WAIT_SECS` so that the wait plus the 30-second
+budget fits inside it. A lower wait refuses more of a first install on a small host;
+see [the OCI timeouts page](../operations/oci-reverse-proxy-timeouts.md) for how to
+set the timeout on each proxy.
+
 ## Verdicts and freshness
 
 Verdicts are stored per content digest in `proxy_scan_results` and shared

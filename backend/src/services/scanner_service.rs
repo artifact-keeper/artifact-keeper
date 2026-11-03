@@ -99,6 +99,9 @@ pub const PROXY_SCAN_MAX_BYTES: usize = 200 * 1024 * 1024;
 /// of a fresh wheel is seconds; this bounds the added `pip install` latency so a
 /// slow or contended scan cannot stall the pull indefinitely. Budget exceeded
 /// is treated as inconclusive (fail-open serves-with-pending, fail-closed 423).
+/// It starts when the scan holds a permit: the wait for one is bounded on its
+/// own by `AK_PROXY_SCAN_QUEUE_WAIT_SECS`, and the scan goes on without the request
+/// up to [`PROXY_SCAN_BACKGROUND_BUDGET`] (#5231).
 pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Wall-clock budget for a single inline OCI image proxy scan (#3003 PR-2).
@@ -127,6 +130,12 @@ pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
 /// precedent for a context that can legitimately take longer than the file
 /// gate's 30s.
 pub const PROXY_RESCAN_BUDGET_CEILING: Duration = Duration::from_secs(120);
+
+/// How long a proxy file scan may run once it holds a permit, after the
+/// requests waiting on it have had their [`PROXY_SCAN_INLINE_BUDGET`] (#5231).
+/// Nobody is waiting by then: what this bounds is how long one permit can be
+/// held. The scan is killed at this point and the file has no verdict.
+pub const PROXY_SCAN_BACKGROUND_BUDGET: Duration = PROXY_RESCAN_BUDGET_CEILING;
 
 /// The scan budget an individual rescan request actually runs under (#3455
 /// review, F2).
@@ -4041,6 +4050,13 @@ async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPe
     .await
 }
 
+/// A held scan-extraction permit, for a caller that has to wait for one outside
+/// the clock it scans under (#5231). The scan methods taking one do not acquire
+/// another.
+pub struct InlineScanSlot {
+    _permit: ScanExtractionPermit,
+}
+
 /// The cumulative-budget breach error, shared by the reader-level budget under
 /// the tar walk and the per-entry copy so a bomb reports identically wherever
 /// it is caught.
@@ -5966,6 +5982,10 @@ async fn run_inline_proxy_scanners_target(
     // What the CVE-authoritative scanner actually cataloged (#3003). `None`
     // until a CVE engine that reports a catalog completes.
     let mut cve_cataloged: Option<Vec<CatalogedComponent>> = None;
+    // Read before the scan, so a verdict says what it was graded against: a
+    // vulnerability-database update during the scan must make the next pull scan
+    // again, not reuse this verdict as if it had seen the new data (#5231).
+    let version_at_start = cve_authoritative_scanner_version(scanners).await;
 
     for scanner in scanners {
         // Applicability gates on the target artifact's path/content-type
@@ -6189,7 +6209,7 @@ async fn run_inline_proxy_scanners_target(
     // Cheap: `Scanner::version` is `VersionCache`-backed, so this is a memory
     // read, not a second `--version` subprocess.
     let scanner_version = if cve_scanner_ran {
-        cve_authoritative_scanner_version(scanners).await
+        version_at_start
     } else {
         None
     };
@@ -9393,10 +9413,29 @@ impl ScannerService {
         content: &Bytes,
         expected: Option<&ExpectedComponent>,
     ) -> Result<ProxyScanVerdict> {
-        // Fair-share + global cap: inline scans queue behind the same semaphore
-        // as upload scans instead of contending for unbounded extraction slots.
-        let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
+        let slot = self.acquire_inline_scan_slot(synthetic.repository_id).await;
+        self.scan_content_expecting_in_slot(&slot, synthetic, content, expected)
+            .await
+    }
 
+    /// Wait for a scan-extraction permit. Fair-share + global cap: inline scans
+    /// queue behind the same semaphore as upload scans instead of contending
+    /// for unbounded extraction slots.
+    pub async fn acquire_inline_scan_slot(&self, repository_id: Uuid) -> InlineScanSlot {
+        InlineScanSlot {
+            _permit: acquire_scan_extraction_permit(repository_id).await,
+        }
+    }
+
+    /// [`ScannerService::scan_content_expecting`] under a permit the caller
+    /// already holds, so that the wait for it is not part of the scan (#5231).
+    pub async fn scan_content_expecting_in_slot(
+        &self,
+        _slot: &InlineScanSlot,
+        synthetic: &Artifact,
+        content: &Bytes,
+        expected: Option<&ExpectedComponent>,
+    ) -> Result<ProxyScanVerdict> {
         let target = ScanTarget {
             artifact: synthetic,
             repository_key: "",
@@ -11491,6 +11530,20 @@ pub(crate) mod test_helpers {
         /// under test) before completing. Proves the BudgetExceeded arm
         /// end-to-end (#3455) without a real grype subprocess.
         Hang(std::time::Duration),
+        /// [`Self::Hang`], then the given outcome: a verdict that lands after
+        /// the request that started the scan gave up (#5231).
+        HangThen(std::time::Duration, &'static MockCveRescan),
+    }
+
+    /// Hold every scan-extraction permit, so that a scan queues until the guard
+    /// drops (#5231). The semaphore is process-wide, which nextest's one process
+    /// per test keeps to the test that calls this.
+    pub async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
+        super::scan_extraction_semaphore()
+            .clone()
+            .acquire_many_owned(super::max_concurrent_scan_extractions() as u32)
+            .await
+            .expect("the semaphore is never closed")
     }
 
     /// CVE-authoritative mock scanner reporting a fixed live version string.
@@ -11587,7 +11640,15 @@ pub(crate) mod test_helpers {
             _: &bytes::Bytes,
         ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match self.rescan {
+            let rescan = match self.rescan {
+                MockCveRescan::HangThen(d, then) => {
+                    tokio::time::sleep(d).await;
+                    *then
+                }
+                rescan => rescan,
+            };
+            match rescan {
+                MockCveRescan::HangThen(..) => unreachable!("replaced above"),
                 MockCveRescan::Clean => Ok(crate::services::scanner_service::ScanOutput::default()),
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
@@ -34321,6 +34382,7 @@ tonic-build = "0.12"
 
 /// Vulnerability-database provenance parsing (#3014). Fixtures are verbatim
 /// output of grype 0.118.0 and trivy 0.71.2.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod vuln_db_provenance_tests {
     use super::*;

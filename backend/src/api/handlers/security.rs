@@ -4933,6 +4933,815 @@ mod tests {
         }
     }
 
+    /// #5231: the verdict row for `digest`, polled for up to `within` while a
+    /// scan with no request waiting on it finishes.
+    async fn verdict_lands_5231(
+        pool: &PgPool,
+        digest: &str,
+        within: std::time::Duration,
+    ) -> Option<String> {
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone());
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let row = pss
+                .lookup_verdict(digest, crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+                .await
+                .expect("read the verdict");
+            if let Some(row) = row {
+                return Some(row.verdict);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// #5231: a state whose scanner behaves as `rescan`, the fixture repository,
+    /// and bytes of their own, so the verdict row is this test's alone.
+    async fn scan_state_5231(
+        pool: &PgPool,
+        rescan: crate::services::scanner_service::test_helpers::MockCveRescan,
+        mutate: impl FnOnce(&mut crate::config::Config),
+    ) -> (
+        SharedState,
+        ProxyScanFixture,
+        bytes::Bytes,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::services::scanner_service::test_helpers::VersionedCveScanner;
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let content = bytes::Bytes::from(format!("npm tarball {}", Uuid::new_v4()));
+        let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+        let (scanner, scans) = VersionedCveScanner::counting(Some("grype-test"), rescan);
+        let state = scanner_state_with(
+            &fx,
+            vec![std::sync::Arc::new(scanner)],
+            "pkg/-/pkg-1.0.0.tgz",
+            content.clone(),
+            mutate,
+        )
+        .await;
+        (state, fx, content, digest, scans)
+    }
+
+    /// #5231: a scan that waits in the queue for longer than the budget, and
+    /// then runs quickly, serves. The budget used to be spent in the queue, so
+    /// this answered `423` with the scan never having started. Every scan
+    /// permit is held for 32 real seconds: no paused clock next to a database
+    /// pool (see `http_client.rs:884`).
+    #[tokio::test]
+    async fn a_scan_queued_past_the_budget_still_serves_under_fail_closed_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+
+        let permits = hold_all_scan_permits().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+            drop(permits);
+        });
+
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::FailClosed,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "clean", "time in the queue must not spend the budget");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(&[digest]).await;
+    }
+
+    /// #5231: a scan that runs over the budget is still refused, with no bytes
+    /// served, and is not killed: it records its verdict and the retry gets that
+    /// verdict, without scanning again.
+    #[tokio::test]
+    async fn an_over_budget_scan_is_refused_and_a_retry_finds_its_verdict_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            // Cataloged: a clean verdict that graded nothing is not reused
+            // under fail_closed, and this one has to be.
+            MockCveRescan::HangThen(
+                std::time::Duration::from_secs(32),
+                &MockCveRescan::Cataloged("pkg", "1.0.0"),
+            ),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        assert_eq!(pull().await, "423", "over budget stays refused");
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("clean"),
+            "the scan must finish after its request gave up"
+        );
+        assert_eq!(pull().await, "clean");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: the verdict a late scan lands is enforced. A file found vulnerable
+    /// after its first request gave up is `423` and then `403`, never served.
+    #[tokio::test]
+    async fn a_late_vulnerable_verdict_blocks_the_retry_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::HangThen(
+                std::time::Duration::from_secs(32),
+                &MockCveRescan::Vulnerable,
+            ),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        assert_eq!(pull().await, "423");
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("vulnerable"),
+        );
+        assert_eq!(pull().await, "403");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: under `record_only` the pull is answered at once and a scan queued
+    /// past the budget still records a verdict. It used to be dropped from the
+    /// queue, which left most of a first install with no verdict.
+    #[tokio::test]
+    async fn a_record_only_scan_queued_past_the_budget_records_a_verdict_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+
+        let permits = hold_all_scan_permits().await;
+        let started = std::time::Instant::now();
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::RecordOnly,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "pending");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "record_only must not hold the response for the scan"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        drop(permits);
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("clean"),
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: two requests for one file share one scan, which is what keeps
+    /// client retries from stacking scans of the same bytes.
+    #[tokio::test]
+    async fn concurrent_pulls_of_one_file_share_one_scan_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(2)),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        let (first, second) = tokio::join!(pull(), pull());
+        assert_eq!((first.as_str(), second.as_str()), ("clean", "clean"));
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: the queue wait has a bound of its own (`AK_PROXY_SCAN_QUEUE_WAIT_SECS`).
+    /// Past it the request is refused, and the scan keeps its place in the queue
+    /// for the retry.
+    #[tokio::test]
+    async fn a_request_stops_waiting_for_the_queue_and_the_scan_keeps_its_place_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |config| {
+                config.proxy_scan_queue_wait_secs = 1;
+            })
+            .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        let permits = hold_all_scan_permits().await;
+        let started = std::time::Instant::now();
+        assert_eq!(pull().await, "423");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the queue wait is bounded by its setting, took {:?}",
+            started.elapsed()
+        );
+        drop(permits);
+
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("clean"),
+        );
+        assert_eq!(pull().await, "clean");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: a client that aborts leaves nothing queued for long. A
+    /// `fail_closed` scan nobody waits on leaves the queue after the grace
+    /// period, and never runs.
+    #[tokio::test]
+    async fn an_aborted_request_does_not_leave_its_scan_queued_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+        let permits = hold_all_scan_permits().await;
+
+        let aborted = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            ),
+        )
+        .await;
+        assert!(
+            aborted.is_err(),
+            "the request is still waiting when dropped"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        drop(permits);
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(3)).await,
+            None,
+            "the abandoned scan must have left the queue"
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: one repository filling its share of the table does not
+    /// refuse another repository's scans.
+    #[tokio::test]
+    async fn one_repository_cannot_exhaust_the_scan_table_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state_a, fx_a, _, _, _) = scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+        let (state_b, fx_b, content_b, digest_b, _) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+        let permits = hold_all_scan_permits().await;
+
+        let mut filler = Vec::new();
+        for n in 0..1100 {
+            let content = bytes::Bytes::from(format!("filler {n} {}", Uuid::new_v4()));
+            let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+            let served = gate_pull_3396(
+                &state_a,
+                &fx_a,
+                &format!("filler-{n}.tgz"),
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::RecordOnly,
+                ProxyScanIdentity::NotApplicable,
+            )
+            .await;
+            assert_eq!(served, "pending");
+            filler.push(digest);
+        }
+
+        let served = gate_pull_3396(
+            &state_b,
+            &fx_b,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest_b,
+            &content_b,
+            ProxyScanAction::RecordOnly,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(served, "pending");
+        drop(permits);
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest_b, std::time::Duration::from_secs(60))
+                .await
+                .as_deref(),
+            Some("clean"),
+            "the other repository's scan must have got a place in the table"
+        );
+        fx_a.cleanup(&filler).await;
+        fx_b.cleanup(std::slice::from_ref(&digest_b)).await;
+    }
+
+    /// #5231 review: a request is answered inside three quarters of the router's
+    /// timeout however short it is, so the client gets the `423` and not the
+    /// router's undifferentiated 503.
+    #[tokio::test]
+    async fn a_short_request_timeout_still_gets_a_423_in_time_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(40)),
+            |config| config.global_request_timeout_secs = 20,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::FailClosed,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "423");
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(16),
+            "took {:?}",
+            started.elapsed()
+        );
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: time the request already spent (the upstream fetch) counts.
+    /// The router's clock has been running since the request arrived.
+    #[tokio::test]
+    async fn the_wait_uses_what_is_left_of_the_request_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(10)),
+            |_| {},
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let answer_by = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let pull = REQUEST_ANSWER_BY
+            .scope(
+                answer_by,
+                gate_pull_3396(
+                    &state,
+                    &fx,
+                    "pkg-1.0.0.tgz",
+                    None,
+                    &digest,
+                    &content,
+                    ProxyScanAction::FailClosed,
+                    ProxyScanIdentity::NotApplicable,
+                ),
+            )
+            .await;
+        assert_eq!(pull, "423");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: requests for one file do not pile up behind its scan. Each
+    /// holds a router slot and a buffer of its own, so past the bound they are
+    /// answered `423` at once.
+    #[tokio::test]
+    async fn requests_joining_one_scan_are_bounded_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(3)),
+            |_| {},
+        )
+        .await;
+        let pulls = (0..20).map(|_| {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        });
+        let answers = futures::future::join_all(pulls).await;
+        let served = answers.iter().filter(|a| a.as_str() == "clean").count();
+        let refused = answers.iter().filter(|a| a.as_str() == "423").count();
+        assert_eq!((served, refused), (16, 4), "{answers:?}");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: a verdict recorded while a background scan ran is not
+    /// overwritten by it, so a clean scan cannot undo a vulnerable verdict. The
+    /// request refused meanwhile finds the newer verdict on its retry.
+    #[tokio::test]
+    async fn a_background_scan_does_not_overwrite_a_newer_verdict_5231() {
+        use crate::api::handlers::proxy_helpers::{ProxyScanIdentity, PROXY_SCAN_TYPE};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxyScanService};
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) = scan_state_5231(
+            &pool,
+            MockCveRescan::HangThen(
+                std::time::Duration::from_secs(3),
+                &MockCveRescan::Cataloged("pkg", "1.0.0"),
+            ),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+        let pss = ProxyScanService::new(pool.clone());
+        let newer = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            pss.record_verdict_with_catalog(
+                &digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-test"),
+                Some(fx.repo_id),
+                Some(3),
+                None,
+            )
+            .await
+            .expect("record the newer verdict");
+        };
+        let (first, ()) = tokio::join!(pull(), newer);
+        assert_eq!(first, "423", "the scan's verdict was not recorded");
+        let row = pss
+            .lookup_verdict(&digest, PROXY_SCAN_TYPE)
+            .await
+            .expect("read")
+            .expect("a verdict");
+        assert_eq!(row.verdict, "vulnerable");
+        assert_eq!(pull().await, "403");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// Reports one version until its scan has run, then another: the vulnerability
+    /// database changing under a running scan (#5231 review).
+    struct VersionChangesDuringScan(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for VersionChangesDuringScan {
+        fn name(&self) -> &str {
+            "version-changes-during-scan"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn version(&self) -> Option<String> {
+            Some(if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                "grype-new".to_string()
+            } else {
+                "grype-old".to_string()
+            })
+        }
+        async fn scan(
+            &self,
+            _: &crate::models::artifact::Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::services::scanner_service::ScanOutput::default())
+        }
+    }
+
+    /// #5231 review: a verdict records the version the scan ran with, so a
+    /// database update during the scan makes the next pull scan again.
+    #[tokio::test]
+    async fn a_verdict_records_the_version_its_scan_ran_with_5231() {
+        use crate::api::handlers::proxy_helpers::{ProxyScanIdentity, PROXY_SCAN_TYPE};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxyScanService};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let content = bytes::Bytes::from(format!("npm tarball {}", Uuid::new_v4()));
+        let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+        let state = scanner_state_with(
+            &fx,
+            vec![std::sync::Arc::new(VersionChangesDuringScan(
+                std::sync::atomic::AtomicBool::new(false),
+            ))],
+            "pkg/-/pkg-1.0.0.tgz",
+            content.clone(),
+            |_| {},
+        )
+        .await;
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::FailClosed,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "clean");
+        let row = ProxyScanService::new(pool.clone())
+            .lookup_verdict(&digest, PROXY_SCAN_TYPE)
+            .await
+            .expect("read")
+            .expect("a verdict");
+        assert_eq!(row.scanner_version.as_deref(), Some("grype-old"));
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: a request is answered once the verdict is durable, and the
+    /// scan's permit is free by then, even if the CVE detail is slow to write.
+    #[tokio::test]
+    async fn a_slow_detail_write_holds_neither_the_answer_nor_the_permit_5231() {
+        use crate::api::handlers::proxy_helpers::{ProxyScanIdentity, PROXY_SCAN_TYPE};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxyScanService};
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) =
+            scan_state_5231(&pool, MockCveRescan::Vulnerable, |_| {}).await;
+
+        let mut blocker = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE proxy_scan_findings IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("lock");
+
+        let pull = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            ),
+        )
+        .await;
+        let permits =
+            tokio::time::timeout(std::time::Duration::from_secs(2), hold_all_scan_permits()).await;
+        blocker.rollback().await.expect("rollback");
+        assert_eq!(
+            pull.ok().as_deref(),
+            Some("403"),
+            "answered from the verdict"
+        );
+        assert!(permits.is_ok(), "the permit is released before the writes");
+        drop(permits);
+
+        let pss = ProxyScanService::new(pool.clone());
+        let mut findings = 0;
+        for _ in 0..50 {
+            findings = pss
+                .fetch_findings(&digest, PROXY_SCAN_TYPE, 50)
+                .await
+                .expect("read findings")
+                .len();
+            if findings > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(findings, 1, "the detail still lands");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: one digest served under two names is two scans, so bytes
+    /// cannot join a scan that grades them as something else.
+    #[tokio::test]
+    async fn one_digest_under_two_file_names_is_two_scans_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(2)),
+            |_| {},
+        )
+        .await;
+        let pull = |name: &'static str| {
+            gate_pull_3396(
+                &state,
+                &fx,
+                name,
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+        let _ = tokio::join!(pull("pkg-1.0.0.tgz"), pull("pkg-1.0.0.whl"));
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
     /// #3396: a fail_closed npm remote holds a `vulnerable` verdict for a
     /// tarball. A rescan of that tarball cannot pin it, and the engine
     /// catalogs nothing and finds nothing. The rescan is inconclusive (503

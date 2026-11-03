@@ -469,6 +469,7 @@ pub mod protobuf_bsr;
 pub mod proxy_cache_cap;
 pub mod proxy_helpers;
 pub(crate) mod proxy_scan_archive;
+pub(crate) mod proxy_scan_inflight;
 pub mod pub_registry;
 pub mod publish_quota;
 pub mod puppet;
