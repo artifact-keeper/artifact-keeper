@@ -1381,7 +1381,11 @@ async fn enforce_maven_age_gate(
     // and an anonymous probe for random versions creates no review rows.
     // Undated because the upstream could not be read: fail closed with the
     // retryable 503, not a 451 and a review for a version nobody has seen.
-    if basis.is_none() && AgeGateService::gating_requested(params) {
+    // A threshold of 0 needs no date, so neither applies there (#5151).
+    if basis.is_none()
+        && AgeGateService::gating_requested(params)
+        && params.age_gate_min_age_days > 0
+    {
         match lookup {
             MavenPomLookup::Missing => {
                 return Err(AppError::NotFound("File not found".to_string()).into_response());
@@ -14526,6 +14530,41 @@ mod age_gate_4702_tests {
             .await
             .expect("body");
         (status, body)
+    }
+
+    /// #5151: a threshold of 0 needs no publish time, so an unreadable POM is
+    /// no reason to refuse the download.
+    #[tokio::test]
+    async fn zero_days_does_not_need_a_readable_pom_5151() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{}", file(OLD, "pom"))))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{}", file(OLD, "jar"))))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"zero-jar"[..]))
+            .mount(&mock)
+            .await;
+        let (id, key, dir) = gated_remote(&pool, &mock, "upstream_publish_time").await;
+        sqlx::query("UPDATE repositories SET age_gate_min_age_days = 0 WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("lower the threshold");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy_and_age_gate(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let (status, body) = get(&state, &key, &file(OLD, "jar")).await;
+        tdh::cleanup_member_repo(&pool, id, &dir).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"zero-jar");
     }
 
     async fn requested(mock: &MockServer, path: &str) -> bool {

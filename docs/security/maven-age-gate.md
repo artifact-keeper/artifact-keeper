@@ -49,6 +49,9 @@ no parseable `Last-Modified` has no publish time and is withheld with the
 `451` (the same rule every format follows). If your upstream sends no
 `Last-Modified`, use `first_seen`.
 
+A minimum age of 0 needs no date: nothing above is consulted for it, so an
+unreadable POM does not refuse the download. A rejected review still blocks.
+
 A version whose POM the upstream does not have (`404` or `410`) answers a
 plain `404` and records no review, as an ungated Remote would: nothing is
 served either way, and a resolver that tries several repositories in turn

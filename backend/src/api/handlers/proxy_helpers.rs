@@ -2695,6 +2695,30 @@ pub async fn proxy_fetch_uncached(
     .await
 }
 
+/// Read a metadata document from upstream as of now, bypassing the proxy cache
+/// and holding the metadata memory budget like every other buffered read. The
+/// age gate reads this before it treats a member as not hosting a version
+/// (#5150): a cached copy older than the publish cannot say that.
+pub(crate) async fn proxy_fetch_uncached_metadata_budgeted(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    accept: Option<&str>,
+) -> Result<(Bytes, OwnedSemaphorePermit), Response> {
+    let permit = proxy_metadata_budget()
+        .reserve(LARGE_METADATA_MAX_BYTES)
+        .await;
+    let content = with_proxy_repo(repo_id, repo_key, upstream_url, path, |repo| async move {
+        proxy_service
+            .fetch_upstream_direct_with_accept(&repo, path, accept)
+            .await
+    })
+    .await?;
+    Ok((content, permit))
+}
+
 /// Fetch from upstream directly, preserving the upstream `Link` header.
 ///
 /// Returns the whole [`DirectUpstreamBody`], including the upstream
@@ -9454,6 +9478,60 @@ pub async fn enforce_age_gate(
             ))
         }
     }
+}
+
+/// What the download age gate decided for one Remote.
+#[derive(Debug)]
+pub(crate) enum AgeGateOutcome<T> {
+    /// Keep serving the requested file.
+    Allowed,
+    /// Withheld, and a last-known-good version answers instead.
+    Substitute(T),
+    /// A Virtual member's upstream does not host the version (#5150). The
+    /// member has nothing to refuse and is out of this request: it writes no
+    /// review, and the walk must not ask it for bytes either, since its gate
+    /// has not cleared them.
+    NotHosted,
+}
+
+/// The download age gate of a Remote, given what its upstream says about the
+/// version. `as_virtual_member` allows [`AgeGateOutcome::NotHosted`]; a direct
+/// Remote has no sibling to defer to and always takes the ordinary decision.
+/// `Err` is [`enforce_age_gate`]'s terminal answer.
+pub(crate) async fn decide_download_age_gate(
+    svc: Option<&crate::services::age_gate_service::AgeGateService>,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+    evidence: crate::services::age_gate_service::UpstreamVersionEvidence,
+    as_virtual_member: bool,
+) -> Result<AgeGateOutcome<AgeGateSubstitution>, Response> {
+    use crate::services::age_gate_service::UpstreamVersionEvidence;
+
+    let published_at = evidence.published_at();
+    let basis = match svc {
+        Some(svc) => {
+            if as_virtual_member
+                && evidence == UpstreamVersionEvidence::NotHosted
+                && svc
+                    .member_may_step_aside(params, package, version)
+                    .await
+                    .map_err(|e| e.into_response())?
+            {
+                return Ok(AgeGateOutcome::NotHosted);
+            }
+            svc.download_basis(params, package, version, published_at, evidence.is_listed())
+                .await
+                .map_err(|e| e.into_response())?
+        }
+        None => published_at,
+    };
+    Ok(
+        match enforce_age_gate(svc, params, package, version, basis).await? {
+            Some(blocked) => AgeGateOutcome::Substitute(blocked),
+            None => AgeGateOutcome::Allowed,
+        },
+    )
 }
 
 /// Build a minimal `Repository` model for proxy operations.

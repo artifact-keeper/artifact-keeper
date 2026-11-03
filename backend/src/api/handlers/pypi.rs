@@ -38,6 +38,7 @@ use crate::api::handlers::cache_headers::{
     negotiated_cacheable_response, VARY_ACCEPT,
 };
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
+use crate::api::handlers::proxy_helpers::AgeGateOutcome;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::validation::validate_outbound_url;
@@ -46,7 +47,7 @@ use crate::error::AppError;
 use crate::formats::pypi::{is_wheel_core_metadata_entry, PkgInfo, PypiHandler};
 use crate::formats::pypi_name::{NormalizedProjectName, PEP508_NAME_PATTERN};
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::AgeGateService;
+use crate::services::age_gate_service::{AgeGateService, UpstreamVersionEvidence};
 use crate::services::upstream_metadata::metadata_http_client;
 use chrono::Utc;
 
@@ -802,7 +803,7 @@ async fn simple_project(
 
     // PEP 691 content negotiation also governs the proxy path: a JSON client
     // must get the upstream's JSON representation (which carries PEP 700
-    // `upload-time`), not its HTML index (which never does).
+    // `upload-time`), not its HTML index (which rarely does).
     let wants_json = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
@@ -2495,14 +2496,17 @@ async fn filter_pypi_simple_html_response(
         let Ok(client) = metadata_http_client() else {
             return html;
         };
-        let Ok(times) = svc
+        match svc
             .metadata_cache()
             .fetch_pypi_publish_times(&client, repo.id, effective_upstream, project)
             .await
-        else {
-            return html;
-        };
-        times
+        {
+            Ok(times) => times,
+            // No JSON API, but the index dates its own files (#5151). The
+            // download reads the same attribute, so the two stay in step.
+            Err(_) if html.contains("data-upload-time=") => std::collections::HashMap::new(),
+            Err(_) => return html,
+        }
     } else {
         std::collections::HashMap::new()
     };
@@ -2515,18 +2519,122 @@ async fn filter_pypi_simple_html_response(
     }
 }
 
+/// `Accept` for the age gate's simple-index read: the PEP 691 representation
+/// is the one with PEP 700 `upload-time`, and HTML is every upstream's floor.
+const PYPI_GATE_INDEX_ACCEPT: &str = "application/vnd.pypi.simple.v1+json, text/html;q=0.9";
+
+/// Read one version's evidence out of an upstream simple-index body.
+///
+/// HTML goes through the same rebuild the listing path uses, so the two read
+/// the same anchors. An HTML page with no distribution anchors (a login page,
+/// a captive proxy) is no answer rather than an empty project. The filename
+/// check is a backstop: a file named in the body but missed by the parse is
+/// listed, not absent.
+fn pypi_index_version_evidence(
+    body: &[u8],
+    repo_key: &str,
+    project: &str,
+    filename: &str,
+    version: &str,
+) -> UpstreamVersionEvidence {
+    let versions = match sniff_simple_index(body) {
+        SniffedSimpleIndex::Json => {
+            let Ok(doc) = serde_json::from_slice::<serde_json::Value>(body) else {
+                return UpstreamVersionEvidence::Unknown;
+            };
+            if !doc.get("files").is_some_and(|files| files.is_array()) {
+                return UpstreamVersionEvidence::Unknown;
+            }
+            crate::services::age_gate_service::collect_pypi_simple_json_versions(&doc)
+        }
+        SniffedSimpleIndex::Html => {
+            let html = rewrite_upstream_urls(&String::from_utf8_lossy(body), repo_key, project);
+            let (_, versions) =
+                crate::services::age_gate_service::parse_pypi_simple_index_anchors(&html);
+            if versions.is_empty() {
+                return UpstreamVersionEvidence::Unknown;
+            }
+            versions
+        }
+        SniffedSimpleIndex::Binary => return UpstreamVersionEvidence::Unknown,
+    };
+    match crate::services::age_gate_service::pypi_listed_version(&versions, version) {
+        Some(published_at) => UpstreamVersionEvidence::Listed(published_at),
+        None if String::from_utf8_lossy(body).contains(filename) => {
+            UpstreamVersionEvidence::Listed(None)
+        }
+        None => UpstreamVersionEvidence::NotHosted,
+    }
+}
+
+/// What a Remote's upstream says about `version`.
+///
+/// The Warehouse JSON API comes first, so an upstream that has one pays no
+/// extra read. Its failure says nothing about the package: an index with no
+/// such endpoint answers 404 or 403 for projects it hosts (#5151). The simple
+/// index is the document every PyPI upstream serves, so it dates the version
+/// when it can and is the only source of "not hosted" (#5150). It is read from
+/// the upstream as of now, with the Remote's configured credentials.
+async fn pypi_version_evidence(
+    state: &SharedState,
+    repo: &RepoInfo,
+    project: &NormalizedProjectName,
+    filename: &str,
+    version: &str,
+) -> UpstreamVersionEvidence {
+    let Some(upstream_url) = &repo.upstream_url else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    if let (Some(svc), Ok(client)) = (state.age_gate_service.as_deref(), metadata_http_client()) {
+        let published_at = svc
+            .metadata_cache()
+            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project.as_str())
+            .await
+            .ok()
+            .and_then(|times| {
+                crate::services::age_gate_service::pypi_publish_time(&times, version)
+            });
+        if published_at.is_some() {
+            return UpstreamVersionEvidence::Listed(published_at);
+        }
+    }
+    let Some(proxy) = &state.proxy_service else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
+    let (effective_upstream, upstream_path) =
+        pypi_upstream_url_and_path(upstream_url, &format!("{}/", project.as_str()), &index_path);
+    match proxy_helpers::proxy_fetch_uncached_metadata_budgeted(
+        proxy,
+        repo.id,
+        &repo.key,
+        &effective_upstream,
+        &upstream_path,
+        Some(PYPI_GATE_INDEX_ACCEPT),
+    )
+    .await
+    {
+        Ok((body, _budget_permit)) => {
+            pypi_index_version_evidence(&body, &repo.key, project.as_str(), filename, version)
+        }
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => UpstreamVersionEvidence::NotHosted,
+        Err(_) => UpstreamVersionEvidence::Unknown,
+    }
+}
+
 async fn apply_pypi_download_age_gate(
     state: &SharedState,
     repo: &RepoInfo,
-    project: &str,
+    project: &NormalizedProjectName,
     filename: &str,
-) -> Result<Option<String>, Response> {
+    as_virtual_member: bool,
+) -> Result<AgeGateOutcome<String>, Response> {
     // Cheap struct-derived pre-check, then DB-resolve the authoritative
     // policy (mode + upstream identity) by id — struct-derived params can
     // carry a stale or defaulted mode (e.g. a virtual member's RepoInfo),
     // and gate policy is enforcement input (#2264).
     if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
-        return Ok(None);
+        return Ok(AgeGateOutcome::Allowed);
     }
     let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
         .await
@@ -2538,43 +2646,36 @@ async fn apply_pypi_download_age_gate(
         AppError::Validation("Missing version in filename".to_string()).into_response()
     })?;
 
-    let svc = state.age_gate_service.as_deref();
-    // Publish-time evidence from the project's upstream JSON metadata; under
-    // `first_seen` the time itself is ignored, but presence in the document
-    // is the existence evidence that may start the observation clock.
-    let published_at = if let (Some(svc), Some(upstream_url), Ok(client)) =
-        (svc, &repo.upstream_url, metadata_http_client())
-    {
-        svc.metadata_cache()
-            .fetch_pypi_publish_times(&client, repo.id, upstream_url, project)
-            .await
-            .ok()
-            .and_then(|times| {
-                crate::services::age_gate_service::pypi_publish_time(&times, &version)
-            })
+    // Publish-time evidence from the upstream; under `first_seen` the time
+    // itself is ignored, but a listing is the existence evidence that may
+    // start the observation clock. A threshold of 0 needs neither, so it never
+    // waits on the upstream (#5151).
+    let evidence = if params.age_gate_min_age_days > 0 {
+        pypi_version_evidence(state, repo, project, filename, &version).await
     } else {
-        None
-    };
-    let basis = match svc {
-        Some(svc) => svc
-            .download_basis(
-                &params,
-                project,
-                &version,
-                published_at,
-                published_at.is_some(),
-            )
-            .await
-            .map_err(|e| e.into_response())?,
-        None => published_at,
+        UpstreamVersionEvidence::Unknown
     };
 
     // The shared seam (#2264) owns the decision and the terminal 451; only
     // the LKG wheel-filename substitution below is pypi-specific.
-    let lkg = proxy_helpers::enforce_age_gate(svc, &params, project, &version, basis).await?;
-    Ok(lkg.map(|blocked| {
-        pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path)
-    }))
+    Ok(
+        match proxy_helpers::decide_download_age_gate(
+            state.age_gate_service.as_deref(),
+            &params,
+            project.as_str(),
+            &version,
+            evidence,
+            as_virtual_member,
+        )
+        .await?
+        {
+            AgeGateOutcome::Allowed => AgeGateOutcome::Allowed,
+            AgeGateOutcome::NotHosted => AgeGateOutcome::NotHosted,
+            AgeGateOutcome::Substitute(blocked) => AgeGateOutcome::Substitute(
+                pypi_lkg_filename_from_artifact_path(&blocked.last_known_good.artifact_path),
+            ),
+        },
+    )
 }
 
 /// Run the remote-PyPI download age gate and, when the requested version is
@@ -2583,9 +2684,11 @@ async fn apply_pypi_download_age_gate(
 /// via the proxy cache: presigned redirect / cache stream / upstream
 /// refetch), or the 451 block propagated as an `Err`.
 ///
-/// Returns `Ok(Some(response))` when the gate handled the request and
-/// `Ok(None)` when the version is allowed and the caller should keep serving
-/// normally. Shared by both the cache-miss and the local-`artifacts`-hit
+/// Returns `Substitute(response)` when the gate handled the request and
+/// `Allowed` when the version is allowed and the caller should keep serving
+/// normally. `NotHosted` is only for a Virtual member (`virtual_id` is `Some`)
+/// whose upstream does not host the version: the caller skips the member
+/// (#5150). Shared by both the cache-miss and the local-`artifacts`-hit
 /// branches of `serve_file` so a young version is never streamed just because a
 /// local row exists (parity with npm's unconditional `serve_tarball` gate).
 ///
@@ -2602,16 +2705,19 @@ async fn enforce_pypi_download_age_gate(
     filename: &str,
     virtual_id: Option<uuid::Uuid>,
     ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
-) -> Result<Option<Response>, Response> {
+) -> Result<AgeGateOutcome<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
-        _ => return Ok(None),
+        _ => return Ok(AgeGateOutcome::Allowed),
     };
 
     let lkg_filename =
-        match apply_pypi_download_age_gate(state, repo, project.as_str(), filename).await? {
-            Some(lkg) => lkg,
-            None => return Ok(None),
+        match apply_pypi_download_age_gate(state, repo, project, filename, virtual_id.is_some())
+            .await?
+        {
+            AgeGateOutcome::Substitute(lkg) => lkg,
+            AgeGateOutcome::Allowed => return Ok(AgeGateOutcome::Allowed),
+            AgeGateOutcome::NotHosted => return Ok(AgeGateOutcome::NotHosted),
         };
 
     // The substitute is a download like any other: a repository that scans
@@ -2639,7 +2745,7 @@ async fn enforce_pypi_download_age_gate(
             ctx,
         )
         .await
-        .map(Some);
+        .map(AgeGateOutcome::Substitute);
     }
 
     // The gate above and this cache key are now the SAME string by
@@ -2657,7 +2763,7 @@ async fn enforce_pypi_download_age_gate(
         // Without this, whether a cache hit counted depended on nothing but
         // `presigned_downloads_enabled`.
         record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
-        return Ok(Some(redirect));
+        return Ok(AgeGateOutcome::Substitute(redirect));
     }
     if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
         proxy,
@@ -2671,7 +2777,10 @@ async fn enforce_pypi_download_age_gate(
     {
         // #3649: a warm cache hit is a served download.
         record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
-        return Ok(Some(build_streaming_file_response(&lkg_filename, result)));
+        return Ok(AgeGateOutcome::Substitute(build_streaming_file_response(
+            &lkg_filename,
+            result,
+        )));
     }
     let index_path = fetch_pypi_upstream_index_path(&state.db, repo.id).await;
     let result = fetch_from_pypi_remote_streaming(
@@ -2687,7 +2796,10 @@ async fn enforce_pypi_download_age_gate(
     .await?;
     // #3649: and so is the cold fetch that substituted it.
     record_lkg_proxy_download(state, repo.id, repo_key, &lkg_cache_path, ctx).await;
-    Ok(Some(build_streaming_file_response(&lkg_filename, result)))
+    Ok(AgeGateOutcome::Substitute(build_streaming_file_response(
+        &lkg_filename,
+        result,
+    )))
 }
 
 /// Record a last-known-good substitution served by
@@ -2770,7 +2882,7 @@ async fn serve_file(
                     // Enforce the download age gate before any proxy fetch, and
                     // serve the last-known-good wheel if the requested version is
                     // withheld. Shared with the local-`artifacts`-hit branch below.
-                    if let Some(resp) = enforce_pypi_download_age_gate(
+                    if let AgeGateOutcome::Substitute(resp) = enforce_pypi_download_age_gate(
                         state,
                         repo,
                         repo_key,
@@ -3009,10 +3121,13 @@ async fn serve_file(
                     // of its bytes can be served — including from a local
                     // `artifacts` cache row below (parity with the direct
                     // artifacts-hit fix). For local / ungated members the helper
-                    // early-returns `Ok(None)` (no upstream_url / not applicable)
+                    // early-returns `Allowed` (no upstream_url / not applicable)
                     // so normal resolution proceeds; an aged version also returns
-                    // `Ok(None)`. A withheld young version returns the
-                    // last-known-good wheel (`Ok(Some(resp))`) or 451 (`Err`).
+                    // `Allowed`. A withheld young version returns the
+                    // last-known-good wheel (`Substitute`) or 451 (`Err`). A
+                    // member whose upstream does not host the version answers
+                    // `NotHosted` and is skipped whole, bytes included, since its
+                    // gate cleared none of them (#5150).
                     let member_info = proxy_helpers::repo_info_from_member(member);
 
                     // #2912: enforce THIS member's curation rules before any of its
@@ -3036,7 +3151,7 @@ async fn serve_file(
                     // `None`: a Remote virtual MEMBER's proxy pass-through is
                     // deliberately uncounted (#1278/#2260); #3649 does not
                     // change that policy from inside the age gate.
-                    if let Some(resp) = enforce_pypi_download_age_gate(
+                    match enforce_pypi_download_age_gate(
                         state,
                         &member_info,
                         &member.key,
@@ -3047,7 +3162,16 @@ async fn serve_file(
                     )
                     .await?
                     {
-                        return Ok(resp);
+                        AgeGateOutcome::Allowed => {}
+                        AgeGateOutcome::Substitute(resp) => return Ok(resp),
+                        AgeGateOutcome::NotHosted => {
+                            debug!(
+                                member_key = %member.key,
+                                %filename,
+                                "age-gated pypi member does not host this version; skipping"
+                            );
+                            continue;
+                        }
                     }
 
                     // Try local storage first (works for hosted repos and
@@ -3229,7 +3353,7 @@ async fn serve_file(
     // withheld version returns 451 (or the last-known-good wheel) instead of the
     // young local artifact.
     if repo.repo_type == RepositoryType::Remote {
-        if let Some(resp) = enforce_pypi_download_age_gate(
+        if let AgeGateOutcome::Substitute(resp) = enforce_pypi_download_age_gate(
             state,
             repo,
             repo_key,
@@ -23147,5 +23271,813 @@ mod duplicate_entry_tests {
         assert!(established(
             &identities_for_test(&file, DupFormat::Pypi, sdist_name, &ok_sdist).1
         ));
+    }
+}
+
+/// #5150 / #5151: which member of a PyPI virtual answers for a gated version,
+/// and what the gate reads when the upstream has no Warehouse JSON API.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod age_gate_upstream_evidence_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{header_regex, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PROJECT: &str = "gated";
+    const VERSION: &str = "1.0.0";
+    const WHEEL: &str = "gated-1.0.0-py3-none-any.whl";
+    const OLD: &str = "2015-06-01T00:00:00Z";
+
+    fn young() -> String {
+        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
+    fn proj() -> NormalizedProjectName {
+        NormalizedProjectName::parse(PROJECT).expect("valid project")
+    }
+
+    /// One Remote's upstream, served under its own path prefix of one mock
+    /// server: the SSRF allowlist guard can only be held once per test.
+    struct Upstream<'a> {
+        server: &'a MockServer,
+        prefix: &'static str,
+    }
+
+    impl Upstream<'_> {
+        fn url(&self) -> String {
+            format!("{}/{}", self.server.uri(), self.prefix)
+        }
+
+        fn file_url(&self, filename: &str) -> String {
+            format!("{}/files/{filename}", self.url())
+        }
+
+        /// The Warehouse JSON API, dating `version`.
+        async fn warehouse(&self, version: &str, published: &str) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/pypi/{PROJECT}/json", self.prefix)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "releases": { version: [{ "upload_time_iso_8601": published }] }
+                })))
+                .mount(self.server)
+                .await;
+        }
+
+        async fn warehouse_status(&self, status: u16) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/pypi/{PROJECT}/json", self.prefix)))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(self.server)
+                .await;
+        }
+
+        async fn simple_status(&self, status: u16) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/simple/{PROJECT}/", self.prefix)))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(self.server)
+                .await;
+        }
+
+        /// A PEP 503 HTML index with one anchor per `(filename, upload time)`.
+        async fn simple_html(&self, files: &[(&str, Option<&str>)]) {
+            let anchors: String = files
+                .iter()
+                .map(|(filename, time)| {
+                    let attr = time
+                        .map(|t| format!(" data-upload-time=\"{t}\""))
+                        .unwrap_or_default();
+                    let href = self.file_url(filename);
+                    format!("<a href=\"{href}\"{attr}>{filename}</a><br/>\n")
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/simple/{PROJECT}/", self.prefix)))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    format!("<!DOCTYPE html><html><body>{anchors}</body></html>"),
+                    "text/html",
+                ))
+                .mount(self.server)
+                .await;
+        }
+
+        async fn wheel(&self, filename: &str, bytes: &'static [u8]) {
+            Mock::given(method("GET"))
+                .and(path(format!("/{}/files/{filename}", self.prefix)))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .mount(self.server)
+                .await;
+        }
+
+        /// A complete upstream hosting an old `WHEEL`.
+        async fn hosting_old_wheel(&self, bytes: &'static [u8]) {
+            self.warehouse(VERSION, OLD).await;
+            self.simple_html(&[(WHEEL, None)]).await;
+            self.wheel(WHEEL, bytes).await;
+        }
+    }
+
+    struct Member {
+        id: uuid::Uuid,
+        dir: std::path::PathBuf,
+    }
+
+    async fn add_member(
+        fx: &tdh::Fixture,
+        upstream: &Upstream<'_>,
+        priority: i32,
+        min_age_days: i32,
+    ) -> Member {
+        let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "pypi").await;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = $2 WHERE id = $3",
+        )
+        .bind(upstream.url())
+        .bind(min_age_days)
+        .bind(id)
+        .execute(&fx.pool)
+        .await
+        .expect("configure member");
+        tdh::link_virtual_member(&fx.pool, fx.repo_id, id, priority).await;
+        tdh::publish_repo(&fx.pool, id).await;
+        Member { id, dir }
+    }
+
+    fn state_for(fx: &tdh::Fixture) -> crate::api::SharedState {
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy)
+    }
+
+    /// Download `filename` through `fx`'s repository: `(status, body)`.
+    async fn download(
+        state: &crate::api::SharedState,
+        fx: &tdh::Fixture,
+        filename: &str,
+    ) -> (StatusCode, Bytes) {
+        let repo = super::resolve_pypi_repo(&fx.pool, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("repo resolves"));
+        let resp = match super::serve_file(
+            state,
+            &repo,
+            &fx.repo_key,
+            &proj(),
+            filename,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(r) | Err(r) => r,
+        };
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (status, body)
+    }
+
+    async fn review_count(fx: &tdh::Fixture, repo_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count reviews")
+    }
+
+    async fn teardown(fx: tdh::Fixture, members: Vec<Member>) {
+        for member in members {
+            tdh::cleanup_member_repo(&fx.pool, member.id, &member.dir).await;
+        }
+        fx.teardown().await;
+    }
+
+    fn assert_451(status: StatusCode, body: &Bytes, requested_age_days: Option<i64>) {
+        assert_eq!(status.as_u16(), 451, "{}", String::from_utf8_lossy(body));
+        let json: serde_json::Value = serde_json::from_slice(body).expect("451 body");
+        assert_eq!(json["error"], "age_gate_blocked");
+        assert_eq!(json["requested_age_days"].as_i64(), requested_age_days);
+    }
+
+    /// Two gated members with the one that must not decide at priority 1.
+    async fn virtual_with_first_member<'a>(
+        fx: &tdh::Fixture,
+        first: &Upstream<'a>,
+        second: &Upstream<'a>,
+        first_min_age: i32,
+    ) -> Vec<Member> {
+        vec![
+            add_member(fx, first, 1, first_min_age).await,
+            add_member(fx, second, 2, 7).await,
+        ]
+    }
+
+    /// #5150: a member whose upstream has no such project has nothing to
+    /// refuse. No 451, no review row, and the member that hosts it serves.
+    #[tokio::test]
+    async fn member_without_the_project_steps_aside_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = (
+            review_count(&fx, members[0].id).await,
+            review_count(&fx, members[1].id).await,
+        );
+        teardown(fx, members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"wheel-from-b");
+        assert_eq!(reviews, (0, 0), "no review row for a package not hosted");
+    }
+
+    /// #5150 on a simple-only member: the JSON API's 404 proves nothing there,
+    /// the index that lists other versions of the project is what decides.
+    #[tokio::test]
+    async fn simple_only_member_without_the_version_steps_aside_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.simple_html(&[("gated-0.1.0-py3-none-any.whl", None)])
+            .await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = review_count(&fx, members[0].id).await;
+        teardown(fx, members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"wheel-from-b");
+        assert_eq!(reviews, 0);
+    }
+
+    /// #5150's table: a member at 0 days that does not host it is no veto.
+    #[tokio::test]
+    async fn zero_day_member_without_the_project_is_no_veto_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 0).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"wheel-from-b");
+    }
+
+    /// A member that hides the version from its index while still answering
+    /// the file path is out of this request. Stepping aside must never hand
+    /// out that member's ungated bytes.
+    #[tokio::test]
+    async fn stepped_aside_member_never_serves_its_own_bytes_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[("gated-0.1.0-py3-none-any.whl", None)])
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/{WHEEL}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(&b"hidden-bytes"[..]))
+            .mount(&server)
+            .await;
+        let members = vec![add_member(&fx, &a, 1, 7).await];
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The other half of #5150: a member that hosts the version and refuses
+    /// it blocks the virtual. It must not fall through to a member that would
+    /// serve the same version.
+    #[tokio::test]
+    async fn hosting_member_too_young_still_blocks_the_virtual_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.warehouse(VERSION, &young()).await;
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"young-wheel").await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = review_count(&fx, members[0].id).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, Some(0));
+        assert_eq!(reviews, 1, "the review belongs to the hosting member");
+    }
+
+    /// Listed with no time anywhere is a hosted answer with an unknown age: it
+    /// blocks at a positive threshold and does not fall through (#5151 keeps
+    /// the fail-closed contract, #5150 keeps the block).
+    #[tokio::test]
+    async fn listed_without_a_time_blocks_and_does_not_fall_through_5151() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// An upstream that cannot be read has not said the package is missing:
+    /// transient and refused answers stay fail-closed, in every status shape.
+    #[tokio::test]
+    async fn unreadable_member_index_is_not_a_miss_5150() {
+        for (json_status, simple_status) in [(404, 500), (403, 403), (500, 401), (404, 429)] {
+            let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+                return;
+            };
+            let (server, guard) = tdh::non_loopback_mock_server().await;
+            let a = Upstream {
+                server: &server,
+                prefix: "a",
+            };
+            let b = Upstream {
+                server: &server,
+                prefix: "b",
+            };
+            a.warehouse_status(json_status).await;
+            a.simple_status(simple_status).await;
+            b.hosting_old_wheel(b"wheel-from-b").await;
+            let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+            let state = state_for(&fx);
+
+            let (status, body) = download(&state, &fx, WHEEL).await;
+            teardown(fx, members).await;
+            drop(guard);
+
+            assert_451(status, &body, None);
+        }
+    }
+
+    /// A 200 that is not a simple index (a login page, a captive proxy) says
+    /// nothing about the package either.
+    #[tokio::test]
+    async fn non_index_page_from_a_member_is_not_a_miss_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "<html><body><a href=\"/forgot\">Forgot?</a></body></html>",
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// An administrator's rejection on the member survives the upstream
+    /// dropping the version: a rejection is a decision, not an age.
+    #[tokio::test]
+    async fn rejected_review_on_a_non_hosting_member_still_blocks_5150() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "pypi").await else {
+            return;
+        };
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let b = Upstream {
+            server: &server,
+            prefix: "b",
+        };
+        b.hosting_old_wheel(b"wheel-from-b").await;
+        let members = virtual_with_first_member(&fx, &a, &b, 7).await;
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'rejected')",
+        )
+        .bind(members[0].id)
+        .bind(PROJECT)
+        .bind(VERSION)
+        .execute(&fx.pool)
+        .await
+        .expect("reject");
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        teardown(fx, members).await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// Direct Remote with `gate`, on a fixture of its own.
+    async fn direct_remote(upstream_url: &str, min_age: i32, mode: &str) -> Option<tdh::Fixture> {
+        let fx = tdh::Fixture::setup("remote", "pypi").await?;
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, age_gate_enabled = true, \
+             age_gate_min_age_days = $2, age_gate_mode = $3 WHERE id = $4",
+        )
+        .bind(upstream_url)
+        .bind(min_age)
+        .bind(mode)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("gate the remote");
+        Some(fx)
+    }
+
+    /// A direct Remote has no sibling to defer to: its answer is unchanged.
+    #[tokio::test]
+    async fn direct_remote_without_the_project_is_unchanged_5150() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// #5151: `min_age_days = 0` lets every version through, with no publish
+    /// time anywhere and no review row.
+    #[tokio::test]
+    async fn zero_days_serves_a_simple_only_upstream_with_no_times_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"simple-only-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 0, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let reviews = review_count(&fx, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"simple-only-wheel");
+        assert_eq!(reviews, 0);
+    }
+
+    /// #5151: `0` also never depends on the upstream's metadata being
+    /// readable, and a pending row left by the old behaviour is released.
+    #[tokio::test]
+    async fn zero_days_releases_a_pending_row_without_metadata_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.warehouse_status(403).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("<a href=\"{}\">{WHEEL}</a>", a.file_url(WHEEL)),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        a.wheel(WHEEL, b"simple-only-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 0, "upstream_publish_time").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'pending')",
+        )
+        .bind(fx.repo_id)
+        .bind(PROJECT)
+        .bind(VERSION)
+        .execute(&fx.pool)
+        .await
+        .expect("seed pending");
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let row: String =
+            sqlx::query_scalar("SELECT status FROM age_gate_reviews WHERE repository_id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("row");
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(row, "approved");
+    }
+
+    /// #5151: a rejection still blocks at 0 days (the #1558 trusted-remote
+    /// contract); only the age delay goes away.
+    #[tokio::test]
+    async fn zero_days_still_honours_a_rejection_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"simple-only-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 0, "upstream_publish_time").await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'rejected')",
+        )
+        .bind(fx.repo_id)
+        .bind(PROJECT)
+        .bind(VERSION)
+        .execute(&fx.pool)
+        .await
+        .expect("seed rejection");
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_eq!(status.as_u16(), 451, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// #5151: the upload time an HTML index publishes is read, including for
+    /// a percent-encoded local version like the ones PyTorch's index links.
+    #[tokio::test]
+    async fn old_data_upload_time_serves_without_a_json_api_5151() {
+        const CPU_WHEEL: &str = "gated-1.0.0+cpu-py3-none-any.whl";
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.warehouse_status(403).await;
+        let href = a.file_url("gated-1.0.0%2Bcpu-py3-none-any.whl");
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "<a href=\"{href}#sha256=7c9e\" data-upload-time=\"{OLD}\">{CPU_WHEEL}</a>"
+                ),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        a.wheel("gated-1.0.0%2Bcpu-py3-none-any.whl", b"cpu-wheel")
+            .await;
+        a.wheel(CPU_WHEEL, b"cpu-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, CPU_WHEEL).await;
+        let reviews = review_count(&fx, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_ne!(status.as_u16(), 451, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(reviews, 0);
+    }
+
+    /// #5151: a young `data-upload-time` blocks with its real age, and the
+    /// row carries the time so the sweep can release it.
+    #[tokio::test]
+    async fn young_data_upload_time_blocks_with_its_age_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let now = young();
+        a.simple_html(&[(WHEEL, Some(now.as_str()))]).await;
+        a.wheel(WHEEL, b"young-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        let dated: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT upstream_published_at FROM age_gate_reviews WHERE repository_id = $1",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("review row");
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+        assert!(dated.is_some(), "the review row records the time");
+    }
+
+    /// #5151: a PEP 691 upstream's PEP 700 `upload-time` is read too; it is
+    /// the representation that carries the time when HTML does not.
+    #[tokio::test]
+    async fn pep700_upload_time_dates_a_version_without_a_json_api_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let now = young();
+        Mock::given(method("GET"))
+            .and(path(format!("/a/simple/{PROJECT}/")))
+            .and(header_regex("accept", r"vnd\.pypi\.simple\.v1\+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::json!({
+                    "meta": { "api-version": "1.1" },
+                    "name": PROJECT,
+                    "files": [{ "filename": WHEEL, "url": a.file_url(WHEEL), "upload-time": now }]
+                })
+                .to_string(),
+                PEP691_JSON_CONTENT_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        a.simple_html(&[(WHEEL, None)]).await;
+        a.wheel(WHEEL, b"young-wheel").await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// The JSON API stays first: it is the existing source, and an upstream
+    /// that has it pays no extra read.
+    #[tokio::test]
+    async fn warehouse_time_is_read_before_the_simple_index_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let now = young();
+        a.warehouse(VERSION, &now).await;
+        a.simple_html(&[(WHEEL, Some(OLD))]).await;
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// The documented way out for an upstream with no times is `first_seen`.
+    /// It must work there: a listed file is the existence evidence that starts
+    /// the clock even without a JSON API, and the block carries that age.
+    #[tokio::test]
+    async fn first_seen_starts_the_clock_from_the_simple_index_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        a.simple_html(&[(WHEEL, None)]).await;
+        let Some(fx) = direct_remote(&a.url(), 7, "first_seen").await else {
+            return;
+        };
+        let state = state_for(&fx);
+
+        let (status, body) = download(&state, &fx, WHEEL).await;
+        fx.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// The listing makes the download's decision on the same evidence: an
+    /// HTML index without a JSON API withholds the young version it dates.
+    #[tokio::test]
+    async fn html_listing_filters_by_data_upload_time_5151() {
+        let (server, _guard) = tdh::non_loopback_mock_server().await;
+        let a = Upstream {
+            server: &server,
+            prefix: "a",
+        };
+        let Some(fx) = direct_remote(&a.url(), 7, "upstream_publish_time").await else {
+            return;
+        };
+        let state = state_for(&fx);
+        let repo = super::resolve_pypi_repo(&fx.pool, &fx.repo_key)
+            .await
+            .unwrap_or_else(|_| panic!("repo resolves"));
+        let now = young();
+        let html = format!(
+            "<a href=\"/x/gated-1.0.0-py3-none-any.whl\" data-upload-time=\"{OLD}\">o</a>\
+             <a href=\"/x/gated-2.0.0-py3-none-any.whl\" data-upload-time=\"{now}\">y</a>"
+        );
+
+        let filtered =
+            super::filter_pypi_simple_html_response(&state, &repo, &a.url(), PROJECT, html).await;
+        fx.teardown().await;
+
+        assert!(filtered.contains("gated-1.0.0"), "{filtered}");
+        assert!(!filtered.contains("gated-2.0.0"), "{filtered}");
     }
 }
