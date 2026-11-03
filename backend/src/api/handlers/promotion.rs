@@ -958,6 +958,25 @@ fn screen_bulk_item(
 /// leaves the copy with no scan rows and its findings unacknowledged: a target
 /// policy with `block_unscanned` refuses it, and one without serves it, as for any
 /// promotion before verdicts travelled.
+/// Whether this principal could itself acknowledge a finding in `target_repo_id`.
+/// A promotion gate counts a source decision only if it would reach the target, and
+/// the carry moves one only for such a promoter, so the two ask the same question.
+pub(crate) async fn promoter_may_acknowledge(
+    db: &sqlx::PgPool,
+    auth: &AuthExtension,
+    target_repo_id: Uuid,
+) -> bool {
+    use crate::services::finding_acknowledgements::{AckActor, FindingAcknowledgementService};
+    auth.is_admin
+        && FindingAcknowledgementService::new(db.clone())
+            .authorize_repository(
+                &AckActor::new(auth.user_id, auth.access_scope()),
+                target_repo_id,
+            )
+            .await
+            .is_ok()
+}
+
 pub(super) async fn carry_scan_state_to_promoted(
     db: &sqlx::PgPool,
     source_artifact_id: Uuid,
@@ -966,15 +985,10 @@ pub(super) async fn carry_scan_state_to_promoted(
     auth: &AuthExtension,
 ) -> PromotionScanState {
     use crate::services::finding_acknowledgements::{
-        AckActor, CarryPrincipal, FindingAcknowledgementService,
+        CarryPrincipal, FindingAcknowledgementService,
     };
     let service = FindingAcknowledgementService::new(db.clone());
-    let actor = AckActor::new(auth.user_id, auth.access_scope());
-    let may_acknowledge = auth.is_admin
-        && service
-            .authorize_repository(&actor, target_repo_id)
-            .await
-            .is_ok();
+    let may_acknowledge = promoter_may_acknowledge(db, auth, target_repo_id).await;
     let principal = CarryPrincipal {
         user_id: auth.user_id,
         may_acknowledge,
@@ -1281,7 +1295,21 @@ pub async fn promote_artifact(
     if !req.skip_policy_check {
         let policy_service = PromotionPolicyService::new(state.db.clone());
         let eval_result = policy_service
-            .evaluate_artifact(artifact_id, source_repo.id)
+            .evaluate_promotion(
+                artifact_id,
+                source_repo.id,
+                Some(
+                    crate::services::promotion_policy_service::PromotionGateContext {
+                        target_repository_id: target_repo.id,
+                        promoter_may_acknowledge: promoter_may_acknowledge(
+                            &state.db,
+                            &auth,
+                            target_repo.id,
+                        )
+                        .await,
+                    },
+                ),
+            )
             .await?;
 
         policy_violations = eval_result
@@ -1323,7 +1351,12 @@ pub async fn promote_artifact(
         let rule_service =
             crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
         let failing = rule_service
-            .evaluate_for_promotion(artifact_id, source_repo.id, target_repo.id)
+            .evaluate_for_promotion(
+                artifact_id,
+                source_repo.id,
+                target_repo.id,
+                promoter_may_acknowledge(&state.db, &auth, target_repo.id).await,
+            )
             .await?;
         if !failing.is_empty() {
             let refusal = PromotionResponse {
@@ -1682,7 +1715,21 @@ pub async fn promote_artifacts_bulk(
         } else {
             Some(
                 PromotionPolicyService::new(state.db.clone())
-                    .evaluate_artifact(*artifact_id, source_repo.id)
+                    .evaluate_promotion(
+                        *artifact_id,
+                        source_repo.id,
+                        Some(
+                            crate::services::promotion_policy_service::PromotionGateContext {
+                                target_repository_id: target_repo.id,
+                                promoter_may_acknowledge: promoter_may_acknowledge(
+                                    &state.db,
+                                    &auth,
+                                    target_repo.id,
+                                )
+                                .await,
+                            },
+                        ),
+                    )
                     .await
                     .map_err(|e| crate::api::handlers::db_err_message(&e)),
             )
@@ -1728,7 +1775,12 @@ pub async fn promote_artifacts_bulk(
                 state.db.clone(),
             );
             match rule_service
-                .evaluate_for_promotion(*artifact_id, source_repo.id, target_repo.id)
+                .evaluate_for_promotion(
+                    *artifact_id,
+                    source_repo.id,
+                    target_repo.id,
+                    promoter_may_acknowledge(&state.db, &auth, target_repo.id).await,
+                )
                 .await
             {
                 Ok(failing) if !failing.is_empty() => {
@@ -5215,6 +5267,108 @@ mod tests {
             cleanup(&pool, &[src, tgt], admin).await;
         }
 
+        /// #5153: a decision scoped to the source says nothing about the target, so
+        /// it does not open a gate guarding the target for a promoter who could not
+        /// have made it there. For one who could, it passes and is carried.
+        #[tokio::test]
+        async fn test_a_source_decision_opens_a_target_gate_only_if_it_reaches_there_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153g-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153g-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "g5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "g5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let admin = make_admin(&pool, "g5153a").await;
+            let promoter = make_tenant_admin(&pool, "g5153p").await;
+            grant_repo(&pool, promoter, src).await;
+            grant_repo(&pool, promoter, tgt).await;
+            make_rule(&pool, src, tgt, Some("high"), Some(0)).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            // A plain promote token: the decision does not reach the target.
+            let artifact = make_artifact(&pool, src, &storage, "g5153n").await;
+            seed_acknowledged_critical(&pool, src, artifact, admin).await;
+            let mut token = admin_ext(promoter);
+            token.is_admin = false;
+            token.is_api_token = true;
+            token.scopes = Some(vec!["promote:artifacts".to_string()]);
+            let refused = promote_artifact(
+                State(state.clone()),
+                Extension(token),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await;
+            match refused {
+                Ok(res) => assert!(!res.0.promoted, "the gate guards the target"),
+                Err(AppError::Conflict(_)) | Err(AppError::Authorization(_)) => {}
+                Err(other) => panic!("unexpected: {other:?}"),
+            }
+            assert!(!target_has_artifact(&pool, tgt, "g5153n").await);
+
+            // An administrator who could acknowledge there: passes, and carries it.
+            let artifact = make_artifact(&pool, src, &storage, "g5153y").await;
+            seed_acknowledged_critical(&pool, src, artifact, admin).await;
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(admin)),
+                Path((src_key.clone(), artifact)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("promote");
+            assert!(res.0.promoted, "{:?}", res.0.message);
+            // Both findings `seed_acknowledged_critical` acknowledges travel.
+            assert_eq!(
+                res.0
+                    .scan_state
+                    .expect("scan state")
+                    .acknowledgements_carried,
+                2
+            );
+            cleanup(&pool, &[src, tgt], admin).await;
+        }
+
+        async fn seed_acknowledged_critical(pool: &PgPool, repo: Uuid, artifact: Uuid, by: Uuid) {
+            let scan = seed_acknowledged_scan(pool, repo, artifact, by).await;
+            let finding: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                            affected_component, affected_version) \
+                 VALUES ($1, $2, 'critical', 'c', 'CVE-2031-5154', 'lodash', '4') RETURNING id",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .fetch_one(pool)
+            .await
+            .expect("critical finding");
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                pool.clone(),
+            )
+            .acknowledge_finding(
+                finding,
+                &crate::services::finding_acknowledgements::AckActor::new(
+                    by,
+                    crate::models::access_scope::AccessScope::Admin,
+                ),
+                Some("accepted"),
+                Default::default(),
+            )
+            .await
+            .expect("acknowledge the critical");
+        }
+
         /// Same-tenant SINGLE promote: tenant admin owns BOTH repos -> succeeds.
         #[tokio::test]
         async fn test_single_promote_same_tenant_allowed() {
@@ -6143,7 +6297,7 @@ mod tests {
 
             let svc = PromotionRuleService::new(pool.clone());
             let failing = svc
-                .evaluate_for_promotion(artifact, src, tgt)
+                .evaluate_for_promotion(artifact, src, tgt, true)
                 .await
                 .expect("evaluate");
             assert!(
@@ -6178,7 +6332,7 @@ mod tests {
 
             let svc = PromotionRuleService::new(pool.clone());
             let failing = svc
-                .evaluate_for_promotion(artifact, src, tgt)
+                .evaluate_for_promotion(artifact, src, tgt, true)
                 .await
                 .expect("evaluate");
             assert!(

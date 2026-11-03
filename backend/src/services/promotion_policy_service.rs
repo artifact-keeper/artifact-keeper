@@ -173,9 +173,57 @@ struct ScanRow {
     findings_count: i32,
 }
 
-/// SQL for an artifact's OPEN findings by severity, through the view the download
-/// gate reads (#5153), over the same scans. One finding per identity, at the highest
-/// severity any scan reported, so two engines reporting a CVE count once.
+/// Where a promotion is going, and whether the promoter could acknowledge there.
+#[derive(Debug, Clone, Copy)]
+pub struct PromotionGateContext {
+    pub target_repository_id: Uuid,
+    pub promoter_may_acknowledge: bool,
+}
+
+/// The findings a promotion gate treats as open, as a CTE named `open_findings` with
+/// one row per finding in the scans the download gate grades
+/// (`artifact_current_scan_ids`). `$1` is the artifact, `$2` the repository the
+/// artifact is going to (NULL: the one it is in), and `$3` whether the promoter could
+/// acknowledge there.
+///
+/// A gate on a promotion guards the target, so a decision covers a finding here only
+/// if it will apply there: a decision for every repository, one already live in the
+/// target, or one live in the source when the promoter could have made it in the
+/// target, in which case the carry moves it (#5153). A decision scoped to the source
+/// and a promoter who could not make it says nothing about the target, so the finding
+/// is open for the gate. Lapsed and revoked decisions cover nothing.
+macro_rules! gate_open_findings_cte {
+    () => {
+        r#"
+    WITH open_findings AS (
+        SELECT sf.finding_class, sf.cve_id, sf.title, sf.affected_component,
+               sf.affected_version, sf.severity
+        FROM scan_findings sf
+        JOIN artifacts a ON a.id = sf.artifact_id
+        WHERE sf.artifact_id = $1
+          AND sf.scan_result_id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+          AND NOT EXISTS (
+              SELECT 1 FROM finding_acknowledgements fa
+              WHERE fa.checksum_sha256 = a.checksum_sha256
+                AND fa.revoked_at IS NULL
+                AND (fa.expires_at IS NULL OR fa.expires_at > NOW())
+                AND fa.finding_class = sf.finding_class
+                AND fa.advisory_key = finding_advisory_key(sf.cve_id, sf.title)
+                AND fa.component_key = finding_component_key(sf.affected_component)
+                AND fa.component_version_key = finding_component_key(sf.affected_version)
+                AND finding_severity_rank(sf.severity) <= fa.max_severity_rank
+                AND (fa.repository_id IS NULL
+                     OR fa.repository_id = COALESCE($2::uuid, a.repository_id)
+                     OR ($3::boolean AND fa.repository_id = a.repository_id))
+          )
+    )
+"#
+    };
+}
+
+/// SQL for an artifact's open findings by severity (see [`gate_open_findings_cte`]).
+/// One finding per identity, at the highest severity any scan reported, so two engines
+/// reporting a CVE count once.
 ///
 /// It used to read the counts stored on `scan_results`, which know nothing about
 /// acknowledgements, so a finding the download gate let through still blocked
@@ -183,49 +231,65 @@ struct ScanRow {
 /// vendor's retracted and acknowledged false positive blocked promotion for ever.
 /// A finding reported by a scan that did not finish counts, as at the download gate.
 ///
+/// The stored counts still speak for a completed scan that claims findings and has no
+/// rows for them: a dedup copy from before its two inserts shared a transaction
+/// (#1035, #1058). Nothing can be acknowledged on such a row and a rescan replaces it,
+/// and reading it as clean would be the wrong way to fail.
+///
 /// The `HAVING` preserves the caller's "no completed scan at all" signal: an
 /// aggregate with no `GROUP BY` would otherwise always return one all-zeros row,
 /// turning "never scanned" into "scanned and clean".
-pub(crate) const OPEN_FINDING_COUNTS_SQL: &str = r#"
-    WITH open_findings AS (
-        SELECT MAX(finding_severity_rank(sf.severity)) AS severity_rank
-        FROM scan_findings_effective sf
-        WHERE sf.artifact_id = $1
-          AND sf.scan_result_id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
-          AND NOT sf.is_acknowledged
-        GROUP BY sf.finding_class,
-                 finding_advisory_key(sf.cve_id, sf.title),
-                 finding_component_key(sf.affected_component),
-                 finding_component_key(sf.affected_version)
+pub(crate) const OPEN_FINDING_COUNTS_SQL: &str = concat!(
+    gate_open_findings_cte!(),
+    r#"
+    , by_identity AS (
+        SELECT MAX(finding_severity_rank(severity)) AS severity_rank
+        FROM open_findings
+        GROUP BY finding_class,
+                 finding_advisory_key(cve_id, title),
+                 finding_component_key(affected_component),
+                 finding_component_key(affected_version)
+    ), rowless AS (
+        SELECT COALESCE(MAX(critical_count), 0) AS critical,
+               COALESCE(MAX(high_count), 0) AS high,
+               COALESCE(MAX(medium_count), 0) AS medium,
+               COALESCE(MAX(low_count), 0) AS low,
+               COALESCE(MAX(findings_count), 0) AS total
+        FROM scan_results sr
+        WHERE sr.artifact_id = $1 AND sr.status = 'completed' AND sr.findings_count > 0
+          AND sr.id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+          AND NOT EXISTS (SELECT 1 FROM scan_findings f WHERE f.scan_result_id = sr.id)
     )
-    SELECT (COUNT(*) FILTER (WHERE severity_rank = 4))::int AS critical_count,
-           (COUNT(*) FILTER (WHERE severity_rank = 3))::int AS high_count,
-           (COUNT(*) FILTER (WHERE severity_rank = 2))::int AS medium_count,
-           (COUNT(*) FILTER (WHERE severity_rank = 1))::int AS low_count,
-           COUNT(*)::int AS findings_count
-    FROM open_findings
+    SELECT GREATEST((COUNT(*) FILTER (WHERE severity_rank = 4))::int, MAX(r.critical))::int
+               AS critical_count,
+           GREATEST((COUNT(*) FILTER (WHERE severity_rank = 3))::int, MAX(r.high))::int
+               AS high_count,
+           GREATEST((COUNT(*) FILTER (WHERE severity_rank = 2))::int, MAX(r.medium))::int
+               AS medium_count,
+           GREATEST((COUNT(*) FILTER (WHERE severity_rank = 1))::int, MAX(r.low))::int
+               AS low_count,
+           GREATEST(COUNT(by_identity.severity_rank)::int, MAX(r.total))::int
+               AS findings_count
+    FROM rowless r
+    LEFT JOIN by_identity ON TRUE
     HAVING EXISTS (SELECT 1 FROM scan_results WHERE artifact_id = $1 AND status = 'completed')
-"#;
+"#
+);
 
-/// SQL for an artifact's open CVEs, sourced from `scan_findings` (the populated
-/// source), not the never-written `cve_history` table. An artifact's open CVEs
-/// are the unacknowledged, cve_id-bearing findings from its latest completed
-/// scan -- the same `scan_findings` shape the SBOM read path uses. The old
-/// `cve_history` read was always empty, so a "block on open CVEs" gate silently
-/// passed (#1620; data source also addresses #1561).
+/// SQL for an artifact's open CVEs: the cve_id-bearing findings open for this gate
+/// (see [`gate_open_findings_cte`]), not the never-written `cve_history` table, whose
+/// always-empty read let a "block on open CVEs" gate silently pass (#1620; data source
+/// also addresses #1561).
 ///
-/// Scoped to the scans the download gate grades, for the same reason as
-/// [`OPEN_FINDING_COUNTS_SQL`]: joining findings to one single latest row hid the
-/// open CVEs of every other engine. `SELECT DISTINCT` already collapses a CVE
-/// that several engines report, so widening the join cannot produce duplicates.
-const OPEN_CVES_SQL: &str = r#"
-    SELECT DISTINCT sf.cve_id
-    FROM scan_findings_effective sf
-    WHERE sf.artifact_id = $1
-      AND sf.scan_result_id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
-      AND sf.cve_id IS NOT NULL
-      AND NOT sf.is_acknowledged
-"#;
+/// `SELECT DISTINCT` collapses a CVE that several engines report.
+const OPEN_CVES_SQL: &str = concat!(
+    gate_open_findings_cte!(),
+    r#"
+    SELECT DISTINCT cve_id
+    FROM open_findings
+    WHERE cve_id IS NOT NULL
+"#
+);
 
 /// Build the block-unscanned violation for a genuinely-unscanned artifact.
 /// Pure (no DB): the message is fixed and the detail payload carries the
@@ -532,12 +596,23 @@ impl PromotionPolicyService {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> Result<PolicyEvaluationResult> {
+        self.evaluate_promotion(artifact_id, repository_id, None)
+            .await
+    }
+
+    /// [`Self::evaluate_artifact`] for a promotion into `gate`'s target.
+    pub async fn evaluate_promotion(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        gate: Option<PromotionGateContext>,
+    ) -> Result<PolicyEvaluationResult> {
         let mut violations = Vec::new();
         let mut action = PolicyAction::Allow;
         // (rule, why it passes) for every rule this evaluation applies.
         let mut applied: Vec<(String, String)> = Vec::new();
 
-        let cve_summary = self.get_cve_summary(artifact_id).await?;
+        let cve_summary = self.get_cve_summary_for(artifact_id, gate).await?;
         let license_summary = self.get_license_summary(artifact_id).await?;
         let scan_policy = self.get_scan_policy(repository_id).await?;
         let license_policy = self.get_license_policy(repository_id).await?;
@@ -793,9 +868,22 @@ impl PromotionPolicyService {
         Ok(classify_scan_state(&rows))
     }
 
+    #[cfg(test)]
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
+        self.get_cve_summary_for(artifact_id, None).await
+    }
+
+    async fn get_cve_summary_for(
+        &self,
+        artifact_id: Uuid,
+        gate: Option<PromotionGateContext>,
+    ) -> Result<Option<CveSummary>> {
+        let target = gate.map(|g| g.target_repository_id);
+        let may_acknowledge = gate.is_some_and(|g| g.promoter_may_acknowledge);
         let scan: Option<ScanRow> = sqlx::query_as(OPEN_FINDING_COUNTS_SQL)
             .bind(artifact_id)
+            .bind(target)
+            .bind(may_acknowledge)
             .fetch_optional(&self.db)
             .await?;
 
@@ -805,6 +893,8 @@ impl PromotionPolicyService {
 
         let open_cves: Vec<String> = sqlx::query_scalar(OPEN_CVES_SQL)
             .bind(artifact_id)
+            .bind(target)
+            .bind(may_acknowledge)
             .fetch_all(&self.db)
             .await?;
 
@@ -1028,9 +1118,9 @@ mod tests {
         // Guards the #1620 repoint: the query must read unacknowledged,
         // cve_id-bearing rows from the latest completed scan's scan_findings,
         // and must NOT touch the dead cve_history table.
-        assert!(OPEN_CVES_SQL.contains("FROM scan_findings_effective"));
-        assert!(OPEN_CVES_SQL.contains("NOT sf.is_acknowledged"));
-        assert!(OPEN_CVES_SQL.contains("sf.cve_id IS NOT NULL"));
+        assert!(OPEN_CVES_SQL.contains("FROM scan_findings sf"));
+        assert!(OPEN_CVES_SQL.contains("FROM finding_acknowledgements fa"));
+        assert!(OPEN_CVES_SQL.contains("cve_id IS NOT NULL"));
         assert!(OPEN_CVES_SQL.contains("artifact_current_scan_ids"));
         assert!(!OPEN_CVES_SQL.contains("cve_history"));
     }
@@ -1061,13 +1151,13 @@ mod tests {
         );
         // One finding per identity at its highest severity, not a row count: two
         // engines reporting a CVE are one finding.
-        assert!(OPEN_FINDING_COUNTS_SQL.contains("MAX(finding_severity_rank(sf.severity))"));
-        assert!(OPEN_FINDING_COUNTS_SQL.contains("GROUP BY sf.finding_class"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("MAX(finding_severity_rank(severity))"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("GROUP BY finding_class"));
         assert!(!OPEN_FINDING_COUNTS_SQL.contains("SUM("));
 
-        // Open findings, through the view the download gate reads (#5153).
-        assert!(OPEN_FINDING_COUNTS_SQL.contains("FROM scan_findings_effective"));
-        assert!(OPEN_FINDING_COUNTS_SQL.contains("NOT sf.is_acknowledged"));
+        // Open findings: a decision counts only if it reaches the target (#5153).
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("FROM finding_acknowledgements fa"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("$3::boolean AND fa.repository_id"));
         assert!(OPEN_FINDING_COUNTS_SQL.contains("status = 'completed'"));
     }
 

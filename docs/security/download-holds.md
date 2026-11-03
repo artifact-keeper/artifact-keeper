@@ -82,7 +82,7 @@ finding: a rescan, a dedup copy and a promotion all keep it.
 | Part of the decision | What it means |
 | --- | --- |
 | The bytes | The artifact's SHA-256. A re-upload of the same bytes is covered; a new build under the same version is not. |
-| The repository | The finding's own repository, or the one named by `repository_id`, which must hold these bytes. If the finding's scan has copies in other repositories and `repository_id` is omitted, the request answers `409`: a scan listing reports a copy under its source's id, so the row may belong to a repository other than the one you are looking at. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, which takes an unrestricted credential and no tenant binding, or a promotion carried the decision. |
+| The repository | The finding's own repository, or the one named by `repository_id`, which must hold these bytes. If the finding's scan has copies in other repositories and `repository_id` is omitted, the request answers `409`: a scan listing reports a copy under its source's id, so the row may belong to a repository other than the one you are looking at. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, which takes an unrestricted credential and no repository-only grants, or a promotion carried the decision. |
 | Advisory, component, component version, finding class | A new CVE, or the same CVE on another component or version, stays open. The engine that reported it does not matter: one decision covers every engine reporting the same component. |
 | Severity | The severity of the row acknowledged. If the finding is re-graded above it, it reopens. Acknowledging it again accepts the new severity. |
 | `expires_at` (optional) | The finding reopens at this time, with no further action. Without it, the decision lasts until revoked. |
@@ -113,8 +113,9 @@ verdict, and a target with `block_unscanned` refuses it until it is scanned ther
 Who may decide: an instance administrator with an unrestricted credential, in any
 repository. A credential scoped to some repositories, only inside them. An
 administrator holding repository grants and no instance-wide role, only where they
-hold a grant, public repositories included: public read access is not authority to
-accept a risk for someone else's repository. REST and gRPC apply the same check.
+hold a grant, public repositories included. That last rule guards against deciding by
+mistake for a repository someone else looks after. It is not tenant isolation. REST and
+gRPC apply the same check.
 `GET /api/v1/security/acknowledgements` lists decisions for callers who may act
 everywhere, and `include_inactive=true` adds expired and revoked ones.
 
@@ -124,8 +125,10 @@ of a reused scan. A caller who can see only a copy gets the copy's rows without 
 `DELETE /api/v1/security/findings/{id}/acknowledge` or
 `DELETE /api/v1/security/acknowledgements/{id}` revokes a decision, and with it every
 copy a promotion made of it that the caller has authority over. Copies past that
-stay effective, and the answer counts them (`acknowledgements_left_effective`,
-`left_effective`). A decision for every repository that the caller cannot undo is
+stay effective, and the answer counts what stays in force
+(`acknowledgements_left_effective`, `left_effective`, not on gRPC). Lapsed copies are not
+counted, and the by-id count includes a separate decision for every repository that
+still covers the finding. A decision for every repository that the caller cannot undo is
 refused rather than left half-done, because the finding would stay acknowledged in
 their own repository. The finding route takes `?repository_id=` and, like an
 acknowledgement, answers `409` without it when the finding's scan has copies in other
@@ -137,8 +140,12 @@ The download gate grades each artifact's current scans: per scan type, the lates
 complete scan and anything after it. A finding only an older scan reported no
 longer blocks. A later scan that crashed, or that could not assess the artifact
 (`partial`, `not_cataloged`), does not clear what the complete scan reported. The
-promotion thresholds and `max_cve_severity` rules read the same open findings, so an
-acknowledged finding no longer counts against them. Every external
+promotion thresholds and `max_cve_severity` rules read the same scans, and count the
+findings open for the target: a decision covers a finding there only if it is for every
+repository, is live in the target, or is live in the source and the promoter could
+acknowledge in the target, so the promotion carries it. A decision scoped to the source
+does not open a gate for a `promote:artifacts` token. An approval re-reads the policy and
+is refused if it now fails, unless the reviewer sets `skip_policy_check`. Every external
 scanner shares one scan type and a clean submission names no vendor, so external
 submissions never supersede each other: all of them are graded, and a finding a
 vendor stops reporting stays until it is acknowledged.

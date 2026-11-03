@@ -359,6 +359,8 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         request: Request<UpdateCveStatusRequest>,
     ) -> Result<Response<CveHistoryEntry>, Status> {
         authorize_grpc_scope(&request, scope::WRITE_ARTIFACTS)?;
+        // Triage needs an `admin`-granting scope, as on REST.
+        authorize_grpc_scope(&request, "admin")?;
         // The token's subject and repository restriction, as REST passes them, so
         // this plane decides under the same authority check.
         let principal = request

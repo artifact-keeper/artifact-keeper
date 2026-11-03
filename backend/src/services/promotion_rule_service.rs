@@ -359,10 +359,15 @@ impl PromotionRuleService {
     // -----------------------------------------------------------------------
 
     /// Evaluate a single artifact against a promotion rule.
+    ///
+    /// `promoter_may_acknowledge`: whoever is promoting could acknowledge in the
+    /// rule's target, so a decision live in the source will be carried and counts.
+    /// False where there is no such person, as on the automatic path.
     pub async fn evaluate_artifact(
         &self,
         artifact_id: Uuid,
         rule: &PromotionRule,
+        promoter_may_acknowledge: bool,
     ) -> Result<RuleEvaluationResult> {
         let mut violations: Vec<String> = Vec::new();
         let now = Utc::now();
@@ -383,7 +388,10 @@ impl PromotionRuleService {
         // this artifact's format) and a `completed` scan both pass through to
         // the count-based check -- they must NOT be treated as unscanned.
         if let Some(ref max_severity) = rule.max_cve_severity {
-            if let Some(scan) = self.get_latest_scan(artifact_id).await? {
+            if let Some(scan) = self
+                .get_latest_scan(artifact_id, rule.target_repo_id, promoter_may_acknowledge)
+                .await?
+            {
                 if let Some(v) = check_cve_severity(
                     max_severity,
                     scan.critical_count,
@@ -479,6 +487,7 @@ impl PromotionRuleService {
         artifact_id: Uuid,
         source_repo_id: Uuid,
         target_repo_id: Uuid,
+        promoter_may_acknowledge: bool,
     ) -> Result<Vec<RuleEvaluationResult>> {
         let rules: Vec<PromotionRule> = sqlx::query_as::<_, PromotionRule>(
             r#"
@@ -495,7 +504,9 @@ impl PromotionRuleService {
 
         let mut failing = Vec::new();
         for rule in &rules {
-            let eval = self.evaluate_artifact(artifact_id, rule).await?;
+            let eval = self
+                .evaluate_artifact(artifact_id, rule, promoter_may_acknowledge)
+                .await?;
             if !eval.passed {
                 failing.push(eval);
             }
@@ -526,7 +537,7 @@ impl PromotionRuleService {
         let mut results = Vec::new();
 
         for rule in &rules {
-            let eval = self.evaluate_artifact(artifact_id, rule).await?;
+            let eval = self.evaluate_artifact(artifact_id, rule, false).await?;
 
             results.push(AutoPromotionResult {
                 rule_id: rule.id,
@@ -570,12 +581,20 @@ impl PromotionRuleService {
     /// the per-scanner aggregates describe overlapping finding sets, and `MAX`
     /// cannot weaken a "greater than allowed" threshold. `HAVING COUNT(*) > 0`
     /// preserves the `None` = "no completed scan" signal the caller falls back on.
-    async fn get_latest_scan(&self, artifact_id: Uuid) -> Result<Option<ScanCountsRow>> {
-        // The same open findings the policy gate and the download gate read (#5153).
+    async fn get_latest_scan(
+        &self,
+        artifact_id: Uuid,
+        target_repo_id: Uuid,
+        promoter_may_acknowledge: bool,
+    ) -> Result<Option<ScanCountsRow>> {
+        // The same open findings the policy gate reads: a decision counts only if it
+        // reaches this rule's target (#5153).
         let row: Option<ScanCountsRow> = sqlx::query_as::<_, ScanCountsRow>(
             crate::services::promotion_policy_service::OPEN_FINDING_COUNTS_SQL,
         )
         .bind(artifact_id)
+        .bind(target_repo_id)
+        .bind(promoter_may_acknowledge)
         .fetch_optional(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;

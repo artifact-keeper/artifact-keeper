@@ -187,6 +187,21 @@ const HELD_ARTIFACTS_SQL: &str = "SELECT id, repository_id FROM artifacts \
        AND quarantine_status = 'quarantined' AND quarantine_until IS NULL \
        AND quarantine_source = 'scan_policy'";
 
+/// Live every-repository decisions on the same identity as this repository-scoped
+/// decision, outside its lineage.
+const OTHER_EVERY_REPOSITORY_DECISIONS_SQL: &str = "SELECT COUNT(*) \
+     FROM finding_acknowledgements this \
+     JOIN finding_acknowledgements other \
+       ON other.checksum_sha256 = this.checksum_sha256 \
+      AND other.finding_class = this.finding_class \
+      AND other.advisory_key = this.advisory_key \
+      AND other.component_key = this.component_key \
+      AND other.component_version_key = this.component_version_key \
+      AND other.lineage_id <> this.lineage_id \
+     WHERE this.id = $1 AND this.repository_id IS NOT NULL \
+       AND other.repository_id IS NULL AND other.revoked_at IS NULL \
+       AND (other.expires_at IS NULL OR other.expires_at > NOW())";
+
 /// Whether the scan a finding belongs to has a copy in this repository.
 const COPY_IN_REPOSITORY_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_findings sf \
      JOIN scan_results copy ON copy.source_scan_id = sf.scan_result_id \
@@ -213,7 +228,7 @@ const CLEAR_FROZEN_FLAG_SQL: &str = "UPDATE scan_findings sf \
 
 /// A user holding repository grants, directly or through a group, and no
 /// instance-wide role: see `FindingAcknowledgementService::may_act_in`.
-const TENANT_BOUND_SQL: &str = "SELECT \
+const BOUND_TO_GRANTS_SQL: &str = "SELECT \
      NOT EXISTS (SELECT 1 FROM role_assignments \
                  WHERE user_id = $1 AND repository_id IS NULL) \
      AND (EXISTS (SELECT 1 FROM role_assignments \
@@ -237,8 +252,9 @@ fn not_found() -> AppError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct RevokeOutcome {
     pub revoked: usize,
-    /// Copies of the decision left effective, in repositories the caller has no
-    /// authority over.
+    /// Decisions still in force on this finding that the revoke did not undo: copies
+    /// in repositories the caller has no authority over and, for a revoke by id, a
+    /// separate decision for every repository. Lapsed decisions are not counted.
     pub left_effective: i64,
 }
 
@@ -396,22 +412,24 @@ impl FindingAcknowledgementService {
     // Authority
     // -----------------------------------------------------------------------
 
-    /// Every caller of this service has already established the `is_admin`
-    /// capability: the REST routes with `require_admin`, the by-CVE route with
-    /// `enforce_admin_audited`, the gRPC plane in its interceptor, promotion before
-    /// it asks. What is decided here is where that capability reaches.
+    /// Every caller of this service has already established the admin capability:
+    /// the REST routes with `require_admin`, where `is_admin` is gated on an
+    /// `admin`-granting scope; the by-CVE route with `enforce_admin_audited`; the
+    /// gRPC `UpdateCveStatus` method with an `admin`-granting scope; promotion before it asks. What is decided here is where
+    /// that capability is meant to be used.
     ///
     /// * The credential must cover the repository.
-    /// * `is_admin` with no repository grants, or with an instance-wide role, has no
-    ///   tenant to stay inside: `POST /users` creates admins with no role row at all,
-    ///   and they could always triage any repository.
-    /// * `is_admin` holding repository grants and no instance-wide role is what this
-    ///   codebase calls a tenant admin. It needs a grant on the repository, public
-    ///   or not: public read access is not authority to accept a risk for someone
-    ///   else's repository.
+    /// * An admin with no repository grants, or with an instance-wide role, may act
+    ///   anywhere: `POST /users` creates admins with no role row at all, and they
+    ///   could always triage any repository.
+    /// * An admin holding repository grants and no instance-wide role needs a grant
+    ///   on the repository, public or not.
     ///
-    /// There is no tenant column, so binding is inferred from the grants, and a
-    /// tenant admin who has been given no grant yet reads as unbound.
+    /// The last rule is a guard against an admin deciding by mistake for a repository
+    /// they do not look after, not tenant isolation. There is no tenant column, so it is inferred
+    /// from the grants: an admin with none reads as unbound, and one who is given a
+    /// single repository role, group or owner grant becomes bound and is refused
+    /// elsewhere. That fails closed, and an instance-wide role lifts it.
     async fn may_act_in(&self, actor: &AckActor, repository_id: Uuid) -> Result<bool> {
         if !actor.credential.grants(repository_id) {
             return Ok(false);
@@ -419,21 +437,21 @@ impl FindingAcknowledgementService {
         let Some(user_id) = actor.user_id else {
             return Ok(true);
         };
-        if !self.is_tenant_bound(user_id).await? {
+        if !self.is_bound_to_its_grants(user_id).await? {
             return Ok(true);
         }
-        // TENANT-GATE-ONLY (#3331). The question here is literally tenant ownership:
-        // does a tenant-bound admin hold any grant on this repository. The capability
-        // is `is_admin`, established by every caller, so this carries no action, and
-        // it fronts a decision rather than a repository's contents.
+        // TENANT-GATE-ONLY (#3331). The question here is whether a bound admin holds
+        // any grant on this repository. The capability is `is_admin`, established by
+        // every caller, so this carries no action, and it fronts a decision rather
+        // than a repository's contents.
         RepositoryService::new(self.db.clone())
             .user_can_access_repo(repository_id, user_id, RepoAccess::TenantOnly)
             .await
     }
 
     /// Whether this user holds repository grants and no instance-wide role.
-    async fn is_tenant_bound(&self, user_id: Uuid) -> Result<bool> {
-        sqlx::query_scalar(TENANT_BOUND_SQL)
+    async fn is_bound_to_its_grants(&self, user_id: Uuid) -> Result<bool> {
+        sqlx::query_scalar(BOUND_TO_GRANTS_SQL)
             .bind(user_id)
             .fetch_one(&self.db)
             .await
@@ -451,18 +469,21 @@ impl FindingAcknowledgementService {
             Ok(())
         } else {
             Err(AppError::Authorization(
-                "You are not authorized to decide for this repository's tenant".to_string(),
+                "You hold grants on other repositories but not on this one, so you cannot \
+                 decide for it"
+                    .to_string(),
             ))
         }
     }
 
     /// Whether `actor` may make or undo a decision for every repository: an
-    /// unrestricted credential, not bound to a tenant.
+    /// unrestricted credential, and not an admin bound to the repositories it holds
+    /// grants on (see [`Self::may_act_in`]).
     pub async fn authorize_every_repository(&self, actor: &AckActor) -> Result<()> {
         if !self.may_act_everywhere(actor).await? {
             return Err(AppError::Authorization(
                 "Deciding for every repository needs an unrestricted credential \
-                 and no tenant binding"
+                 and no repository-only grants"
                     .to_string(),
             ));
         }
@@ -475,7 +496,7 @@ impl FindingAcknowledgementService {
         }
         match actor.user_id {
             None => Ok(true),
-            Some(user_id) => Ok(!self.is_tenant_bound(user_id).await?),
+            Some(user_id) => Ok(!self.is_bound_to_its_grants(user_id).await?),
         }
     }
 
@@ -499,9 +520,11 @@ impl FindingAcknowledgementService {
         struct Reach {
             id: Uuid,
             repository_id: Option<Uuid>,
+            live: bool,
         }
         let reach: Vec<Reach> = sqlx::query_as(
-            "SELECT id, repository_id FROM finding_acknowledgements \
+            "SELECT id, repository_id, (expires_at IS NULL OR expires_at > NOW()) AS live \
+             FROM finding_acknowledgements \
              WHERE lineage_id = ANY($1) AND revoked_at IS NULL",
         )
         .bind(lineages)
@@ -517,6 +540,9 @@ impl FindingAcknowledgementService {
             };
             if may {
                 allowed.push(row.id);
+            } else if !row.live {
+                // Lapsed: it covers nothing, wherever it is, so nothing is left in
+                // force and there is nothing to refuse over.
             } else if applies_in_request.contains(&row.id) {
                 return Err(AppError::Authorization(
                     "This finding is covered by a decision for every repository, which this \
@@ -970,7 +996,14 @@ impl FindingAcknowledgementService {
                 "This decision applies in a repository this credential does not cover".to_string(),
             ));
         }
-        self.revoke_ids(&allowed, left_effective, actor.user_id)
+        // A separate decision for every repository still covers this finding where
+        // the revoked one applied. A revoke by id does not reach it, so count it.
+        let also_covering: i64 = sqlx::query_scalar(OTHER_EVERY_REPOSITORY_DECISIONS_SQL)
+            .bind(id)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        self.revoke_ids(&allowed, left_effective + also_covering, actor.user_id)
             .await
     }
 
@@ -1574,6 +1607,93 @@ mod tests {
         assert_eq!(json["max_severity"], "high");
         assert_eq!(json["revoked_reason"], "superseded");
         assert!(json["repository_id"].is_null());
+    }
+
+    /// #5153: triage needs an `admin`-granting scope, as on REST.
+    #[tokio::test]
+    async fn test_update_cve_status_requires_the_admin_scope_5153() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::grpc::auth_interceptor::GrpcPrincipal;
+        use crate::grpc::generated::cve_history_service_server::CveHistoryService;
+        use crate::grpc::generated::UpdateCveStatusRequest;
+        use crate::grpc::sbom_server::CveHistoryGrpcServer;
+        use crate::models::access_scope::AccessScope;
+        use tonic::Request;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+        )
+        .bind(artifact)
+        .bind(repo)
+        .bind(format!("grpc/{artifact}"))
+        .bind(format!("{:064x}", artifact.as_u128()))
+        .execute(&pool)
+        .await
+        .expect("artifact");
+        let scan: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+        )
+        .bind(artifact)
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .expect("scan");
+        sqlx::query(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id) \
+             VALUES ($1, $2, 'high', 't', 'CVE-2031-5156')",
+        )
+        .bind(scan)
+        .bind(artifact)
+        .execute(&pool)
+        .await
+        .expect("finding");
+        let server = CveHistoryGrpcServer::new(pool.clone());
+        let call = |scopes: Option<Vec<String>>| {
+            let mut request = Request::new(UpdateCveStatusRequest {
+                id: crate::services::sbom_service::synth_cve_id(artifact, "CVE-2031-5156")
+                    .to_string(),
+                status: crate::grpc::generated::CveStatus::Acknowledged as i32,
+                reason: "accepted".to_string(),
+            });
+            request.extensions_mut().insert(GrpcPrincipal {
+                is_admin: true,
+                scopes,
+                user_id,
+                allowed_repo_ids: AccessScope::Admin,
+            });
+            request
+        };
+        let refused = server
+            .update_cve_status(call(Some(vec!["write:artifacts".to_string()])))
+            .await
+            .expect_err("a narrow token is refused");
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+        let decided: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM finding_acknowledgements WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(decided, 0);
+        server
+            .update_cve_status(call(Some(vec!["admin".to_string()])))
+            .await
+            .expect("an admin-scoped token");
+        server
+            .update_cve_status(call(None))
+            .await
+            .expect("an interactive token");
+        tdh::cleanup_member_repo(&pool, repo, &std::env::temp_dir().join("none")).await;
+        tdh::cleanup_user(&pool, user_id).await;
     }
 
     /// #5153: a decision stays inside the token's repository restriction, and the

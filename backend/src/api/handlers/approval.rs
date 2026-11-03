@@ -540,7 +540,21 @@ pub async fn request_approval(
     let policy_result = if !req.skip_policy_check {
         let policy_service = PromotionPolicyService::new(state.db.clone());
         match policy_service
-            .evaluate_artifact(req.artifact_id, source_repo.id)
+            .evaluate_promotion(
+                req.artifact_id,
+                source_repo.id,
+                Some(
+                    crate::services::promotion_policy_service::PromotionGateContext {
+                        target_repository_id: target_repo.id,
+                        promoter_may_acknowledge: super::promotion::promoter_may_acknowledge(
+                            &state.db,
+                            &auth,
+                            target_repo.id,
+                        )
+                        .await,
+                    },
+                ),
+            )
             .await
         {
             Ok(eval) => Some(build_policy_result_json(
@@ -909,10 +923,48 @@ pub async fn approve_promotion(
     // execute path returns 403 with the violations: a rule-blocked approval must
     // NOT execute the copy/insert, so it fails like a rejected promotion.
     if !req.skip_policy_check {
+        // The severity policy ran when the request was made, and what it read can
+        // have changed: an acknowledgement revoked or lapsed since then must not
+        // keep passing (#5153). Refused with the violations, like a rule, and the
+        // reviewer can override with `skip_policy_check`.
+        let may_acknowledge =
+            super::promotion::promoter_may_acknowledge(&state.db, &auth, target_repo.id).await;
+        let policy = crate::services::promotion_policy_service::PromotionPolicyService::new(
+            state.db.clone(),
+        )
+        .evaluate_promotion(
+            approval.artifact_id,
+            source_repo.id,
+            Some(
+                crate::services::promotion_policy_service::PromotionGateContext {
+                    target_repository_id: target_repo.id,
+                    promoter_may_acknowledge: may_acknowledge,
+                },
+            ),
+        )
+        .await?;
+        if !policy.passed {
+            let detail = policy
+                .violations
+                .iter()
+                .map(|v| v.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(AppError::Authorization(format!(
+                "Promotion blocked by policy violations: {}",
+                detail
+            )));
+        }
+
         let rule_service =
             crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
         let failing = rule_service
-            .evaluate_for_promotion(approval.artifact_id, source_repo.id, target_repo.id)
+            .evaluate_for_promotion(
+                approval.artifact_id,
+                source_repo.id,
+                target_repo.id,
+                may_acknowledge,
+            )
             .await?;
         if !failing.is_empty() {
             let detail = failing
@@ -3189,6 +3241,84 @@ mod tests {
             cleanup_user(&pool, requester).await;
             let _ = std::fs::remove_dir_all(&sdir);
             let _ = std::fs::remove_dir_all(&tdir);
+        }
+
+        /// #5153: the severity policy ran when the request was made. What it read may
+        /// have changed by approval: an acknowledgement revoked in between does not
+        /// keep passing, unless the reviewer overrides.
+        #[tokio::test]
+        async fn test_approval_rereads_the_policy_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153p-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153p-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "p5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "p5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "p5153").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let (artifact, _path) = make_artifact_with_origin(
+                &pool,
+                src,
+                &storage,
+                "p5153",
+                &tdh::mint_proxy_origin(&pool).await,
+            )
+            .await;
+            let scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                     findings_count, critical_count, completed_at, checksum_sha256) \
+                 SELECT $1, $2, 'dependency', 'completed', 1, 1, NOW(), checksum_sha256 \
+                 FROM artifacts WHERE id = $1 RETURNING id",
+            )
+            .bind(artifact)
+            .bind(src)
+            .fetch_one(&pool)
+            .await
+            .expect("scan");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id) \
+                 VALUES ($1, $2, 'critical', 't', 'CVE-2031-5155')",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .expect("finding");
+            let requester = make_requester(&pool, "p5153").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let refused = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(AppError::Authorization(_))),
+                "an open critical must not pass at approval"
+            );
+            let approved = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: true,
+                }),
+            )
+            .await;
+            assert!(approved.is_ok(), "the reviewer can override");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
         }
 
         /// #4710: approving and rejecting a request each write one audit row

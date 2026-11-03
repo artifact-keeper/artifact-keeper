@@ -27,7 +27,10 @@ use artifact_keeper_backend::services::finding_acknowledgements::{
 };
 use artifact_keeper_backend::services::open_findings::{severity_counts, FindingScope};
 use artifact_keeper_backend::services::policy_service::PolicyService;
-use artifact_keeper_backend::services::promotion_policy_service::PromotionPolicyService;
+use artifact_keeper_backend::services::promotion_policy_service::{
+    PromotionGateContext, PromotionPolicyService,
+};
+use artifact_keeper_backend::services::promotion_rule_service::PromotionRuleService;
 use artifact_keeper_backend::services::quarantine_service::enforce_download_gate;
 use artifact_keeper_backend::services::sbom_service::SbomService;
 use artifact_keeper_backend::services::scan_result_service::{
@@ -2417,6 +2420,41 @@ async fn the_promotion_gate_honours_an_acknowledged_external_finding() {
     assert_eq!(after.critical_count, 0, "acknowledged: it does not");
     assert!(after.open_cves.is_empty());
     assert!(fx.allowed(repo, artifact).await, "the download gate agrees");
+
+    // Going somewhere else, it stays closed for a promoter who could carry the
+    // decision or once it is for every repository, and only then.
+    let target = fx.repo().await;
+    let toward_target = |may_acknowledge: bool, pool: PgPool| async move {
+        PromotionPolicyService::new(pool)
+            .evaluate_promotion(
+                artifact,
+                repo,
+                Some(PromotionGateContext {
+                    target_repository_id: target,
+                    promoter_may_acknowledge: may_acknowledge,
+                }),
+            )
+            .await
+            .expect("evaluate")
+            .cve_summary
+            .expect("summary")
+            .critical_count
+    };
+    assert_eq!(toward_target(false, fx.pool.clone()).await, 1);
+    assert_eq!(toward_target(true, fx.pool.clone()).await, 0);
+    fx.svc
+        .acknowledge_finding(
+            id,
+            &fx.actor(),
+            "retracted, everywhere",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledge everywhere");
+    assert_eq!(toward_target(false, fx.pool.clone()).await, 0);
     fx.cleanup().await;
 }
 
@@ -2427,4 +2465,300 @@ async fn the_foreign_key_migration_bounds_its_lock() {
     let set = sql.find("SET LOCAL lock_timeout").expect("a lock timeout");
     let alter = sql.find("ALTER TABLE").expect("the change");
     assert!(set < alter, "set before the lock is taken");
+}
+
+// ---------------------------------------------------------------------------
+// A promotion gate guards the target
+// ---------------------------------------------------------------------------
+
+struct GateRig {
+    source_repo: Uuid,
+    target_repo: Uuid,
+    artifact: Uuid,
+    finding: Uuid,
+}
+
+/// A critical finding on `staging`, a `staging -> prod` rule blocking `high`, and
+/// the same bytes in `prod`, so a decision can be live there too.
+async fn gate_rig(fx: &mut Fx) -> GateRig {
+    let source_repo = fx.repo().await;
+    let target_repo = fx.repo().await;
+    let d = digest();
+    let artifact = fx.artifact(source_repo, "a.tgz", &d).await;
+    fx.artifact(target_repo, "held.tgz", &d).await;
+    let scan = fx
+        .scan(
+            source_repo,
+            artifact,
+            "dependency",
+            &[finding_from(
+                CVE_A,
+                LODASH,
+                "1",
+                "grype",
+                Severity::Critical,
+            )],
+        )
+        .await;
+    sqlx::query(
+        "INSERT INTO promotion_rules (name, source_repo_id, target_repo_id, is_enabled, max_cve_severity) \
+         VALUES ($1, $2, $3, true, 'high')",
+    )
+    .bind(format!("ack-gate-{source_repo}"))
+    .bind(source_repo)
+    .bind(target_repo)
+    .execute(&fx.pool)
+    .await
+    .expect("rule");
+    let finding = fx.finding_ids(scan).await[0];
+    GateRig {
+        source_repo,
+        target_repo,
+        artifact,
+        finding,
+    }
+}
+
+/// `(policy gate passes, rule gate passes)` for a promoter who can or cannot
+/// acknowledge in the target.
+async fn gates(fx: &Fx, rig: &GateRig, may_acknowledge: bool) -> (bool, bool) {
+    let summary = PromotionPolicyService::new(fx.pool.clone())
+        .evaluate_promotion(
+            rig.artifact,
+            rig.source_repo,
+            Some(PromotionGateContext {
+                target_repository_id: rig.target_repo,
+                promoter_may_acknowledge: may_acknowledge,
+            }),
+        )
+        .await
+        .expect("policy")
+        .cve_summary
+        .expect("summary");
+    assert_eq!(
+        summary.critical_count == 0,
+        summary.open_cves.is_empty(),
+        "counts and open CVEs read the same findings"
+    );
+    let failing = PromotionRuleService::new(fx.pool.clone())
+        .evaluate_for_promotion(
+            rig.artifact,
+            rig.source_repo,
+            rig.target_repo,
+            may_acknowledge,
+        )
+        .await
+        .expect("rule");
+    (summary.critical_count == 0, failing.is_empty())
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_decision_scoped_to_the_source_opens_a_target_gate_only_for_who_could_carry_it() {
+    let mut fx = Fx::new().await;
+    let rig = gate_rig(&mut fx).await;
+    assert_eq!(
+        gates(&fx, &rig, true).await,
+        (false, false),
+        "nothing decided"
+    );
+
+    fx.svc
+        .acknowledge_finding(rig.finding, &fx.actor(), "staging only", Default::default())
+        .await
+        .expect("acknowledge");
+    assert_eq!(
+        gates(&fx, &rig, false).await,
+        (false, false),
+        "plain promoter"
+    );
+    assert_eq!(
+        gates(&fx, &rig, true).await,
+        (true, true),
+        "authorised promoter"
+    );
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_decision_that_already_reaches_the_target_opens_its_gate_for_anyone() {
+    let mut fx = Fx::new().await;
+    let rig = gate_rig(&mut fx).await;
+    let every = AcknowledgeOptions {
+        scope: AcknowledgementScope::AllRepositories,
+        ..Default::default()
+    };
+    fx.svc
+        .acknowledge_finding(rig.finding, &fx.actor(), "everywhere", every)
+        .await
+        .expect("acknowledge everywhere");
+    assert_eq!(
+        gates(&fx, &rig, false).await,
+        (true, true),
+        "every repository"
+    );
+    fx.svc
+        .revoke_acknowledgment(rig.finding, Some(rig.source_repo), &fx.actor())
+        .await
+        .expect("revoke");
+
+    fx.svc
+        .acknowledge_finding(
+            rig.finding,
+            &fx.actor(),
+            "prod",
+            AcknowledgeOptions {
+                repository_id: Some(rig.target_repo),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledge in the target");
+    assert_eq!(
+        gates(&fx, &rig, false).await,
+        (true, true),
+        "live in the target"
+    );
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_lapsed_or_revoked_decision_opens_no_promotion_gate() {
+    let mut fx = Fx::new().await;
+    let rig = gate_rig(&mut fx).await;
+    fx.svc
+        .acknowledge_finding(
+            rig.finding,
+            &fx.actor(),
+            "short",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                expires_at: Some(Utc::now() + Duration::milliseconds(300)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledge");
+    assert_eq!(gates(&fx, &rig, false).await, (true, true));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(gates(&fx, &rig, true).await, (false, false), "expired");
+
+    fx.svc
+        .acknowledge_finding(rig.finding, &fx.actor(), "again", Default::default())
+        .await
+        .expect("acknowledge again");
+    assert_eq!(gates(&fx, &rig, true).await, (true, true));
+    fx.svc
+        .revoke_acknowledgment(rig.finding, None, &fx.actor())
+        .await
+        .expect("revoke");
+    assert_eq!(gates(&fx, &rig, true).await, (false, false), "revoked");
+    fx.cleanup().await;
+}
+
+/// A row that claims findings it has no rows for: a dedup copy from before the two
+/// inserts shared a transaction (#1035, #1058). The stored counts are all there is
+/// to go on, and clean is not what they say.
+#[tokio::test]
+#[ignore]
+async fn a_scan_claiming_findings_it_has_no_rows_for_still_counts() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx.scan(repo, artifact, "dependency", &[]).await;
+    sqlx::query(
+        "UPDATE scan_results SET findings_count = 2, critical_count = 1, high_count = 1 WHERE id = $1",
+    )
+    .bind(scan)
+    .execute(&fx.pool)
+    .await
+    .expect("counts");
+    let summary = PromotionPolicyService::new(fx.pool.clone())
+        .evaluate_artifact(artifact, repo)
+        .await
+        .expect("evaluate")
+        .cve_summary
+        .expect("summary");
+    assert_eq!((summary.critical_count, summary.high_count), (1, 1));
+    fx.cleanup().await;
+}
+
+/// `left_effective` is about what is still in force.
+#[tokio::test]
+#[ignore]
+async fn left_effective_counts_only_what_is_still_in_force() {
+    let mut fx = Fx::new().await;
+    let inside = fx.repo().await;
+    let outside = fx.repo().await;
+    let d = digest();
+    let a = fx.artifact(inside, "a.tgz", &d).await;
+    let scan = fx
+        .scan(inside, a, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    fx.ack_scan(scan).await;
+    let promoted = fx.artifact(outside, "a.tgz", &d).await;
+    carry(&fx, a, promoted).await.expect("carry");
+    sqlx::query(
+        "UPDATE finding_acknowledgements SET expires_at = NOW() - INTERVAL '1 hour' \
+         WHERE repository_id = $1",
+    )
+    .bind(outside)
+    .execute(&fx.pool)
+    .await
+    .expect("lapse the copy");
+    let scoped = AckActor::new(fx.admin, AccessScope::Restricted(vec![inside]));
+    let finding_id = fx.finding_ids(scan).await[0];
+    let answered = fx
+        .svc
+        .revoke_acknowledgment(finding_id, Some(inside), &scoped)
+        .await
+        .expect("revoke");
+    assert_eq!(answered.acknowledgements_left_effective, Some(0));
+    fx.cleanup().await;
+}
+
+/// Revoking a repository's decision by id, while a separate every-repository
+/// decision still covers that finding there, must not read as nothing left.
+#[tokio::test]
+#[ignore]
+async fn revoking_by_id_says_when_another_decision_still_covers_the_finding() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let id = fx.finding_ids(scan).await[0];
+    let scoped = fx
+        .svc
+        .acknowledge_finding(id, &fx.actor(), "here", Default::default())
+        .await
+        .expect("here")
+        .acknowledgement_id
+        .expect("decision");
+    fx.svc
+        .acknowledge_finding(
+            id,
+            &fx.actor(),
+            "everywhere",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("everywhere");
+    let outcome = FindingAcknowledgementService::new(fx.pool.clone())
+        .revoke(scoped, &fx.actor())
+        .await
+        .expect("revoke");
+    assert_eq!(outcome.revoked, 1);
+    assert_eq!(outcome.left_effective, 1);
+    assert!(
+        fx.allowed(repo, artifact).await,
+        "and it does still cover it"
+    );
+    fx.cleanup().await;
 }
