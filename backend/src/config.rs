@@ -1138,6 +1138,9 @@ pub struct Config {
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+    /// How long a request waits for its proxy file scan to get a permit (#5231).
+    /// Env var: `AK_PROXY_SCAN_QUEUE_WAIT_SECS`. Default 60, least 1.
+    pub proxy_scan_queue_wait_secs: u64,
 
     /// How long, in seconds, an HTTP/1 connection may take to deliver a
     /// complete request head (request line plus headers) on the API and
@@ -1693,6 +1696,7 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show proxy_scan_queue_wait_secs,
     show http_header_read_timeout_secs,
     show http_listen_backlog,
     show upload_progress_window_secs,
@@ -1853,6 +1857,7 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            proxy_scan_queue_wait_secs: 60,
             http_header_read_timeout_secs: DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
             http_listen_backlog: 0,
             upload_progress_window_secs: 60,
@@ -2240,6 +2245,7 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            proxy_scan_queue_wait_secs: env_parse("AK_PROXY_SCAN_QUEUE_WAIT_SECS", 60_u64),
             http_header_read_timeout_secs: env_parse(
                 "HTTP_HEADER_READ_TIMEOUT_SECS",
                 DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,

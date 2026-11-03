@@ -9913,7 +9913,7 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
 /// map every arm back onto the SAME fail-open/fail-closed handling they had
 /// before this change (`.ok()`-shaped), because that posture is #2954's and
 /// is explicitly out of scope here.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ProxyScanInconclusive {
     /// No scanner is configured for this instance.
     NoScanner,
@@ -9922,7 +9922,9 @@ pub(crate) enum ProxyScanInconclusive {
     /// the scan future, not as a distinct arm -- there is no separate
     /// "staging failed" case to discriminate.
     ScanFailed,
-    /// The scan did not finish inside its budget.
+    /// The scan did not finish inside its budget. For a request waiting on a
+    /// file scan (#5231) this also covers a scan that did not get a permit
+    /// inside the queue wait, or that there was no room to start.
     BudgetExceeded,
 }
 
@@ -9999,6 +10001,233 @@ pub(crate) async fn proxy_scan_and_record(
     .await
 }
 
+/// How long a background scan's writes may take: the verdict row, and then the
+/// inventory and CVE detail. Nothing else bounds them, and the first holds the
+/// scan's place in the table.
+const PROXY_SCAN_RECORD_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Join the scan of these bytes, or start one in its own task (#5231). The
+/// waiter is there when `intent` says the caller waits, and `Full` says what had
+/// no room, which is counted here.
+///
+/// The task holds the bytes until the scan ends, whether or not a request is
+/// still waiting: it waits for a permit until nobody wants the scan any more
+/// (see [`InFlightScans`]), then runs for at most
+/// [`PROXY_SCAN_BACKGROUND_BUDGET`]. The permit and the bytes go as soon as the
+/// scan ends and the place in the table once the verdict row is written, which
+/// is also when waiting requests are answered. The inventory and CVE detail
+/// follow, holding none of that.
+///
+/// A verdict recorded for these bytes while the scan ran is newer than this
+/// scan's result, so it stands, and the requests waiting here are answered as
+/// inconclusive for their retry to read it.
+///
+/// [`InFlightScans`]: crate::api::handlers::proxy_scan_inflight::InFlightScans
+/// [`PROXY_SCAN_BACKGROUND_BUDGET`]: crate::services::scanner_service::PROXY_SCAN_BACKGROUND_BUDGET
+#[allow(clippy::too_many_arguments)]
+fn scan_file_in_flight(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    expected: Option<crate::services::scanner_service::ExpectedComponent>,
+    intent: crate::api::handlers::proxy_scan_inflight::ScanIntent,
+) -> std::result::Result<
+    Option<crate::api::handlers::proxy_scan_inflight::ScanWaiter>,
+    crate::api::handlers::proxy_scan_inflight::TableFull,
+> {
+    use crate::api::handlers::proxy_scan_inflight::{
+        InFlightScans, ScanEntry, ScanKey, ScanProgress,
+    };
+    let key = ScanKey {
+        repo_id,
+        digest: digest.to_string(),
+        file: synthetic.name.clone(),
+        pin: expected
+            .as_ref()
+            .map(crate::services::scanner_service::ExpectedComponent::pin_identity),
+    };
+    let (waiter, ticket) = match InFlightScans::global().enter(key, bytes.len(), intent) {
+        ScanEntry::Joined(waiter) => return Ok(waiter),
+        ScanEntry::Started(waiter, ticket) => (waiter, ticket),
+        ScanEntry::Full(full) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %synthetic.name, digest = %digest,
+                limit = full.label(),
+                "no room for this proxy scan in flight; not scanning this file now, \
+                 the next pull of it will"
+            );
+            crate::services::metrics_service::record_proxy_scan_queue_refused(full.label());
+            return Err(full);
+        }
+    };
+    let state = state.clone();
+    let digest = digest.to_string();
+    let bytes = bytes.clone();
+    tokio::spawn(async move {
+        let Some(scanner) = state.scanner_service.clone() else {
+            ticket.report(ScanProgress::Done(Err(ProxyScanInconclusive::NoScanner)));
+            return;
+        };
+        let slot = tokio::select! {
+            biased;
+            slot = scanner.acquire_inline_scan_slot(repo_id) => slot,
+            () = ticket.abandoned() => {
+                tracing::info!(
+                    repo_id = %repo_id, file = %synthetic.name, digest = %digest,
+                    "queued proxy scan has no request waiting on it any more; dropping it, \
+                     the next pull of this file scans it"
+                );
+                crate::services::metrics_service::record_proxy_scan_abandoned();
+                ticket.report(ScanProgress::Done(Err(ProxyScanInconclusive::ScanFailed)));
+                return;
+            }
+        };
+        ticket.report(ScanProgress::Running(tokio::time::Instant::now()));
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+        let observed = match pss.lookup_verdict(&digest, PROXY_SCAN_TYPE).await {
+            Ok(row) => row.map(|row| row.scanned_at),
+            Err(e) => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %synthetic.name, error = %e,
+                    "proxy scan: could not read the stored verdict; treating as inconclusive"
+                );
+                ticket.report(ScanProgress::Done(Err(ProxyScanInconclusive::ScanFailed)));
+                return;
+            }
+        };
+        let scanned = run_scan_within(
+            &state,
+            repo_id,
+            &synthetic,
+            &bytes,
+            expected.as_ref(),
+            &ProxyScanMode::File,
+            crate::services::scanner_service::PROXY_SCAN_BACKGROUND_BUDGET,
+            Some(&slot),
+        )
+        .await;
+        drop(slot);
+        drop(bytes);
+        let verdict = match scanned {
+            Ok(verdict) => verdict,
+            Err(reason) => {
+                ticket.report(ScanProgress::Done(Err(reason)));
+                return;
+            }
+        };
+
+        let recorded = tokio::time::timeout(
+            PROXY_SCAN_RECORD_BUDGET,
+            record_verdict_row(
+                &pss,
+                repo_id,
+                &digest,
+                &synthetic.name,
+                &verdict,
+                expected.as_ref(),
+                Some(observed),
+            ),
+        )
+        .await;
+        if matches!(recorded, Ok(false)) {
+            tracing::warn!(
+                repo_id = %repo_id, file = %synthetic.name, digest = %digest,
+                "a verdict was recorded for these bytes while this proxy scan ran; \
+                 leaving it, and discarding this scan's result"
+            );
+            ticket.report(ScanProgress::Done(Err(ProxyScanInconclusive::ScanFailed)));
+            return;
+        }
+        if recorded.is_err() {
+            tracing::warn!(
+                repo_id = %repo_id, file = %synthetic.name, digest = %digest,
+                "writing the proxy scan verdict took too long; treating as inconclusive"
+            );
+            ticket.report(ScanProgress::Done(Err(ProxyScanInconclusive::ScanFailed)));
+            return;
+        }
+        // Only what the gate's decision reads goes to the requests waiting.
+        ticket.report(ScanProgress::Done(Ok(
+            crate::services::scanner_service::ProxyScanVerdict {
+                packages: Vec::new(),
+                findings: Vec::new(),
+                ..verdict.clone()
+            },
+        )));
+        drop(ticket);
+
+        if tokio::time::timeout(
+            PROXY_SCAN_RECORD_BUDGET,
+            record_verdict_detail(&pss, repo_id, &digest, &synthetic.name, &verdict),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                repo_id = %repo_id, file = %synthetic.name, digest = %digest,
+                "writing the proxy scan inventory and CVE detail took too long; the verdict \
+                 stands without them"
+            );
+        }
+    });
+    Ok(waiter)
+}
+
+/// The verdict for a file scan under the fail-closed gate, for as long as this
+/// request is prepared to wait for it (#5231): see
+/// [`wait_for_verdict`](crate::api::handlers::proxy_scan_inflight::wait_for_verdict).
+async fn wait_for_file_scan(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    digest: &str,
+    synthetic: crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    use crate::api::handlers::proxy_scan_inflight::{
+        answer_within, wait_for_verdict, ScanIntent, REQUEST_ANSWER_BY,
+    };
+    if state.scanner_service.is_none() {
+        return Err(ProxyScanInconclusive::NoScanner);
+    }
+    let filename = synthetic.name.clone();
+    let waiter = scan_file_in_flight(
+        state,
+        repo_id,
+        digest,
+        synthetic,
+        bytes,
+        expected.cloned(),
+        ScanIntent::Wait,
+    )
+    .map_err(|_| ProxyScanInconclusive::BudgetExceeded)?
+    .expect("a caller that waits gets a waiter");
+    // On a route with no request timeout, or called from outside one, the
+    // configured timeout is all there is to go on.
+    let answer_by = REQUEST_ANSWER_BY.try_with(|by| *by).ok().or_else(|| {
+        answer_within(state.config.global_request_timeout_secs)
+            .map(|within| tokio::time::Instant::now() + within)
+    });
+    let result = wait_for_verdict(
+        waiter,
+        crate::services::scanner_service::PROXY_SCAN_INLINE_BUDGET,
+        std::time::Duration::from_secs(state.config.proxy_scan_queue_wait_secs.max(1)),
+        answer_by,
+    )
+    .await;
+    if matches!(result, Err(ProxyScanInconclusive::BudgetExceeded)) {
+        tracing::warn!(
+            repo_id = %repo_id, file = %filename, digest = %digest,
+            "proxy scan did not finish in time for this request; refusing it, \
+             the scan goes on and a retry finds its verdict"
+        );
+    }
+    result
+}
+
 /// [`proxy_scan_and_record`] for the on-demand rescan of cached bytes (#3396).
 ///
 /// A rescan has no request coordinate, so it never pins. It records its
@@ -10062,46 +10291,11 @@ async fn scan_and_record(
     rescan: bool,
 ) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
 {
-    let scanner = state
-        .scanner_service
-        .as_ref()
-        .ok_or(ProxyScanInconclusive::NoScanner)?;
     let filename = synthetic.name.clone();
-    let scan_fut = async {
-        match mode {
-            ProxyScanMode::File => {
-                scanner
-                    .scan_content_expecting(synthetic, bytes, expected)
-                    .await
-            }
-            ProxyScanMode::FileRequiringCatalog => {
-                scanner
-                    .scan_content_requiring_catalog(synthetic, bytes)
-                    .await
-            }
-            ProxyScanMode::OciImage(ctx) => {
-                crate::api::handlers::oci_v2::oci_stage_and_scan_image(state, ctx, synthetic, bytes)
-                    .await
-            }
-        }
-    };
-    let verdict = match run_scan_within_budget(budget, scan_fut).await {
-        Ok(v) => v,
-        Err(ScanTimeoutOutcome::Failed(e)) => {
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, error = %e,
-                "inline proxy scan failed; treating as inconclusive"
-            );
-            return Err(ProxyScanInconclusive::ScanFailed);
-        }
-        Err(ScanTimeoutOutcome::TimedOut) => {
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename,
-                "inline proxy scan exceeded the budget; treating as inconclusive"
-            );
-            return Err(ProxyScanInconclusive::BudgetExceeded);
-        }
-    };
+    let verdict = run_scan_within(
+        state, repo_id, synthetic, bytes, expected, mode, budget, None,
+    )
+    .await?;
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
     if rescan {
@@ -10129,11 +10323,93 @@ async fn scan_and_record(
             return Err(ProxyScanInconclusive::ScanFailed);
         }
     }
+    record_verdict_row(&pss, repo_id, digest, &filename, &verdict, expected, None).await;
+    record_verdict_detail(&pss, repo_id, digest, &filename, &verdict).await;
+    Ok(verdict)
+}
+
+/// Run the scanners over `bytes` within `budget`, under `slot` when the caller
+/// already holds a permit.
+#[allow(clippy::too_many_arguments)]
+async fn run_scan_within(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    synthetic: &crate::models::artifact::Artifact,
+    bytes: &Bytes,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    mode: &ProxyScanMode,
+    budget: std::time::Duration,
+    slot: Option<&crate::services::scanner_service::InlineScanSlot>,
+) -> std::result::Result<crate::services::scanner_service::ProxyScanVerdict, ProxyScanInconclusive>
+{
+    let scanner = state
+        .scanner_service
+        .as_ref()
+        .ok_or(ProxyScanInconclusive::NoScanner)?;
+    let filename = synthetic.name.clone();
+    let scan_fut = async {
+        match mode {
+            ProxyScanMode::File => match slot {
+                Some(slot) => {
+                    scanner
+                        .scan_content_expecting_in_slot(slot, synthetic, bytes, expected)
+                        .await
+                }
+                None => {
+                    scanner
+                        .scan_content_expecting(synthetic, bytes, expected)
+                        .await
+                }
+            },
+            ProxyScanMode::FileRequiringCatalog => {
+                scanner
+                    .scan_content_requiring_catalog(synthetic, bytes)
+                    .await
+            }
+            ProxyScanMode::OciImage(ctx) => {
+                crate::api::handlers::oci_v2::oci_stage_and_scan_image(state, ctx, synthetic, bytes)
+                    .await
+            }
+        }
+    };
+    match run_scan_within_budget(budget, scan_fut).await {
+        Ok(v) => Ok(v),
+        Err(ScanTimeoutOutcome::Failed(e)) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, error = %e,
+                "inline proxy scan failed; treating as inconclusive"
+            );
+            Err(ProxyScanInconclusive::ScanFailed)
+        }
+        Err(ScanTimeoutOutcome::TimedOut) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename,
+                "inline proxy scan exceeded the budget; treating as inconclusive"
+            );
+            Err(ProxyScanInconclusive::BudgetExceeded)
+        }
+    }
+}
+
+/// Write the verdict row. When `observed` is set, only if the row still has that
+/// `scanned_at` (`None` inside: no row), and the return says whether it did. A
+/// write that fails is logged and counts as done: the verdict still decides the
+/// request.
+#[allow(clippy::too_many_arguments)]
+async fn record_verdict_row(
+    pss: &crate::services::proxy_scan_service::ProxyScanService,
+    repo_id: Uuid,
+    digest: &str,
+    filename: &str,
+    verdict: &crate::services::scanner_service::ProxyScanVerdict,
+    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    observed: Option<Option<chrono::DateTime<Utc>>>,
+) -> bool {
     // #4594: the cataloged-component count is written with the verdict, so
     // the proxy-scans view can say when a verdict was graded on file
     // contents only.
-    if let Err(e) = pss
-        .record_verdict_with_catalog(
+    match pss
+        .record_verdict_if_unchanged(
             digest,
             PROXY_SCAN_TYPE,
             verdict.verdict_token(),
@@ -10149,12 +10425,26 @@ async fn scan_and_record(
             expected
                 .map(crate::services::scanner_service::ExpectedComponent::pin_identity)
                 .as_deref(),
+            observed,
         )
         .await
     {
-        tracing::warn!(repo_id = %repo_id, file = %filename, error = %e, "failed to persist proxy scan verdict");
+        Ok(written) => written,
+        Err(e) => {
+            tracing::warn!(repo_id = %repo_id, file = %filename, error = %e, "failed to persist proxy scan verdict");
+            true
+        }
     }
+}
 
+/// Write the inventory and the CVE detail behind a recorded verdict.
+async fn record_verdict_detail(
+    pss: &crate::services::proxy_scan_service::ProxyScanService,
+    repo_id: Uuid,
+    digest: &str,
+    filename: &str,
+    verdict: &crate::services::scanner_service::ProxyScanVerdict,
+) {
     // Persist the inventory for SBOM generation. Deliberately after the
     // verdict and independently fallible: the verdict is what gates
     // distribution, so an inventory write failure must never prevent a
@@ -10211,8 +10501,6 @@ async fn scan_and_record(
             );
         }
     }
-
-    Ok(verdict)
 }
 
 /// What the serve path was able to establish about WHAT these bytes are being
@@ -10639,11 +10927,15 @@ async fn decide_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
-            let budget = proxy_scan_mode_budget(&mode);
-            let result = proxy_scan_and_record(
-                state, repo_id, digest, &synthetic, bytes, expected, &mode, budget,
-            )
-            .await;
+            let result = if matches!(mode, ProxyScanMode::File) {
+                wait_for_file_scan(state, repo_id, digest, synthetic, bytes, expected).await
+            } else {
+                let budget = proxy_scan_mode_budget(&mode);
+                proxy_scan_and_record(
+                    state, repo_id, digest, &synthetic, bytes, expected, &mode, budget,
+                )
+                .await
+            };
             scan_inline_serve_decision(result, severity_gate, repo_id, filename, digest)
         }
         ServeDecision::ServePendingScanAsync => {
@@ -10681,6 +10973,21 @@ async fn decide_proxy_scan_serve(
                 ProxyScanIdentity::Established(e) => Some(e),
                 ProxyScanIdentity::NotApplicable => None,
             };
+            if matches!(mode, ProxyScanMode::File) {
+                // #5231: the scan outlives this response and gets its turn,
+                // however long the queue. There is no request to fail if there is
+                // no room, which is counted: the next pull scans it.
+                let _ = scan_file_in_flight(
+                    state,
+                    repo_id,
+                    digest,
+                    synthetic,
+                    bytes,
+                    expected,
+                    crate::api::handlers::proxy_scan_inflight::ScanIntent::Background,
+                );
+                return ProxyScanServeOutcome::Serve(ProxyScanServed::Pending);
+            }
             let budget = proxy_scan_mode_budget(&mode);
             tokio::spawn(async move {
                 let _ = proxy_scan_and_record(
@@ -17787,6 +18094,7 @@ mod tests {
                 auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
+                proxy_scan_queue_wait_secs: 60,
                 http_header_read_timeout_secs: 10,
                 http_listen_backlog: 0,
                 upload_progress_window_secs: 60,

@@ -510,7 +510,13 @@ async fn conditional_request_timeout(
     if is_byte_transfer_path(req.uri().path()) {
         return next.run(req).await;
     }
-    match tokio::time::timeout(timeout, next.run(req)).await {
+    // A scan gate has to answer inside what is left of this clock (#5231).
+    let answer_by = tokio::time::Instant::now()
+        + crate::api::handlers::proxy_scan_inflight::answer_within(timeout.as_secs())
+            .unwrap_or(timeout);
+    let request = crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY
+        .scope(answer_by, next.run(req));
+    match tokio::time::timeout(timeout, request).await {
         Ok(response) => response,
         Err(_) => request_timed_out_response(),
     }
