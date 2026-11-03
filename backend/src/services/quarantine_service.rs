@@ -148,8 +148,8 @@ pub enum HoldAnswer {
     /// 403: the repository's scan policy refuses the artifact.
     ScanPolicy,
     /// The recorded source does not settle it (no source: a hold written by
-    /// the scanner, by a 1.11 replica during a rolling upgrade, or before
-    /// migration 299; or a source that contradicts the row): ask the scan
+    /// a scanner before #5153, by a 1.11 replica during a rolling upgrade, or
+    /// before migration 299; or a source that contradicts the row): ask the scan
     /// policy, the same evaluation the gate's policy half runs.
     AskPolicy,
 }
@@ -590,6 +590,52 @@ pub async fn transition(
     }
 
     Ok(())
+}
+
+/// Release a scan-policy hold whose policy no longer refuses the artifact (#5153).
+///
+/// A hold with `quarantine_source = 'scan_policy'` exists only because of the
+/// policy. The caller has evaluated the policy and found it allows the artifact.
+/// The guard is on the whole predicate, so an administrator's hold, an upload
+/// hold, a rejection and a hold with no recorded origin (which may be an
+/// administrator's) are never released here, including one set since that
+/// evaluation. Returns whether a hold was released, and audits it.
+pub async fn release_cleared_scan_policy_hold(
+    db: &PgPool,
+    artifact_id: Uuid,
+    actor: Option<Uuid>,
+    released_by: &str,
+) -> Result<bool> {
+    let released = sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL, \
+             quarantine_reason = NULL, quarantine_source = NULL \
+         WHERE id = $1 AND quarantine_status = 'quarantined' \
+           AND quarantine_until IS NULL AND quarantine_source = 'scan_policy'",
+    )
+    .bind(artifact_id)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .rows_affected()
+        == 1;
+    if released {
+        let mut entry = crate::services::audit_service::AuditEntry::new(
+            crate::services::audit_service::AuditAction::QuarantineReleased,
+            crate::services::audit_service::ResourceType::Artifact,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "previous_status": "quarantined",
+            "released_by": released_by,
+        }));
+        if let Some(actor) = actor {
+            entry = entry.user(actor);
+        }
+        crate::services::audit_service::audit_fire_and_forget(db.clone(), entry).await;
+        tracing::info!(%artifact_id, released_by, "Scan-policy hold released: the policy no longer refuses the artifact");
+    }
+    Ok(released)
 }
 
 /// Pure legality check for the admin quarantine-now action (#2912).

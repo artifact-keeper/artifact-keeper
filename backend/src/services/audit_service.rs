@@ -260,6 +260,16 @@ pub enum AuditAction {
     /// per minute so a CI loop retrying a blocked pull writes at most two
     /// rows a minute per replica; see [`record_proxy_scan_blocked`].
     ProxyScanBlocked,
+    /// An administrator accepted a finding: a decision about an advisory in a
+    /// component of specific bytes (#5153).
+    FindingAcknowledged,
+    /// An acknowledgement was revoked. One row per decision the revoke reached.
+    FindingAcknowledgementRevoked,
+    /// A promotion copied an acknowledgement into the target repository. The
+    /// actor is the promoter; the decision stays that of its original author.
+    FindingAcknowledgementCarried,
+    /// An acknowledgement reached its expiry and stopped applying.
+    FindingAcknowledgementExpired,
 }
 
 impl AuditAction {
@@ -328,6 +338,10 @@ impl AuditAction {
             AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
             AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
             AuditAction::RepositoryAllowlistChanged => "REPOSITORY_ALLOWLIST_CHANGED",
+            AuditAction::FindingAcknowledged => "FINDING_ACKNOWLEDGED",
+            AuditAction::FindingAcknowledgementRevoked => "FINDING_ACKNOWLEDGEMENT_REVOKED",
+            AuditAction::FindingAcknowledgementCarried => "FINDING_ACKNOWLEDGEMENT_CARRIED",
+            AuditAction::FindingAcknowledgementExpired => "FINDING_ACKNOWLEDGEMENT_EXPIRED",
             AuditAction::QuarantineReleased => "QUARANTINE_RELEASED",
             AuditAction::QuarantineRejected => "QUARANTINE_REJECTED",
             AuditAction::PromotionApprovalGranted => "PROMOTION_APPROVAL_GRANTED",
@@ -2013,6 +2027,26 @@ mod tests {
     fn test_core_privileged_action_names_and_outcomes() {
         use crate::services::audit_export::Outcome;
         let cases = [
+            (
+                AuditAction::FindingAcknowledged,
+                "FINDING_ACKNOWLEDGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementRevoked,
+                "FINDING_ACKNOWLEDGEMENT_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementCarried,
+                "FINDING_ACKNOWLEDGEMENT_CARRIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementExpired,
+                "FINDING_ACKNOWLEDGEMENT_EXPIRED",
+                Outcome::Success,
+            ),
             (
                 AuditAction::QuarantineReleased,
                 "QUARANTINE_RELEASED",

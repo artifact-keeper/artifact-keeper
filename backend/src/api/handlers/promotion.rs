@@ -933,6 +933,31 @@ fn screen_bulk_item(
     }
 }
 
+/// Give a promoted copy its source's scan verdict and acknowledgements (#5153).
+///
+/// The bytes are already in the target and the promotion is already recorded, so
+/// a failure here does not undo it. It leaves the copy unscanned and its findings
+/// unacknowledged, which is the fail-closed state a target policy refuses.
+pub(super) async fn carry_scan_state_to_promoted(
+    db: &sqlx::PgPool,
+    source_artifact_id: Uuid,
+    new_artifact_id: Uuid,
+    promoted_by: Uuid,
+) {
+    if let Err(e) =
+        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(db.clone())
+            .carry_to_promoted_artifact(source_artifact_id, new_artifact_id, promoted_by)
+            .await
+    {
+        tracing::warn!(
+            source_artifact = %source_artifact_id,
+            new_artifact = %new_artifact_id,
+            error = %e,
+            "Promoted copy did not receive its scan state; it stays unscanned until scanned"
+        );
+    }
+}
+
 /// Insert the target-repository row for a promoted artifact.
 ///
 /// Shared by the single and bulk promote paths, which wrote byte-identical
@@ -957,7 +982,9 @@ async fn insert_promoted_artifact_row(
     // the image pullable commit together (#4578).
     let mut tx = db.begin().await?;
     // NO-SCAN-ON-UPLOAD: promotion copies an existing artifact whose own scans
-    // gated the promotion; it is not an upload (#4166 scope).
+    // gated the promotion; it is not an upload (#4166 scope). Those scans and the
+    // acknowledgements on them travel with the copy (#5153,
+    // `carry_scan_state_to_promoted`).
     // NO-QUOTA-ADMISSION: a promotion copy, not a client publish; whether a
     // promotion is bounded by the target's storage quota is open (#4422).
     sqlx::query!(
@@ -1389,6 +1416,8 @@ pub async fn promote_artifact(
     )
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
+
+    carry_scan_state_to_promoted(&state.db, artifact_id, new_artifact_id, auth.user_id).await;
 
     // #3939: the copy is a new artifact in the target repository, written
     // with raw SQL rather than through `finalize_upload`, so the promotion
@@ -1824,6 +1853,8 @@ pub async fn promote_artifacts_bulk(
             },
         )
         .await;
+
+        carry_scan_state_to_promoted(&state.db, *artifact_id, new_artifact_id, auth.user_id).await;
 
         // #3939: same per-copy event as the single-promote path.
         state
@@ -4729,6 +4760,134 @@ mod tests {
             );
 
             cleanup(&pool, &[src, tgt], corp_admin).await;
+        }
+
+        /// Seed a completed scan with one high finding on `artifact` and acknowledge
+        /// it. Returns the scan id.
+        async fn seed_acknowledged_scan(
+            pool: &PgPool,
+            repo: Uuid,
+            artifact: Uuid,
+            by: Uuid,
+        ) -> Uuid {
+            let scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                                           findings_count, high_count, completed_at) \
+                 VALUES ($1, $2, 'dependency', 'completed', 1, 1, NOW()) RETURNING id",
+            )
+            .bind(artifact)
+            .bind(repo)
+            .fetch_one(pool)
+            .await
+            .expect("insert scan");
+            let finding: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                            affected_component, affected_version) \
+                 VALUES ($1, $2, 'high', 'seed', 'CVE-2031-5153', 'lodash', '4') RETURNING id",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .fetch_one(pool)
+            .await
+            .expect("insert finding");
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                pool.clone(),
+            )
+            .acknowledge_finding(finding, Some(by), Some("accepted"), Default::default())
+            .await
+            .expect("acknowledge");
+            scan
+        }
+
+        /// #5153: both promote routes hand the copy its verdict and decisions, so
+        /// the target's policy sees a scanned artifact with an accepted finding.
+        #[tokio::test]
+        async fn test_promote_carries_verdict_and_acknowledgements_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "c5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "c5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "c5153").await;
+            sqlx::query(
+                "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                            block_on_fail, is_enabled) \
+                 VALUES ($1, $2, 'high', true, false, true)",
+            )
+            .bind(format!("c5153-{tgt}"))
+            .bind(tgt)
+            .execute(&pool)
+            .await
+            .expect("target policy");
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+
+            let single = make_artifact(&pool, src, &storage, "c5153a").await;
+            seed_acknowledged_scan(&pool, src, single, user).await;
+            let res = promote_artifact(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path((src_key.clone(), single)),
+                Json(PromoteArtifactRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("single promote");
+            assert!(res.0.promoted, "{:?}", res.0.message);
+
+            let bulk = make_artifact(&pool, src, &storage, "c5153b").await;
+            seed_acknowledged_scan(&pool, src, bulk, user).await;
+            let res = promote_artifacts_bulk(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(tgt_key.clone()),
+                    artifact_ids: vec![bulk],
+                    skip_policy_check: true,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote");
+            assert_eq!(res.0.promoted, 1, "{:?}", res.0.results);
+
+            let copies: Vec<Uuid> =
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(tgt)
+                    .fetch_all(&pool)
+                    .await
+                    .expect("copies");
+            assert_eq!(copies.len(), 2);
+            for copy in copies {
+                let result = crate::services::policy_service::PolicyService::new(pool.clone())
+                    .evaluate_artifact(copy, tgt)
+                    .await
+                    .expect("evaluate");
+                assert!(
+                    result.allowed,
+                    "the copy must arrive scanned and acknowledged: {:?}",
+                    result.violations
+                );
+                let (rows, acknowledged): (i64, i64) = sqlx::query_as(
+                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE is_acknowledged) \
+                     FROM scan_findings_effective WHERE artifact_id = $1",
+                )
+                .bind(copy)
+                .fetch_one(&pool)
+                .await
+                .expect("copied findings");
+                assert_eq!((rows, acknowledged), (1, 1));
+            }
+
+            cleanup(&pool, &[src, tgt], user).await;
         }
 
         /// Same-tenant SINGLE promote: tenant admin owns BOTH repos -> succeeds.

@@ -27,8 +27,8 @@
 //!    The same advisory reported for several packages of one artifact, or by
 //!    several scanners, is one vulnerability.
 //! 3. **Severity.** The highest severity any of those scans reported for it.
-//! 4. **Open or acknowledged.** Acknowledged only when every finding row
-//!    behind it is acknowledged. The severity counts are of OPEN
+//! 4. **Open or acknowledged.** Acknowledged only when a decision covers every
+//!    finding row behind it (#5153, `scan_findings_effective`). The severity counts are of OPEN
 //!    vulnerabilities; acknowledged ones are counted separately.
 
 use serde::Serialize;
@@ -95,7 +95,7 @@ vulnerabilities AS (
            {key} AS advisory,
            MAX({rank}) AS severity_rank,
            BOOL_AND(sf.is_acknowledged) AS acknowledged
-    FROM scan_findings sf
+    FROM scan_findings_effective sf
     JOIN latest_scans ls ON ls.id = sf.scan_result_id
     GROUP BY sf.artifact_id, {key}
 )"#,

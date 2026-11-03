@@ -443,6 +443,9 @@ pub struct ScanResult {
 }
 
 /// An individual vulnerability finding within a scan.
+///
+/// Read from `scan_findings_effective`: the acknowledged fields come from the
+/// decision covering the finding (#5153), not from the row itself.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ScanFinding {
     pub id: Uuid,
@@ -461,6 +464,12 @@ pub struct ScanFinding {
     pub acknowledged_by: Option<Uuid>,
     pub acknowledged_reason: Option<String>,
     pub acknowledged_at: Option<DateTime<Utc>>,
+    /// The decision covering this finding (#5153), when one does.
+    #[serde(default)]
+    pub acknowledgement_id: Option<Uuid>,
+    /// When that decision stops applying; `None` means until revoked.
+    #[serde(default)]
+    pub acknowledgement_expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// `vulnerability`, `malicious` or `policy` (#3013). See [`FindingClass`].
     pub finding_class: String,

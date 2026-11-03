@@ -1049,6 +1049,14 @@ pub async fn approve_promotion(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+    super::promotion::carry_scan_state_to_promoted(
+        &state.db,
+        artifact.id,
+        new_artifact_id,
+        auth.user_id,
+    )
+    .await;
+
     // Record promotion history
     let promotion_id = Uuid::new_v4();
     sqlx::query(
@@ -3127,6 +3135,17 @@ mod tests {
                 make_artifact_with_origin(&pool, src, &storage, "ao4152", &proxy_origin).await;
             let requester = make_requester(&pool, "ao4152").await;
             let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+            // #5153: the third promote path hands over the verdict too.
+            let source_scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                                           completed_at) \
+                 VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+            )
+            .bind(artifact)
+            .bind(src)
+            .fetch_one(&pool)
+            .await
+            .expect("source scan");
 
             let res = approve_promotion(
                 State(state.clone()),
@@ -3149,6 +3168,18 @@ mod tests {
                 proxy_origin,
                 "the approval copy must record the SOURCE artifact's origin \
                  byte-for-byte, not a fresh derivation for the target repo"
+            );
+            let carried: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scan_results WHERE repository_id = $1 AND source_scan_id = $2",
+            )
+            .bind(tgt)
+            .bind(source_scan)
+            .fetch_one(&pool)
+            .await
+            .expect("carried scan");
+            assert_eq!(
+                carried, 1,
+                "the approval copy must carry the source's verdict"
             );
 
             cleanup(&pool, &[src, tgt], user).await;

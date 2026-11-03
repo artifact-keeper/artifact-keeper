@@ -1,0 +1,1405 @@
+//! Regression tests for #5153: an acknowledgement is a decision about an
+//! advisory in a component of specific bytes, not a flag on one finding row.
+//!
+//! Every scenario goes through the real write paths (`create_findings`,
+//! `copy_scan_results`, `convert_to_reused`) and asserts on the readers an
+//! operator depends on: the scan-policy gate, the finding listing and the
+//! shared severity counts.
+//!
+//! ```sh
+//! AK_TESTS_REQUIRE_DB=1 DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" \
+//!   cargo nextest run --run-ignored ignored-only --test finding_acknowledgement_tests
+//! ```
+
+use std::path::PathBuf;
+
+use chrono::{Duration, Utc};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use artifact_keeper_backend::error::AppError;
+use artifact_keeper_backend::models::sbom::CveStatus;
+use artifact_keeper_backend::models::security::{FindingClass, RawFinding, ScanResult, Severity};
+use artifact_keeper_backend::services::finding_acknowledgements::{
+    AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope, FindingAcknowledgementService,
+};
+use artifact_keeper_backend::services::open_findings::{severity_counts, FindingScope};
+use artifact_keeper_backend::services::policy_service::PolicyService;
+use artifact_keeper_backend::services::quarantine_service::enforce_download_gate;
+use artifact_keeper_backend::services::sbom_service::SbomService;
+use artifact_keeper_backend::services::scan_result_service::{
+    FindingListFilter, ScanResultService,
+};
+
+const LODASH: &str = "lodash";
+const CVE_A: &str = "CVE-2021-23337";
+const CVE_B: &str = "CVE-2020-8203";
+
+struct Fx {
+    pool: PgPool,
+    svc: ScanResultService,
+    admin: Uuid,
+    repos: Vec<Uuid>,
+}
+
+impl Fx {
+    async fn new() -> Self {
+        let pool = PgPool::connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+            .await
+            .expect("connect");
+        let admin = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
+             VALUES ($1, $2, $3, 'unused', 'local', true, true)",
+        )
+        .bind(admin)
+        .bind(format!("ack-admin-{admin}"))
+        .bind(format!("ack-admin-{admin}@test.local"))
+        .execute(&pool)
+        .await
+        .expect("insert admin");
+        Self {
+            svc: ScanResultService::new(pool.clone()),
+            pool,
+            admin,
+            repos: Vec::new(),
+        }
+    }
+
+    /// A hosted repository whose enabled policy blocks `high` and above.
+    async fn repo(&mut self) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+             VALUES ($1, $2, $2, $3, 'local', 'generic')",
+        )
+        .bind(id)
+        .bind(format!("ack-5153-{id}"))
+        .bind(format!("/tmp/ack-5153-{id}"))
+        .execute(&self.pool)
+        .await
+        .expect("insert repo");
+        sqlx::query(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+                                        block_on_fail, is_enabled) \
+             VALUES ($1, $2, 'high', false, false, true)",
+        )
+        .bind(format!("ack-5153-{id}"))
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .expect("insert policy");
+        self.repos.push(id);
+        id
+    }
+
+    async fn artifact(&self, repo: Uuid, name: &str, digest: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let path = format!("{id}/{name}");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'application/octet-stream', $4)",
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(name)
+        .bind(&path)
+        .bind(digest)
+        .execute(&self.pool)
+        .await
+        .expect("insert artifact");
+        id
+    }
+
+    /// One completed scan through the real writers. Returns its id.
+    async fn scan(
+        &self,
+        repo: Uuid,
+        artifact: Uuid,
+        scan_type: &str,
+        findings: &[RawFinding],
+    ) -> Uuid {
+        let digest: String =
+            sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&self.pool)
+                .await
+                .expect("digest");
+        let row = self
+            .svc
+            .create_scan_result_with_checksum(artifact, repo, scan_type, Some(digest.trim()))
+            .await
+            .expect("create scan");
+        self.svc
+            .create_findings(row.id, artifact, findings)
+            .await
+            .expect("create findings");
+        self.complete(row.id, findings.len() as i32, "complete")
+            .await;
+        row.id
+    }
+
+    async fn unfinished_scan(&self, repo: Uuid, artifact: Uuid) -> ScanResult {
+        let digest: String =
+            sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&self.pool)
+                .await
+                .expect("digest");
+        self.svc
+            .create_scan_result_with_checksum(artifact, repo, "dependency", Some(digest.trim()))
+            .await
+            .expect("create scan")
+    }
+
+    async fn complete(&self, scan: Uuid, count: i32, completeness: &str) {
+        self.svc
+            .complete_scan(
+                scan,
+                count,
+                0,
+                count,
+                0,
+                0,
+                0,
+                Some("test-1"),
+                Utc::now(),
+                completeness,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("complete scan");
+    }
+
+    async fn finding_ids(&self, scan: Uuid) -> Vec<Uuid> {
+        sqlx::query_scalar("SELECT id FROM scan_findings WHERE scan_result_id = $1 ORDER BY id")
+            .bind(scan)
+            .fetch_all(&self.pool)
+            .await
+            .expect("finding ids")
+    }
+
+    async fn ack_scan(&self, scan: Uuid) {
+        for id in self.finding_ids(scan).await {
+            self.svc
+                .acknowledge_finding(id, self.admin, "accepted: SEC-421", Default::default())
+                .await
+                .expect("acknowledge");
+        }
+    }
+
+    async fn allowed(&self, repo: Uuid, artifact: Uuid) -> bool {
+        PolicyService::new(self.pool.clone())
+            .evaluate_artifact(artifact, repo)
+            .await
+            .expect("evaluate")
+            .allowed
+    }
+
+    /// Whether the listing reports every finding of `scan` as acknowledged.
+    async fn listed_acknowledged(&self, scan: Uuid) -> bool {
+        let filter = no_filter();
+        let (rows, total) = self
+            .svc
+            .list_findings(scan, &filter, 0, 100)
+            .await
+            .expect("list");
+        assert!(total > 0, "scan {scan} has no findings to judge");
+        rows.iter().all(|f| f.is_acknowledged)
+    }
+
+    async fn open_count(&self, artifact: Uuid) -> i64 {
+        severity_counts(&self.pool, FindingScope::Artifact(artifact))
+            .await
+            .expect("counts")
+            .open
+    }
+
+    /// The audit write is fire-and-forget, so poll until the row lands.
+    async fn audit_count(&self, action: &str, needle: &str) -> i64 {
+        let mut count = 0;
+        for _ in 0..100 {
+            count = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND details::text LIKE $2",
+            )
+            .bind(action)
+            .bind(format!("%{needle}%"))
+            .fetch_one(&self.pool)
+            .await
+            .expect("audit count");
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        count
+    }
+
+    async fn cleanup(self) {
+        sqlx::query("DELETE FROM artifacts WHERE repository_id = ANY($1)")
+            .bind(&self.repos)
+            .execute(&self.pool)
+            .await
+            .expect("remove artifacts");
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(&self.repos)
+            .execute(&self.pool)
+            .await
+            .expect("remove repositories");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(self.admin)
+            .execute(&self.pool)
+            .await
+            .expect("remove admin");
+    }
+}
+
+fn no_filter() -> FindingListFilter<'static> {
+    FindingListFilter {
+        severity: None,
+        source: None,
+        cve_id: None,
+        finding_class: None,
+    }
+}
+
+fn digest() -> String {
+    format!("{:064x}", Uuid::new_v4().as_u128())
+}
+
+fn finding(cve: &str, component: &str, version: &str) -> RawFinding {
+    finding_from(cve, component, version, "grype", Severity::High)
+}
+
+fn finding_from(
+    cve: &str,
+    component: &str,
+    version: &str,
+    source: &str,
+    severity: Severity,
+) -> RawFinding {
+    RawFinding {
+        severity,
+        title: format!("{cve} in {component}"),
+        description: None,
+        cve_id: Some(cve.to_string()),
+        affected_component: Some(component.to_string()),
+        affected_version: Some(version.to_string()),
+        fixed_version: None,
+        source: Some(source.to_string()),
+        source_url: None,
+        finding_class: FindingClass::Vulnerability,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Survival
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn acknowledgement_survives_a_rescan() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "lodash.tgz", &digest()).await;
+    let findings = [finding(CVE_A, LODASH, "4.17.15")];
+
+    let first = fx.scan(repo, artifact, "dependency", &findings).await;
+    assert!(
+        !fx.allowed(repo, artifact).await,
+        "unacknowledged high must block"
+    );
+    fx.ack_scan(first).await;
+    assert!(
+        fx.allowed(repo, artifact).await,
+        "acknowledged high must not block"
+    );
+
+    let rescan = fx.scan(repo, artifact, "dependency", &findings).await;
+    assert!(
+        fx.allowed(repo, artifact).await,
+        "the rescan's identical finding must stay covered"
+    );
+    assert!(
+        fx.listed_acknowledged(rescan).await,
+        "the listing must report the rescan's row as acknowledged"
+    );
+    let counts = severity_counts(&fx.pool, FindingScope::Artifact(artifact))
+        .await
+        .expect("counts");
+    assert_eq!((counts.open, counts.acknowledged), (0, 1));
+    enforce_download_gate(&fx.pool, artifact)
+        .await
+        .expect("the download gate must serve it");
+
+    fx.cleanup().await;
+}
+
+/// Walkthrough finding F6: two engines reporting one CVE in one component are
+/// one decision, not two.
+#[tokio::test]
+#[ignore]
+async fn one_decision_covers_every_engine_reporting_the_same_component() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "lodash.tgz", &digest()).await;
+
+    let grype = fx
+        .scan(
+            repo,
+            artifact,
+            "image",
+            &[finding(CVE_A, LODASH, "4.17.15")],
+        )
+        .await;
+    let osv = fx
+        .scan(
+            repo,
+            artifact,
+            "dependency",
+            &[finding_from(
+                CVE_A,
+                LODASH,
+                "4.17.15",
+                "osv.dev",
+                Severity::High,
+            )],
+        )
+        .await;
+    assert!(!fx.allowed(repo, artifact).await);
+
+    fx.ack_scan(grype).await;
+    assert!(fx.listed_acknowledged(osv).await);
+    assert!(fx.allowed(repo, artifact).await);
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn acknowledgement_survives_a_dedup_copy_of_the_same_bytes_in_the_repository() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(repo, "a.tgz", &d).await;
+    let source = fx
+        .scan(
+            repo,
+            original,
+            "dependency",
+            &[finding(CVE_A, LODASH, "4.17.15")],
+        )
+        .await;
+    fx.ack_scan(source).await;
+
+    // copy_scan_results: the auto-scan path.
+    let copy = fx.artifact(repo, "b.tgz", &d).await;
+    let copied = fx
+        .svc
+        .copy_scan_results(source, copy, repo, "dependency", &d, None)
+        .await
+        .expect("copy");
+    assert!(fx.listed_acknowledged(copied.id).await, "copy_scan_results");
+    assert!(fx.allowed(repo, copy).await, "copy_scan_results gate");
+
+    // convert_to_reused: the trigger-scan path.
+    let converted_artifact = fx.artifact(repo, "c.tgz", &d).await;
+    let placeholder = fx
+        .svc
+        .create_scan_result_with_checksum(converted_artifact, repo, "dependency", Some(&d))
+        .await
+        .expect("placeholder");
+    fx.svc
+        .convert_to_reused(placeholder.id, source, converted_artifact, None)
+        .await
+        .expect("convert");
+    assert!(
+        fx.listed_acknowledged(placeholder.id).await,
+        "convert_to_reused"
+    );
+    assert!(
+        fx.allowed(repo, converted_artifact).await,
+        "convert_to_reused gate"
+    );
+
+    fx.cleanup().await;
+}
+
+/// The scope decision of #5153: an acknowledgement made in one repository does
+/// not silently open another repository's gate for the same bytes. The
+/// operator can say so explicitly.
+#[tokio::test]
+#[ignore]
+async fn a_cross_repository_dedup_copy_is_covered_only_when_the_operator_said_so() {
+    let mut fx = Fx::new().await;
+    let dev = fx.repo().await;
+    let prod = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(dev, "a.tgz", &d).await;
+    let source = fx
+        .scan(
+            dev,
+            original,
+            "dependency",
+            &[finding(CVE_A, LODASH, "4.17.15")],
+        )
+        .await;
+    fx.ack_scan(source).await;
+
+    let in_prod = fx.artifact(prod, "a.tgz", &d).await;
+    let copied = fx
+        .svc
+        .copy_scan_results(source, in_prod, prod, "dependency", &d, None)
+        .await
+        .expect("copy");
+    assert!(
+        !fx.allowed(prod, in_prod).await,
+        "a repository-scoped acknowledgement must not open another repository's gate"
+    );
+    assert!(!fx.listed_acknowledged(copied.id).await);
+    assert!(
+        fx.allowed(dev, original).await,
+        "the original stays covered"
+    );
+
+    // Explicit widening.
+    let id = fx.finding_ids(source).await[0];
+    fx.svc
+        .acknowledge_finding(
+            id,
+            fx.admin,
+            "accepted everywhere: SEC-421",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("widen");
+    assert!(fx.allowed(prod, in_prod).await, "explicitly widened");
+    assert!(fx.listed_acknowledged(copied.id).await);
+
+    // And the widened decision is revoked as one thing.
+    fx.svc
+        .revoke_acknowledgment(id, fx.admin)
+        .await
+        .expect("revoke");
+    assert!(!fx.allowed(prod, in_prod).await);
+    assert!(!fx.allowed(dev, original).await);
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn acknowledgement_survives_promotion_and_the_verdict_travels_with_it() {
+    let mut fx = Fx::new().await;
+    let staging = fx.repo().await;
+    let release = fx.repo().await;
+    sqlx::query("UPDATE scan_policies SET block_unscanned = true WHERE repository_id = $1")
+        .bind(release)
+        .execute(&fx.pool)
+        .await
+        .expect("block_unscanned");
+    let d = digest();
+    let original = fx.artifact(staging, "a.tgz", &d).await;
+    let source = fx
+        .scan(
+            staging,
+            original,
+            "dependency",
+            &[finding(CVE_A, LODASH, "4.17.15")],
+        )
+        .await;
+    fx.ack_scan(source).await;
+
+    let promoted = fx.artifact(release, "a.tgz", &d).await;
+    assert!(
+        !fx.allowed(release, promoted).await,
+        "before the carry the promoted row has no scan on record"
+    );
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .await
+        .expect("carry");
+    assert!(
+        fx.allowed(release, promoted).await,
+        "the promoted copy carries the verdict and the decision"
+    );
+    let copied: Uuid = sqlx::query_scalar(
+        "SELECT id FROM scan_results WHERE artifact_id = $1 AND source_scan_id = $2",
+    )
+    .bind(promoted)
+    .bind(source)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("the copied verdict records its provenance");
+    assert!(fx.listed_acknowledged(copied).await);
+
+    // A later rescan on the target keeps it.
+    fx.scan(
+        release,
+        promoted,
+        "dependency",
+        &[finding(CVE_A, LODASH, "4.17.15")],
+    )
+    .await;
+    assert!(fx.allowed(release, promoted).await, "rescan on the target");
+
+    fx.cleanup().await;
+}
+
+/// A copied verdict is provenance, not a pin: a staging repository can be emptied
+/// after its artifacts were promoted, and the copy keeps its findings.
+#[tokio::test]
+#[ignore]
+async fn the_source_of_a_carried_verdict_can_still_be_deleted() {
+    let mut fx = Fx::new().await;
+    let staging = fx.repo().await;
+    let release = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(staging, "a.tgz", &d).await;
+    let source = fx
+        .scan(
+            staging,
+            original,
+            "dependency",
+            &[finding(CVE_A, LODASH, "1")],
+        )
+        .await;
+    fx.ack_scan(source).await;
+    let promoted = fx.artifact(release, "a.tgz", &d).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .await
+        .expect("carry");
+
+    sqlx::query("DELETE FROM repositories WHERE id = $1")
+        .bind(staging)
+        .execute(&fx.pool)
+        .await
+        .expect("the source repository can be deleted");
+    fx.repos.retain(|r| *r != staging);
+
+    let (source_scan, reused): (Option<Uuid>, bool) =
+        sqlx::query_as("SELECT source_scan_id, is_reused FROM scan_results WHERE artifact_id = $1")
+            .bind(promoted)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("the copy remains");
+    assert_eq!(source_scan, None);
+    assert!(reused);
+    assert!(
+        fx.allowed(release, promoted).await,
+        "the carried decision belongs to the target and stays"
+    );
+    fx.cleanup().await;
+}
+
+/// Promotion carries an open finding as open: nothing acknowledged in the
+/// source means nothing covered in the target.
+#[tokio::test]
+#[ignore]
+async fn promotion_does_not_invent_a_decision_for_an_open_finding() {
+    let mut fx = Fx::new().await;
+    let staging = fx.repo().await;
+    let release = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(staging, "a.tgz", &d).await;
+    fx.scan(
+        staging,
+        original,
+        "dependency",
+        &[finding(CVE_A, LODASH, "4.17.15")],
+    )
+    .await;
+    let promoted = fx.artifact(release, "a.tgz", &d).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .await
+        .expect("carry");
+    assert!(
+        !fx.allowed(release, promoted).await,
+        "the copied open finding must block in the target"
+    );
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Revoke
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn revoke_applies_everywhere_the_decision_reached() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let target = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(repo, "a.tgz", &d).await;
+    let findings = [finding(CVE_A, LODASH, "4.17.15")];
+    let first = fx.scan(repo, original, "dependency", &findings).await;
+    fx.ack_scan(first).await;
+    let rescan = fx.scan(repo, original, "dependency", &findings).await;
+    let copy = fx.artifact(repo, "b.tgz", &d).await;
+    let copied = fx
+        .svc
+        .copy_scan_results(first, copy, repo, "dependency", &d, None)
+        .await
+        .expect("copy");
+    let promoted = fx.artifact(target, "a.tgz", &d).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .await
+        .expect("carry");
+    assert!(fx.allowed(repo, original).await);
+    assert!(fx.allowed(repo, copy).await);
+    assert!(fx.allowed(target, promoted).await);
+
+    // Revoked through the OLDEST row: the old scan is not special.
+    let oldest = fx.finding_ids(first).await[0];
+    let revoked = fx
+        .svc
+        .revoke_acknowledgment(oldest, fx.admin)
+        .await
+        .expect("revoke");
+    assert!(!revoked.is_acknowledged);
+
+    for (r, a, label) in [
+        (repo, original, "rescanned artifact"),
+        (repo, copy, "dedup copy"),
+        (target, promoted, "promoted copy"),
+    ] {
+        assert!(!fx.allowed(r, a).await, "{label} must block after a revoke");
+    }
+    for scan in [first, rescan, copied.id] {
+        let filter = no_filter();
+        let (rows, _) = fx
+            .svc
+            .list_findings(scan, &filter, 0, 10)
+            .await
+            .expect("list");
+        assert!(rows
+            .iter()
+            .all(|f| !f.is_acknowledged && f.acknowledged_by.is_none()));
+    }
+
+    // A later acknowledgement in the source is a new decision. It does not bring
+    // the revoked copy in the target back.
+    fx.ack_scan(rescan).await;
+    assert!(fx.allowed(repo, original).await);
+    assert!(
+        !fx.allowed(target, promoted).await,
+        "a new decision in the source must not reopen the target"
+    );
+
+    fx.cleanup().await;
+}
+
+/// A decision made again on a live identity joins its lineage, so a revoke still
+/// reaches what the first one was carried to.
+#[tokio::test]
+#[ignore]
+async fn re_acknowledging_keeps_the_reach_of_a_revoke() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let target = fx.repo().await;
+    let d = digest();
+    let original = fx.artifact(repo, "a.tgz", &d).await;
+    let scan = fx
+        .scan(repo, original, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    fx.ack_scan(scan).await;
+    let promoted = fx.artifact(target, "a.tgz", &d).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(original, promoted, fx.admin)
+        .await
+        .expect("carry");
+    fx.ack_scan(scan).await;
+    assert!(fx.allowed(repo, original).await);
+    assert!(fx.allowed(target, promoted).await);
+
+    let id = fx.finding_ids(scan).await[0];
+    fx.svc
+        .revoke_acknowledgment(id, fx.admin)
+        .await
+        .expect("revoke");
+    assert!(!fx.allowed(repo, original).await);
+    assert!(!fx.allowed(target, promoted).await);
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn revoking_a_finding_with_no_decision_changes_nothing_and_succeeds() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let id = fx.finding_ids(scan).await[0];
+    let f = fx
+        .svc
+        .revoke_acknowledgment(id, fx.admin)
+        .await
+        .expect("idempotent revoke");
+    assert!(!f.is_acknowledged);
+    let missing = fx.svc.revoke_acknowledgment(Uuid::new_v4(), fx.admin).await;
+    assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
+    fx.cleanup().await;
+}
+
+/// A decision can be seen and revoked with no finding row to reach it through,
+/// and its record stays after a revoke.
+#[tokio::test]
+#[ignore]
+async fn decisions_are_listed_and_revoked_by_id() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let d = digest();
+    let artifact = fx.artifact(repo, "a.tgz", &d).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    fx.ack_scan(scan).await;
+    let svc = FindingAcknowledgementService::new(fx.pool.clone());
+    let filter = AcknowledgementFilter {
+        repository_id: Some(repo),
+        checksum_sha256: Some(&d),
+        advisory: Some(&CVE_A.to_lowercase()),
+        include_inactive: false,
+    };
+    let (rows, total) = svc.list(filter, 0, 10).await.expect("list");
+    assert_eq!(total, 1);
+    assert_eq!(rows[0].state, "active");
+    assert_eq!(rows[0].component_key, LODASH);
+    assert_eq!(rows[0].acknowledged_by, Some(fx.admin));
+    assert_eq!(rows[0].max_severity_rank, 3);
+
+    assert_eq!(
+        svc.revoke(rows[0].id, Some(fx.admin))
+            .await
+            .expect("revoke"),
+        1
+    );
+    assert!(!fx.allowed(repo, artifact).await);
+    let (active, _) = svc.list(filter, 0, 10).await.expect("list active");
+    assert!(active.is_empty());
+    let (all, _) = svc
+        .list(
+            AcknowledgementFilter {
+                include_inactive: true,
+                ..filter
+            },
+            0,
+            10,
+        )
+        .await
+        .expect("list all");
+    assert_eq!(all[0].state, "revoked");
+    assert_eq!(all[0].revoked_by, Some(fx.admin));
+    assert_eq!(all[0].revoked_reason.as_deref(), Some("revoked"));
+
+    let missing = svc.revoke(Uuid::new_v4(), Some(fx.admin)).await;
+    assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Expiry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn an_expired_acknowledgement_stops_covering_without_any_sweep() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let findings = [finding(CVE_A, LODASH, "4.17.15")];
+    let scan = fx.scan(repo, artifact, "dependency", &findings).await;
+    let id = fx.finding_ids(scan).await[0];
+
+    let expires_at = Utc::now() + Duration::milliseconds(1500);
+    let acked = fx
+        .svc
+        .acknowledge_finding(
+            id,
+            fx.admin,
+            "until the upgrade",
+            AcknowledgeOptions {
+                expires_at: Some(expires_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("acknowledge");
+    assert!(acked.is_acknowledged);
+    assert!(fx.allowed(repo, artifact).await, "covered until it expires");
+    assert_eq!(fx.open_count(artifact).await, 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+
+    assert!(
+        !fx.allowed(repo, artifact).await,
+        "the gate honours expiry on its own"
+    );
+    assert!(!fx.listed_acknowledged(scan).await, "the listing too");
+    assert_eq!(fx.open_count(artifact).await, 1, "and the counts");
+
+    // The sweep records the lapse once and refreshes the stored score; it is
+    // not what makes the gate correct.
+    let svc = FindingAcknowledgementService::new(fx.pool.clone());
+    assert!(svc.record_expired().await.expect("sweep") >= 1);
+    let score_open: i32 =
+        sqlx::query_scalar("SELECT high_count FROM repo_security_scores WHERE repository_id = $1")
+            .bind(repo)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("score");
+    assert_eq!(score_open, 1, "the sweep refreshes the materialized score");
+    assert_eq!(
+        svc.record_expired().await.expect("second sweep"),
+        0,
+        "a lapse is recorded once"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn an_expiry_in_the_past_is_refused() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let id = fx.finding_ids(scan).await[0];
+    let res = fx
+        .svc
+        .acknowledge_finding(
+            id,
+            fx.admin,
+            "already over",
+            AcknowledgeOptions {
+                expires_at: Some(Utc::now() - Duration::hours(1)),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(res, Err(AppError::Validation(_))), "{res:?}");
+    assert!(!fx.allowed(repo, artifact).await);
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// What an acknowledgement never covers
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn a_new_finding_is_never_covered_by_an_old_acknowledgement() {
+    let cases: [(&str, RawFinding); 4] = [
+        ("a different CVE", finding(CVE_B, LODASH, "4.17.15")),
+        (
+            "the same CVE on another component",
+            finding(CVE_A, "underscore", "4.17.15"),
+        ),
+        (
+            "the same CVE on another version",
+            finding(CVE_A, LODASH, "4.17.20"),
+        ),
+        (
+            "the same finding at a higher severity than was accepted",
+            finding_from(CVE_A, LODASH, "4.17.15", "grype", Severity::Critical),
+        ),
+    ];
+    for (label, new) in cases {
+        let mut fx = Fx::new().await;
+        let repo = fx.repo().await;
+        let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+        let accepted = finding(CVE_A, LODASH, "4.17.15");
+        let first = fx
+            .scan(
+                repo,
+                artifact,
+                "dependency",
+                std::slice::from_ref(&accepted),
+            )
+            .await;
+        fx.ack_scan(first).await;
+        assert!(fx.allowed(repo, artifact).await);
+
+        let rescan = fx
+            .scan(repo, artifact, "dependency", &[accepted, new])
+            .await;
+        assert!(!fx.allowed(repo, artifact).await, "{label} must block");
+        assert!(
+            !fx.listed_acknowledged(rescan).await,
+            "{label} must list as open"
+        );
+        fx.cleanup().await;
+    }
+}
+
+/// Different bytes under the same coordinate are not the artifact the operator
+/// looked at, even when the scanner reports the same CVE in the same component.
+#[tokio::test]
+#[ignore]
+async fn different_bytes_are_not_covered() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let findings = [finding(CVE_A, LODASH, "4.17.15")];
+    let original = fx.artifact(repo, "a.tgz", &digest()).await;
+    let first = fx.scan(repo, original, "dependency", &findings).await;
+    fx.ack_scan(first).await;
+
+    let rebuilt = fx.artifact(repo, "a.tgz", &digest()).await;
+    fx.scan(repo, rebuilt, "dependency", &findings).await;
+    assert!(fx.allowed(repo, original).await);
+    assert!(!fx.allowed(repo, rebuilt).await);
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The gate reads the current scan
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn a_superseded_scan_no_longer_blocks() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    fx.scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    assert!(!fx.allowed(repo, artifact).await);
+    // The same engine no longer reports it.
+    fx.scan(repo, artifact, "dependency", &[]).await;
+    assert!(fx.allowed(repo, artifact).await, "history must not block");
+    fx.cleanup().await;
+}
+
+/// A later scan that could not assess the artifact does not clear what a
+/// complete scan reported.
+#[tokio::test]
+#[ignore]
+async fn an_incomplete_rescan_does_not_clear_the_previous_verdict() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    fx.scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+        .await;
+    let blind = fx.unfinished_scan(repo, artifact).await;
+    fx.complete(blind.id, 0, "not_cataloged").await;
+    assert!(
+        !fx.allowed(repo, artifact).await,
+        "a scan that cataloged nothing must not clear the finding"
+    );
+    fx.cleanup().await;
+}
+
+/// Findings from a scan that died before completing are still graded, and a
+/// newer crash can still add to an older completed verdict.
+#[tokio::test]
+#[ignore]
+async fn findings_of_a_crashed_rescan_are_still_graded() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    fx.scan(repo, artifact, "dependency", &[]).await;
+    assert!(fx.allowed(repo, artifact).await);
+    let crashed = fx.unfinished_scan(repo, artifact).await;
+    fx.svc
+        .create_findings(crashed.id, artifact, &[finding(CVE_A, LODASH, "1")])
+        .await
+        .expect("findings");
+    assert!(!fx.allowed(repo, artifact).await, "fail closed");
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// The other acknowledge path, audit, and the scan-policy hold (F5)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn the_security_tab_path_records_the_same_decision() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let findings = [
+        finding(CVE_A, LODASH, "4.17.15"),
+        finding(CVE_A, "underscore", "1.0"),
+        finding(CVE_B, LODASH, "4.17.15"),
+    ];
+    fx.scan(repo, artifact, "dependency", &findings).await;
+    let sbom = SbomService::new(fx.pool.clone());
+    sbom.update_cve_status_by_artifact_cve(
+        artifact,
+        CVE_A,
+        CveStatus::Acknowledged,
+        Some(fx.admin),
+        Some("not reachable"),
+    )
+    .await
+    .expect("acknowledge");
+    assert_eq!(fx.open_count(artifact).await, 1, "CVE_B stays open");
+
+    // Survives a rescan for both components of CVE_A, and only those.
+    let rescan = fx.scan(repo, artifact, "dependency", &findings).await;
+    let ack_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_findings_effective WHERE scan_result_id = $1 AND is_acknowledged",
+    )
+    .bind(rescan)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("effective rows");
+    assert_eq!(ack_rows, 2);
+
+    sbom.update_cve_status_by_artifact_cve(artifact, CVE_A, CveStatus::Open, Some(fx.admin), None)
+        .await
+        .expect("revoke");
+    assert_eq!(fx.open_count(artifact).await, 2);
+
+    let unknown = sbom
+        .update_cve_status_by_artifact_cve(
+            artifact,
+            "CVE-1999-0001",
+            CveStatus::Acknowledged,
+            Some(fx.admin),
+            None,
+        )
+        .await;
+    assert!(matches!(unknown, Err(AppError::NotFound(_))), "{unknown:?}");
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn acknowledge_revoke_and_lapse_are_audited() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let cve = format!("CVE-2031-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let scan = fx
+        .scan(repo, artifact, "dependency", &[finding(&cve, LODASH, "1")])
+        .await;
+    let needle = cve.to_uppercase();
+    let id = fx.finding_ids(scan).await[0];
+    fx.svc
+        .acknowledge_finding(id, fx.admin, "accepted", Default::default())
+        .await
+        .expect("ack");
+    assert_eq!(fx.audit_count("FINDING_ACKNOWLEDGED", &needle).await, 1);
+    fx.svc
+        .revoke_acknowledgment(id, fx.admin)
+        .await
+        .expect("revoke");
+    assert_eq!(
+        fx.audit_count("FINDING_ACKNOWLEDGEMENT_REVOKED", &needle)
+            .await,
+        1
+    );
+    fx.svc
+        .acknowledge_finding(
+            id,
+            fx.admin,
+            "short",
+            AcknowledgeOptions {
+                expires_at: Some(Utc::now() + Duration::milliseconds(300)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ack again");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .record_expired()
+        .await
+        .expect("sweep");
+    assert_eq!(
+        fx.audit_count("FINDING_ACKNOWLEDGEMENT_EXPIRED", &needle)
+            .await,
+        1
+    );
+    fx.cleanup().await;
+}
+
+async fn stamp_hold(fx: &Fx, artifact: Uuid, source: Option<&str>) {
+    sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+         quarantine_reason = 'held', quarantine_source = $2 WHERE id = $1",
+    )
+    .bind(artifact)
+    .bind(source)
+    .execute(&fx.pool)
+    .await
+    .expect("stamp hold");
+}
+
+async fn hold_status(fx: &Fx, artifact: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT quarantine_status FROM artifacts WHERE id = $1")
+        .bind(artifact)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("status")
+}
+
+/// Walkthrough finding F5: once every finding behind a scan-policy hold is
+/// acknowledged the hold is over. Before #5153 the artifact kept answering 409
+/// until an administrator released it by hand.
+#[tokio::test]
+#[ignore]
+async fn acknowledging_the_last_finding_releases_a_scan_policy_hold() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(
+            repo,
+            artifact,
+            "dependency",
+            &[finding(CVE_A, LODASH, "1"), finding(CVE_B, LODASH, "1")],
+        )
+        .await;
+    stamp_hold(&fx, artifact, Some("scan_policy")).await;
+    let ids = fx.finding_ids(scan).await;
+
+    fx.svc
+        .acknowledge_finding(ids[0], fx.admin, "accepted", Default::default())
+        .await
+        .expect("first");
+    assert_eq!(
+        hold_status(&fx, artifact).await.as_deref(),
+        Some("quarantined"),
+        "one finding is still open"
+    );
+    assert!(enforce_download_gate(&fx.pool, artifact).await.is_err());
+
+    fx.svc
+        .acknowledge_finding(ids[1], fx.admin, "accepted", Default::default())
+        .await
+        .expect("second");
+    assert_eq!(
+        hold_status(&fx, artifact).await.as_deref(),
+        Some("released")
+    );
+    enforce_download_gate(&fx.pool, artifact)
+        .await
+        .expect("the hold is over");
+    let mut audited: i64 = 0;
+    for _ in 0..100 {
+        audited = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'QUARANTINE_RELEASED' AND resource_id = $1",
+        )
+        .bind(artifact)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("audit");
+        if audited > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(audited, 1);
+
+    // A revoke reopens the block through the live policy half of the gate.
+    fx.svc
+        .revoke_acknowledgment(ids[1], fx.admin)
+        .await
+        .expect("revoke");
+    assert!(matches!(
+        enforce_download_gate(&fx.pool, artifact).await,
+        Err(AppError::Authorization(_))
+    ));
+    fx.cleanup().await;
+}
+
+/// An acknowledgement answers for findings, not for a person's decision to
+/// hold an artifact, or for a hold whose origin nobody recorded.
+#[tokio::test]
+#[ignore]
+async fn acknowledging_never_releases_a_hold_that_is_not_a_scan_policy_hold() {
+    for source in [Some("admin"), None] {
+        let mut fx = Fx::new().await;
+        let repo = fx.repo().await;
+        let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+        let scan = fx
+            .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+            .await;
+        stamp_hold(&fx, artifact, source).await;
+        fx.ack_scan(scan).await;
+        assert_eq!(
+            hold_status(&fx, artifact).await.as_deref(),
+            Some("quarantined"),
+            "source {source:?}"
+        );
+        assert!(matches!(
+            enforce_download_gate(&fx.pool, artifact).await,
+            Err(AppError::Conflict(_))
+        ));
+        fx.cleanup().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Migration
+// ---------------------------------------------------------------------------
+
+fn migration_backfill_sql() -> String {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let file = std::fs::read_dir(&dir)
+        .expect("migrations dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("_finding_acknowledgements.sql"))
+        })
+        .expect("the #5153 migration exists");
+    let sql = std::fs::read_to_string(file).expect("read migration");
+    let start = sql
+        .find("-- BEGIN backfill")
+        .expect("backfill start marker");
+    let end = sql.find("-- END backfill").expect("backfill end marker");
+    sql[start..end].to_string()
+}
+
+async fn legacy_ack(fx: &Fx, finding_id: Uuid, reason: &str) {
+    sqlx::query(
+        "UPDATE scan_findings SET is_acknowledged = true, acknowledged_by = $2, \
+         acknowledged_reason = $3, acknowledged_at = NOW() WHERE id = $1",
+    )
+    .bind(finding_id)
+    .bind(fx.admin)
+    .bind(reason)
+    .execute(&fx.pool)
+    .await
+    .expect("legacy ack");
+}
+
+async fn decisions_for(
+    fx: &Fx,
+    digest: &str,
+) -> Vec<(Option<Uuid>, String, Option<String>, String)> {
+    sqlx::query_as(
+        "SELECT repository_id, advisory_key, reason, created_via \
+         FROM finding_acknowledgements WHERE checksum_sha256 = $1 \
+         ORDER BY advisory_key, repository_id",
+    )
+    .bind(digest)
+    .fetch_all(&fx.pool)
+    .await
+    .expect("decisions")
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_migration_carries_current_acknowledgements_and_nothing_else() {
+    let mut fx = Fx::new().await;
+    let repo = fx.repo().await;
+    let backfill = migration_backfill_sql();
+
+    // 1. Acknowledged in the current scan: migrates, keeps actor and reason,
+    //    and then survives a rescan.
+    let d1 = digest();
+    let a1 = fx.artifact(repo, "one.tgz", &d1).await;
+    let findings = [finding(CVE_A, LODASH, "1")];
+    let s1 = fx.scan(repo, a1, "dependency", &findings).await;
+    legacy_ack(&fx, fx.finding_ids(s1).await[0], "legacy reason").await;
+
+    // 2. Acknowledged only in an older scan; the current scan reports it open.
+    //    The operator sees it open today, so the migration must not hide it.
+    let d2 = digest();
+    let a2 = fx.artifact(repo, "two.tgz", &d2).await;
+    let old = fx.scan(repo, a2, "dependency", &findings).await;
+    legacy_ack(&fx, fx.finding_ids(old).await[0], "old").await;
+    fx.scan(repo, a2, "dependency", &findings).await;
+
+    // 3. One engine's row acknowledged, another engine's row for the same
+    //    component open. Migrating would hide a row that blocks today.
+    let d3 = digest();
+    let a3 = fx.artifact(repo, "three.tgz", &d3).await;
+    let s3 = fx.scan(repo, a3, "image", &findings).await;
+    legacy_ack(&fx, fx.finding_ids(s3).await[0], "one engine").await;
+    fx.scan(repo, a3, "dependency", &findings).await;
+
+    // 4. Acknowledged in a scan the artifact no longer reports it in.
+    let d4 = digest();
+    let a4 = fx.artifact(repo, "four.tgz", &d4).await;
+    let s4 = fx.scan(repo, a4, "dependency", &findings).await;
+    legacy_ack(&fx, fx.finding_ids(s4).await[0], "gone").await;
+    fx.scan(repo, a4, "dependency", &[]).await;
+
+    // 5. Never acknowledged.
+    let d5 = digest();
+    let a5 = fx.artifact(repo, "five.tgz", &d5).await;
+    fx.scan(repo, a5, "dependency", &findings).await;
+
+    sqlx::raw_sql(sqlx::AssertSqlSafe(backfill.clone()))
+        .execute(&fx.pool)
+        .await
+        .expect("backfill");
+
+    let one = decisions_for(&fx, &d1).await;
+    assert_eq!(one.len(), 1, "{one:?}");
+    assert_eq!(one[0].0, Some(repo), "scoped to the repository");
+    assert_eq!(one[0].1, CVE_A);
+    assert_eq!(one[0].2.as_deref(), Some("legacy reason"));
+    assert_eq!(one[0].3, "migration");
+    let filter = no_filter();
+    let (rows, _) = fx
+        .svc
+        .list_findings(s1, &filter, 0, 10)
+        .await
+        .expect("list");
+    assert!(rows[0].is_acknowledged);
+    assert_eq!(rows[0].acknowledged_by, Some(fx.admin));
+    assert!(fx.allowed(repo, a1).await);
+    fx.scan(repo, a1, "dependency", &findings).await;
+    assert!(
+        fx.allowed(repo, a1).await,
+        "a migrated decision survives a rescan"
+    );
+
+    assert!(decisions_for(&fx, &d2).await.is_empty(), "history only");
+    assert!(!fx.allowed(repo, a2).await);
+    assert!(
+        decisions_for(&fx, &d3).await.is_empty(),
+        "another engine still open"
+    );
+    assert!(!fx.allowed(repo, a3).await);
+    assert!(
+        decisions_for(&fx, &d4).await.is_empty(),
+        "no longer reported"
+    );
+    assert!(
+        decisions_for(&fx, &d5).await.is_empty(),
+        "never acknowledged"
+    );
+    assert!(!fx.allowed(repo, a5).await);
+
+    // Running it again changes nothing.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(backfill))
+        .execute(&fx.pool)
+        .await
+        .expect("backfill twice");
+    assert_eq!(decisions_for(&fx, &d1).await.len(), 1);
+
+    // The frozen flags no longer speak: a revoke leaves the legacy column as
+    // it was and the finding is open anyway.
+    fx.svc
+        .revoke_acknowledgment(fx.finding_ids(s1).await[0], fx.admin)
+        .await
+        .expect("revoke");
+    assert!(!fx.allowed(repo, a1).await);
+
+    fx.cleanup().await;
+}

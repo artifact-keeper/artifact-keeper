@@ -11170,7 +11170,10 @@ impl ScannerService {
         );
         if let Err(e) = sqlx::query(
             "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
-             quarantine_reason = $2 \
+             quarantine_reason = $2, \
+             quarantine_source = CASE WHEN quarantine_status = 'quarantined' \
+                                           AND quarantine_until IS NULL \
+                                      THEN quarantine_source ELSE 'scan_policy' END \
              WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
         )
         .bind(artifact_id)
@@ -11244,6 +11247,25 @@ impl ScannerService {
             }
         };
 
+        // #5153: the scanner now records the origin of its holds, so a rescan that
+        // leaves the policy with nothing to refuse (the findings are gone, or are
+        // acknowledged) ends that hold rather than leaving it answering for a policy
+        // that passes. Any other hold stays; see the guard in the release.
+        let mut current_status = current_status;
+        if matches!(current_status.as_deref(), Some("quarantined"))
+            && !has_timed_hold
+            && policy_result.as_ref().is_some_and(|p| p.allowed)
+            && crate::services::quarantine_service::release_cleared_scan_policy_hold(
+                &self.db,
+                artifact_id,
+                None,
+                "scan",
+            )
+            .await?
+        {
+            current_status = Some("released".to_string());
+        }
+
         let decision = post_scan_status_decision(
             current_status.as_deref(),
             findings_count,
@@ -11270,7 +11292,9 @@ impl ScannerService {
             let result = sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
                        quarantine_reason = CASE WHEN $2 = 'released' THEN NULL \
-                                                ELSE COALESCE($3, quarantine_reason) END \
+                                                ELSE COALESCE($3, quarantine_reason) END, \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                                                ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status = 'quarantined' \
                        AND quarantine_until IS NOT NULL",
             )
@@ -11295,7 +11319,9 @@ impl ScannerService {
             sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, \
                        quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
-                       quarantine_reason = $3 \
+                       quarantine_reason = $3, \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                                                ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined' \
                        AND quarantine_status IS DISTINCT FROM 'rejected'",
             )
@@ -13104,6 +13130,12 @@ mod tests {
             .expect("update_quarantine_status must not error");
 
         let (status, reason, has_until) = quarantine_row(&fx.pool, artifact_id).await;
+        let source: Option<String> =
+            sqlx::query_scalar("SELECT quarantine_source FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("fetch quarantine source");
         fx.teardown().await;
 
         assert_eq!(
@@ -13122,6 +13154,64 @@ mod tests {
             !has_until,
             "a policy quarantine must be permanent (quarantine_until NULL) so it cannot lapse"
         );
+        assert_eq!(
+            source.as_deref(),
+            Some("scan_policy"),
+            "#5153: the scanner records the origin of its hold, so an acknowledgement \
+             that clears the policy can release it and only it"
+        );
+    }
+
+    /// #5153: a rescan the policy no longer objects to ends a hold the policy
+    /// wrote, and only that kind of hold.
+    #[tokio::test]
+    async fn test_update_quarantine_status_releases_only_a_cleared_scan_policy_hold() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let scanner = scanner_for_fixture(&fx);
+        seed_enabled_policy(&fx.pool, fx.repo_id, "test-cve-gate-5153").await;
+
+        for (source, expected) in [
+            (Some("scan_policy"), "clean"),
+            (Some("admin"), "quarantined"),
+            (None, "quarantined"),
+        ] {
+            let artifact_id = Uuid::new_v4();
+            insert_test_artifact(&fx, artifact_id, "hold-5153", Some("quarantined"), None).await;
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_source = $2, is_deleted = false WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .bind(source)
+            .execute(&fx.pool)
+            .await
+            .expect("stamp source");
+            // A completed scan with nothing to refuse.
+            sqlx::query(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+                 VALUES ($1, $2, 'dependency', 'completed', NOW())",
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("clean scan");
+
+            scanner
+                .update_quarantine_status(artifact_id, 0)
+                .await
+                .expect("update_quarantine_status");
+            let (status, _, _) = quarantine_row(&fx.pool, artifact_id).await;
+            assert_eq!(status.as_deref(), Some(expected), "source {source:?}");
+            sqlx::query("DELETE FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .execute(&fx.pool)
+                .await
+                .expect("remove artifact");
+        }
+        fx.teardown().await;
     }
 
     /// Negative twin of the above: a *disabled* policy must not quarantine, so the

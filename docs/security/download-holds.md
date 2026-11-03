@@ -21,7 +21,8 @@ repository-scoped token is refused), and enumerate every repository.
 Before 1.12.0 a scan-policy hold answered `409`, like any other hold. A
 client that retried on `409` waiting for a release now gets `403` for a
 scan-policy hold: the artifact will not be released by waiting, only by a
-rescan that clears the findings, an acknowledgement, or a policy change. The
+rescan that clears the findings, an acknowledgement (see
+[Acknowledging a finding](#acknowledging-a-finding)), or a policy change. The
 `403` body is the same neutral text the scan-policy gate already used
 ("Artifact download is blocked by the repository's scan policy"); it names no
 policy or finding. A Maven checksum (`.sha1`, `.md5`, `.sha256`, `.sha512`)
@@ -37,7 +38,7 @@ hold next to `quarantine_status = 'quarantined'`:
 | `upload` | The upload-time quarantine period (always timed). |
 | `admin` | An administrator's quarantine-now. |
 | `scan_policy` | A scan policy refusing the artifact after a scan. |
-| `null` | Holds written before 1.12.0, by a 1.11 replica during a rolling upgrade, and by the scanner, which does not record its source yet. |
+| `null` | Holds written before 1.12.0, and by a 1.11 replica during a rolling upgrade. |
 
 A release clears the source. The gate never trusts the free-text
 `quarantine_reason`. A hold with no source answers `403` exactly when a scan
@@ -71,3 +72,45 @@ half runs), so no backfill is needed for the status codes to be right.
   back as `cursor` until it is `null`. Each page evaluates a bounded number
   of hosted artifacts (`evaluated` in the response) and may hold fewer than
   `per_page` items while still returning a cursor.
+
+## Acknowledging a finding
+
+`POST /api/v1/security/findings/{id}/acknowledge` with a `reason` records a
+decision. It applies until it is revoked or expires, whichever scan wrote the
+finding: a rescan, a dedup copy and a promotion all keep it.
+
+| Part of the decision | What it means |
+| --- | --- |
+| The bytes | The artifact's SHA-256. A re-upload of the same bytes is covered; a new build under the same version is not. |
+| The repository | The finding's own repository. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, or they got there by promotion. |
+| Advisory, component, component version, finding class | A new CVE, or the same CVE on another component or version, stays open. The engine that reported it does not matter: one decision covers every engine reporting the same component. |
+| Severity | The severity of the row acknowledged. If the finding is re-graded above it, it reopens. Acknowledging it again accepts the new severity. |
+| `expires_at` (optional) | The finding reopens at this time, with no further action. Without it, the decision lasts until revoked. |
+
+Acknowledging releases a hold whose `quarantine_source` is `scan_policy` once
+the policy no longer refuses the artifact, and writes a `QUARANTINE_RELEASED`
+audit row. It does not release an administrator's hold, an upload-period hold, a
+rejection, or a hold with no recorded source (written before 1.12.0): those need
+`POST /api/v1/quarantine/{id}/release`.
+
+A promotion copies the source's verdict (the latest completed scan of each
+type, with its provenance) and its live decisions into the target repository,
+where the target's own policy grades the findings. `GET /api/v1/security/acknowledgements`
+lists decisions, and `include_inactive=true` adds expired and revoked ones.
+
+`DELETE /api/v1/security/findings/{id}/acknowledge` or
+`DELETE /api/v1/security/acknowledgements/{id}` revokes a decision, and with it
+every copy a promotion made of it. A decision made independently in another
+repository for the same bytes stays. After a revoke the scan policy refuses the
+artifact again (`403`); the hold is not written back.
+
+The download gate grades each artifact's current scans: per scan type, the latest
+complete scan and anything after it. A finding only an older scan reported no
+longer blocks. A later scan that crashed, or that could not assess the artifact
+(`partial`, `not_cataloged`), does not clear what the complete scan reported.
+
+Upgrading to 1.12.0 turns an acknowledged row into a decision only when every row
+of that finding in the artifact's current scans is acknowledged. A finding
+acknowledged only in an older scan, or by one engine while another's row is open,
+stays open and is acknowledged again. Proxied files have no acknowledgement
+(#5152).

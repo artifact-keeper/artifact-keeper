@@ -227,7 +227,7 @@ const OPEN_CVES_SQL: &str = r#"
         ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
     )
     SELECT DISTINCT sf.cve_id
-    FROM scan_findings sf
+    FROM scan_findings_effective sf
     JOIN latest_scans ls ON sf.scan_result_id = ls.id
     WHERE sf.cve_id IS NOT NULL
       AND NOT sf.is_acknowledged
@@ -1034,7 +1034,7 @@ mod tests {
         // Guards the #1620 repoint: the query must read unacknowledged,
         // cve_id-bearing rows from the latest completed scan's scan_findings,
         // and must NOT touch the dead cve_history table.
-        assert!(OPEN_CVES_SQL.contains("FROM scan_findings"));
+        assert!(OPEN_CVES_SQL.contains("FROM scan_findings_effective"));
         assert!(OPEN_CVES_SQL.contains("NOT sf.is_acknowledged"));
         assert!(OPEN_CVES_SQL.contains("sf.cve_id IS NOT NULL"));
         assert!(OPEN_CVES_SQL.contains("status = 'completed'"));

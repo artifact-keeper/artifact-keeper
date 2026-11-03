@@ -729,6 +729,14 @@ pub(crate) const FIND_OWN_REUSABLE_SCAN_SQL: &str = concat!(
     " AND artifact_id = $6 ORDER BY completed_at DESC LIMIT 1"
 );
 
+/// The columns of [`ScanFinding`] as `scan_findings_effective` (migration 312)
+/// projects them.
+const SCAN_FINDING_COLUMNS: &str =
+    "id, scan_result_id, artifact_id, severity, title, description, \
+     cve_id, affected_component, affected_version, fixed_version, source, source_url, \
+     is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at, \
+     acknowledgement_id, acknowledgement_expires_at, created_at, finding_class";
+
 impl ScanResultService {
     pub fn new(db: PgPool) -> Self {
         Self { db }
@@ -2363,14 +2371,11 @@ impl ScanResultService {
             cve_id,
             finding_class,
         } = *filter;
-        let findings = sqlx::query_as!(
-            ScanFinding,
+        // #5153: acknowledged state comes from the decisions, through the view.
+        let sql = format!(
             r#"
-            SELECT id, scan_result_id, artifact_id, severity, title, description,
-                   cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url, is_acknowledged, acknowledged_by,
-                   acknowledged_reason, acknowledged_at, created_at, finding_class
-            FROM scan_findings
+            SELECT {SCAN_FINDING_COLUMNS}
+            FROM scan_findings_effective
             WHERE scan_result_id = $1
               AND ($2::text IS NULL OR severity = $2)
               AND ($3::text IS NULL OR source = $3)
@@ -2386,18 +2391,19 @@ impl ScanResultService {
                 END,
                 created_at DESC
             LIMIT $5 OFFSET $6
-            "#,
-            scan_result_id,
-            severity,
-            source,
-            cve_id,
-            limit,
-            offset,
-            finding_class,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#
+        );
+        let findings = sqlx::query_as::<_, ScanFinding>(sqlx::AssertSqlSafe(sql))
+            .bind(scan_result_id)
+            .bind(severity)
+            .bind(source)
+            .bind(cve_id)
+            .bind(limit)
+            .bind(offset)
+            .bind(finding_class)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let total = sqlx::query_scalar!(
             r#"
@@ -2422,36 +2428,34 @@ impl ScanResultService {
         Ok((findings, total))
     }
 
-    /// Acknowledge a finding (accept risk).
+    /// Acknowledge a finding (accept risk): record a decision about its identity
+    /// (#5153, [`crate::services::finding_acknowledgements`]) and return the row
+    /// as the readers now see it.
     pub async fn acknowledge_finding(
         &self,
         finding_id: Uuid,
         user_id: Uuid,
         reason: &str,
+        options: crate::services::finding_acknowledgements::AcknowledgeOptions,
     ) -> Result<ScanFinding> {
-        let finding = sqlx::query_as!(
-            ScanFinding,
-            r#"
-            UPDATE scan_findings
-            SET is_acknowledged = true, acknowledged_by = $2,
-                acknowledged_reason = $3, acknowledged_at = NOW()
-            WHERE id = $1
-            RETURNING id, scan_result_id, artifact_id, severity, title, description,
-                      cve_id, affected_component, affected_version, fixed_version,
-                      source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at, finding_class
-            "#,
-            finding_id,
-            user_id,
-            reason,
+        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+            self.db.clone(),
         )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
+        .acknowledge_finding(finding_id, Some(user_id), Some(reason), options)
+        .await?;
+        self.get_finding(finding_id).await
+    }
 
-        self.refresh_score_for_artifact(finding.artifact_id).await;
-        Ok(finding)
+    /// One finding with its effective acknowledged state.
+    async fn get_finding(&self, finding_id: Uuid) -> Result<ScanFinding> {
+        let sql =
+            format!("SELECT {SCAN_FINDING_COLUMNS} FROM scan_findings_effective WHERE id = $1");
+        sqlx::query_as::<_, ScanFinding>(sqlx::AssertSqlSafe(sql))
+            .bind(finding_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))
     }
 
     /// Recompute the security score of the repository holding `artifact_id`
@@ -2481,29 +2485,18 @@ impl ScanResultService {
         }
     }
 
-    /// Revoke acknowledgment of a finding.
-    pub async fn revoke_acknowledgment(&self, finding_id: Uuid) -> Result<ScanFinding> {
-        let finding = sqlx::query_as!(
-            ScanFinding,
-            r#"
-            UPDATE scan_findings
-            SET is_acknowledged = false, acknowledged_by = NULL,
-                acknowledged_reason = NULL, acknowledged_at = NULL
-            WHERE id = $1
-            RETURNING id, scan_result_id, artifact_id, severity, title, description,
-                      cve_id, affected_component, affected_version, fixed_version,
-                      source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at, finding_class
-            "#,
-            finding_id,
+    /// Revoke the decision covering a finding, wherever it reached (#5153).
+    pub async fn revoke_acknowledgment(
+        &self,
+        finding_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<ScanFinding> {
+        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+            self.db.clone(),
         )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
-
-        self.refresh_score_for_artifact(finding.artifact_id).await;
-        Ok(finding)
+        .revoke_finding(finding_id, Some(user_id))
+        .await?;
+        self.get_finding(finding_id).await
     }
 
     // -----------------------------------------------------------------------
@@ -3954,6 +3947,8 @@ mod tests {
             acknowledged_by: None,
             acknowledged_reason: None,
             acknowledged_at: None,
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
             created_at: chrono::Utc::now(),
             finding_class: "vulnerability".to_string(),
         };
@@ -3981,6 +3976,8 @@ mod tests {
             acknowledged_by: Some(user_id),
             acknowledged_reason: Some("Accepted risk for legacy code".to_string()),
             acknowledged_at: Some(chrono::Utc::now()),
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
             created_at: chrono::Utc::now(),
             finding_class: "vulnerability".to_string(),
         };
@@ -4934,7 +4931,7 @@ mod tests {
             let admin = crate::api::handlers::test_db_helpers::create_user(&pool)
                 .await
                 .0;
-            svc.acknowledge_finding(finding_id, admin, "not reachable")
+            svc.acknowledge_finding(finding_id, admin, "not reachable", Default::default())
                 .await
                 .expect("acknowledge");
             assert_agree(
@@ -4946,9 +4943,9 @@ mod tests {
                 1,
             );
 
-            // grype rescans and now reports only CVE-2026-0002 (a new,
-            // unacknowledged row). CVE-2026-0001 is still reported by the
-            // image scanner, at high.
+            // grype rescans and now reports only CVE-2026-0002. The new row is
+            // covered by the decision (#5153), so it stays acknowledged.
+            // CVE-2026-0001 is still reported by the image scanner, at high.
             seed_scan_4338(
                 &svc,
                 artifact_id,
@@ -4965,7 +4962,7 @@ mod tests {
             svc.recalculate_score(repo_id)
                 .await
                 .expect("score after rescan");
-            assert_agree("after the rescan", &views().await, 1, 1, 2, 0);
+            assert_agree("after the rescan", &views().await, 0, 1, 1, 1);
         }
 
         /// Build a completed source scan with one High finding.
