@@ -28,6 +28,8 @@ impl TestCa {
 struct TlsServer {
     addr: std::net::SocketAddr,
     connections: Arc<AtomicUsize>,
+    resumed: Arc<AtomicUsize>,
+    stream_release: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -39,6 +41,10 @@ impl Drop for TlsServer {
 
 impl TlsServer {
     async fn start(ca: &TestCa) -> Self {
+        Self::start_with_close(ca, false).await
+    }
+
+    async fn start_with_close(ca: &TestCa, close_after_response: bool) -> Self {
         let key = KeyPair::generate().unwrap();
         let cert = CertificateParams::new(vec!["localhost".to_string()])
             .unwrap()
@@ -47,7 +53,7 @@ impl TlsServer {
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
@@ -60,6 +66,10 @@ impl TlsServer {
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let accepted = connections.clone();
+        let resumed = Arc::new(AtomicUsize::new(0));
+        let resumed_handshakes = resumed.clone();
+        let stream_release = Arc::new(tokio::sync::Notify::new());
+        let release = stream_release.clone();
         let task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -68,9 +78,14 @@ impl TlsServer {
                         let (socket, _) = incoming.unwrap();
                         let acceptor = acceptor.clone();
                         let accepted = accepted.clone();
+                        let resumed = resumed_handshakes.clone();
+                        let release = release.clone();
                         tasks.spawn(async move {
                             let Ok(mut stream) = acceptor.accept(socket).await else { return; };
                             accepted.fetch_add(1, Ordering::SeqCst);
+                            if stream.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+                                resumed.fetch_add(1, Ordering::SeqCst);
+                            }
                             let mut pending = Vec::new();
                             loop {
                                 let mut bytes = [0; 4096];
@@ -79,12 +94,28 @@ impl TlsServer {
                                 pending.extend_from_slice(&bytes[..n]);
                                 if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
                                     let request = String::from_utf8_lossy(&pending[..end]);
+                                    if request.starts_with("GET /stream ") {
+                                        if stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab").await.is_err() { return; }
+                                        if stream.flush().await.is_err() { return; }
+                                        release.notified().await;
+                                        if stream.write_all(b"cd").await.is_err() { return; }
+                                        if stream.flush().await.is_err() { return; }
+                                        pending.drain(..end + 4);
+                                        continue;
+                                    }
                                     let response = if request.starts_with("GET /redirect ") {
                                         "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\n\r\n"
+                                    } else if close_after_response {
+                                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok"
                                     } else {
                                         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
                                     };
                                     if stream.write_all(response.as_bytes()).await.is_err() { return; }
+                                    if stream.flush().await.is_err() { return; }
+                                    if close_after_response {
+                                        let _ = stream.shutdown().await;
+                                        return;
+                                    }
                                     pending.drain(..end + 4);
                                 }
                             }
@@ -97,6 +128,8 @@ impl TlsServer {
         Self {
             addr,
             connections,
+            resumed,
+            stream_release,
             task,
         }
     }
@@ -190,6 +223,79 @@ async fn ca_rotation_updates_retained_clones_and_replaces_a_live_pool() {
         succeeds(&fixed, &server_a).await,
         "control: old fixed client still trusts A"
     );
+}
+
+#[tokio::test]
+async fn removing_a_root_discards_cached_tls13_sessions() {
+    let a = TestCa::new();
+    let b = TestCa::new();
+    // Closing each connection forces a fresh TLS handshake instead of HTTP pooling.
+    let server_a = TlsServer::start_with_close(&a, true).await;
+    let server_b = TlsServer::start(&b).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    publish(&path, &a.pem);
+    let manager = manager(path.clone());
+    let client = register(&manager);
+    let fixed: Client = client.current().into();
+
+    assert!(succeeds(&client, &server_a).await);
+    assert!(succeeds(&client, &server_a).await);
+    assert_eq!(server_a.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        server_a.resumed.load(Ordering::SeqCst),
+        1,
+        "control: the second TLS 1.3 handshake must actually resume"
+    );
+
+    publish(&path, &b.pem);
+    assert!(manager.refresh());
+    assert!(!succeeds(&client, &server_a).await);
+    assert!(succeeds(&client, &server_b).await);
+    assert_eq!(server_a.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(server_a.resumed.load(Ordering::SeqCst), 1);
+
+    assert!(succeeds(&fixed, &server_a).await);
+    assert_eq!(
+        server_a.resumed.load(Ordering::SeqCst),
+        2,
+        "control: the retained old TLS configuration still has a usable ticket"
+    );
+}
+
+#[tokio::test]
+async fn an_in_flight_response_finishes_after_its_root_is_removed() {
+    let a = TestCa::new();
+    let b = TestCa::new();
+    let server_a = TlsServer::start(&a).await;
+    let server_b = TlsServer::start(&b).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bundle.pem");
+    publish(&path, &a.pem);
+    let manager = manager(path.clone());
+    let client = register(&manager);
+    let mut response = client
+        .get(format!("https://localhost:{}/stream", server_a.addr.port()))
+        .send()
+        .await
+        .unwrap();
+    let mut first = Vec::new();
+    while first.len() < 2 {
+        first.extend_from_slice(&response.chunk().await.unwrap().unwrap());
+    }
+    assert_eq!(first, b"ab", "response must already be streaming");
+
+    publish(&path, &b.pem);
+    assert!(manager.refresh());
+    assert!(!succeeds(&client, &server_a).await);
+    assert!(succeeds(&client, &server_b).await);
+    server_a.stream_release.notify_one();
+    let remaining = tokio::time::timeout(Duration::from_secs(3), response.bytes())
+        .await
+        .expect("rotation must not cancel an active response")
+        .unwrap();
+    assert_eq!(remaining.as_ref(), b"cd");
+    assert!(!succeeds(&client, &server_a).await);
 }
 
 #[test]
