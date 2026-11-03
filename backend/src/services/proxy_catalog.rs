@@ -356,6 +356,30 @@ pub fn not_cached_metadata_sql(format: &RepositoryFormat, path_column: &str) -> 
     }
 }
 
+/// The `repository_format` labels [`caches_packuments`] holds for: the value
+/// to bind to `labels_param` of [`not_cached_metadata_sql_by_format`].
+pub fn packument_format_labels() -> Vec<&'static str> {
+    RepositoryFormat::ALL
+        .iter()
+        .filter(|f| caches_packuments(f))
+        .map(|f| f.as_key())
+        .collect()
+}
+
+/// [`not_cached_metadata_sql`] for a statement spanning formats: the format is
+/// `format_column`, compared with the `text[]` placeholder `labels_param`,
+/// bound to [`packument_format_labels`].
+pub fn not_cached_metadata_sql_by_format(
+    path_column: &str,
+    format_column: &str,
+    labels_param: &str,
+) -> String {
+    format!(
+        "({not_index} AND ({path_column} LIKE '%/-/%' OR NOT {format_column} = ANY({labels_param})))",
+        not_index = not_cached_index_sql(path_column),
+    )
+}
+
 /// One catalog row as surfaced by the remote-repository browse listing
 /// (PF-002 / #2519). Unlike [`ProxyCacheEntry`] this carries `cached_at`, so
 /// the listing can render the cache timestamp without reading the storage

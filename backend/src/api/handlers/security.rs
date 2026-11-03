@@ -108,6 +108,12 @@ pub struct DashboardResponse {
     /// keeps its meaning (hosted rejections plus these). The rows behind it
     /// are `GET /api/v1/security/proxy-blocked`.
     pub proxy_blocked: i64,
+    /// Distinct proxied digests whose recorded verdict a repository's proxy
+    /// scan gate would refuse if it enforced (#5232): `proxy_blocked` plus
+    /// what a `record_only` repository records and serves. Counts nothing
+    /// toward `proxy_blocked` or `policy_violations_blocked`. The rows behind
+    /// it are `GET /api/v1/security/proxy-blocked?would_block=true`.
+    pub proxy_would_block: i64,
     /// Repositories whose grade letter, over what was assessed, is A (#4336:
     /// an `unrated` repository has no letter and is not counted).
     pub repos_grade_a: i64,
@@ -958,6 +964,7 @@ async fn get_dashboard(
         high_findings: summary.high_findings,
         policy_violations_blocked: summary.policy_violations_blocked,
         proxy_blocked: summary.proxy_blocked,
+        proxy_would_block: summary.proxy_would_block,
         repos_grade_a: summary.repos_grade_a,
         repos_grade_f: summary.repos_grade_f,
         repos_rated: summary.repos_rated,
@@ -981,6 +988,12 @@ pub struct ProxyBlockedQuery {
     /// (`critical`, `high`, `medium`, `low`, `info`). An item whose verdict
     /// recorded no severity is kept: the gate blocks it under every policy.
     pub min_severity: Option<String>,
+    /// Preview what enforcement would refuse (#5232): apply each repository's
+    /// severity gate to its recorded verdicts whatever its current
+    /// `proxy_scan_action`, so a `record_only` repository lists what it would
+    /// refuse. Adds `would_block_summary` to the response and
+    /// `proxy_scan_action` to each item. Off by default.
+    pub would_block: Option<bool>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -1005,12 +1018,41 @@ pub struct ProxyBlockedItem {
     /// verdict recorded before per-CVE detail existed.
     pub cve_ids: Vec<String>,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
+    /// The repository's current action, so a preview tells what is refused
+    /// today from what `record_only` still serves. Only with `would_block`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_scan_action: Option<String>,
+}
+
+/// What a `would_block` preview adds to the list (#5232). Distinct digests,
+/// like the dashboard and the `proxy-scans` summary; `pagination.total` counts
+/// paths.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ProxyWouldBlockSummary {
+    /// Digests behind the listed items.
+    pub would_block_digests: i64,
+    /// Cached digests with no verdict recorded (a failed scan records none).
+    /// Not listed and not in `would_block_digests`: there is nothing to grade.
+    /// `fail_closed` would not serve them from a verdict: it scans them inline
+    /// on the next pull, refuses them if the result is blocking, and answers
+    /// `423` if the scan is inconclusive.
+    pub no_verdict: i64,
+    /// Cached digests whose verdict is older than the scan window. Handled as
+    /// `no_verdict` by the gate: the next pull scans the bytes again.
+    pub stale_verdict: i64,
+    /// Cached digests with a `clean` verdict that graded nothing. `fail_open`
+    /// and `record_only` accept it, `fail_closed` does not: it scans them
+    /// inline as `no_verdict`.
+    pub clean_graded_nothing: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProxyBlockedResponse {
     pub items: Vec<ProxyBlockedItem>,
     pub pagination: crate::api::dto::Pagination,
+    /// Set only with `would_block`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub would_block_summary: Option<ProxyWouldBlockSummary>,
 }
 
 /// Whether an item with this stored severity passes a `min_severity` filter.
@@ -1052,6 +1094,7 @@ async fn list_proxy_blocked(
     // Every repository's blocked content: an instance administrator with an
     // unrestricted credential, like the admin hold queues.
     auth.require_unscoped_admin("the cross-repository proxy-blocked list")?;
+    let would_block = query.would_block.unwrap_or(false);
     let min = match query.min_severity.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(
@@ -1065,13 +1108,35 @@ async fn list_proxy_blocked(
     let (page, per_page, offset) =
         crate::api::dto::Pagination::clamp_offset(query.page, query.per_page);
     let svc = ScanResultService::new(state.db.clone());
-    let entries: Vec<_> = svc
-        .list_blocked_proxy_entries(query.repository.as_deref())
-        .await?
+    let entries = if would_block {
+        svc.list_would_block_proxy_entries(query.repository.as_deref())
+            .await?
+    } else {
+        svc.list_blocked_proxy_entries(query.repository.as_deref())
+            .await?
+    };
+    let entries: Vec<_> = entries
         .into_iter()
         .filter(|e| meets_min_severity(e.max_severity.as_deref(), min))
         .collect();
     let total = entries.len() as i64;
+    let would_block_summary = if would_block {
+        let counts = svc
+            .count_proxy_no_verdict(query.repository.as_deref())
+            .await?;
+        Some(ProxyWouldBlockSummary {
+            would_block_digests: entries
+                .iter()
+                .map(|e| e.checksum_sha256.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len() as i64,
+            no_verdict: counts.no_verdict,
+            stale_verdict: counts.stale_verdict,
+            clean_graded_nothing: counts.clean_graded_nothing,
+        })
+    } else {
+        None
+    };
     let page_entries: Vec<_> = entries
         .into_iter()
         .skip(offset.max(0) as usize)
@@ -1104,11 +1169,13 @@ async fn list_proxy_blocked(
             medium_count: e.medium_count,
             low_count: e.low_count,
             scanned_at: e.scanned_at,
+            proxy_scan_action: would_block.then_some(e.proxy_scan_action),
         })
         .collect();
     Ok(Json(ProxyBlockedResponse {
         items,
         pagination: crate::api::dto::Pagination::for_page(page, per_page, total),
+        would_block_summary,
     }))
 }
 
@@ -3456,6 +3523,7 @@ async fn rescan_proxy_cached_path(
         ProxyBlockedQuery,
         ProxyBlockedItem,
         ProxyBlockedResponse,
+        ProxyWouldBlockSummary,
         ScoreResponse,
         ScoreCoverageResponse,
         TriggerScanRequest,
@@ -6530,6 +6598,7 @@ mod tests {
                     Query(ProxyBlockedQuery {
                         repository: Some(key),
                         min_severity: min,
+                        would_block: None,
                         page: None,
                         per_page: None,
                     }),
@@ -6573,6 +6642,531 @@ mod tests {
         assert!(matches!(non_admin, Err(AppError::Authorization(_))));
         assert!(dashboard.proxy_blocked >= 1);
         assert!(dashboard.policy_violations_blocked >= dashboard.proxy_blocked);
+    }
+
+    /// The items of a #5232 list as `(path, digest)`, sorted.
+    fn listed_5232(resp: &ProxyBlockedResponse, key: &str) -> Vec<(String, String)> {
+        let mut v: Vec<_> = resp
+            .items
+            .iter()
+            .filter(|i| i.repository_key == key)
+            .map(|i| (i.path.clone(), i.checksum_sha256.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// One cached path and, when `verdict` is set, the verdict of its digest:
+    /// `(verdict, max_severity, findings_count, components_cataloged, pin, age_days)`.
+    #[allow(clippy::type_complexity)]
+    async fn seed_file_5232(
+        pool: &PgPool,
+        repo_id: Uuid,
+        path: &str,
+        digest: &str,
+        verdict: Option<(&str, Option<&str>, i32, Option<i32>, Option<&str>, i32)>,
+    ) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+                                                size_bytes, checksum_sha256) \
+             VALUES ($1, $2, $3, 'm', 8, $4)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("{repo_id}/{path}"))
+        .bind(digest)
+        .execute(pool)
+        .await
+        .expect("cache row");
+        let Some((verdict, severity, findings, cataloged, pin, age_days)) = verdict else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+                                             max_severity, components_cataloged, pin_identity, \
+                                             scanned_at) \
+             VALUES ($1, 'grype', $2, $3, $4, $5, $6, NOW() - make_interval(days => $7)) \
+             ON CONFLICT (checksum_sha256, scan_type) DO NOTHING",
+        )
+        .bind(digest)
+        .bind(verdict)
+        .bind(findings)
+        .bind(severity)
+        .bind(cataloged)
+        .bind(pin)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .expect("verdict");
+    }
+
+    /// What the real gate answers one pull of `digest` under the repository's
+    /// stored policy, read the way a Remote arm reads it.
+    async fn real_gate_5232(state: &SharedState, repo_id: Uuid, digest: &str) -> String {
+        use crate::api::handlers::proxy_helpers::{
+            gate_proxy_scan_serve, proxy_rescan_synthetic_artifact, remote_scan_policy,
+            ProxyScanIdentity, ProxyScanMode, ProxyScanServeOutcome,
+        };
+        let (action, gate) = remote_scan_policy(&state.db, repo_id)
+            .await
+            .map_err(|_| "unreadable policy")
+            .unwrap()
+            .expect("scan-on-proxy is on");
+        let bytes = bytes::Bytes::from_static(b"stub content");
+        let synthetic = proxy_rescan_synthetic_artifact(
+            repo_id,
+            "p/-/p-1.tgz",
+            digest,
+            bytes.len() as i64,
+            None,
+        );
+        match gate_proxy_scan_serve(
+            state,
+            repo_id,
+            "p-1.tgz",
+            digest,
+            synthetic,
+            &bytes,
+            action,
+            gate,
+            ProxyScanIdentity::NotApplicable,
+            ProxyScanMode::File,
+        )
+        .await
+        {
+            ProxyScanServeOutcome::Serve(served) => format!("serve:{served:?}"),
+            ProxyScanServeOutcome::Deny(resp) => format!("deny:{}", resp.status().as_u16()),
+        }
+    }
+
+    /// #5232: `would_block` previews enforcement. The list a `record_only`
+    /// repository shows is the list `proxy-blocked` shows once it enforces,
+    /// and every entry is what the real gate answers 403 to; no-verdict files
+    /// are never listed but are counted, and are what the gate answers 423 to
+    /// when it cannot scan. Existing `proxy_blocked` semantics do not move.
+    #[tokio::test]
+    async fn would_block_previews_what_the_gate_refuses_5232_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (a, a_key, a_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (b, b_key, b_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (helm, helm_key, helm_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        let (off, off_key, off_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (enf, enf_key, enf_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (mvn, mvn_key, mvn_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        // (repository, scan_on_proxy, block_on_policy_violation, action)
+        for (repo, on, block, action) in [
+            (a, true, true, "record_only"),
+            // No threshold opted in: the gate refuses any finding, so a low
+            // verdict is in the preview although it is below "high".
+            (b, true, false, "record_only"),
+            // helm stores the settings, but its proxy path runs no gate.
+            (helm, true, true, "record_only"),
+            (off, false, true, "record_only"),
+            (enf, true, true, "fail_closed"),
+            (mvn, true, true, "record_only"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                                           scan_on_proxy, block_on_policy_violation, \
+                                           severity_threshold, proxy_scan_action) \
+                 VALUES ($1, true, false, $2, $3, 'high', $4)",
+            )
+            .bind(repo)
+            .bind(on)
+            .bind(block)
+            .bind(action)
+            .execute(&pool)
+            .await
+            .expect("scan config");
+        }
+        let d = |_: &str| format!("{:064x}", Uuid::new_v4().as_u128());
+        let (crit, high, med, ungraded, clean) = (d(""), d(""), d(""), d(""), d(""));
+        let (none, errored, stale, nothing, pinned) = (d(""), d(""), d(""), d(""), d(""));
+        let (packument, index, low, helm_d, off_d, enf_d) =
+            (d(""), d(""), d(""), d(""), d(""), d(""));
+        let (mvn_jar, mvn_index) = (d(""), d(""));
+        let vuln = |sev| Some(("vulnerable", sev, 1, Some(5), None, 0));
+        let f = |repo, path: &'static str, digest: String, v| (repo, path, digest, v);
+        let files = vec![
+            f(a, "crit/-/crit-1.tgz", crit.clone(), vuln(Some("critical"))),
+            f(a, "high/-/high-1.tgz", high.clone(), vuln(Some("high"))),
+            // The same digest at a second path: two items, one digest.
+            f(a, "high/-/high-copy.tgz", high.clone(), vuln(Some("high"))),
+            f(a, "med/-/med-1.tgz", med.clone(), vuln(Some("medium"))),
+            f(a, "ungraded/-/u-1.tgz", ungraded.clone(), vuln(None)),
+            f(
+                a,
+                "clean/-/c-1.tgz",
+                clean.clone(),
+                Some(("clean", None, 0, Some(5), None, 0)),
+            ),
+            f(a, "none/-/n-1.tgz", none.clone(), None),
+            f(
+                a,
+                "errored/-/e-1.tgz",
+                errored.clone(),
+                Some(("error", None, 0, None, None, 0)),
+            ),
+            f(
+                a,
+                "stale/-/s-1.tgz",
+                stale.clone(),
+                Some(("vulnerable", Some("critical"), 1, Some(5), None, 40)),
+            ),
+            f(
+                a,
+                "nothing/-/n-1.tgz",
+                nothing.clone(),
+                Some(("clean", None, 0, Some(0), None, 0)),
+            ),
+            f(
+                a,
+                "pinned/-/p-1.tgz",
+                pinned.clone(),
+                Some(("clean", None, 0, Some(0), Some("npm|p|1"), 0)),
+            ),
+            // Cached metadata the gate never grades is not "no verdict".
+            f(a, "packument", packument.clone(), None),
+            f(a, "x/-/index.v1+json", index.clone(), None),
+            f(b, "low/-/low-1.tgz", low.clone(), vuln(Some("low"))),
+            f(helm, "h/-/h-1.tgz", helm_d.clone(), vuln(Some("critical"))),
+            f(off, "o/-/o-1.tgz", off_d.clone(), vuln(Some("critical"))),
+            f(enf, "e/-/e-1.tgz", enf_d.clone(), vuln(Some("critical"))),
+            // Only the npm family keeps its packages under `/-/`.
+            f(mvn, "org/x/1/x-1.jar", mvn_jar.clone(), None),
+            f(mvn, "org/x/index.v1+json", mvn_index.clone(), None),
+        ];
+        for (repo, path, digest, verdict) in &files {
+            seed_file_5232(&pool, *repo, path, digest, *verdict).await;
+        }
+        let state = tdh::build_state(pool.clone(), a_dir.to_string_lossy().as_ref());
+        let admin = tdh::admin_auth(user_id, &username);
+        let list =
+            |auth: AuthExtension, repo: Option<String>, wb: Option<bool>, min: Option<&str>| {
+                let state = state.clone();
+                let min = min.map(str::to_string);
+                async move {
+                    list_proxy_blocked(
+                        State(state),
+                        Extension(auth),
+                        Query(ProxyBlockedQuery {
+                            repository: repo,
+                            min_severity: min,
+                            would_block: wb,
+                            page: None,
+                            per_page: Some(200),
+                        }),
+                    )
+                    .await
+                    .map(|j| j.0)
+                }
+            };
+        let some = |k: &String| Some(k.clone());
+
+        // Under record_only: today's view and the preview.
+        let today_a = list(admin.clone(), some(&a_key), None, None)
+            .await
+            .expect("today");
+        let today_false = list(admin.clone(), some(&a_key), Some(false), None)
+            .await
+            .expect("off");
+        let preview_a = list(admin.clone(), some(&a_key), Some(true), None)
+            .await
+            .expect("preview");
+        let preview_b = list(admin.clone(), some(&b_key), Some(true), None)
+            .await
+            .expect("b");
+        let preview_helm = list(admin.clone(), some(&helm_key), Some(true), None)
+            .await
+            .expect("helm");
+        let preview_off = list(admin.clone(), some(&off_key), Some(true), None)
+            .await
+            .expect("off");
+        let preview_enf = list(admin.clone(), some(&enf_key), Some(true), None)
+            .await
+            .expect("enf");
+        let today_enf = list(admin.clone(), some(&enf_key), None, None)
+            .await
+            .expect("enf today");
+        let preview_mvn = list(admin.clone(), some(&mvn_key), Some(true), None)
+            .await
+            .expect("mvn");
+        let crit_only = list(admin.clone(), some(&a_key), Some(true), Some("critical"))
+            .await
+            .expect("min");
+        let unknown = list(
+            admin.clone(),
+            Some("no-such-repo-5232".into()),
+            Some(true),
+            None,
+        )
+        .await
+        .expect("unknown");
+        let across = list(admin.clone(), None, Some(true), None)
+            .await
+            .expect("across");
+        let non_admin = list(
+            tdh::make_auth(user_id, &username),
+            some(&a_key),
+            Some(true),
+            None,
+        )
+        .await;
+        let mut scoped_admin = tdh::admin_auth(user_id, &username);
+        scoped_admin.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![a]);
+        let scoped = list(scoped_admin, some(&a_key), Some(true), None).await;
+        let dashboard = get_dashboard(State(state.clone()), Extension(admin.clone()))
+            .await
+            .expect("dashboard")
+            .0;
+        let default_json = serde_json::to_value(&today_enf).expect("json");
+        let preview_json = serde_json::to_value(&preview_enf).expect("json");
+        let served_crit = real_gate_5232(&state, a, &crit).await;
+        // A digest of its own: serving it pending queues a scan that records
+        // a verdict, and `none` has to reach the flip with no verdict.
+        let pending_probe = d("");
+        let served_none = real_gate_5232(&state, a, &pending_probe).await;
+
+        // Flip to enforcement: what the preview said is what is now refused.
+        sqlx::query("UPDATE scan_configs SET proxy_scan_action = 'fail_closed' WHERE repository_id = ANY($1)")
+            .bind([a, b].as_slice())
+            .execute(&pool)
+            .await
+            .expect("flip");
+        let enforced_a = list(admin.clone(), some(&a_key), None, None)
+            .await
+            .expect("enforced a");
+        let enforced_b = list(admin.clone(), some(&b_key), None, None)
+            .await
+            .expect("enforced b");
+        let preview_after = list(admin.clone(), some(&a_key), Some(true), None)
+            .await
+            .expect("after");
+        let mut gate_a = std::collections::HashMap::new();
+        for digest in [
+            &crit, &high, &ungraded, &med, &none, &errored, &stale, &nothing,
+        ] {
+            gate_a.insert(digest.clone(), real_gate_5232(&state, a, digest).await);
+        }
+        let gate_low = real_gate_5232(&state, b, &low).await;
+
+        for digest in files.iter().map(|f| &f.2).chain([&pending_probe]) {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&pool)
+                .await;
+        }
+        for (repo, dir) in [
+            (b, &b_dir),
+            (helm, &helm_dir),
+            (off, &off_dir),
+            (enf, &enf_dir),
+            (mvn, &mvn_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, repo, dir).await;
+        }
+        tdh::cleanup(&pool, a, user_id).await;
+        let _ = std::fs::remove_dir_all(&a_dir);
+
+        // proxy_blocked keeps its meaning: record-only refuses nothing, and
+        // an explicit `would_block=false` is the default.
+        assert!(
+            today_a.items.is_empty(),
+            "record-only refuses nothing today"
+        );
+        assert!(today_a.would_block_summary.is_none());
+        assert!(today_false.items.is_empty());
+        assert!(today_false.would_block_summary.is_none());
+        // The default response is byte-compatible: the new keys are absent.
+        assert!(default_json.get("would_block_summary").is_none());
+        assert!(default_json["items"][0].get("proxy_scan_action").is_none());
+        assert_eq!(preview_json["items"][0]["proxy_scan_action"], "fail_closed");
+
+        // The preview applies the gate, not the action.
+        let want_a = {
+            let mut v = vec![
+                ("crit/-/crit-1.tgz".to_string(), crit.clone()),
+                ("high/-/high-1.tgz".to_string(), high.clone()),
+                ("high/-/high-copy.tgz".to_string(), high.clone()),
+                ("ungraded/-/u-1.tgz".to_string(), ungraded.clone()),
+            ];
+            v.sort();
+            v
+        };
+        assert_eq!(listed_5232(&preview_a, &a_key), want_a);
+        assert_eq!(preview_a.pagination.total, 4, "items are paths");
+        assert!(preview_a
+            .items
+            .iter()
+            .all(|i| i.proxy_scan_action.as_deref() == Some("record_only")));
+        assert_eq!(
+            preview_a.would_block_summary,
+            Some(ProxyWouldBlockSummary {
+                would_block_digests: 3,
+                no_verdict: 2,
+                stale_verdict: 1,
+                clean_graded_nothing: 1,
+            }),
+            "no-verdict files are counted apart and never listed"
+        );
+        assert_eq!(
+            listed_5232(&preview_b, &b_key),
+            vec![("low/-/low-1.tgz".to_string(), low.clone())],
+            "no threshold opted in: any finding would be refused"
+        );
+        assert!(preview_helm.items.is_empty(), "helm runs no gate");
+        assert_eq!(
+            preview_helm.would_block_summary,
+            Some(ProxyWouldBlockSummary::default())
+        );
+        assert!(
+            preview_off.items.is_empty(),
+            "scanning off has no gate to preview"
+        );
+        assert_eq!(
+            preview_off.would_block_summary,
+            Some(ProxyWouldBlockSummary::default())
+        );
+        assert_eq!(
+            preview_mvn.would_block_summary.as_ref().unwrap().no_verdict,
+            1
+        );
+        // An enforcing repository is in both views, the same way.
+        assert_eq!(
+            listed_5232(&preview_enf, &enf_key),
+            listed_5232(&today_enf, &enf_key)
+        );
+        assert_eq!(listed_5232(&today_enf, &enf_key).len(), 1);
+        // Filters and scoping apply to the preview as to the list.
+        let crit_paths: Vec<_> = crit_only.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(crit_paths, vec!["crit/-/crit-1.tgz", "ungraded/-/u-1.tgz"]);
+        assert_eq!(
+            crit_only
+                .would_block_summary
+                .as_ref()
+                .unwrap()
+                .would_block_digests,
+            2
+        );
+        assert!(unknown.items.is_empty());
+        assert_eq!(
+            unknown.would_block_summary,
+            Some(ProxyWouldBlockSummary::default())
+        );
+        assert_eq!(listed_5232(&across, &a_key), want_a);
+        assert_eq!(listed_5232(&across, &b_key).len(), 1);
+        assert_eq!(listed_5232(&across, &enf_key).len(), 1);
+        assert!(matches!(non_admin, Err(AppError::Authorization(_))));
+        assert!(matches!(scoped, Err(AppError::Authorization(_))));
+        // crit, high, ungraded and low are recorded, not refused.
+        assert!(dashboard.proxy_would_block >= dashboard.proxy_blocked + 4);
+
+        // Record-only serves them.
+        assert_eq!(served_crit, "serve:Recorded");
+        assert_eq!(served_none, "serve:Pending");
+
+        // Preview and enforcement agree: the list, then the gate itself.
+        assert_eq!(listed_5232(&enforced_a, &a_key), want_a);
+        assert_eq!(listed_5232(&preview_after, &a_key), want_a);
+        assert_eq!(
+            listed_5232(&enforced_b, &b_key),
+            vec![("low/-/low-1.tgz".to_string(), low.clone())]
+        );
+        for digest in [&crit, &high, &ungraded] {
+            assert_eq!(gate_a[digest], "deny:403", "a listed digest is refused");
+        }
+        assert_eq!(gate_low, "deny:403");
+        assert_eq!(
+            gate_a[&med], "serve:Clean",
+            "below the threshold: not listed, served"
+        );
+        // Counted apart: no scanner here, so the inline scan is inconclusive.
+        for digest in [&none, &stale, &nothing] {
+            assert_eq!(
+                gate_a[digest], "deny:423",
+                "no usable verdict is scanned inline"
+            );
+        }
+    }
+
+    /// #5232: `clean_graded_nothing` is counted in SQL over the whole catalog;
+    /// it must hold for exactly the rows the gate's own
+    /// `clean_verdict_graded_nothing` declines to reuse.
+    #[tokio::test]
+    async fn clean_graded_nothing_count_agrees_with_the_gate_5232_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{clean_verdict_graded_nothing, ProxyScanRow};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy, \
+                                       block_on_policy_violation, severity_threshold, \
+                                       proxy_scan_action) \
+             VALUES ($1, true, false, true, true, 'high', 'record_only')",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("scan config");
+        let mut digests = Vec::new();
+        let mut want = 0;
+        for verdict in ["clean", "vulnerable"] {
+            for findings in [0, 1] {
+                for cataloged in [None, Some(0), Some(5)] {
+                    for pin in [None, Some("npm|p|1")] {
+                        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+                        seed_file_5232(
+                            &pool,
+                            repo,
+                            &format!("p{}/-/p.tgz", digests.len()),
+                            &digest,
+                            Some((verdict, None, findings, cataloged, pin, 0)),
+                        )
+                        .await;
+                        let row = ProxyScanRow {
+                            checksum_sha256: digest.clone(),
+                            scan_type: "grype".to_string(),
+                            verdict: verdict.to_string(),
+                            findings_count: findings,
+                            critical_count: 0,
+                            high_count: 0,
+                            medium_count: 0,
+                            low_count: 0,
+                            max_severity: None,
+                            scanner_version: None,
+                            scanned_at: chrono::Utc::now(),
+                        };
+                        if clean_verdict_graded_nothing(&row, pin, cataloged) {
+                            want += 1;
+                        }
+                        digests.push(digest);
+                    }
+                }
+            }
+        }
+        let counts = ScanResultService::new(pool.clone())
+            .count_proxy_no_verdict(Some(&key))
+            .await
+            .expect("counts");
+        for digest in &digests {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_member_repo(&pool, repo, &dir).await;
+
+        assert!(want > 0);
+        assert_eq!(counts.clean_graded_nothing, want);
+        assert_eq!(counts.no_verdict, 0);
+        assert_eq!(counts.stale_verdict, 0);
     }
 
     /// #4363: an instance administrator's write locks the repository's proxy
@@ -7565,6 +8159,7 @@ mod tests {
             high_findings: 15,
             policy_violations_blocked: 3,
             proxy_blocked: 0,
+            proxy_would_block: 0,
             repos_grade_a: 6,
             repos_grade_f: 1,
             repos_rated: 0,
@@ -7591,6 +8186,7 @@ mod tests {
             high_findings: 0,
             policy_violations_blocked: 0,
             proxy_blocked: 0,
+            proxy_would_block: 0,
             repos_grade_a: 0,
             repos_grade_f: 0,
             repos_rated: 0,
@@ -8362,6 +8958,7 @@ mod tests {
             high_findings: 3,
             policy_violations_blocked: 0,
             proxy_blocked: 0,
+            proxy_would_block: 0,
             repos_grade_a: 4,
             repos_grade_f: 0,
             repos_rated: 0,
