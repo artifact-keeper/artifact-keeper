@@ -5617,6 +5617,26 @@ impl ProxyService {
             .await
     }
 
+    /// [`Self::get_cached_artifact_by_path`] without the expiry gate, for a
+    /// fact an expired copy still states correctly (#5170: the release an apt
+    /// `Release` names). The origin policy and the checksum still apply, and
+    /// an unreadable entry is a miss.
+    pub async fn get_cached_artifact_by_path_ignoring_expiry(
+        &self,
+        repo_key: &str,
+        path: &str,
+    ) -> Result<Option<CachedBody>> {
+        self.ensure_origin_policy_allows_for(RemoteRef::Key(repo_key))
+            .await?;
+        let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
+        Ok(self
+            .cache_store
+            .get(&cache_key, &metadata_key, true, None, None)
+            .await
+            .unwrap_or(None))
+    }
+
     /// Metadata-only freshness check for a proxy-cached artifact.
     ///
     /// Loads only the cache metadata sidecar (small JSON) and verifies that
