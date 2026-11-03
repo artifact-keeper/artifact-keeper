@@ -540,7 +540,21 @@ pub async fn request_approval(
     let policy_result = if !req.skip_policy_check {
         let policy_service = PromotionPolicyService::new(state.db.clone());
         match policy_service
-            .evaluate_artifact(req.artifact_id, source_repo.id)
+            .evaluate_promotion(
+                req.artifact_id,
+                source_repo.id,
+                Some(
+                    crate::services::promotion_policy_service::PromotionGateContext {
+                        target_repository_id: target_repo.id,
+                        promoter_may_acknowledge: super::promotion::promoter_may_acknowledge(
+                            &state.db,
+                            &auth,
+                            target_repo.id,
+                        )
+                        .await,
+                    },
+                ),
+            )
             .await
         {
             Ok(eval) => Some(build_policy_result_json(
@@ -909,10 +923,50 @@ pub async fn approve_promotion(
     // execute path returns 403 with the violations: a rule-blocked approval must
     // NOT execute the copy/insert, so it fails like a rejected promotion.
     if !req.skip_policy_check {
+        // The severity policy ran when the request was made, and what it read can
+        // have changed: an acknowledgement revoked or lapsed since then must not
+        // keep passing (#5153). Refused on the condition promotion refuses on, so a
+        // violation that only warns there, such as `max_artifact_age_days` passed
+        // during review, does not refuse here. Refused with the violations, like a
+        // rule, and the reviewer can override with `skip_policy_check`.
+        let may_acknowledge =
+            super::promotion::promoter_may_acknowledge(&state.db, &auth, target_repo.id).await;
+        let policy = crate::services::promotion_policy_service::PromotionPolicyService::new(
+            state.db.clone(),
+        )
+        .evaluate_promotion(
+            approval.artifact_id,
+            source_repo.id,
+            Some(
+                crate::services::promotion_policy_service::PromotionGateContext {
+                    target_repository_id: target_repo.id,
+                    promoter_may_acknowledge: may_acknowledge,
+                },
+            ),
+        )
+        .await?;
+        if !policy.passed && policy.action == crate::models::sbom::PolicyAction::Block {
+            let detail = policy
+                .violations
+                .iter()
+                .map(|v| v.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(AppError::Authorization(format!(
+                "Promotion blocked by policy violations: {}",
+                detail
+            )));
+        }
+
         let rule_service =
             crate::services::promotion_rule_service::PromotionRuleService::new(state.db.clone());
         let failing = rule_service
-            .evaluate_for_promotion(approval.artifact_id, source_repo.id, target_repo.id)
+            .evaluate_for_promotion(
+                approval.artifact_id,
+                source_repo.id,
+                target_repo.id,
+                may_acknowledge,
+            )
             .await?;
         if !failing.is_empty() {
             let detail = failing
@@ -1049,6 +1103,15 @@ pub async fn approve_promotion(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let scan_state = super::promotion::carry_scan_state_to_promoted(
+        &state.db,
+        artifact.id,
+        new_artifact_id,
+        target_repo.id,
+        &auth,
+    )
+    .await;
+
     // Record promotion history
     let promotion_id = Uuid::new_v4();
     sqlx::query(
@@ -1125,6 +1188,7 @@ pub async fn approve_promotion(
             "requested_by": approval.requested_by,
             "promoted_artifact_id": new_artifact_id,
             "promotion_id": promotion_id,
+            "scan_state": scan_state,
             "skip_policy_check": req.skip_policy_check,
             "notes": req.notes,
         })),
@@ -3127,6 +3191,18 @@ mod tests {
                 make_artifact_with_origin(&pool, src, &storage, "ao4152", &proxy_origin).await;
             let requester = make_requester(&pool, "ao4152").await;
             let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+            // #5153: the third promote path hands over the verdict too.
+            let source_scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                                           completed_at, checksum_sha256) \
+                 SELECT $1, $2, 'dependency', 'completed', NOW(), checksum_sha256 \
+                 FROM artifacts WHERE id = $1 RETURNING id",
+            )
+            .bind(artifact)
+            .bind(src)
+            .fetch_one(&pool)
+            .await
+            .expect("source scan");
 
             let res = approve_promotion(
                 State(state.clone()),
@@ -3150,11 +3226,189 @@ mod tests {
                 "the approval copy must record the SOURCE artifact's origin \
                  byte-for-byte, not a fresh derivation for the target repo"
             );
+            let carried: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scan_results WHERE repository_id = $1 AND source_scan_id = $2",
+            )
+            .bind(tgt)
+            .bind(source_scan)
+            .fetch_one(&pool)
+            .await
+            .expect("carried scan");
+            assert_eq!(
+                carried, 1,
+                "the approval copy must carry the source's verdict"
+            );
 
             cleanup(&pool, &[src, tgt], user).await;
             cleanup_user(&pool, requester).await;
             let _ = std::fs::remove_dir_all(&sdir);
             let _ = std::fs::remove_dir_all(&tdir);
+        }
+
+        /// #5153: the severity policy ran when the request was made. What it read may
+        /// have changed by approval: an acknowledgement revoked in between does not
+        /// keep passing, unless the reviewer overrides.
+        #[tokio::test]
+        async fn test_approval_rereads_the_policy_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153p-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153p-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "p5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "p5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "p5153").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let (artifact, _path) = make_artifact_with_origin(
+                &pool,
+                src,
+                &storage,
+                "p5153",
+                &tdh::mint_proxy_origin(&pool).await,
+            )
+            .await;
+            let scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                     findings_count, critical_count, completed_at, checksum_sha256) \
+                 SELECT $1, $2, 'dependency', 'completed', 1, 1, NOW(), checksum_sha256 \
+                 FROM artifacts WHERE id = $1 RETURNING id",
+            )
+            .bind(artifact)
+            .bind(src)
+            .fetch_one(&pool)
+            .await
+            .expect("scan");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id) \
+                 VALUES ($1, $2, 'critical', 't', 'CVE-2031-5155')",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .expect("finding");
+            let requester = make_requester(&pool, "p5153").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let refused = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(AppError::Authorization(_))),
+                "an open critical must not pass at approval"
+            );
+            let approved = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: true,
+                }),
+            )
+            .await;
+            assert!(approved.is_ok(), "the reviewer can override");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+        }
+
+        /// #5153: approval refuses what promotion refuses, and no more. A violation
+        /// graded below `high` warns at promotion, and an artifact that aged past
+        /// `max_artifact_age_days` during review is one of those.
+        #[tokio::test]
+        async fn test_approval_allows_what_promotion_only_warns_about_5153() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr5153w-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr5153w-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "w5153-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "w5153-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "w5153").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let (artifact, _path) = make_artifact_with_origin(
+                &pool,
+                src,
+                &storage,
+                "w5153",
+                &tdh::mint_proxy_origin(&pool).await,
+            )
+            .await;
+            sqlx::query(
+                "INSERT INTO scan_policies (name, repository_id, max_severity, is_enabled, \
+                                            max_artifact_age_days) \
+                 VALUES ($1, $2, 'medium', true, 1)",
+            )
+            .bind(format!("w5153-{src}"))
+            .bind(src)
+            .execute(&pool)
+            .await
+            .expect("policy");
+            sqlx::query(
+                "UPDATE artifacts SET created_at = NOW() - INTERVAL '3 days' WHERE id = $1",
+            )
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .expect("age");
+            let scan: Uuid = sqlx::query_scalar(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+                     findings_count, medium_count, completed_at, checksum_sha256) \
+                 SELECT $1, $2, 'dependency', 'completed', 1, 1, NOW(), checksum_sha256 \
+                 FROM artifacts WHERE id = $1 RETURNING id",
+            )
+            .bind(artifact)
+            .bind(src)
+            .fetch_one(&pool)
+            .await
+            .expect("scan");
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id) \
+                 VALUES ($1, $2, 'medium', 't', 'CVE-2031-5157')",
+            )
+            .bind(scan)
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .expect("finding");
+            let eval = PromotionPolicyService::new(pool.clone())
+                .evaluate_artifact(artifact, src)
+                .await
+                .expect("evaluate");
+            assert!(!eval.passed, "the rig must produce violations");
+            assert_eq!(eval.action, crate::models::sbom::PolicyAction::Warn);
+            assert!(eval.violations.iter().any(|v| v.rule == "max-artifact-age"));
+
+            let requester = make_requester(&pool, "w5153").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(res.is_ok(), "a warning does not refuse an approval");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
         }
 
         /// #4710: approving and rejecting a request each write one audit row

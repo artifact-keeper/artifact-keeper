@@ -380,6 +380,25 @@ pub fn spawn_all(
         });
     }
 
+    // Lapsed finding acknowledgements (every 5 minutes, #5153). Every gate reads
+    // `expires_at` itself; this writes the audit row and refreshes stored scores.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticker = interval(Duration::from_secs(300));
+            let service =
+                crate::services::finding_acknowledgements::FindingAcknowledgementService::new(db);
+
+            loop {
+                ticker.tick().await;
+                if let Err(e) = service.record_expired().await {
+                    tracing::warn!("Failed to record lapsed acknowledgements: {}", e);
+                }
+            }
+        });
+    }
+
     // API-token cache invalidation map prune (every hour).
     //
     // The invalidation map records when each user's API-token cache entries
