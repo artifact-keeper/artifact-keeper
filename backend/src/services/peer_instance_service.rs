@@ -1303,12 +1303,10 @@ mod tests {
     }
 
     /// Connect to the test database when `DATABASE_URL` is set and reachable;
-    /// otherwise return `None` so the DB-backed tests skip silently and
-    /// `cargo test --lib` still passes without a running Postgres. CI's
-    /// integration job sets `DATABASE_URL` and exercises these branches.
+    /// otherwise return `None` so `cargo test --lib` still passes without a
+    /// running Postgres. Fails loud under `AK_TESTS_REQUIRE_DB` (#4801).
     async fn test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::PgPool::connect(&url).await.ok()
+        crate::testing::try_pool_with(5).await
     }
 
     async fn insert_test_repo(pool: &sqlx::PgPool, suffix: &Uuid) -> Uuid {

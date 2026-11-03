@@ -3817,12 +3817,7 @@ mod tests {
     const TEST_PASSPHRASE: &str = "signing-rotation-atomic-test-passphrase";
 
     async fn rotation_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(8)
-            .connect(&url)
-            .await
-            .ok()
+        crate::testing::try_pool_with(8).await
     }
 
     fn rotation_test_service(pool: sqlx::PgPool) -> SigningService {

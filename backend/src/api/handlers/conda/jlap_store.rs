@@ -19,9 +19,9 @@
 //!    JLAP (the IV absorbs a trimmed line, so the chain values of the lines
 //!    that stay do not change).
 //!
-//! The JLAP a revision's documents carry is therefore always the stored JLAP
-//! whose footer is that revision's `repodata.json` hash, and it is written
-//! before that `repodata.json` is served anywhere. A withdrawal moves the
+//! The JLAP a revision's documents carry is therefore the stored JLAP whose
+//! footer is that revision's `repodata.json` hash, written before that
+//! `repodata.json` is served anywhere. A withdrawal moves the
 //! subdir revision (the catalog trigger marks it in the writer's
 //! transaction); the next render diffs the document without the package and
 //! appends its `remove` before the new `repodata.json` exists for any
@@ -31,6 +31,13 @@
 //! recorded a later revision) leaves the stored JLAP as it is and carries it:
 //! appending an older document after a newer one would put a withdrawn
 //! package back in the tail.
+//!
+//! So does a render of the revision already recorded whose bytes differ (two
+//! renders that decided visibility at different instants, #5167). Appending
+//! would have them take turns restoring each other's document, stepping the
+//! tail back. The cost is one mismatched pair until the revision next moves:
+//! this render's `repodata.json` is not the document the footer names, so a
+//! client holding it finds no patch and downloads the index.
 //!
 //! The documents are hashed as served: `repodata.json` and the uncompressed
 //! bytes of `repodata.json.zst` and `.bz2` are the same bytes, so a client
@@ -405,9 +412,9 @@ pub(crate) async fn record_keeping(
             tx.commit().await.map_err(err)?;
             return Ok(bytes.clone());
         }
-        if latest_revision.is_some_and(|r| r > revision) {
-            // A newer revision is already recorded: this render is behind
-            // it, and appending it would move the tail backwards.
+        if latest_revision.is_some_and(|r| r >= revision) {
+            // This revision or a newer one is already recorded with other
+            // bytes: appending this render could move the tail backwards.
             tx.rollback().await.map_err(err)?;
             return Ok(bytes.clone());
         }
@@ -759,5 +766,44 @@ mod tests {
         let behind = record_doc(&fx, 2, &docs[0], 3).await;
         assert_eq!(behind.render(), prev_bytes);
         assert_eq!(kept_revisions(&fx).await, vec![3, 4, 5]);
+    }
+
+    /// #5167: two renders of one revision that decided visibility at different
+    /// instants do not take turns appending each other's document. The tail
+    /// stays where the first left it, and the next revision patches from it.
+    #[tokio::test]
+    async fn renders_of_one_revision_do_not_step_the_tail_back_5167() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let first = listing(&["a"]);
+        let second = listing(&["a", "b"]);
+        let other = listing(&["a", "c"]);
+        let later = listing(&["a", "b", "c"]);
+
+        record_doc(&fx, 1, &first, 8).await;
+        let stored = record_doc(&fx, 2, &second, 8).await;
+        assert_eq!(stored.lines.len(), 1);
+
+        // The other render of revision 2, then the first again, then the
+        // other: the stored JLAP is carried each time and nothing is kept.
+        for json in [&other, &second, &other] {
+            let carried = record_doc(&fx, 2, json, 8).await;
+            assert_eq!(carried, stored);
+            assert_eq!(kept_revisions(&fx).await, vec![1, 2]);
+        }
+
+        // The next revision patches from the document the footer names.
+        let next = record_doc(&fx, 3, &later, 8).await;
+        assert_eq!(next.lines[..1], stored.lines[..]);
+        assert_eq!(next.lines.len(), 2);
+        let mut patched: Value = serde_json::from_slice(&first).unwrap();
+        for line in &next.lines {
+            let line: Value = serde_json::from_str(line).unwrap();
+            apply(&mut patched, line["patch"].as_array().unwrap());
+        }
+        assert_eq!(patched, serde_json::from_slice::<Value>(&later).unwrap());
+        assert_eq!(next.latest, blake2_256(&later));
+        assert_eq!(kept_revisions(&fx).await, vec![1, 2, 3]);
     }
 }

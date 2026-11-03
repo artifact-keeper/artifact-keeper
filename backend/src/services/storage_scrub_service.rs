@@ -265,6 +265,16 @@ fn still_live_sql(kind: ScrubObjectKind) -> &'static str {
     }
 }
 
+/// What [`StorageScrubService::try_repair`] did with a damaged object.
+enum RepairOutcome {
+    /// Restored; describes the donor.
+    Repaired(String),
+    /// Every candidate was tried and none could be used.
+    NoVerifiedCopy,
+    /// `max_bytes` ran out with candidates still unread.
+    BudgetExhausted,
+}
+
 impl StorageScrubService {
     pub fn new(db: PgPool, storage_registry: Arc<StorageRegistry>) -> Self {
         Self {
@@ -320,7 +330,7 @@ impl StorageScrubService {
                 if !self.within_budget(&result, opts) {
                     break;
                 }
-                self.scrub_one(ScrubObjectKind::Artifact, &t, opts.repair, &mut result)
+                self.scrub_one(ScrubObjectKind::Artifact, &t, opts, &mut result)
                     .await;
                 art_cursor = Some(t.id);
                 self.save_cursors(&scope, art_cursor, blob_cursor, false)
@@ -341,7 +351,7 @@ impl StorageScrubService {
                     if !self.within_budget(&result, opts) {
                         break;
                     }
-                    self.scrub_one(ScrubObjectKind::OciBlob, &t, opts.repair, &mut result)
+                    self.scrub_one(ScrubObjectKind::OciBlob, &t, opts, &mut result)
                         .await;
                     blob_cursor = Some(t.id);
                     self.save_cursors(&scope, None, blob_cursor, false).await?;
@@ -487,14 +497,14 @@ impl StorageScrubService {
         &self,
         kind: ScrubObjectKind,
         t: &ScrubTarget,
-        repair: bool,
+        opts: &ScrubOptions,
         result: &mut ScrubResult,
     ) {
         // Counted here, once per object, whether or not the check got far
         // enough to read it: counting inside `scrub_one_inner` as well
         // double-counted every object whose finding failed to record (#4323).
         result.objects_checked += 1;
-        if let Err(e) = self.scrub_one_inner(kind, t, repair, result).await {
+        if let Err(e) = self.scrub_one_inner(kind, t, opts, result).await {
             if result.errors.len() < REPORT_SAMPLE_CAP {
                 result.errors.push(format!(
                     "{} {} ({}): {e}",
@@ -510,7 +520,7 @@ impl StorageScrubService {
         &self,
         kind: ScrubObjectKind,
         t: &ScrubTarget,
-        repair: bool,
+        opts: &ScrubOptions,
         result: &mut ScrubResult,
     ) -> Result<()> {
         let storage = self.storage_registry.backend_for(&t.location())?;
@@ -550,17 +560,29 @@ impl StorageScrubService {
 
         let mut status = status.to_string();
         let mut detail = None;
-        if repair && !key_is_content_addressed(&t.storage_key, &t.checksum) {
+        if opts.repair && !key_is_content_addressed(&t.storage_key, &t.checksum) {
             detail = Some(
                 "path-keyed object: reported only (repair needs a content-addressed key)".into(),
             );
-        } else if repair {
-            match self.try_repair(kind, t, storage.as_ref(), result).await {
-                Ok(Some(donor)) => {
+        } else if opts.repair {
+            match self
+                .try_repair(kind, t, storage.as_ref(), opts.max_bytes, result)
+                .await
+            {
+                Ok(RepairOutcome::Repaired(donor)) => {
                     status = "repaired".into();
                     detail = Some(format!("restored from verified copy {donor}"));
                 }
-                Ok(None) => detail = Some("no verified good copy available".into()),
+                Ok(RepairOutcome::NoVerifiedCopy) => {
+                    detail = Some("no verified good copy available".into())
+                }
+                Ok(RepairOutcome::BudgetExhausted) => {
+                    detail = Some(
+                        "repair stopped at the byte budget before every copy was tried; \
+                         a later run retries it"
+                            .into(),
+                    )
+                }
                 Err(e) => detail = Some(format!("repair failed: {e}")),
             }
         }
@@ -588,21 +610,24 @@ impl StorageScrubService {
 
     /// Find another stored copy of the same digest whose bytes verify, spool
     /// it to a temp file while hashing, and write it over the damaged key.
-    /// Returns a description of the donor on success, `None` when no copy
-    /// verified.
     ///
     /// Every byte read here (donor copies, and the re-verification of the
     /// repaired object) counts toward `bytes_read`, so a repair run honours
-    /// `max_bytes` (#4323).
+    /// `max_bytes` (#4323). The budget is checked between donors, so a run of
+    /// corrupt copies stops there (#5168). The first donor is always tried,
+    /// even when reading the damaged object used up the budget, or an object
+    /// as large as the budget could never be repaired. A copy that verified is
+    /// always written.
     async fn try_repair(
         &self,
         kind: ScrubObjectKind,
         t: &ScrubTarget,
         target: &dyn StorageBackend,
+        max_bytes: u64,
         result: &mut ScrubResult,
-    ) -> Result<Option<String>> {
+    ) -> Result<RepairOutcome> {
         let Some(expected) = parse_sha256_hex(&t.checksum) else {
-            return Ok(None);
+            return Ok(RepairOutcome::NoVerifiedCopy);
         };
         let hex_digest = hex::encode(expected);
         let donors: Vec<ScrubTarget> = sqlx::query_as(
@@ -629,10 +654,15 @@ impl StorageScrubService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        let mut tried_a_donor = false;
         for donor in donors {
+            if tried_a_donor && result.bytes_read >= max_bytes {
+                return Ok(RepairOutcome::BudgetExhausted);
+            }
             let Ok(source) = self.storage_registry.backend_for(&donor.location()) else {
                 continue;
             };
+            tried_a_donor = true;
             let (spool, read) =
                 match spool_verified(source.as_ref(), &donor.storage_key, &expected).await {
                     Ok(spooled) => spooled,
@@ -652,19 +682,19 @@ impl StorageScrubService {
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
             if !live {
-                return Ok(None);
+                return Ok(RepairOutcome::NoVerifiedCopy);
             }
             target.put_file(&t.storage_key, spool.path()).await?;
             let (check, read) = Self::check_object(target, t).await?;
             result.bytes_read += read;
             if check == ObjectCheck::Intact {
-                return Ok(Some(format!(
+                return Ok(RepairOutcome::Repaired(format!(
                     "{}:{} ({})",
                     donor.storage_backend, donor.storage_key, donor.id
                 )));
             }
         }
-        Ok(None)
+        Ok(RepairOutcome::NoVerifiedCopy)
     }
 
     async fn clear_finding(&self, kind: ScrubObjectKind, id: Uuid) -> Result<()> {
@@ -1092,6 +1122,124 @@ mod db_tests {
             res.bytes_read >= 3 * original.len() as u64,
             "target, donor and re-verification reads: {res:?}"
         );
+    }
+
+    /// #5168: the repair loop checks `max_bytes` between donors. With three
+    /// corrupt copies and a budget one donor past the target, it reads one
+    /// donor and stops, and the finding does not claim no good copy exists:
+    /// the copies it did not read may be good.
+    #[tokio::test]
+    async fn scrub_repair_stops_between_donors_at_the_byte_budget_5168() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut donors = Vec::new();
+        for _ in 0..3 {
+            let Some(donor_fx) = tdh::Fixture::setup("local", "generic").await else {
+                fx.teardown().await;
+                return;
+            };
+            donors.push(donor_fx);
+        }
+        let original = b"scrub-donor-budget-bytes";
+        let corrupt = b"scrub-donor-budget-byteX";
+        let len = original.len() as u64;
+        let cas = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha_hex(original),
+        );
+        let (bad, _) = seed_at(&fx, &cas, "d/bad.bin", original, corrupt).await;
+        for donor_fx in &donors {
+            seed_at(donor_fx, &cas, "d/copy.bin", original, corrupt).await;
+        }
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let res = svc
+            .run(&ScrubOptions {
+                max_bytes: 2 * len,
+                ..opts(&fx, true)
+            })
+            .await
+            .expect("scrub run");
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM storage_scrub_findings WHERE object_kind = 'artifact' \
+             AND object_id = $1",
+        )
+        .bind(bad)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("finding");
+
+        // A later run with room for every copy reads them all and reports
+        // that none verified.
+        sqlx::query("DELETE FROM storage_scrub_state WHERE scope = $1")
+            .bind(fx.repo_id.to_string())
+            .execute(&fx.pool)
+            .await
+            .expect("reset cursor");
+        let full = svc.run(&opts(&fx, true)).await.expect("full run");
+        let full_detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM storage_scrub_findings WHERE object_kind = 'artifact' \
+             AND object_id = $1",
+        )
+        .bind(bad)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("finding");
+        fx.teardown().await;
+        for donor_fx in donors {
+            donor_fx.teardown().await;
+        }
+
+        assert_eq!(res.corrupt, 1, "{res:?}");
+        assert_eq!(res.repaired, 0, "{res:?}");
+        assert_eq!(res.bytes_read, 2 * len, "the target and one donor: {res:?}");
+        assert!(
+            detail.as_deref().is_some_and(|d| d.contains("byte budget")),
+            "{detail:?}"
+        );
+        assert_eq!(
+            full.bytes_read,
+            4 * len,
+            "the target and all three: {full:?}"
+        );
+        assert_eq!(
+            full_detail.as_deref(),
+            Some("no verified good copy available")
+        );
+    }
+
+    /// #5168: the budget never stops the first donor, or an object as large as
+    /// the budget could never be repaired.
+    #[tokio::test]
+    async fn scrub_repair_tries_the_first_donor_past_the_budget_5168() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let Some(donor_fx) = tdh::Fixture::setup("local", "generic").await else {
+            fx.teardown().await;
+            return;
+        };
+        let original = b"scrub-first-donor-bytes";
+        let cas = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+            &sha_hex(original),
+        );
+        let (bad, _) = seed_at(&fx, &cas, "f/bad.bin", original, b"scrub-first-donor-byteX").await;
+        seed_at(&donor_fx, &cas, "f/copy.bin", original, original).await;
+        let svc = StorageScrubService::new(fx.pool.clone(), fx.state.storage_registry.clone());
+        let res = svc
+            .run(&ScrubOptions {
+                max_bytes: original.len() as u64,
+                ..opts(&fx, true)
+            })
+            .await
+            .expect("scrub run");
+        let status = finding_status(&fx.pool, bad).await;
+        let fixed = fs_storage(&fx).get(&cas).await.expect("object");
+        fx.teardown().await;
+        donor_fx.teardown().await;
+
+        assert_eq!(res.repaired, 1, "{res:?}");
+        assert_eq!(status.as_deref(), Some("repaired"));
+        assert_eq!(&fixed[..], original);
     }
 
     /// #4323: findings of hard-deleted rows and the cursor of a deleted
