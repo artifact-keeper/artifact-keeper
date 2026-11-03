@@ -960,6 +960,9 @@ pub struct DashboardSummary {
     /// Distinct proxied digests a repository's proxy scan gate refuses right
     /// now (#4777): the proxy half of `policy_violations_blocked`, on its own.
     pub proxy_blocked: i64,
+    /// Distinct proxied digests a repository's proxy scan gate would refuse if
+    /// it enforced (#5232): `proxy_blocked` plus what `record_only` serves.
+    pub proxy_would_block: i64,
     pub repos_grade_a: i64,
     pub repos_grade_f: i64,
     /// Repositories by grade status (#4336). Rows a 1.11 replica wrote count

@@ -282,6 +282,65 @@ Refusals answered outside the shared gate are not audited yet: a conda
 attestation sidecar of a blocked package, the NuGet digest-pinned row repair
 path, and OCI image pulls.
 
+## Previewing enforcement
+
+`record_only` refuses nothing, so the three views above are empty under it.
+To see what enforcement would refuse (#5232):
+
+- `GET /api/v1/security/proxy-blocked?would_block=true` applies each
+  repository's severity gate to its recorded verdicts whatever its current
+  action, using the same check the gate uses. The access rule and the
+  `repository`, `min_severity`, `page` and `per_page` parameters are those of
+  the list above. Each item also carries the repository's `proxy_scan_action`,
+  so what is refused today can be told from what `record_only` still serves.
+- `GET /api/v1/security/dashboard` returns `proxy_would_block`: the distinct
+  digests behind that list across repositories. It includes `proxy_blocked`,
+  and it is not added to `proxy_blocked` or `policy_violations_blocked`.
+
+Without `would_block` the list and its response are unchanged, and
+`policy-blocks` is not affected.
+
+The gate applied is the one enforcement would apply, which is not always the
+threshold on the settings page: with `block_on_policy_violation` off, any
+finding refuses, so a `low` verdict is listed under a `high` threshold. A
+`vulnerable` verdict with no recorded severity is always listed. A format whose
+proxy path runs no gate, and a repository with `scan_on_proxy` off, list
+nothing.
+
+### Files with no usable verdict
+
+These are never listed, because there is nothing to grade, but they are where
+`fail_closed` differs from the list. The response counts them in
+`would_block_summary`, in distinct digests:
+
+| Field | Which cached digests | Under `fail_closed`, on the next pull |
+| --- | --- | --- |
+| `would_block_digests` | Those behind the listed items | `403` |
+| `no_verdict` | No verdict recorded: not pulled since scanning was enabled, or the scan did not finish | Scanned inline |
+| `stale_verdict` | Verdict older than the 30-day window | Scanned inline |
+| `clean_graded_nothing` | `clean`, no findings, no component cataloged, no pin | Scanned inline |
+
+An inline scan decides there and then: served if clean or below the threshold,
+`403` if the gate refuses the result, and `423` if the scan is inconclusive (no
+scanner, over the 200 MiB cap, over the time budget) or what the bytes are
+served as cannot be established. `record_only` and `fail_open` serve all three
+kinds. So these counts are the pulls that will wait on a scan after the switch
+and may be refused, not a count of refusals. A large `no_verdict` is a reason to
+pull or rescan before enforcing.
+
+The counts cover the catalog the `proxy-scans` summary reads, where the same
+files show as `not_scanned`: cached index documents and npm packuments are left
+out, but a file the format serves without gating it, such as a Maven POM or a
+Debian `Release`, is counted although `fail_closed` serves it anyway. Read them
+as an upper bound. They ignore `min_severity`.
+
+The preview reads stored verdicts only, as `proxy_blocked` does. A pull can
+still come out differently when the CVE database has advanced since the verdict
+(the bytes are scanned again), when a format reuses a verdict only for the
+coordinate it was graded as (Go, Composer, Conan, Debian, RPM, Alpine), and on
+a Virtual route, where the stricter of the two repositories' policies applies
+and each repository here is judged on its own settings.
+
 ## Actions
 
 | `proxy_scan_action` | First pull of unknown bytes | Vulnerable | Inconclusive (over the byte cap, scan error, timeout, identity mismatch) |

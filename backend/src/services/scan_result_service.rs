@@ -339,6 +339,75 @@ pub(crate) fn proxy_gate_refuses(
         .blocks(max_severity.and_then(Severity::from_str_loose))
 }
 
+/// Whether a repository's proxy scan gate would refuse a stored `vulnerable`
+/// verdict if it enforced (#5232), whatever its current action:
+/// [`proxy_gate_refuses`] itself, asked with an enforcing action, so a preview
+/// and the gate cannot grade a verdict differently. `fail_open` and
+/// `fail_closed` grade a stored `vulnerable` verdict alike; they differ only
+/// where there is no verdict to grade ([`ProxyNoVerdictCounts`]).
+pub(crate) fn proxy_gate_would_refuse(
+    format: &str,
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    max_severity: Option<&str>,
+) -> bool {
+    proxy_gate_refuses(
+        format,
+        block_on_policy_violation,
+        severity_threshold,
+        crate::services::proxy_scan_service::ProxyScanAction::FailClosed.as_db_str(),
+        max_severity,
+    )
+}
+
+/// Count the distinct digests at least one repository's proxy scan gate would
+/// refuse if it enforced (#5232): [`count_blocked_proxy_digests`] plus what
+/// `record_only` repositories record and serve.
+pub(crate) fn count_would_block_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
+    let would_block: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            proxy_gate_would_refuse(
+                &r.format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                r.max_severity.as_deref(),
+            )
+        })
+        .map(|r| r.checksum_sha256.as_str())
+        .collect();
+    would_block.len() as i64
+}
+
+/// Cached digests of gate-running repositories that a `would_block` preview
+/// does not list, because the gate has no verdict it would act on (#5232):
+/// `fail_closed` scans them inline on the next pull, then serves, refuses, or
+/// answers `423` if the scan is inconclusive; `fail_open` and `record_only`
+/// serve them. Same catalog as the `proxy-scans` summary, so cached metadata
+/// is left out, and a cached file the format serves without gating it (a
+/// Maven POM, a Debian `Release`) is counted there and here.
+#[derive(Debug, Default, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ProxyNoVerdictCounts {
+    /// No verdict row, or an `error` row, which no current code writes: the
+    /// same reading as the `proxy-scans` summary's `not_scanned`.
+    pub no_verdict: i64,
+    /// A `clean` or `vulnerable` verdict older than the scan TTL.
+    pub stale_verdict: i64,
+    /// A current `clean` verdict for which
+    /// [`clean_verdict_graded_nothing`](crate::services::proxy_scan_service::clean_verdict_graded_nothing)
+    /// holds: `fail_closed` does not reuse it.
+    pub clean_graded_nothing: i64,
+}
+
+/// The `repository_format` labels of the formats that run the proxy gate.
+fn proxy_gated_format_labels() -> Vec<&'static str> {
+    crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .filter(|f| crate::formats::format_enforces_scan_on_proxy(f))
+        .map(|f| f.as_key())
+        .collect()
+}
+
 /// One proxied path whose stored verdict its repository's proxy scan gate
 /// currently refuses (#4510, #4777): a `proxy_cache_artifacts` row (or, for
 /// OCI, an image manifest the repository references) whose digest has a
@@ -389,6 +458,7 @@ pub(crate) fn build_dashboard_summary(
         high_findings,
         policy_violations_blocked: 0,
         proxy_blocked: 0,
+        proxy_would_block: 0,
         repos_grade_a,
         repos_grade_f,
         repos_rated: 0,
@@ -2924,9 +2994,12 @@ impl ScanResultService {
             repos_grade_f,
         );
         let hosted = self.count_hosted_rejected().await?;
-        let proxy = self.count_proxy_blocked().await?;
+        // One read: `proxy_would_block` grades the same candidates.
+        let candidates = self.proxy_block_candidates().await?;
+        let proxy = count_blocked_proxy_digests(&candidates);
         out.policy_violations_blocked = hosted + proxy;
         out.proxy_blocked = proxy;
+        out.proxy_would_block = count_would_block_proxy_digests(&candidates);
         out.repos_rated = tally.rated;
         out.repos_incomplete = tally.incomplete;
         out.repos_unrated = tally.unrated;
@@ -2970,7 +3043,16 @@ impl ScanResultService {
     /// least one repository's proxy scan gate refuses right now, the same
     /// set the cross-repository blocked listing pages through.
     pub async fn count_proxy_blocked(&self) -> Result<i64> {
-        let rows: Vec<ProxyBlockCandidate> = sqlx::query_as(
+        Ok(count_blocked_proxy_digests(
+            &self.proxy_block_candidates().await?,
+        ))
+    }
+
+    /// Every fresh `vulnerable` verdict on a digest a scanning repository
+    /// caches, paired with that repository's settings and whatever its action:
+    /// the gate's predicates decide from here.
+    async fn proxy_block_candidates(&self) -> Result<Vec<ProxyBlockCandidate>> {
+        sqlx::query_as(
             r#"
             SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
                    psr.max_severity,
@@ -3001,9 +3083,7 @@ impl ScanResultService {
         .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(count_blocked_proxy_digests(&rows))
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// The CVE ids recorded for each of `digests` (#4777), most severe
@@ -3045,6 +3125,110 @@ impl ScanResultService {
     /// [`Self::count_policy_violations_blocked`], filtered with
     /// [`proxy_gate_refuses`], so a listed row is one the gate would refuse.
     pub async fn list_blocked_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        rows.retain(|r| {
+            proxy_gate_refuses(
+                &r.repository_format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                &r.proxy_scan_action,
+                r.max_severity.as_deref(),
+            )
+        });
+        Ok(rows)
+    }
+
+    /// Every proxied path a repository's proxy scan gate would refuse if it
+    /// enforced (#5232): [`Self::list_blocked_proxy_entries`] over the same
+    /// candidates, filtered with [`proxy_gate_would_refuse`].
+    pub async fn list_would_block_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        rows.retain(|r| {
+            proxy_gate_would_refuse(
+                &r.repository_format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                r.max_severity.as_deref(),
+            )
+        });
+        Ok(rows)
+    }
+
+    /// See [`ProxyNoVerdictCounts`]. One statement; the catalog is read once
+    /// per repository, and each distinct digest is looked up once.
+    pub async fn count_proxy_no_verdict(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<ProxyNoVerdictCounts> {
+        let packument_formats: Vec<&str> =
+            crate::services::proxy_catalog::packument_format_labels();
+        let not_metadata = crate::services::proxy_catalog::not_cached_metadata_sql_by_format(
+            "pca.path",
+            "r.format::text",
+            "$5",
+        );
+        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            WITH scanning AS (
+                SELECT r.id, r.format
+                  FROM scan_configs sc
+                  JOIN repositories r ON r.id = sc.repository_id
+                 WHERE sc.scan_on_proxy
+                   AND r.repo_type IN ('remote', 'virtual')
+                   AND r.format::text = ANY($3)
+                   AND ($4::text IS NULL OR r.key = $4)
+            ), cached AS (
+                SELECT pca.checksum_sha256 AS digest
+                  FROM scanning r
+                  JOIN proxy_cache_artifacts pca ON pca.repository_id = r.id
+                 WHERE pca.checksum_sha256 IS NOT NULL
+                   AND {not_metadata}
+                UNION
+                SELECT REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM scanning r
+                  JOIN manifest_blob_refs mbr ON mbr.repository_id = r.id
+            )
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE psr.verdict IS NULL
+                       OR psr.verdict NOT IN ('clean', 'vulnerable')
+                ) AS no_verdict,
+                COUNT(*) FILTER (
+                    WHERE psr.verdict IN ('clean', 'vulnerable')
+                      AND psr.scanned_at <= NOW() - make_interval(days => $2)
+                ) AS stale_verdict,
+                COUNT(*) FILTER (
+                    WHERE psr.verdict = 'clean'
+                      AND psr.scanned_at > NOW() - make_interval(days => $2)
+                      AND psr.findings_count = 0
+                      AND COALESCE(psr.components_cataloged, 0) <= 0
+                      AND psr.pin_identity IS NULL
+                ) AS clean_graded_nothing
+              FROM cached
+              LEFT JOIN proxy_scan_results psr
+                     ON psr.checksum_sha256 = cached.digest
+                    AND psr.scan_type = $1
+            "#
+        )))
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .bind(proxy_gated_format_labels())
+        .bind(repository_key)
+        .bind(packument_formats)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Fresh `vulnerable` verdicts on cached paths of scanning repositories,
+    /// ordered by repository key then path, before any gate decides.
+    async fn cached_vulnerable_proxy_entries(
         &self,
         repository_key: Option<&str>,
     ) -> Result<Vec<ProxyBlockedEntry>> {
@@ -3095,18 +3279,7 @@ impl ScanResultService {
                 "blocked proxy listing reached its candidate cap; later repositories are not listed"
             );
         }
-        Ok(rows
-            .into_iter()
-            .filter(|r| {
-                proxy_gate_refuses(
-                    &r.repository_format,
-                    r.block_on_policy_violation,
-                    &r.severity_threshold,
-                    &r.proxy_scan_action,
-                    r.max_severity.as_deref(),
-                )
-            })
-            .collect())
+        Ok(rows)
     }
 }
 
@@ -3417,6 +3590,121 @@ mod tests {
         ];
         assert_eq!(count_blocked_proxy_digests(&rows), 3);
         assert_eq!(count_blocked_proxy_digests(&[]), 0);
+    }
+
+    /// #5232: the preview is the gate's own predicate asked with an enforcing
+    /// action, and agrees with every decision the serve paths take on a stored
+    /// `vulnerable` verdict, for every format, opt-in, threshold and severity.
+    #[test]
+    fn test_would_refuse_is_the_gate_under_enforcement_5232() {
+        use crate::api::handlers::proxy_helpers::stored_verdict_blocks_under_gate;
+        use crate::services::proxy_scan_service::{
+            decide_cache_scan_gate, decide_serve, CacheScanGate, ProxyScanAction, ProxyScanRow,
+            ServeDecision, StoredProxyVerdict,
+        };
+        use crate::services::scan_config_service::proxy_severity_gate_for_row;
+        let now = chrono::Utc::now();
+        for format in [
+            "npm", "pypi", "conda", "helm_oci", "helm", "generic", "no-such",
+        ] {
+            for block in [false, true] {
+                for threshold in ["critical", "high", "medium", "low", "info", "garbage"] {
+                    for severity in [
+                        Some("critical"),
+                        Some("high"),
+                        Some("medium"),
+                        Some("low"),
+                        Some("info"),
+                        Some("junk"),
+                        None,
+                    ] {
+                        let ctx = format!("{format} {block} {threshold} {severity:?}");
+                        let would = proxy_gate_would_refuse(format, block, threshold, severity);
+                        for action in ["fail_open", "fail_closed"] {
+                            assert_eq!(
+                                would,
+                                proxy_gate_refuses(format, block, threshold, action, severity),
+                                "{ctx}: an enforcing repository lists exactly the preview"
+                            );
+                        }
+                        assert!(
+                            !proxy_gate_refuses(format, block, threshold, "record_only", severity),
+                            "{ctx}: record-only itself keeps refusing nothing"
+                        );
+
+                        // The decisions the real serve paths take.
+                        let row = ProxyScanRow {
+                            checksum_sha256: "d".repeat(64),
+                            scan_type: "grype".to_string(),
+                            verdict: "vulnerable".to_string(),
+                            findings_count: 1,
+                            critical_count: 0,
+                            high_count: 0,
+                            medium_count: 0,
+                            low_count: 0,
+                            max_severity: severity.map(str::to_string),
+                            scanner_version: Some("v".to_string()),
+                            scanned_at: now,
+                        };
+                        let gate = proxy_severity_gate_for_row(block, threshold, "fail_closed");
+                        let enforced = crate::formats::format_key_enforces_scan_on_proxy(format);
+                        for action in [ProxyScanAction::FailOpen, ProxyScanAction::FailClosed] {
+                            assert_eq!(
+                                decide_serve(Some(&row), Some("v"), action, 30, now),
+                                ServeDecision::BlockCached,
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                would,
+                                enforced && stored_verdict_blocks_under_gate(Some(&row), gate),
+                                "{ctx}: the buffered gate"
+                            );
+                            let stored = StoredProxyVerdict {
+                                row: row.clone(),
+                                pin_identity: None,
+                                components_cataloged: Some(1),
+                            };
+                            let fast = decide_cache_scan_gate(
+                                Some(&stored),
+                                Some("v"),
+                                action,
+                                gate,
+                                30,
+                                now,
+                            );
+                            assert_eq!(
+                                would,
+                                enforced && fast == CacheScanGate::Block,
+                                "{ctx}: the redirect gate"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #5232: the counter is `proxy_blocked` plus what `record_only` serves,
+    /// once per digest, and a digest refused anywhere is not counted twice.
+    #[test]
+    fn test_count_would_block_proxy_digests_5232() {
+        let rows = vec![
+            // Enforcing: both counters.
+            block_candidate("a", Some("critical"), "fail_open", true, "high"),
+            // The same digest record-only elsewhere: still one.
+            block_candidate("a", Some("critical"), "record_only", true, "high"),
+            // Record-only at or above its threshold: the preview only.
+            block_candidate("b", Some("high"), "record_only", true, "high"),
+            // Record-only below its threshold: neither.
+            block_candidate("c", Some("medium"), "record_only", true, "high"),
+            // Record-only with no threshold opted in: any finding would block.
+            block_candidate("d", Some("low"), "record_only", false, "critical"),
+            // Record-only and ungraded: fails closed.
+            block_candidate("e", None, "record_only", true, "critical"),
+        ];
+        assert_eq!(count_blocked_proxy_digests(&rows), 1);
+        assert_eq!(count_would_block_proxy_digests(&rows), 4);
+        assert_eq!(count_would_block_proxy_digests(&[]), 0);
     }
 
     /// #4582: a blocking verdict counts only where the format's proxy path
