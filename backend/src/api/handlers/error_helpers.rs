@@ -88,8 +88,9 @@ pub fn require_signing_key(
 /// satisfy these endpoints, so this is **409 Conflict**, not 500: the request
 /// is fine and the server is healthy — the repository's signing *configuration*
 /// conflicts with what the endpoint must produce, and only an operator can
-/// resolve it. Nothing will change until they do (#2651 proposes rejecting the
-/// combination at config time, upstream of here).
+/// resolve it. Nothing will change until they do. Key creation (#2651) and the
+/// signing config route (#5198) refuse the combination, so this is what a binding
+/// made before those checks gets, or one made directly in the database.
 ///
 /// The status matters operationally, because these endpoints are anonymous:
 /// every `dnf` poll of a misconfigured repo hits this path. Returning 500 +
