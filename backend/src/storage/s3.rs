@@ -7037,6 +7037,46 @@ mod tests {
         );
     }
 
+    /// #5133: S3 has no rename, so a promote is the server-side copy, and the
+    /// source stays for the caller's existing cleanup (nothing is deleted here).
+    #[tokio::test]
+    async fn test_promote_is_server_side_copy_and_keeps_source_5133() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/test-bucket/staged"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "5")
+                    .insert_header("last-modified", "Tue, 03 Nov 2026 00:00:00 GMT")
+                    .insert_header("etag", "\"x\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/test-bucket/blob"))
+            .and(header_exists("x-amz-copy-source"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<CopyObjectResult><ETag>\"x\"</ETag></CopyObjectResult>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let backend = mock_s3_backend(&server.uri(), false).await;
+        crate::storage::StorageBackend::promote(&backend, "staged", "blob")
+            .await
+            .unwrap();
+    }
+
     /// Positive control for #3164: copies at or below the 5 GiB threshold must
     /// keep using the single atomic `CopyObject` ("You create a copy of your
     /// object up to 5 GB in size in a single atomic action using this API" —
