@@ -21,9 +21,27 @@ git at the version-controlled hooks in `.githooks/`, which require only git and 
 extra tooling to install:
 
 - **pre-commit** runs `cargo fmt --all -- --check` when Rust files are staged (instant).
-- **pre-push** runs `cargo check --workspace --all-targets` and `cargo test --workspace --lib`
-  with `SQLX_OFFLINE=true`, so compile errors and unit-test failures are caught before they
-  reach a red PR. No database needed.
+- **pre-push** runs `cargo check --workspace --all-targets` with `SQLX_OFFLINE=true`, so
+  compile errors are caught before they reach a red PR. It needs no database, and it does not
+  run the tests. CI runs them on every PR.
+
+To run the unit tests before a push as well, set `AK_PRE_PUSH_TESTS=1`. The hook then runs
+`cargo nextest run --workspace --lib --test-threads 8`, the runner CI uses, and stops with a
+message if either of these is missing:
+
+- [cargo-nextest](https://nexte.st): `cargo install cargo-nextest --locked`. Many tests rely on
+  its one process per test, so plain `cargo test` fails on a clean tree (#3479).
+- A migrated throwaway database in `DATABASE_URL`. The tests create and delete rows across the
+  whole schema, so never point this at a live instance. `./scripts/dev.sh start` needs
+  `sqlx-cli` (`cargo install sqlx-cli --locked`); `./scripts/dev.sh reset` wipes it afterwards:
+
+```bash
+./scripts/dev.sh start
+set -a; . ./.env.local-dev; set +a
+AK_PRE_PUSH_TESTS=1 git push
+```
+
+A full test build peaks around 20 GB of rustc memory, which is why this is not the default.
 
 The hooks are fast local feedback, not a substitute for CI. Bypass once with
 `git commit --no-verify` / `git push --no-verify` only when you genuinely need to.
@@ -68,8 +86,9 @@ related workflows) enforces, in order of how fast you can reproduce each locally
 | CHANGELOG fragments | every `changes/unreleased/*.md` is well-formed | `python3 scripts/ci/changelog-fragments.py validate` |
 | CodeQL | static analysis | n/a (runs in CI) |
 
-The fmt/clippy/unit-test gates are the ones the hooks cover. The coverage, duplication, and
-linked-issue gates run only in CI, so check those before pushing a large change. Do not use
+The hooks cover the fmt gate and compile errors, and with `AK_PRE_PUSH_TESTS=1` the unit tests.
+Run clippy yourself. The coverage, duplication, and linked-issue gates run only in CI, so check
+those before pushing a large change. Do not use
 "push and see if CI passes" as a workflow, and do not bypass a failing gate with `--admin`.
 
 ## Changelog entries

@@ -8867,8 +8867,8 @@ mod tests {
     ///
     /// Relies on `cargo nextest`'s process-per-test isolation, which CI and
     /// `CLAUDE.md` both mandate: the counter is a process-global, so under a
-    /// plain `cargo test` (still what `.githooks/pre-push` runs) a concurrent
-    /// test that verifies a password would inflate this delta. Not fixed here.
+    /// plain `cargo test` a concurrent test that verifies a password would
+    /// inflate this delta.
     async fn bcrypt_verifies_during<F, Fut>(f: F) -> u64
     where
         F: FnOnce() -> Fut,

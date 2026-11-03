@@ -8,8 +8,10 @@
 //!   cargo nextest run -p artifact-keeper-backend --test azure_shared_key_live_test --run-ignored all
 //!
 //! SAS URLs carry signatures, and when Azure refuses a signature its error body
-//! quotes the string it signed, source SAS included. Nothing here prints either:
-//! errors go through `redacted` before they reach a panic message.
+//! quotes the string it signed, source SAS included. The backend's errors leave
+//! that body out (#5181), but this file also reads Azure's responses directly,
+//! so nothing here prints either: errors go through `redacted` before they
+//! reach a panic message.
 
 use artifact_keeper_backend::storage::azure::{AzureBackend, AzureConfig, AzureCopyPath};
 use artifact_keeper_backend::storage::{StorageBackend, StoragePathFormat};
