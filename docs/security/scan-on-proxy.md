@@ -163,10 +163,16 @@ and so is Alpine's `libcrypto3` through its `origin`).
   are inconclusive and not scanned.
 - *Release, Debian.* The release the remote's own cached `Release` /
   `InRelease` names (`Origin` Debian or Ubuntu, then `Version` or
-  `Codename`), for the suite whose cached `Packages` index lists the file, or
-  else the one release every cached suite of the remote agrees on; failing
-  both, a stable-update or backport version (`+deb12u1`, `~bpo12+1`). The
-  remote's `Release` is cached by any `apt update` through it.
+  `Codename`), for the suite whose `Packages` index lists the file. The
+  remote's `Release` and index are cached by any `apt update` through it, and
+  an index a cached `Release` names is fetched and verified against it when no
+  client has fetched it. A file no such index lists, or whose suite's `Release`
+  is not cached, is graded on the release its version names (`+deb12u1`,
+  `~bpo12+1`, the rightmost marker when there are several), and is otherwise
+  inconclusive: another suite's release is never used. When a Debian suite and
+  the version's marker name different releases (`+deb11u1` in a Debian 12
+  suite), the package is inconclusive; a marker on an Ubuntu or derivative
+  package is not compared.
 - *Release, RPM.* The dist tag in the package's release: `el9` / `el9_2` is
   RHEL 9 (RHEL rebuilds such as Rocky, AlmaLinux and Oracle Linux are graded
   against the RHEL feed, as the scanner itself grades them), `fc40` Fedora 40,
