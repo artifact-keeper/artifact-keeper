@@ -1315,32 +1315,22 @@ mod tests {
     ///  - positive control: a non-OCI repository's hosted bytes are still
     ///    counted unchanged.
     ///
-    /// Test-strategy note (why #3249 was scoped out of #3134's PR): the
-    /// snapshot upsert is keyed cluster-wide on `CURRENT_DATE`, so the
-    /// written row can never be fixture-scoped — any global-value assertion
-    /// races every concurrently running test (the #3129 flake class). This
-    /// test therefore never asserts the stored row's absolute value. It calls
-    /// `capture_daily_snapshot()` itself before and after seeding and asserts
-    /// the DELTA between the two RETURNING payloads, with the two defenses
-    /// the #3134 test proved out under a full parallel suite run:
-    ///  - fixture sizes are TERABYTE-scale integers (no real storage is
-    ///    written), so every wrong composition (blob bytes missing, legacy
-    ///    row double count, per-reference multiplication, physical-once
-    ///    dedup) lands >= 23 TB outside the window while concurrent tests
-    ///    move KBs-to-GBs;
-    ///  - the check tolerates +/- `SLACK` (10 GB) of unrelated churn inside
-    ///    the observation window and retries a few times.
-    /// The repeated upserts themselves are safe: each overwrites today's row
-    /// with a fresh cluster-wide aggregate, which is exactly what the daily
-    /// scheduler does, and no other test asserts `storage_metrics` contents.
+    /// The snapshot aggregates whole tables and upserts one row keyed on
+    /// `CURRENT_DATE`, so on the shared test database any delta absorbs other
+    /// tests' rows (#4256). This test owns a private database
+    /// ([`crate::testing::try_isolated_pool`]) and calls
+    /// `capture_daily_snapshot()` before and after seeding: nothing else can
+    /// move the totals, so the deltas of the two RETURNING payloads are exact
+    /// and there is no retry.
     #[tokio::test]
     async fn test_capture_daily_snapshot_includes_oci_blob_and_proxy_cache_bytes() {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::repository_service::RepositoryService;
 
-        let Some(pool) = tdh::try_pool().await else {
+        let Some(iso) = crate::testing::try_isolated_pool().await else {
             return;
         };
+        let pool = iso.pool.clone();
         let service = AnalyticsService::new(pool.clone());
         let repo_service = RepositoryService::new(pool.clone());
 
@@ -1353,7 +1343,6 @@ mod tests {
         const HOSTED_PLAIN: i64 = 41 * TB; // artifacts row in the generic repo (positive control)
         const LEGACY: i64 = 53 * TB; // legacy `proxy-cache/%` artifacts row (must be excluded)
         const CACHED: i64 = 61 * TB; // proxy_cache_artifacts catalog row
-        const SLACK: i64 = 10_000_000_000; // unrelated concurrent churn budget
 
         // Once per repo: BLOB_SHARED twice (two repos), refs don't multiply,
         // legacy row excluded.
@@ -1366,170 +1355,134 @@ mod tests {
         let (remote, _, _) = tdh::create_repo(&pool, "remote", "pypi").await;
         let repo_ids = [oci_a, oci_b, plain, remote];
 
-        let mut matched = false;
-        for _attempt in 0..5 {
-            let before = service
-                .capture_daily_snapshot()
-                .await
-                .expect("capture baseline snapshot");
+        let before = service
+            .capture_daily_snapshot()
+            .await
+            .expect("capture baseline snapshot");
 
-            let digest_shared = format!("sha256:{:0>64}", Uuid::new_v4().simple());
-            let digest_solo = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let digest_shared = format!("sha256:{:0>64}", Uuid::new_v4().simple());
+        let digest_solo = format!("sha256:{:0>64}", Uuid::new_v4().simple());
 
-            for (repo, name, size, storage_key) in [
-                (
-                    oci_a,
-                    "manifest",
-                    MANIFEST,
-                    format!("oci/{oci_a}/manifests/m"),
-                ),
-                (
-                    plain,
-                    "plain",
-                    HOSTED_PLAIN,
-                    format!("generic/{plain}/plain.bin"),
-                ),
-                (
-                    remote,
-                    "legacy",
-                    LEGACY,
-                    format!("proxy-cache/{remote}/legacy.whl"),
-                ),
-            ] {
-                sqlx::query(
-                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
-                     checksum_sha256, content_type, storage_key) \
-                     VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/octet-stream', $6)",
-                )
-                .bind(repo)
-                .bind(format!("snapshot-3249/{name}/{}", Uuid::new_v4()))
-                .bind(name)
-                .bind(size)
-                .bind(format!("{:0>64}", "3249"))
-                .bind(storage_key)
-                .execute(&pool)
-                .await
-                .expect("seed artifacts row");
-            }
-
-            for (repo, digest, size) in [
-                (oci_a, &digest_shared, BLOB_SHARED),
-                (oci_b, &digest_shared, BLOB_SHARED),
-                (oci_a, &digest_solo, BLOB_SOLO),
-            ] {
-                sqlx::query(
-                    "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
-                     VALUES ($1, $2, $3, $4)",
-                )
-                .bind(repo)
-                .bind(digest)
-                .bind(size)
-                .bind(format!("oci-blobs/{digest}"))
-                .execute(&pool)
-                .await
-                .expect("seed oci_blobs row");
-            }
-
-            // Two manifests referencing the shared blob in the same repo:
-            // per-REFERENCE counting would inflate the figure; per-repo-row
-            // counting (the ledger's) must not.
-            for i in 0..2 {
-                sqlx::query(
-                    "INSERT INTO manifest_blob_refs \
-                     (manifest_digest, blob_digest, repository_id, kind) \
-                     VALUES ($1, $2, $3, 'layer')",
-                )
-                .bind(format!("sha256:{:0>63}{i}", Uuid::new_v4().simple()))
-                .bind(&digest_shared)
-                .bind(oci_a)
-                .execute(&pool)
-                .await
-                .expect("seed manifest_blob_refs row");
-            }
-
+        for (repo, name, size, storage_key) in [
+            (
+                oci_a,
+                "manifest",
+                MANIFEST,
+                format!("oci/{oci_a}/manifests/m"),
+            ),
+            (
+                plain,
+                "plain",
+                HOSTED_PLAIN,
+                format!("generic/{plain}/plain.bin"),
+            ),
+            (
+                remote,
+                "legacy",
+                LEGACY,
+                format!("proxy-cache/{remote}/legacy.whl"),
+            ),
+        ] {
             sqlx::query(
-                "INSERT INTO proxy_cache_artifacts \
-                 (repository_id, path, storage_key, metadata_key, size_bytes) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, '1.0.0', $4, $5, 'application/octet-stream', $6)",
             )
-            .bind(remote)
-            .bind("snapshot-3249/legacy.whl")
-            .bind(format!(
-                "proxy-cache/{remote}/snapshot-3249/legacy.whl/__content__"
-            ))
-            .bind(format!(
-                "proxy-cache/{remote}/snapshot-3249/legacy.whl/__cache_meta__.json"
-            ))
-            .bind(CACHED)
+            .bind(repo)
+            .bind(format!("snapshot-3249/{name}/{}", Uuid::new_v4()))
+            .bind(name)
+            .bind(size)
+            .bind(format!("{:0>64}", "3249"))
+            .bind(storage_key)
             .execute(&pool)
             .await
-            .expect("seed proxy cache row");
-
-            // The migration-182 triggers charge the ledger inline; reconcile
-            // anyway so the assertion binds to the documented authoritative
-            // per-repo sums rather than to trigger bookkeeping.
-            for repo in repo_ids {
-                repo_service
-                    .reconcile_usage_ledger(repo)
-                    .await
-                    .expect("reconcile usage ledger");
-            }
-
-            let after = service
-                .capture_daily_snapshot()
-                .await
-                .expect("capture post-seed snapshot");
-
-            // Remove this attempt's rows before deciding, so a retry re-seeds
-            // from a clean slate.
-            for table in ["manifest_blob_refs", "oci_blobs", "proxy_cache_artifacts"] {
-                let sql = format!("DELETE FROM {table} WHERE repository_id = ANY($1)");
-                sqlx::query(sqlx::AssertSqlSafe(&*sql))
-                    .bind(&repo_ids[..])
-                    .execute(&pool)
-                    .await
-                    .expect("cleanup seeded rows");
-            }
-            sqlx::query("DELETE FROM artifacts WHERE repository_id = ANY($1)")
-                .bind(&repo_ids[..])
-                .execute(&pool)
-                .await
-                .expect("cleanup seeded artifacts");
-
-            let total_delta = after.total_storage_bytes - before.total_storage_bytes;
-            // The proxy half is a BREAKDOWN of the total, not a disjoint
-            // bucket: the same CACHED bytes must appear in both deltas
-            // (migration 182 defines the ledger's proxy_bytes as exactly the
-            // proxy catalog's sum, and EXPECTED_TOTAL_DELTA counts CACHED).
-            // Same contract as the identically named /admin/stats field.
-            let proxy_delta = after.proxy_storage_bytes - before.proxy_storage_bytes;
-            if (total_delta - EXPECTED_TOTAL_DELTA).abs() <= SLACK
-                && (proxy_delta - CACHED).abs() <= SLACK
-            {
-                matched = true;
-                break;
-            }
-            eprintln!(
-                "attempt saw snapshot total_storage_bytes delta {total_delta} \
-                 (expected {EXPECTED_TOTAL_DELTA}) / proxy_storage_bytes delta \
-                 {proxy_delta} (expected {CACHED}); retrying"
-            );
+            .expect("seed artifacts row");
         }
-        // Clean up the fixture repositories BEFORE asserting, so a failing
-        // run does not leak them into the shared test database.
-        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
-            .bind(&repo_ids[..])
+
+        for (repo, digest, size) in [
+            (oci_a, &digest_shared, BLOB_SHARED),
+            (oci_b, &digest_shared, BLOB_SHARED),
+            (oci_a, &digest_solo, BLOB_SOLO),
+        ] {
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(repo)
+            .bind(digest)
+            .bind(size)
+            .bind(format!("oci-blobs/{digest}"))
             .execute(&pool)
             .await
-            .expect("cleanup repos");
+            .expect("seed oci_blobs row");
+        }
 
-        assert!(
-            matched,
-            "capture_daily_snapshot never reflected the seeded storage: expected \
-             total_storage_bytes +{EXPECTED_TOTAL_DELTA} +/- {SLACK} (manifest {MANIFEST} + \
-             shared blob {BLOB_SHARED} once per mounted repo + solo blob {BLOB_SOLO} + hosted \
-             {HOSTED_PLAIN} + cached {CACHED}, legacy proxy-cache/% row {LEGACY} excluded), \
-             with proxy_storage_bytes +{CACHED} INSIDE that total, not beside it"
+        // Two manifests referencing the shared blob in the same repo:
+        // per-REFERENCE counting would inflate the figure; per-repo-row
+        // counting (the ledger's) must not.
+        for i in 0..2 {
+            sqlx::query(
+                "INSERT INTO manifest_blob_refs \
+                 (manifest_digest, blob_digest, repository_id, kind) \
+                 VALUES ($1, $2, $3, 'layer')",
+            )
+            .bind(format!("sha256:{:0>63}{i}", Uuid::new_v4().simple()))
+            .bind(&digest_shared)
+            .bind(oci_a)
+            .execute(&pool)
+            .await
+            .expect("seed manifest_blob_refs row");
+        }
+
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts \
+             (repository_id, path, storage_key, metadata_key, size_bytes) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(remote)
+        .bind("snapshot-3249/legacy.whl")
+        .bind(format!(
+            "proxy-cache/{remote}/snapshot-3249/legacy.whl/__content__"
+        ))
+        .bind(format!(
+            "proxy-cache/{remote}/snapshot-3249/legacy.whl/__cache_meta__.json"
+        ))
+        .bind(CACHED)
+        .execute(&pool)
+        .await
+        .expect("seed proxy cache row");
+
+        // The migration-182 triggers charge the ledger inline; reconcile
+        // anyway so the assertion binds to the documented authoritative
+        // per-repo sums rather than to trigger bookkeeping.
+        for repo in repo_ids {
+            repo_service
+                .reconcile_usage_ledger(repo)
+                .await
+                .expect("reconcile usage ledger");
+        }
+
+        let after = service
+            .capture_daily_snapshot()
+            .await
+            .expect("capture post-seed snapshot");
+
+        assert_eq!(
+            after.total_storage_bytes - before.total_storage_bytes,
+            EXPECTED_TOTAL_DELTA,
+            "total_storage_bytes must move by manifest {MANIFEST} + shared blob {BLOB_SHARED} \
+             once per mounted repo + solo blob {BLOB_SOLO} + hosted {HOSTED_PLAIN} + cached \
+             {CACHED}, with the legacy proxy-cache/% row {LEGACY} excluded"
+        );
+        // The proxy half is a BREAKDOWN of the total, not a disjoint bucket: the
+        // same CACHED bytes must appear in both deltas (migration 182 defines
+        // the ledger's proxy_bytes as exactly the proxy catalog's sum, and
+        // EXPECTED_TOTAL_DELTA counts CACHED). Same contract as the identically
+        // named /admin/stats field.
+        assert_eq!(
+            after.proxy_storage_bytes - before.proxy_storage_bytes,
+            CACHED,
+            "proxy_storage_bytes must move by the cached bytes INSIDE the total, not beside it"
         );
     }
 }

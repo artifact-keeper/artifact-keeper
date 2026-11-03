@@ -19,7 +19,9 @@
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_TYPE, ETAG};
+use axum::http::header::{
+    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_RANGE, RANGE,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -916,9 +918,13 @@ async fn download_file(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, model_id, revision, filename)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    download_file_impl(state, auth, repo_key, model_id, revision, filename, ctx).await
+    download_file_impl(
+        state, auth, repo_key, model_id, revision, filename, headers, ctx,
+    )
+    .await
 }
 
 async fn download_file_namespaced(
@@ -931,6 +937,7 @@ async fn download_file_namespaced(
         String,
         String,
     )>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     download_file_impl(
@@ -940,11 +947,92 @@ async fn download_file_namespaced(
         format!("{namespace}/{name}"),
         revision,
         filename,
+        headers,
         ctx,
     )
     .await
 }
 
+/// The `Range` to honour for this request, if any.
+///
+/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
+/// keeps reporting the whole file. `If-Range` keeps it only for the current
+/// strong ETag; an older ETag or a date gets the whole file, which is the safe
+/// answer for a client resuming a file that may have changed (§13.1.5).
+fn effective_range<'a>(
+    headers: &'a HeaderMap,
+    etag: Option<&str>,
+    is_head: bool,
+) -> Option<&'a str> {
+    if is_head {
+        return None;
+    }
+    if let Some(validator) = headers.get(IF_RANGE) {
+        let current = etag.filter(|e| !e.starts_with("W/"));
+        if validator.to_str().ok() != current || current.is_none() {
+            return None;
+        }
+    }
+    headers.get(RANGE).and_then(|v| v.to_str().ok())
+}
+
+/// Apply the client's `Range` to a Remote or Virtual serve, which arrives from
+/// the shared streaming builder as a complete `200` (#5145).
+///
+/// The window is cut from the object's stream by
+/// [`ranged_stream_response`](crate::api::handlers::repositories::ranged_stream_response),
+/// as the OCI blob route does for its proxied bytes. `Range` is never forwarded
+/// upstream, so a cold serve still fills the cache with the whole file.
+///
+/// Left as it is: anything but a `200` (a presigned redirect's target answers
+/// `Range` itself), a content-coded body (a client's offsets describe the
+/// decoded file) and a body of unknown length.
+#[allow(clippy::result_large_err)]
+fn apply_range_to_streamed_serve(
+    resp: Response,
+    headers: &HeaderMap,
+    is_head: bool,
+) -> Result<Response, Response> {
+    use futures::StreamExt;
+
+    let total = resp
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let Some(total) = total.filter(|_| {
+        resp.status() == StatusCode::OK && !resp.headers().contains_key(CONTENT_ENCODING)
+    }) else {
+        return Ok(resp);
+    };
+
+    let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
+    let range = effective_range(headers, etag, is_head);
+    let (mut parts, body) = resp.into_parts();
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|e| crate::error::AppError::BadGateway(e.to_string())))
+        .boxed();
+    let ranged = crate::api::handlers::repositories::ranged_stream_response(
+        range,
+        total,
+        stream,
+        Vec::new(),
+    )
+    .map_err(|e| e.into_response())?;
+
+    let (ranged_parts, ranged_body) = ranged.into_parts();
+    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
+        // No representation is served, so none of its headers apply.
+        parts.headers.clear();
+    }
+    parts.status = ranged_parts.status;
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.extend(ranged_parts.headers);
+    Ok(Response::from_parts(parts, ranged_body))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download_file_impl(
     state: SharedState,
     auth: Option<crate::api::middleware::auth::AuthExtension>,
@@ -952,6 +1040,7 @@ async fn download_file_impl(
     model_id: String,
     revision: String,
     filename: String,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
@@ -972,7 +1061,7 @@ async fn download_file_impl(
     // the resolve ETag below (#2915).
     use sqlx::Row;
     let artifact = sqlx::query(
-        "SELECT id, storage_key, checksum_sha256 FROM artifacts \
+        "SELECT id, storage_key, size_bytes, checksum_sha256 FROM artifacts \
          WHERE repository_id = $1 \
            AND is_deleted = false \
            AND path = $2 \
@@ -1025,7 +1114,7 @@ async fn download_file_impl(
                 &mut resp,
             )
             .await;
-            return Ok(resp);
+            return apply_range_to_streamed_serve(resp, &headers, ctx.is_head);
         }
         return Err((StatusCode::NOT_FOUND, "File not found").into_response());
     };
@@ -1037,23 +1126,57 @@ async fn download_file_impl(
         .ok()
         .flatten();
 
-    let mut resp = proxy_helpers::serve_local_artifact(
-        &state,
-        &repo,
-        artifact_id,
-        &storage_key,
-        "application/octet-stream",
-        Some(filename),
-        &ctx,
-    )
-    .await?;
+    let size_bytes: i64 = artifact.try_get("size_bytes").map_err(super::db_err)?;
 
-    // A hosted serve is built by `proxy_helpers::build_download_response`, which
-    // emits only Content-Type/Content-Length/Content-Disposition - so `hf
-    // download` against a Local or hosted HF repo failed its HEAD metadata probe
-    // outright, on content this instance owns. Adding the two headers here
-    // rather than in `build_download_response` keeps the HF-specific commit
-    // semantics out of the shared, format-agnostic builder (#2915).
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    // Streamed, not read into memory: model weights run to many gigabytes, and
+    // a range must not cost a read of the whole object into the heap (#5145).
+    let body = storage
+        .get_stream(&storage_key)
+        .await
+        .map_err(|e| proxy_helpers::internal_error("Storage", e))?;
+
+    let etag = checksum
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("\"{c}\""));
+    let verify = crate::api::handlers::repositories::serve_verification(
+        state.config.download_verify_checksums,
+        checksum.as_deref().unwrap_or_default(),
+        || format!("{repo_key}/{artifact_path}"),
+    );
+    let mut resp = crate::api::handlers::repositories::ranged_stream_response_checked(
+        effective_range(&headers, etag.as_deref(), ctx.is_head),
+        size_bytes.max(0) as u64,
+        body,
+        vec![
+            (CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                CONTENT_DISPOSITION,
+                crate::api::download_response::content_disposition_attachment(filename),
+            ),
+        ],
+        verify,
+        ctx.is_head,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
+    // A refused range served no bytes, so it is not a download.
+    if resp.status() != StatusCode::RANGE_NOT_SATISFIABLE {
+        crate::services::artifact_service::record_download(&state.db, artifact_id, &ctx).await;
+    }
+
+    // The shared range builder emits only the range and representation headers,
+    // and `hf download` needs these two as well, on its HEAD metadata probe
+    // too. Adding them here keeps the HF-specific commit semantics out of the
+    // shared, format-agnostic builder (#2915).
     apply_local_metadata_headers(&mut resp, checksum.as_deref(), &model_id, &revision);
     Ok(resp)
 }
@@ -3417,5 +3540,472 @@ mod catalog_registration_tests {
         let row = row.expect("a huggingface upload must write a packages row (#3659)");
         assert_eq!(row.version, "main");
         assert_eq!(row.versions, vec!["main".to_string()]);
+    }
+}
+
+/// #5145: the `resolve` route honours HTTP `Range` on every serving path, so an
+/// interrupted `hf download` can resume instead of appending the whole file to
+/// its `.incomplete` copy.
+#[cfg(test)]
+mod range_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use sha2::Digest;
+
+    const MODEL: &str = "acme/ranged-model";
+    const COMMIT: &str = "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf";
+
+    /// 1000 bytes in which every offset is distinguishable from its neighbours.
+    fn payload() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    fn with_range(mut req: Request<axum::body::Body>, range: &str) -> Request<axum::body::Body> {
+        req.headers_mut().insert(RANGE, range.parse().unwrap());
+        req
+    }
+
+    fn header(headers: &HeaderMap, name: axum::http::header::HeaderName) -> Option<&str> {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Seed `content` into a Local repository at the model's `main/model.bin`.
+    async fn seed(
+        state: &crate::api::SharedState,
+        pool: &sqlx::PgPool,
+        repo: &crate::api::handlers::proxy_helpers::RepoInfo,
+        user_id: uuid::Uuid,
+        content: &[u8],
+        checksum: &str,
+    ) {
+        tdh::seed_artifact_with_checksum(
+            state,
+            pool,
+            repo,
+            &format!("huggingface/{MODEL}/main/model.bin"),
+            &format!("{MODEL}/main/model.bin"),
+            MODEL,
+            "main",
+            "application/octet-stream",
+            bytes::Bytes::copy_from_slice(content),
+            user_id,
+            checksum,
+        )
+        .await;
+    }
+
+    fn resolve_uri(repo_key: &str) -> String {
+        format!("/{repo_key}/{MODEL}/resolve/main/model.bin")
+    }
+
+    #[test]
+    fn effective_range_applies_if_range_and_head_rules_5145() {
+        let mut plain = HeaderMap::new();
+        plain.insert(RANGE, "bytes=1-2".parse().unwrap());
+        assert_eq!(
+            super::effective_range(&plain, Some("\"a\""), false),
+            Some("bytes=1-2")
+        );
+        assert_eq!(
+            super::effective_range(&plain, None, false),
+            Some("bytes=1-2")
+        );
+        assert_eq!(super::effective_range(&plain, Some("\"a\""), true), None);
+        assert_eq!(super::effective_range(&HeaderMap::new(), None, false), None);
+
+        let mut guarded = plain.clone();
+        guarded.insert(IF_RANGE, "\"a\"".parse().unwrap());
+        assert_eq!(
+            super::effective_range(&guarded, Some("\"a\""), false),
+            Some("bytes=1-2")
+        );
+        assert_eq!(super::effective_range(&guarded, Some("\"b\""), false), None);
+        assert_eq!(super::effective_range(&guarded, None, false), None);
+
+        // A weak validator never satisfies `If-Range`.
+        let mut weak = plain;
+        weak.insert(IF_RANGE, "W/\"a\"".parse().unwrap());
+        assert_eq!(super::effective_range(&weak, Some("W/\"a\""), false), None);
+    }
+
+    /// Every range form against a hosted file: each row is the `Range` sent, the
+    /// expected status, `Content-Range` and body window.
+    #[tokio::test]
+    #[allow(clippy::type_complexity)]
+    async fn hosted_resolve_honours_every_range_form_5145() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let data = payload();
+        let checksum = sha256_hex(&data);
+        let repo = f.repo_info("local", None);
+        seed(&f.state, &f.pool, &repo, f.user_id, &data, &checksum).await;
+
+        let cases: Vec<(
+            Option<&str>,
+            StatusCode,
+            Option<&str>,
+            std::ops::Range<usize>,
+        )> = vec![
+            (None, StatusCode::OK, None, 0..1000),
+            (
+                Some("bytes=100-199"),
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 100-199/1000"),
+                100..200,
+            ),
+            // The form `huggingface_hub` sends on resume.
+            (
+                Some("bytes=900-"),
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 900-999/1000"),
+                900..1000,
+            ),
+            (
+                Some("bytes=-10"),
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 990-999/1000"),
+                990..1000,
+            ),
+            (
+                Some("bytes=0-"),
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 0-999/1000"),
+                0..1000,
+            ),
+            (
+                Some("bytes=990-5000"),
+                StatusCode::PARTIAL_CONTENT,
+                Some("bytes 990-999/1000"),
+                990..1000,
+            ),
+            // A single-range server may answer these with the whole file.
+            (Some("bytes=0-1,5-6"), StatusCode::OK, None, 0..1000),
+            (Some("not-a-range"), StatusCode::OK, None, 0..1000),
+        ];
+        let mut seen = Vec::new();
+        for (range, ..) in &cases {
+            let mut req = tdh::get(resolve_uri(&f.repo_key));
+            if let Some(range) = range {
+                req = with_range(req, range);
+            }
+            seen.push(tdh::send_with_headers(f.router_anon(super::router()), req).await);
+        }
+        let (past_status, past_body, past_headers) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=1000-"),
+        )
+        .await;
+        f.teardown().await;
+
+        for ((range, status, content_range, window), (got, body, headers)) in
+            cases.iter().zip(&seen)
+        {
+            assert_eq!(got, status, "{range:?}");
+            assert_eq!(header(headers, CONTENT_RANGE), *content_range, "{range:?}");
+            assert_eq!(&body[..], &data[window.clone()], "{range:?}");
+            assert_eq!(
+                header(headers, CONTENT_LENGTH),
+                Some(window.len().to_string().as_str()),
+                "{range:?}"
+            );
+            assert_eq!(header(headers, ACCEPT_RANGES), Some("bytes"), "{range:?}");
+            // `hf download` reads these from the file response too.
+            let etag = format!("\"{checksum}\"");
+            assert_eq!(header(headers, ETAG), Some(etag.as_str()), "{range:?}");
+            assert!(headers.contains_key("x-repo-commit"), "{range:?}");
+        }
+
+        assert_eq!(past_status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&past_headers, CONTENT_RANGE), Some("bytes */1000"));
+        assert_eq!(header(&past_headers, ACCEPT_RANGES), Some("bytes"));
+        assert!(past_body.is_empty());
+    }
+
+    /// `Range` is defined for GET only (RFC 9110 §14.2), and the HEAD metadata
+    /// probe must keep reporting the whole file's length.
+    #[tokio::test]
+    async fn hosted_head_ignores_range_and_advertises_it_5145() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let data = payload();
+        let repo = f.repo_info("local", None);
+        seed(
+            &f.state,
+            &f.pool,
+            &repo,
+            f.user_id,
+            &data,
+            &sha256_hex(&data),
+        )
+        .await;
+        let (status, _, headers) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            with_range(tdh::head(resolve_uri(&f.repo_key)), "bytes=100-199"),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(header(&headers, CONTENT_LENGTH), Some("1000"));
+        assert_eq!(header(&headers, ACCEPT_RANGES), Some("bytes"));
+        assert_eq!(header(&headers, CONTENT_RANGE), None);
+    }
+
+    /// `If-Range` guards a resume against the file having changed: only the
+    /// current strong ETag keeps the range; anything else gets the whole file.
+    #[tokio::test]
+    async fn hosted_if_range_keeps_range_only_for_the_current_etag_5145() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let data = payload();
+        let checksum = sha256_hex(&data);
+        let repo = f.repo_info("local", None);
+        seed(&f.state, &f.pool, &repo, f.user_id, &data, &checksum).await;
+        let etag = format!("\"{checksum}\"");
+        let mut got = Vec::new();
+        for validator in [
+            etag.as_str(),
+            "\"some-older-etag\"",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+        ] {
+            let mut req = with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=100-199");
+            req.headers_mut()
+                .insert(IF_RANGE, validator.parse().unwrap());
+            let (status, body, _) =
+                tdh::send_with_headers(f.router_anon(super::router()), req).await;
+            got.push((status, body.len()));
+        }
+        f.teardown().await;
+
+        assert_eq!(
+            got,
+            vec![
+                (StatusCode::PARTIAL_CONTENT, 100),
+                (StatusCode::OK, 1000),
+                (StatusCode::OK, 1000),
+            ]
+        );
+    }
+
+    /// A stored object that no longer matches its checksum: whole-object serves
+    /// are refused, and a window (which a whole-object digest cannot check) is
+    /// served as the other formats' range path does.
+    #[tokio::test]
+    async fn hosted_range_verifies_only_whole_object_serves_5145() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let data = payload();
+        let wrong = sha256_hex(b"different bytes");
+        let repo = f.repo_info("local", None);
+        seed(&f.state, &f.pool, &repo, f.user_id, &data, &wrong).await;
+        let (full, ..) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            tdh::get(resolve_uri(&f.repo_key)),
+        )
+        .await;
+        let (whole_range, ..) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=0-"),
+        )
+        .await;
+        let (window, body, _) = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=100-199"),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(full, StatusCode::BAD_GATEWAY);
+        assert_eq!(whole_range, StatusCode::BAD_GATEWAY);
+        assert_eq!(window, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &data[100..200]);
+    }
+
+    /// The issue's scenario. A cold Remote resolve slices the upstream's whole
+    /// body (never forwarding `Range`, so the cache fills with the whole file),
+    /// and the warm one slices the cached object, with no second upstream fetch.
+    #[tokio::test]
+    async fn remote_resolve_honours_range_cold_and_cached_5145() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let data = payload();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{MODEL}/resolve/main/model.bin")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"72b987e498d7e3a1\"")
+                    .insert_header("x-repo-commit", COMMIT)
+                    .set_body_bytes(data.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let uri = resolve_uri(&f.repo_key);
+
+        let cold = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            with_range(tdh::get(uri.clone()), "bytes=900-"),
+        )
+        .await;
+        tdh::wait_for_cache_commit(cache.path(), data.len() as u64).await;
+        let warm = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            with_range(tdh::get(uri.clone()), "bytes=100-199"),
+        )
+        .await;
+        let past_end = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            with_range(tdh::get(uri.clone()), "bytes=1000-"),
+        )
+        .await;
+        let whole = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(uri.clone()),
+        )
+        .await;
+        let upstream_saw_range = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.headers.contains_key("range"));
+        f.teardown().await;
+
+        assert!(
+            !upstream_saw_range,
+            "the cache must fill with the whole file"
+        );
+
+        assert_eq!(cold.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&cold.2, CONTENT_RANGE), Some("bytes 900-999/1000"));
+        assert_eq!(header(&cold.2, CONTENT_LENGTH), Some("100"));
+        assert_eq!(&cold.1[..], &data[900..]);
+
+        assert_eq!(warm.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&warm.2, CONTENT_RANGE), Some("bytes 100-199/1000"));
+        assert_eq!(&warm.1[..], &data[100..200]);
+
+        for served in [&cold.2, &warm.2] {
+            assert_eq!(header(served, ACCEPT_RANGES), Some("bytes"));
+            assert_eq!(header(served, ETAG), Some("\"72b987e498d7e3a1\""));
+            assert_eq!(
+                header(served, "x-repo-commit".parse().unwrap()),
+                Some(COMMIT)
+            );
+        }
+
+        assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&past_end.2, CONTENT_RANGE), Some("bytes */1000"));
+        assert!(past_end.1.is_empty());
+
+        assert_eq!(whole.0, StatusCode::OK);
+        assert_eq!(header(&whole.2, ACCEPT_RANGES), Some("bytes"));
+        assert_eq!(&whole.1[..], &data[..]);
+    }
+
+    /// Offsets a client computes describe the decoded file, so a window of a
+    /// content-coded body would be the wrong bytes: it is served whole, without
+    /// advertising ranges.
+    #[tokio::test]
+    async fn remote_coded_body_is_served_whole_despite_range_5145() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let coded = b"pretend-gzip-bytes".repeat(10);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{MODEL}/resolve/main/model.bin")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("x-repo-commit", COMMIT)
+                    .set_body_bytes(coded.clone()),
+            )
+            .mount(&server)
+            .await;
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let (status, body, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state),
+            with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=5-9"),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &coded[..]);
+        assert_eq!(header(&headers, CONTENT_RANGE), None);
+        assert_eq!(header(&headers, ACCEPT_RANGES), None);
+    }
+
+    /// A Virtual repository's local member goes through the same streaming
+    /// resolver as its Remote members.
+    #[tokio::test]
+    async fn virtual_resolve_honours_range_for_a_local_member_5145() {
+        let Some(f) = tdh::Fixture::setup("virtual", "huggingface").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&f.pool, "local", "huggingface").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(f.repo_id)
+        .bind(member_id)
+        .execute(&f.pool)
+        .await
+        .expect("link virtual member");
+        tdh::publish_repo(&f.pool, member_id).await;
+        let data = payload();
+        let member = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        seed(
+            &f.state,
+            &f.pool,
+            &member,
+            f.user_id,
+            &data,
+            &sha256_hex(&data),
+        )
+        .await;
+
+        let window = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=100-199"),
+        )
+        .await;
+        let past_end = tdh::send_with_headers(
+            f.router_anon(super::router()),
+            with_range(tdh::get(resolve_uri(&f.repo_key)), "bytes=1000-"),
+        )
+        .await;
+        tdh::cleanup(&f.pool, member_id, f.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        f.teardown().await;
+
+        assert_eq!(window.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&window.2, CONTENT_RANGE), Some("bytes 100-199/1000"));
+        assert_eq!(&window.1[..], &data[100..200]);
+        assert!(window.2.contains_key(ETAG));
+        assert!(window.2.contains_key("x-repo-commit"));
+        assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&past_end.2, CONTENT_RANGE), Some("bytes */1000"));
     }
 }

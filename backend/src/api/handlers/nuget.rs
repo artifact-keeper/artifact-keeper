@@ -12248,29 +12248,6 @@ mod remote_discovery_tests {
         assert!(body.contains(&format!("/{}/v3/flatcontainer/serilog/", fx.repo_key)));
     }
 
-    /// Collects `tracing` output emitted on this thread while the guard lives.
-    #[derive(Clone, Default)]
-    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
-        type Writer = LogCapture;
-
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     /// #3899: a registration page the upstream does not serve reached the log
     /// only as the request's final 404. The failing step, the upstream it was
     /// resolved against and the redacted fetch target are now recorded.
@@ -12288,15 +12265,9 @@ mod remote_discovery_tests {
         set_upstream(&fx.pool, fx.repo_id, &upstream).await;
         let app = app(&fx);
 
-        let capture = LogCapture::default();
+        let capture = tdh::LogCapture::default();
         let status = {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::INFO)
-                    .finish(),
-            );
+            let _guard = capture.install(tracing::Level::INFO);
             let (status, _) = tdh::send(
                 app.clone(),
                 tdh::get(format!(
@@ -12307,7 +12278,7 @@ mod remote_discovery_tests {
             .await;
             status
         };
-        let first_phase = capture.0.lock().unwrap().len();
+        let first_phase = capture.text().len();
 
         // An upstream configured with `user:pass@` credentials never reaches
         // these log lines unredacted.
@@ -12319,13 +12290,7 @@ mod remote_discovery_tests {
             .await
             .expect("set credentialed upstream");
         {
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_writer(capture.clone())
-                    .with_ansi(false)
-                    .with_max_level(tracing::Level::INFO)
-                    .finish(),
-            );
+            let _guard = capture.install(tracing::Level::INFO);
             tdh::send(
                 app,
                 tdh::get(format!(
@@ -12337,7 +12302,7 @@ mod remote_discovery_tests {
         }
         fx.teardown().await;
 
-        let all = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let all = capture.text();
         let credentialed: Vec<&str> = all[first_phase..]
             .lines()
             .filter(|l| l.contains("NuGet upstream resolution step"))
@@ -12350,7 +12315,7 @@ mod remote_discovery_tests {
         }
 
         assert_eq!(status, StatusCode::NOT_FOUND);
-        let logs = String::from_utf8(capture.0.lock().unwrap()[..first_phase].to_vec()).unwrap();
+        let logs = &all[..first_phase];
         let line = logs
             .lines()
             .find(|l| l.contains("step=\"registration_page\""))

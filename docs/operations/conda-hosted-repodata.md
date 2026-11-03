@@ -108,10 +108,14 @@ client downloaded the whole index anyway.
   bulk import): clients holding the older document download the index once.
 - Ordering: the JLAP is recorded inside the render of the revision, before
   that revision's documents are kept or served, under the JLAP row's lock.
-  The JLAP a replica serves always ends at the `repodata.json` it serves, so
-  a withdrawal is absent from the JLAP tail as soon as it is absent from
-  `repodata.json`. A render that finds a newer revision already recorded
-  (another replica moved on) does not append, so the tail never moves back.
+  The JLAP a replica serves ends at the `repodata.json` it serves, so a
+  withdrawal, which moves the revision, is absent from the JLAP tail as soon
+  as it is absent from `repodata.json`. A render that finds a newer revision
+  already recorded (another replica moved on) does not append, so the tail
+  never moves back. Neither does a render of the recorded revision with other
+  bytes (two renders that decided visibility at different instants): until
+  the revision next moves, a client holding that render's document finds no
+  patch and downloads `repodata.json`.
 - Only hosted channels serve a JLAP; Remote and Virtual channels answer 404
   and clients fetch `repodata.json`.
 
