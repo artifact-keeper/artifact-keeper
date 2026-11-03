@@ -1080,6 +1080,7 @@ async fn maven_remote_stream(
     repo_key: &str,
     upstream_url: &str,
     path: &str,
+    is_head: bool,
 ) -> Result<Response, Response> {
     if maven_sha1_sidecar_gate_applies(path) {
         let proxy_for_sidecar = Arc::clone(proxy);
@@ -1114,7 +1115,7 @@ async fn maven_remote_stream(
                 crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
                 digest,
             ),
-            cached_maven_sha1(proxy, repo_key, path),
+            maven_remote_sha1(proxy, repo_id, repo_key, upstream_url, path, is_head),
         );
         let result = result.map_err(IntoResponse::into_response)?;
         let mut response = proxy_helpers::build_streaming_response_with_disposition(
@@ -1928,6 +1929,89 @@ async fn cached_maven_sha1(
     }
 }
 
+/// The SHA-1 to state for a Remote repository's serve of `path`.
+///
+/// A GET states only what is already cached ([`cached_maven_sha1`]): its own
+/// body fills the cache, so the next GET has the sidecar. A HEAD has no body
+/// to do that, and a cold path would stay headerless however often it was
+/// probed, so a HEAD that finds nothing cached resolves the sidecar through
+/// the proxy cache (#4963), the fetch a client would otherwise make itself.
+/// That fetch is cached or negative-cached, so it happens once per path.
+async fn maven_remote_sha1(
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+    is_head: bool,
+) -> Option<String> {
+    if let Some(cached) = cached_maven_sha1(proxy, repo_key, path).await {
+        return Some(cached);
+    }
+    if !is_head {
+        return None;
+    }
+    match resolve_maven_sha1_sidecar(proxy, repo_id, repo_key, upstream_url, path).await? {
+        crate::services::proxy_service::CacheCommitDigest::Sha1Hex(hex) => Some(hex),
+        _ => None,
+    }
+}
+
+/// Build a Virtual's response from its winning member's result (#4573, #4963):
+/// count a hosted winner once, and state the checksums of the member that
+/// actually served, never another member's.
+///
+/// A Remote member's fill on this path is not gated on its sidecar, so unlike
+/// [`maven_remote_stream`] the two can disagree if the upstream's do. The
+/// client then fails the download on the header exactly as it would on the
+/// `.sha1` it would otherwise request from that member.
+///
+/// `members` are the ones the winner was resolved from. The winner is known
+/// only once the walk ends, so the sidecar read runs after it rather than
+/// alongside the content open as on the direct Remote route.
+async fn maven_virtual_response(
+    state: &SharedState,
+    proxy: Option<&crate::services::proxy_service::ProxyService>,
+    members: &[crate::models::repository::Repository],
+    (result, origin): (
+        crate::services::proxy_service::StreamingFetchResult,
+        proxy_helpers::VirtualServeOrigin,
+    ),
+    path: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    use proxy_helpers::VirtualServeOrigin as Origin;
+    let (sha1, md5) = match &origin {
+        Origin::Hosted(artifact_id) => {
+            crate::services::artifact_service::record_download(&state.db, *artifact_id, ctx).await;
+            hosted_maven_checksums(&state.db, *artifact_id)
+                .await
+                .unwrap_or_default()
+        }
+        Origin::Remote { repo_id, repo_key } => {
+            let upstream_url = members
+                .iter()
+                .find(|member| member.id == *repo_id)
+                .and_then(|member| member.upstream_url.as_deref());
+            let sha1 = match (proxy, upstream_url) {
+                (Some(proxy), Some(upstream_url)) => {
+                    maven_remote_sha1(proxy, *repo_id, repo_key, upstream_url, path, ctx.is_head)
+                        .await
+                }
+                _ => None,
+            };
+            (sha1, None)
+        }
+        Origin::Unrecorded => (None, None),
+    };
+    let mut response =
+        proxy_helpers::stream_fetch_result(result, content_type_for_path(path), None)?;
+    if response.status() == StatusCode::OK {
+        insert_maven_checksum_headers(response.headers_mut(), sha1.as_deref(), md5.as_deref());
+    }
+    Ok(response)
+}
+
 /// The stored SHA-1 and MD5 of a hosted artifact row (#4573), for a virtual
 /// repository's serve from a hosted member. `None` when the row is gone or
 /// the lookup fails: the header is an optimisation, never a reason to fail
@@ -2139,6 +2223,7 @@ impl proxy_helpers::ScannedProxyFile for MavenScannedArchive<'_> {
             req.repo_key,
             self.upstream_url,
             req.source_path,
+            false,
         )
         .await
     }
@@ -3681,8 +3766,15 @@ async fn serve_artifact(
                             .await;
                         }
                     }
-                    let response =
-                        maven_remote_stream(proxy, repo.id, repo_key, upstream_url, path).await?;
+                    let response = maven_remote_stream(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        path,
+                        ctx.is_head,
+                    )
+                    .await?;
                     // #3265: count the proxy serve. Every other proxying
                     // format (pypi, npm, and the shared
                     // `try_remote_or_virtual_download` path) records here;
@@ -3866,17 +3958,37 @@ async fn serve_artifact(
                     proxy_for_virtual.and(state.proxy_service.as_ref()),
                 ) {
                     // A hosted member's serve on the walk is counted exactly
-                    // as on the fallback resolver below (#4268).
-                    let resolve_run = |run: Vec<crate::models::repository::Repository>| {
-                        proxy_helpers::resolve_unscanned_member_run(
+                    // as on the fallback resolver below (#4268), and a member
+                    // policy block ends the walk where any other failure moves
+                    // on to the next member.
+                    let local_fetch = &local_fetch;
+                    let resolve_run = |run: Vec<crate::models::repository::Repository>| async move {
+                        let members = run.clone();
+                        match proxy_helpers::resolve_virtual_download_from_members_with_origin(
                             run,
                             proxy_for_virtual,
                             path,
-                            &local_fetch,
-                            content_type_for_path(path),
-                            Some((&state.db, ctx)),
                             Some(ctx),
+                            local_fetch,
                         )
+                        .await
+                        {
+                            Ok(served) => Some(
+                                maven_virtual_response(
+                                    state,
+                                    proxy_for_virtual,
+                                    &members,
+                                    served,
+                                    path,
+                                    ctx,
+                                )
+                                .await,
+                            ),
+                            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
+                                Some(Err(resp))
+                            }
+                            Err(_) => None,
+                        }
                     };
                     let target = &target;
                     let scanned = |member: crate::models::repository::Repository, policy| async move {
@@ -3910,7 +4022,8 @@ async fn serve_artifact(
                     }
                 }
 
-                let result = match proxy_helpers::resolve_virtual_download_from_members(
+                let resolved_from = members.clone();
+                let served = match proxy_helpers::resolve_virtual_download_from_members_with_origin(
                     members,
                     proxy_for_virtual,
                     path,
@@ -3919,39 +4032,24 @@ async fn serve_artifact(
                 )
                 .await
                 {
-                    Ok(result) => result,
+                    Ok(served) => served,
                     Err(resp) => {
                         return maven_virtual_age_gate_answer(Err(resp), age_refusal);
                     }
                 };
 
-                // Only the winning member's result reaches here, so this counts once;
-                // proxy-member and row-less legacy serves carry `None` (#1278).
-                let hosted_checksums = match result.artifact_id {
-                    Some(artifact_id) => {
-                        crate::services::artifact_service::record_download(
-                            &state.db,
-                            artifact_id,
-                            ctx,
-                        )
-                        .await;
-                        hosted_maven_checksums(&state.db, artifact_id).await
-                    }
-                    None => None,
-                };
-
-                let mut response =
-                    proxy_helpers::stream_fetch_result(result, content_type_for_path(path), None)?;
-                // #4573: a hosted member's serve carries the checksums its
-                // own hosted route sends.
-                if let (Some((sha1, md5)), StatusCode::OK) = (hosted_checksums, response.status()) {
-                    insert_maven_checksum_headers(
-                        response.headers_mut(),
-                        sha1.as_deref(),
-                        md5.as_deref(),
-                    );
-                }
-                return Ok(response);
+                // Only the winning member's result reaches here, so a hosted
+                // winner counts once; proxy-member and row-less legacy serves
+                // are not counted here (#1278).
+                return maven_virtual_response(
+                    state,
+                    proxy_for_virtual,
+                    &resolved_from,
+                    served,
+                    path,
+                    ctx,
+                )
+                .await;
             }
 
             // Legacy hosted fallback for repositories populated before Maven
@@ -14170,6 +14268,384 @@ mod scan_on_proxy_tests {
         tdh::cleanup_member_repo(&fx.pool, first, &first_dir).await;
         tdh::cleanup_member_repo(&fx.pool, second, &second_dir).await;
         fx.teardown().await;
+    }
+}
+
+/// #4963 (#4573 gaps): `X-Checksum-SHA1` on a Virtual's unscanned serve from a
+/// Remote member, and on a HEAD for a remote Maven path.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod remote_sha1_header_4963_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use sha1::Digest;
+    use wiremock::matchers::{method, path as wpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const JAR: &str = "com/acme/sha1gap/1.0/sha1gap-1.0.jar";
+    const SNAPSHOT_JAR: &str = "com/acme/sha1gap/1.0-SNAPSHOT/sha1gap-1.0-SNAPSHOT.jar";
+
+    fn sha1_of(bytes: &[u8]) -> String {
+        hex::encode(sha1::Sha1::digest(bytes))
+    }
+
+    /// Serve `route` and, when `sidecar` is set, its `.sha1` (404 otherwise).
+    async fn upstream(route: &str, body: &[u8], sidecar: Option<String>) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{route}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+        let sha1 = match sidecar {
+            Some(hex) => ResponseTemplate::new(200).set_body_string(hex),
+            None => ResponseTemplate::new(404),
+        };
+        Mock::given(method("GET"))
+            .and(wpath(format!("/{route}.sha1")))
+            .respond_with(sha1)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn proxied_state(pool: &PgPool, dir: &tempfile::TempDir) -> SharedState {
+        let storage = dir.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), storage);
+        tdh::build_state_with_proxy(pool.clone(), storage, proxy)
+    }
+
+    async fn pull(state: &SharedState, key: &str, route: &str) -> (StatusCode, Bytes, HeaderMap) {
+        tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::get(format!("/{key}/{route}")),
+        )
+        .await
+    }
+
+    async fn head(state: &SharedState, key: &str, route: &str) -> (StatusCode, HeaderMap) {
+        let (status, _, headers) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), state.clone()),
+            tdh::head(format!("/{key}/{route}")),
+        )
+        .await;
+        (status, headers)
+    }
+
+    fn sha1_header(headers: &HeaderMap) -> Option<&str> {
+        headers
+            .get("x-checksum-sha1")
+            .map(|v| v.to_str().expect("ascii header"))
+    }
+
+    /// Commit `route` and its `.sha1` to `remote_key`'s proxy cache the way a
+    /// client does: one pull of each.
+    async fn warm(
+        state: &SharedState,
+        pull_key: &str,
+        remote_key: &str,
+        dir: &tempfile::TempDir,
+        route: &str,
+    ) {
+        for path in [route.to_string(), format!("{route}.sha1")] {
+            let (status, _, _) = pull(state, pull_key, &path).await;
+            assert_eq!(status, StatusCode::OK, "warming {path}");
+            tdh::await_proxy_sidecar(&dir.path().join(format!(
+                "proxy-cache/{remote_key}/{path}/__cache_meta__.json"
+            )))
+            .await;
+        }
+    }
+
+    /// A second Remote member of `virtual_id`, at `priority`.
+    async fn add_remote_member(
+        pool: &PgPool,
+        virtual_id: Uuid,
+        upstream_url: &str,
+        priority: i32,
+    ) -> (Uuid, String) {
+        let (id, key, _dir) = tdh::create_repo(pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream_url)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("point member at its upstream");
+        tdh::link_virtual_member(pool, virtual_id, id, priority).await;
+        tdh::publish_repo(pool, id).await;
+        (id, key)
+    }
+
+    /// A warm Virtual GET and HEAD served by a Remote member carry the SHA-1
+    /// of that member's cached `.sha1`, and fetch nothing to do it. Before,
+    /// only a direct Remote serve did, so every jar through a Virtual cost
+    /// Maven a second `.sha1` request.
+    #[tokio::test]
+    async fn virtual_remote_member_serve_carries_cached_sha1() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body: &[u8] = b"sha1gap-virtual-body";
+        let server = upstream(JAR, body, Some(sha1_of(body))).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+
+        // The client's first pull: the sidecar is not cached yet, so no header
+        // (the client fetches `.sha1` as before).
+        let (status, _, cold) = pull(&state, &virtual_key, JAR).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1_header(&cold), None, "nothing cached yet");
+        warm(&state, &virtual_key, &remote_key, &dir, JAR).await;
+        let before = server.received_requests().await.unwrap().len();
+
+        let (status, served, headers) = pull(&state, &virtual_key, JAR).await;
+        let (head_status, head_headers) = head(&state, &virtual_key, JAR).await;
+        let after = server.received_requests().await.unwrap().len();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&served[..], body);
+        let expected = sha1_of(body);
+        assert_eq!(sha1_header(&headers), Some(expected.as_str()), "warm GET");
+        assert_eq!(head_status, StatusCode::OK);
+        assert_eq!(
+            sha1_header(&head_headers),
+            Some(expected.as_str()),
+            "warm HEAD"
+        );
+        assert_eq!(
+            after, before,
+            "a warm serve reads the header from the cache"
+        );
+
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+    }
+
+    /// The header describes the member that served the bytes. Here the winner
+    /// has no sidecar and a lower-priority member has one for different bytes:
+    /// sending that one would fail the client's download of a correct body.
+    #[tokio::test]
+    async fn virtual_header_never_comes_from_a_member_that_did_not_serve() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (winner_body, loser_body): (&[u8], &[u8]) = (b"winner-bytes", b"loser-bytes");
+        let winner_up = upstream(JAR, winner_body, None).await;
+        let loser_up = upstream(JAR, loser_body, Some(sha1_of(loser_body))).await;
+        let (winner_id, _winner_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &winner_up.uri()).await;
+        let (loser_id, loser_key) = add_remote_member(&pool, virtual_id, &loser_up.uri(), 10).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        warm(&state, &loser_key, &loser_key, &dir, JAR).await;
+
+        for _ in 0..2 {
+            let (status, served, headers) = pull(&state, &virtual_key, JAR).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&served[..], winner_body, "priority decides the bytes");
+            assert_eq!(
+                sha1_header(&headers),
+                None,
+                "the loser's SHA-1 must not leak"
+            );
+        }
+
+        tdh::cleanup_member_repo(&pool, winner_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, loser_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+    }
+
+    /// A Virtual with a scanning member walks its unscanned members through a
+    /// separate run; a Remote winner there carries the header too.
+    #[tokio::test]
+    async fn virtual_unscanned_run_beside_a_scanning_member_carries_cached_sha1() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body: &[u8] = b"sha1gap-walk-body";
+        let unscanned_up = upstream(JAR, body, Some(sha1_of(body))).await;
+        let scanning_up = upstream(JAR, b"never-served", None).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &unscanned_up.uri()).await;
+        let (scanning_id, _scanning_key) =
+            add_remote_member(&pool, virtual_id, &scanning_up.uri(), 10).await;
+        tdh::enable_proxy_scan(&pool, scanning_id, "fail_open").await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        warm(&state, &remote_key, &remote_key, &dir, JAR).await;
+
+        let (status, served, headers) = pull(&state, &virtual_key, JAR).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&served[..], body);
+        assert!(
+            headers.get("X-AK-Scan").is_none(),
+            "the unscanned member won"
+        );
+        assert_eq!(sha1_header(&headers), Some(sha1_of(body).as_str()));
+
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, scanning_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+    }
+
+    /// Negative control: a hosted member owning the coordinate disables every
+    /// Remote member, scanning or not, and its row's stored checksums still
+    /// reach the client. Passes without the #4963 change too.
+    #[tokio::test]
+    async fn virtual_hosted_winner_beside_a_scanning_member_keeps_stored_checksums() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body: &[u8] = b"sha1gap-hosted-body";
+        let (hosted_id, _hosted_key, hosted_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::publish_repo(&pool, hosted_id).await;
+        let sha1 = sha1_of(body);
+        let md5 = compute_checksum(body, ChecksumType::Md5);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, checksum_sha1, checksum_md5, content_type, storage_key) \
+             VALUES ($1, $2, 'sha1gap', '1.0', $3, $4, $5, $6, 'application/java-archive', $7)",
+        )
+        .bind(hosted_id)
+        .bind(JAR)
+        .bind(body.len() as i64)
+        .bind(crate::services::artifact_service::ArtifactService::calculate_sha256(body))
+        .bind(&sha1)
+        .bind(&md5)
+        .bind(format!("maven/{JAR}"))
+        .execute(&pool)
+        .await
+        .expect("seed hosted row");
+
+        let (virtual_id, virtual_key, _vdir) = tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::link_virtual_member(&pool, virtual_id, hosted_id, 1).await;
+        let scanning_up = upstream(JAR, b"never-served", None).await;
+        let (scanning_id, _scanning_key) =
+            add_remote_member(&pool, virtual_id, &scanning_up.uri(), 10).await;
+        tdh::enable_proxy_scan(&pool, scanning_id, "fail_open").await;
+        let state = proxied_state(&pool, &tempfile::tempdir().unwrap());
+        state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: hosted_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage_for_repo")
+            .put(&format!("maven/{JAR}"), Bytes::copy_from_slice(body))
+            .await
+            .expect("put hosted bytes");
+
+        let (status, served, headers) = pull(&state, &virtual_key, JAR).await;
+
+        tdh::cleanup_member_repo(&pool, scanning_id, hosted_dir.as_path()).await;
+        tdh::cleanup_member_repo(&pool, hosted_id, hosted_dir.as_path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, hosted_dir.as_path()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&served[..], body);
+        assert_eq!(sha1_header(&headers), Some(sha1.as_str()));
+        assert_eq!(
+            headers.get("x-checksum-md5").map(|v| v.to_str().unwrap()),
+            Some(md5.as_str())
+        );
+    }
+
+    /// A `-SNAPSHOT` is mutable, so its cached sidecar may describe an older
+    /// deploy: no header through a Virtual, as on the direct Remote route.
+    #[tokio::test]
+    async fn virtual_snapshot_serve_carries_no_sha1() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body: &[u8] = b"sha1gap-snapshot-body";
+        let server = upstream(SNAPSHOT_JAR, body, Some(sha1_of(body))).await;
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        warm(&state, &virtual_key, &remote_key, &dir, SNAPSHOT_JAR).await;
+
+        let (status, _, headers) = pull(&state, &virtual_key, SNAPSHOT_JAR).await;
+        let (head_status, head_headers) = head(&state, &virtual_key, SNAPSHOT_JAR).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1_header(&headers), None);
+        assert_eq!(head_status, StatusCode::OK);
+        assert_eq!(sha1_header(&head_headers), None);
+
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+    }
+
+    /// A HEAD has no body to fill the cache with, so on a cold path the cached
+    /// sidecar a GET relies on never appears. It resolves the sidecar instead,
+    /// on a direct Remote and through a Virtual. Before, a cold HEAD carried no
+    /// header however often it was repeated.
+    #[tokio::test]
+    async fn cold_head_resolves_the_sidecar_on_remote_and_virtual() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body: &[u8] = b"sha1gap-cold-head-body";
+        let expected = sha1_of(body);
+
+        let server = upstream(JAR, body, Some(expected.clone())).await;
+        let (remote_id, remote_key, virtual_id, _) =
+            tdh::create_remote_and_virtual(&pool, "maven", &server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        let (status, headers) = head(&state, &remote_key, JAR).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1_header(&headers), Some(expected.as_str()), "Remote");
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        let (status, headers) = head(&state, &virtual_key, JAR).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1_header(&headers), Some(expected.as_str()), "Virtual");
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+    }
+
+    /// A warm HEAD on a direct Remote answers from the cache; with no sidecar
+    /// upstream, a HEAD answers 200 without the header.
+    #[tokio::test]
+    async fn remote_head_warm_uses_cache_and_missing_sidecar_omits_header() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let body: &[u8] = b"sha1gap-warm-head-body";
+        let server = upstream(JAR, body, Some(sha1_of(body))).await;
+        let (remote_id, remote_key, virtual_id, _) =
+            tdh::create_remote_and_virtual(&pool, "maven", &server.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        warm(&state, &remote_key, &remote_key, &dir, JAR).await;
+        let before = server.received_requests().await.unwrap().len();
+        let (status, headers) = head(&state, &remote_key, JAR).await;
+        let after = server.received_requests().await.unwrap().len();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1_header(&headers), Some(sha1_of(body).as_str()));
+        assert_eq!(after, before, "a warm HEAD contacts no upstream");
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
+
+        let bare = upstream(JAR, body, None).await;
+        let (remote_id, remote_key, virtual_id, _) =
+            tdh::create_remote_and_virtual(&pool, "maven", &bare.uri()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = proxied_state(&pool, &dir);
+        let (status, headers) = head(&state, &remote_key, JAR).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1_header(&headers), None);
+        tdh::cleanup_member_repo(&pool, remote_id, dir.path()).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, dir.path()).await;
     }
 }
 

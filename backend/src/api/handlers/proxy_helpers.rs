@@ -3344,6 +3344,55 @@ where
     F: Fn(Uuid, StorageLocation) -> Fut,
     Fut: Future<Output = Result<StreamingFetchResult, Response>>,
 {
+    resolve_virtual_download_winner(
+        members,
+        proxy_service,
+        path,
+        member_fetch_urls,
+        ctx,
+        local_fetch,
+    )
+    .await
+    .map(|(result, _origin)| result)
+}
+
+/// [`resolve_virtual_download_from_members`], also reporting which member won
+/// (#4963), for a caller that states something about the served bytes that
+/// only that member can vouch for.
+pub(crate) async fn resolve_virtual_download_from_members_with_origin<F, Fut>(
+    members: Vec<Repository>,
+    proxy_service: Option<&ProxyService>,
+    path: &str,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    local_fetch: F,
+) -> Result<(StreamingFetchResult, VirtualServeOrigin), Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
+    resolve_virtual_download_winner(
+        members,
+        proxy_service,
+        path,
+        &std::collections::HashMap::new(),
+        ctx,
+        local_fetch,
+    )
+    .await
+}
+
+async fn resolve_virtual_download_winner<F, Fut>(
+    members: Vec<Repository>,
+    proxy_service: Option<&ProxyService>,
+    path: &str,
+    member_fetch_urls: &std::collections::HashMap<Uuid, String>,
+    ctx: Option<&crate::api::middleware::download_telemetry::DownloadContext>,
+    local_fetch: F,
+) -> Result<(StreamingFetchResult, VirtualServeOrigin), Response>
+where
+    F: Fn(Uuid, StorageLocation) -> Fut,
+    Fut: Future<Output = Result<StreamingFetchResult, Response>>,
+{
     if members.is_empty() {
         return Err(no_accessible_members_response());
     }
@@ -3460,7 +3509,7 @@ where
             if let (Some(ctx), Some(proxy)) = (ctx, proxy_service) {
                 record_virtual_serve(proxy.db(), Some(proxy), &origin, path, ctx, false).await;
             }
-            Ok(result)
+            Ok((result, origin))
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
         _ => Err(member_miss_response()),
