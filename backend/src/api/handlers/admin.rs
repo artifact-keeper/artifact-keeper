@@ -565,7 +565,8 @@ pub async fn execute_backup(
     let archive_storage =
         StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
-    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage)
+        .with_storage_registry(state.storage_registry.clone());
 
     // `execute_run`, not `execute`: a run that ends FAILED has already recorded
     // its own terminal state and the message naming what went wrong, and that
@@ -663,7 +664,8 @@ pub async fn restore_backup(
     let archive_storage =
         StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
-    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage)
+        .with_storage_registry(state.storage_registry.clone());
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),

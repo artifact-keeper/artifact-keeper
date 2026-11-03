@@ -21,6 +21,7 @@ use crate::error::{AppError, Result};
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::metrics_service;
 use crate::services::storage_service::StorageService;
+use crate::storage::{StorageLocation, StorageRegistry};
 use crate::util::bounded_archive;
 
 /// Backup status
@@ -212,13 +213,36 @@ pub struct BackupRun {
     pub failure: Option<String>,
 }
 
+/// One artifact object to capture in a backup, together with the repository
+/// storage location its bytes actually live under.
+///
+/// The storage key alone is not enough: a filesystem repository roots its
+/// objects at `<STORAGE_PATH>/<repo_key>`, so reading the key through the
+/// deployment-global storage handle misses every object (#5053).
+#[derive(Debug, Clone)]
+struct ArtifactObject {
+    storage_key: String,
+    location: StorageLocation,
+}
+
 /// Backup service
 pub struct BackupService {
     db: PgPool,
     /// Primary storage: where source artifacts are read from during a backup
     /// and restored to during a restore. Always the deployment's main storage
     /// bucket.
+    ///
+    /// This is the legacy/global handle. When a [`StorageRegistry`] is
+    /// attached it is used only as the fallback for artifacts whose repository
+    /// location is unknown (e.g. a legacy archive with no repository rows);
+    /// otherwise artifact bytes are resolved per repository so filesystem
+    /// repositories are read from and written to their own directory tree.
     storage: Arc<StorageService>,
+    /// Resolves each artifact's repository-specific storage location
+    /// (`storage_backend` + `storage_path`). `None` keeps the historical
+    /// single-handle behavior, which is correct only when every repository
+    /// shares the global root (and is what existing unit tests construct).
+    storage_registry: Option<Arc<StorageRegistry>>,
     /// Storage for backup **archives** (`.tar.gz`). Defaults to `storage`, but
     /// points at a separate bucket when `BACKUP_S3_BUCKET` is configured
     /// (#2507). Only the archive read/write path uses this handle, so a
@@ -855,6 +879,71 @@ fn archive_repository_layouts(
     Ok(layouts)
 }
 
+/// Map each archived artifact storage key to its repository's storage
+/// location, using the archive's own `repositories` and `artifacts` rows
+/// (#5053).
+///
+/// Restore must put bytes back where the repository reads them. On filesystem
+/// that is `<repo.storage_path>`, not the deployment-global root, so the key
+/// alone is not enough to choose a destination. The tables are read
+/// best-effort: a malformed or absent pair falls back to the legacy global
+/// handle rather than failing the bytes half of a restore (the database half
+/// validates and reports malformed rows separately).
+///
+/// If two repositories recorded the same `storage_key`, the first row wins.
+/// That ambiguity predates this mapping (the archive format stores only the
+/// key), and for every backend except filesystem the key space is shared
+/// anyway.
+fn archive_artifact_locations(
+    entries: &[(std::path::PathBuf, Vec<u8>)],
+) -> std::collections::HashMap<String, StorageLocation> {
+    use std::collections::HashMap;
+
+    let mut repository_locations: HashMap<String, StorageLocation> = HashMap::new();
+    if let Some(bytes) = backup_table(entries, "repositories") {
+        if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
+            for row in rows {
+                let (Some(id), Some(backend), Some(path)) = (
+                    row.get("id").and_then(serde_json::Value::as_str),
+                    row.get("storage_backend")
+                        .and_then(serde_json::Value::as_str),
+                    row.get("storage_path").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                repository_locations.insert(
+                    id.to_string(),
+                    StorageLocation {
+                        backend: backend.to_string(),
+                        path: path.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    let mut artifact_locations: HashMap<String, StorageLocation> = HashMap::new();
+    if let Some(bytes) = backup_table(entries, "artifacts") {
+        if let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
+            for row in rows {
+                let (Some(storage_key), Some(repository_id)) = (
+                    row.get("storage_key").and_then(serde_json::Value::as_str),
+                    row.get("repository_id").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                if let Some(location) = repository_locations.get(repository_id) {
+                    artifact_locations
+                        .entry(storage_key.to_string())
+                        .or_insert_with(|| location.clone());
+                }
+            }
+        }
+    }
+
+    artifact_locations
+}
+
 async fn validate_restore_layouts(
     conn: &mut sqlx::PgConnection,
     layouts: &std::collections::BTreeMap<Uuid, u32>,
@@ -911,9 +1000,24 @@ impl BackupService {
         Self {
             db,
             storage,
+            storage_registry: None,
             archive_storage,
             active_backup: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Attach the deployment's storage registry so artifact bytes are read
+    /// from and written to each repository's configured backend and path
+    /// (#5053).
+    ///
+    /// Without it the service uses [`Self::storage`] for every artifact. That
+    /// is only correct when every repository stores objects directly under the
+    /// global root; a filesystem repository roots them at its own
+    /// `storage_path`, so a backup must resolve the repository location per
+    /// artifact rather than reuse one handle for all of them.
+    pub fn with_storage_registry(mut self, storage_registry: Arc<StorageRegistry>) -> Self {
+        self.storage_registry = Some(storage_registry);
+        self
     }
 
     /// Construct a backup service whose **archives** are read from/written to a
@@ -931,6 +1035,7 @@ impl BackupService {
         Self {
             db,
             storage,
+            storage_registry: None,
             archive_storage,
             active_backup: Arc::new(Mutex::new(None)),
         }
@@ -1260,12 +1365,14 @@ impl BackupService {
             table_data.push((table.to_string(), json_bytes));
         }
 
-        // Fetch artifact storage keys and content. A metadata backup carries
-        // no artifact bytes — that is the advertised distinction between the
+        // Fetch artifact objects and content. A metadata backup carries no
+        // artifact bytes — that is the advertised distinction between the
         // types, so it must be honored rather than silently producing a full
-        // archive (#3011).
-        let storage_keys = if backup_includes_artifact_bytes(backup.backup_type) {
-            Self::artifact_storage_keys(&mut snapshot, repository_filter.as_deref(), since_filter)
+        // archive (#3011). Each object carries its repository's storage
+        // location, because a filesystem repository roots its bytes under its
+        // own `storage_path` rather than the deployment-global root (#5053).
+        let artifacts = if backup_includes_artifact_bytes(backup.backup_type) {
+            Self::artifact_objects(&mut snapshot, repository_filter.as_deref(), since_filter)
                 .await?
         } else {
             Vec::new()
@@ -1276,18 +1383,20 @@ impl BackupService {
         // that artifact's content; that must never be invisible.
         let mut artifact_data: Vec<(String, Vec<u8>)> = Vec::new();
         let mut unreadable: Vec<(String, String)> = Vec::new();
-        for key in storage_keys {
+        for artifact in artifacts {
             ensure_backup_not_cancelled(cancel)?;
-            match self.storage.get(&key).await {
-                Ok(content) => artifact_data.push((key, content.to_vec())),
+            match self.read_artifact(&artifact).await {
+                Ok(content) => artifact_data.push((artifact.storage_key.clone(), content.to_vec())),
                 Err(e) => {
                     tracing::warn!(
                         backup_id = %backup_id,
-                        storage_key = %key,
+                        storage_key = %artifact.storage_key,
+                        storage_backend = %artifact.location.backend,
+                        storage_path = %artifact.location.path,
                         error = %e,
                         "backup could not read artifact bytes; the archive will not contain this object"
                     );
-                    unreadable.push((key, e.to_string()));
+                    unreadable.push((artifact.storage_key, e.to_string()));
                 }
             }
         }
@@ -1457,6 +1566,11 @@ impl BackupService {
     /// `since` cutoff (#2789; `None` => every modification time). Both
     /// predicates are null-guarded so passing `None`/`None` returns every
     /// artifact exactly as before.
+    ///
+    /// Retained as the key-only counterpart used by the filter tests; the
+    /// backup read path uses [`Self::artifact_objects`] because a key alone
+    /// cannot identify the repository storage location (#5053).
+    #[cfg(test)]
     async fn artifact_storage_keys(
         conn: &mut sqlx::PgConnection,
         repository_filter: Option<&[Uuid]>,
@@ -1479,6 +1593,82 @@ impl BackupService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(keys)
+    }
+
+    /// List the artifact objects to include in a backup together with the
+    /// storage location of the repository that owns each one.
+    ///
+    /// This is the read path that makes filesystem repositories work: their
+    /// bytes live under `<repo.storage_path>` (e.g.
+    /// `<STORAGE_PATH>/maven-releases`), not under the deployment-global
+    /// storage root, so a single global handle cannot reach them (#5053).
+    /// Filters match [`Self::artifact_storage_keys`] exactly.
+    async fn artifact_objects(
+        conn: &mut sqlx::PgConnection,
+        repository_filter: Option<&[Uuid]>,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<ArtifactObject>> {
+        let repo_ids: Option<Vec<Uuid>> = repository_filter.map(|r| r.to_vec());
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            r#"
+            SELECT a.storage_key, r.storage_backend, r.storage_path
+            FROM artifacts a
+            JOIN repositories r ON r.id = a.repository_id
+            WHERE ($1::uuid[] IS NULL OR a.repository_id = ANY($1))
+              AND ($2::timestamptz IS NULL OR a.updated_at >= $2)
+            "#,
+        )
+        .bind(repo_ids)
+        .bind(since)
+        .fetch_all(conn)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(storage_key, backend, path)| ArtifactObject {
+                storage_key,
+                location: StorageLocation { backend, path },
+            })
+            .collect())
+    }
+
+    /// Read one artifact's bytes from its repository's storage location.
+    ///
+    /// Falls back to the deployment-global handle when no registry is attached
+    /// (legacy construction), preserving the historical behavior exactly.
+    async fn read_artifact(&self, artifact: &ArtifactObject) -> Result<Bytes> {
+        match &self.storage_registry {
+            Some(registry) => {
+                registry
+                    .backend_for(&artifact.location)?
+                    .get(&artifact.storage_key)
+                    .await
+            }
+            None => self.storage.get(&artifact.storage_key).await,
+        }
+    }
+
+    /// Write one restored artifact back to its repository's storage location.
+    ///
+    /// `location` is the archived repository location for the key, when the
+    /// archive carries one. Without either a location or a registry this falls
+    /// back to the deployment-global handle, preserving legacy restores.
+    async fn write_artifact(
+        &self,
+        storage_key: &str,
+        location: Option<&StorageLocation>,
+        content: Bytes,
+    ) -> Result<()> {
+        match (&self.storage_registry, location) {
+            (Some(registry), Some(location)) => {
+                registry
+                    .backend_for(location)?
+                    .put(storage_key, content)
+                    .await
+            }
+            _ => self.storage.put(storage_key, content).await,
+        }
     }
 
     /// Export the `artifacts` table as a JSON array, honoring the resolved
@@ -1773,8 +1963,13 @@ impl BackupService {
             }
         }
 
-        // Restore artifact files
+        // Restore artifact files. The archive's own artifact/repository rows
+        // say which repository owns each key, so filesystem repositories get
+        // their bytes back under their own storage path instead of the global
+        // root (#5053). Legacy archives with no such rows keep the historical
+        // global-handle behavior.
         if options.restore_artifacts {
+            let artifact_locations = archive_artifact_locations(&entries);
             for (path, content) in &entries {
                 if !path.starts_with("artifacts/") {
                     continue;
@@ -1788,8 +1983,11 @@ impl BackupService {
                 }
 
                 match self
-                    .storage
-                    .put(&storage_key, Bytes::from(content.clone()))
+                    .write_artifact(
+                        &storage_key,
+                        artifact_locations.get(&storage_key),
+                        Bytes::from(content.clone()),
+                    )
                     .await
                 {
                     Ok(_) => result.artifacts_restored += 1,
@@ -3419,6 +3617,253 @@ mod tests {
             created_by: None,
             name: None,
         }
+    }
+
+    /// #5053: a filesystem repository stores artifact bytes under its own
+    /// `storage_path` (`<STORAGE_PATH>/<repo_key>`), not under the
+    /// deployment-global storage root. A full backup must resolve each
+    /// artifact through its repository's configured location.
+    ///
+    /// FAILS ON MAIN: the backup read every key through one global handle, so
+    /// this object was reported unreadable and the run failed with
+    /// "backup is missing artifact content".
+    #[tokio::test]
+    async fn full_backup_reads_filesystem_artifacts_from_repository_storage_path_5053() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::FilesystemBackend;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+
+        // Deliberately DIFFERENT from the repository's own directory: the
+        // fixture used by most tests points both at the same tempdir, which
+        // hides exactly this bug.
+        let global_root = std::env::temp_dir().join(format!("bk-5053-global-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&global_root).expect("create global storage dir");
+        let global_storage = Arc::new(StorageService::new(Arc::new(FilesystemBackend::new(
+            global_root.clone(),
+        ))));
+        let registry = Arc::new(
+            StorageRegistry::new(std::collections::HashMap::new(), "filesystem".to_string())
+                .with_filesystem_bucket_root(global_root.clone()),
+        );
+        let repo_storage = registry
+            .backend_for(&StorageLocation {
+                backend: "filesystem".to_string(),
+                path: repo_dir.to_string_lossy().into_owned(),
+            })
+            .expect("resolve repository storage");
+
+        let storage_key = format!("00/00/{}", "a".repeat(64));
+        let content = b"repository-rooted-artifact-bytes";
+        repo_storage
+            .put(&storage_key, Bytes::from_static(content))
+            .await
+            .expect("write artifact below the repository root");
+        // The same key must NOT exist at the global root, or this test would
+        // not distinguish the two locations.
+        assert!(
+            global_storage.get(&storage_key).await.is_err(),
+            "test setup must keep the bytes only under the repository root"
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts
+                (repository_id, path, name, size_bytes, checksum_sha256,
+                 content_type, storage_key, updated_at)
+            VALUES ($1, $2, $3, $4, $5, 'application/octet-stream', $6, NOW())
+            "#,
+        )
+        .bind(repo_id)
+        .bind(format!("path/{storage_key}"))
+        .bind("5053-artifact")
+        .bind(content.len() as i64)
+        .bind("a".repeat(64))
+        .bind(&storage_key)
+        .execute(&pool)
+        .await
+        .expect("insert artifact row");
+
+        let service = BackupService::new(pool.clone(), global_storage)
+            .with_storage_registry(registry.clone());
+        let backup = service
+            .create(full_backup_of(repo_id))
+            .await
+            .expect("create backup job");
+        let run = service
+            .execute_run(backup.id)
+            .await
+            .expect("execute backup");
+
+        assert!(
+            run.failure.is_none(),
+            "backup must read repository-rooted bytes: {:?}",
+            run.failure
+        );
+        assert_eq!(run.backup.status, BackupStatus::Completed);
+        assert_eq!(run.backup.artifact_count, Some(1));
+
+        let archive = service
+            .archive_storage
+            .get(backup.storage_path.as_ref().unwrap())
+            .await
+            .expect("read backup archive");
+        let entries = BackupService::extract_entries(&archive).expect("extract archive");
+        let expected_path = std::path::PathBuf::from(format!("artifacts/{storage_key}"));
+        let (_, captured) = entries
+            .iter()
+            .find(|(path, _)| path == &expected_path)
+            .expect("archive must carry the repository-rooted artifact");
+        assert_eq!(captured, content);
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(backup.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        let _ = std::fs::remove_dir_all(&global_root);
+    }
+
+    /// #5053 restore half: bytes must land under the owning repository's
+    /// storage path, not the deployment-global root. Uses a scoped archive
+    /// carrying only this repository's rows so no sibling test's repositories
+    /// are touched.
+    #[tokio::test]
+    async fn restore_writes_filesystem_artifacts_to_repository_storage_path_5053() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::FilesystemBackend;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let storage_key = insert_artifact_at(&pool, repo_id, "5053", Utc::now()).await;
+        let content = b"restored-below-the-repository-root";
+
+        let global_root = std::env::temp_dir().join(format!("bk-5053-restore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&global_root).expect("create global storage dir");
+        let global_storage = Arc::new(StorageService::new(Arc::new(FilesystemBackend::new(
+            global_root.clone(),
+        ))));
+        let registry = Arc::new(
+            StorageRegistry::new(std::collections::HashMap::new(), "filesystem".to_string())
+                .with_filesystem_bucket_root(global_root.clone()),
+        );
+        let service = BackupService::new(pool.clone(), global_storage.clone())
+            .with_storage_registry(registry.clone());
+        let job = service
+            .create(full_backup_of(repo_id))
+            .await
+            .expect("create backup job");
+
+        // Export only this repository's rows, then build the archive the same
+        // way `do_backup` would.
+        let mut conn = pool.acquire().await.expect("acquire connection");
+        let all_repositories = BackupService::export_table(&mut conn, "repositories")
+            .await
+            .expect("export repositories");
+        let repositories = serde_json::Value::Array(vec![all_repositories
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == repo_id.to_string())
+            .expect("fixture repository row")
+            .clone()]);
+        let artifacts = BackupService::export_artifacts(&mut conn, Some(&[repo_id]), None)
+            .await
+            .expect("export artifacts");
+        drop(conn);
+
+        let repositories_bytes = serde_json::to_vec(&repositories).unwrap();
+        let artifacts_bytes = serde_json::to_vec(&artifacts).unwrap();
+        let tables = [
+            ("repositories", repositories_bytes.as_slice()),
+            ("artifacts", artifacts_bytes.as_slice()),
+        ];
+        let contents = [(storage_key.as_str(), content.as_slice())];
+        let (size, checksum) =
+            payload_summary(tables.iter().copied().chain(contents.iter().copied()));
+        let manifest = BackupManifest {
+            version: "1.0".to_string(),
+            backup_id: job.id,
+            backup_type: BackupType::Full,
+            created_at: Utc::now(),
+            database_tables: vec!["repositories".to_string(), "artifacts".to_string()],
+            artifact_count: 1,
+            artifacts_unreadable: 0,
+            total_size_bytes: size,
+            checksum: checksum.clone(),
+        };
+        let archive = build_backup_tar(&tables, &contents, &serde_json::to_vec(&manifest).unwrap())
+            .expect("build archive");
+        let archive_len = archive.len() as i64;
+        service
+            .archive_storage
+            .put(job.storage_path.as_ref().unwrap(), Bytes::from(archive))
+            .await
+            .expect("write archive");
+        sqlx::query(
+            "UPDATE backups SET status = 'completed', size_bytes = $2, payload_checksum = $3 \
+             WHERE id = $1",
+        )
+        .bind(job.id)
+        .bind(archive_len)
+        .bind(checksum)
+        .execute(&pool)
+        .await
+        .expect("mark backup completed");
+
+        let result = service
+            .restore(
+                job.id,
+                RestoreOptions {
+                    restore_database: false,
+                    restore_artifacts: true,
+                    target_repository_id: None,
+                    allow_unverified_archive: false,
+                    actor: None,
+                },
+            )
+            .await
+            .expect("restore archive");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.artifacts_restored, 1);
+
+        let repo_storage = registry
+            .backend_for(&StorageLocation {
+                backend: "filesystem".to_string(),
+                path: repo_dir.to_string_lossy().into_owned(),
+            })
+            .expect("resolve repository storage");
+        assert_eq!(
+            repo_storage
+                .get(&storage_key)
+                .await
+                .expect("restored bytes live under the repository root"),
+            Bytes::from_static(content)
+        );
+        assert!(
+            global_storage.get(&storage_key).await.is_err(),
+            "restore must not deposit the artifact at the deployment-global root"
+        );
+
+        let _ = sqlx::query("DELETE FROM backups WHERE id = $1")
+            .bind(job.id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        let _ = std::fs::remove_dir_all(&global_root);
     }
 
     #[tokio::test]
