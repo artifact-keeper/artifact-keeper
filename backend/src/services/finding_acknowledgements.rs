@@ -45,7 +45,6 @@ use crate::services::audit_service::{
 };
 use crate::services::policy_service::PolicyService;
 use crate::services::quarantine_service;
-use crate::services::repository_service::{RepoAccess, RepositoryService};
 use crate::services::scan_result_service::{ScanResultService, FIND_CARRYABLE_SCAN_SQL};
 use crate::services::scan_state::ScanStateRow;
 use crate::services::scanner_service::{
@@ -226,22 +225,6 @@ const CLEAR_FROZEN_FLAG_SQL: &str = "UPDATE scan_findings sf \
        AND finding_component_key(sf.affected_component) = $5 \
        AND finding_component_key(sf.affected_version) = $6";
 
-/// A user holding repository grants, directly or through a group, and no
-/// instance-wide role: see `FindingAcknowledgementService::may_act_in`.
-const BOUND_TO_GRANTS_SQL: &str = "SELECT \
-     NOT EXISTS (SELECT 1 FROM role_assignments \
-                 WHERE user_id = $1 AND repository_id IS NULL) \
-     AND (EXISTS (SELECT 1 FROM role_assignments \
-                  WHERE user_id = $1 AND repository_id IS NOT NULL) \
-          OR EXISTS (SELECT 1 FROM permissions p \
-                     WHERE p.target_type IN ('repository', 'project') \
-                       AND p.actions <> '{}' \
-                       AND ((p.principal_type IN ('user', 'service_account') \
-                             AND p.principal_id = $1) \
-                            OR (p.principal_type = 'group' AND p.principal_id IN \
-                                (SELECT group_id FROM user_group_members \
-                                 WHERE user_id = $1)))))";
-
 /// The one answer for a finding that does not exist and one the caller cannot
 /// reach, so the first request cannot be used to tell them apart.
 fn not_found() -> AppError {
@@ -414,89 +397,38 @@ impl FindingAcknowledgementService {
 
     /// Every caller of this service has already established the admin capability:
     /// the REST routes with `require_admin`, where `is_admin` is gated on an
-    /// `admin`-granting scope; the by-CVE route with `enforce_admin_audited`; the
-    /// gRPC `UpdateCveStatus` method with an `admin`-granting scope; promotion before it asks. What is decided here is where
-    /// that capability is meant to be used.
-    ///
-    /// * The credential must cover the repository.
-    /// * An admin with no repository grants, or with an instance-wide role, may act
-    ///   anywhere: `POST /users` creates admins with no role row at all, and they
-    ///   could always triage any repository.
-    /// * An admin holding repository grants and no instance-wide role needs a grant
-    ///   on the repository, public or not.
-    ///
-    /// The last rule is a guard against an admin deciding by mistake for a repository
-    /// they do not look after, not tenant isolation. There is no tenant column, so it is inferred
-    /// from the grants: an admin with none reads as unbound, and one who is given a
-    /// single repository role, group or owner grant becomes bound and is refused
-    /// elsewhere. That fails closed, and an instance-wide role lifts it.
-    async fn may_act_in(&self, actor: &AckActor, repository_id: Uuid) -> Result<bool> {
-        if !actor.credential.grants(repository_id) {
-            return Ok(false);
-        }
-        let Some(user_id) = actor.user_id else {
-            return Ok(true);
-        };
-        if !self.is_bound_to_its_grants(user_id).await? {
-            return Ok(true);
-        }
-        // TENANT-GATE-ONLY (#3331). The question here is whether a bound admin holds
-        // any grant on this repository. The capability is `is_admin`, established by
-        // every caller, so this carries no action, and it fronts a decision rather
-        // than a repository's contents.
-        RepositoryService::new(self.db.clone())
-            .user_can_access_repo(repository_id, user_id, RepoAccess::TenantOnly)
-            .await
+    /// `admin`-granting scope; the by-CVE route with `enforce_admin_audited`; the gRPC
+    /// method with an `admin`-granting scope; promotion before it asks. What is decided
+    /// here is how far the credential reaches: an unrestricted credential reaches every
+    /// repository, and a restricted one only those it lists. The repository roles the
+    /// user holds play no part.
+    fn may_act_in(actor: &AckActor, repository_id: Uuid) -> bool {
+        actor.credential.grants(repository_id)
     }
 
-    /// Whether this user holds repository grants and no instance-wide role.
-    async fn is_bound_to_its_grants(&self, user_id: Uuid) -> Result<bool> {
-        sqlx::query_scalar(BOUND_TO_GRANTS_SQL)
-            .bind(user_id)
-            .fetch_one(&self.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))
+    fn may_act_everywhere(actor: &AckActor) -> bool {
+        matches!(actor.credential, AccessScope::Admin)
     }
 
     /// Whether `actor` may decide for one repository. A credential that does not
-    /// cover it is told it does not exist (404), like every other route. A tenant
-    /// miss is a 403, like promotion's.
+    /// cover it is told it does not exist (404), like every other route.
     pub async fn authorize_repository(&self, actor: &AckActor, repository_id: Uuid) -> Result<()> {
-        if !actor.credential.grants(repository_id) {
-            return Err(not_found());
-        }
-        if self.may_act_in(actor, repository_id).await? {
+        if Self::may_act_in(actor, repository_id) {
             Ok(())
         } else {
-            Err(AppError::Authorization(
-                "You hold grants on other repositories but not on this one, so you cannot \
-                 decide for it"
-                    .to_string(),
-            ))
+            Err(not_found())
         }
     }
 
     /// Whether `actor` may make or undo a decision for every repository: an
-    /// unrestricted credential, and not an admin bound to the repositories it holds
-    /// grants on (see [`Self::may_act_in`]).
+    /// unrestricted credential.
     pub async fn authorize_every_repository(&self, actor: &AckActor) -> Result<()> {
-        if !self.may_act_everywhere(actor).await? {
-            return Err(AppError::Authorization(
-                "Deciding for every repository needs an unrestricted credential \
-                 and no repository-only grants"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn may_act_everywhere(&self, actor: &AckActor) -> Result<bool> {
-        if !matches!(actor.credential, AccessScope::Admin) {
-            return Ok(false);
-        }
-        match actor.user_id {
-            None => Ok(true),
-            Some(user_id) => Ok(!self.is_bound_to_its_grants(user_id).await?),
+        if Self::may_act_everywhere(actor) {
+            Ok(())
+        } else {
+            Err(AppError::Authorization(
+                "Deciding for every repository needs an unrestricted credential".to_string(),
+            ))
         }
     }
 
@@ -535,8 +467,8 @@ impl FindingAcknowledgementService {
         let mut left_effective = 0;
         for row in reach {
             let may = match row.repository_id {
-                Some(repository_id) => self.may_act_in(actor, repository_id).await?,
-                None => self.may_act_everywhere(actor).await?,
+                Some(repository_id) => Self::may_act_in(actor, repository_id),
+                None => Self::may_act_everywhere(actor),
             };
             if may {
                 allowed.push(row.id);
@@ -620,7 +552,7 @@ impl FindingAcknowledgementService {
         if let Some(repository_id) = requested {
             if repository_id != key.repository_id
                 && !copy_in(repository_id).await?
-                && !self.may_act_in(actor, key.repository_id).await?
+                && !Self::may_act_in(actor, key.repository_id)
             {
                 return Err(not_found());
             }

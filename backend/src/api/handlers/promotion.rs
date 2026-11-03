@@ -5205,10 +5205,10 @@ mod tests {
             cleanup(&pool, &[src, tgt], user).await;
         }
 
-        /// #5153: public read access is not authority to decide. A grant-bound
-        /// admin carries nothing into another tenant's public repository.
+        /// #5250: what roles an administrator holds does not change what the gate and the
+        /// carry read: they ask the same question, and it follows the decision rule.
         #[tokio::test]
-        async fn test_a_grant_bound_admin_carries_nothing_into_a_public_target_5153() {
+        async fn test_an_admin_holding_repository_roles_carries_into_the_target_5250() {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
@@ -5261,9 +5261,31 @@ mod tests {
                 .await
                 .expect("evaluate");
             assert!(
-                !result.allowed,
-                "the decision must not cross into the target"
+                result.allowed,
+                "the decision reaches the target: {:?}",
+                result.violations
             );
+            assert_eq!(
+                res.0
+                    .scan_state
+                    .clone()
+                    .expect("scan state")
+                    .acknowledgements_carried,
+                1
+            );
+
+            // The gate and the carry both follow `promoter_may_acknowledge`.
+            let mut admin_token = admin_ext(tenant_admin);
+            assert!(promoter_may_acknowledge(&pool, &admin_token, tgt).await);
+            admin_token.allowed_repo_ids =
+                crate::models::access_scope::AccessScope::Restricted(vec![src]);
+            assert!(
+                !promoter_may_acknowledge(&pool, &admin_token, tgt).await,
+                "a credential restricted to the source does not reach the target"
+            );
+            let mut plain = admin_ext(tenant_admin);
+            plain.is_admin = false;
+            assert!(!promoter_may_acknowledge(&pool, &plain, tgt).await);
             cleanup(&pool, &[src, tgt], admin).await;
         }
 
