@@ -7958,6 +7958,24 @@ impl ProxyService {
         Ok((resp.content, resp.content_type, resp.effective_url))
     }
 
+    /// Fetch metadata from upstream without reading or writing the proxy cache,
+    /// negotiating a representation with `accept`, for a caller that needs the
+    /// upstream's answer as of now (#5150). Same origin policy, URL gate and
+    /// upstream authentication as every other upstream read.
+    pub async fn fetch_upstream_direct_with_accept(
+        &self,
+        repo: &Repository,
+        path: &str,
+        accept: Option<&str>,
+    ) -> Result<Bytes> {
+        self.ensure_origin_policy_allows(repo).await?;
+        let full_url = self.gated_upstream_url(repo, path).await?;
+        let resp = self
+            .fetch_from_upstream_with_accept(&full_url, repo.id, accept, LARGE_METADATA_MAX_BYTES)
+            .await?;
+        Ok(resp.content)
+    }
+
     /// Fetch from upstream without reading or writing the proxy cache, and
     /// return the body with the upstream `Last-Modified` header (#4702: the
     /// Maven age gate dates a version by its POM's `Last-Modified`). Same

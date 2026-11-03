@@ -38,20 +38,21 @@ use tracing::{debug, info};
 use crate::api::extractors::RequestBaseUrl;
 use crate::api::handlers::cache_headers::{check_conditional_request, compute_etag};
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
+use crate::api::handlers::proxy_helpers::AgeGateOutcome;
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::age_gate_service::AgeGateService;
+use crate::services::age_gate_service::{
+    npm_packument_version_evidence, AgeGateService, UpstreamVersionEvidence,
+};
 use crate::services::metrics_service;
 use crate::services::npm_attestation_cache::{self as attestation_cache, CachedMetaResponse};
 use crate::services::npm_packument_cache::{
     self as packument_cache, CachedPackument, NpmPackumentCache,
 };
-use crate::services::upstream_metadata::UpstreamMetadataCache;
 use crate::services::upstream_tracing::send_upstream;
-use chrono::Utc;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -4460,42 +4461,57 @@ fn npm_lkg_redirect(
     (lkg_path, lkg_filename)
 }
 
-async fn npm_publish_time_for_version(
+/// What the upstream's packument says about `version`. With `confirm_miss`, a
+/// miss is re-read from the upstream itself: a cached packument older than the
+/// publish does not list a version the upstream now has (#5150).
+async fn npm_version_evidence(
     state: &SharedState,
     repo: &RepoInfo,
     package_name: &str,
     version: &str,
-) -> Option<chrono::DateTime<Utc>> {
-    if let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) {
-        let encoded_name = encode_package_name_for_upstream(package_name);
-        // Capped like every other buffered packument read (#2181): this runs
-        // on the tarball download path, where an unbounded upstream metadata
-        // body must not be able to balloon memory.
-        //
-        // Fetch/cache split (#3297): same decoded cache key as the metadata
-        // handlers, so the packument this age-gate probe caches is the SAME
-        // entry `get_package_metadata` reads and refreshes — leaving this
-        // site on the encoded key would double-cache every scoped packument.
-        if let Ok((content, _, _budget_permit)) =
-            proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
-                proxy,
-                repo.id,
-                &repo.key,
-                upstream_url,
-                &encoded_name,
-                package_name,
-                None,
-                proxy_helpers::LARGE_METADATA_MAX_BYTES,
-            )
-            .await
-        {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&content) {
-                let times = UpstreamMetadataCache::parse_npm_publish_times(&json);
-                return times.get(version).copied();
-            }
-        }
+    confirm_miss: bool,
+) -> UpstreamVersionEvidence {
+    let (Some(upstream_url), Some(proxy)) = (&repo.upstream_url, &state.proxy_service) else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    let encoded_name = encode_package_name_for_upstream(package_name);
+    // Capped like every other buffered packument read (#2181): this runs on
+    // the tarball download path, where an unbounded upstream metadata body
+    // must not be able to balloon memory.
+    //
+    // Fetch/cache split (#3297): same decoded cache key as the metadata
+    // handlers, so the packument this age-gate probe caches is the SAME entry
+    // `get_package_metadata` reads and refreshes -- leaving this site on the
+    // encoded key would double-cache every scoped packument.
+    let cached = match proxy_helpers::proxy_fetch_capped_with_cache_key_and_accept_budgeted(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &encoded_name,
+        package_name,
+        None,
+        proxy_helpers::LARGE_METADATA_MAX_BYTES,
+    )
+    .await
+    {
+        Ok((content, _, _budget_permit)) => npm_packument_version_evidence(&content, version),
+        Err(resp) if resp.status() == StatusCode::NOT_FOUND => UpstreamVersionEvidence::NotHosted,
+        Err(_) => UpstreamVersionEvidence::Unknown,
+    };
+    if !confirm_miss || cached != UpstreamVersionEvidence::NotHosted {
+        return cached;
     }
-    None
+    proxy_helpers::age_gate_upstream_evidence(
+        proxy,
+        repo.id,
+        &repo.key,
+        upstream_url,
+        &encoded_name,
+        None,
+        |content| npm_packument_version_evidence(content, version),
+    )
+    .await
 }
 
 async fn apply_npm_download_age_gate(
@@ -4503,7 +4519,8 @@ async fn apply_npm_download_age_gate(
     repo: &RepoInfo,
     package_name: &str,
     filename: &str,
-) -> Result<Option<(String, String)>, Response> {
+    as_virtual_member: bool,
+) -> Result<AgeGateOutcome<(String, String)>, Response> {
     // Cheap struct-derived pre-check so an ungated repo skips the filename
     // parse, the DB policy resolve, and the upstream publish-time fetch. The
     // authoritative policy (mode + upstream identity) is then re-resolved
@@ -4511,7 +4528,7 @@ async fn apply_npm_download_age_gate(
     // defaulted mode (e.g. a virtual member's RepoInfo), and gate policy is
     // enforcement input, so it is read from the source of truth (#2264).
     if !AgeGateService::is_applicable(&proxy_helpers::age_gate_params(repo)) {
-        return Ok(None);
+        return Ok(AgeGateOutcome::Allowed);
     }
     let params = crate::services::age_gate_service::resolve_repo_params(&state.db, repo.id)
         .await
@@ -4524,32 +4541,33 @@ async fn apply_npm_download_age_gate(
 
     // Publish-time evidence from the packument; under `first_seen` the time
     // itself is ignored, but presence in the upstream-served document is the
-    // existence evidence that may start the version's observation clock.
-    let published_at = npm_publish_time_for_version(state, repo, package_name, &version).await;
-    let basis = match state.age_gate_service.as_deref() {
-        Some(svc) => svc
-            .download_basis(
-                &params,
-                package_name,
-                &version,
-                published_at,
-                published_at.is_some(),
-            )
-            .await
-            .map_err(|e| e.into_response())?,
-        None => published_at,
+    // existence evidence that may start the version's observation clock. A
+    // threshold of 0 needs neither, so it never waits on the upstream (#5151).
+    let evidence = if params.age_gate_min_age_days > 0 {
+        npm_version_evidence(state, repo, package_name, &version, as_virtual_member).await
+    } else {
+        UpstreamVersionEvidence::Unknown
     };
     // The shared seam (#2264) owns the decision and the terminal 451; only
     // the LKG substitution below is npm-specific.
-    let lkg = proxy_helpers::enforce_age_gate(
-        state.age_gate_service.as_deref(),
-        &params,
-        package_name,
-        &version,
-        basis,
+    Ok(
+        match proxy_helpers::decide_download_age_gate(
+            state.age_gate_service.as_deref(),
+            &params,
+            package_name,
+            &version,
+            evidence,
+            as_virtual_member,
+        )
+        .await?
+        {
+            AgeGateOutcome::Allowed => AgeGateOutcome::Allowed,
+            AgeGateOutcome::NotHosted => AgeGateOutcome::NotHosted,
+            AgeGateOutcome::Substitute(blocked) => {
+                AgeGateOutcome::Substitute(npm_lkg_redirect(&blocked.last_known_good, package_name))
+            }
+        },
     )
-    .await?;
-    Ok(lkg.map(|blocked| npm_lkg_redirect(&blocked.last_known_good, package_name)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4906,8 +4924,8 @@ async fn serve_tarball(
         {
             let mut fetch_path = upstream_path.clone();
             let mut response_filename = filename.to_string();
-            if let Some((lkg_path, lkg_filename)) =
-                apply_npm_download_age_gate(state, &repo, package_name, filename).await?
+            if let AgeGateOutcome::Substitute((lkg_path, lkg_filename)) =
+                apply_npm_download_age_gate(state, &repo, package_name, filename, false).await?
             {
                 fetch_path = lkg_path;
                 response_filename = lkg_filename;
@@ -5167,6 +5185,13 @@ async fn serve_tarball(
         // locally-owned name served from the local member) is never
         // age-gated. The shared `resolve_virtual_download` helper is left
         // untouched so no other format (maven/hex/...) is affected.
+        //
+        // #5150: a member whose upstream does not host the version is left out
+        // of everything below. It has nothing to refuse, and its gate cleared
+        // no bytes, so it must not be asked for them. Any member that does host
+        // it still decides here, so a too-young answer blocks the virtual even
+        // when another member would serve the same version.
+        let mut not_hosting = std::collections::HashSet::new();
         if let Some(proxy) = proxy_for_virtual {
             for member in &members {
                 if member.repo_type != RepositoryType::Remote {
@@ -5176,16 +5201,24 @@ async fn serve_tarball(
                     continue;
                 };
                 let member_info = proxy_helpers::repo_info_from_member(member);
-                // `apply_npm_download_age_gate` early-returns `Ok(None)` for a
+                // `apply_npm_download_age_gate` early-returns `Allowed` for a
                 // member whose gate is not applicable (disabled / non-npm), so
-                // ungated members are unaffected. An aged version -> `Ok(None)`;
+                // ungated members are unaffected. An aged version -> `Allowed`;
                 // a withheld young version with a last-known-good -> serve the
                 // LKG tarball from this member; without one -> `Err(451)` via `?`.
-                match apply_npm_download_age_gate(state, &member_info, package_name, filename)
+                match apply_npm_download_age_gate(state, &member_info, package_name, filename, true)
                     .await?
                 {
-                    None => {}
-                    Some((lkg_path, lkg_filename)) => {
+                    AgeGateOutcome::Allowed => {}
+                    AgeGateOutcome::NotHosted => {
+                        debug!(
+                            member_key = %member.key,
+                            package = %package_name,
+                            "age-gated npm member does not host this version; leaving it out"
+                        );
+                        not_hosting.insert(member.id);
+                    }
+                    AgeGateOutcome::Substitute((lkg_path, lkg_filename)) => {
                         let lkg = proxy_helpers::proxy_fetch_streaming_with_cache_key(
                             proxy,
                             member.id,
@@ -5219,6 +5252,11 @@ async fn serve_tarball(
                 }
             }
         }
+
+        let members: Vec<_> = members
+            .into_iter()
+            .filter(|m| !not_hosting.contains(&m.id))
+            .collect();
 
         // #3023: apply the inline scan-and-block gate on the virtual npm path,
         // the same gate the direct-Remote tarball path runs. For each eligible
@@ -20602,5 +20640,549 @@ mod duplicate_entry_tests {
         }
         let single = tar_gz_with(&[("package/package.json", good), ("package/index.js", b"1")]);
         assert!(established(&check(&single).1));
+    }
+}
+
+/// #5150: only a gated member that hosts the requested version may veto it
+/// through an npm virtual, and every other unknown stays fail-closed.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod age_gate_member_miss_5150_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use chrono::Utc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PKG: &str = "@example-org/example-package";
+    const PACKUMENT_PATH: &str = "/@example-org%2Fexample-package";
+    const TARBALL: &str = "example-package-1.2.3.tgz";
+    const VERSION: &str = "1.2.3";
+    const OLD: &str = "2015-06-01T00:00:00.000Z";
+
+    fn tarball_path() -> String {
+        format!("/{PKG}/-/{TARBALL}")
+    }
+
+    fn packument(version: &str, time: Option<&str>) -> serde_json::Value {
+        let mut doc = serde_json::json!({
+            "name": PKG,
+            "dist-tags": { "latest": version },
+            "versions": { version: { "name": PKG, "version": version } },
+            "time": {},
+        });
+        if let Some(time) = time {
+            doc["time"][version] = serde_json::json!(time);
+        }
+        doc
+    }
+
+    async fn mount_packument(server: &MockServer, doc: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(PACKUMENT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_tarball(server: &MockServer, bytes: &'static [u8]) {
+        Mock::given(method("GET"))
+            .and(path(tarball_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+
+    /// An upstream hosting an old 1.2.3.
+    async fn hosting_old(bytes: &'static [u8]) -> MockServer {
+        let server = MockServer::start().await;
+        mount_packument(&server, packument(VERSION, Some(OLD))).await;
+        mount_tarball(&server, bytes).await;
+        server
+    }
+
+    /// An upstream hosting a just-published 1.2.3.
+    async fn hosting_young(bytes: &'static [u8]) -> MockServer {
+        let server = MockServer::start().await;
+        let now = Utc::now().to_rfc3339();
+        mount_packument(&server, packument(VERSION, Some(&now))).await;
+        mount_tarball(&server, bytes).await;
+        server
+    }
+
+    struct Rig {
+        fx: tdh::Fixture,
+        state: SharedState,
+        members: Vec<(uuid::Uuid, std::path::PathBuf)>,
+    }
+
+    /// Virtual over one gated Remote per `(upstream, min_age_days, mode)`, at
+    /// priorities in slice order.
+    async fn build_rig(gates: &[(&MockServer, i32, &str)]) -> Option<Rig> {
+        let fx = tdh::Fixture::setup("virtual", "npm").await?;
+        let mut members = Vec::new();
+        for (index, (upstream, min_age, mode)) in gates.iter().enumerate() {
+            let (id, _key, dir) = tdh::create_repo(&fx.pool, "remote", "npm").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $1, is_public = true, \
+                 age_gate_enabled = true, age_gate_min_age_days = $2, age_gate_mode = $3 \
+                 WHERE id = $4",
+            )
+            .bind(upstream.uri())
+            .bind(min_age)
+            .bind(mode)
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .expect("configure member");
+            tdh::link_virtual_member(&fx.pool, fx.repo_id, id, index as i32 + 1).await;
+            tdh::publish_repo(&fx.pool, id).await;
+            members.push((id, dir));
+        }
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
+        Some(Rig { fx, state, members })
+    }
+
+    impl Rig {
+        async fn download(&self) -> (StatusCode, Bytes) {
+            let resp = match super::download_scoped_tarball(
+                axum::extract::State(self.state.clone()),
+                axum::Extension(tdh::admin_auth_ext()),
+                axum::extract::Path((
+                    self.fx.repo_key.clone(),
+                    "example-org".to_string(),
+                    "example-package".to_string(),
+                    TARBALL.to_string(),
+                )),
+                Default::default(),
+            )
+            .await
+            {
+                Ok(r) | Err(r) => r,
+            };
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .expect("body");
+            (status, body)
+        }
+
+        async fn reviews(&self, index: usize) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM age_gate_reviews WHERE repository_id = $1")
+                .bind(self.members[index].0)
+                .fetch_one(&self.fx.pool)
+                .await
+                .expect("count reviews")
+        }
+
+        async fn teardown(self) {
+            for (id, dir) in &self.members {
+                tdh::cleanup_member_repo(&self.fx.pool, *id, dir).await;
+            }
+            self.fx.teardown().await;
+        }
+    }
+
+    fn assert_451(status: StatusCode, body: &Bytes, requested_age_days: Option<i64>) {
+        assert_eq!(status.as_u16(), 451, "{}", String::from_utf8_lossy(body));
+        let json: serde_json::Value = serde_json::from_slice(body).expect("451 body");
+        assert_eq!(json["requested_age_days"].as_i64(), requested_age_days);
+    }
+
+    fn assert_served(status: StatusCode, body: &Bytes, expected: &[u8]) {
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(body));
+        assert_eq!(&body[..], expected);
+    }
+
+    /// The #5150 report: the member with no such package has nothing to
+    /// refuse, whichever side of the member that hosts it it sits on. Its
+    /// gate settings do not change that.
+    #[tokio::test]
+    async fn member_without_the_package_steps_aside_in_either_order_5150() {
+        for (min_age, mode) in [
+            (7, "upstream_publish_time"),
+            (7, "first_seen"),
+            (0, "upstream_publish_time"),
+        ] {
+            for missing_first in [true, false] {
+                let missing = MockServer::start().await;
+                let host = hosting_old(b"host-bytes").await;
+                let gates = if missing_first {
+                    [
+                        (&missing, min_age, mode),
+                        (&host, 7, "upstream_publish_time"),
+                    ]
+                } else {
+                    [
+                        (&host, 7, "upstream_publish_time"),
+                        (&missing, min_age, mode),
+                    ]
+                };
+                let Some(rig) = build_rig(&gates).await else {
+                    return;
+                };
+
+                let (status, body) = rig.download().await;
+                let reviews = (rig.reviews(0).await, rig.reviews(1).await);
+                rig.teardown().await;
+
+                assert_served(status, &body, b"host-bytes");
+                assert_eq!(reviews, (0, 0), "{min_age} {mode} first={missing_first}");
+            }
+        }
+    }
+
+    /// A member whose packument lists other versions does not host this one.
+    #[tokio::test]
+    async fn member_without_the_version_steps_aside_5150() {
+        let other = MockServer::start().await;
+        mount_packument(&other, packument("9.9.9", Some(OLD))).await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&other, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+
+        let (status, body) = rig.download().await;
+        let reviews = rig.reviews(0).await;
+        rig.teardown().await;
+
+        assert_served(status, &body, b"host-bytes");
+        assert_eq!(reviews, 0);
+    }
+
+    /// When no member hosts it the answer is a plain miss, not a 451.
+    #[tokio::test]
+    async fn no_member_hosting_it_is_a_404_5150() {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let Some(rig) = build_rig(&[
+            (&a, 7, "upstream_publish_time"),
+            (&b, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+
+        let (status, body) = rig.download().await;
+        let reviews = (rig.reviews(0).await, rig.reviews(1).await);
+        rig.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(reviews, (0, 0));
+    }
+
+    /// A member that hides the version from its packument while still serving
+    /// the tarball is out of this request, so its undated bytes never go out.
+    /// Otherwise hiding a version would be a way around the gate.
+    #[tokio::test]
+    async fn stepped_aside_member_never_serves_its_own_bytes_5150() {
+        let hiding = MockServer::start().await;
+        mount_packument(&hiding, packument("9.9.9", Some(OLD))).await;
+        mount_tarball(&hiding, b"hidden-bytes").await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&hiding, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+        let (status, body) = rig.download().await;
+        rig.teardown().await;
+        assert_served(status, &body, b"host-bytes");
+
+        let hiding = MockServer::start().await;
+        mount_packument(&hiding, packument("9.9.9", Some(OLD))).await;
+        mount_tarball(&hiding, b"hidden-bytes").await;
+        let Some(rig) = build_rig(&[(&hiding, 7, "upstream_publish_time")]).await else {
+            return;
+        };
+        let (status, body) = rig.download().await;
+        rig.teardown().await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// A member that hosts the version and finds it too young blocks the
+    /// virtual on either side of a member that would serve it.
+    #[tokio::test]
+    async fn hosting_member_too_young_blocks_in_either_order_5150() {
+        for young_first in [true, false] {
+            let young = hosting_young(b"young-bytes").await;
+            let host = hosting_old(b"host-bytes").await;
+            let gates = if young_first {
+                [
+                    (&young, 7, "upstream_publish_time"),
+                    (&host, 7, "upstream_publish_time"),
+                ]
+            } else {
+                [
+                    (&host, 7, "upstream_publish_time"),
+                    (&young, 7, "upstream_publish_time"),
+                ]
+            };
+            let Some(rig) = build_rig(&gates).await else {
+                return;
+            };
+            let young_index = usize::from(!young_first);
+
+            let (status, body) = rig.download().await;
+            let reviews = rig.reviews(young_index).await;
+            rig.teardown().await;
+
+            assert_451(status, &body, Some(0));
+            assert_eq!(reviews, 1, "young_first={young_first}");
+        }
+    }
+
+    /// Listed with no `time` entry is a hosted answer of unknown age.
+    #[tokio::test]
+    async fn listed_without_a_time_blocks_the_virtual_5150() {
+        let undated = MockServer::start().await;
+        mount_packument(&undated, packument(VERSION, None)).await;
+        mount_tarball(&undated, b"undated-bytes").await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&undated, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+
+        let (status, body) = rig.download().await;
+        rig.teardown().await;
+
+        assert_451(status, &body, None);
+    }
+
+    /// Only a 404/410 or a readable document that omits the version says "not
+    /// hosted". An outage, a refusal or a page that is no packument does not.
+    #[tokio::test]
+    async fn unreadable_member_packument_is_not_a_miss_5150() {
+        let responses = [
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(503),
+            ResponseTemplate::new(401),
+            ResponseTemplate::new(403),
+            ResponseTemplate::new(429),
+            ResponseTemplate::new(200).set_body_raw("<html>Sign in</html>", "text/html"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"error": "nope"})),
+        ];
+        for response in responses {
+            let down = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(PACKUMENT_PATH))
+                .respond_with(response)
+                .mount(&down)
+                .await;
+            let host = hosting_old(b"host-bytes").await;
+            let Some(rig) = build_rig(&[
+                (&down, 7, "upstream_publish_time"),
+                (&host, 7, "upstream_publish_time"),
+            ])
+            .await
+            else {
+                return;
+            };
+
+            let (status, body) = rig.download().await;
+            rig.teardown().await;
+
+            assert_451(status, &body, None);
+        }
+    }
+
+    /// A cached packument older than the publish is not evidence: a version
+    /// released since is hosted, and it blocks. The negative answer has to
+    /// come from the upstream itself.
+    #[tokio::test]
+    async fn stale_cached_packument_does_not_make_a_young_version_a_miss_5150() {
+        let publishing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(PACKUMENT_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(packument("9.9.9", Some(OLD))))
+            .up_to_n_times(1)
+            .mount(&publishing)
+            .await;
+        let now = Utc::now().to_rfc3339();
+        mount_packument(&publishing, packument(VERSION, Some(&now))).await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&publishing, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+        // Warm the member's packument cache with the document before the publish.
+        let _ = super::get_package_metadata(
+            &rig.state,
+            tdh::admin_auth_ext().as_ref(),
+            &rig.fx.repo_key,
+            PKG,
+            "http://localhost",
+            false,
+        )
+        .await;
+
+        let (status, body) = rig.download().await;
+        rig.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// A rejection on the member outlives the upstream dropping the version.
+    #[tokio::test]
+    async fn rejected_review_on_a_non_hosting_member_still_blocks_5150() {
+        let missing = MockServer::start().await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&missing, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO age_gate_reviews (repository_id, package_name, package_version, status) \
+             VALUES ($1, $2, $3, 'rejected')",
+        )
+        .bind(rig.members[0].0)
+        .bind(PKG)
+        .bind(VERSION)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("reject");
+
+        let (status, body) = rig.download().await;
+        rig.teardown().await;
+
+        assert_eq!(status.as_u16(), 451, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// `first_seen`: a version this member has observed was hosted here, so a
+    /// young clock still blocks when the upstream later stops listing it.
+    #[tokio::test]
+    async fn first_seen_observation_on_a_non_hosting_member_still_blocks_5150() {
+        let missing = MockServer::start().await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&missing, 7, "first_seen"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+        let params =
+            crate::services::age_gate_service::resolve_repo_params(&rig.fx.pool, rig.members[0].0)
+                .await
+                .expect("params");
+        rig.state
+            .age_gate_service
+            .as_deref()
+            .expect("service")
+            .observe_first_seen(&params, PKG, VERSION)
+            .await
+            .expect("observe");
+
+        let (status, body) = rig.download().await;
+        rig.teardown().await;
+
+        assert_451(status, &body, Some(0));
+    }
+
+    /// Confirming a miss costs one upstream read per project within the window,
+    /// however many requests ask, on top of the ordinary packument read.
+    #[tokio::test]
+    async fn repeated_misses_share_one_confirming_read_5150() {
+        let other = MockServer::start().await;
+        mount_packument(&other, packument("9.9.9", Some(OLD))).await;
+        let host = hosting_old(b"host-bytes").await;
+        let Some(rig) = build_rig(&[
+            (&other, 7, "upstream_publish_time"),
+            (&host, 7, "upstream_publish_time"),
+        ])
+        .await
+        else {
+            return;
+        };
+        // The ordinary cached read, so everything after it counts confirmations.
+        let (first, _) = rig.download().await;
+        let baseline = other.received_requests().await.unwrap_or_default().len();
+
+        let results = futures::future::join_all((0..4).map(|_| rig.download())).await;
+        let after = other.received_requests().await.unwrap_or_default().len();
+        rig.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert!(results.iter().all(|(s, _)| *s == StatusCode::OK));
+        assert_eq!(
+            after, baseline,
+            "served from the window: {baseline} -> {after}"
+        );
+    }
+
+    /// A direct Remote has no sibling to defer to: its answer is unchanged.
+    #[tokio::test]
+    async fn direct_remote_without_the_package_is_unchanged_5150() {
+        let missing = MockServer::start().await;
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        sqlx::query(
+            "UPDATE repositories SET upstream_url = $1, is_public = true, \
+             age_gate_enabled = true, age_gate_min_age_days = 7 WHERE id = $2",
+        )
+        .bind(missing.uri())
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("gate the remote");
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &storage, proxy);
+
+        let result = super::download_scoped_tarball(
+            axum::extract::State(state),
+            axum::Extension(tdh::admin_auth_ext()),
+            axum::extract::Path((
+                fx.repo_key.clone(),
+                "example-org".to_string(),
+                "example-package".to_string(),
+                TARBALL.to_string(),
+            )),
+            Default::default(),
+        )
+        .await;
+        fx.teardown().await;
+
+        let status = match result {
+            Ok(r) | Err(r) => r.status(),
+        };
+        assert_eq!(status.as_u16(), 451);
     }
 }
