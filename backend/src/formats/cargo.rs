@@ -432,6 +432,18 @@ pub struct CargoToml {
     pub workspace: Option<CargoWorkspace>,
 }
 
+/// `package.readme`: a path, or a boolean. Cargo writes `readme = false` into
+/// the published (normalized) manifest of a package without a README, and
+/// `true` means the default `README.md`
+/// (<https://doc.rust-lang.org/cargo/reference/manifest.html#the-readme-field>).
+/// A string-only field rejected those manifests outright (#5140).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CargoReadme {
+    Path(String),
+    Enabled(bool),
+}
+
 /// Cargo package section
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CargoPackage {
@@ -448,7 +460,7 @@ pub struct CargoPackage {
     #[serde(default)]
     pub documentation: Option<String>,
     #[serde(default)]
-    pub readme: Option<String>,
+    pub readme: Option<CargoReadme>,
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
@@ -849,6 +861,25 @@ exclude = ["examples"]
             Some(vec!["crate-a".to_string(), "crate-b".to_string()])
         );
         assert_eq!(ws.exclude, Some(vec!["examples".to_string()]));
+    }
+
+    /// #5140: cargo normalizes a package without a README to `readme = false`
+    /// on publish; the manifest must still parse, and `true` / a path too.
+    #[test]
+    fn test_parse_cargo_toml_readme_bool_or_path() {
+        for (value, expected) in [
+            ("false", CargoReadme::Enabled(false)),
+            ("true", CargoReadme::Enabled(true)),
+            ("\"README.md\"", CargoReadme::Path("README.md".to_string())),
+        ] {
+            let content =
+                format!("[package]\nname = \"pkg\"\nversion = \"0.1.0\"\nreadme = {value}\n");
+            let package = CargoHandler::parse_cargo_toml(&content)
+                .unwrap()
+                .package
+                .unwrap();
+            assert_eq!(package.readme, Some(expected), "readme = {value}");
+        }
     }
 
     #[test]
