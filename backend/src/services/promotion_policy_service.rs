@@ -192,6 +192,10 @@ pub struct PromotionGateContext {
 /// target, in which case the carry moves it (#5153). A decision scoped to the source
 /// and a promoter who could not make it says nothing about the target, so the finding
 /// is open for the gate. Lapsed and revoked decisions cover nothing.
+///
+/// A decision live in the target speaks for the target, as it does at the download
+/// gate, and the carry leaves it in place. So one whose ceiling is below this finding
+/// keeps the finding open, whatever a wider or a source decision would accept.
 macro_rules! gate_open_findings_cte {
     () => {
         r#"
@@ -212,9 +216,21 @@ macro_rules! gate_open_findings_cte {
                 AND fa.component_key = finding_component_key(sf.affected_component)
                 AND fa.component_version_key = finding_component_key(sf.affected_version)
                 AND finding_severity_rank(sf.severity) <= fa.max_severity_rank
-                AND (fa.repository_id IS NULL
-                     OR fa.repository_id = COALESCE($2::uuid, a.repository_id)
-                     OR ($3::boolean AND fa.repository_id = a.repository_id))
+                AND (fa.repository_id = COALESCE($2::uuid, a.repository_id)
+                     OR ((fa.repository_id IS NULL
+                          OR ($3::boolean AND fa.repository_id = a.repository_id))
+                         AND NOT EXISTS (
+                             SELECT 1 FROM finding_acknowledgements narrower
+                             WHERE narrower.repository_id = COALESCE($2::uuid, a.repository_id)
+                               AND narrower.checksum_sha256 = fa.checksum_sha256
+                               AND narrower.finding_class = fa.finding_class
+                               AND narrower.advisory_key = fa.advisory_key
+                               AND narrower.component_key = fa.component_key
+                               AND narrower.component_version_key = fa.component_version_key
+                               AND narrower.revoked_at IS NULL
+                               AND (narrower.expires_at IS NULL OR narrower.expires_at > NOW())
+                               AND finding_severity_rank(sf.severity) > narrower.max_severity_rank
+                         )))
           )
     )
 "#
@@ -1157,7 +1173,8 @@ mod tests {
 
         // Open findings: a decision counts only if it reaches the target (#5153).
         assert!(OPEN_FINDING_COUNTS_SQL.contains("FROM finding_acknowledgements fa"));
-        assert!(OPEN_FINDING_COUNTS_SQL.contains("$3::boolean AND fa.repository_id"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("($3::boolean AND fa.repository_id"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("narrower.max_severity_rank"));
         assert!(OPEN_FINDING_COUNTS_SQL.contains("status = 'completed'"));
     }
 

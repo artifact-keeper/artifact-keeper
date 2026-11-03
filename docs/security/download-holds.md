@@ -114,8 +114,8 @@ Who may decide: an instance administrator with an unrestricted credential, in an
 repository. A credential scoped to some repositories, only inside them. An
 administrator holding repository grants and no instance-wide role, only where they
 hold a grant, public repositories included. That last rule guards against deciding by
-mistake for a repository someone else looks after. It is not tenant isolation. REST and
-gRPC apply the same check.
+mistake for a repository someone else looks after. It is not tenant isolation. Every
+path that decides applies the same check.
 `GET /api/v1/security/acknowledgements` lists decisions for callers who may act
 everywhere, and `include_inactive=true` adds expired and revoked ones.
 
@@ -145,7 +145,9 @@ findings open for the target: a decision covers a finding there only if it is fo
 repository, is live in the target, or is live in the source and the promoter could
 acknowledge in the target, so the promotion carries it. A decision scoped to the source
 does not open a gate for a `promote:artifacts` token. An approval re-reads the policy and
-is refused if it now fails, unless the reviewer sets `skip_policy_check`. Every external
+is refused on the condition a promotion is, unless the reviewer sets `skip_policy_check`.
+A violation that only warns at promotion, such as `max_artifact_age_days`, does not refuse
+it. Every external
 scanner shares one scan type and a clean submission names no vendor, so external
 submissions never supersede each other: all of them are graded, and a finding a
 vendor stops reporting stays until it is acknowledged.

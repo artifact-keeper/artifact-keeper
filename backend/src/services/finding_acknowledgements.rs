@@ -1141,7 +1141,8 @@ impl FindingAcknowledgementService {
     ///   revoke on either side reaches both. Only when the principal could
     ///   acknowledge in the target: a `promote:artifacts` token cannot carry a
     ///   risk acceptance past a stricter target. What stays behind is audited, and
-    ///   the finding is then open there. A decision live on the target stays.
+    ///   the finding is then open there. A decision live on the target stays, and one
+    ///   that has lapsed there is replaced.
     ///
     /// A failure leaves the target with neither. A clean verdict inherits the 1-day
     /// limit dedup gives it, so one older than that is not carried: the answer says so.
@@ -1189,7 +1190,37 @@ impl FindingAcknowledgementService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        let mut superseded_in_target: Vec<FindingAcknowledgement> = Vec::new();
         let (carried, left_behind) = if principal.may_acknowledge {
+            // A lapsed decision still holds its place in the live-decision index,
+            // and decides nothing. A new decision replaces it, and so does this one.
+            let close_sql = format!(
+                "UPDATE finding_acknowledgements \
+                 SET revoked_at = NOW(), revoked_by = $3, revoked_reason = 'superseded' \
+                 WHERE id IN ( \
+                     SELECT old.id FROM finding_acknowledgements old \
+                     JOIN finding_acknowledgements incoming \
+                       ON incoming.checksum_sha256 = old.checksum_sha256 \
+                      AND incoming.finding_class = old.finding_class \
+                      AND incoming.advisory_key = old.advisory_key \
+                      AND incoming.component_key = old.component_key \
+                      AND incoming.component_version_key = old.component_version_key \
+                     WHERE old.repository_id = $2 AND old.revoked_at IS NULL \
+                       AND old.expires_at IS NOT NULL AND old.expires_at <= NOW() \
+                       AND incoming.repository_id = $1 AND incoming.revoked_at IS NULL \
+                       AND (incoming.expires_at IS NULL OR incoming.expires_at > NOW()) \
+                       AND incoming.checksum_sha256 = $4::bpchar \
+                 ) \
+                 RETURNING {ACKNOWLEDGEMENT_COLUMNS}"
+            );
+            superseded_in_target = sqlx::query_as(sqlx::AssertSqlSafe(close_sql))
+                .bind(source.repository_id)
+                .bind(target.repository_id)
+                .bind(principal.user_id)
+                .bind(&source.checksum_sha256)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
             let sql = format!(
                 "INSERT INTO finding_acknowledgements (\
                      lineage_id, repository_id, checksum_sha256, finding_class, advisory_key, \
@@ -1309,6 +1340,17 @@ impl FindingAcknowledgementService {
             "artifact_id": new_artifact_id,
             "target_repository_id": target.repository_id,
         });
+        for decision in &superseded_in_target {
+            audit_fire_and_forget(
+                self.db.clone(),
+                decision_audit_entry(
+                    AuditAction::FindingAcknowledgementRevoked,
+                    decision,
+                    Some(principal.user_id),
+                ),
+            )
+            .await;
+        }
         for (action, decisions) in [
             (AuditAction::FindingAcknowledgementCarried, &carried),
             (AuditAction::FindingAcknowledgementNotCarried, &left_behind),

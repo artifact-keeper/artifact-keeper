@@ -1955,7 +1955,7 @@ async fn a_scoped_credential_stays_inside_its_scope() {
 /// private repository.
 #[tokio::test]
 #[ignore]
-async fn a_tenant_admin_cannot_decide_for_another_tenant() {
+async fn a_grant_bound_admin_cannot_decide_outside_its_grants() {
     let mut fx = Fx::new().await;
     let repo = fx.repo().await;
     sqlx::query("UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1")
@@ -2475,6 +2475,7 @@ struct GateRig {
     source_repo: Uuid,
     target_repo: Uuid,
     artifact: Uuid,
+    target_artifact: Uuid,
     finding: Uuid,
 }
 
@@ -2485,7 +2486,7 @@ async fn gate_rig(fx: &mut Fx) -> GateRig {
     let target_repo = fx.repo().await;
     let d = digest();
     let artifact = fx.artifact(source_repo, "a.tgz", &d).await;
-    fx.artifact(target_repo, "held.tgz", &d).await;
+    let target_artifact = fx.artifact(target_repo, "held.tgz", &d).await;
     let scan = fx
         .scan(
             source_repo,
@@ -2515,8 +2516,24 @@ async fn gate_rig(fx: &mut Fx) -> GateRig {
         source_repo,
         target_repo,
         artifact,
+        target_artifact,
         finding,
     }
+}
+
+async fn decide_in(fx: &Fx, rig: &GateRig, repository_id: Uuid) {
+    fx.svc
+        .acknowledge_finding(
+            rig.finding,
+            &fx.actor(),
+            "decided",
+            AcknowledgeOptions {
+                repository_id: Some(repository_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("decide");
 }
 
 /// `(policy gate passes, rule gate passes)` for a promoter who can or cannot
@@ -2759,6 +2776,128 @@ async fn revoking_by_id_says_when_another_decision_still_covers_the_finding() {
     assert!(
         fx.allowed(repo, artifact).await,
         "and it does still cover it"
+    );
+    fx.cleanup().await;
+}
+
+/// A gate that passes on a source decision is promising the carry will move it. An
+/// expired row in the target must not stand in its way.
+#[tokio::test]
+#[ignore]
+async fn a_carry_replaces_an_expired_decision_in_the_target() {
+    let mut fx = Fx::new().await;
+    let rig = gate_rig(&mut fx).await;
+    decide_in(&fx, &rig, rig.source_repo).await;
+    decide_in(&fx, &rig, rig.target_repo).await;
+    sqlx::query(
+        "UPDATE finding_acknowledgements SET expires_at = NOW() - INTERVAL '1 hour' \
+         WHERE repository_id = $1",
+    )
+    .bind(rig.target_repo)
+    .execute(&fx.pool)
+    .await
+    .expect("lapse the target's decision");
+    assert_eq!(
+        gates(&fx, &rig, true).await,
+        (true, true),
+        "the gate passes"
+    );
+
+    FindingAcknowledgementService::new(fx.pool.clone())
+        .carry_to_promoted_artifact(rig.artifact, rig.target_artifact, fx.admin_principal())
+        .await
+        .expect("carry");
+
+    assert!(
+        fx.allowed(rig.target_repo, rig.target_artifact).await,
+        "and the decision the gate relied on arrived"
+    );
+    let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+        "SELECT revoked_reason, created_via FROM finding_acknowledgements \
+         WHERE repository_id = $1 ORDER BY created_at",
+    )
+    .bind(rig.target_repo)
+    .fetch_all(&fx.pool)
+    .await
+    .expect("rows");
+    assert_eq!(
+        rows,
+        vec![
+            (Some("superseded".to_string()), "api".to_string()),
+            (None, "promotion".to_string()),
+        ]
+    );
+    fx.cleanup().await;
+}
+
+/// The carry keeps a live decision in the target, so the gate must not rely on a
+/// higher ceiling that will never arrive there.
+#[tokio::test]
+#[ignore]
+async fn a_lower_ceiling_live_in_the_target_keeps_the_gate_shut() {
+    let mut fx = Fx::new().await;
+    let rig = gate_rig(&mut fx).await;
+    decide_in(&fx, &rig, rig.source_repo).await;
+    decide_in(&fx, &rig, rig.target_repo).await;
+    assert_eq!(
+        gates(&fx, &rig, false).await,
+        (true, true),
+        "the target's own"
+    );
+
+    let set_target_ceiling = |rank: i16, pool: PgPool, repo: Uuid| async move {
+        sqlx::query(
+            "UPDATE finding_acknowledgements SET max_severity_rank = $1 \
+             WHERE repository_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(rank)
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("ceiling");
+    };
+    set_target_ceiling(3, fx.pool.clone(), rig.target_repo).await;
+    assert_eq!(
+        gates(&fx, &rig, true).await,
+        (false, false),
+        "source decision"
+    );
+
+    // The narrower decision speaks in the target, as it does at the download gate.
+    fx.svc
+        .acknowledge_finding(
+            rig.finding,
+            &fx.actor(),
+            "everywhere",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("everywhere");
+    assert_eq!(
+        gates(&fx, &rig, false).await,
+        (false, false),
+        "every repository"
+    );
+    // The same finding scanned in the target: the download gate reads it the same way.
+    fx.scan(
+        rig.target_repo,
+        rig.target_artifact,
+        "dependency",
+        &[finding_from(
+            CVE_A,
+            LODASH,
+            "1",
+            "grype",
+            Severity::Critical,
+        )],
+    )
+    .await;
+    assert!(
+        !fx.allowed(rig.target_repo, rig.target_artifact).await,
+        "agrees"
     );
     fx.cleanup().await;
 }

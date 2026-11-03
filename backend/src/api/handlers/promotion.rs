@@ -5205,10 +5205,10 @@ mod tests {
             cleanup(&pool, &[src, tgt], user).await;
         }
 
-        /// #5153: public read access is not authority to decide. A tenant-bound
+        /// #5153: public read access is not authority to decide. A grant-bound
         /// admin carries nothing into another tenant's public repository.
         #[tokio::test]
-        async fn test_a_tenant_bound_admin_carries_nothing_into_a_public_target_5153() {
+        async fn test_a_grant_bound_admin_carries_nothing_into_a_public_target_5153() {
             let Some(pool) = tdh::try_pool().await else {
                 return;
             };
