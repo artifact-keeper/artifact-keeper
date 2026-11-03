@@ -363,7 +363,9 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    fn new(factory: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static) -> Self {
+    pub(super) fn new(
+        factory: impl Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
+    ) -> Self {
         Self {
             factory: Arc::new(factory),
         }
