@@ -6402,7 +6402,7 @@ SELECT r.id, r.key, r.storage_backend, r.storage_path, r.format::TEXT AS format,
         LIMIT 1) a ON true \
   LEFT JOIN proxy_cache_artifacts pc \
          ON r.repo_type = 'remote' AND pc.repository_id = r.id AND pc.path = $3 \
- WHERE r.key = $1";
+ WHERE r.key = $1 AND r.key NOT LIKE '~deleting~%'";
 
 /// Run [`PACKAGE_LOOKUP_SQL`]. A missing repository is 404 and a repository
 /// of another format 400, exactly as [`resolve_conda_repo`] answers; a

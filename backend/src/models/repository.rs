@@ -479,6 +479,24 @@ pub struct Repository {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Prefix of the key a repository is renamed to while its delete job runs.
+///
+/// `~` is not a legal character of a repository key
+/// (`validate_repository_key`), so no repository can be created under it.
+pub const DELETING_PREFIX: &str = "~deleting~";
+
+/// Whether `key` is the temporary key of a repository whose delete job is
+/// running.
+///
+/// Such a repository is being torn down: by-key resolution must treat it as
+/// absent on every surface (format routes, API handlers, search, auth
+/// visibility) so callers cannot keep reading or writing a repository whose
+/// rows are about to disappear. Internal delete machinery resolves by id, so
+/// it is unaffected.
+pub fn is_deleting_key(key: &str) -> bool {
+    key.starts_with(DELETING_PREFIX)
+}
+
 impl Repository {
     /// Build a `StorageLocation` from this repository's configured backend and path.
     pub fn storage_location(&self) -> crate::storage::StorageLocation {
@@ -503,6 +521,24 @@ pub struct VirtualRepoMember {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_deleting_key_matches_delete_prefix() {
+        assert!(is_deleting_key("~deleting~abc"));
+        assert!(is_deleting_key(&format!(
+            "{DELETING_PREFIX}{}",
+            uuid::Uuid::nil()
+        )));
+    }
+
+    #[test]
+    fn test_is_deleting_key_rejects_real_keys() {
+        assert!(!is_deleting_key("docker"));
+        assert!(!is_deleting_key("my-repo"));
+        assert!(!is_deleting_key("~deleting"));
+        assert!(!is_deleting_key("delete~deleting~abc"));
+        assert!(!is_deleting_key(""));
+    }
 
     #[test]
     fn test_repository_type_is_staging() {

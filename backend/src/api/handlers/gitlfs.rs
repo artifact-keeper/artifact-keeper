@@ -195,7 +195,7 @@ async fn resolve_lfs_repo(db: &PgPool, repo_key: &str) -> Result<RepoInfo, Respo
     use sqlx::Row;
     let repo = sqlx::query(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
-         repo_type::text as repo_type, upstream_url, promotion_only FROM repositories WHERE key = $1",
+         repo_type::text as repo_type, upstream_url, promotion_only FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
     )
     .bind(repo_key)
     .fetch_optional(db)
@@ -523,15 +523,19 @@ async fn upload_object(
     // stalled body, and the per-principal admission cap bounds how many of
     // these one caller can run at once. The stager enforces
     // `MAX_UPLOAD_SIZE` on the bytes received (413 mid-stream).
-    let (staged, digests) =
-        proxy_helpers::stage_stream_content_addressed(&state, body.into_data_stream()).await?;
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
 
     if staged.is_empty() {
         return Err(lfs_error_response(StatusCode::BAD_REQUEST, "Empty body"));
     }
 
     // Verify SHA-256 matches the OID
-    let computed_sha256 = digests.sha256;
+    let computed_sha256 = digests.sha256.clone();
 
     if computed_sha256 != oid {
         return Err(lfs_error_response(
@@ -567,30 +571,20 @@ async fn upload_object(
 
     let artifact_path = format!("lfs/objects/{}/{}", &oid[..2], oid);
     let size_bytes = staged.size_bytes();
-    super::publish_quota::preflight_publish_quota(
-        &state.db,
-        repo.id,
+
+    // Store the object, streaming it from local scratch or copying the object
+    // the repository's backend already staged (#4990). The helper runs the
+    // quota preflight and the cross-repo write guard before writing.
+    let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
         super::publish_quota::PublishAt::Path(&artifact_path),
-        size_bytes,
+        &storage_key,
+        staged,
+        &digests,
     )
     .await?;
-
-    // Store the object, streaming it from the scratch file.
-    let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    let staged_stream = proxy_helpers::open_staged_upload_stream(&staged).await?;
-    storage
-        .put_stream(&storage_key, staged_stream)
-        .await
-        .map_err(|e| {
-            lfs_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-        })?;
-    drop(staged);
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 

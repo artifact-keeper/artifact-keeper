@@ -6184,7 +6184,7 @@ async fn upload(
     let mut action: Option<String> = None;
     let mut pkg_name: Option<String> = None;
     let mut pkg_version: Option<String> = None;
-    let mut staged_content: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged_content: Option<super::repositories::GenericStagedBody> = None;
     let mut content_digests: Option<crate::services::artifact_service::ContentDigests> = None;
     let mut file_name: Option<String> = None;
     let mut sha256_digest: Option<String> = None;
@@ -6237,10 +6237,11 @@ async fn upload(
             }
             "content" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                // Spool the wheel straight to a bounded scratch file while
-                // computing SHA-256/SHA-1/MD5 incrementally — never buffered.
+                // Stage the wheel on the repository's backend when it streams
+                // natively, else in local scratch, computing SHA-256/SHA-1/MD5
+                // incrementally — never buffered (#4990).
                 let (s, d) =
-                    proxy_helpers::stage_upload_field_content_addressed(&state, field).await?;
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?;
                 staged_content = Some(s);
                 content_digests = Some(d);
             }
@@ -6373,11 +6374,18 @@ async fn upload(
     // The identity gate parses the archive's METADATA / PKG-INFO; keep what it
     // parsed so the stored `pkg_info` carries the distribution's classifiers
     // and URLs (#3783) without a second walk.
+    // The identity gate and the content analysis below both read the staged
+    // distribution as a local file. A locally staged body borrows its scratch
+    // file; a backend-staged body is materialized once and the temporary copy
+    // is removed when `staged_local` drops (#4990).
+    let staged_local =
+        super::repositories::materialize_staged_for_repo(&state, &repo, &staged_content).await?;
+    let staged_path = staged_local.path().to_path_buf();
     let extracted_pkg_info: Option<PkgInfo> = {
-        let staged_path = staged_content.path().to_path_buf();
         let expected_name = normalized.clone();
         let expected_version = pkg_version.clone();
         let dist_filename = filename.clone();
+        let staged_path = staged_path.clone();
         crate::util::bounded_archive::with_ingest_extraction_async(|| {
             tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&staged_path).map_err(|e| {
@@ -6402,10 +6410,10 @@ async fn upload(
     // #4033: read the distribution's own bytes for the two things its Python
     // metadata never names — native libraries a wheel-repair tool copied in,
     // and the `setup.py` an sdist install executes. Done here, while the
-    // staged scratch file still exists (it is consumed and dropped further
+    // staged local copy still exists (it is consumed and dropped further
     // down); the row it produces is written after the artifact is committed.
-    let content_analysis =
-        analyze_pypi_upload(staged_content.path().to_path_buf(), filename.clone()).await;
+    let content_analysis = analyze_pypi_upload(staged_path, filename.clone()).await;
+    drop(staged_local);
 
     // SHA-256 was computed incrementally while the body was spooled to disk.
     let computed_sha256 = digests.sha256.clone();
@@ -6470,28 +6478,31 @@ async fn upload(
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
     let artifact_service = state.create_artifact_service(storage);
-    // Re-read the staged scratch file as a `'static` stream; the service does the
-    // dedup `exists()` check first and only streams into storage on a miss.
-    let content_stream = proxy_helpers::open_staged_upload_stream(&staged_content).await?;
+    // Hand the service the staged body directly: local scratch is re-read as a
+    // `'static` stream, a backend-staged object is promoted server-side. The
+    // service does the dedup `exists()` check first and only moves bytes on a
+    // miss.
+    let content = staged_content.upload_content().await?;
     let artifact = artifact_service
-        .upload_stream_with_sync_options(
+        .upload_content_with_sync_options(
             repo.id,
             &artifact_path,
             &normalized,
             Some(&pkg_version),
             content_type,
-            content_stream,
+            content,
             digests,
             size_bytes,
             Some(user_id),
             // #4889: queue after the metadata write below, not before it.
             false,
             None,
+            None,
         )
         .await
         .map_err(|e| e.into_response())?;
-    // Scratch file no longer needed once the service has consumed the stream.
-    drop(staged_content);
+    // The staging copy is no longer needed once the service has consumed it.
+    staged_content.discard().await;
 
     artifact_service
         .set_metadata(artifact.id, "pypi", pkg_metadata, serde_json::json!({}))

@@ -397,10 +397,14 @@ async fn upload_cookbook(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Spool the tarball straight to a bounded scratch file instead of buffering
-    // the whole body in memory; the small `cookbook` JSON field is still read
-    // in-hand. See proxy_helpers::stage_upload_field / put_artifact_stream.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    // Stage the tarball on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole body in
+    // memory; the small `cookbook` JSON field is still read in-hand. See
+    // repositories::stage_upload_field_for_repo.
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     let mut cookbook_json: Option<serde_json::Value> = None;
 
     while let Some(field) = multipart
@@ -411,7 +415,9 @@ async fn upload_cookbook(
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "tarball" => {
-                staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+                staged = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                );
             }
             "cookbook" => {
                 // Small JSON metadata field (not the artifact body): read as
@@ -435,7 +441,7 @@ async fn upload_cookbook(
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing tarball field").into_response())?;
 
     if staged.is_empty() {
@@ -501,10 +507,18 @@ async fn upload_cookbook(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash).
+    // Stream the staged tarball into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     // Captured before `cookbook_json` is moved into the metadata JSON below.

@@ -10074,6 +10074,23 @@ impl StagedWrite {
     }
 }
 
+/// A local file view of a staged body for a parser that seeks. A locally
+/// staged body borrows its scratch file; a backend-staged body owns the
+/// temporary copy downloaded for the parse (#4990).
+pub(crate) enum LocalStagedBody<'a> {
+    Borrowed(&'a std::path::Path),
+    Temporary(tempfile::NamedTempFile),
+}
+
+impl LocalStagedBody<'_> {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Borrowed(path) => path,
+            Self::Temporary(temp) => temp.path(),
+        }
+    }
+}
+
 /// Whether a single upload into `repo` stages its body on the repository's
 /// own backend instead of local scratch (#3916): the backend must stream
 /// natively (`StorageBackend::supports_streamed_assembly`, S3, GCS and Azure
@@ -10087,6 +10104,30 @@ pub(crate) fn stages_on_backend(
 }
 
 impl GenericStagedBody {
+    /// Stage a format-native single-PUT body for `repo`: on the repository's
+    /// own backend when it streams natively, else in local scratch (#4990).
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn stage_for_repo<S, E>(
+        state: &SharedState,
+        repo: &proxy_helpers::RepoInfo,
+        stream: S,
+    ) -> std::result::Result<(Self, crate::services::artifact_service::ContentDigests), Response>
+    where
+        S: futures::Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+        E: std::error::Error + 'static,
+    {
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(|e| e.into_response())?;
+        Self::stage(
+            state,
+            &repo.storage_location(),
+            stages_on_backend(&repo.storage_backend, storage.as_ref()),
+            stream,
+        )
+        .await
+    }
+
     /// Stage `stream` on the repository's backend at `location` when
     /// `on_backend`, else in local scratch, computing SHA-256 / SHA-1 / MD5 in
     /// the same pass either way.
@@ -10147,6 +10188,56 @@ impl GenericStagedBody {
         }
     }
 
+    /// Whether the staged body is empty (a zero-byte upload).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.size_bytes() == 0
+    }
+
+    /// A local file holding the staged bytes, for a parser that seeks (a ZIP
+    /// reader). A locally staged body borrows its scratch file; a
+    /// backend-staged body is downloaded once and the temporary copy is
+    /// removed when the returned guard drops. Staging itself stays on the
+    /// repository's backend (#4990); only the parse needs the local copy.
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn materialize(
+        &self,
+        storage: &dyn crate::storage::StorageBackend,
+        temp_dir: Option<&std::path::Path>,
+    ) -> std::result::Result<LocalStagedBody<'_>, Response> {
+        use tokio::io::AsyncWriteExt;
+        match self {
+            Self::Local(staged) => Ok(LocalStagedBody::Borrowed(staged.path())),
+            Self::Backend(staged) => {
+                let mut builder = tempfile::Builder::new();
+                builder.prefix(super::incus::STAGED_PARSE_FILE_PREFIX);
+                let temp = match temp_dir {
+                    Some(dir) => builder.tempfile_in(dir),
+                    None => builder.tempfile(),
+                }
+                .map_err(|e| proxy_helpers::spool_error("Staging file", &e))?;
+                let file = temp
+                    .reopen()
+                    .map_err(|e| proxy_helpers::spool_error("Staging file", &e))?;
+                let mut file = tokio::fs::File::from_std(file);
+                let mut stream = storage
+                    .get_stream(staged.key())
+                    .await
+                    .map_err(|e| e.into_response())?;
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    let chunk = chunk.map_err(|e| e.into_response())?;
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| proxy_helpers::spool_error("Staging write", &e))?;
+                }
+                file.flush()
+                    .await
+                    .map_err(|e| proxy_helpers::spool_error("Staging flush", &e))?;
+                drop(file);
+                Ok(LocalStagedBody::Temporary(temp))
+            }
+        }
+    }
+
     /// The staged body as a local file, for the consumers that read one (RPM
     /// header parse, WASM plugins). [`GenericStagingPlan`] keeps those uploads
     /// on local scratch, so a backend-staged body never gets here; it reads as
@@ -10161,7 +10252,7 @@ impl GenericStagedBody {
     }
 
     #[allow(clippy::result_large_err)]
-    async fn upload_content(
+    pub(crate) async fn upload_content(
         &self,
     ) -> std::result::Result<crate::services::artifact_service::UploadContent, Response> {
         use crate::services::artifact_service::UploadContent;
@@ -10289,6 +10380,51 @@ async fn stage_multipart_field(
     );
     let (staged, digests) = staged?;
     Ok((GenericStagedBody::Backend(staged), digests))
+}
+
+/// Stage one multipart file field of a format-native single-PUT route on the
+/// repository's backend when it streams natively, else in local scratch
+/// (#4990).
+#[allow(clippy::result_large_err)]
+pub(crate) async fn stage_upload_field_for_repo(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    field: axum::extract::multipart::Field<'_>,
+) -> std::result::Result<
+    (
+        GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    ),
+    Response,
+> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let location =
+        stages_on_backend(&repo.storage_backend, storage.as_ref()).then(|| repo.storage_location());
+    stage_multipart_field(state, location.as_ref(), field).await
+}
+
+/// A local file view of a format-native staged body, for a parser that seeks
+/// or reads by offset (a zip reader, the RPM header). A locally staged body
+/// borrows its scratch file; a backend-staged body is downloaded once to the
+/// shared upload staging volume and removed when the returned guard drops
+/// (#4990). Staging itself stays on the repository's backend; only the parse
+/// needs a local copy.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn materialize_staged_for_repo<'a>(
+    state: &SharedState,
+    repo: &proxy_helpers::RepoInfo,
+    staged: &'a GenericStagedBody,
+) -> std::result::Result<LocalStagedBody<'a>, Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let dir = super::incus::staging_root(&state.config.storage_path);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| proxy_helpers::spool_error("Staging directory", &e))?;
+    staged.materialize(storage.as_ref(), Some(&dir)).await
 }
 
 /// Authorize a generic artifact write: resolve the repository and enforce the
@@ -38735,5 +38871,53 @@ mod conditional_put_and_serve_verification_tests {
             .is_ok(),
             "a coded body is not the advertised digest's bytes"
         );
+    }
+
+    /// #5002: a single-PUT format route stages on the repository's own backend
+    /// only when the backend is not filesystem and advertises native streaming.
+    /// Every other combination keeps the local spool, so an S3 repo with a
+    /// test double that buffers still never gets a backend-staged body.
+    #[test]
+    fn object_backends_with_native_streaming_stage_on_the_backend() {
+        struct MockBackend {
+            streams: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::storage::StorageBackend for MockBackend {
+            async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                _key: &str,
+                _stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+            ) -> crate::error::Result<crate::storage::PutStreamResult> {
+                Ok(crate::storage::PutStreamResult {
+                    checksum_sha256: String::new(),
+                    bytes_written: 0,
+                })
+            }
+            fn supports_streamed_assembly(&self) -> bool {
+                self.streams
+            }
+        }
+
+        let streaming = MockBackend { streams: true };
+        let buffering = MockBackend { streams: false };
+        assert!(super::stages_on_backend("s3", &streaming));
+        assert!(super::stages_on_backend("gcs", &streaming));
+        assert!(super::stages_on_backend("azure", &streaming));
+        assert!(!super::stages_on_backend("filesystem", &streaming));
+        assert!(!super::stages_on_backend("s3", &buffering));
     }
 }

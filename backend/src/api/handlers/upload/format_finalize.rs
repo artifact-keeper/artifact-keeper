@@ -121,6 +121,138 @@ pub(crate) struct StagedRpm {
     scripts: crate::api::handlers::rpm::ExtractedScripts,
 }
 
+/// The `artifact_metadata` document a native finalize records, ready to write
+/// inside the artifact-row transaction (#5002).
+pub(crate) struct NativeMetadata {
+    pub format: &'static str,
+    pub metadata: serde_json::Value,
+    pub properties: serde_json::Value,
+}
+
+/// The `artifact_metadata` row a native finalize writes, derived from the
+/// staged parse.
+///
+/// The completion writes this in the same transaction as the `artifacts` row,
+/// so a failure after the row commits cannot leave an indexed artifact without
+/// its format metadata. Everything else the native route does (catalog rows,
+/// script analysis, cache invalidation, the Debian/RPM extra tables) stays in
+/// [`record`] after the commit.
+pub(crate) fn metadata_document(
+    staged: &StagedNativeFinalize,
+    _target: &NativeTarget,
+    session: &UploadSession,
+    rpm_metadata: Option<&serde_json::Value>,
+) -> Result<Option<NativeMetadata>, String> {
+    let document = match staged {
+        StagedNativeFinalize::Incus(metadata) => NativeMetadata {
+            format: "incus",
+            metadata: metadata.clone(),
+            properties: serde_json::json!({}),
+        },
+        StagedNativeFinalize::Debian(package) => NativeMetadata {
+            format: "debian",
+            metadata: package.control_document().clone(),
+            properties: serde_json::json!({}),
+        },
+        StagedNativeFinalize::Maven(maven) => NativeMetadata {
+            format: "maven",
+            metadata: maven.metadata.clone(),
+            properties: serde_json::json!({}),
+        },
+        StagedNativeFinalize::Npm(npm) => NativeMetadata {
+            format: "npm",
+            metadata: serde_json::json!({
+                "name": npm.package_name,
+                "version": npm.version,
+                "version_data": npm.version_data,
+            }),
+            properties: serde_json::json!({}),
+        },
+        StagedNativeFinalize::Pypi(pypi) => NativeMetadata {
+            format: "pypi",
+            metadata: pypi.metadata.clone(),
+            properties: serde_json::json!({}),
+        },
+        StagedNativeFinalize::Rpm(_) => {
+            // The header parse normally supplies the document; when it did not
+            // parse, the native route falls back to the NEVRA in the file
+            // name, and so does this completion.
+            let metadata = match rpm_metadata {
+                Some(metadata) => metadata.clone(),
+                None => {
+                    let filename = basename(&session.artifact_path);
+                    let (name, version, release, arch) =
+                        crate::api::handlers::rpm::parse_rpm_filename(filename)
+                            .ok_or_else(|| "not an RPM package file name".to_string())?;
+                    crate::api::handlers::rpm::build_rpm_metadata(
+                        &name, &version, &release, &arch, filename,
+                    )
+                }
+            };
+            NativeMetadata {
+                format: "rpm",
+                metadata,
+                properties: serde_json::json!({}),
+            }
+        }
+    };
+    Ok(Some(document))
+}
+
+/// Whether `format` has a dedicated finalize above. A format that does keeps
+/// the generic behaviour for a path [`native_target`] declined (a Maven
+/// checksum sidecar); the generic dispatch below is only for formats with no
+/// native finalize at all.
+pub(crate) fn has_native_finalize(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Incus
+            | RepositoryFormat::Lxc
+            | RepositoryFormat::Debian
+            | RepositoryFormat::Maven
+            | RepositoryFormat::Gradle
+            | RepositoryFormat::Npm
+            | RepositoryFormat::Pypi
+            | RepositoryFormat::Rpm
+    )
+}
+
+/// The `artifact_metadata` document a format handler derives from the upload
+/// path alone, for the formats with no native finalize above (#5002).
+///
+/// Most handlers index a chunked upload from its path (a Terraform provider's
+/// platform, a Helm chart's name and version, a Chef cookbook's coordinates);
+/// this runs the same `parse_metadata` the native route's handler exposes, with
+/// an empty body. A path the handler does not recognise, or a generic handler
+/// whose document is just the path, yields `None` and the upload keeps the
+/// generic behaviour. The document is written inside the artifact transaction
+/// by the completion, like the native ones.
+pub(crate) async fn generic_metadata_document(
+    format: &RepositoryFormat,
+    artifact_path: &str,
+) -> Option<NativeMetadata> {
+    let format_key = format.handler_key();
+    if format_key == "generic" || has_native_finalize(format) {
+        return None;
+    }
+    let handler = crate::formats::get_handler_for_format(format);
+    let metadata = crate::formats::FormatHandler::parse_metadata(
+        handler.as_ref(),
+        artifact_path,
+        &Bytes::new(),
+    )
+    .await
+    .ok()?;
+    if metadata.as_object().is_some_and(|object| object.is_empty()) {
+        return None;
+    }
+    Some(NativeMetadata {
+        format: format_key,
+        metadata,
+        properties: serde_json::json!({}),
+    })
+}
+
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
@@ -574,12 +706,14 @@ async fn stage_pypi(
     })
 }
 
-/// Record a natively finalized chunked upload's format records against its
-/// committed artifact row. `rpm_metadata` is the header metadata the
-/// completion's RPM parse produced (RPM only).
+/// Record a natively finalized chunked upload's non-metadata format records
+/// against its committed artifact row: catalog entries, script analysis and
+/// cache invalidation. The `artifact_metadata` document itself is written by
+/// the completion inside the artifact-row transaction (#5002).
+/// `rpm_metadata` is the header metadata the completion's RPM parse produced
+/// (RPM only).
 pub(crate) async fn record(
     state: &SharedState,
-    artifact_service: &crate::services::artifact_service::ArtifactService,
     session: &UploadSession,
     artifact_id: Uuid,
     target: &NativeTarget,
@@ -588,9 +722,7 @@ pub(crate) async fn record(
 ) -> Result<(), String> {
     let catalog = PackageService::new(state.db.clone());
     match staged {
-        StagedNativeFinalize::Incus(metadata) => {
-            crate::api::handlers::incus::store_image_metadata(&state.db, artifact_id, &metadata)
-                .await?;
+        StagedNativeFinalize::Incus(_) => {
             catalog
                 .try_create_or_update_from_artifact(
                     session.repository_id,
@@ -606,9 +738,8 @@ pub(crate) async fn record(
         }
         StagedNativeFinalize::Debian(package) => {
             let (upload, deb_head) = package.parts();
-            crate::api::handlers::debian::record_debian_package(
-                state,
-                artifact_service,
+            crate::api::handlers::debian::record_debian_package_extras(
+                &state.db,
                 session.repository_id,
                 artifact_id,
                 session.total_size,
@@ -616,21 +747,17 @@ pub(crate) async fn record(
                 upload,
                 deb_head,
             )
-            .await
-            .map_err(|e| e.to_string())
+            .await;
+            Ok(())
         }
         StagedNativeFinalize::Maven(maven) => {
             let StagedMaven {
                 coords,
-                metadata,
+                metadata: _,
                 package_name,
                 package_description,
                 package_metadata,
             } = *maven;
-            artifact_service
-                .set_metadata(artifact_id, "maven", metadata, serde_json::json!({}))
-                .await
-                .map_err(|e| e.to_string())?;
             catalog
                 .try_create_or_update_from_artifact(
                     session.repository_id,
@@ -671,19 +798,6 @@ pub(crate) async fn record(
                 version,
                 version_data,
             } = *npm;
-            artifact_service
-                .set_metadata(
-                    artifact_id,
-                    "npm",
-                    serde_json::json!({
-                        "name": package_name,
-                        "version": version,
-                        "version_data": version_data,
-                    }),
-                    serde_json::json!({}),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
             crate::api::handlers::npm::record_npm_install_script_analysis(
                 state,
                 artifact_id,
@@ -716,15 +830,11 @@ pub(crate) async fn record(
         }
         StagedNativeFinalize::Pypi(pypi) => {
             let StagedPypi {
-                metadata,
+                metadata: _,
                 summary,
                 catalog: catalog_metadata,
                 analysis,
             } = *pypi;
-            artifact_service
-                .set_metadata(artifact_id, "pypi", metadata, serde_json::json!({}))
-                .await
-                .map_err(|e| e.to_string())?;
             crate::api::handlers::pypi::record_pypi_package_analysis(state, artifact_id, analysis)
                 .await;
             catalog
@@ -744,32 +854,9 @@ pub(crate) async fn record(
             let StagedRpm {
                 scripts: (scripts, unanalyzed, completeness),
             } = *rpm;
-            // The header metadata (or, when the header did not parse, the
-            // filename-derived NEVRA the native route falls back to).
-            let fallback;
-            let metadata = match rpm_metadata {
-                Some(metadata) => metadata,
-                None => {
-                    let filename = basename(&session.artifact_path);
-                    let (name, version, release, arch) =
-                        crate::api::handlers::rpm::parse_rpm_filename(filename)
-                            .ok_or_else(|| "not an RPM package file name".to_string())?;
-                    fallback = crate::api::handlers::rpm::build_rpm_metadata(
-                        &name, &version, &release, &arch, filename,
-                    );
-                    if let Err(e) = crate::api::handlers::rpm::record_rpm_metadata(
-                        &state.db,
-                        artifact_id,
-                        session.repository_id,
-                        &fallback,
-                    )
-                    .await
-                    {
-                        tracing::warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
-                    }
-                    &fallback
-                }
-            };
+            // The header document (or the filename-derived fallback) is
+            // written in the artifact transaction by the completion; only the
+            // scriptlet analysis and catalog entry remain here.
             if let Err(e) = crate::services::package_analysis_service::record_install_scripts(
                 &state.db,
                 artifact_id,
@@ -782,8 +869,8 @@ pub(crate) async fn record(
             {
                 tracing::warn!(artifact_id = %artifact_id, error = %e, "rpm scriptlet analysis could not be recorded");
             }
-            let description = metadata
-                .get("summary")
+            let description = rpm_metadata
+                .and_then(|metadata| metadata.get("summary"))
                 .and_then(|v| v.as_str())
                 .filter(|d| !d.is_empty());
             catalog
@@ -828,6 +915,42 @@ mod tests {
         }
         gz.flush().unwrap();
         gz.finish().unwrap()
+    }
+
+    /// #5002: a format without a native finalize still dispatches its handler
+    /// on chunked completion, deriving the document from the upload path. The
+    /// native formats keep their own parsers (and their path-declined cases
+    /// stay generic).
+    #[tokio::test]
+    async fn generic_metadata_document_dispatches_non_native_formats() {
+        let document = generic_metadata_document(
+            &RepositoryFormat::Terraform,
+            "hashicorp/aws/5.0.0/download/linux/amd64",
+        )
+        .await
+        .expect("Terraform provider path must dispatch");
+        assert_eq!(document.format, "terraform");
+        assert_eq!(document.metadata["namespace"], "hashicorp");
+        assert_eq!(document.metadata["name"], "aws");
+        assert_eq!(document.metadata["version"], "5.0.0");
+        assert_eq!(document.metadata["os"], "linux");
+        assert_eq!(document.metadata["arch"], "amd64");
+
+        // A format with a native finalize never takes the generic path, even
+        // when its own parser declines this particular path.
+        assert!(has_native_finalize(&RepositoryFormat::Maven));
+        assert!(generic_metadata_document(
+            &RepositoryFormat::Maven,
+            "com/example/1.0/a.jar.sha256"
+        )
+        .await
+        .is_none());
+        // The generic handler's document is just the path, so it adds nothing.
+        assert!(
+            generic_metadata_document(&RepositoryFormat::Generic, "a/b.bin")
+                .await
+                .is_none()
+        );
     }
 
     fn npm_tgz(name: &str, version: &str) -> Vec<u8> {

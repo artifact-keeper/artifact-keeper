@@ -2967,6 +2967,34 @@ impl ArtifactService {
         metadata: serde_json::Value,
         properties: serde_json::Value,
     ) -> Result<ArtifactMetadata> {
+        Self::upsert_metadata(&self.db, artifact_id, format, metadata, properties).await
+    }
+
+    /// [`Self::set_metadata`] inside a caller-owned transaction (#5002).
+    ///
+    /// A chunked completion writes the artifact row and its format metadata in
+    /// one transaction, so a crash between the two cannot leave an indexed row
+    /// without metadata (the native Maven and npm routes already do this).
+    pub async fn set_metadata_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        artifact_id: Uuid,
+        format: &str,
+        metadata: serde_json::Value,
+        properties: serde_json::Value,
+    ) -> Result<ArtifactMetadata> {
+        Self::upsert_metadata(&mut **tx, artifact_id, format, metadata, properties).await
+    }
+
+    async fn upsert_metadata<'e, E>(
+        executor: E,
+        artifact_id: Uuid,
+        format: &str,
+        metadata: serde_json::Value,
+        properties: serde_json::Value,
+    ) -> Result<ArtifactMetadata>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let metadata = sanitize_metadata_urls(metadata);
         let meta = sqlx::query_as!(
             ArtifactMetadata,
@@ -2984,7 +3012,7 @@ impl ArtifactService {
             metadata,
             properties
         )
-        .fetch_one(&self.db)
+        .fetch_one(executor)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 

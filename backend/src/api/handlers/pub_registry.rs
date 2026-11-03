@@ -677,20 +677,25 @@ async fn upload_package(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Spool the tar.gz straight to a bounded scratch file instead of buffering
-    // the whole archive in memory. See proxy_helpers::stage_upload_field.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    // Stage the tar.gz on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole archive in
+    // memory. See repositories::stage_upload_field_for_repo.
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
-            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+            staged =
+                Some(super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?);
             break;
         }
     }
 
-    let staged = staged.ok_or_else(|| {
+    let (staged, digests) = staged.ok_or_else(|| {
         pub_error_response(
             StatusCode::BAD_REQUEST,
             "BAD_REQUEST",
@@ -706,21 +711,25 @@ async fn upload_package(
         ));
     }
 
-    // Extract pubspec.yaml from the staged archive on disk, decoding the gzip
-    // stream incrementally so we never hold the whole archive in memory.
+    // Extract pubspec.yaml from the staged archive, decoding the gzip stream
+    // incrementally so we never hold the whole archive in memory.
     // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
-    let pubspec = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        extract_pubspec_from_staged(staged.path())
-    })
-    .await
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid Pub package: {}", e),
-        )
-            .into_response()
-    })?;
+    let pubspec = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            extract_pubspec_from_staged(local.path())
+        })
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid Pub package: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     let pkg_name = &pubspec.name;
     let pkg_version = &pubspec.version;
@@ -756,10 +765,18 @@ async fn upload_package(
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
-    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash).
+    // Stream the staged archive into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("pub/{}/{}/{}", pkg_name, pkg_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     // Build metadata JSON
