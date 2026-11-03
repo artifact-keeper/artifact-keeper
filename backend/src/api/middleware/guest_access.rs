@@ -304,6 +304,7 @@ fn defers_to_package_route(path: &str) -> bool {
         "/hex",
         "/huggingface",
         "/jetbrains",
+        "/agentplugins",
         "/chef",
         "/puppet",
         "/ansible",

@@ -25164,6 +25164,8 @@ mod scan_on_upload_coverage_tests {
         ("rubygems.rs", "push_gem"),
         ("rpm.rs", "store_rpm"),
         ("huggingface.rs", "upload_file_impl"),
+        // #5251: the Agent Plugins publish inserts through `insert_artifact`.
+        ("agent_plugins.rs", "publish_plugin"),
     ];
 
     /// Every handler source, read from disk so a NEW handler file is covered
@@ -25461,6 +25463,7 @@ mod scan_on_upload_coverage_tests {
     /// exempted by a marker), so a rename or a matcher regression fails
     /// loudly instead of silently dropping a handler out of the gate.
     const ISSUE_4422_PUBLISH_HANDLERS: &[(&str, &str)] = &[
+        ("agent_plugins.rs", "publish_plugin"),
         ("alpine.rs", "store_apk"),
         ("ansible.rs", "upload_collection"),
         ("bazel.rs", "put_file"),

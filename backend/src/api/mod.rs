@@ -685,6 +685,12 @@ pub fn redact_token_path_segment(path: &str) -> std::borrow::Cow<'_, str> {
     let lead = &path[..path.len() - trimmed.len()];
     let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("t/") {
         ("t/", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("agentplugins/t/") {
+        // #5251: only a real token route (token, repository, document).
+        if crate::api::middleware::auth::agentplugins_url_token(trimmed).is_none() {
+            return Cow::Borrowed(path);
+        }
+        ("agentplugins/t/", rest)
     } else if let Some(rest) = trimmed.strip_prefix("conda/t/") {
         // A token channel needs a path after the token; without one the
         // segment is a route under a repository named `t`.
@@ -1146,6 +1152,16 @@ mod tests {
 
     #[test]
     fn test_redact_token_path_extra_leading_slashes() {
+        let result = redact_sensitive_params(
+            "/agentplugins/t/ak_secret123/plugins/claude-marketplace.json",
+            None,
+        );
+        assert_eq!(
+            result,
+            "/agentplugins/t/[REDACTED]/plugins/claude-marketplace.json"
+        );
+        let result = redact_sensitive_params("/agentplugins/t/marketplace.json", None);
+        assert_eq!(result, "/agentplugins/t/marketplace.json");
         let result = redact_sensitive_params("//conda/t/ak_secret123/my-repo/", None);
         assert_eq!(result, "//conda/t/[REDACTED]/my-repo/");
     }

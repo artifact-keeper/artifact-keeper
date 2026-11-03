@@ -3913,6 +3913,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "gitlfs" => Ok(RepositoryFormat::Gitlfs),
         "vscode" => Ok(RepositoryFormat::Vscode),
         "jetbrains" => Ok(RepositoryFormat::Jetbrains),
+        "agentplugins" => Ok(RepositoryFormat::AgentPlugins),
         "huggingface" => Ok(RepositoryFormat::Huggingface),
         "mlmodel" => Ok(RepositoryFormat::Mlmodel),
         "cran" => Ok(RepositoryFormat::Cran),
@@ -3948,6 +3949,38 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
             s
         ))),
     }
+}
+
+/// Refuse a repository type a format cannot serve.
+///
+/// Agent Plugins repositories (#5251) are hosted only: there is no upstream
+/// marketplace protocol to proxy and no merge rule for virtual members yet
+/// (D3 of the design). The key `t` is also refused for this format, because
+/// `/agentplugins/t/{token}/{repo}/...` is the token-in-path route (D8) and a
+/// repository named `t` would be ambiguous with it.
+fn validate_format_supports_repo_type(
+    format: &RepositoryFormat,
+    repo_type: &RepositoryType,
+    key: &str,
+) -> Result<()> {
+    if *format != RepositoryFormat::AgentPlugins {
+        return Ok(());
+    }
+    if !repo_type.is_hosted() {
+        return Err(AppError::Validation(format!(
+            "Agent Plugins repositories are hosted-only: repo_type {} is not supported \
+             (use local)",
+            repo_type.as_str()
+        )));
+    }
+    if key == "t" {
+        return Err(AppError::Validation(
+            "The key \"t\" is reserved for Agent Plugins repositories: \
+             /agentplugins/t/{token}/... is the token-in-path route"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// List repositories
@@ -4208,6 +4241,7 @@ pub async fn create_repository(
     let service = state.create_repository_service();
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
+    validate_format_supports_repo_type(&format, &repo_type, &payload.key)?;
     let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
     // Computed before `format` is moved into the create request below.
     let is_hex_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Hex);
@@ -17077,10 +17111,35 @@ mod tests {
             "bazel",
             "protobuf",
             "pacman",
+            "agentplugins",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
         }
+    }
+
+    #[test]
+    fn agent_plugins_repositories_are_hosted_only_5251() {
+        let ap = RepositoryFormat::AgentPlugins;
+        for ok in [RepositoryType::Local, RepositoryType::Staging] {
+            assert!(validate_format_supports_repo_type(&ap, &ok, "plugins").is_ok());
+        }
+        for bad in [RepositoryType::Remote, RepositoryType::Virtual] {
+            let err = validate_format_supports_repo_type(&ap, &bad, "plugins")
+                .expect_err("non-hosted agentplugins must be refused");
+            match err {
+                AppError::Validation(msg) => assert!(msg.contains("hosted-only"), "{msg}"),
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        }
+        assert!(validate_format_supports_repo_type(&ap, &RepositoryType::Local, "t").is_err());
+        // Other formats are untouched.
+        assert!(validate_format_supports_repo_type(
+            &RepositoryFormat::Jetbrains,
+            &RepositoryType::Remote,
+            "t"
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------
