@@ -30,6 +30,7 @@ use crate::formats::mcp::{
     self as fmt, BackingGate, GateAudience, GateOutcome, HoldKind, McpError, PackagePin,
     PackagePolicy, RegistryState, ServeDecision, ServerStatus, StoredVersion, VersionState,
 };
+use crate::services::mcp_curation;
 use crate::services::mcp_packages::{self, GateCtx};
 
 pub const MOUNT_PREFIX: &str = "/mcp";
@@ -308,16 +309,17 @@ async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> 
     }
 }
 
-/// Remote and Virtual MCP repositories are refused at creation in this
-/// release; a row that exists anyway answers 501 rather than empty results.
+/// Hosted and Remote MCP repositories serve their stored rows (a Remote's
+/// are the upstream entries its sync ingested). A Virtual repository answers
+/// 501 until its read path lands.
 fn reject_if_not_hosted_read(repo: &RepoInfo) -> Result<(), Response> {
-    if matches!(repo.repo_type.as_str(), "local" | "staging") {
+    if matches!(repo.repo_type.as_str(), "local" | "staging" | "remote") {
         return Ok(());
     }
     Err(problem(
         501,
         "mcp_not_implemented",
-        "Remote and virtual MCP registries are not available in this release",
+        "Virtual MCP registries are not available in this release",
         serde_json::json!({}),
     ))
 }
@@ -344,8 +346,9 @@ async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> G
 
 /// One stored server version row.
 #[derive(Debug, Clone)]
-struct VersionRow {
+pub(crate) struct VersionRow {
     artifact_id: Uuid,
+    repository_id: Uuid,
     name: String,
     version: String,
     checksum: String,
@@ -355,6 +358,7 @@ struct VersionRow {
 }
 
 type RawRow = (
+    Uuid,
     Uuid,
     String,
     String,
@@ -366,13 +370,14 @@ type RawRow = (
 
 fn rows_from_raw(raw: Vec<RawRow>) -> Vec<VersionRow> {
     raw.into_iter()
-        .filter_map(|(artifact_id, name, version, checksum, qs, qu, meta)| {
+        .filter_map(|(artifact_id, repository_id, name, version, checksum, qs, qu, meta)| {
             let stored = StoredVersion::from_metadata(&meta);
             if stored.is_none() {
                 tracing::warn!(artifact_id = %artifact_id, "MCP server version has no readable metadata; skipped");
             }
             Some(VersionRow {
                 artifact_id,
+                repository_id,
                 name,
                 version,
                 checksum,
@@ -384,7 +389,7 @@ fn rows_from_raw(raw: Vec<RawRow>) -> Vec<VersionRow> {
         .collect()
 }
 
-const ROW_COLUMNS: &str = "a.id, a.name, a.version, a.checksum_sha256, a.quarantine_status, \
+const ROW_COLUMNS: &str = "a.id, a.repository_id, a.name, a.version, a.checksum_sha256, a.quarantine_status, \
      a.quarantine_until, m.metadata";
 
 /// Every live version of `name` in `repo_id`, text-ordered by version.
@@ -430,9 +435,25 @@ fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String
     )
 }
 
-/// Decide one row for `audience`, evaluating the version's own hold and every
-/// backing gate.
-async fn decide_row(
+/// The version's repository-level hold (deny list, Remote curation, server
+/// age gate), `Err` when it cannot be evaluated.
+async fn repo_hold(ctx: GateCtx<'_>, row: &VersionRow) -> Result<Option<HoldKind>, ()> {
+    let policy = mcp_curation::load_serve_policy(ctx.db, row.repository_id).await?;
+    let holds = mcp_curation::repo_holds(
+        ctx,
+        &policy,
+        row.repository_id,
+        &[(row.artifact_id, &row.name, &row.version)],
+    )
+    .await?;
+    Ok(holds.get(&row.artifact_id).copied())
+}
+
+/// Decide one row for `audience`, evaluating the version's own hold (the
+/// server.json artifact's, then the repository-level one) and every backing
+/// gate. The one per-row serve decision of the MCP surface; a Virtual
+/// repository decides each member's rows with it.
+pub(crate) async fn decide_row(
     ctx: GateCtx<'_>,
     row: &VersionRow,
     policy_now: PackagePolicy,
@@ -450,6 +471,16 @@ async fn decide_row(
             });
             None
         }
+    };
+    let own = match own {
+        Some(h) => Some(h),
+        None => repo_hold(ctx, row).await.unwrap_or_else(|()| {
+            gates.push(BackingGate {
+                package: "curation".into(),
+                outcome: GateOutcome::Unavailable,
+            });
+            None
+        }),
     };
     gates.extend(mcp_packages::backing_gates(ctx, &row.stored, policy_now).await);
     let state = VersionState {
@@ -482,16 +513,22 @@ fn served_entry(
     );
     let mut registry = row.stored.registry.clone();
     registry.is_latest = is_latest;
-    fmt::envelope(
-        server,
-        &registry,
-        serde_json::json!({
-            "repository": repo.key,
-            "artifactId": row.artifact_id,
-            "sha256": row.checksum,
-            "packagePolicy": row.stored.policy.as_str(),
-        }),
-    )
+    let mut source = serde_json::json!({
+        "repository": repo.key,
+        "artifactId": row.artifact_id,
+        "sha256": row.checksum,
+        "packagePolicy": row.stored.policy.as_str(),
+    });
+    if let Some(origin) = row
+        .stored
+        .upstream
+        .as_ref()
+        .and_then(|u| u.get("origin"))
+    {
+        source["kind"] = "upstream".into();
+        source["origin"] = origin.clone();
+    }
+    fmt::envelope(server, &registry, source)
 }
 
 /// The repository's package policy now (a read failure is fail-closed: the
@@ -570,6 +607,35 @@ fn audit_refusal(
         entry = entry.user(a.user_id);
     }
     tokio::spawn(audit_fire_and_forget(db.clone(), entry));
+}
+
+/// `MCP_GATE_UNAVAILABLE`: a serve gate could not be evaluated and the
+/// surface failed closed. Sampled like the refusal audit, keyed on the
+/// version (or, for a listing batch, the repository).
+fn audit_gate_unavailable(db: &PgPool, repository_id: Uuid, subject: Uuid, details: serde_json::Value) {
+    if !refusal_audit_due(subject, "gate-unavailable") {
+        return;
+    }
+    use crate::services::audit_service::{
+        audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+    };
+    let mut details = details;
+    details["repository_id"] = repository_id.to_string().into();
+    let entry = AuditEntry::new(AuditAction::McpGateUnavailable, ResourceType::Repository)
+        .resource(repository_id)
+        .details(details);
+    tokio::spawn(audit_fire_and_forget(db.clone(), entry));
+}
+
+/// A listing batch was omitted because a gate could not be evaluated.
+fn listing_gate_unavailable(db: &PgPool, repository_id: Uuid) {
+    tracing::warn!(repository_id = %repository_id, "MCP listing gate unavailable; batch omitted");
+    audit_gate_unavailable(
+        db,
+        repository_id,
+        repository_id,
+        serde_json::json!({"surface": "listing"}),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -699,7 +765,7 @@ async fn fetch_listing_batch(
         .await
         .map_err(internal)?;
     let raw_len = raw.len();
-    let last = raw.last().map(|r| (r.1.clone(), r.2.clone()));
+    let last = raw.last().map(|r| (r.2.clone(), r.3.clone()));
     Ok(ListingBatch {
         rows: rows_from_raw(raw),
         raw_len,
@@ -708,8 +774,10 @@ async fn fetch_listing_batch(
 }
 
 /// The rows of `rows` the reader-only gate admits, in order. A gate that
-/// cannot be evaluated omits the whole batch (fail closed).
-async fn servable(
+/// cannot be evaluated omits the whole batch (fail closed). The listing half
+/// of [`decide_row`]: a Virtual repository filters each member's rows with
+/// it.
+pub(crate) async fn servable(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
@@ -727,13 +795,35 @@ async fn servable(
             stored: r.stored.clone(),
         })
         .collect();
-    match mcp_packages::listing_refusals(ctx, repo_id, &listing, policy_now).await {
-        Ok(refused) => rows
-            .into_iter()
-            .filter(|r| !refused.contains(&r.artifact_id))
-            .collect(),
+    let refused = match mcp_packages::listing_refusals(ctx, repo_id, &listing, policy_now).await
+    {
+        Ok(refused) => refused,
         Err(mcp_packages::GateUnavailable) => {
-            tracing::warn!(repository_id = %repo_id, "MCP listing gate unavailable; batch omitted");
+            listing_gate_unavailable(ctx.db, repo_id);
+            return Vec::new();
+        }
+    };
+    let rows: Vec<VersionRow> = rows
+        .into_iter()
+        .filter(|r| !refused.contains(&r.artifact_id))
+        .collect();
+    let held = match mcp_curation::load_serve_policy(ctx.db, repo_id).await {
+        Ok(policy) => {
+            let keys: Vec<mcp_curation::ServeRow<'_>> = rows
+                .iter()
+                .map(|r| (r.artifact_id, r.name.as_str(), r.version.as_str()))
+                .collect();
+            mcp_curation::repo_holds(ctx, &policy, repo_id, &keys).await
+        }
+        Err(()) => Err(()),
+    };
+    match held {
+        Ok(held) => rows
+            .into_iter()
+            .filter(|r| !held.contains_key(&r.artifact_id))
+            .collect(),
+        Err(()) => {
+            listing_gate_unavailable(ctx.db, repo_id);
             Vec::new()
         }
     }
@@ -1164,6 +1254,17 @@ async fn get_version_impl(
                 // fall back past a version that may be servable.
                 if status == 503 {
                     audit_refusal(&state.db, auth, &repo, row, hold_class, audience);
+                    audit_gate_unavailable(
+                        &state.db,
+                        repo.id,
+                        row.artifact_id,
+                        serde_json::json!({
+                            "surface": "detail",
+                            "repository": repo.key,
+                            "server": row.name,
+                            "version": row.version,
+                        }),
+                    );
                     return Err(resp);
                 }
                 if first_refusal.is_none() {
@@ -1273,6 +1374,20 @@ fn admit_document(
     }
     fmt::reduce_publisher_meta(&mut server)?;
     Ok(server)
+}
+
+/// Refuse a publish whose name matches the repository's `mcp_server_deny`
+/// list (403 `mcp_server_denied`); deny always wins.
+async fn refuse_denied_name(db: &PgPool, repo: &RepoInfo, name: &str) -> Result<(), Response> {
+    let settings = crate::services::mcp_settings::load(db, repo.id, &repo.repo_type)
+        .await
+        .map_err(internal)?;
+    if mcp_curation::is_denied(&settings.mcp_server_deny.unwrap_or_default(), name) {
+        return Err(mcp_error(McpError::ServerDenied {
+            name: name.to_string(),
+        }));
+    }
+    Ok(())
 }
 
 /// Insert the server.json row, its metadata and the OCI retention holds in
@@ -1414,7 +1529,7 @@ async fn lock_server(
 /// Recompute `registry.isLatest` for every version of `name`, inside the
 /// caller's transaction and under the per-server lock: the newest
 /// non-deleted version by [`fmt::latest_order`] (publish time breaks ties).
-async fn recompute_latest_in(
+pub(crate) async fn recompute_latest_in(
     tx: &mut sqlx::PgConnection,
     repo_id: Uuid,
     name: &str,
@@ -1528,6 +1643,7 @@ async fn publish_server(
         .await
         .map_err(mcp_error)?;
     let server = admit_document(&body, &settings).map_err(mcp_error)?;
+    refuse_denied_name(&state.db, &repo, &server.name).await?;
     let pins = mcp_packages::resolve_packages(&state, &settings, &server, base.as_str())
         .await
         .map_err(mcp_error)?;
@@ -2060,6 +2176,15 @@ mod tests {
                 "services/mcp_packages.rs",
                 include_str!("../../services/mcp_packages.rs"),
             ),
+            (
+                "services/mcp_curation.rs",
+                include_str!("../../services/mcp_curation.rs"),
+            ),
+            (
+                "services/mcp_catalog.rs",
+                include_str!("../../services/mcp_catalog.rs"),
+            ),
+            ("api/handlers/mcp_remote.rs", include_str!("mcp_remote.rs")),
         ] {
             let production = src.split("#[cfg(test)]").next().unwrap_or(src);
             for needle in [
@@ -2075,6 +2200,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The Remote sync is the one MCP module that reads a URL, and only the
+    /// repository's configured upstream through the proxy helper (SSRF
+    /// guard, size cap, upstream credentials): never a client of its own.
+    #[test]
+    fn mcp_remote_sync_fetches_only_through_the_proxy_helper() {
+        let src = include_str!("../../services/mcp_remote.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for needle in [
+            concat!("reqwest", "::"),
+            concat!("Client", "::builder("),
+            concat!("http_client", "::"),
+            concat!("TcpStream", "::connect"),
+        ] {
+            assert!(!production.contains(needle), "{needle}");
+        }
+        assert_eq!(
+            production.matches(concat!("proxy_fetch", "_capped_with_format(")).count(),
+            1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2243,6 +2389,42 @@ mod tests {
     // -----------------------------------------------------------------------
     // Publish
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn deny_list_refuses_publish_and_hides_on_serve() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let (s, _) = env.publish(&doc("com.acme/keep", "1.0.0", serde_json::json!({}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = env.publish(&doc("com.acme/later", "1.0.0", serde_json::json!({}))).await;
+        assert_eq!(s, StatusCode::OK);
+        env.config(
+            crate::services::mcp_settings::SERVER_DENY_KEY,
+            r#"["com.evil/*", "com.acme/later"]"#,
+        )
+        .await;
+        let (s, body) = env.publish(&doc("Com.Evil/x", "1.0.0", serde_json::json!({}))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "mcp_server_denied");
+        // A version published before the glob is hidden from then on.
+        let (s, b, _) = env.get(env.anon(), "/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        let names: Vec<String> = json(&b)["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["server"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["com.acme/keep"]);
+        let (s, b, h) = env
+            .get(env.anon(), "/servers/com.acme%2Flater/versions/1.0.0")
+            .await;
+        assert_eq!((s, b.as_ref()), (StatusCode::NOT_FOUND, fmt::NOT_FOUND_BODY.as_bytes()));
+        assert_refusal_headers(&h);
+        env.teardown().await;
+    }
 
     #[tokio::test]
     async fn publish_npm_package_under_own_repos() {

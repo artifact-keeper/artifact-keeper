@@ -9037,6 +9037,7 @@ pub(crate) fn age_gate_format_from_str(
         "go" => RepositoryFormat::Go,
         "vscode" => RepositoryFormat::Vscode,
         "cargo" => RepositoryFormat::Cargo,
+        "mcp" => RepositoryFormat::Mcp,
         // #4702: Gradle repositories gate as Maven (same layout and handler).
         "maven" | "gradle" => RepositoryFormat::Maven,
         other if other.starts_with("npm") || other == "yarn" || other == "pnpm" => {
@@ -23826,6 +23827,7 @@ mod tests {
             RepositoryFormat::Vscode,
             RepositoryFormat::Cargo,
             RepositoryFormat::Maven,
+            RepositoryFormat::Mcp,
         ] {
             let spec = crate::formats::age_gate_spec(&canonical)
                 .expect("format must carry an age-gate capability spec");

@@ -447,6 +447,7 @@ pub mod lifecycle;
 pub mod maven;
 pub mod maven_proxy;
 pub mod mcp;
+pub mod mcp_remote;
 pub mod migration;
 pub mod monitoring;
 pub mod npm;

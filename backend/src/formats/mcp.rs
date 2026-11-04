@@ -115,6 +115,8 @@ pub enum McpError {
     ReservedNamespace { namespace: String },
     /// Name outside the repository's namespace allowlist (403).
     NamespaceNotAllowed { namespace: String },
+    /// Name matches the repository's `mcp_server_deny` list (403).
+    ServerDenied { name: String },
     /// `(name, version)` already published (409).
     VersionExists,
     /// `search` shorter than 3 characters (422, upstream parity).
@@ -144,7 +146,9 @@ impl McpError {
             | McpError::PackageVersionUnpinned { .. }
             | McpError::OciNotAnImage { .. }
             | McpError::SearchTooShort => 422,
-            McpError::ReservedNamespace { .. } | McpError::NamespaceNotAllowed { .. } => 403,
+            McpError::ReservedNamespace { .. }
+            | McpError::NamespaceNotAllowed { .. }
+            | McpError::ServerDenied { .. } => 403,
             McpError::VersionExists => 409,
             McpError::Misconfigured(_) | McpError::Internal(_) => 500,
         }
@@ -162,6 +166,7 @@ impl McpError {
             McpError::OciNotAnImage { .. } => "mcp_oci_not_an_image",
             McpError::ReservedNamespace { .. } => "mcp_namespace_reserved",
             McpError::NamespaceNotAllowed { .. } => "mcp_namespace_not_allowed",
+            McpError::ServerDenied { .. } => "mcp_server_denied",
             McpError::VersionExists => "mcp_version_exists",
             McpError::SearchTooShort => "mcp_search_too_short",
             McpError::Misconfigured(_) => "mcp_repository_misconfigured",
@@ -202,6 +207,9 @@ impl McpError {
             }
             McpError::NamespaceNotAllowed { namespace } => {
                 format!("namespace '{namespace}' is not in this repository's namespace allowlist")
+            }
+            McpError::ServerDenied { name } => {
+                format!("server '{name}' matches this repository's server deny list")
             }
             McpError::VersionExists => {
                 "this server version already exists; publish a new version".to_string()
@@ -751,7 +759,7 @@ fn validate_transport(path: &str, t: &Transport, remote: bool) -> V {
     }
 }
 
-fn validate_package(i: usize, p: &Package) -> V {
+fn validate_package(i: usize, p: &Package, allow_floating_oci: bool) -> V {
     let path = format!("packages[{i}]");
     if !REGISTRY_TYPES.contains(&p.registry_type.as_str()) {
         return Err(McpError::invalid(
@@ -777,6 +785,7 @@ fn validate_package(i: usize, p: &Package) -> V {
         }
         match parse_oci_identifier(&p.identifier) {
             Ok(_) => {}
+            Err(OciRefError::Floating) if allow_floating_oci => {}
             Err(OciRefError::Floating) => return Err(McpError::OciFloatingTag { index: i }),
             Err(OciRefError::Invalid(msg)) => {
                 return Err(McpError::invalid(format!("{path}.identifier"), msg))
@@ -868,6 +877,14 @@ fn validate_icon(i: usize, icon: &Icon) -> V {
 
 /// Every rule of the plan's section 4.2 that does not need the database.
 pub fn validate_server_json(s: &ServerJson) -> V {
+    validate_server_json_opts(s, false)
+}
+
+/// [`validate_server_json`] with OCI `latest`/tagless identifiers admitted
+/// when `allow_floating_oci` (documents ingested from an upstream registry
+/// into a Remote repository, whose floating tags are pinned or hidden at
+/// sync rather than refused).
+pub fn validate_server_json_opts(s: &ServerJson, allow_floating_oci: bool) -> V {
     if let Some(schema) = s.schema.as_deref() {
         check_http_url("$schema", Some(schema))?;
     }
@@ -911,7 +928,7 @@ pub fn validate_server_json(s: &ServerJson) -> V {
     check_count("packages", s.packages.len(), MAX_PACKAGES)?;
     check_count("remotes", s.remotes.len(), MAX_REMOTES)?;
     for (i, p) in s.packages.iter().enumerate() {
-        validate_package(i, p)?;
+        validate_package(i, p, allow_floating_oci)?;
     }
     for (i, r) in s.remotes.iter().enumerate() {
         validate_transport(&format!("remotes[{i}]"), r, true)?;
@@ -1159,6 +1176,16 @@ pub enum OciRefError {
 /// `localhost`, otherwise the host is `docker.io` (and a one-component path
 /// gains `library/`).
 pub fn parse_oci_identifier(s: &str) -> std::result::Result<OciRef, OciRefError> {
+    match parse_oci_reference(s)? {
+        (_, true) => Err(OciRefError::Floating),
+        (r, false) => Ok(r),
+    }
+}
+
+/// [`parse_oci_identifier`] that resolves a floating reference instead of
+/// refusing it: `:latest` and a tagless reference both come back with tag
+/// `latest` and `true` (floating).
+pub fn parse_oci_reference(s: &str) -> std::result::Result<(OciRef, bool), OciRefError> {
     let invalid = |m: &str| OciRefError::Invalid(m.to_string());
     if s.is_empty() || s.len() > 512 || s.chars().any(char::is_whitespace) {
         return Err(invalid("not an image reference"));
@@ -1208,15 +1235,21 @@ pub fn parse_oci_identifier(s: &str) -> std::result::Result<OciRef, OciRefError>
     {
         return Err(invalid("the repository path is not a valid image name"));
     }
-    if tag.as_deref() == Some("latest") || (tag.is_none() && digest.is_none()) {
-        return Err(OciRefError::Floating);
-    }
-    Ok(OciRef {
-        host,
-        path,
-        tag,
-        digest,
-    })
+    let floating = tag.as_deref() == Some("latest") || (tag.is_none() && digest.is_none());
+    let tag = if floating {
+        Some("latest".to_string())
+    } else {
+        tag
+    };
+    Ok((
+        OciRef {
+            host,
+            path,
+            tag,
+            digest,
+        },
+        floating,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +1473,10 @@ pub struct StoredVersion {
     pub registry: RegistryState,
     pub policy: PackagePolicy,
     pub pins: Vec<PackagePin>,
+    /// `metadata.upstream` of a version a Remote ingested from its upstream
+    /// registry (`{origin, sha256, publishedAt, updatedAt}`); `None` when
+    /// published here.
+    pub upstream: Option<serde_json::Value>,
 }
 
 impl StoredVersion {
@@ -1459,11 +1496,13 @@ impl StoredVersion {
             Some(v) => serde_json::from_value(v.clone()).ok()?,
             None => Vec::new(),
         };
+        let upstream = doc.get("upstream").filter(|u| u.is_object()).cloned();
         Some(Self {
             server,
             registry,
             policy,
             pins,
+            upstream,
         })
     }
 

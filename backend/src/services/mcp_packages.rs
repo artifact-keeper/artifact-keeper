@@ -608,9 +608,11 @@ async fn resolve_oci_package(
     pkg: &mcp::Package,
     repo: &BackingRepo,
     base_url: &str,
+    pin_floating: bool,
 ) -> Result<PackagePin, McpError> {
-    let r = match mcp::parse_oci_identifier(&pkg.identifier) {
-        Ok(r) => r,
+    let (r, floating) = match mcp::parse_oci_reference(&pkg.identifier) {
+        Ok((_, true)) if !pin_floating => return Err(McpError::OciFloatingTag { index }),
+        Ok(parsed) => parsed,
         Err(mcp::OciRefError::Floating) => return Err(McpError::OciFloatingTag { index }),
         Err(mcp::OciRefError::Invalid(m)) => {
             return Err(McpError::invalid(
@@ -686,6 +688,9 @@ async fn resolve_oci_package(
     if found.tag_digest_mismatch {
         warnings.push("oci_tag_digest_mismatch".to_string());
     }
+    if floating {
+        warnings.push(FLOATING_TAG_WARNING.to_string());
+    }
     Ok(PackagePin {
         index,
         registry_type: "oci".to_string(),
@@ -721,6 +726,9 @@ async fn repos_location(db: &PgPool, repo_id: Uuid) -> Result<StorageLocation, M
     Ok(StorageLocation { backend, path })
 }
 
+/// The pin warning of an OCI `latest`/tagless identifier pinned at sync.
+pub const FLOATING_TAG_WARNING: &str = "oci_floating_tag";
+
 /// Resolve and pin every package of `server` under the repository's policy.
 /// `open` resolves nothing.
 pub async fn resolve_packages(
@@ -734,6 +742,24 @@ pub async fn resolve_packages(
     }
     let mut pins = Vec::with_capacity(server.packages.len());
     for (index, pkg) in server.packages.iter().enumerate() {
+        pins.push(resolve_package(state, settings, index, pkg, base_url, false).await?);
+    }
+    Ok(pins)
+}
+
+/// Resolve and pin one `packages[]` entry under `own-repos`. With
+/// `pin_floating`, an OCI `latest`/tagless identifier is resolved through the
+/// backing repository's `latest` tag and pinned with the
+/// [`FLOATING_TAG_WARNING`] warning instead of refused (Remote ingest).
+pub async fn resolve_package(
+    state: &crate::api::SharedState,
+    settings: &McpSettings,
+    index: usize,
+    pkg: &mcp::Package,
+    base_url: &str,
+    pin_floating: bool,
+) -> Result<PackagePin, McpError> {
+    {
         let Some(repo) = settings.repos.get(&pkg.registry_type) else {
             let mapped: Vec<&str> = settings.repos.keys().map(String::as_str).collect();
             return Err(McpError::ExternalRegistry {
@@ -751,14 +777,12 @@ pub async fn resolve_packages(
                 ),
             });
         };
-        let pin = if pkg.registry_type == "oci" {
-            resolve_oci_package(state, index, pkg, repo, base_url).await?
+        if pkg.registry_type == "oci" {
+            resolve_oci_package(state, index, pkg, repo, base_url, pin_floating).await
         } else {
-            resolve_artifact_package(&state.db, index, pkg, repo, base_url).await?
-        };
-        pins.push(pin);
+            resolve_artifact_package(&state.db, index, pkg, repo, base_url).await
+        }
     }
-    Ok(pins)
 }
 
 /// The retention hold of an OCI pin in a hosted backing repository.
@@ -1058,10 +1082,7 @@ async fn age_gate_outcome(
     pin: &PackagePin,
     cached_at: DateTime<Utc>,
 ) -> Result<Option<GateOutcome>, ()> {
-    use crate::services::age_gate_service::{
-        decide_age_gate_check, review_identity_match, upstream_fingerprint, AgeGateCheckAction,
-        AgeGateDecision, AgeGateMode, AgeGateService, ReviewIdentityMatch, ReviewPolicyView,
-    };
+    use crate::services::age_gate_service::{AgeGateMode, AgeGateService, ReviewIdentityMatch};
     let params = &facts.age;
     if !AgeGateService::gating_requested(params)
         || crate::formats::age_gate_spec(&params.format).is_none()
@@ -1075,8 +1096,59 @@ async fn age_gate_outcome(
         return Ok(None);
     };
     let package = age_gate_package_name(&pin.registry_type, &pin.submitted.identifier);
+    let (review, identity, view) = review_view(svc, params, &package, version).await?;
+    let reviewed_publish = review
+        .as_ref()
+        .zip(identity)
+        .filter(|(_, id)| *id != ReviewIdentityMatch::Differs)
+        .and_then(|(r, _)| r.upstream_published_at);
+    let (basis, recorded_basis) = match params.age_gate_mode {
+        AgeGateMode::FirstSeen => {
+            let seen = svc
+                .lookup_first_seen(params, &package, version)
+                .await
+                .map_err(|_| ())?;
+            (seen, seen)
+        }
+        AgeGateMode::UpstreamPublishTime => (
+            Some(reviewed_publish.map_or(cached_at, |p| p.min(cached_at))),
+            reviewed_publish,
+        ),
+    };
+    age_gate_verdict(
+        ctx,
+        params,
+        &package,
+        version,
+        basis,
+        recorded_basis,
+        view.as_ref(),
+        review.map(|r| r.id),
+    )
+    .await
+}
+
+/// The age-gate review of `(package, version)` in `params`' repository, how
+/// its recorded basis relates to the repository's current policy, and the
+/// policy view [`age_gate_verdict`] decides with.
+async fn review_view(
+    svc: &crate::services::age_gate_service::AgeGateService,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+) -> Result<
+    (
+        Option<crate::services::age_gate_service::AgeGateReview>,
+        Option<crate::services::age_gate_service::ReviewIdentityMatch>,
+        Option<crate::services::age_gate_service::ReviewPolicyView>,
+    ),
+    (),
+> {
+    use crate::services::age_gate_service::{
+        review_identity_match, upstream_fingerprint, ReviewPolicyView,
+    };
     let review = svc
-        .get_review(params.id, &package, version)
+        .get_review(params.id, package, version)
         .await
         .map_err(|_| ())?;
     let fingerprint = upstream_fingerprint(params.upstream_url.as_deref());
@@ -1096,27 +1168,69 @@ async fn age_gate_outcome(
             is_automatic: r.reviewed_by.is_none(),
             identity,
         });
-    let reviewed_publish = review
-        .as_ref()
-        .zip(identity)
-        .filter(|(_, id)| *id != ReviewIdentityMatch::Differs)
-        .and_then(|(r, _)| r.upstream_published_at);
-    let (basis, recorded_basis) = match params.age_gate_mode {
-        AgeGateMode::FirstSeen => {
-            let seen = svc
-                .lookup_first_seen(params, &package, version)
-                .await
-                .map_err(|_| ())?;
-            (seen, seen)
-        }
-        AgeGateMode::UpstreamPublishTime => (
-            Some(reviewed_publish.map_or(cached_at, |p| p.min(cached_at))),
-            reviewed_publish,
-        ),
+    Ok((review, identity, view))
+}
+
+/// The `first_seen` age gate of one server version of a Remote MCP registry
+/// (`params` is the registry itself): the basis is the first sighting the
+/// sync recorded at ingest. `Ok(None)` when no gate is asked for; `Err` when
+/// it cannot be evaluated (an unenforceable mode, no age-gate service, a
+/// database error), which the caller fails closed.
+pub(crate) async fn server_version_age_gate(
+    ctx: GateCtx<'_>,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    name: &str,
+    version: &str,
+) -> Result<Option<GateOutcome>, ()> {
+    use crate::services::age_gate_service::AgeGateService;
+    if !AgeGateService::gating_requested(params) {
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(params).map_err(|_| ())?;
+    let svc = ctx.age_gate.ok_or(())?;
+    let (review, _, view) = review_view(svc, params, name, version).await?;
+    let seen = svc
+        .lookup_first_seen(params, name, version)
+        .await
+        .map_err(|_| ())?;
+    age_gate_verdict(
+        ctx,
+        params,
+        name,
+        version,
+        seen,
+        seen,
+        view.as_ref(),
+        review.map(|r| r.id),
+    )
+    .await
+}
+
+/// The age-gate verdict of one `(package, version)` of `params`' repository
+/// given its age `basis` and its review state, as the download path decides
+/// it ([`decide_age_gate_check`]). Under [`GateCtx::record_reviews`] a hold
+/// records (or bumps) the pending review with `recorded_basis`. Shared by the
+/// backing-package gate and the server-version gate of a Remote MCP registry.
+///
+/// [`decide_age_gate_check`]: crate::services::age_gate_service::decide_age_gate_check
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn age_gate_verdict(
+    ctx: GateCtx<'_>,
+    params: &crate::services::age_gate_service::AgeGateRepoParams,
+    package: &str,
+    version: &str,
+    basis: Option<DateTime<Utc>>,
+    recorded_basis: Option<DateTime<Utc>>,
+    view: Option<&crate::services::age_gate_service::ReviewPolicyView>,
+    existing_review: Option<Uuid>,
+) -> Result<Option<GateOutcome>, ()> {
+    use crate::services::age_gate_service::{
+        decide_age_gate_check, AgeGateCheckAction, AgeGateDecision, AgeGateService,
     };
+    let svc = ctx.age_gate.ok_or(())?;
     let meets =
         AgeGateService::meets_age_threshold(basis, params.age_gate_min_age_days, Utc::now());
-    match decide_age_gate_check(view.as_ref(), meets) {
+    match decide_age_gate_check(view, meets) {
         AgeGateCheckAction::Allow
         | AgeGateCheckAction::AllowAlreadyApproved
         | AgeGateCheckAction::AllowAndAutoApprovePending => return Ok(None),
@@ -1126,7 +1240,7 @@ async fn age_gate_outcome(
     }
     let review_id = if ctx.record_reviews {
         match svc
-            .check(params, &package, version, recorded_basis)
+            .check(params, package, version, recorded_basis)
             .await
             .map_err(|_| ())?
         {
@@ -1134,7 +1248,7 @@ async fn age_gate_outcome(
             AgeGateDecision::Block { review_id, .. } => Some(review_id),
         }
     } else {
-        review.map(|r| r.id)
+        existing_review
     };
     Ok(Some(GateOutcome::AgeGate {
         review_id,

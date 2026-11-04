@@ -356,7 +356,208 @@ change the locked setting (`403`).
 
 ## Remote repositories
 
-(Filled in by the Remote workstream.)
+A Remote `mcp` repository is **an allowlist that happens to be populated
+from an upstream registry, not a mirror of it.** Its `upstream_url` is a
+registry origin, without `/v0.1`: the official registry
+(`https://registry.modelcontextprotocol.io`), another Artifact Keeper
+(`https://ak.example.com/mcp/<key>`), or any server of the v0.1 API. Nothing
+from upstream is served until it is approved (`mcp_remote_posture:
+approval_required`, the default), and `/v0.1` on a Remote serves only what
+the sync stored, through the same read path and gates as a hosted
+repository. Writes (`publish`, `status`) answer `405`.
+
+```json
+{
+  "key": "mcp-official", "format": "mcp", "repo_type": "remote",
+  "upstream_url": "https://registry.modelcontextprotocol.io",
+  "mcp_package_repos": {"npm": "npm-remote", "pypi": "pypi-remote", "oci": "ghcr-remote"},
+  "mcp_auto_approve_namespaces": ["io.github.modelcontextprotocol"],
+  "mcp_server_deny": ["*.evil/*"]
+}
+```
+
+Pair it with the clients' own allowlists so developers cannot route around
+it: Copilot's "Registry only" policy, Claude Code `allowedMcpServers` with
+`allowManagedMcpServersOnly`, Cursor's team allowlist.
+
+### Sync
+
+Every hour (`MCP_REMOTE_SYNC_INTERVAL_SECS`, minimum 60) and on demand, the
+repository pages `GET {upstream}/v0.1/servers?limit=100&updated_since=<watermark>&cursor=...`
+through the Remote's outbound path (SSRF guard, the repository's upstream
+credentials, 8 MiB per page). One replica runs the scheduled pass (a
+scheduler lease) and each repository's run holds a cluster-wide lock, so a
+manual trigger never overlaps a scheduled one. The watermark is the newest
+upstream `updatedAt` a completed pass saw (upstream's clock), held at least
+ten minutes behind the run's start so an entry updated mid-pass is read
+again; a pass that stops early (200 pages, an upstream error after the first
+page) resumes at its cursor next time. Each run:
+
+1. Records every upstream server name in the catalog (one `curation_packages`
+   row, `format: mcp`, `version: "*"`) with a cached summary (title,
+   description, versions, latest version, upstream status and time), so
+   browsing never calls upstream. A new name starts `pending`; a name whose
+   namespace (or full name) matches `mcp_auto_approve_namespaces` starts
+   `approved`; a **lookalike** of an approved or ingested name (another
+   namespace one edit away, or equal after folding `rn`/`m`, `vv`/`w`,
+   `0`/`o`, `1`/`i`/`l`, `5`/`s` and separators, with the same or a lookalike
+   server slug) starts in `review` with `flags.typosquat.similarTo`, whatever
+   the auto-approve list says.
+2. **Ingests** the versions of every eligible name as artifacts of the Remote
+   (path `servers/<name>/<version>/server.json`, the hosted metadata shape):
+   approved names, pending names under `allow_with_gates`, approved
+   `name@version` pins, and in `mcp_remote_mode: mirror` every name that is
+   not denied or blocked. Upstream documents pass the hosted validation
+   (except that OCI `latest`/tagless images are admitted, below, and the
+   reserved `io.modelcontextprotocol` namespace is the upstream's own);
+   one that fails is counted `invalid` and skipped.
+3. **Pins every package at sync**, through the Remote's own
+   `mcp_package_repos`, exactly as a publish does. An upstream
+   `registryBaseUrl` naming the host of the backing Remote's upstream is the
+   registry that Remote proxies and is accepted. An OCI `latest` or tagless
+   image is resolved through the backing repository's `latest` tag and
+   pinned to its digest with the pin warning `oci_floating_tag`
+   (`mcp_oci_floating_tag_policy: pin`, the default), or left unpinned
+   (`hide`). A package that cannot be pinned (no backing repository, not
+   pulled through it yet, policy `hide`) is recorded in
+   `metadata.ingest.unresolved` and the version is `unresolvable`: stored,
+   never served. Each run retries the resolution of up to 100 such versions.
+4. **Never overwrites** an ingested `name@version`. Changed upstream bytes
+   keep the stored document, re-queue that version (a `name@version` row in
+   `review` with `contentDrift: {storedSha256, upstreamSha256, detectedAt}`),
+   audit `MCP_SERVER_CONTENT_DRIFT` and, when the version was being served,
+   `MCP_SERVER_REOPENED`. The version is held (`hold: content_drift`) until
+   an administrator approves it again, which serves the **stored** document.
+   Upstream status changes (`active`, `deprecated`, `deleted`) are mirrored
+   onto the stored version; they are not content.
+5. Records the first sighting of every new version for the age gate, scans
+   the stored document like an upload, indexes it for search (the Packages
+   page and OpenSearch), and audits `MCP_MIRROR_SYNCED` with the run's
+   counts.
+
+Ingesting never makes a version visible; the read-time decision below does.
+
+### What a Remote serves
+
+Every row a Remote stores goes through `decide_mcp_serve` with the hold of
+its curation state, evaluated on every read (strongest first):
+
+| State | Hold (`hold`, `error` for a repository holder) |
+| --- | --- |
+| name matches `mcp_server_deny` (any repository type) | `curation`, `mcp_rejected` |
+| name `blocked` | `curation`, `mcp_rejected` |
+| version row `approved` (a pin, or re-approved drift) | none: served |
+| version row `blocked` | `curation`, `mcp_rejected` |
+| version row with `contentDrift`, not re-approved | `content_drift`, `mcp_pending_review` |
+| version row `pending`/`review` | `curation`, `mcp_pending_review` |
+| name `approved` | none |
+| name `pending` under `allow_with_gates` | none |
+| name `pending`/`review` (or no row) under `approval_required`; `review` under either | `curation`, `mcp_pending_review` |
+| server version younger than the Remote's age gate | `age_gate`, `mcp_age_gate_blocked` |
+| any of the above cannot be read (database error) | `503 mcp_gate_unavailable`, audited `MCP_GATE_UNAVAILABLE` |
+
+Then every backing-package gate applies as for a hosted version. The reason
+body (`review_id` is the curation row's id for a curation or drift hold, the
+age-gate review's id for the age gate) goes only to repository holders;
+everyone else gets the unknown-name `404`. Failing closed is a deliberate
+divergence from the npm curation seam, which fails open: this document
+decides what an agent executes.
+
+`allow_with_gates` (`mcp_remote_posture`) serves every name that is not
+denied, blocked or flagged, with every gate on. The posture can be locked by
+an instance administrator (`mcp_remote_posture_locked`).
+
+**Age gate.** Enable the Remote's own age gate (`PUT
+/api/v1/repositories/{key}/age-gate`, mode `first_seen`, the only mode for
+MCP: the upstream `publishedAt` is the upstream's claim) to hold every
+server version until it has been known to this instance for `min_age_days`.
+An exact read records a pending review in the repository's age-gate queue;
+approving it releases the version.
+
+The served `_meta["com.artifactkeeper.registry/source"]` of an ingested
+version adds `"kind": "upstream"` and `"origin": "<upstream_url>"`.
+
+**Deny list on hosted repositories.** `mcp_server_deny` also refuses a
+publish to a Local or Staging repository with `403`
+`{"error": "mcp_server_denied"}`, and hides an already published version
+(for example one published before the glob was added) on every read.
+
+### Management API
+
+Base: `/api/v1/repositories/{key}/mcp`, Remote MCP repositories only (any
+other key answers `404`). Reads need an authenticated caller who can read
+the repository (token scope `read:repositories`); decisions need the
+repository `admin` action (token scope `write:repositories`). Errors use the
+API's usual `{"code", "message"}` body.
+
+| Method and path | Who | Request | Response |
+| --- | --- | --- | --- |
+| `GET /catalog` | read | query `search` (substring of the name), `status` (`pending`\|`approved`\|`blocked`\|`review`), `namespace` (exact), `requested` (`true`: someone asked for it), `queue` (`true`: name or one of its versions awaits a decision), `cursor`, `limit` (default 50, max 200) | `200 CatalogPage`; `400` bad query |
+| `GET /catalog/servers/{serverName}` | read | name URL-encoded or with a literal slash | `200 CatalogItem`; `404` |
+| `POST /catalog/{id}/approve` | admin | `{"reason": "..."}` (optional body) | `200 DecisionResult` |
+| `POST /catalog/{id}/block` | admin | same | `200 DecisionResult` |
+| `POST /catalog/{id}/reopen` | admin | same; back to `review` | `200 DecisionResult` |
+| `POST /catalog/pins` | admin | `{"name": "io.github.acme/x", "version": "1.2.0", "reason": "..."}` | `200 DecisionResult`; `404` name not in the catalog; `400` bad version |
+| `POST /catalog/bulk-approve` | admin | `{"pattern": "io.github.acme/*", "includeReview": false, "reason": "..."}` | `200 BulkResult`; `400` bad pattern |
+| `POST /catalog/{id}/request-approval` | read | `{"note": "..."}` (optional, 500 characters kept) | `200 CatalogItem` |
+| `GET /sync` | read | | `200 SyncState` |
+| `POST /sync` | admin, or an API token with `trigger:sync` and access to the repository | | `200 {"repository": "<key>", "summary": SyncSummary}`; `409` a run is in progress; `502` upstream unreadable |
+
+`{id}` is the `curation_packages` id of a name row (or of a
+`name@version` row for approve/block/reopen). The generic curation routes
+work on the same rows: `POST /api/v1/curation/packages/{id}/approve|block`
+and `POST /api/v1/curation/packages/bulk-approve|bulk-block` (instance
+administrators) audit and ingest MCP rows the same way, and
+`POST /api/v1/curation/repos/{key}/sync` runs this sync for a Remote MCP
+repository.
+
+Approving a name (or pinning a version) ingests it right away; when upstream
+cannot be reached the approval stands, `ingestError` says why, and the next
+sync ingests it. A bulk approval ingests in the background. Bulk approval
+takes `pending` names whose full name or namespace matches the glob (`*`
+matches any run of characters, `/` included; ASCII case-insensitive),
+skips denied names and, unless `includeReview`, flagged ones.
+
+Shapes (JSON, camelCase):
+
+```text
+CatalogPage    { items: CatalogItem[], nextCursor: string | null,
+                 counts: { pending?: n, approved?: n, blocked?: n, review?: n } }
+CatalogItem    { id: uuid, name, namespace,
+                 status: "pending" | "approved" | "blocked" | "review",
+                 denied: bool,                      // matches mcp_server_deny: never served
+                 title: string | null, description: string | null,
+                 latestVersion: string | null, versions: string[],   // newest first, at most 200
+                 upstreamStatus: "active" | "deprecated" | "deleted" | null,
+                 upstreamUpdatedAt: RFC 3339 | null,
+                 flags: { typosquat?: { similarTo: string } },
+                 approvalRequests: { count?, lastRequestedAt?, lastRequestedBy?, lastNote? },
+                 evaluationReason: string | null, evaluatedAt: RFC 3339 | null,
+                 evaluatedBy: uuid | null, firstSeenAt: RFC 3339,
+                 pins: CatalogPin[], ingested: CatalogVersion[] }
+CatalogPin     { id: uuid, version, status,
+                 contentDrift: { storedSha256, upstreamSha256, detectedAt } | null,
+                 evaluationReason: string | null }
+CatalogVersion { version, artifactId: uuid,           // the server.json artifact (capabilities diff, health)
+                 upstreamStatus, unresolved: [{ index, error, detail }] }
+DecisionResult { item: CatalogItem, ingestError: string | null }
+BulkResult     { approved: n, names: string[],        // first 100
+                 skippedDenied: n, skippedReview: n }
+SyncState      { updatedSince, resumeCursor, resumeSince, lastStartedAt,
+                 lastFinishedAt, lastSucceededAt, lastError, lastSummary: SyncSummary }
+SyncSummary    { pages, entries, namesNew, autoApproved, flagged, ingested,
+                 unchanged, statusChanged, drifted, invalid, unresolved,
+                 reResolved, backfilledNames, complete: bool, errors: string[] }
+```
+
+Audit: `MCP_SERVER_APPROVED`, `MCP_SERVER_REJECTED`, `MCP_SERVER_REOPENED`,
+`MCP_SERVER_CONTENT_DRIFT`, `MCP_GATE_UNAVAILABLE` and `MCP_MIRROR_SYNCED`
+(see `docs/audit-events.md`).
+
+The artifact routes (`/api/v1/repositories/{key}/artifacts`) list every
+stored document of a Remote, including versions of names that are not
+approved in `mirror` mode (they are public upstream documents); the `/v0.1`
+surface, which clients read, is the control.
 
 ## Virtual repositories
 

@@ -1113,6 +1113,10 @@ fn api_v1_routes(
                 // Precomputed RPM repodata (#4544):
                 // POST /repositories/{key}/rpm/repodata/rebuild.
                 .merge(handlers::rpm::repo_router())
+                // Remote MCP registries (#5253): upstream catalog, approval
+                // queue, pins, bulk approval, sync:
+                // /repositories/{key}/mcp/{catalog,sync}[/...].
+                .merge(handlers::mcp_remote::repo_router())
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).

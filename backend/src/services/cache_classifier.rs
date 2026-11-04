@@ -322,6 +322,14 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // hashes).
         RepositoryFormat::Bazel => classify_bazel(&lower),
 
+        // MCP registry API (#5253): a Remote MCP registry's sync reads the
+        // upstream listing and per-server version lists, which change with
+        // every publish and status flip, so they always revalidate. One exact
+        // version document is stable but not immutable (an upstream
+        // administrator may edit it; the sync detects that as content drift),
+        // so it gets a longer, finite lifetime.
+        RepositoryFormat::Mcp => classify_mcp(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -791,6 +799,35 @@ fn classify_bazel(lower: &str) -> Mutability {
     }
 }
 
+/// TTL of one exact upstream MCP server version document.
+pub const MCP_VERSION_DOCUMENT_TTL_SECS: i64 = 3600;
+
+/// MCP registry API paths (`v0.1/...` or `v0/...`, query included).
+fn classify_mcp(lower: &str) -> Mutability {
+    let path = lower.split('?').next().unwrap_or(lower);
+    let rest = path
+        .strip_prefix("v0.1/")
+        .or_else(|| path.strip_prefix("v0/"));
+    let Some(rest) = rest else {
+        return Mutability::mutable_default();
+    };
+    let always_revalidate = Mutability::Mutable {
+        default_ttl_secs: 0,
+    };
+    let Some(tail) = rest.strip_prefix("servers/") else {
+        // `servers` (the listing) and anything unrecognised.
+        return always_revalidate;
+    };
+    match tail.rsplit_once("/versions/") {
+        Some((_, version)) if !version.is_empty() && version != "latest" && !version.contains('/') => {
+            Mutability::Mutable {
+                default_ttl_secs: MCP_VERSION_DOCUMENT_TTL_SECS,
+            }
+        }
+        _ => always_revalidate,
+    }
+}
+
 /// The final path segment (after the last `/`), or the whole string.
 fn leaf(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -1052,6 +1089,28 @@ mod tests {
                  snapshot directory from the mutable rule"
             );
         }
+    }
+
+    /// #5253: MCP registry paths are never immutable; the listing and version
+    /// lists always revalidate, one exact version document lives an hour.
+    #[test]
+    fn mcp_registry_paths_classify() {
+        use RepositoryFormat::Mcp;
+        let ttl = |p: &str| match classify(&Mcp, p) {
+            Mutability::Mutable { default_ttl_secs } => default_ttl_secs,
+            Mutability::Immutable => panic!("{p} must not be immutable"),
+        };
+        assert_eq!(ttl("v0.1/servers?limit=100&cursor=abc"), 0);
+        assert_eq!(ttl("v0.1/servers"), 0);
+        assert_eq!(ttl("v0/servers/com.acme%2Fx/versions"), 0);
+        assert_eq!(ttl("v0.1/servers/com.acme%2Fx/versions/latest"), 0);
+        assert_eq!(
+            ttl("v0.1/servers/com.acme%2Fx/versions/1.0.0"),
+            MCP_VERSION_DOCUMENT_TTL_SECS
+        );
+        assert_eq!(ttl("v0.1/ping"), 0);
+        assert_eq!(ttl("other/path"), MUTABLE_DEFAULT_TTL_SECS);
+        assert!(!is_explicitly_mutable_index(&Mcp, "v0.1/servers"));
     }
 
     /// `(format, path, expected_immutable)` rows straight from the §2.1 table.

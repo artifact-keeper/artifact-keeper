@@ -1237,6 +1237,7 @@ jobs:
             --test grouped_listing_keyset_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
+            --test mcp_registry_proxy_tests \
             --test migration_storage_path_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
@@ -1320,6 +1321,7 @@ jobs:
             --test grouped_listing_keyset_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
+            --test mcp_registry_proxy_tests \
             --test migration_storage_path_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \

@@ -1,0 +1,766 @@
+//! Remote MCP registries (#5253), end to end over a wiremock "official
+//! registry": the upstream sync, the approval queue, the curation holds on
+//! `/v0.1`, mirror paging, content drift, lookalike flags, the server age
+//! gate and fail-closed evaluation.
+//!
+//! Requires a PostgreSQL database with migrations applied:
+//!
+//! ```sh
+//! DATABASE_URL=postgresql://registry:registry@localhost:5432/artifact_registry \
+//!   cargo nextest run --run-ignored ignored-only --test mcp_registry_proxy_tests
+//! ```
+
+#![allow(clippy::disallowed_methods)] // streaming-invariant: test file exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+mod common;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use axum::{Extension, Router};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use uuid::Uuid;
+use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use artifact_keeper_backend::api::handlers::{mcp, mcp_remote};
+use artifact_keeper_backend::api::middleware::auth::AuthExtension;
+use artifact_keeper_backend::api::{AppState, SharedState};
+use artifact_keeper_backend::config::Config;
+use artifact_keeper_backend::models::access_scope::AccessScope;
+use artifact_keeper_backend::services::proxy_service::ProxyService;
+use artifact_keeper_backend::services::storage_service::{FilesystemBackend, StorageService};
+
+const NOT_FOUND: &str =
+    r#"{"detail":"Server not found","status":404,"title":"Not Found","type":"about:blank"}"#;
+
+fn server(name: &str, version: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+        "name": name,
+        "description": description,
+        "version": version,
+        "remotes": [{"type": "streamable-http", "url": "https://mcp.example.test/mcp"}],
+    })
+}
+
+fn entry(server: serde_json::Value, updated: &str) -> serde_json::Value {
+    serde_json::json!({
+        "server": server,
+        "_meta": {"io.modelcontextprotocol.registry/official": {
+            "status": "active", "publishedAt": updated, "updatedAt": updated, "isLatest": true,
+        }},
+    })
+}
+
+fn page(entries: Vec<serde_json::Value>, next: Option<&str>) -> serde_json::Value {
+    let mut metadata = serde_json::json!({"count": entries.len()});
+    if let Some(n) = next {
+        metadata["nextCursor"] = n.into();
+    }
+    serde_json::json!({"servers": entries, "metadata": metadata})
+}
+
+struct Harness {
+    pool: PgPool,
+    upstream: MockServer,
+    repo_id: Uuid,
+    key: String,
+    dir: String,
+    admin: AuthExtension,
+    state: SharedState,
+    extra: Vec<Uuid>,
+}
+
+fn admin_auth(user_id: Uuid) -> AuthExtension {
+    AuthExtension {
+        user_id,
+        username: "mcp-admin".into(),
+        email: "mcp-admin@test.local".into(),
+        is_admin: true,
+        is_api_token: false,
+        is_service_account: false,
+        scopes: None,
+        allowed_repo_ids: AccessScope::Admin,
+        iat_ms: None,
+    }
+}
+
+impl Harness {
+    async fn new(with_age_gate: bool) -> Self {
+        let upstream = common::upstream_mock::admitted_mock_server().await;
+        let pool = common::require_db_pool().await;
+        let id = Uuid::new_v4();
+        let key = format!("mcp-remote-{}", &id.to_string()[..8]);
+        let dir = format!("/tmp/mcp-remote-it-{id}");
+        std::fs::create_dir_all(&dir).unwrap();
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', 'mcp'::repository_format, $4, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&dir)
+        .bind(upstream.uri())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let user = common::insert_active_user(&pool, "mcp-admin").await;
+        let config = Config {
+            database_url: std::env::var("DATABASE_URL").unwrap_or_default(),
+            storage_path: dir.clone(),
+            jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+            setup_password_hint: None,
+            ..Default::default()
+        };
+        let storage: Arc<dyn artifact_keeper_backend::storage::StorageBackend> =
+            Arc::new(artifact_keeper_backend::storage::filesystem::FilesystemStorage::new(&dir));
+        let registry = Arc::new(artifact_keeper_backend::storage::StorageRegistry::new(
+            HashMap::new(),
+            "filesystem".to_string(),
+        ));
+        let mut state = AppState::new(config, pool.clone(), storage, registry);
+        state.proxy_service = Some(Arc::new(ProxyService::new(
+            pool.clone(),
+            Arc::new(StorageService::new(Arc::new(FilesystemBackend::new(
+                std::path::PathBuf::from(&dir),
+            )))),
+            artifact_keeper_backend::services::proxy_cache_scope::ProxyCacheScope::unscoped(),
+        )));
+        if with_age_gate {
+            state.set_age_gate_service(Arc::new(
+                artifact_keeper_backend::services::age_gate_service::AgeGateService::new(
+                    pool.clone(),
+                    Arc::new(artifact_keeper_backend::services::event_bus::EventBus::new(4)),
+                ),
+            ));
+        }
+        Self {
+            pool,
+            upstream,
+            repo_id: id,
+            key,
+            dir,
+            admin: admin_auth(user),
+            state: Arc::new(state),
+            extra: Vec::new(),
+        }
+    }
+
+    fn app(&self, auth: Option<AuthExtension>) -> Router {
+        Router::new()
+            .nest("/mcp", mcp::router())
+            .nest("/api/v1/repositories", mcp_remote::repo_router())
+            .with_state(self.state.clone())
+            .layer(Extension::<Option<AuthExtension>>(auth))
+    }
+
+    async fn call(
+        &self,
+        auth: Option<AuthExtension>,
+        verb: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut b = Request::builder().method(verb).uri(uri);
+        if body.is_some() {
+            b = b.header("content-type", "application/json");
+        }
+        let req = b
+            .body(body.map(|v| Body::from(v.to_string())).unwrap_or_else(Body::empty))
+            .unwrap();
+        let resp = self.app(auth).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    async fn admin_json(&self, verb: &str, tail: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
+        let uri = format!("/api/v1/repositories/{}/mcp{tail}", self.key);
+        let (s, b) = self.call(Some(self.admin.clone()), verb, &uri, body).await;
+        (s, serde_json::from_slice(&b).unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn sync(&self) -> serde_json::Value {
+        let (s, b) = self.admin_json("POST", "/sync", None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        b["summary"].clone()
+    }
+
+    async fn item(&self, name: &str) -> serde_json::Value {
+        let (s, b) = self
+            .admin_json("GET", &format!("/catalog/servers/{name}"), None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        b
+    }
+
+    async fn read(&self, auth: Option<AuthExtension>, tail: &str) -> (StatusCode, Vec<u8>) {
+        let uri = format!("/mcp/{}/v0.1{tail}", self.key);
+        self.call(auth, "GET", &uri, None).await
+    }
+
+    async fn listed_names(&self) -> Vec<String> {
+        let (s, b) = self.read(None, "/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        v["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| format!("{}@{}", e["server"]["name"].as_str().unwrap(), e["server"]["version"].as_str().unwrap()))
+            .collect()
+    }
+
+    async fn config(&self, key: &str, value: &str) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+             ON CONFLICT (repository_id, key) DO UPDATE SET value = $3",
+        )
+        .bind(self.repo_id)
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Mount the listing (no `updated_since`) and per-name version lists.
+    async fn upstream_serves(&self, entries: Vec<serde_json::Value>) {
+        Mock::given(method("GET"))
+            .and(path("/v0.1/servers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(entries.clone(), None)))
+            .mount(&self.upstream)
+            .await;
+        let mut by_name: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        for e in entries {
+            by_name
+                .entry(e["server"]["name"].as_str().unwrap().to_string())
+                .or_default()
+                .push(e);
+        }
+        for (name, list) in by_name {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v0.1/servers/{}/versions",
+                    urlencoding::encode(&name)
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(list, None)))
+                .mount(&self.upstream)
+                .await;
+        }
+    }
+
+    async fn teardown(self) {
+        for id in self.extra.iter().chain([&self.repo_id]) {
+            for sql in [
+                "DELETE FROM curation_packages WHERE staging_repo_id = $1",
+                "DELETE FROM oci_tags WHERE repository_id = $1",
+                "DELETE FROM packages WHERE repository_id = $1",
+                "DELETE FROM artifact_metadata WHERE artifact_id IN \
+                 (SELECT id FROM artifacts WHERE repository_id = $1)",
+                "DELETE FROM mcp_remote_sync_state WHERE repository_id = $1",
+                "DELETE FROM artifacts WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(id).execute(&self.pool).await;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+const T1: &str = "2026-10-01T00:00:00Z";
+const T2: &str = "2026-10-02T00:00:00Z";
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn deny_by_default_until_approved() {
+    let h = Harness::new(false).await;
+    h.upstream_serves(vec![entry(server("io.github.acme/weather", "1.0.0", "Weather"), T1)])
+        .await;
+    let summary = h.sync().await;
+    assert_eq!(summary["namesNew"], 1);
+    assert_eq!(summary["complete"], true);
+    let item = h.item("io.github.acme/weather").await;
+    assert_eq!(item["status"], "pending");
+    assert!(item["ingested"].as_array().unwrap().is_empty(), "not approved: not ingested");
+    assert!(h.listed_names().await.is_empty());
+    // A reader of the public repository: the unknown-name answer.
+    let (s, b) = h.read(None, "/servers/io.github.acme%2Fweather/versions/1.0.0").await;
+    assert_eq!((s, b.as_slice()), (StatusCode::NOT_FOUND, NOT_FOUND.as_bytes()));
+
+    // Approve: the version is ingested at once and served.
+    let id = item["id"].as_str().unwrap();
+    let (s, b) = h.admin_json("POST", &format!("/catalog/{id}/approve"), None).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b["ingestError"].is_null(), "{b}");
+    assert_eq!(h.listed_names().await, ["io.github.acme/weather@1.0.0"]);
+    let (s, b) = h.read(None, "/servers/io.github.acme%2Fweather/versions/latest").await;
+    assert_eq!(s, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    let source = &v["_meta"]["com.artifactkeeper.registry/source"];
+    assert_eq!(source["kind"], "upstream");
+    assert_eq!(source["origin"], h.upstream.uri());
+
+    // Reopen: held again, and the holder learns why.
+    let (s, _) = h.admin_json("POST", &format!("/catalog/{id}/reopen"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(h.listed_names().await.is_empty());
+    let (s, b) = h
+        .read(Some(h.admin.clone()), "/servers/io.github.acme%2Fweather/versions/1.0.0")
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["error"], "mcp_pending_review");
+    assert_eq!(v["gate"], "curation");
+    assert_eq!(v["review_id"], id);
+
+    // Writes on a Remote: 405.
+    let (s, _) = h
+        .call(
+            Some(h.admin.clone()),
+            "POST",
+            &format!("/mcp/{}/v0.1/publish", h.key),
+            Some(server("io.github.acme/x", "1.0.0", "X")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
+    h.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn bulk_namespace_approve_and_deny_wins() {
+    let h = Harness::new(false).await;
+    h.upstream_serves(vec![
+        entry(server("io.github.acme/a", "1.0.0", "A"), T1),
+        entry(server("io.github.acme/b", "1.0.0", "B"), T1),
+        entry(server("io.github.acme/evil", "1.0.0", "Evil"), T1),
+        entry(server("com.other/c", "1.0.0", "C"), T1),
+    ])
+    .await;
+    h.config("mcp_server_deny", r#"["*/evil"]"#).await;
+    h.sync().await;
+    let (s, b) = h
+        .admin_json(
+            "POST",
+            "/catalog/bulk-approve",
+            Some(serde_json::json!({"pattern": "io.github.acme"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["approved"], 2);
+    assert_eq!(b["skippedDenied"], 1);
+    // The background ingest and the next sync converge.
+    h.sync().await;
+    assert_eq!(
+        h.listed_names().await,
+        ["io.github.acme/a@1.0.0", "io.github.acme/b@1.0.0"]
+    );
+    // Deny wins over an explicit approval.
+    let evil = h.item("io.github.acme/evil").await;
+    assert_eq!(evil["denied"], true);
+    let id = evil["id"].as_str().unwrap();
+    let (s, _) = h.admin_json("POST", &format!("/catalog/{id}/approve"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    // A denied name is never even ingested.
+    assert!(h.item("io.github.acme/evil").await["ingested"].as_array().unwrap().is_empty());
+    let (s, b) = h
+        .read(Some(h.admin.clone()), "/servers/io.github.acme%2Fevil/versions/1.0.0")
+        .await;
+    assert_eq!((s, b.as_slice()), (StatusCode::NOT_FOUND, NOT_FOUND.as_bytes()));
+    h.sync().await;
+    assert!(!h.listed_names().await.iter().any(|n| n.contains("evil")));
+    // A glob added later hides what was approved and served.
+    h.config("mcp_server_deny", r#"["*/evil", "io.github.acme/b"]"#).await;
+    assert_eq!(h.listed_names().await, ["io.github.acme/a@1.0.0"]);
+    let (s, b) = h
+        .read(Some(h.admin.clone()), "/servers/io.github.acme%2Fb/versions/1.0.0")
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!((v["error"].as_str(), v["gate"].as_str()), (Some("mcp_rejected"), Some("curation")));
+    h.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn unevaluable_gate_fails_closed_with_503() {
+    // The Remote asks for an age gate but this instance has no age-gate
+    // service: the gate cannot be evaluated.
+    let h = Harness::new(false).await;
+    h.upstream_serves(vec![entry(server("io.github.acme/w", "1.0.0", "W"), T1)])
+        .await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme"]"#).await;
+    let summary = h.sync().await;
+    assert_eq!((summary["autoApproved"].as_u64(), summary["ingested"].as_u64()), (Some(1), Some(1)));
+    assert_eq!(h.listed_names().await.len(), 1);
+    sqlx::query(
+        "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 7, \
+         age_gate_mode = 'first_seen' WHERE id = $1",
+    )
+    .bind(h.repo_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    for auth in [None, Some(h.admin.clone())] {
+        let (s, b) = h.read(auth, "/servers/io.github.acme%2Fw/versions/1.0.0").await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["error"], "mcp_gate_unavailable");
+    }
+    assert!(h.listed_names().await.is_empty(), "listing fails closed");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'MCP_GATE_UNAVAILABLE' AND resource_id = $1",
+    )
+    .bind(h.repo_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(audited >= 1);
+    h.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn age_gate_first_seen_holds_server_versions() {
+    let h = Harness::new(true).await;
+    h.upstream_serves(vec![entry(server("io.github.acme/w", "1.0.0", "W"), T1)])
+        .await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme/*"]"#).await;
+    sqlx::query(
+        "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 7, \
+         age_gate_mode = 'first_seen' WHERE id = $1",
+    )
+    .bind(h.repo_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    h.sync().await;
+    assert!(h.listed_names().await.is_empty(), "first seen just now");
+    let (s, b) = h
+        .read(Some(h.admin.clone()), "/servers/io.github.acme%2Fw/versions/1.0.0")
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["error"], "mcp_age_gate_blocked");
+    assert_eq!(v["min_age_days"], 7);
+    assert!(v["review_id"].is_string(), "an exact read records the review");
+    // Old enough: served.
+    sqlx::query(
+        "UPDATE age_gate_version_observations SET first_seen_at = now() - interval '8 days' \
+         WHERE repository_id = $1",
+    )
+    .bind(h.repo_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(h.listed_names().await, ["io.github.acme/w@1.0.0"]);
+    let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+        .bind(h.repo_id)
+        .execute(&h.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM age_gate_version_observations WHERE repository_id = $1")
+        .bind(h.repo_id)
+        .execute(&h.pool)
+        .await;
+    h.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn content_drift_revokes_and_requeues() {
+    let h = Harness::new(false).await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme"]"#).await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param_is_missing("updated_since"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acme/w", "1.0.0", "Original"), T1)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    // The next pass asks only for what changed, and upstream edited 1.0.0.
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param("updated_since", T1))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acme/w", "1.0.0", "Rug pulled"), T2)],
+            None,
+        )))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    h.sync().await;
+    let (s, b) = h.read(None, "/servers/io.github.acme%2Fw/versions/1.0.0").await;
+    assert_eq!(s, StatusCode::OK);
+    let original: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(original["server"]["description"], "Original");
+
+    let summary = h.sync().await;
+    assert_eq!(summary["drifted"], 1, "{summary}");
+    assert!(h.listed_names().await.is_empty(), "approval revoked");
+    let (s, b) = h
+        .read(Some(h.admin.clone()), "/servers/io.github.acme%2Fw/versions/1.0.0")
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["hold"], "content_drift");
+    let item = h.item("io.github.acme/w").await;
+    let pin = &item["pins"][0];
+    assert_eq!(pin["status"], "review");
+    assert!(pin["contentDrift"]["upstreamSha256"].is_string());
+    // Re-approval serves the stored (original) document: write-once.
+    let (s, _) = h
+        .admin_json("POST", &format!("/catalog/{}/approve", pin["id"].as_str().unwrap()), None)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, b) = h.read(None, "/servers/io.github.acme%2Fw/versions/1.0.0").await;
+    let served: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(served["server"]["description"], "Original");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE resource_id = $1 ORDER BY created_at",
+    )
+    .bind(h.repo_id)
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    for a in ["MCP_SERVER_CONTENT_DRIFT", "MCP_SERVER_REOPENED", "MCP_MIRROR_SYNCED"] {
+        assert!(actions.iter().any(|x| x == a), "{a} in {actions:?}");
+    }
+    h.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn mirror_sync_pages_with_cursor_and_updated_since() {
+    let h = Harness::new(false).await;
+    h.config("mcp_remote_mode", "mirror").await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param_is_missing("cursor"))
+        .and(query_param_is_missing("updated_since"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("com.acme/a", "1.0.0", "A"), T1)],
+            Some("com.acme/a:1.0.0"),
+        )))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param("cursor", "com.acme/a:1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("com.acme/b", "2.0.0", "B"), T2)],
+            None,
+        )))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param("updated_since", T2))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(Vec::new(), None)))
+        .expect(1)
+        .mount(&h.upstream)
+        .await;
+    let first = h.sync().await;
+    assert_eq!((first["pages"].as_u64(), first["ingested"].as_u64()), (Some(2), Some(2)));
+    // Mirror mode ingests every name; serving is still curated.
+    assert!(h.listed_names().await.is_empty());
+    let (s, state) = h.admin_json("GET", "/sync", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(state["updatedSince"], "2026-10-02T00:00:00Z");
+    let second = h.sync().await;
+    assert_eq!(second["entries"], 0);
+    let (_, catalog) = h.admin_json("GET", "/catalog?limit=1", None).await;
+    assert_eq!(catalog["items"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["counts"]["pending"], 2);
+    let cursor = catalog["nextCursor"].as_str().unwrap();
+    let (_, next) = h.admin_json("GET", &format!("/catalog?limit=1&cursor={cursor}"), None).await;
+    assert_eq!(next["items"][0]["name"], "com.acme/b");
+    assert!(next["nextCursor"].is_null());
+    h.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn lookalike_names_route_to_review() {
+    let h = Harness::new(false).await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.*"]"#).await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param_is_missing("updated_since"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acme/filesystem", "1.0.0", "FS"), T1)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param("updated_since", T1))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acrne/filesystem", "1.0.0", "FS"), T2)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    h.sync().await;
+    assert_eq!(h.item("io.github.acme/filesystem").await["status"], "approved");
+    let summary = h.sync().await;
+    assert_eq!(summary["flagged"], 1);
+    let squat = h.item("io.github.acrne/filesystem").await;
+    assert_eq!(squat["status"], "review", "the flag overrides auto-approval");
+    assert_eq!(squat["flags"]["typosquat"]["similarTo"], "io.github.acme/filesystem");
+    assert_eq!(h.listed_names().await, ["io.github.acme/filesystem@1.0.0"]);
+    h.teardown().await;
+}
+
+/// An OCI backing repository holding `acme/mcp:latest` (an image index).
+async fn seed_latest_image(h: &mut Harness) -> String {
+    let id = Uuid::new_v4();
+    let key = format!("oci-local-{}", &id.to_string()[..8]);
+    let dir = format!("{}/oci-{id}", h.dir);
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format) \
+         VALUES ($1, $2, $2, $3, 'local', 'docker'::repository_format)",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(&dir)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    h.extra.push(id);
+    let child = "a".repeat(64);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                       "digest": format!("sha256:{child}"), "size": 1,
+                       "platform": {"os": "linux", "architecture": "amd64"}}],
+    }))
+    .unwrap();
+    let hex = artifact_keeper_backend::formats::mcp::sha256_hex(&body);
+    let digest = format!("sha256:{hex}");
+    let file = std::path::Path::new(&dir).join(format!(
+        "{}{digest}",
+        artifact_keeper_backend::storage::keys::OCI_MANIFEST_STORAGE_PREFIX
+    ));
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &body).unwrap();
+    sqlx::query(
+        "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
+         VALUES ($1, 'acme/mcp', 'latest', $2, 'application/vnd.oci.image.index.v1+json')",
+    )
+    .bind(id)
+    .bind(&digest)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    for (path, name, version, sha) in [
+        ("v2/acme/mcp/manifests/latest".to_string(), "acme/mcp", "latest".to_string(), hex.clone()),
+        (format!("v2/acme/mcp/manifests/sha256:{child}"), "acme/mcp", format!("sha256:{child}"), child.clone()),
+    ] {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, \
+             content_type, storage_key) VALUES ($1, $2, $3, $4, 1, $5, 'application/json', $2)",
+        )
+        .bind(id)
+        .bind(&path)
+        .bind(name)
+        .bind(version)
+        .bind(sha)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    h.config("mcp_package_repos", &serde_json::json!({"oci": key}).to_string())
+        .await;
+    digest
+}
+
+fn oci_server(name: &str, identifier: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name, "description": "Image", "version": "1.0.0",
+        "packages": [{"registryType": "oci", "identifier": identifier,
+                      "transport": {"type": "stdio"}}],
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn floating_oci_tags_are_pinned_and_warned_or_hidden() {
+    let mut h = Harness::new(false).await;
+    let digest = seed_latest_image(&mut h).await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme"]"#).await;
+    h.upstream_serves(vec![
+        entry(oci_server("io.github.acme/latest", "ghcr.io/acme/mcp:latest"), T1),
+        entry(oci_server("io.github.acme/tagless", "ghcr.io/acme/mcp"), T1),
+    ])
+    .await;
+    h.sync().await;
+    assert_eq!(
+        h.listed_names().await,
+        ["io.github.acme/latest@1.0.0", "io.github.acme/tagless@1.0.0"]
+    );
+    let (_, b) = h.read(None, "/servers/io.github.acme%2Flatest/versions/1.0.0").await;
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    let identifier = v["server"]["packages"][0]["identifier"].as_str().unwrap();
+    assert!(identifier.ends_with(&format!(":latest@{digest}")), "{identifier}");
+    let warnings: Vec<String> = sqlx::query_scalar(
+        "SELECT m.metadata->'packages'->0->'resolved'->'warnings'->>0 FROM artifacts a \
+         JOIN artifact_metadata m ON m.artifact_id = a.id WHERE a.repository_id = $1",
+    )
+    .bind(h.repo_id)
+    .fetch_all(&h.pool)
+    .await
+    .unwrap();
+    assert!(warnings.iter().all(|w| w == "oci_floating_tag"), "{warnings:?}");
+
+    // `hide`: a floating image is never pinned, so the version never serves.
+    h.config("mcp_oci_floating_tag_policy", "hide").await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0.1/servers/{}/versions",
+            urlencoding::encode("io.github.acme/hidden")
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(oci_server("io.github.acme/hidden", "ghcr.io/acme/mcp:latest"), T1)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    sqlx::query(
+        "INSERT INTO curation_packages (staging_repo_id, remote_repo_id, format, package_name, \
+         version, upstream_path, status) VALUES ($1, $1, 'mcp', 'io.github.acme/hidden', '*', 'x', 'pending')",
+    )
+    .bind(h.repo_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let item = h.item("io.github.acme/hidden").await;
+    let (s, _) = h
+        .admin_json("POST", &format!("/catalog/{}/approve", item["id"].as_str().unwrap()), None)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let item = h.item("io.github.acme/hidden").await;
+    assert_eq!(item["ingested"][0]["unresolved"][0]["error"], "mcp_oci_floating_tag");
+    assert!(!h.listed_names().await.iter().any(|n| n.contains("hidden")));
+    let (s, b) = h
+        .read(Some(h.admin.clone()), "/servers/io.github.acme%2Fhidden/versions/1.0.0")
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    assert_eq!(v["error"], "mcp_unresolvable");
+    h.teardown().await;
+}

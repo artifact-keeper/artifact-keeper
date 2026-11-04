@@ -567,6 +567,18 @@ static MAVEN_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
 /// age-gate support; the config endpoint rejects attempts to enable it.
+static MCP_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Mcp,
+    label: "mcp",
+    // A server version is write-once in AK: a Remote MCP registry never
+    // overwrites an ingested `name@version` (changed upstream bytes raise a
+    // content-drift hold instead), so a first sighting binds to fixed content.
+    immutable_coordinates: true,
+    // The upstream `publishedAt` is the upstream registry's claim; the gate
+    // trusts this instance's own clock (`first_seen`) only (#5253).
+    publish_time_resolver: false,
+};
+
 pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormatSpec> {
     match format {
         RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
@@ -582,6 +594,9 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         // handler. sbt has its own handler with no age-gate seam, so it stays
         // out (an entry without enforcement would accept a gate it ignores).
         RepositoryFormat::Maven | RepositoryFormat::Gradle => Some(&MAVEN_AGE_GATE_SPEC),
+        // Remote MCP registries gate server versions in the `/v0.1` read path
+        // (`services::mcp_curation`), not a download handler.
+        RepositoryFormat::Mcp => Some(&MCP_AGE_GATE_SPEC),
         _ => None,
     }
 }

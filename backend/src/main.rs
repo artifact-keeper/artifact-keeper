@@ -1228,6 +1228,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5253: hourly upstream sync of Remote MCP registries. Every replica
+    // ticks; a scheduler lease picks one per tick and a per-repository
+    // cluster lock keeps a manual trigger from overlapping a run.
+    artifact_keeper_backend::services::mcp_remote::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),
