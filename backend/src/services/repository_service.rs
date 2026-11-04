@@ -1008,6 +1008,7 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "gitlfs" => Some(RepositoryFormat::Gitlfs),
         "vscode" => Some(RepositoryFormat::Vscode),
         "jetbrains" => Some(RepositoryFormat::Jetbrains),
+        "agentplugins" => Some(RepositoryFormat::AgentPlugins),
         "huggingface" => Some(RepositoryFormat::Huggingface),
         "mlmodel" => Some(RepositoryFormat::Mlmodel),
         "cran" => Some(RepositoryFormat::Cran),

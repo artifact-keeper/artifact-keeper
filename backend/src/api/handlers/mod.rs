@@ -399,6 +399,7 @@ mod proxy_origin_policy_tests;
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;
+pub mod agent_plugins;
 pub mod alpine;
 pub mod analytics;
 pub mod ansible;

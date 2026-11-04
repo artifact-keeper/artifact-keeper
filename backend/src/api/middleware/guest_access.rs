@@ -305,6 +305,7 @@ fn defers_to_package_route(path: &str) -> bool {
         "/huggingface",
         "/mcp",
         "/jetbrains",
+        "/agentplugins",
         "/chef",
         "/puppet",
         "/ansible",

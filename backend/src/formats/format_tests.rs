@@ -65,6 +65,7 @@ mod tests {
         "opkg",
         "p2",
         "bazel",
+        "agentplugins",
         "mcp",
     ];
 
@@ -224,6 +225,7 @@ mod tests {
             ("opkg", RepositoryFormat::Opkg),
             ("p2", RepositoryFormat::P2),
             ("bazel", RepositoryFormat::Bazel),
+            ("agentplugins", RepositoryFormat::AgentPlugins),
             ("mcp", RepositoryFormat::Mcp),
         ];
 
@@ -886,6 +888,7 @@ mod tests {
             "opkg",
             "p2",
             "bazel",
+            "agentplugins",
             "mcp",
             "chef",
             "puppet",

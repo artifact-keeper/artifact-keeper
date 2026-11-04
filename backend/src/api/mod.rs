@@ -685,6 +685,14 @@ pub fn redact_token_path_segment(path: &str) -> std::borrow::Cow<'_, str> {
     let lead = &path[..path.len() - trimmed.len()];
     let (prefix, rest) = if let Some(rest) = trimmed.strip_prefix("t/") {
         ("t/", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("agentplugins/t/") {
+        // #5251: as for conda, the segment is a token whenever anything
+        // follows it (`/agentplugins/t/<TOKEN>/plugins` and `.../plugins/`
+        // included); `/agentplugins/t/<doc>` is a route of a repository `t`.
+        if !rest.contains('/') {
+            return Cow::Borrowed(path);
+        }
+        ("agentplugins/t/", rest)
     } else if let Some(rest) = trimmed.strip_prefix("conda/t/") {
         // A token channel needs a path after the token; without one the
         // segment is a route under a repository named `t`.
@@ -1146,6 +1154,32 @@ mod tests {
 
     #[test]
     fn test_redact_token_path_extra_leading_slashes() {
+        let result = redact_sensitive_params(
+            "/agentplugins/t/ak_secret123/plugins/claude-marketplace.json",
+            None,
+        );
+        assert_eq!(
+            result,
+            "/agentplugins/t/[REDACTED]/plugins/claude-marketplace.json"
+        );
+        let result = redact_sensitive_params("/agentplugins/t/marketplace.json", None);
+        assert_eq!(result, "/agentplugins/t/marketplace.json");
+        for (raw, redacted) in [
+            (
+                "/agentplugins/t/ak_secret123/plugins",
+                "/agentplugins/t/[REDACTED]/plugins",
+            ),
+            (
+                "/agentplugins/t/ak_secret123/plugins/",
+                "/agentplugins/t/[REDACTED]/plugins/",
+            ),
+            (
+                "/agentplugins/t/ak_secret123/",
+                "/agentplugins/t/[REDACTED]/",
+            ),
+        ] {
+            assert_eq!(redact_sensitive_params(raw, None), redacted, "{raw}");
+        }
         let result = redact_sensitive_params("//conda/t/ak_secret123/my-repo/", None);
         assert_eq!(result, "//conda/t/[REDACTED]/my-repo/");
     }

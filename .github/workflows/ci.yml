@@ -1223,6 +1223,7 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test agent_plugins_tests \
             --test admin_middleware_fresh_user_tests \
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
@@ -1305,6 +1306,7 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test agent_plugins_tests \
             --test admin_middleware_fresh_user_tests \
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \

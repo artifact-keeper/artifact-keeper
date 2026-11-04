@@ -83,7 +83,7 @@ finding: a rescan, a dedup copy and a promotion all keep it.
 | Part of the decision | What it means |
 | --- | --- |
 | The bytes | The artifact's SHA-256. A re-upload of the same bytes is covered; a new build under the same version is not. |
-| The repository | The finding's own repository, or the one named by `repository_id`, which must hold these bytes. If the finding's scan has copies in other repositories and `repository_id` is omitted, the request answers `409`: a scan listing reports a copy under its source's id, so the row may belong to a repository other than the one you are looking at. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, which takes an unrestricted credential and no repository-only grants, or a promotion carried the decision. |
+| The repository | The finding's own repository, or the one named by `repository_id`, which must hold these bytes. If the finding's scan has copies in other repositories and `repository_id` is omitted, the request answers `409`: a scan listing reports a copy under its source's id, so the row may belong to a repository other than the one you are looking at. The same bytes in another repository are not covered unless the request says `"scope": "all_repositories"`, which takes an unrestricted credential, or a promotion carried the decision. |
 | Advisory, component, component version, finding class | A new CVE, or the same CVE on another component or version, stays open. The engine that reported it does not matter: one decision covers every engine reporting the same component. |
 | Severity | The severity of the row acknowledged. If the finding is re-graded above it, it reopens. Acknowledging it again accepts the new severity. |
 | `expires_at` (optional) | The finding reopens at this time, with no further action. Without it, the decision lasts until revoked. |
@@ -111,14 +111,13 @@ whether the verdict travelled and why not. A clean verdict keeps dedup's 1-day
 limit, so an artifact that soaked in staging for longer than that arrives with no
 verdict, and a target with `block_unscanned` refuses it until it is scanned there.
 
-Who may decide: an instance administrator with an unrestricted credential, in any
-repository. A credential scoped to some repositories, only inside them. An
-administrator holding repository grants and no instance-wide role, only where they
-hold a grant, public repositories included. That last rule guards against deciding by
-mistake for a repository someone else looks after. It is not tenant isolation. Every
-path that decides applies the same check.
-`GET /api/v1/security/acknowledgements` lists decisions for callers who may act
-everywhere, and `include_inactive=true` adds expired and revoked ones.
+Who may decide: an instance administrator. An unrestricted credential reaches every
+repository, whatever repository roles its owner holds, and a credential scoped to some
+repositories reaches only those. A non-administrator cannot decide. Every path that
+decides applies the same check. A decision for every repository needs an unrestricted
+credential.
+`GET /api/v1/security/acknowledgements` lists decisions for an unrestricted
+credential, and `include_inactive=true` adds expired and revoked ones.
 
 `GET /api/v1/security/scans/{id}/findings?artifact_id=` lists one artifact's own rows
 of a reused scan. A caller who can see only a copy gets the copy's rows without it.

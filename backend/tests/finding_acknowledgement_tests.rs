@@ -1951,51 +1951,6 @@ async fn a_scoped_credential_stays_inside_its_scope() {
     fx.cleanup().await;
 }
 
-/// An admin holding grants elsewhere and none here does not decide for this
-/// private repository.
-#[tokio::test]
-#[ignore]
-async fn a_grant_bound_admin_cannot_decide_outside_its_grants() {
-    let mut fx = Fx::new().await;
-    let repo = fx.repo().await;
-    sqlx::query("UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1")
-        .bind(repo)
-        .execute(&fx.pool)
-        .await
-        .expect("private");
-    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
-    let scan = fx
-        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
-        .await;
-    let tenant_admin = bound_admin(&fx).await;
-    let id = fx.finding_ids(scan).await[0];
-    let refused = fx
-        .svc
-        .acknowledge_finding(
-            id,
-            &AckActor::new(tenant_admin, AccessScope::Admin),
-            "not mine",
-            Default::default(),
-        )
-        .await;
-    assert!(
-        matches!(refused, Err(AppError::Authorization(_))),
-        "{refused:?}"
-    );
-    assert!(!fx.allowed(repo, artifact).await);
-    sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
-        .bind(tenant_admin)
-        .execute(&fx.pool)
-        .await
-        .expect("remove grant");
-    sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(tenant_admin)
-        .execute(&fx.pool)
-        .await
-        .expect("remove tenant admin");
-    fx.cleanup().await;
-}
-
 #[tokio::test]
 #[ignore]
 async fn the_audit_trail_names_the_ceiling_and_records_a_supersede() {
@@ -2110,28 +2065,30 @@ async fn the_backfill_does_not_share_a_transaction_with_any_blocking_ddl() {
 // Authority
 // ---------------------------------------------------------------------------
 
-/// An `is_admin` user with one repository grant and no instance-wide role: what
-/// this codebase calls a tenant admin. The grant is on a repository of its own.
-async fn bound_admin(fx: &Fx) -> Uuid {
+/// The shape creating a repository leaves: an `is_admin` user with repository-scoped
+/// roles on what it created and no instance-wide role.
+async fn admin_holding_repository_roles(fx: &Fx, created: Uuid) -> Uuid {
     let id = plain_admin(fx).await;
-    let own: Uuid = sqlx::query_scalar(
-        "INSERT INTO repositories (key, name, storage_path, repo_type, format) \
-         VALUES ($1, $1, $2, 'local', 'generic') RETURNING id",
-    )
-    .bind(format!("ack-tenant-{id}"))
-    .bind(format!("/tmp/ack-tenant-{id}"))
-    .fetch_one(&fx.pool)
-    .await
-    .expect("own repository");
     sqlx::query(
         "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-         SELECT $1, r.id, $2 FROM roles r WHERE r.name = 'admin'",
+         SELECT $1, r.id, $2 FROM roles r WHERE r.name IN ('repository-owner', 'developer')",
     )
     .bind(id)
-    .bind(own)
+    .bind(created)
     .execute(&fx.pool)
     .await
-    .expect("repository grant");
+    .expect("repository roles");
+    let (instance_wide, on_repositories): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) FILTER (WHERE repository_id IS NULL), \
+                COUNT(*) FILTER (WHERE repository_id IS NOT NULL) \
+         FROM role_assignments WHERE user_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("roles");
+    assert_eq!(instance_wide, 0);
+    assert!(on_repositories > 0);
     id
 }
 
@@ -2193,45 +2150,6 @@ async fn an_admin_with_no_role_row_can_decide_and_withdraw_on_a_private_reposito
         )
         .await
         .expect("an unbound admin can decide for every repository");
-    fx.cleanup().await;
-}
-
-#[tokio::test]
-#[ignore]
-async fn public_read_access_is_not_authority_to_decide() {
-    let mut fx = Fx::new().await;
-    let repo = fx.repo().await;
-    sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
-        .bind(repo)
-        .execute(&fx.pool)
-        .await
-        .expect("public");
-    let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
-    let scan = fx
-        .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
-        .await;
-    let id = fx.finding_ids(scan).await[0];
-    fx.ack_scan(scan).await;
-    let tenant_admin = AckActor::new(bound_admin(&fx).await, AccessScope::Admin);
-    let revoke = fx.svc.revoke_acknowledgment(id, None, &tenant_admin).await;
-    assert!(
-        matches!(revoke, Err(AppError::Authorization(_))),
-        "{revoke:?}"
-    );
-    assert!(fx.allowed(repo, artifact).await, "the decision stands");
-    fx.svc
-        .revoke_acknowledgment(id, None, &fx.actor())
-        .await
-        .expect("revoke");
-    let decide = fx
-        .svc
-        .acknowledge_finding(id, &tenant_admin, "not mine", Default::default())
-        .await;
-    assert!(
-        matches!(decide, Err(AppError::Authorization(_))),
-        "{decide:?}"
-    );
-    assert!(!fx.allowed(repo, artifact).await);
     fx.cleanup().await;
 }
 
@@ -2899,5 +2817,167 @@ async fn a_lower_ceiling_live_in_the_target_keeps_the_gate_shut() {
         !fx.allowed(rig.target_repo, rig.target_artifact).await,
         "agrees"
     );
+    fx.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// An administrator's reach
+// ---------------------------------------------------------------------------
+
+/// #5250: what repository roles an administrator holds does not narrow where they
+/// may decide, on a repository they created or one they did not.
+#[tokio::test]
+#[ignore]
+async fn an_admin_holding_repository_roles_decides_everywhere() {
+    let mut fx = Fx::new().await;
+    let created = fx.repo().await;
+    let other = fx.repo().await;
+    make_private(&fx, other).await;
+    let id = admin_holding_repository_roles(&fx, created).await;
+    let admin = AckActor::new(id, AccessScope::Admin);
+
+    for repo in [created, other] {
+        let artifact = fx.artifact(repo, "a.tgz", &digest()).await;
+        let scan = fx
+            .scan(repo, artifact, "dependency", &[finding(CVE_A, LODASH, "1")])
+            .await;
+        let finding_id = fx.finding_ids(scan).await[0];
+        fx.svc
+            .acknowledge_finding(finding_id, &admin, "accepted", Default::default())
+            .await
+            .expect("decide");
+        assert!(fx.allowed(repo, artifact).await);
+        fx.svc
+            .revoke_acknowledgment(finding_id, None, &admin)
+            .await
+            .expect("withdraw");
+        assert!(!fx.allowed(repo, artifact).await);
+
+        let every = AcknowledgeOptions {
+            scope: AcknowledgementScope::AllRepositories,
+            ..Default::default()
+        };
+        fx.svc
+            .acknowledge_finding(finding_id, &admin, "everywhere", every)
+            .await
+            .expect("decide for every repository");
+        assert!(fx.allowed(repo, artifact).await);
+        fx.svc
+            .revoke_acknowledgment(finding_id, None, &admin)
+            .await
+            .expect("withdraw for every repository");
+        assert!(!fx.allowed(repo, artifact).await);
+    }
+    fx.cleanup().await;
+}
+
+/// A revoke by such an administrator reaches the whole lineage, including the
+/// copy in a repository they hold no role on.
+#[tokio::test]
+#[ignore]
+async fn an_admin_holding_repository_roles_revokes_a_whole_lineage() {
+    let mut fx = Fx::new().await;
+    let created = fx.repo().await;
+    let other = fx.repo().await;
+    make_private(&fx, other).await;
+    let admin = AckActor::new(
+        admin_holding_repository_roles(&fx, created).await,
+        AccessScope::Admin,
+    );
+    let d = digest();
+    let original = fx.artifact(created, "a.tgz", &d).await;
+    let scan = fx
+        .scan(
+            created,
+            original,
+            "dependency",
+            &[finding(CVE_A, LODASH, "1")],
+        )
+        .await;
+    let finding_id = fx.finding_ids(scan).await[0];
+    fx.svc
+        .acknowledge_finding(finding_id, &admin, "accepted", Default::default())
+        .await
+        .expect("decide");
+    let promoted = fx.artifact(other, "a.tgz", &d).await;
+    carry(&fx, original, promoted).await.expect("carry");
+    assert!(fx.allowed(other, promoted).await);
+
+    let withdrawn = fx
+        .svc
+        .revoke_acknowledgment(finding_id, Some(created), &admin)
+        .await
+        .expect("revoke");
+    assert_eq!(withdrawn.acknowledgements_left_effective, Some(0));
+    assert!(!fx.allowed(created, original).await);
+    assert!(!fx.allowed(other, promoted).await);
+    fx.cleanup().await;
+}
+
+/// The same administrator on a credential restricted to one repository stays there.
+#[tokio::test]
+#[ignore]
+async fn a_restricted_credential_stays_limited_whatever_roles_its_owner_holds() {
+    let mut fx = Fx::new().await;
+    let created = fx.repo().await;
+    let other = fx.repo().await;
+    let id = admin_holding_repository_roles(&fx, created).await;
+    let restricted = AckActor::new(id, AccessScope::Restricted(vec![created]));
+    let in_scope = fx.artifact(created, "a.tgz", &digest()).await;
+    let scan = fx
+        .scan(
+            created,
+            in_scope,
+            "dependency",
+            &[finding(CVE_A, LODASH, "1")],
+        )
+        .await;
+    let out_of_scope = fx.artifact(other, "a.tgz", &digest()).await;
+    let other_scan = fx
+        .scan(
+            other,
+            out_of_scope,
+            "dependency",
+            &[finding(CVE_A, LODASH, "1")],
+        )
+        .await;
+
+    let elsewhere = fx
+        .svc
+        .acknowledge_finding(
+            fx.finding_ids(other_scan).await[0],
+            &restricted,
+            "no",
+            Default::default(),
+        )
+        .await;
+    assert!(
+        matches!(elsewhere, Err(AppError::NotFound(_))),
+        "{elsewhere:?}"
+    );
+    assert!(!fx.allowed(other, out_of_scope).await);
+
+    let finding_id = fx.finding_ids(scan).await[0];
+    let every = fx
+        .svc
+        .acknowledge_finding(
+            finding_id,
+            &restricted,
+            "no",
+            AcknowledgeOptions {
+                scope: AcknowledgementScope::AllRepositories,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(every, Err(AppError::Authorization(_))),
+        "{every:?}"
+    );
+    fx.svc
+        .acknowledge_finding(finding_id, &restricted, "here", Default::default())
+        .await
+        .expect("inside the credential");
+    assert!(fx.allowed(created, in_scope).await);
     fx.cleanup().await;
 }

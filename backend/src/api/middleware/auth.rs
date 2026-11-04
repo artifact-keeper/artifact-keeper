@@ -2177,6 +2177,14 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
             segments.next(); // "<TOKEN>"
         }
     }
+    // Agent Plugins token-in-path routes (#5251, D8) put the credential in
+    // front of the repository key: `/agentplugins/t/<TOKEN>/<repo_key>/...`.
+    // The format refuses `t` as a repository key, so the pair is skipped only
+    // when a repository key and a document follow the token.
+    if format == "agentplugins" && agentplugins_url_token(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     // WASM plugin proxy routes are nested as
     //   /ext/<format_key>/<repo_key>/...
     // so the repository key is the THIRD path segment, not the second
@@ -2248,6 +2256,22 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     // a repository fail with 401 for an *invalid credential* it never sent.
     // Same shape test `extract_repo_key` applies to the matching skip.
     segments.next()?;
+    Some(token)
+}
+
+/// Extract the credential from an Agent Plugins token-in-path URL,
+/// `agentplugins/t/<TOKEN>/<repo_key>/<document...>` (leading `/` already
+/// trimmed, #5251). Claude Code cannot attach a header to a marketplace it
+/// adds from a URL, so a private repository is read with a repository-scoped
+/// token in the path, the pattern conda's token channels use. `None` unless
+/// the token, the repository key and at least one more segment are present.
+pub(crate) fn agentplugins_url_token(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("agentplugins/t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let (repo_key, document) = rest.split_once('/')?;
+    if token.is_empty() || repo_key.is_empty() || document.is_empty() {
+        return None;
+    }
     Some(token)
 }
 
@@ -2335,6 +2359,9 @@ pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> 
         return extracted;
     }
     if let Some(token) = extract_conda_url_token(request.uri().path()) {
+        return ExtractedToken::ApiKey(token);
+    }
+    if let Some(token) = agentplugins_url_token(request.uri().path().trim_start_matches('/')) {
         return ExtractedToken::ApiKey(token);
     }
     if let Some(token) = extract_nuget_push_api_key(request) {
@@ -3570,6 +3597,43 @@ mod tests {
             .unwrap();
         let result = extract_token(&request);
         assert!(matches!(result, ExtractedToken::ApiKey("token-xyz")));
+    }
+
+    #[test]
+    fn agentplugins_token_path_resolves_repo_and_token_5251() {
+        let p = "/agentplugins/t/ak_tok/plugins/claude-marketplace.json";
+        assert_eq!(extract_repo_key(p), "plugins");
+        assert_eq!(
+            agentplugins_url_token(p.trim_start_matches('/')),
+            Some("ak_tok")
+        );
+        assert_eq!(
+            extract_repo_key("/agentplugins/t/tok/plugins/p/1.0.0/p-1.0.0.zip"),
+            "plugins"
+        );
+        // The plain routes keep the second segment.
+        assert_eq!(
+            extract_repo_key("/agentplugins/plugins/marketplace.json"),
+            "plugins"
+        );
+        for not_token in [
+            "agentplugins/t/tok/plugins",
+            "agentplugins/t/tok/plugins/",
+            "agentplugins/t//plugins/x",
+            "agentplugins/t/tok//x",
+            "agentplugins/plugins/x/y",
+            "conda/t/tok/plugins/x",
+        ] {
+            assert_eq!(agentplugins_url_token(not_token), None, "{not_token}");
+        }
+        let request = Request::builder()
+            .uri("/agentplugins/t/url-token-9/plugins/marketplace.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("url-token-9")
+        ));
     }
 
     #[test]

@@ -940,8 +940,9 @@ pub struct ListAcknowledgementsQuery {
 pub struct RevokeResponse {
     /// Decisions revoked.
     pub revoked: usize,
-    /// Copies of the decision that stay effective, in repositories this credential
-    /// has no authority over.
+    /// Decisions still in force on this finding that the revoke did not undo: copies
+    /// in repositories this credential does not cover and separate decisions for every
+    /// repository. Lapsed decisions are not counted.
     pub left_effective: i64,
 }
 
@@ -10278,6 +10279,113 @@ mod tests {
         for repo in [prod, dev] {
             tdh::cleanup_member_repo(&pool, repo, &std::env::temp_dir().join("none")).await;
         }
+    }
+
+    /// #5250: the built-in admin holds roles on the repositories it created and no
+    /// instance-wide role. That does not narrow what it may do here, a credential
+    /// restricted to some repositories stays there, and a non-admin stays refused.
+    #[tokio::test]
+    async fn test_an_admin_holding_repository_roles_over_http_5250() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+        use axum::http::StatusCode;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let pool = fx.pool.clone();
+        let (created, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_role(&pool, created, fx.user_id, "developer").await;
+        sqlx::query(
+            "UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&pool)
+        .await
+        .expect("private");
+        let artifact = Uuid::new_v4();
+        let path = format!("r5250/{artifact}");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+        )
+        .bind(artifact)
+        .bind(fx.repo_id)
+        .bind(&path)
+        .bind(format!("{:064x}", artifact.as_u128()))
+        .execute(&pool)
+        .await
+        .expect("artifact");
+        let scan: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+        )
+        .bind(artifact)
+        .bind(fx.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("scan");
+        let finding: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                        affected_component, affected_version) \
+             VALUES ($1, $2, 'high', 't', 'CVE-2031-5250', 'lodash', '4') RETURNING id",
+        )
+        .bind(scan)
+        .bind(artifact)
+        .fetch_one(&pool)
+        .await
+        .expect("finding");
+
+        let mut admin = tdh::make_auth(fx.user_id, &fx.username);
+        admin.is_admin = true;
+        let mut restricted = admin.clone();
+        restricted.allowed_repo_ids = AccessScope::Restricted(vec![created]);
+        let plain = tdh::make_auth(fx.user_id, &fx.username);
+        let acknowledge = format!("/findings/{finding}/acknowledge");
+        let every = serde_json::json!({ "reason": "accepted", "scope": "all_repositories" });
+
+        let (status, body) =
+            security_call(&fx.state, &admin, "GET", "/acknowledgements", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for refused in [&restricted, &plain] {
+            let (status, _) =
+                security_call(&fx.state, refused, "GET", "/acknowledgements", None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        // Not in a repository this user created, and for every repository.
+        let (status, _) =
+            security_call(&fx.state, &plain, "POST", &acknowledge, Some(every.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = security_call(
+            &fx.state,
+            &restricted,
+            "POST",
+            &acknowledge,
+            Some(every.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) =
+            security_call(&fx.state, &admin, "POST", &acknowledge, Some(every)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let decision = body["acknowledgement_id"]
+            .as_str()
+            .expect("decision")
+            .to_string();
+
+        let by_id = format!("/acknowledgements/{decision}");
+        for refused in [&restricted, &plain] {
+            let (status, _) = security_call(&fx.state, refused, "DELETE", &by_id, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let (status, body) = security_call(&fx.state, &admin, "DELETE", &by_id, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revoked"], 1);
+        assert_eq!(body["left_effective"], 0);
+
+        tdh::cleanup_member_repo(&pool, created, &std::env::temp_dir().join("none")).await;
+        fx.teardown().await;
     }
 
     #[test]

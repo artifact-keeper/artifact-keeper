@@ -701,6 +701,7 @@ have no core proxy path to gate.
 | `protobuf` | `protobuf` | accepted | |
 | `incus` | `incus`, `lxc` | accepted | |
 | `pacman` | `pacman` | accepted | |
+| `agentplugins` | `agentplugins` | accepted | Hosted only: there is no proxied download to gate. Uploads are scanned on publish. |
 | `mcp` | `mcp` | accepted | |
 <!-- coverage-table:end -->
 

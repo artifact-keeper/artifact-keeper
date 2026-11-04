@@ -1,5 +1,6 @@
 //! Package format handlers.
 
+pub mod agent_plugins;
 pub mod alpine;
 pub mod ansible;
 pub mod bazel;
@@ -144,6 +145,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
         "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
+        "agentplugins" => Some(Box::new(agent_plugins::AgentPluginsHandler::new())),
         "mcp" => Some(Box::new(mcp::McpHandler::new())),
         _ => None,
     }
@@ -210,6 +212,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
         RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
+        RepositoryFormat::AgentPlugins => Box::new(agent_plugins::AgentPluginsHandler::new()),
         RepositoryFormat::Mcp => Box::new(mcp::McpHandler::new()),
     }
 }
@@ -425,6 +428,7 @@ fn core_handler_metadata(
             &[".vsix"],
         ),
         "jetbrains" => ("JetBrains Plugins", "JetBrains IDE plugins", &[".zip"]),
+        "agentplugins" => ("Agent Plugins", "AI coding-agent plugin bundles", &[".zip"]),
         "huggingface" => ("Hugging Face", "Hugging Face models and datasets", &[]),
         "mlmodel" => ("ML Models", "Machine-learning model artifacts", &[]),
         "cran" => ("CRAN", "R packages", &[".tar.gz"]),
