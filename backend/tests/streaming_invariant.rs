@@ -105,6 +105,13 @@ use std::path::{Path, PathBuf};
 /// PUT waits for it and is answered with the completion's own response, read
 /// once under a 64 KiB bound (an empty 201 or a small OCI error document,
 /// never blob bytes). oci_v2.rs 1 -> 2, total 31 -> 32.
+///
+/// #5253: the MCP registry's package resolver fills a missing package of a
+/// Remote backing repository by calling that repository's own handler in
+/// process and, for the metadata documents it pins from (an npm packument, a
+/// PyPI JSON index, ...), reads the answer once under `FILL_JSON_MAX` (8 MiB).
+/// Artifact bodies on the same path are drained frame by frame, never
+/// buffered. New file mcp_resolver.rs: 1, total 32 -> 33.
 const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/handlers/conda/merge_gate.rs", 1),
     ("src/api/handlers/goproxy.rs", 1),
@@ -115,6 +122,7 @@ const ALLOWLIST: &[(&str, usize)] = &[
     ("src/api/middleware/rate_limit.rs", 2),
     ("src/main.rs", 1),
     ("src/services/artifactory_client.rs", 1),
+    ("src/services/mcp_resolver.rs", 1),
     ("src/services/nexus_client.rs", 1),
     ("src/services/scheduler_service.rs", 3),
     ("src/storage/azure.rs", 4),
@@ -470,15 +478,16 @@ fn streaming_invariant_exempt_sites_match_allowlist() {
 
     let total: usize = actual_marks.values().sum();
     assert_eq!(
-        total, 32,
-        "expected 32 exempt sites after #1608 Phase 4b + #2491 reconciliation \
+        total, 33,
+        "expected 33 exempt sites after #1608 Phase 4b + #2491 reconciliation \
          + PF-005 (#2517) generic multipart streaming (repositories.rs -2) \
          + RPM curation-sync reconciliation (scheduler_service.rs +1) \
          + packument HTTP caching (#3052, npm.rs +1) \
          + the #3392 npm virtual-merge rework (npm.rs -1, reconciled by #3494) \
          + the /v2/token form peek (#4020, rate_limit.rs +1) \
          + the virtual conda merge error replay (#4608, merge_gate.rs +1) \
-         + the OCI completion retry replay (#4902, oci_v2.rs +1); \
+         + the OCI completion retry replay (#4902, oci_v2.rs +1) \
+         + the MCP resolver's capped metadata read (#5253, mcp_resolver.rs +1); \
          got {total}"
     );
 }
