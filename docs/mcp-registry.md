@@ -187,6 +187,11 @@ EOF
 mcp-publisher publish
 ```
 
+When a package is still being filled into a Remote backing repository,
+publish answers `202 resolving` and `mcp-publisher` prints that as an error
+although the version was stored. Do not run it again; see [Packages in a
+Remote backing repository](#packages-in-a-remote-backing-repository).
+
 Names follow the schema (`namespace/name`, 3 to 200 characters). The
 `io.modelcontextprotocol` namespace and its sub-namespaces (including
 `io.modelcontextprotocol.anonymous`) are reserved and refused with `403`. A
@@ -703,8 +708,15 @@ artifact metadata API carry it), under `resolution`:
 ```
 
 Note: `mcp-publisher publish` accepts only `200`/`201` and prints a `202` as an
-error even though the publish was stored; pull packages through the Remote
-first (then publish answers `200`), or use `curl`.
+error even though the publish was stored and is being resolved. Do not run it
+again: while the version is resolving, and for ever once it resolved, a second
+publish of the same `name@version` is `409 mcp_version_exists`. Follow the
+version instead (a holder's exact read answers `404 mcp_resolving` until it
+is served, then `200`; `resolution` in the version's metadata has the state),
+and republish only after it **failed**, which releases the version number.
+To get a plain `200`, pull the packages through the Remote first, call
+`POST /validate` and publish when every package reports `outcome: pinned`, or
+publish with `curl`.
 
 ### Tombstones
 
