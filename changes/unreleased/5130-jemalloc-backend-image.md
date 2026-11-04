@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5130]
+---
+- **The published backend image now builds with jemalloc, so bursts of proxy downloads no longer grow RSS until the container is OOM-killed** (#5130). The image is UBI 9/glibc, whose malloc keeps freed memory in per-thread arenas: a proxy-only mirror serving bursts of concurrent Maven downloads went from 77 MiB to 3919 MiB and stayed there while idle, then was killed at its 4 GiB limit. Both compiling stages of `docker/Dockerfile.backend` now default to `CARGO_FEATURES=jemalloc`, and `docker-publish.yml` passes it explicitly; jemalloc returns freed pages after its decay interval instead of holding every arena warm. Source builds use `cargo build --release --features jemalloc`; a glibc build that cannot switch can set `MALLOC_ARENA_MAX=2` as a mitigation. Sizing, verification and the allocator's effect on idle RSS are in `docs/operations/backend-memory-allocator.md`.

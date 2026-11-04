@@ -3606,6 +3606,67 @@ mod tests {
         }
     }
 
+    /// #5130: the shipped backend image runs on UBI 9/glibc, whose malloc
+    /// keeps freed memory in per-thread arenas. A proxy-only mirror serving
+    /// bursts of concurrent Maven downloads grew RSS from 77 MiB to 3919 MiB,
+    /// stayed flat while idle, and was OOM-killed at its 4 GiB limit. The
+    /// image therefore builds the backend with jemalloc, whose decay returns
+    /// freed pages instead of holding every arena warm.
+    ///
+    /// Both compiling stages declare `ARG CARGO_FEATURES`, and the cook and
+    /// the build must agree or the cooked dependencies are not reused. Pin
+    /// every declaration, and pin the workflow's explicit build arg: its
+    /// value overrides the Dockerfile default, so dropping it would ship the
+    /// system allocator again while the Dockerfile still looked fixed.
+    #[test]
+    fn backend_image_builds_with_jemalloc_5130() {
+        let dockerfile = include_str!("../../docker/Dockerfile.backend");
+        let values: Vec<&str> = dockerfile
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("ARG CARGO_FEATURES="))
+            .map(|value| value.trim_matches('"'))
+            .collect();
+        assert_eq!(
+            values.len(),
+            2,
+            "docker/Dockerfile.backend must declare ARG CARGO_FEATURES in \
+             both the deps and builder stages, found {values:?}"
+        );
+        assert!(
+            values.iter().all(|features| *features == "jemalloc"),
+            "docker/Dockerfile.backend must build with jemalloc (#5130); \
+             found CARGO_FEATURES={values:?}. glibc's malloc retains freed \
+             proxy-download buffers per thread, so bursts against a Maven \
+             remote grow RSS until the container is OOM-killed and do not \
+             release it while idle. See \
+             docs/operations/backend-memory-allocator.md."
+        );
+        assert!(
+            dockerfile
+                .matches(r#"--features "$CARGO_FEATURES""#)
+                .count()
+                >= 2,
+            "docker/Dockerfile.backend declares CARGO_FEATURES but no longer \
+             passes it to both cargo invocations; the jemalloc feature would \
+             not reach the binary (#5130)"
+        );
+
+        let workflow = include_str!("../../.github/workflows/docker-publish.yml");
+        let backend_job = workflow
+            .split_once("\n  build-backend:\n")
+            .and_then(|(_, rest)| rest.split_once("\n  build-openscap:\n"))
+            .map(|(backend, _)| backend)
+            .expect("docker-publish.yml must define build-backend before build-openscap");
+        assert!(
+            backend_job.contains("CARGO_FEATURES=jemalloc"),
+            "docker-publish.yml's build-backend job must pass \
+             CARGO_FEATURES=jemalloc (#5130). Its build args override the \
+             Dockerfile default, so omitting it publishes a glibc-malloc \
+             image that retains freed proxy-download memory."
+        );
+    }
+
     #[test]
     fn secret_env_present_checks_both_forms() {
         env::remove_var("TEST_SECRET_4142");
