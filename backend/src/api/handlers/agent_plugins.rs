@@ -1218,7 +1218,9 @@ mod tests {
 
     /// The production composition: the router nested at `/agentplugins`
     /// under `repo_visibility_middleware`, so path tokens are really
-    /// validated.
+    /// validated, with the global `security_headers_middleware` outermost as
+    /// `main.rs` applies it to the whole app, so the headers asserted are
+    /// the ones a client receives (#5259).
     fn full_stack(state: &crate::api::SharedState) -> Router {
         use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
         let vis = RepoVisibilityState {
@@ -1236,6 +1238,9 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 vis,
                 repo_visibility_middleware,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::security_headers::security_headers_middleware,
             ))
             .with_state(state.clone())
     }
@@ -1347,6 +1352,9 @@ mod tests {
 
         assert_eq!(ok, StatusCode::OK);
         assert_eq!(headers[CACHE_CONTROL], "private, no-store");
+        // Through the global security-headers layer the route's stricter
+        // policy must survive, not be replaced by the default (#5259).
+        assert_eq!(headers["x-frame-options"], "DENY", "global layer ran");
         assert_eq!(headers["referrer-policy"], "no-referrer");
         let doc: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
