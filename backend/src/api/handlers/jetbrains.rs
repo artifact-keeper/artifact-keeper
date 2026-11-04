@@ -1191,6 +1191,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 
@@ -1563,6 +1564,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(info.repo_type, "hosted");
         assert!(info.upstream_url.is_none());

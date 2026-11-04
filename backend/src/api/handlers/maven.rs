@@ -284,6 +284,7 @@ async fn resolve_maven_repo(
                     age_gate_mode: entry.age_gate_mode.clone(),
                     curation_enabled: entry.curation_enabled,
                     curation_default_action: entry.curation_default_action.clone(),
+                    allow_overwrite: false,
                 });
             }
         }
@@ -5905,6 +5906,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.repo_type, "hosted");
@@ -5926,6 +5928,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(

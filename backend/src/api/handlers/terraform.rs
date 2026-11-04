@@ -4145,6 +4145,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(info.id, id);
         assert_eq!(info.storage_path, "/data/terraform");
@@ -4171,6 +4172,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert!(info.upstream_url.is_none());
     }

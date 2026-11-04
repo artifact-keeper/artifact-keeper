@@ -4642,7 +4642,7 @@ async fn persist_debian_upload(
     .await
     .map_err(crate::api::handlers::db_err)?;
 
-    if existing.is_some() {
+    if existing.is_some() && !repo.allow_overwrite {
         return Err((StatusCode::CONFLICT, "Package already exists").into_response());
     }
 
