@@ -361,3 +361,145 @@ change the locked setting (`403`).
 ## Virtual repositories
 
 (Filled in by the Virtual workstream.)
+
+## Lint and health
+
+### The lint
+
+Every server version is linted (`McpLintScanner`, offline and
+deterministic: no network, no model). The lint reads the stored server.json
+(`title`, `description`, every package's `runtimeArguments`,
+`packageArguments`, `environmentVariables` and transport `headers`, every
+remote's `url`, `headers` and `variables`), the tools the publisher declares
+in `_meta` (`com.artifactkeeper/capabilities.tools`, directly or inside
+`io.modelcontextprotocol.registry/publisher-provided`), the tools of stored
+MCPB bundles (`metadata.bundles[*].manifest.tools`), the OCI pins and image
+labels, and the `statusMessage`.
+
+It runs on every hosted publish (independent of the repository's scan
+settings) and on every status change, and can be re-run over a stored
+version (`services::mcp_lint::lint_stored_version`, for Remote ingest and
+admin edits). Observed tool snapshots are linted with
+`mcp_lint::lint_tools` and recorded under their own source
+(`mcp_lint::record_lint_findings(db, artifact_id, findings, source)`), so
+publisher-declared and bundle tools are not linted twice.
+
+### Rules, actions and how the gates read them
+
+| Rule | Actions | What it flags |
+| --- | --- | --- |
+| `secret_literal` | `block` | A recognisable credential (AWS key id, GitHub/GitLab/npm/PyPI/Slack/Stripe/Google token, `sk-` keys, JWT, PEM private key) in any linted string; in value positions (`default`, `value`, `choices`, header values, URL variables) also a high-entropy random literal; a password in a remote URL's user-info; a credential-named query parameter with a literal value. The value is never repeated in the finding. |
+| `secret_unmarked` | `review` | An environment variable, header or argument whose name reads as a credential (`token`, `secret`, `password`, `api_key`, `auth`, `authorization`, `key`, ...) without `isSecret: true`. |
+| `injection_phrase` | `review` | Instructions aimed at the model: "ignore previous instructions", "you must", "do not tell the user", "system prompt", pseudo-tags (`<important>`, `<system>`), HTML/markdown comments, `IMPORTANT:`, chat role tags (`<\|im_start\|>`, `[INST]`, `<<SYS>>`), fenced code, "before using this tool", credential file references (`~/.ssh`, `id_rsa`, `.aws/credentials`, `.npmrc`, `mcp.json`). URLs count only in descriptions and titles shown to the model (server, tools, `inputSchema`), not in `statusMessage` or variable descriptions. Decision 13: `review`, never `block`. |
+| `hidden_text` | `block` | Control (other than tab and line breaks), bidirectional, zero-width or Unicode tag characters in any linted string or object key. Stored as finding class `malicious`. |
+| `dangerous_args` | `block`, `review` | `block`: in `runtimeArguments`, flags that re-route installs around the backing repository (`--registry`, `--index-url`, `--extra-index-url`, `--find-links`, `--index`, `--default-index`, `--source`, `--pypi-mirror`); anywhere, `--privileged`, a bind mount of the host root (`-v /:/host`, `--mount source=/`) or of the Docker socket. `review`: the same re-routing flags in `packageArguments`, other host bind mounts, `--network/--net/--pid/--ipc/--uts/--userns=host`, `--cap-add`, `--security-opt`, `--device`, `--unsafe-perm`, `--trusted-host`, `--insecure`, `-A`/`--allow-*`, and `LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH` and other code-injecting variables (as `-e`/`--env` values, positional `NAME=value` arguments or environment variable names). Both `--flag value` and `--flag=value` spellings. |
+| `remote_url_shape` | `review`, `warn` | `remotes[].url` only. `review`: a template variable in the host, user-info, an IP literal (private or public), `localhost`. `warn`: plain `http`, a non-default port on a public host, an internal host name (`.internal`, `.local`, `.corp`, `.lan`, `.intranet`, `.home.arpa`, `.localdomain`) in a public registry. |
+| `oci_tag_digest_mismatch` | `warn` | A submitted `:tag@sha256:D` whose tag currently resolves to another digest (`D` is pinned). |
+| `oci_label_mismatch` | `warn` | The pinned image's config has no `io.modelcontextprotocol.server.name` label, a label naming another server, or a config that is not stored in the backing repository (labels are read from the stored manifest and config blob, never fetched). Under `mcp_require_oci_label: true` this refuses the publish instead (see below). |
+| `mcpb_missing_sha` | `block`, `review` | `block`: an `mcpb` package without `fileSha256`. `review`: an `mcpb` `fileSha256` that matches no bundle stored with the version (when bundles are stored). |
+| `destructive_tool` | `review`, `warn` | `warn`: a tool whose name reads as destructive (`delete`, `drop`, `rm`, `purge`, `wipe`, `truncate`, `kill`, `reset`, `overwrite`, ...) or that declares `destructiveHint: true`. `review`: a destructive name whose annotations claim `readOnlyHint: true` or `destructiveHint: false`. |
+| `shell_like_tool_name` | `review` | A tool whose name reads as running arbitrary commands (`shell`, `bash`, `sh`, `cmd`, `powershell`, `terminal`, `exec`, `eval`, `subprocess`, or `run`/`execute` with `command`/`script`/`code`/`process`). |
+
+| Action | `scan_findings.severity` | Hosted publish / status change | Every other path (scan-policy gate) |
+| --- | --- | --- | --- |
+| `block` | `critical` | refused `422 mcp_lint_blocked` | held by any enabled scan policy (`max_severity` `critical` or stricter) until acknowledged |
+| `review` | `high` | accepted, finding recorded | held by a scan policy at `max_severity` `high` or stricter until acknowledged |
+| `warn` | `low` | accepted, finding recorded | held only by a policy at `max_severity` `low` |
+
+A held version disappears from the MCP surface exactly as any other
+scan-policy hold (`mcp_rejected`, section "What a client sees"), and
+acknowledging the finding through `POST /api/v1/security/findings/{id}/acknowledge`
+releases it. A finding's acknowledgement identity is the server.json bytes,
+the rule and the field: re-linting the same version keeps it acknowledged.
+
+### Where findings are stored
+
+One completed `scan_results` row with `scan_type = "mcp_lint"` and
+`scanner_version = "ak-mcp-lint/1"` per lint run of the server.json artifact,
+listed by `GET /api/v1/security/artifacts/{artifact_id}/scans` like any scan.
+Each finding:
+
+| Column | Value |
+| --- | --- |
+| `title` | `mcp_lint/<rule>` (for example `mcp_lint/secret_literal`) |
+| `description` | the one-line message |
+| `affected_component` | `<source>:<path>`, for example `server_json:packages[0].environmentVariables[1].default` |
+| `source` | `mcp_lint/<source>`: `server_json`, `status_message`, or the caller's source for observed tools |
+| `severity` | per the action table above |
+| `finding_class` | `malicious` for `hidden_text`, `policy` otherwise |
+| `cve_id`, `affected_version` | `null` |
+
+A run of one source replaces that source's findings and carries every other
+source's forward, so the newest `mcp_lint` row is the whole verdict; a run
+whose findings did not change writes no row.
+
+### Publish and status refusals
+
+`POST /v0.1/publish` and `PATCH .../status` answer `422`
+`application/problem+json`:
+
+- `mcp_lint_blocked`: `detail` lists `<rule> at <path>: <message>` for every
+  `block` finding; extension member `findings: [{rule, action, path,
+  message}]`.
+- `mcp_oci_label_mismatch` (publish, `mcp_require_oci_label: true`):
+  `detail` = `packages[<i>]: <why>; this registry requires the label
+  (mcp_require_oci_label)`; `findings: [{rule: "oci_label_mismatch", action:
+  "block", path: "packages[<i>].identifier"}]`.
+
+### Server health
+
+`GET /api/v1/repositories/{key}/mcp/servers/{serverName}/versions/{version}/health`
+(`{serverName}` URL-encoded or with a literal slash; `{version}` exact).
+Caller: an instance administrator or a user with `read` granted on the
+repository (the quarantine-reason predicate). Anyone else, an unknown
+repository, a non-MCP repository, an unknown or deleted version: `404` with
+the standard error body. Works on Local, Staging and Remote repositories
+(Remote: ingested versions).
+
+`200`:
+
+```json
+{
+  "name": "com.acme/weather",
+  "version": "1.2.0",
+  "artifactId": "8d6c…",
+  "status": "warning",
+  "packagePolicy": "own-repos",
+  "packages": [
+    {
+      "index": 0, "package": "npm:@acme/weather-mcp@1.2.0", "registryType": "npm",
+      "repository": "npm-local", "scanned": true, "score": 97, "grade": "A",
+      "critical": 0, "high": 0, "medium": 1, "low": 0, "info": 0,
+      "gate": "allowed", "status": "warning"
+    }
+  ],
+  "lint": {
+    "ran": true, "scanId": "…", "lintedAt": "2026-11-03T10:00:00Z",
+    "block": 0, "review": 1, "warn": 0,
+    "findings": [
+      {
+        "id": "…", "rule": "secret_unmarked", "action": "review", "severity": "high",
+        "source": "server_json", "path": "packages[0].environmentVariables[0].isSecret",
+        "message": "\"API_TOKEN\" looks like a credential but is not marked `isSecret: true`, …",
+        "acknowledged": false
+      }
+    ]
+  }
+}
+```
+
+- `packages[].counts` (`critical` .. `info`) are the unacknowledged findings
+  of the pinned artifacts' current scans; `score`/`grade` use the repository
+  score formula over them (`null` when unscanned). `gate` is the backing
+  gate: `allowed | quarantine | scan_policy | age_gate | unresolvable |
+  unavailable`.
+- `lint.block/review/warn` count unacknowledged findings; `lint.findings[]`
+  lists all of them (`id` is the finding id the acknowledgement API takes).
+  `ran: false` (and no `scanId`) when the version was never linted.
+- `status`, the worst of: per package `critical` (gate `quarantine`,
+  `scan_policy` or `unresolvable`, or a critical finding), `warning`
+  (`age_gate`, or a high/medium finding), `unknown` (no completed scan, or
+  gate `unavailable`), else `ok`; the lint `critical` (`block` > 0),
+  `warning` (`review` > 0), `unknown` (never ran); `unknown` for a version
+  with packages but no pins (published under `open`). Order:
+  `critical` > `warning` > `unknown` > `ok`.

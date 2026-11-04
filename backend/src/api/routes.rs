@@ -1113,6 +1113,9 @@ fn api_v1_routes(
                 // Precomputed RPM repodata (#4544):
                 // POST /repositories/{key}/rpm/repodata/rebuild.
                 .merge(handlers::rpm::repo_router())
+                // MCP server health roll-up (#5253):
+                // GET /repositories/{key}/mcp/servers/{name}/versions/{v}/health.
+                .merge(handlers::mcp_health::repo_router())
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).

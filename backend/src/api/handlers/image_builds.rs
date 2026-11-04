@@ -570,7 +570,7 @@ async fn digest_belongs_to_image(
 /// catalog row with those bytes (migrated data before the backfill records
 /// it). Used for the children an index lists, which are read only when this
 /// repository holds them.
-async fn manifest_recorded_in_repository(
+pub(crate) async fn manifest_recorded_in_repository(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     digest: &str,
@@ -598,7 +598,7 @@ async fn manifest_recorded_in_repository(
 /// manifest can name any digest, and on storage shared by several
 /// repositories the object of a blob recorded only for another repository is
 /// readable by its digest key.
-async fn blob_recorded_in_repository(
+pub(crate) async fn blob_recorded_in_repository(
     db: &sqlx::PgPool,
     repo_id: Uuid,
     digest: &str,

@@ -30,6 +30,7 @@ use crate::formats::mcp::{
     self as fmt, BackingGate, GateAudience, GateOutcome, HoldKind, McpError, PackagePin,
     PackagePolicy, RegistryState, ServeDecision, ServerStatus, StoredVersion, VersionState,
 };
+use crate::services::mcp_lint;
 use crate::services::mcp_packages::{self, GateCtx};
 
 pub const MOUNT_PREFIX: &str = "/mcp";
@@ -1531,6 +1532,9 @@ async fn publish_server(
     let pins = mcp_packages::resolve_packages(&state, &settings, &server, base.as_str())
         .await
         .map_err(mcp_error)?;
+    let lint = mcp_lint::McpLintScanner::check_publish(&state, repo.id, &server, &pins)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     let bytes = fmt::canonical_bytes(&server);
     let sha256 = fmt::sha256_hex(&bytes);
@@ -1586,6 +1590,7 @@ async fn publish_server(
             return Err(resp);
         }
     };
+    mcp_lint::record_after_write(&state.db, artifact_id, &lint, mcp_lint::SERVER_JSON_SOURCE).await;
     crate::services::scanner_service::trigger_scan_on_upload(
         &state.db,
         state.scanner_service.clone(),
@@ -1797,6 +1802,8 @@ async fn update_status_impl(
     // A status change is a write, gated like a publish.
     repo.reject_if_promotion_only(false).map_err(reproblem)?;
     let (next, message) = parse_status_update(body).map_err(mcp_error)?;
+    let status_lint = mcp_lint::McpLintScanner::check_status_message(message.as_deref())
+        .map_err(IntoResponse::into_response)?;
     // One transaction under the per-server lock: every version changes or
     // none does, and `isLatest` is recomputed from the state just written.
     let mut tx = state.db.begin().await.map_err(internal)?;
@@ -1835,6 +1842,10 @@ async fn update_status_impl(
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
+    for id in &changed {
+        let source = mcp_lint::STATUS_MESSAGE_SOURCE;
+        mcp_lint::record_after_write(&state.db, *id, &status_lint, source).await;
+    }
     let policy_now = current_policy(&state.db, repo.id).await;
     let all = versions_of(&state.db, repo.id, name).await?;
     let latest = newest_servable(
@@ -2060,6 +2071,15 @@ mod tests {
                 "services/mcp_packages.rs",
                 include_str!("../../services/mcp_packages.rs"),
             ),
+            (
+                "services/mcp_lint.rs",
+                include_str!("../../services/mcp_lint.rs"),
+            ),
+            (
+                "services/mcp_health.rs",
+                include_str!("../../services/mcp_health.rs"),
+            ),
+            ("api/handlers/mcp_health.rs", include_str!("mcp_health.rs")),
         ] {
             let production = src.split("#[cfg(test)]").next().unwrap_or(src);
             for needle in [
