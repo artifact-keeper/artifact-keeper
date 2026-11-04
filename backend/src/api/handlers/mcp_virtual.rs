@@ -62,7 +62,7 @@ pub fn encode_member_cursor(member_key: &str, member_cursor: Option<&str>) -> St
 /// Inverse of [`encode_member_cursor`]: the member key and its own cursor
 /// (`None` = start of that member). Anything else is the listing's `400`.
 pub fn decode_member_cursor(cursor: &str) -> Result<(String, Option<String>), McpError> {
-    let bad = || McpError::invalid("cursor", "invalid cursor");
+    let bad = || McpError::invalid_query("cursor", "invalid cursor");
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(cursor.trim_end_matches('='))
         .map_err(|_| bad())?;
@@ -92,7 +92,7 @@ pub fn start_position(
     let idx = keys
         .iter()
         .position(|k| *k == key)
-        .ok_or_else(|| McpError::invalid("cursor", "invalid cursor"))?;
+        .ok_or_else(|| McpError::invalid_query("cursor", "invalid cursor"))?;
     let inner = inner.map(|c| fmt::decode_cursor(&c)).transpose()?;
     Ok((idx, inner))
 }
@@ -747,7 +747,12 @@ mod tests {
             &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("m:nokey"),
             &inner,
         ] {
-            assert!(decode_member_cursor(garbage).is_err(), "{garbage}");
+            // D4: a malformed composite cursor is a query error.
+            assert_eq!(
+                decode_member_cursor(garbage).unwrap_err().code(),
+                "mcp_invalid_query",
+                "{garbage}"
+            );
         }
     }
 
@@ -764,7 +769,12 @@ mod tests {
             start_position(&keys, Some(("b".into(), None))).unwrap(),
             (1, None)
         );
-        assert!(start_position(&keys, Some(("gone".into(), None))).is_err());
+        assert_eq!(
+            start_position(&keys, Some(("gone".into(), None)))
+                .unwrap_err()
+                .code(),
+            "mcp_invalid_query"
+        );
         assert!(start_position(&keys, Some(("a".into(), Some("%%".into())))).is_err());
     }
 
@@ -1115,10 +1125,12 @@ mod tests {
                 "com.acme/c@1.0.0=l2"
             ]
         );
+        // D4: a malformed composite cursor is a query error, as on a hosted
+        // repository.
         let (s, b) = env.get("/servers?cursor=garbage").await;
         assert_eq!(
             (s, b["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("mcp_invalid_server_json"))
+            (StatusCode::BAD_REQUEST, Some("mcp_invalid_query"))
         );
         let gone = encode_member_cursor("not-a-member", None);
         assert_eq!(

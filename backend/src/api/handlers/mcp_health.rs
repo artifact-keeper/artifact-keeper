@@ -7,8 +7,13 @@
 //! same way: an instance administrator, or a caller with `read` granted on
 //! the repository. Everyone else (anonymous on a public registry included)
 //! gets the same `404` as an unknown repository, server or version.
+//!
+//! A soft-deleted version (status `deleted`) answers `404` as on the read
+//! surface, unless `?include_deleted=true`.
 
-use axum::extract::{Extension, Path, State};
+use std::collections::HashMap;
+
+use axum::extract::{Extension, Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use uuid::Uuid;
@@ -40,17 +45,30 @@ async fn health_encoded(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, name, version)): Path<(String, String, String)>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<ServerHealth>> {
-    health_impl(&state, auth.as_ref(), &key, &name, &version).await
+    health_impl(&state, auth.as_ref(), &key, &name, &version, &q).await
 }
 
 async fn health_split(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, ns, name, version)): Path<(String, String, String, String)>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Result<Json<ServerHealth>> {
     let name = super::mcp::server_name(&ns, Some(&name));
-    health_impl(&state, auth.as_ref(), &key, &name, &version).await
+    health_impl(&state, auth.as_ref(), &key, &name, &version, &q).await
+}
+
+/// `include_deleted` of the query: `true` | `false` (default).
+fn include_deleted(q: &HashMap<String, String>) -> Result<bool> {
+    match q.get("include_deleted").map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(AppError::Validation(
+            "include_deleted must be true or false".to_string(),
+        )),
+    }
 }
 
 async fn health_impl(
@@ -59,7 +77,9 @@ async fn health_impl(
     key: &str,
     name: &str,
     version: &str,
+    q: &HashMap<String, String>,
 ) -> Result<Json<ServerHealth>> {
+    let include_deleted = include_deleted(q)?;
     let repo_id: Uuid =
         sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1 AND format::text = 'mcp'")
             .bind(key)
@@ -88,6 +108,11 @@ async fn health_impl(
     let (artifact_id, metadata) = row.ok_or_else(not_found)?;
     let stored = StoredVersion::from_metadata(&metadata)
         .ok_or_else(|| AppError::Internal("unreadable MCP metadata".to_string()))?;
+    // As on the read surface: a soft-deleted version is not found unless
+    // asked for.
+    if stored.registry.status == crate::formats::mcp::ServerStatus::Deleted && !include_deleted {
+        return Err(not_found());
+    }
     let ctx = GateCtx::of(state, false);
     Ok(Json(
         mcp_health::server_health(ctx, repo_id, artifact_id, &stored).await?,
@@ -373,6 +398,45 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, 0, "a refused publish stores nothing");
+        env.teardown().await;
+    }
+
+    /// D5: a soft-deleted version's health answers 404, as the read surface
+    /// does, unless `include_deleted=true`.
+    #[tokio::test]
+    async fn deleted_versions_have_no_health_unless_asked() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        env.npm_backing().await;
+        let (s, body) = env
+            .mcp("POST", "/publish", Some(&doc("1.0.0", json!({}))))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(
+            env.health("com.acme%2Fw", "1.0.0", true).await.0,
+            StatusCode::OK
+        );
+        let (s, body) = env
+            .mcp("DELETE", "/servers/com.acme%2Fw/versions/1.0.0", None)
+            .await;
+        assert!(s.is_success(), "{s} {body}");
+        assert_eq!(
+            env.health("com.acme%2Fw", "1.0.0", true).await.0,
+            StatusCode::NOT_FOUND
+        );
+        let app = env.fx.router_with_auth(repo_router());
+        let uri = format!(
+            "/{}/mcp/servers/com.acme%2Fw/versions/1.0.0/health?include_deleted=true",
+            env.fx.repo_key
+        );
+        let (s, h) = env.call(app, "GET", &uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{h}");
+        let app = env.fx.router_with_auth(repo_router());
+        let (s, _) = env
+            .call(app, "GET", &uri.replace("=true", "=maybe"), None)
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
         env.teardown().await;
     }
 
