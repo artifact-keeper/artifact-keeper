@@ -42,6 +42,9 @@ There is no `nextCursor` on the last page. Each entry's `_meta` carries:
 - `io.modelcontextprotocol.registry/official`: `status`, `statusMessage`,
   `statusChangedAt`, `publishedAt`, `updatedAt`, `isLatest`. `status` is only
   ever `active`, `deprecated` or `deleted`: a hold is never written here.
+  `isLatest` is computed on every read: it marks the server's newest version
+  that is servable now, so it agrees with `/versions/latest` while a newer
+  version is held.
 - `com.artifactkeeper.registry/source`: the repository, the server.json
   artifact id and sha256, and the package policy the version was published
   under.
@@ -52,9 +55,20 @@ as upstream does.
 
 Choices pinned for this release: list order is name then version as text
 (upstream's); a version is write-once (`409` on republish, even with identical
-bytes); `latest` is the newest version that is servable now; a `deleted`
-version answers `404` unless `include_deleted=true`; publish bodies are capped
-at 256 KiB (`413`); documents nest at most 32 levels deep (`400`).
+bytes, and also while a version deleted through the artifact API is in the
+trash); `latest` is the newest version that is servable now, ordered as
+upstream orders versions (SemVer by SemVer precedence, a `v` prefix allowed; a
+SemVer version always ranks above a non-SemVer one; two non-SemVer versions by
+`publishedAt`); `version=latest` picks each server's newest version first and
+only then applies `updated_since` to it; a `deleted` version answers `404`
+unless `include_deleted=true`; publish bodies are capped at 256 KiB (`413`);
+documents nest at most 32 levels deep (`400`).
+
+Listing work is bounded: one `/servers` request gates at most 1000 rows (and
+`version=latest` at most 1000 versions, at most 100 per server) and answers a
+`nextCursor` to resume whenever it stops early, so a page can be short without
+being the last. `/versions` lists at most the newest 1000 versions of a
+server.
 
 ## Authentication and publishing
 
@@ -144,7 +158,18 @@ Settings are part of the repository API (`POST`/`PATCH /api/v1/repositories`):
 Each `mcp_package_repos` value must be an existing repository whose format
 serves that registry type (an `npm`, `yarn` or `pnpm` repository for `npm`; a
 `docker`/`podman`/`oras` repository for `oci`, and so on); it may be Local,
-Remote or Virtual.
+Remote or Virtual. The caller saving the setting must be able to read each
+repository it names: an administrator, or `read` through a grant; a public
+repository needs no grant, an `internal` one does (the mapping re-exports what
+the repository holds to every reader of the MCP registry). A repository the
+caller cannot read is refused with the same message as one that does not
+exist.
+
+Server versions enter an MCP repository only through `POST .../publish`. The
+generic artifact upload routes (`PUT`/`POST /api/v1/repositories/{key}/artifacts/...`
+and `/api/v1/uploads`) refuse an MCP repository with `400`, except for a
+trusted peer replication (an administrator or service account sending the
+replication header).
 
 To publish a server under `own-repos`, publish (or pull through a Remote) its
 package first, then publish the server.json. A publish answers `422` with one
@@ -183,17 +208,20 @@ version.
 
 The gate always evaluates the pinned digest, never whatever the tag names now:
 it looks up the manifest records that carry the pinned index digest or its
-runner-architecture child. A multi-arch push records each platform child by
-digest, so those records survive a tag move. A single-architecture image
-pushed only by tag has one record, at the tag, which the next push of that tag
-rewrites; once that happens the pinned digest has nothing left to gate and the
+runner-architecture child. A tag push records the manifest only at the tag,
+and the next push of that tag rewrites that record, so for a Local (or a
+Virtual's Local member) repository the pin also writes a manifest record at
+`v2/<name>/manifests/<digest>`, copied from the record at publish (with its
+hold) and scanned like a pushed manifest. The pinned bytes stay gateable after
+the tag moves. If every record of the pinned digest is gone anyway, the
 version becomes `unresolvable` (hidden) rather than served ungated. A publish
 whose image has no manifest record at all is refused with
 `mcp_package_not_found`. When the publish named both a tag and
 a digest and they disagree, the digest is pinned and the pin records the
 warning `oci_tag_digest_mismatch`.
 
-For a Local OCI repository the pin also writes a digest-keyed tag row, which
+For a Local OCI repository (including the Local member a Virtual mapping
+resolved the image in) the pin also writes a digest-keyed tag row, which
 keeps storage GC from collecting the pinned manifest when its tag moves or is
 deleted. Known limit in this release: an explicit
 `DELETE /v2/<name>/manifests/sha256:<digest>` still removes the manifest; the
@@ -207,7 +235,9 @@ already published: they are `unresolvable` until republished as a new version.
 
 A version is **held** when Artifact Keeper will not hand its recipe to a
 client: its server.json artifact is quarantined or refused by scan policy, or
-a package it pins is quarantined, refused by scan policy, rejected, or gone.
+a package it pins is quarantined, refused by scan policy, rejected, younger
+than the age gate of the Remote it was pulled through, refused by that
+Remote's stored proxy-scan verdict, or gone.
 One decision function (`decide_mcp_serve`) answers every read:
 
 | State | `/servers`, `/versions`, `search` | `latest` | Exact version, reader | Exact version, repository holder | `error` |
@@ -215,7 +245,8 @@ One decision function (`decide_mcp_serve`) answers every read:
 | server.json quarantined | omitted | skipped | `404` plain | `404` + reason, `hold: quarantine` | `mcp_pending_review` |
 | server.json refused by scan policy or rejected | omitted | skipped | `404` plain | `404` + reason | `mcp_rejected` |
 | pinned package quarantined | omitted | skipped | `404` plain | `404` + `package`, `gate: quarantine` | `mcp_backing_artifact_blocked` |
-| pinned package refused by scan policy or rejected | omitted | skipped | `404` plain | `404` + `package`, `gate: scan_policy` | `mcp_backing_artifact_blocked` |
+| pinned package refused by scan policy or rejected, or by its Remote's stored proxy-scan verdict | omitted | skipped | `404` plain | `404` + `package`, `gate: scan_policy` | `mcp_backing_artifact_blocked` |
+| pinned package younger than its Remote's age gate | omitted | skipped | `404` plain | `404` + `package`, `gate: age_gate`, `review_id`, `min_age_days`, `requested_age_days` | `mcp_age_gate_blocked` |
 | pinned package gone, or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
 | a gate cannot be evaluated (database error) | omitted | `503` | `503` | `503` | `mcp_gate_unavailable` |
 | `deprecated` | listed | eligible | `200` | `200` | |
@@ -232,7 +263,12 @@ One decision function (`decide_mcp_serve`) answers every read:
   `package` as submitted (`npm:@acme/db-tool@2.0.0`) and the `gate`. It never
   names the backing repository, an artifact id, a finding or a policy.
 - Every refusal is `application/problem+json` with `Cache-Control: no-store`,
-  and is audited as `MCP_SERVER_DOWNLOAD_REFUSED`.
+  and is audited as `MCP_SERVER_DOWNLOAD_REFUSED`. That includes the refusals
+  the shared middleware in front of the registry gives on `/mcp/` paths
+  (`401`, `404`, `429`, `503`), which keep their `WWW-Authenticate` and
+  `Retry-After` headers; read refusals carry the read routes' CORS headers.
+- Listings evaluate the scan-policy gate afresh on every request (no cached
+  decision), since a listing entry is the whole document.
 - `include_deleted=true` widens only `deleted`; it never reveals a hold.
 
 Why `404` and not `403`/`409`/`451`: VS Code treats a `404` on
@@ -244,6 +280,17 @@ not a control. The artifact routes (`/api/v1/repositories/{key}/artifacts/...`)
 keep the usual `409`/`403`.
 
 Releasing a hold restores the version on the next read.
+
+The age gate is evaluated without contacting the upstream. Under
+`first_seen` the basis is the recorded first sighting; under
+`upstream_publish_time` it is the publish time a review of the version has
+recorded, otherwise the time this instance cached the package (never earlier
+than its upstream publish, so a version is never treated as older than it
+is). A package pulled through recently is therefore held until its cached
+copy is old enough, unless an administrator approves its age-gate review; an
+exact read of the held version records that review as pending (with an
+unknown publish time) so it appears in the review queue. A rejected review
+holds the version. Formats without an age gate (OCI, NuGet) are not affected.
 
 ## Storage
 
@@ -260,9 +307,6 @@ and replicate like any other artifact.
 
 ## Not in this release
 
-- Age-gate evaluation of backing packages at read time. A package pulled
-  through a Remote has already passed that Remote's age gate on the way in;
-  the `mcp_age_gate_blocked` answer exists for when this lands.
 - Refusing a `DELETE` by digest of a pinned manifest (see above).
 - Drift detection for tag writes made by promotion and migration imports
   (pushes and Remote refreshes are covered).
@@ -272,9 +316,12 @@ and replicate like any other artifact.
 - Artifact Keeper never dereferences a URL in a server.json (`websiteUrl`,
   `icons`, `repository.url`, `remotes[].url`). Publish, list and read are
   database and object-storage operations only.
-- Descriptions, titles, argument and variable text refuse control,
-  bidirectional-override and zero-width characters. URLs must be absolute
-  `http`/`https`.
+- Descriptions, titles, argument and variable text, and every string (key
+  or value) of the publisher-provided `_meta`, refuse control characters,
+  bidirectional marks, overrides and isolates (including U+061C), zero-width
+  and invisible formatting characters (U+200B-U+200F, U+2060-U+2064, the
+  BOM), the line and paragraph separators (U+2028/U+2029) and Unicode tag
+  characters (U+E0000-U+E007F). URLs must be absolute `http`/`https`.
 - Publishes are quota-admitted like any upload and capped at 256 KiB, 16
   packages, 8 remotes and 64 entries per list.
 
