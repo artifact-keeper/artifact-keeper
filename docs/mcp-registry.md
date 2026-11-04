@@ -406,7 +406,13 @@ Server versions enter an MCP repository only through `POST .../publish`. The
 generic artifact upload routes (`PUT`/`POST /api/v1/repositories/{key}/artifacts/...`
 and `/api/v1/uploads`) refuse an MCP repository with `400`, except for a
 trusted peer replication (an administrator or service account sending the
-replication header).
+replication header). Likewise a server version (or a bundle) leaves an MCP
+repository only through `DELETE .../servers/{serverName}/versions/{version}`
+(the soft delete below): the generic
+`DELETE /api/v1/repositories/{key}/artifacts/...` refuses an MCP repository
+with `400`, administrators included, after its access checks, with the same
+replication exemption. The generic route knows nothing of namespaces, so it
+would let a writer of one namespace delete another's server.json.
 
 To publish a server under `own-repos`, publish (or pull through a Remote) its
 package first, then publish the server.json. A publish answers `422` with one
@@ -788,7 +794,9 @@ linted as a status change's: `422 mcp_lint_blocked`). Sets status `deleted`
 (`400` if it already is), recomputes `isLatest`, keeps the artifact, its bytes
 and its tombstone; the version answers `404` unless `include_deleted=true`.
 `200` with the served entry (`status: "deleted"`). Audited
-`MCP_SERVER_DELETED` (`from`, `status_message`).
+`MCP_SERVER_DELETED` (`from`, `status_message`). This is the only delete
+route for a server version: the generic artifact `DELETE` answers `400` on an
+MCP repository (see [Package policy](#package-policy)).
 
 ### MCPB bundles
 

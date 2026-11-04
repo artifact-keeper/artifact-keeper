@@ -10708,18 +10708,42 @@ pub(crate) fn reject_generic_write_to_mcp(
     auth: &AuthExtension,
     headers: &HeaderMap,
 ) -> std::result::Result<(), Response> {
+    mcp_generic_mutation_refusal(format, auth, headers, MCP_GENERIC_WRITE_REFUSED)
+        .map_err(IntoResponse::into_response)
+}
+
+const MCP_GENERIC_WRITE_REFUSED: &str =
+    "MCP registries accept server versions only through POST /mcp/{repository}/v0.1/publish";
+
+/// The generic artifact `DELETE` on an MCP registry (#5253). A server version
+/// (and its bundles) is deleted only through
+/// `DELETE /mcp/{repository}/v0.1/servers/{name}/versions/{version}`, which
+/// runs the namespace write gate (`mcp_namespaces` rules,
+/// `mcp_require_namespace_grant`), records the version as `deleted`,
+/// recomputes `isLatest` and audits `MCP_SERVER_DELETED`. The generic route
+/// knows none of that, so a plain repository writer could delete another
+/// namespace's server.json through it: it refuses MCP repositories, admins
+/// included, except a trusted peer replication (as for generic writes).
+pub(crate) const MCP_GENERIC_DELETE_REFUSED: &str =
+    "MCP registries delete server versions only through \
+     DELETE /mcp/{repository}/v0.1/servers/{serverName}/versions/{version}";
+
+/// `400` for a generic write or delete into an MCP repository unless the
+/// caller is a trusted peer replication (admin or service account with the
+/// replication header).
+pub(crate) fn mcp_generic_mutation_refusal(
+    format: &RepositoryFormat,
+    auth: &AuthExtension,
+    headers: &HeaderMap,
+    message: &str,
+) -> Result<()> {
     let trusted = replication_exemption_trusted(
         super::is_replication_request(headers),
         auth.is_admin,
         auth.is_service_account,
     );
     if format == &RepositoryFormat::Mcp && !trusted {
-        return Err(AppError::Validation(
-            "MCP registries accept server versions only through \
-             POST /mcp/{repository}/v0.1/publish"
-                .to_string(),
-        )
-        .into_response());
+        return Err(AppError::Validation(message.to_string()));
     }
     Ok(())
 }
@@ -12450,6 +12474,10 @@ pub async fn delete_artifact(
     // (deny-by-default) so a write-only grantee cannot destroy artifacts and a
     // rules-less/public repo confers no delete. Mirrors the upload `write` gate.
     require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // After the access gates (nothing is said about a repository the caller
+    // cannot delete from): MCP versions are deleted through the namespace-
+    // gated MCP route only.
+    mcp_generic_mutation_refusal(&repo.format, &auth, &headers, MCP_GENERIC_DELETE_REFUSED)?;
     // Refused before the soft delete so a request never ends half done, and
     // after the access gates so it says nothing about a repository the caller
     // cannot write to.
@@ -22393,6 +22421,92 @@ mod tests {
 
         tdh::cleanup(&pool, pub_repo_id, other_id).await;
         let _ = std::fs::remove_dir_all(&pub_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #5253: the generic `DELETE /api/v1/repositories/{key}/artifacts/...` is
+    /// not namespace-aware, so on an MCP registry it is refused (`400`, naming
+    /// the MCP route) for a repository writer with the `delete` action and for
+    /// an admin alike; the server.json row stays live. A trusted peer
+    /// replication still deletes.
+    #[tokio::test]
+    async fn generic_delete_of_an_mcp_server_version_is_refused_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let path = "servers/com.other/echo/1.0.0/server.json".to_string();
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 'com.other/echo', '1.0.0', 2, $4, 'application/json', $5)",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(&path)
+        .bind("a".repeat(64))
+        .bind(format!("mcp/com.other/echo/1.0.0/{}.json", "a".repeat(64)))
+        .execute(&pool)
+        .await
+        .expect("seed server.json row");
+        let state = || {
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            ))
+        };
+        let user = tdh::make_auth(user_id, &username);
+        let mut admin = user.clone();
+        admin.is_admin = true;
+        let mut replication = HeaderMap::new();
+        replication.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        for (who, headers) in [
+            (user.clone(), HeaderMap::new()),
+            (user.clone(), replication.clone()),
+            (admin.clone(), HeaderMap::new()),
+        ] {
+            let refused = delete_artifact(
+                state(),
+                Extension(Some(who)),
+                Path((key.clone(), path.clone())),
+                Query(DeleteArtifactQuery::default()),
+                headers,
+            )
+            .await;
+            match refused {
+                Err(AppError::Validation(m)) => assert_eq!(m, MCP_GENERIC_DELETE_REFUSED),
+                other => panic!("generic delete on an MCP repository must be refused: {other:?}"),
+            }
+        }
+        let live: bool = sqlx::query_scalar("SELECT NOT is_deleted FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(live, "the server.json row must stay live");
+        // Peer replication (an admin token with the replication header).
+        let replicated = delete_artifact(
+            state(),
+            Extension(Some(admin)),
+            Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
+            replication,
+        )
+        .await;
+        assert!(replicated.is_ok(), "{replicated:?}");
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
