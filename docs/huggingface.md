@@ -57,6 +57,60 @@ curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/upstream-
 creation time.) Everyone who can read `hf-remote` in Artifact Keeper can then
 download what that Hub token can see, so restrict the repository accordingly.
 
+### Restricting which models a Remote can fetch
+
+A Remote's [upstream filter](upstream-filter.md) decides which paths it may
+request from the Hub. A Hugging Face Remote requests two shapes of path for
+the same model, and **a pattern has to match both**:
+
+| Request | Path sent upstream |
+|---------|--------------------|
+| Model info (`model_info`, the first call of `snapshot_download` and `hf download`) | `api/models/<org>/<name>`, `api/models/<org>/<name>/revision/<rev>` |
+| File listing (`list_repo_tree`) | `api/models/<org>/<name>/tree/<rev>` |
+| File download (`hf_hub_download`) | `<org>/<name>/resolve/<rev>/<file>` |
+
+A filter written as `^acme/` admits the files but refuses model info, so
+`snapshot_download` and `hf download` fail on their first call; one written as
+`^api/models/acme/` does the opposite. Make the `api/models/` prefix optional
+instead. To allow two organisations:
+
+```bash
+curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/upstream-filter \
+  -H "Authorization: Bearer $AK_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"include_patterns": ["^(api/models/)?(sentence-transformers|Qwen)/[^/]+(/|$)"]}'
+```
+
+- **Anchor with `^`.** Patterns match anywhere in the path unless anchored, so
+  an unanchored `Qwen/` also admits `evil-org/Qwen/...` paths.
+- **Keep the `/` after the organisation.** It stops look-alikes: the pattern
+  above refuses `sentence-transformer/...` and `sentence-transformers-x/...`.
+- **One model rather than a whole organisation:**
+  `^(api/models/)?Qwen/Qwen2\.5-1\.5B-Instruct(/|$)`. Escape the dots.
+- **Models without an organisation** (`gpt2`, `bert-base-uncased`) have no
+  `<org>/` segment: `^(api/models/)?gpt2(/|$)`.
+- **Matching is case-sensitive.** A client that spells the organisation in
+  another case (`qwen/...`) is refused. Prefix a pattern with `(?i)` to accept
+  any spelling, and always do so in `exclude_patterns`, where a case-sensitive
+  pattern would let another spelling through.
+
+A refused path answers 404 without contacting the Hub, so a refused model
+looks to the client like one that does not exist. Already-cached files of a
+refused model are served only while their cache entry is fresh; see
+[already-cached content](upstream-filter.md#already-cached-content). Only the
+request to the Remote's `upstream_url` is matched: the Hub's redirect of a
+large file to its CDN is followed without being filtered again.
+
+Check an allowed and a refused model (the second answers 404):
+
+```bash
+export HF_ENDPOINT=https://registry.example.com/huggingface/hf-remote
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HF_TOKEN" \
+  "$HF_ENDPOINT/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/main"   # 200
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HF_TOKEN" \
+  "$HF_ENDPOINT/api/models/sentence-transformer/all-MiniLM-L6-v2/revision/main"    # 404
+```
+
 ## Pointing `huggingface_hub` at it
 
 `huggingface_hub` takes its server from `HF_ENDPOINT` and its credential from
