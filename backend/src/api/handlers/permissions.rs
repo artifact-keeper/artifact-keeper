@@ -386,6 +386,41 @@ fn validate_anonymous_rule(payload: &CreatePermissionRequest) -> Result<()> {
     Ok(())
 }
 
+/// Write-time guard for `conditions.mcp_namespaces` (#5253): a
+/// namespace-conditioned rule is an MCP publish grant that only the MCP
+/// namespace write gate evaluates (every other check treats it as not
+/// applicable), so it is accepted only on a `repository` target that is an
+/// MCP repository. On any other target it would be inert, so refuse it (400)
+/// rather than persist a rule that looks like it grants something.
+async fn validate_mcp_namespace_target(
+    db: &sqlx::PgPool,
+    payload: &CreatePermissionRequest,
+) -> Result<()> {
+    let carries = payload
+        .conditions
+        .as_ref()
+        .is_some_and(|c| c.mcp_namespaces.is_some());
+    if !carries {
+        return Ok(());
+    }
+    let is_mcp_repo = payload.target_type == "repository"
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = $1 AND format::text = 'mcp')",
+        )
+        .bind(payload.target_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    if !is_mcp_repo {
+        return Err(AppError::Validation(
+            "conditions.mcp_namespaces applies only to a 'repository' target that is an MCP \
+             repository"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Create a permission
 #[utoipa::path(
     post,
@@ -450,6 +485,7 @@ pub async fn create_permission(
         conditions.validate()?;
     }
     validate_anonymous_rule(&payload)?;
+    validate_mcp_namespace_target(&state.db, &payload).await?;
 
     // #2826: hydrate the response inside the write statement. The INSERT's
     // `RETURNING *` feeds the shared `hydrate_select` joins through a
@@ -625,6 +661,7 @@ pub async fn update_permission(
         conditions.validate()?;
     }
     validate_anonymous_rule(&payload)?;
+    validate_mcp_namespace_target(&state.db, &payload).await?;
 
     // Same hydrate-inside-the-write-statement shape as create_permission
     // above (#2826); before this, update ran a bare `UPDATE ... RETURNING
@@ -2294,6 +2331,92 @@ mod tests {
 
         tdh::cleanup_user(&pool, user_id).await;
         tdh::cleanup(&pool, repo_id, admin_id).await;
+    }
+
+    /// Review finding 1 (#5253): `conditions.mcp_namespaces` is accepted only
+    /// on an MCP repository target; a non-MCP repository or a project target
+    /// is refused 400 and nothing persists.
+    #[tokio::test]
+    async fn mcp_namespaces_condition_only_on_mcp_repositories() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (generic_id, _, _d1) = tdh::create_repo(&pool, "local", "generic").await;
+        let (mcp_id, _, _d2) = tdh::create_repo(&pool, "local", "mcp").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let auth = tdh::admin_auth(admin_id, &admin_name);
+        let body = |target_type: &str, target_id: Uuid| {
+            Bytes::from(
+                json!({
+                    "principal_type": "user",
+                    "principal_id": user_id,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "actions": ["write"],
+                    "conditions": {"mcp_namespaces": ["com.acme/*"]}
+                })
+                .to_string(),
+            )
+        };
+        for (target_type, target_id) in [
+            ("repository", generic_id),
+            ("project", Uuid::new_v4()),
+            ("repository", Uuid::new_v4()),
+        ] {
+            let (status, resp) = tdh::send(
+                permission_app(state.clone(), auth.clone()),
+                tdh::post(
+                    "/".to_string(),
+                    "application/json",
+                    body(target_type, target_id),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{target_type} {target_id}: {}",
+                String::from_utf8_lossy(&resp)
+            );
+        }
+        let created = response_json(
+            state.clone(),
+            auth.clone(),
+            tdh::post(
+                "/".to_string(),
+                "application/json",
+                body("repository", mcp_id),
+            ),
+        )
+        .await;
+        let id = created["id"].as_str().expect("id").to_string();
+        // An update cannot move the condition onto a non-MCP target either.
+        let (status, _) = tdh::send(
+            permission_app(state.clone(), auth.clone()),
+            tdh::put_json(format!("/{id}"), body("repository", generic_id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM permissions WHERE principal_id = $1")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count permissions");
+        assert_eq!(persisted, 1, "only the MCP repository rule persists");
+
+        let _ = sqlx::query("DELETE FROM permissions WHERE principal_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        tdh::cleanup(&pool, mcp_id, admin_id).await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(generic_id)
+            .execute(&pool)
+            .await;
     }
 
     /// The anonymous principal accepts exactly `read` on a repository (or

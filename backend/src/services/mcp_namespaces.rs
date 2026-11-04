@@ -340,7 +340,7 @@ async fn applicable_rules(db: &PgPool, user_id: Uuid, repo_id: Uuid) -> Result<V
                 OR (p.target_type = 'project' AND p.target_id = \
                     (SELECT project_id FROM repositories WHERE id = $2))) \
            {}",
-        crate::services::permission_service::ip_condition_sql("p", "$3::text")
+        crate::services::permission_service::cidr_condition_sql("p", "$3::text")
     );
     let client_ip = crate::api::middleware::client_ip::current_verified_client_ip();
     let rows: Vec<(Vec<String>, serde_json::Value)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
@@ -759,6 +759,87 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        tdh::cleanup_member_repo(&pool, repo, &dir).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Review finding 1: a namespace-conditioned rule grants nothing to a
+    /// generic permission check (write/delete/read on the artifact API, the
+    /// ACL-engagement probe); only the MCP namespace gate evaluates it.
+    #[tokio::test]
+    async fn namespace_rule_grants_nothing_outside_the_mcp_gate() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        let (user, name) = tdh::create_user(&pool).await;
+        let (repo, _, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        let auth = tdh::make_auth(user, &name);
+        let rule = tdh::grant_permission(
+            &pool,
+            "user",
+            user,
+            "repository",
+            repo,
+            &["read", "write", "delete", "admin"],
+        )
+        .await;
+        sqlx::query("UPDATE permissions SET conditions = $2 WHERE id = $1")
+            .bind(rule)
+            .bind(serde_json::json!({"mcp_namespaces": ["com.acme/*"]}))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let perms = PermissionService::new(pool.clone());
+        for action in ["read", "write", "delete", "admin"] {
+            assert!(
+                !perms
+                    .check_repository_action(user, repo, action, false)
+                    .await
+                    .unwrap(),
+                "{action}: a namespace rule is not a generic grant"
+            );
+            assert!(
+                !perms
+                    .check_permission(user, "repository", repo, action, false)
+                    .await
+                    .unwrap(),
+                "{action}: resolve_actions must skip the namespace rule"
+            );
+        }
+        assert!(
+            !perms
+                .has_any_rules_for_target("repository", repo)
+                .await
+                .unwrap(),
+            "a namespace rule does not engage the generic ACL"
+        );
+        // The MCP gate still honours it.
+        assert!(
+            authorize_write(&pool, &auth, repo, "com.acme/x", "write", None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !authorize_write(&pool, &auth, repo, "com.other/x", "write", None)
+                .await
+                .unwrap()
+        );
+        // The role fallback is unaffected by the (non-applicable) rule.
+        tdh::grant_repo_access(&pool, repo, user).await;
+        let perms = PermissionService::new(pool.clone());
+        assert!(perms
+            .check_repository_action(user, repo, "write", false)
+            .await
+            .unwrap());
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
         tdh::cleanup_member_repo(&pool, repo, &dir).await;
         let _ = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user)
