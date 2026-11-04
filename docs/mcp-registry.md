@@ -663,15 +663,26 @@ plain `404`, as every read does; any reader may call it (repository `write`
 is not needed). Nothing is written, pinned, held, filled or audited. A
 Virtual repository answers `501`, a Remote validates against its own
 settings. Always `200` for a document (also for an invalid one), with
-upstream's `ValidationResult` plus `packages` (always present: `[]` when the
-document was refused before its packages were looked at):
+upstream's `ValidationResult` plus `packages` (always present, and always
+`[]` for an invalid document, `valid: false`):
 
 ```json
 {"valid": false,
- "issues": [{"type": "schema" | "semantic", "path": "packages[0]",
+ "issues": [{"type": "semantic", "path": "packages[0]",
              "message": "packages[0]: npm @acme/x@1.0.0 is not in repository 'npm-local'",
-             "severity": "error" | "info", "reference": "mcp_package_not_found"}],
- "packages": [{"index": 0, "registryType": "npm", "outcome": "pinned" | "fill" | "unchecked",
+             "severity": "error", "reference": "mcp_package_not_found"}],
+ "packages": []}
+```
+
+A valid document lists what a publish would do with each package:
+
+```json
+{"valid": true,
+ "issues": [{"type": "semantic", "path": "packages[1]", "severity": "info",
+             "message": "npm @acme/y is not in repository 'npm-remote' yet; ...",
+             "reference": "mcp_package_fill"}],
+ "packages": [{"index": 0, "registryType": "npm", "outcome": "pinned"},
+              {"index": 1, "registryType": "npm", "outcome": "fill",
                "fillRepository": "npm-remote"}]}
 ```
 
@@ -892,9 +903,15 @@ administrator, the only role that may set or clear `*_locked` settings or
 change a locked setting (a repository administrator gets `403`). It is
 omitted for other formats and on the repository list. A UI shows the lock
 switches only when `mcp_caller_can_lock` is `true` and shows a locked
-setting read-only otherwise. Repository administration itself (admin edit,
-catalog decisions) is answered by the routes (`403 mcp_forbidden`); there is
-no per-repository permission member on the repository response.
+setting read-only otherwise. The same responses carry
+`mcp_caller_is_repo_admin`: `true` when the caller administers the
+repository (the repository `admin` action, through a grant or a role such
+as `repository-owner`, or an instance administrator). It is the check the
+routes themselves apply to repository administration (admin edit and delete
+of a version, catalog decisions, pins and bulk decisions, a sync trigger, an
+introspection request), so a UI can show those controls exactly when they
+will be accepted; a caller without it gets `403` (`mcp_forbidden` on the
+`/v0.1` surface). Also omitted for other formats and on the list.
 
 ## Repository settings (Phase 2 and 3)
 
@@ -925,7 +942,8 @@ change the locked setting (`403`). The posture lock also covers
 `mcp_auto_approve_namespaces` (a standing approval list is posture by another
 name) and bulk approvals whose pattern spans namespaces nobody named (a `*`
 in the namespace part: `*`, `*/x`, `com.*`, `*.acme/*`; naming the namespace,
-`com.acme` or `com.acme/*`, stays allowed). The probe lock also covers
+`com.acme/*`, stays allowed). Bulk blocks only tighten and are not
+restricted. The probe lock also covers
 `mcp_sandbox_introspection`.
 
 ## Remote repositories
@@ -938,7 +956,7 @@ registry origin, without `/v0.1`: the official registry
 from upstream is served until it is approved (`mcp_remote_posture:
 approval_required`, the default), and `/v0.1` on a Remote serves only what
 the sync stored, through the same read path and gates as a hosted
-repository. Writes (`publish`, `status`) answer `405`.
+repository. Writes (`publish`, `status`) answer `405 mcp_read_only`.
 
 ```json
 {
@@ -958,19 +976,27 @@ it: Copilot's "Registry only" policy, Claude Code `allowedMcpServers` with
 
 Every hour (`MCP_REMOTE_SYNC_INTERVAL_SECS`, minimum 60) and on demand, the
 repository pages `GET {upstream}/v0.1/servers?limit=100&updated_since=<watermark>&cursor=...`
-through the Remote's outbound path (SSRF guard, the repository's upstream
+(`include_deleted=true` in place of `updated_since` on the first pass,
+before there is a watermark) through the Remote's outbound path (SSRF guard, the repository's upstream
 credentials, 8 MiB per page). One replica runs the scheduled pass (a
 scheduler lease) and each repository's run holds a cluster-wide lock, so a
 manual trigger never overlaps a scheduled one. The watermark is the newest
 upstream `updatedAt` a completed pass saw (upstream's clock), held at least
 ten minutes behind the run's start so an entry updated mid-pass is read
 again; a pass that stops early (200 pages, an upstream error after the first
-page) resumes at its cursor next time. Each run:
+page) resumes at its cursor next time. Every pass therefore sees deleted
+versions: `updated_since` implies `include_deleted` upstream, and the first
+pass asks for them explicitly, so a version already `deleted` upstream when
+the Remote is first synced is recorded (and, once ingested, stored with
+status `deleted`, served only to `include_deleted=true` reads) like one
+deleted later. Each run:
 
 1. Records every upstream server name in the catalog (one `curation_packages`
    row, `format: mcp`, `version: "*"`) with a cached summary (title,
-   description, versions, latest version, upstream status and time), so
-   browsing never calls upstream. A new name starts `pending`; a name whose
+   description, versions, latest version, upstream status and time, and the
+   risk inputs of the latest non-deleted document: transports, package
+   registry types, secret count, package and remote counts), so browsing
+   never calls upstream. A new name starts `pending`; a name whose
    full name matches a glob of `mcp_auto_approve_namespaces` starts
    `approved` (a `pending` name that a glob added later matches is approved
    on the next sync); a **lookalike** of a known name (approved, pending, in
@@ -1080,10 +1106,27 @@ API's usual `{"code", "message"}` body.
 | `POST /catalog/{id}/block` | admin | same | `200 DecisionResult` |
 | `POST /catalog/{id}/reopen` | admin | same; back to `review` | `200 DecisionResult` |
 | `POST /catalog/pins` | admin | `{"name": "io.github.acme/x", "version": "1.2.0", "reason": "..."}` | `200 DecisionResult`; `404` name not in the catalog; `400` bad version |
-| `POST /catalog/bulk-approve` | admin | `{"pattern": "io.github.acme/*", "includeReview": false, "reason": "..."}` | `200 BulkResult`; `400` bad pattern; `403` a namespace-spanning pattern under `mcp_remote_posture_locked` (instance administrators excepted) |
+| `POST /catalog/bulk-approve` | admin | `{"pattern": "io.github.acme/*", "includeReview": false, "reason": "...", "dryRun": false}` | `200 BulkResult`; `400` bad pattern; `422` a bare namespace (`com.acme`: write `com.acme/*`); `403` a namespace-spanning pattern under `mcp_remote_posture_locked` (instance administrators excepted, dry runs included) |
+| `POST /catalog/bulk-block` | admin | `{"pattern": "io.github.acme/*", "reason": "...", "dryRun": false}` | `200 BulkResult`; `400` bad pattern; `422` a bare namespace |
+| `POST /catalog/bulk-decide` | admin | `{"ids": ["<uuid>", ...], "action": "approve" \| "block", "reason": "..."}` (1 to 500 ids, names or `name@version` rows) | `200 BulkDecideResult`; `400` no ids or more than 500; `422` another `action` |
 | `POST /catalog/{id}/request-approval` | read | `{"note": "..."}` (optional, 500 characters kept) | `200 CatalogItem` |
 | `GET /sync` | read | | `200 SyncState` |
 | `POST /sync` | admin, or an API token with `trigger:sync` and access to the repository | | `200 {"repository": "<key>", "summary": SyncSummary}`; `409` a run is in progress; `502` upstream unreadable |
+
+`GET /api/v1/mcp/pending-summary` (authenticated; token scope
+`read:repositories`) counts the approval queue across every Remote MCP
+repository the caller can read (the `GET /catalog` check, so an instance
+administrator sees all of them): `pending` names, flagged `review` names,
+and `drifted` `name@version` rows awaiting a decision (`pending`/`review`,
+a content drift). `401` without a caller.
+
+```json
+{"pending": 3, "review": 1, "drifted": 1, "total": 5,
+ "repositories": [{"key": "mcp-official", "pending": 3, "review": 1, "drifted": 1}]}
+```
+
+`repositories` lists, by key, only the repositories with something in the
+queue.
 
 `{id}` is the `curation_packages` id of a name row (or of a
 `name@version` row for approve/block/reopen). The generic curation routes
@@ -1095,12 +1138,32 @@ repository.
 
 Approving a name (or pinning a version) ingests it right away; when upstream
 cannot be reached the approval stands, `ingestError` says why, and the next
-sync ingests it. A bulk approval ingests in the background. Bulk approval
-takes `pending` names whose full name or namespace matches the glob (`*`
-matches any run of characters, `/` included; ASCII case-insensitive),
-skips denied names and, unless `includeReview`, flagged ones. A name that
-another decision (a block, say) moved out of `pending`/`review` after the
-bulk approval selected it keeps that decision.
+sync ingests it. A bulk approval ingests in the background.
+
+Bulk decisions by pattern take a glob over the **full** server name, the
+same rule as `mcp_auto_approve_namespaces` and `mcp_server_deny` (`*`
+matches any run of characters, `/` included; ASCII case-insensitive):
+`io.github.acme/*` (one namespace), `com.acme.*/*` (its sub-namespaces),
+`io.github.acme/weather` (one server). A pattern with neither `/` nor `*`
+(a bare namespace) matches no name and is refused with `422` and the
+spelling that would (`use com.acme/* for every server in the namespace`).
+A bulk approval takes `pending` names that match, skips denied names
+(`skippedDenied`) and, unless `includeReview`, flagged ones
+(`skippedReview`). A bulk block takes every matching name that is not
+blocked yet (`pending`, `review` or `approved`, denied ones included); it
+only tightens, so the posture lock does not restrict it. At most 5000 names
+per call. With `dryRun: true` nothing is written or audited: the answer
+counts and lists (every name, up to 5000) what the call would decide, with
+the same refusals as the real call. A name that another decision moved out
+of the state it was selected in keeps that decision.
+
+A bulk decision by id (`bulk-decide`) approves or blocks the listed rows,
+names or `name@version` pins, as one decision per row (each audited, each
+approval ingested in the background). A row already in the target status is
+left alone (`unchanged`), an approval skips a row whose name is denied
+(`skippedDenied`), and an id that is not a row of this repository's catalog
+is reported in `notFound`. Each id is named explicitly, so the posture lock
+restricts it no more than a single decision.
 
 What a caller sees of an item depends on who it is. A repository
 administrator sees everything. A caller who holds the repository (`read`
@@ -1110,7 +1173,21 @@ decision detail but not other users: `evaluatedBy` is `null` and
 public Remote) sees the upstream entries and their status only: `denied` is
 absent, `flags` is `{}`, `evaluationReason`, `evaluatedBy` and each pin's
 `evaluationReason`/`contentDrift` are `null`, `ingested[].unresolved` is
-`[]`, and `approvalRequests` is `{count}` (`{}` when nobody asked).
+`[]`, `summary.lint` is absent, and `approvalRequests` is `{count}` (`{}`
+when nobody asked).
+
+`summary` carries the risk inputs of a name without a per-row call: the
+sync caches `transports` (package `transport.type` and remote `type`,
+sorted), `registryTypes` (package `registryType`, sorted), `secretsCount`
+(package environment variables, package transport headers and remote
+headers marked `isSecret`), `packagesCount` and `remotesCount` from the
+latest non-deleted upstream document it saw, also for a name nobody
+approved. It is `null` until a sync sees a version of the name. For a name
+with an ingested version, `summary.lint` adds the unacknowledged findings
+per action (`block`, `review`, `warn`) of that version's newest lint run
+(see [Lint and health](#lint-and-health)), where the version is the upstream
+latest when it is ingested, else the highest ingested one; it is absent
+while no ingested version has been linted.
 
 A request for approval is recorded per requester
 (`approvalRequests.requesters.<user id> = {at, note}`, at most 100
@@ -1129,6 +1206,7 @@ CatalogItem    { id: uuid, name, namespace,
                  latestVersion: string | null, versions: string[],   // newest first, at most 200
                  upstreamStatus: "active" | "deprecated" | "deleted" | null,
                  upstreamUpdatedAt: RFC 3339 | null,
+                 summary: CatalogSummary | null,
                  flags: { typosquat?: { similarTo: string } },
                  approvalRequests: { count?,          // everyone
                                      lastRequestedAt?, lastRequestedBy?, lastNote?,
@@ -1136,14 +1214,20 @@ CatalogItem    { id: uuid, name, namespace,
                  evaluationReason: string | null, evaluatedAt: RFC 3339 | null,
                  evaluatedBy: uuid | null, firstSeenAt: RFC 3339,
                  pins: CatalogPin[], ingested: CatalogVersion[] }
+CatalogSummary { transports: string[], registryTypes: string[],
+                 secretsCount: n, packagesCount: n, remotesCount: n,
+                 lint?: { version, block: n, review: n, warn: n } }   // holders only
 CatalogPin     { id: uuid, version, status,
                  contentDrift: { storedSha256, upstreamSha256, detectedAt } | null,
                  evaluationReason: string | null }
 CatalogVersion { version, artifactId: uuid,           // the server.json artifact (capabilities diff, health)
                  upstreamStatus, unresolved: [{ index, error, detail }] }
 DecisionResult { item: CatalogItem, ingestError: string | null }
-BulkResult     { approved: n, names: string[],        // first 100
-                 skippedDenied: n, skippedReview: n }
+BulkResult     { approved: n, blocked: n,             // one of them is 0
+                 names: string[],                     // first 100; every one (up to 5000) for a dry run
+                 skippedDenied: n, skippedReview: n, dryRun: bool }
+BulkDecideResult { action: "approve" | "block", decided: uuid[], unchanged: uuid[],
+                   skippedDenied: uuid[], notFound: uuid[] }
 SyncState      { updatedSince, resumeCursor, resumeSince, lastStartedAt,
                  lastFinishedAt, lastSucceededAt, lastError, lastSummary: SyncSummary }
 SyncSummary    { pages, entries, namesNew, autoApproved, flagged, ingested,
