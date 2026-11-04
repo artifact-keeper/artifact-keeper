@@ -173,6 +173,15 @@ as `jetbrains.rs::upload_plugin` does. The structural gates in
 handler source, so the insert must sit in the function that calls those
 helpers.
 
+The object key is content-addressed inside the repository-scoped prefix of
+the #2624 scheme: `agentplugins/{repository_id}/{sha256}/{name}/{version}/{name}-{version}.zip`
+on a shared cloud namespace, `agentplugins/{sha256}/...` on a filesystem
+backend or under `STORAGE_KEY_SCHEME=flat`. The repository segment lets two
+repositories on one bucket hold byte-identical archives without tripping the
+cross-repository write guard (#5267); the hash keeps a losing concurrent
+publish of different bytes from overwriting the winner's object. Downloads
+read the key the artifact row recorded, never a recomputed one.
+
 ## 5. Harness compatibility and index membership
 
 | Index document | Includes plugins tagged |
