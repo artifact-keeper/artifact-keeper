@@ -17,6 +17,7 @@ repository-scoped token is refused), and enumerate every repository.
 | Held with no recorded source, and no scan policy refuses it | `409` |
 | Rejected during review | `403` |
 | Not held, but a scan policy refuses it | `403` |
+| MCP server version whose server.json, or a package it pins, is held | `404` on the `/mcp/{repo}/v0.1` surface for every caller; the reason is in the problem+json body only for callers who hold the repository. The artifact route keeps `409`/`403`. See [`docs/mcp-registry.md`](../mcp-registry.md#what-a-client-sees). |
 
 Before 1.12.0 a scan-policy hold answered `409`, like any other hold. A
 client that retried on `409` waiting for a release now gets `403` for a
