@@ -1935,7 +1935,12 @@ ak-mcp-introspector convert --from <inventory> <file> # print a report body
 ak-mcp-introspector push --from <inventory> --repo <key> --server <name> --version <v> <file>
     AK_URL, AK_TOKEN (write:artifacts)
 ak-mcp-introspector render-sandbox <job.json>         # print the guest spec and runner command
+ak-mcp-introspector sandbox-probe <job.json>          # run that guest for real, print the result
 ```
+
+`sandbox-probe` needs no backend: it runs the job document with the
+configured runner and prints the probe result. It exits `0` only for
+`"outcome": "ok"`, which makes it the check for a sandbox deployment.
 
 **Remote probe.** Per job: the URL must pass `validate_outbound_url` (public
 addresses only; the worker refuses to start while `UPSTREAM_ALLOW_PRIVATE_IPS`
@@ -2025,19 +2030,22 @@ instructions}`, e.g. Cisco MCP Scanner static JSON).
    CGNAT (`100.64.0.0/10`), link-local (`169.254.0.0/16`, including cloud
    metadata), loopback and the IPv6 equivalents. The in-process guard is
    defence in depth, not a substitute.
-3. Sandbox (optional, `--sandbox`): a node with gVisor (`runsc` registered
-   with podman/docker) or a microVM runtime, and a container network that
-   reaches only the AK host (for example an internal network whose sole
-   route is an egress proxy allowing the AK hostname). Mirror the runner
-   images through an AK OCI repository and point the image variables at
-   them. The worker needs the engine socket; isolate the node accordingly.
+3. Sandbox (optional, `--sandbox`): follow the reference deployment in
+   [docs/security/mcp-sandbox.md](security/mcp-sandbox.md), which covers the
+   threat model, a dedicated host with rootless Podman and gVisor (no engine
+   socket in any container), the internal `ak-mcp-sandbox` network whose
+   only peer forwards to AK, and a Kubernetes variant (gVisor
+   `RuntimeClass`, one guest pod per job through the API, RBAC and
+   NetworkPolicies). The files are in `deploy/mcp-introspector/`. Check the
+   deployment with `sandbox-probe` before turning the sandbox on.
 4. Turn it on per repository: `mcp_probe_remotes` (`hosted_only` / `all`)
    and/or `mcp_sandbox_introspection: on`. Both default to off and can be
    locked by an instance administrator.
 
-The repository ships no container image or compose service for the worker;
-build it with `cargo build --release --bin ak-mcp-introspector` and package
-it with your deployment.
+The repository ships no container image for the worker; build it with
+`cargo build --release --bin ak-mcp-introspector` and package it with your
+deployment. The `mcp-sandbox` workflow runs a real sandboxed probe under
+gVisor on every change to the worker (see the security page).
 
 Audit: `MCP_CAPABILITIES_INGESTED` for every stored snapshot (declared,
 reported or observed; the reporter as actor when there is one) and

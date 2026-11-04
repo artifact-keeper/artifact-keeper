@@ -94,6 +94,10 @@ enum Command {
     },
     /// Print what a claimed sandbox job would run.
     RenderSandbox { job: String },
+    /// Run a sandbox job document (as `render-sandbox` takes it) for real,
+    /// with the configured runner, and print the probe result. No backend:
+    /// a deployment check for the sandbox (runtime, network, images).
+    SandboxProbe { job: String },
 }
 
 fn env(k: &str) -> Option<String> {
@@ -206,7 +210,34 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
             Ok(())
         }
+        Command::SandboxProbe { job } => {
+            let out = sandbox_probe_job(sandbox::runner_from_env(env).as_ref(), &read_json(&job)?)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            if out["outcome"] == "ok" {
+                Ok(())
+            } else {
+                Err(format!("sandbox probe outcome: {}", out["outcome"]))
+            }
+        }
     }
+}
+
+/// The result body of running the sandbox job document `job` with `runner`.
+async fn sandbox_probe_job(
+    runner: &dyn sandbox::SandboxRunner,
+    job: &Value,
+) -> Result<Value, String> {
+    let ak = job["akBaseUrl"].as_str().ok_or("job has no akBaseUrl")?;
+    let report = worker::sandbox_probe(
+        runner,
+        &sandbox::images_from_env(env),
+        job["jobId"].as_str().unwrap_or("job"),
+        &job["target"],
+        ak,
+    )
+    .await;
+    Ok(report.to_result_json())
 }
 
 #[tokio::main]
@@ -235,6 +266,40 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    /// `sandbox-probe` runs the guest the runner plans and probes it over
+    /// stdio: here an external runner whose "guest" is the shell MCP server
+    /// the `mcp-sandbox` workflow also runs under gVisor. A target the
+    /// sandbox refuses starts nothing.
+    #[tokio::test]
+    async fn sandbox_probe_runs_a_guest_over_stdio() {
+        let runner = sandbox::ExternalRunner {
+            command: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/mcp_sandbox/echo-mcp-server.sh"
+            )
+            .into(),
+        };
+        let job = |identifier: &str| {
+            json!({"jobId": "j", "akBaseUrl": "https://ak.test", "target": {"package": {
+                "registryType": "oci", "identifier": identifier,
+                "transport": {"type": "stdio"}}}})
+        };
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let out = sandbox_probe_job(&runner, &job(&format!("ak.test/mcp/echo@{digest}")))
+            .await
+            .unwrap();
+        assert_eq!(out["outcome"], "ok", "{out}");
+        assert_eq!(out["tools"][0]["name"], "echo", "{out}");
+        assert_eq!(out["details"]["runner"], "external");
+        let out = sandbox_probe_job(&runner, &job(&format!("evil.test/x@{digest}")))
+            .await
+            .unwrap();
+        assert_eq!(out["outcome"], "unsupported", "{out}");
+        assert!(sandbox_probe_job(&runner, &json!({})).await.is_err());
+        let c = Cli::try_parse_from(["x", "sandbox-probe", "j.json"]).unwrap();
+        assert!(matches!(c.command, Command::SandboxProbe { .. }));
     }
 
     #[test]

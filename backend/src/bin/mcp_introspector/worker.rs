@@ -158,6 +158,30 @@ pub async fn probe_remote(client: reqwest::Client, url: &str) -> ProbeReport {
     }
 }
 
+/// Run one sandbox job (`target` as a claimed job carries it) with `runner`
+/// and probe the guest over its stdio. Shared by the job loop and the
+/// backend-free `sandbox-probe` subcommand.
+pub async fn sandbox_probe(
+    runner: &dyn SandboxRunner,
+    images: &Images,
+    job_id: &str,
+    target: &Value,
+    ak_base_url: &str,
+) -> ProbeReport {
+    match guest_spec(job_id, target, ak_base_url, images)
+        .and_then(|spec| runner.plan(&spec).map(|p| (spec, p)))
+    {
+        Ok((spec, plan)) => {
+            let mut r = run_and_probe(&plan, MAX_ITEMS, MAX_BYTES).await;
+            r.details.insert("runner".into(), json!(runner.name()));
+            r.details.insert("image".into(), json!(spec.image));
+            r.details.insert("notes".into(), json!(spec.notes));
+            r
+        }
+        Err(e) => failed("unsupported", e.to_string()),
+    }
+}
+
 impl Worker {
     pub fn kinds(&self) -> Vec<&'static str> {
         let mut k = vec!["remote_probe"];
@@ -180,18 +204,7 @@ impl Worker {
                 Some(runner) => {
                     let ak = job["akBaseUrl"].as_str().unwrap_or(self.backend.base());
                     let job_id = job["jobId"].as_str().unwrap_or("job");
-                    match guest_spec(job_id, target, ak, &self.images)
-                        .and_then(|spec| runner.plan(&spec).map(|p| (spec, p)))
-                    {
-                        Ok((spec, plan)) => {
-                            let mut r = run_and_probe(&plan, MAX_ITEMS, MAX_BYTES).await;
-                            r.details.insert("runner".into(), json!(runner.name()));
-                            r.details.insert("image".into(), json!(spec.image));
-                            r.details.insert("notes".into(), json!(spec.notes));
-                            r
-                        }
-                        Err(e) => failed("unsupported", e.to_string()),
-                    }
+                    sandbox_probe(runner.as_ref(), &self.images, job_id, target, ak).await
                 }
             },
             _ => failed("unsupported", "unknown job kind"),
