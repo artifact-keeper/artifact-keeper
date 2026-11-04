@@ -1819,36 +1819,67 @@ pub fn upstream_verified(upstream: Option<&serde_json::Value>) -> bool {
         && flag("drifted") != Some(true)
 }
 
+/// The risk inputs of a server.json `server` object, as the Remote catalog
+/// caches them (`CatalogItem.summary`): the transports (package
+/// `transport.type` and remote `type`), package `registryType`s (both
+/// sorted, de-duplicated), how many environment variables and headers
+/// (package transport headers and remote headers) are marked `isSecret`, and
+/// the package and remote counts.
+pub fn server_risk_summary(server: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    let arr = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (packages, remotes) = (arr(server, "packages"), arr(server, "remotes"));
+    let sorted = |it: &mut dyn Iterator<Item = &Value>| {
+        let mut v: Vec<String> = it.filter_map(Value::as_str).map(str::to_string).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let transports = sorted(
+        &mut packages
+            .iter()
+            .filter_map(|p| p.pointer("/transport/type"))
+            .chain(remotes.iter().filter_map(|r| r.get("type"))),
+    );
+    let registry_types = sorted(&mut packages.iter().filter_map(|p| p.get("registryType")));
+    let secret = |list: Vec<Value>| {
+        list.iter()
+            .filter(|e| e.get("isSecret").and_then(Value::as_bool) == Some(true))
+            .count()
+    };
+    let secrets: usize = packages
+        .iter()
+        .map(|p| {
+            secret(arr(p, "environmentVariables"))
+                + secret(
+                    p.get("transport")
+                        .map(|t| arr(t, "headers"))
+                        .unwrap_or_default(),
+                )
+        })
+        .chain(remotes.iter().map(|r| secret(arr(r, "headers"))))
+        .sum();
+    serde_json::json!({
+        "transports": transports,
+        "registryTypes": registry_types,
+        "secretsCount": secrets,
+        "packagesCount": packages.len(),
+        "remotesCount": remotes.len(),
+    })
+}
+
 /// The catalog (`/api/v1/packages`) `metadata` of a stored MCP version: a
 /// summary of its server.json so generic package views can show it without
 /// the registry API.
 pub fn catalog_metadata(doc: &serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     let server = doc.get("server").cloned().unwrap_or(Value::Null);
-    let arr = |k: &str| {
-        server
-            .get(k)
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    };
-    let (packages, remotes) = (arr("packages"), arr("remotes"));
-    let mut transports: Vec<String> = packages
-        .iter()
-        .filter_map(|p| p.pointer("/transport/type"))
-        .chain(remotes.iter().filter_map(|r| r.get("type")))
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect();
-    transports.sort();
-    transports.dedup();
-    let mut registry_types: Vec<String> = packages
-        .iter()
-        .filter_map(|p| p.get("registryType").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect();
-    registry_types.sort();
-    registry_types.dedup();
+    let risk = server_risk_summary(&server);
     let upstream = doc.get("upstream").filter(|u| u.is_object());
     let field = |k: &str| server.get(k).cloned().unwrap_or(Value::Null);
     serde_json::json!({
@@ -1860,10 +1891,10 @@ pub fn catalog_metadata(doc: &serde_json::Value) -> serde_json::Value {
         "title": field("title"),
         "description": field("description"),
         "status": doc.pointer("/registry/status").cloned().unwrap_or(Value::Null),
-        "transports": transports,
-        "packagesCount": packages.len(),
-        "remotesCount": remotes.len(),
-        "registryTypes": registry_types,
+        "transports": risk["transports"],
+        "packagesCount": risk["packagesCount"],
+        "remotesCount": risk["remotesCount"],
+        "registryTypes": risk["registryTypes"],
     })
 }
 
@@ -2824,6 +2855,41 @@ mod tests {
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn risk_summary_counts_transports_types_and_secrets() {
+        let server = serde_json::json!({
+            "packages": [
+                {"registryType": "npm", "transport": {"type": "stdio"},
+                 "environmentVariables": [
+                    {"name": "API_KEY", "isSecret": true},
+                    {"name": "REGION", "isSecret": false},
+                    {"name": "DEBUG"}]},
+                {"registryType": "oci", "transport": {"type": "streamable-http",
+                 "headers": [{"name": "Authorization", "isSecret": true}]}},
+                {"registryType": "npm", "transport": {"type": "stdio"}},
+            ],
+            "remotes": [
+                {"type": "sse", "url": "https://x.test/sse",
+                 "headers": [{"name": "X-Token", "isSecret": true}]},
+            ],
+        });
+        assert_eq!(
+            server_risk_summary(&server),
+            serde_json::json!({
+                "transports": ["sse", "stdio", "streamable-http"],
+                "registryTypes": ["npm", "oci"],
+                "secretsCount": 3,
+                "packagesCount": 3,
+                "remotesCount": 1,
+            })
+        );
+        assert_eq!(
+            server_risk_summary(&serde_json::Value::Null),
+            serde_json::json!({"transports": [], "registryTypes": [], "secretsCount": 0,
+                               "packagesCount": 0, "remotesCount": 0})
         );
     }
 

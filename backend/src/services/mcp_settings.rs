@@ -176,13 +176,26 @@ pub fn validate_globs(key: &str, globs: &[String]) -> Result<Vec<String>> {
 /// the spelling that would.
 pub fn validate_name_globs(key: &str, globs: &[String]) -> Result<Vec<String>> {
     let out = validate_globs(key, globs)?;
-    if let Some(g) = out.iter().find(|g| !g.contains('/') && !g.contains('*')) {
-        return Err(AppError::Validation(format!(
-            "{key}: `{g}` matches no server name (patterns match the full name \
-             `namespace/name`); use `{g}/*` for every server in the namespace"
-        )));
+    if let Some(msg) = bare_namespace_refusal(key, &out) {
+        return Err(AppError::Validation(msg));
     }
     Ok(out)
+}
+
+/// The refusal of the first bare namespace (an entry with neither `/` nor
+/// `*`) in `globs`, with the spelling that would match its servers; `None`
+/// when every entry is a full-name glob. Shared by [`validate_name_globs`]
+/// and the catalog's bulk decisions so both apply one rule.
+pub fn bare_namespace_refusal(key: &str, globs: &[String]) -> Option<String> {
+    globs
+        .iter()
+        .find(|g| !g.contains('/') && !g.contains('*'))
+        .map(|g| {
+            format!(
+                "{key}: `{g}` matches no server name (patterns match the full name \
+                 `namespace/name`); use `{g}/*` for every server in the namespace"
+            )
+        })
 }
 
 /// `*` matches any run of characters (including `/`); everything else is

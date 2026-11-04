@@ -1553,6 +1553,15 @@ fn api_v1_routes(
                 auth_middleware,
             )),
         )
+        // MCP approval-queue count across the Remote MCP repositories the
+        // caller can read (#5253): GET /mcp/pending-summary.
+        .nest(
+            "/mcp",
+            handlers::mcp_remote::summary_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
         // MCP introspection worker API (#5253): claim/complete jobs with an
         // `mcp:introspect` token. The worker is a separate process.
         .nest(

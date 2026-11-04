@@ -4,7 +4,7 @@
 //! (`services::mcp_remote`): browsing never calls upstream, and nothing here
 //! makes an entry visible on `/v0.1` (that is `services::mcp_curation` at
 //! read time). Decisions (approve, block, reopen, `name@version` pins,
-//! namespace-glob bulk approval) write `curation_packages`, audit
+//! bulk decisions by full-name glob or by id) write `curation_packages`, audit
 //! `MCP_SERVER_APPROVED` / `MCP_SERVER_REJECTED` / `MCP_SERVER_REOPENED`, and
 //! an approval ingests the name's versions right away (falling back to the
 //! next sync, through `metadata.needsIngest`, when upstream is unreachable).
@@ -165,6 +165,38 @@ pub struct CatalogVersion {
     pub unresolved: Vec<serde_json::Value>,
 }
 
+/// Lint verdict of a name's latest ingested version: unacknowledged
+/// findings per action (`scan_findings` of its newest `mcp_lint` run).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogLint {
+    /// The ingested version the counts are of.
+    pub version: String,
+    pub block: i64,
+    pub review: i64,
+    pub warn: i64,
+}
+
+/// Risk inputs of a name, cached by the sync from the latest upstream
+/// document it saw (`formats::mcp::server_risk_summary`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSummary {
+    /// Package `transport.type`s and remote `type`s, sorted.
+    pub transports: Vec<String>,
+    /// Package `registryType`s, sorted.
+    pub registry_types: Vec<String>,
+    /// Environment variables and headers marked `isSecret`.
+    pub secrets_count: u64,
+    pub packages_count: u64,
+    pub remotes_count: u64,
+    /// The latest ingested version's lint counts; absent when no version is
+    /// ingested (or linted yet), and for callers who do not hold the
+    /// repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint: Option<CatalogLint>,
+}
+
 /// One upstream server name of the catalog.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -186,6 +218,9 @@ pub struct CatalogItem {
     pub versions: Vec<String>,
     pub upstream_status: Option<String>,
     pub upstream_updated_at: Option<String>,
+    /// Risk inputs of the latest upstream document; `null` until a sync
+    /// sees a (not deleted) version of the name.
+    pub summary: Option<CatalogSummary>,
     /// `{"typosquat": {"similarTo": "<name>"}}` and similar ingest flags.
     #[schema(value_type = Object)]
     pub flags: serde_json::Value,
@@ -242,6 +277,9 @@ impl CatalogItem {
             return self;
         }
         self.denied = None;
+        if let Some(sum) = &mut self.summary {
+            sum.lint = None;
+        }
         self.flags = serde_json::json!({});
         self.evaluation_reason = None;
         for p in &mut self.pins {
@@ -327,6 +365,10 @@ fn item_of(
             .unwrap_or_default(),
         upstream_status: text(m, "upstreamStatus"),
         upstream_updated_at: text(m, "upstreamUpdatedAt"),
+        summary: m
+            .get("summary")
+            .filter(|v| v.is_object())
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
         flags: object(m, "flags"),
         approval_requests: object(m, "approvalRequests"),
         evaluation_reason: row.evaluation_reason,
@@ -413,14 +455,78 @@ async fn items_of(
                 .unwrap_or_default(),
         });
     }
-    Ok(rows
+    let mut items: Vec<CatalogItem> = rows
         .into_iter()
         .map(|r| {
             let p = pins_by.remove(&r.package_name).unwrap_or_default();
             let i = ingested_by.remove(&r.package_name).unwrap_or_default();
             item_of(r, policy, p, i)
         })
-        .collect())
+        .collect();
+    with_lint(db_pool, &mut items).await?;
+    Ok(items)
+}
+
+/// The ingested version whose lint a catalog item shows (pure): the
+/// upstream latest when it is ingested, else the highest ingested version.
+pub fn lint_version(item: &CatalogItem) -> Option<&CatalogVersion> {
+    item.ingested
+        .iter()
+        .find(|v| Some(&v.version) == item.latest_version.as_ref())
+        .or_else(|| {
+            item.ingested.iter().max_by(|a, b| {
+                crate::formats::mcp::compare_versions_for_latest(&a.version, &b.version)
+            })
+        })
+}
+
+/// Fill `summary.lint` of `items` from the newest `mcp_lint` run of each
+/// one's [`lint_version`] (one query for the page).
+async fn with_lint(db_pool: &PgPool, items: &mut [CatalogItem]) -> Result<()> {
+    let ids: Vec<Uuid> = items
+        .iter()
+        .filter_map(|i| lint_version(i).map(|v| v.artifact_id))
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let counts: Vec<(Uuid, i64, i64, i64)> = sqlx::query_as(
+        "SELECT r.artifact_id, \
+                count(*) FILTER (WHERE f.severity = 'critical'), \
+                count(*) FILTER (WHERE f.severity = 'high'), \
+                count(*) FILTER (WHERE f.severity NOT IN ('critical', 'high')) \
+         FROM (SELECT DISTINCT ON (artifact_id) id, artifact_id FROM scan_results \
+               WHERE artifact_id = ANY($1) AND scan_type = $2 AND status = 'completed' \
+               ORDER BY artifact_id, completed_at DESC NULLS LAST, created_at DESC) r \
+         LEFT JOIN scan_findings_effective f \
+           ON f.scan_result_id = r.id AND NOT f.is_acknowledged \
+         GROUP BY r.artifact_id",
+    )
+    .bind(&ids)
+    .bind(crate::services::mcp_lint::MCP_LINT_SCAN_TYPE)
+    .fetch_all(db_pool)
+    .await
+    .map_err(db)?;
+    for item in items.iter_mut() {
+        let Some(v) = lint_version(item) else {
+            continue;
+        };
+        let Some((_, block, review, warn)) = counts.iter().find(|c| c.0 == v.artifact_id) else {
+            continue;
+        };
+        let lint = CatalogLint {
+            version: v.version.clone(),
+            block: *block,
+            review: *review,
+            warn: *warn,
+        };
+        // A name synced before summaries were cached has none: no lint
+        // either until the next sync sees it.
+        if let Some(sum) = &mut item.summary {
+            sum.lint = Some(lint);
+        }
+    }
+    Ok(())
 }
 
 fn policy_err(_: ()) -> AppError {
@@ -744,43 +850,87 @@ pub async fn pin(
     })
 }
 
-/// The answer of a namespace-glob bulk approval.
+/// What a bulk decision does: approve or block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkAction {
+    Approve,
+    Block,
+}
+
+impl BulkAction {
+    pub fn decision(self) -> Decision {
+        match self {
+            BulkAction::Approve => Decision::Approve,
+            BulkAction::Block => Decision::Block,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BulkAction::Approve => "approve",
+            BulkAction::Block => "block",
+        }
+    }
+
+    /// The name-row statuses a pattern decision takes: an approval takes
+    /// `pending` (and flagged `review` ones only when asked); a block takes
+    /// every name not blocked yet.
+    fn takes(self, include_review: bool) -> &'static [&'static str] {
+        match (self, include_review) {
+            (BulkAction::Approve, false) => &[STATUS_PENDING],
+            (BulkAction::Approve, true) => &[STATUS_PENDING, STATUS_REVIEW],
+            (BulkAction::Block, _) => &[STATUS_PENDING, STATUS_REVIEW, STATUS_APPROVED],
+        }
+    }
+}
+
+/// The answer of a full-name-glob bulk approval or block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkResult {
+    /// Names approved (with `dryRun`: names that would be).
     pub approved: usize,
-    /// At most the first 100 approved names.
+    /// Names blocked (with `dryRun`: names that would be).
+    pub blocked: usize,
+    /// The names decided: at most the first 100, or every one (up to 5000)
+    /// for a dry run.
     pub names: Vec<String>,
-    /// Matching names left alone because they match `mcp_server_deny`.
+    /// Matching names an approval left alone because they match
+    /// `mcp_server_deny` (always 0 for a block).
     pub skipped_denied: usize,
-    /// Matching names left alone because they are flagged (`review`);
-    /// approve them one by one, or pass `include_review`.
+    /// Matching names an approval left alone because they are flagged
+    /// (`review`); approve them one by one, or pass `includeReview`.
     pub skipped_review: usize,
+    /// Nothing was written: the answer previews the decision.
+    pub dry_run: bool,
 }
 
-/// Which matching rows a bulk approval takes (pure): `pending` ones, plus
-/// flagged (`review`) ones only when asked; never a denied name.
+/// Which matching rows a bulk decision takes (pure). The glob matches the
+/// full server name only (as `mcp_auto_approve_namespaces` and
+/// `mcp_server_deny` do). An approval takes `pending` names, plus flagged
+/// (`review`) ones only when asked, and never a denied name; a block takes
+/// every matching name not blocked yet, denied or not.
 pub fn bulk_selection(
     rows: &[(Uuid, String, String)],
     pattern: &str,
     deny: &[String],
+    action: BulkAction,
     include_review: bool,
 ) -> (Vec<(Uuid, String)>, usize, usize) {
+    let takes = action.takes(include_review);
     let mut take = Vec::new();
     let (mut denied, mut review) = (0, 0);
     for (id, name, status) in rows {
-        if !(crate::services::mcp_settings::glob_matches(pattern, name)
-            || crate::services::mcp_settings::glob_matches(
-                pattern,
-                crate::formats::mcp::namespace_of(name),
-            ))
-        {
+        if !crate::services::mcp_settings::glob_matches(pattern, name) {
             continue;
         }
-        if cur::is_denied(deny, name) {
+        if !takes.contains(&status.as_str()) {
+            if status == STATUS_REVIEW {
+                review += 1;
+            }
+        } else if action == BulkAction::Approve && cur::is_denied(deny, name) {
             denied += 1;
-        } else if status == STATUS_REVIEW && !include_review {
-            review += 1;
         } else {
             take.push((*id, name.clone()));
         }
@@ -788,51 +938,91 @@ pub fn bulk_selection(
     (take, denied, review)
 }
 
-/// Approve every `pending` name matching the glob `pattern` (on the full
-/// name or the namespace), as one decision. The names' versions are ingested
-/// in the background (and by the next sync, whichever comes first).
-pub async fn approve_pattern(
+/// Validate a bulk pattern: the glob syntax of the settings lists (`400`),
+/// and a full-name glob (`422` for a bare namespace, with the spelling that
+/// would match: `com.acme/*`).
+pub fn validate_bulk_pattern(pattern: &str) -> Result<String> {
+    let globs = crate::services::mcp_settings::validate_globs("pattern", &[pattern.to_string()])?;
+    if let Some(msg) = crate::services::mcp_settings::bare_namespace_refusal("pattern", &globs) {
+        return Err(AppError::UnprocessableEntity(msg));
+    }
+    Ok(globs.into_iter().next().unwrap_or_default())
+}
+
+/// Approve (or block) every name matching the full-name glob `pattern`, as
+/// one decision. Approved names' versions are ingested in the background
+/// (and by the next sync, whichever comes first). With `dry_run` nothing is
+/// written: the answer lists what would be decided.
+#[allow(clippy::too_many_arguments)]
+pub async fn decide_pattern(
     state: &SharedState,
     repo: &RepoInfo,
+    action: BulkAction,
     pattern: &str,
     include_review: bool,
+    dry_run: bool,
     actor: Uuid,
     reason: Option<&str>,
 ) -> Result<BulkResult> {
-    let pattern =
-        crate::services::mcp_settings::validate_globs("pattern", &[pattern.to_string()])?.remove(0);
+    let pattern = validate_bulk_pattern(pattern)?;
     let policy = cur::load_serve_policy(&state.db, repo.id)
         .await
         .map_err(policy_err)?;
     let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
         "SELECT id, package_name, status FROM curation_packages \
          WHERE staging_repo_id = $1 AND format = 'mcp' AND version = '*' \
-           AND status IN ('pending', 'review') ORDER BY package_name",
+           AND status IN ('pending', 'review', 'approved') ORDER BY package_name",
     )
     .bind(repo.id)
     .fetch_all(&state.db)
     .await
     .map_err(db)?;
     let (mut take, skipped_denied, skipped_review) =
-        bulk_selection(&rows, &pattern, &policy.deny, include_review);
+        bulk_selection(&rows, &pattern, &policy.deny, action, include_review);
     take.truncate(MAX_BULK);
+    let result = |take: &[(Uuid, String)], shown: usize| BulkResult {
+        approved: if action == BulkAction::Approve {
+            take.len()
+        } else {
+            0
+        },
+        blocked: if action == BulkAction::Block {
+            take.len()
+        } else {
+            0
+        },
+        names: take.iter().take(shown).map(|t| t.1.clone()).collect(),
+        skipped_denied,
+        skipped_review,
+        dry_run,
+    };
+    if dry_run {
+        return Ok(result(&take, MAX_BULK));
+    }
     let ids: Vec<Uuid> = take.iter().map(|t| t.0).collect();
+    let verb = match action {
+        BulkAction::Approve => "bulk-approved",
+        BulkAction::Block => "bulk-blocked",
+    };
     let reason = reason
         .map(str::to_string)
-        .unwrap_or_else(|| format!("bulk-approved by pattern {pattern}"));
-    // Only rows still in the state they were selected in: a block (or any
-    // other decision) written concurrently since the SELECT wins.
-    let allowed: &[&str] = if include_review {
-        &[STATUS_PENDING, STATUS_REVIEW]
-    } else {
-        &[STATUS_PENDING]
-    };
-    let updated = approve_rows(&state.db, &ids, allowed, &reason, actor).await?;
+        .unwrap_or_else(|| format!("{verb} by pattern {pattern}"));
+    // Only rows still in the state they were selected in: a decision written
+    // concurrently since the SELECT wins.
+    let updated = set_rows(
+        &state.db,
+        &ids,
+        action,
+        action.takes(include_review),
+        &reason,
+        actor,
+    )
+    .await?;
     take.retain(|t| updated.contains(&t.0));
     for (id, name) in &take {
         mcp_remote::audit(
             &state.db,
-            AuditAction::McpServerApproved,
+            action.decision().audit_action(),
             repo,
             Some(name),
             None,
@@ -840,50 +1030,163 @@ pub async fn approve_pattern(
             serde_json::json!({"review_id": id, "reason": reason, "pattern": pattern}),
         );
     }
-    spawn_ingest(
-        state,
-        repo,
-        take.iter()
-            .map(|t| (t.1.clone(), NAME_ROW_VERSION.to_string()))
-            .collect(),
-    );
-    Ok(BulkResult {
-        approved: take.len(),
-        names: take
-            .iter()
-            .take(BULK_NAMES_SHOWN)
-            .map(|t| t.1.clone())
-            .collect(),
-        skipped_denied,
-        skipped_review,
-    })
+    if action == BulkAction::Approve {
+        spawn_ingest(
+            state,
+            repo,
+            take.iter()
+                .map(|t| (t.1.clone(), NAME_ROW_VERSION.to_string()))
+                .collect(),
+        );
+    }
+    Ok(result(&take, BULK_NAMES_SHOWN))
 }
 
-/// Approve the rows `ids` that are still in one of `allowed` statuses (a
-/// decision written since they were selected wins); the ids approved.
-async fn approve_rows(
+/// Ids one bulk decision by id takes.
+pub const MAX_BULK_IDS: usize = 500;
+
+/// The answer of a bulk decision by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkDecideResult {
+    pub action: BulkAction,
+    /// Rows changed to the decision's status.
+    pub decided: Vec<Uuid>,
+    /// Rows already in that status (left alone, not audited again).
+    pub unchanged: Vec<Uuid>,
+    /// Rows an approval left alone because their name matches
+    /// `mcp_server_deny`.
+    pub skipped_denied: Vec<Uuid>,
+    /// Ids that are not a row of this repository's catalog.
+    pub not_found: Vec<Uuid>,
+}
+
+/// Approve or block the catalog rows `ids` (names or `name@version` pins).
+/// Approved rows are ingested in the background, as a bulk approval's are.
+pub async fn decide_ids(
+    state: &SharedState,
+    repo: &RepoInfo,
+    action: BulkAction,
+    ids: &[Uuid],
+    actor: Uuid,
+    reason: Option<&str>,
+) -> Result<BulkDecideResult> {
+    let mut wanted: Vec<Uuid> = Vec::new();
+    for id in ids {
+        if !wanted.contains(id) {
+            wanted.push(*id);
+        }
+    }
+    if wanted.is_empty() || wanted.len() > MAX_BULK_IDS {
+        return Err(AppError::Validation(format!(
+            "ids must name between 1 and {MAX_BULK_IDS} catalog rows"
+        )));
+    }
+    let policy = cur::load_serve_policy(&state.db, repo.id)
+        .await
+        .map_err(policy_err)?;
+    let rows: Vec<StoredRow> = sqlx::query_as(
+        "SELECT id, package_name, version, status, metadata FROM curation_packages \
+         WHERE id = ANY($1) AND staging_repo_id = $2 AND format = 'mcp'",
+    )
+    .bind(&wanted)
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(db)?;
+    let status = action.decision().status();
+    let mut out = BulkDecideResult {
+        action,
+        decided: Vec::new(),
+        unchanged: Vec::new(),
+        skipped_denied: Vec::new(),
+        not_found: Vec::new(),
+    };
+    let mut take: Vec<&StoredRow> = Vec::new();
+    for id in &wanted {
+        match rows.iter().find(|r| r.id == *id) {
+            None => out.not_found.push(*id),
+            Some(r) if r.status == status => out.unchanged.push(*id),
+            Some(r)
+                if action == BulkAction::Approve
+                    && cur::is_denied(&policy.deny, &r.package_name) =>
+            {
+                out.skipped_denied.push(*id)
+            }
+            Some(r) => take.push(r),
+        }
+    }
+    let take_ids: Vec<Uuid> = take.iter().map(|r| r.id).collect();
+    let reason = reason.map(str::to_string).unwrap_or_else(|| match action {
+        BulkAction::Approve => "bulk-approved".to_string(),
+        BulkAction::Block => "bulk-blocked".to_string(),
+    });
+    let others: Vec<&str> = [
+        STATUS_PENDING,
+        STATUS_REVIEW,
+        STATUS_APPROVED,
+        STATUS_BLOCKED,
+    ]
+    .into_iter()
+    .filter(|s| *s != status)
+    .collect();
+    let updated = set_rows(&state.db, &take_ids, action, &others, &reason, actor).await?;
+    let mut ingest = Vec::new();
+    for r in take {
+        if !updated.contains(&r.id) {
+            out.unchanged.push(r.id);
+            continue;
+        }
+        out.decided.push(r.id);
+        mcp_remote::audit(
+            &state.db,
+            action.decision().audit_action(),
+            repo,
+            Some(&r.package_name),
+            audit_version(&r.version),
+            Some(actor),
+            serde_json::json!({"review_id": r.id, "reason": reason, "bulk": true}),
+        );
+        if action == BulkAction::Approve {
+            ingest.push((r.package_name.clone(), r.version.clone()));
+        }
+    }
+    spawn_ingest(state, repo, ingest);
+    Ok(out)
+}
+
+/// Set the rows `ids` that are still in one of `allowed` statuses (a
+/// decision written since they were selected wins) to `action`'s status; the
+/// ids changed. An approval marks the rows `needsIngest`.
+async fn set_rows(
     db_pool: &PgPool,
     ids: &[Uuid],
+    action: BulkAction,
     allowed: &[&str],
     reason: &str,
     actor: Uuid,
 ) -> Result<Vec<Uuid>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     sqlx::query_scalar(
-        "UPDATE curation_packages SET status = 'approved', evaluation_reason = $2, \
+        "UPDATE curation_packages SET status = $5, evaluation_reason = $2, \
                 evaluated_by = $3, evaluated_at = now(), \
-                metadata = metadata || '{\"needsIngest\": true}' \
+                metadata = CASE WHEN $5 = 'approved' \
+                    THEN metadata || '{\"needsIngest\": true}' ELSE metadata END \
          WHERE id = ANY($1) AND status = ANY($4) RETURNING id",
     )
     .bind(ids)
     .bind(reason)
     .bind(actor)
     .bind(allowed)
+    .bind(action.decision().status())
     .fetch_all(db_pool)
     .await
     .map_err(db)
 }
 
-/// [`approve_rows`] for tests in other modules.
+/// [`set_rows`] (an approval) for tests in other modules.
 #[cfg(test)]
 pub(crate) async fn approve_rows_for_tests(
     db_pool: &PgPool,
@@ -891,7 +1194,7 @@ pub(crate) async fn approve_rows_for_tests(
     allowed: &[&str],
     actor: Uuid,
 ) -> Vec<Uuid> {
-    approve_rows(db_pool, ids, allowed, "test", actor)
+    set_rows(db_pool, ids, BulkAction::Approve, allowed, "test", actor)
         .await
         .expect("approve rows")
 }
@@ -1189,15 +1492,57 @@ mod tests {
             (id(), "com.other/c".to_string(), "pending".to_string()),
         ];
         let deny = vec!["*/evil".to_string()];
-        let (take, denied, review) = bulk_selection(&rows, "io.github.acme/*", &deny, false);
+        let (take, denied, review) =
+            bulk_selection(&rows, "io.github.acme/*", &deny, BulkAction::Approve, false);
         assert_eq!(
             take.iter().map(|t| t.1.as_str()).collect::<Vec<_>>(),
             ["io.github.acme/a"]
         );
         assert_eq!((denied, review), (1, 1));
-        let (take, _, review) = bulk_selection(&rows, "io.github.acme", &deny, true);
+        let (take, _, review) =
+            bulk_selection(&rows, "io.github.acme/*", &deny, BulkAction::Approve, true);
         assert_eq!(take.len(), 2);
         assert_eq!(review, 0);
+        // Full names only: the bare namespace matches nothing.
+        let (take, denied, review) =
+            bulk_selection(&rows, "io.github.acme", &deny, BulkAction::Approve, true);
+        assert_eq!((take.len(), denied, review), (0, 0, 0));
+        // A block takes every name not blocked yet, denied ones included.
+        let mut with_approved = rows.clone();
+        with_approved.push((id(), "io.github.acme/d".into(), "approved".into()));
+        with_approved.push((id(), "io.github.acme/e".into(), "blocked".into()));
+        let (take, denied, _) = bulk_selection(
+            &with_approved,
+            "io.github.acme/*",
+            &deny,
+            BulkAction::Block,
+            false,
+        );
+        assert_eq!(
+            take.iter().map(|t| t.1.as_str()).collect::<Vec<_>>(),
+            [
+                "io.github.acme/a",
+                "io.github.acme/b",
+                "io.github.acme/evil",
+                "io.github.acme/d"
+            ]
+        );
+        assert_eq!(denied, 0);
+    }
+
+    #[test]
+    fn bulk_patterns_are_full_name_globs() {
+        assert_eq!(
+            validate_bulk_pattern(" io.github.acme/* ").unwrap(),
+            "io.github.acme/*"
+        );
+        assert_eq!(validate_bulk_pattern("com.*").unwrap(), "com.*");
+        let bare = validate_bulk_pattern("com.acme").unwrap_err();
+        assert!(matches!(bare, AppError::UnprocessableEntity(ref m) if m.contains("`com.acme/*`")));
+        assert!(matches!(
+            validate_bulk_pattern("bad pattern"),
+            Err(AppError::Validation(_))
+        ));
     }
 
     #[test]
@@ -1210,6 +1555,8 @@ mod tests {
                 "title": "W", "description": "Weather", "latestVersion": "2.0.0",
                 "versions": ["2.0.0", "1.0.0"], "upstreamStatus": "active",
                 "flags": {"typosquat": {"similarTo": "com.acrne/w"}},
+                "summary": {"transports": ["stdio"], "registryTypes": ["npm"],
+                            "secretsCount": 2, "packagesCount": 1, "remotesCount": 0},
             }),
             evaluation_reason: None,
             evaluated_at: None,
@@ -1235,6 +1582,11 @@ mod tests {
         assert_eq!(item.latest_version.as_deref(), Some("2.0.0"));
         assert_eq!(item.versions, ["2.0.0", "1.0.0"]);
         assert_eq!(item.flags["typosquat"]["similarTo"], "com.acrne/w");
+        let sum = item.summary.clone().expect("cached summary");
+        assert_eq!(
+            (sum.transports, sum.registry_types, sum.secrets_count),
+            (vec!["stdio".to_string()], vec!["npm".to_string()], 2)
+        );
         assert_eq!(item.approval_requests, serde_json::json!({}));
         assert_eq!(item.pins[0].id, pin_id);
         assert!(item.pins[0].content_drift.is_some());
@@ -1255,6 +1607,17 @@ mod tests {
             upstream_status: "active".into(),
             unresolved: vec![serde_json::json!({"index": 0})],
         }];
+        // Not the upstream latest (2.0.0): the highest ingested version.
+        assert_eq!(
+            lint_version(&full).map(|v| v.version.as_str()),
+            Some("1.0.0")
+        );
+        full.summary.as_mut().unwrap().lint = Some(CatalogLint {
+            version: "1.0.0".into(),
+            block: 0,
+            review: 1,
+            warn: 2,
+        });
         assert_eq!(full.clone().for_view(CatalogView::Curator), full);
         let reader = full.clone().for_view(CatalogView::Reader);
         assert_eq!(reader.denied, None);
@@ -1264,7 +1627,10 @@ mod tests {
         assert_eq!(reader.approval_requests, serde_json::json!({"count": 1}));
         assert_eq!(reader.pins[0].evaluation_reason, None);
         assert!(reader.ingested[0].unresolved.is_empty());
+        let rs = reader.summary.as_ref().unwrap();
+        assert_eq!((rs.secrets_count, rs.lint.is_none()), (2, true));
         let json = serde_json::to_value(&reader).unwrap();
+        assert!(json["summary"].get("lint").is_none(), "{json}");
         assert!(json.get("denied").is_none(), "{json}");
         let holder = full.clone().for_view(CatalogView::Holder);
         assert_eq!(holder.denied, Some(true));
@@ -1272,6 +1638,17 @@ mod tests {
         assert_eq!(holder.evaluated_by, None);
         assert_eq!(holder.approval_requests, serde_json::json!({"count": 1}));
         assert_eq!(holder.ingested[0].unresolved.len(), 1);
+        assert_eq!(
+            holder
+                .summary
+                .as_ref()
+                .unwrap()
+                .lint
+                .as_ref()
+                .unwrap()
+                .review,
+            1
+        );
         // A name nobody requested keeps the empty object.
         assert_eq!(
             item.for_view(CatalogView::Reader).approval_requests,

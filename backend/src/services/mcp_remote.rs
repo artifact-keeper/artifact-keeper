@@ -4,14 +4,16 @@
 //! from an upstream registry, not a mirror of it. Its `upstream_url` is a
 //! registry origin (the official registry, another Artifact Keeper
 //! `/mcp/<key>`, any server of the v0.1 API). The sync pages
-//! `GET {upstream}/v0.1/servers?updated_since=..&limit=100&cursor=..` through
+//! `GET {upstream}/v0.1/servers?updated_since=..&limit=100&cursor=..`
+//! (`include_deleted=true` instead of `updated_since` on the first pass) through
 //! [`proxy_fetch_capped_with_format`](crate::api::handlers::proxy_helpers::proxy_fetch_capped_with_format)
 //! (8 MiB per page, SSRF-guarded, the Remote's upstream credentials) and:
 //!
 //! * records every upstream server name as one `curation_packages` row
 //!   (`version = '*'`) whose `metadata` caches the catalog summary the UI
-//!   browses (title, description, versions, latest, upstream time, flags),
-//!   so browsing never calls upstream;
+//!   browses (title, description, versions, latest, upstream time, flags,
+//!   and the risk summary of the latest document), so browsing never calls
+//!   upstream;
 //! * flags lookalike names at ingest (typosquat, routed to `review`) and
 //!   approves names matching `mcp_auto_approve_namespaces`;
 //! * ingests the versions of every eligible name (approved names, pending
@@ -197,14 +199,21 @@ pub fn parse_page(bytes: &[u8]) -> Result<UpstreamPage, String> {
     Ok(page)
 }
 
-/// The upstream listing path of one page.
+/// The upstream listing path of one page. Every pass sees deleted versions:
+/// an incremental one through `updated_since` (which implies
+/// `include_deleted` upstream), the first one (no watermark yet) through an
+/// explicit `include_deleted=true`, so a version already deleted upstream
+/// at the first sync is recorded as `deleted` too.
 pub fn listing_path(since: Option<DateTime<Utc>>, cursor: Option<&str>) -> String {
     let mut path = format!("v0.1/servers?limit={PAGE_LIMIT}");
-    if let Some(since) = since {
-        path.push_str("&updated_since=");
-        path.push_str(&urlencoding::encode(
-            &since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ));
+    match since {
+        Some(since) => {
+            path.push_str("&updated_since=");
+            path.push_str(&urlencoding::encode(
+                &since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ));
+        }
+        None => path.push_str("&include_deleted=true"),
     }
     if let Some(c) = cursor {
         path.push_str("&cursor=");
@@ -296,9 +305,16 @@ pub fn merge_summary(
             out["title"] = text("title");
             out["description"] = text("description");
             out["upstreamStatus"] = n.status.as_str().into();
+            out["summary"] = fmt::server_risk_summary(&n.server);
         }
         None => {
-            for k in ["latestVersion", "title", "description", "upstreamStatus"] {
+            for k in [
+                "latestVersion",
+                "title",
+                "description",
+                "upstreamStatus",
+                "summary",
+            ] {
                 out[k] = keep(k);
             }
         }
@@ -1999,7 +2015,14 @@ mod tests {
 
     #[test]
     fn upstream_paths_encode_their_parameters() {
-        assert_eq!(listing_path(None, None), "v0.1/servers?limit=100");
+        assert_eq!(
+            listing_path(None, None),
+            "v0.1/servers?limit=100&include_deleted=true"
+        );
+        assert_eq!(
+            listing_path(None, Some("a/b:1")),
+            "v0.1/servers?limit=100&include_deleted=true&cursor=a%2Fb%3A1"
+        );
         assert_eq!(
             listing_path(Some(ts("2026-10-01T00:00:00Z")), Some("io.github.a/b:1.0.0")),
             "v0.1/servers?limit=100&updated_since=2026-10-01T00%3A00%3A00Z&cursor=io.github.a%2Fb%3A1.0.0"
@@ -2046,7 +2069,15 @@ mod tests {
         let e1 = up("a/b", "1.0.0", false, "2026-01-01T00:00:00Z");
         let mut e2 = up("a/b", "2.0.0", true, "2026-02-01T00:00:00Z");
         e2.server["title"] = "Bee".into();
+        e2.server["remotes"] = serde_json::json!([{"type": "sse", "url": "https://b.test/sse",
+            "headers": [{"name": "X-Key", "isSecret": true}]}]);
         let s = merge_summary(&serde_json::Value::Null, &[&e1, &e2]);
+        assert_eq!(
+            s["summary"],
+            serde_json::json!({"transports": ["sse"], "registryTypes": [], "secretsCount": 1,
+                               "packagesCount": 0, "remotesCount": 1}),
+            "the risk inputs of the latest document"
+        );
         assert_eq!(s["versions"], serde_json::json!(["2.0.0", "1.0.0"]));
         assert_eq!(s["latestVersion"], "2.0.0");
         assert_eq!(s["title"], "Bee");
@@ -2062,6 +2093,7 @@ mod tests {
         let s2 = merge_summary(&stored, &[&old]);
         assert_eq!(s2["latestVersion"], "2.0.0");
         assert_eq!(s2["title"], "Bee");
+        assert_eq!(s2["summary"], s["summary"]);
         assert_eq!(
             s2["versions"],
             serde_json::json!(["2.0.0", "1.5.0", "1.0.0"])
@@ -2073,7 +2105,9 @@ mod tests {
         // A deleted-only update keeps the stored summary.
         let mut gone = up("a/b", "3.0.0", true, "2026-04-01T00:00:00Z");
         gone.status = ServerStatus::Deleted;
-        assert_eq!(merge_summary(&s, &[&gone])["latestVersion"], "2.0.0");
+        let s3 = merge_summary(&s, &[&gone]);
+        assert_eq!(s3["latestVersion"], "2.0.0");
+        assert_eq!(s3["summary"], s["summary"]);
         // Bounded.
         let many: Vec<UpstreamEntry> = (0..250)
             .map(|i| up("a/b", &format!("0.0.{i}"), false, "2026-01-01T00:00:00Z"))

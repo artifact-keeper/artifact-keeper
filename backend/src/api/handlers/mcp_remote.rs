@@ -1,8 +1,8 @@
 //! Management API of Remote MCP registries (#5253), mounted under
 //! `/api/v1/repositories/{key}/mcp/...`: the upstream catalog the web UI
 //! browses (unapproved entries live here and never on `/v0.1`), the
-//! approval queue's decisions, `name@version` pins, namespace-glob bulk
-//! approval, and the manual sync trigger. Documented with exact shapes in
+//! approval queue's decisions, `name@version` pins, bulk decisions (by
+//! full-name glob, with a dry run, or by id), and the manual sync trigger. Documented with exact shapes in
 //! `docs/mcp-registry.md` ("Remote repositories").
 
 use axum::extract::{Extension, Path, Query, State};
@@ -20,8 +20,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::mcp_catalog::{
-    self as catalog, BulkResult, CatalogItem, CatalogPage, CatalogQuery, CatalogView, Decision,
-    DecisionResult,
+    self as catalog, BulkAction, BulkDecideResult, BulkResult, CatalogItem, CatalogPage,
+    CatalogQuery, CatalogView, Decision, DecisionResult,
 };
 use crate::services::mcp_remote::{self, SyncError, SyncState, SyncSummary};
 use crate::services::repository_service::RepositoryService;
@@ -32,6 +32,8 @@ pub fn repo_router() -> Router<SharedState> {
         .route("/:key/mcp/catalog/servers/:ns", get(get_server_encoded))
         .route("/:key/mcp/catalog/servers/:ns/:name", get(get_server_split))
         .route("/:key/mcp/catalog/bulk-approve", post(bulk_approve))
+        .route("/:key/mcp/catalog/bulk-block", post(bulk_block))
+        .route("/:key/mcp/catalog/bulk-decide", post(bulk_decide))
         .route("/:key/mcp/catalog/pins", post(create_pin))
         .route(
             "/:key/mcp/catalog/:id/request-approval",
@@ -39,6 +41,12 @@ pub fn repo_router() -> Router<SharedState> {
         )
         .route("/:key/mcp/catalog/:id/:decision", post(decide))
         .route("/:key/mcp/sync", get(sync_status).post(trigger_sync))
+}
+
+/// `GET /api/v1/mcp/pending-summary`: the instance-wide approval-queue
+/// count of Remote MCP registries, mounted behind `auth_middleware`.
+pub fn summary_router() -> Router<SharedState> {
+    Router::new().route("/pending-summary", get(pending_summary))
 }
 
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -55,24 +63,35 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
         get_server_encoded,
         decide,
         bulk_approve,
+        bulk_block,
+        bulk_decide,
         create_pin,
         request_approval,
         sync_status,
         trigger_sync,
+        pending_summary,
     ),
     components(schemas(
         CatalogPage,
         CatalogItem,
         crate::services::mcp_catalog::CatalogPin,
         crate::services::mcp_catalog::CatalogVersion,
+        crate::services::mcp_catalog::CatalogSummary,
+        crate::services::mcp_catalog::CatalogLint,
         Decision,
         DecisionResult,
         BulkResult,
+        BulkAction,
+        BulkDecideResult,
         DecisionRequest,
         BulkApproveRequest,
+        BulkBlockRequest,
+        BulkDecideRequest,
         PinRequest,
         ApprovalRequestBody,
         SyncResponse,
+        PendingSummary,
+        PendingRepository,
     ))
 )]
 pub struct McpRemoteApiDoc;
@@ -240,16 +259,45 @@ pub async fn decide(
     ))
 }
 
-/// Body of a namespace-glob bulk approval.
+/// Body of a full-name-glob bulk approval.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkApproveRequest {
-    /// Glob on the full name or the namespace: `io.github.acme/*`,
-    /// `com.acme`, `com.acme.*`.
+    /// Glob over the full server name (`*` matches any run of characters,
+    /// `/` included): `io.github.acme/*` (one namespace), `com.acme.*/*`
+    /// (its sub-namespaces), `io.github.acme/weather` (one server). A bare
+    /// namespace (`com.acme`) is refused with `422`; write `com.acme/*`.
     pub pattern: String,
     /// Also approve flagged (`review`) names that match (default `false`).
     #[serde(default)]
     pub include_review: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Change nothing; answer what would be approved (default `false`).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Body of a full-name-glob bulk block.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkBlockRequest {
+    /// Glob over the full server name, as for a bulk approval.
+    pub pattern: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Change nothing; answer what would be blocked (default `false`).
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Body of a bulk decision by id.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkDecideRequest {
+    /// Catalog row ids (names or `name@version` pins), 1 to 500.
+    pub ids: Vec<Uuid>,
+    pub action: BulkAction,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -262,7 +310,12 @@ pub struct BulkApproveRequest {
     tag = "mcp",
     params(("key" = String, Path, description = "Remote MCP repository key")),
     request_body = BulkApproveRequest,
-    responses((status = 200, body = BulkResult), (status = 400, description = "Invalid pattern"))
+    responses(
+        (status = 200, body = BulkResult),
+        (status = 400, description = "Invalid pattern"),
+        (status = 403, description = "Repository admin required, or a namespace-spanning pattern under the posture lock"),
+        (status = 422, description = "A bare namespace (write `com.acme/*`)"),
+    )
 )]
 pub async fn bulk_approve(
     State(state): State<SharedState>,
@@ -272,25 +325,101 @@ pub async fn bulk_approve(
 ) -> Result<Json<BulkResult>> {
     let auth = require_auth(auth)?;
     let repo = administered_repo(&state, &auth, &key).await?;
+    let pattern = catalog::validate_bulk_pattern(&req.pattern)?;
     // Under an instance posture lock, only an instance administrator may
     // bulk-approve across namespaces nobody named (`*`, `com.*`, ...).
-    if !auth.is_admin && crate::services::mcp_settings::spans_namespaces(req.pattern.trim()) {
+    if !auth.is_admin && crate::services::mcp_settings::spans_namespaces(&pattern) {
         let rows = crate::services::mcp_settings::load_rows(&state.db, repo.id).await?;
         if crate::services::mcp_settings::locks_of(&rows).posture {
             return Err(AppError::Authorization(format!(
                 "{} is locked by an instance administrator for this repository: a bulk \
-                 approval may not span namespaces (`{}`); name the namespace",
+                 approval may not span namespaces (`{pattern}`); name the namespace",
                 crate::services::mcp_settings::REMOTE_POSTURE_KEY,
-                req.pattern.trim()
             )));
         }
     }
     Ok(Json(
-        catalog::approve_pattern(
+        catalog::decide_pattern(
             &state,
             &repo,
-            &req.pattern,
+            BulkAction::Approve,
+            &pattern,
             req.include_review,
+            req.dry_run,
+            auth.user_id,
+            req.reason.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "mcp_remote_bulk_block",
+    path = "/{key}/mcp/catalog/bulk-block",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(("key" = String, Path, description = "Remote MCP repository key")),
+    request_body = BulkBlockRequest,
+    responses(
+        (status = 200, body = BulkResult),
+        (status = 400, description = "Invalid pattern"),
+        (status = 403, description = "Repository admin required"),
+        (status = 422, description = "A bare namespace (write `com.acme/*`)"),
+    )
+)]
+pub async fn bulk_block(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(req): Json<BulkBlockRequest>,
+) -> Result<Json<BulkResult>> {
+    let auth = require_auth(auth)?;
+    let repo = administered_repo(&state, &auth, &key).await?;
+    // A block only tightens: the posture lock does not restrict it.
+    Ok(Json(
+        catalog::decide_pattern(
+            &state,
+            &repo,
+            BulkAction::Block,
+            &req.pattern,
+            false,
+            req.dry_run,
+            auth.user_id,
+            req.reason.as_deref(),
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "mcp_remote_bulk_decide",
+    path = "/{key}/mcp/catalog/bulk-decide",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(("key" = String, Path, description = "Remote MCP repository key")),
+    request_body = BulkDecideRequest,
+    responses(
+        (status = 200, body = BulkDecideResult),
+        (status = 400, description = "No ids, or more than 500"),
+        (status = 403, description = "Repository admin required"),
+    )
+)]
+pub async fn bulk_decide(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(req): Json<BulkDecideRequest>,
+) -> Result<Json<BulkDecideResult>> {
+    let auth = require_auth(auth)?;
+    let repo = administered_repo(&state, &auth, &key).await?;
+    Ok(Json(
+        catalog::decide_ids(
+            &state,
+            &repo,
+            req.action,
+            &req.ids,
             auth.user_id,
             req.reason.as_deref(),
         )
@@ -336,6 +465,111 @@ pub async fn create_pin(
         )
         .await?,
     ))
+}
+
+/// One repository's share of [`PendingSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct PendingRepository {
+    pub key: String,
+    /// Names awaiting a first decision (`pending`).
+    pub pending: i64,
+    /// Flagged names (`review`: a lookalike, or reopened).
+    pub review: i64,
+    /// `name@version` rows awaiting a decision (a content drift).
+    pub drifted: i64,
+}
+
+/// The approval queue across the Remote MCP repositories the caller can
+/// read (every one for an instance administrator).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct PendingSummary {
+    pub pending: i64,
+    pub review: i64,
+    pub drifted: i64,
+    /// `pending + review + drifted`.
+    pub total: i64,
+    /// The repositories with something in the queue, by key.
+    pub repositories: Vec<PendingRepository>,
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "mcp_pending_summary",
+    path = "/pending-summary",
+    context_path = "/api/v1/mcp",
+    tag = "mcp",
+    responses(
+        (status = 200, body = PendingSummary),
+        (status = 401, description = "Authentication required"),
+    )
+)]
+pub async fn pending_summary(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+) -> Result<Json<PendingSummary>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("read:repositories")?;
+    let remotes: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, key FROM repositories WHERE format = 'mcp' AND repo_type = 'remote' \
+           AND key NOT LIKE '~deleting~%' ORDER BY key",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    // The catalog's own read check per repository (`readable_repo`), so the
+    // count never covers a queue the caller could not browse.
+    let service = RepositoryService::new(state.db.clone());
+    let mut visible: Vec<(Uuid, String)> = Vec::new();
+    for (id, key) in remotes {
+        let Ok(model) = service.get_by_key(&key).await else {
+            continue;
+        };
+        if require_visible(&model, &Some(auth.clone()), &service)
+            .await
+            .is_ok()
+        {
+            visible.push((id, key));
+        }
+    }
+    let ids: Vec<Uuid> = visible.iter().map(|v| v.0).collect();
+    let counts: Vec<(Uuid, i64, i64, i64)> = sqlx::query_as(
+        "SELECT staging_repo_id, \
+                count(*) FILTER (WHERE version = '*' AND status = 'pending'), \
+                count(*) FILTER (WHERE version = '*' AND status = 'review'), \
+                count(*) FILTER (WHERE version <> '*' AND status IN ('pending', 'review')) \
+         FROM curation_packages WHERE format = 'mcp' AND staging_repo_id = ANY($1) \
+         GROUP BY staging_repo_id",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut out = PendingSummary {
+        pending: 0,
+        review: 0,
+        drifted: 0,
+        total: 0,
+        repositories: Vec::new(),
+    };
+    for (id, key) in visible {
+        let Some(&(_, pending, review, drifted)) = counts.iter().find(|c| c.0 == id) else {
+            continue;
+        };
+        if pending + review + drifted == 0 {
+            continue;
+        }
+        out.pending += pending;
+        out.review += review;
+        out.drifted += drifted;
+        out.repositories.push(PendingRepository {
+            key,
+            pending,
+            review,
+            drifted,
+        });
+    }
+    out.total = out.pending + out.review + out.drifted;
+    Ok(Json(out))
 }
 
 /// Body of a request for approval.
@@ -944,9 +1178,123 @@ mod tests {
         };
         let (s, b) = bulk(owner.clone(), "*").await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        // Full-name globs only: a bare namespace is refused with the hint.
         let (s, b) = bulk(owner.clone(), "io.github.acme").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
+        assert!(b.to_string().contains("io.github.acme/*"), "{b}");
+        // A dry run answers the matches and changes nothing.
+        let (s, b) = env
+            .call(
+                Some(owner.clone()),
+                "POST",
+                &format!("/r/{}/mcp/catalog/bulk-approve", env.fx.repo_key),
+                Some(serde_json::json!({"pattern": "io.github.acme/*", "dryRun": true})),
+            )
+            .await;
         assert_eq!(s, StatusCode::OK, "{b}");
-        assert_eq!(b["approved"], 1);
+        assert_eq!(
+            (&b["approved"], &b["dryRun"], &b["names"]),
+            (
+                &serde_json::json!(1),
+                &serde_json::json!(true),
+                &serde_json::json!(["io.github.acme/a"])
+            )
+        );
+        assert_eq!(env.item("io.github.acme%2Fa").await["status"], "pending");
+        let (s, b) = bulk(owner.clone(), "io.github.acme/*").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            (b["approved"].as_u64(), b["dryRun"].as_bool()),
+            (Some(1), Some(false))
+        );
+        // Blocking only tightens: a namespace-spanning block passes the lock.
+        let block = |auth: AuthExtension, body: serde_json::Value| {
+            let uri = format!("/r/{}/mcp/catalog/bulk-block", env.fx.repo_key);
+            let env = &env;
+            async move { env.call(Some(auth), "POST", &uri, Some(body)).await }
+        };
+        let (s, b) = block(
+            owner.clone(),
+            serde_json::json!({"pattern": "*", "dryRun": true}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["blocked"], 2, "{b}");
+        assert_eq!(env.item("io.github.acme%2Fa").await["status"], "approved");
+        let (s, _) = block(owner.clone(), serde_json::json!({"pattern": "com.other"})).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        let (s, b) = block(
+            owner.clone(),
+            serde_json::json!({"pattern": "io.github.*", "reason": "audit"}),
+        )
+        .await;
+        assert_eq!((s, b["blocked"].as_u64()), (StatusCode::OK, Some(1)), "{b}");
+        let a_now = env.item("io.github.acme%2Fa").await;
+        assert_eq!(
+            (a_now["status"].as_str(), a_now["evaluationReason"].as_str()),
+            (Some("blocked"), Some("audit"))
+        );
+        // By id, as a repository administrator under the lock: approve two
+        // rows, one unknown id reported, and an unchanged one left alone.
+        let c = env.item("com.other%2Fc").await;
+        let decide = |auth: AuthExtension, body: serde_json::Value| {
+            let uri = format!("/r/{}/mcp/catalog/bulk-decide", env.fx.repo_key);
+            let env = &env;
+            async move { env.call(Some(auth), "POST", &uri, Some(body)).await }
+        };
+        let unknown = Uuid::new_v4();
+        let (s, b) = decide(
+            owner.clone(),
+            serde_json::json!({"ids": [a_id, c["id"], unknown], "action": "approve"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["action"], "approve");
+        assert_eq!(b["decided"].as_array().unwrap().len(), 2, "{b}");
+        assert_eq!(b["notFound"], serde_json::json!([unknown]));
+        let (s, b) = decide(
+            owner.clone(),
+            serde_json::json!({"ids": [a_id], "action": "approve"}),
+        )
+        .await;
+        assert_eq!(
+            (s, &b["unchanged"]),
+            (StatusCode::OK, &serde_json::json!([a_id]))
+        );
+        let (s, b) = decide(
+            owner.clone(),
+            serde_json::json!({"ids": [c["id"]], "action": "block", "reason": "no"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(env.item("com.other%2Fc").await["status"], "blocked");
+        let (s, _) = decide(
+            owner.clone(),
+            serde_json::json!({"ids": [], "action": "block"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = decide(
+            owner.clone(),
+            serde_json::json!({"ids": [a_id], "action": "reopen"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        let (s, _) = decide(
+            holder.clone(),
+            serde_json::json!({"ids": [a_id], "action": "block"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        // Back to pending for the race check below.
+        sqlx::query(
+            "UPDATE curation_packages SET status = 'pending' WHERE staging_repo_id = $1 \
+             AND version = '*'",
+        )
+        .bind(env.fx.repo_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
         let (s, b) = bulk(env.admin.clone(), "*").await;
         assert_eq!(s, StatusCode::OK, "{b}");
 
@@ -991,6 +1339,87 @@ mod tests {
             .bind(env.fx.repo_id)
             .execute(&env.fx.pool)
             .await;
+        env.teardown().await;
+    }
+
+    /// The instance-wide queue count: pending and flagged names plus
+    /// `name@version` rows awaiting a decision, only over repositories the
+    /// caller can read.
+    #[tokio::test]
+    async fn pending_summary_counts_visible_queues() {
+        let Some(env) = Env::new().await else { return };
+        let all = vec![
+            entry(
+                server("io.github.acme/a", "1.0.0", serde_json::json!({})),
+                T1,
+            ),
+            entry(
+                server("io.github.acme/b", "1.0.0", serde_json::json!({})),
+                T1,
+            ),
+            entry(server("com.other/c", "1.0.0", serde_json::json!({})), T1),
+        ];
+        env.serve(Mock::given(method("GET")).and(path("/v0.1/servers")), all)
+            .await;
+        env.sync().await;
+        let b = env.item("io.github.acme%2Fb").await;
+        sqlx::query("UPDATE curation_packages SET status = 'review' WHERE id = $1")
+            .bind(Uuid::parse_str(b["id"].as_str().unwrap()).unwrap())
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        // A drifted version of c.
+        crate::services::mcp_remote::upsert_row(
+            &env.fx.pool,
+            env.fx.repo_id,
+            "com.other/c",
+            "1.0.0",
+            "review",
+            true,
+            "content drift",
+            &serde_json::json!({"kind": "mcp_version"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let summary = |auth: AuthExtension| {
+            let state = env.state.clone();
+            async move {
+                pending_summary(State(state), Extension(Some(auth)))
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+        let mine = |s: &PendingSummary| {
+            s.repositories
+                .iter()
+                .find(|r| r.key == env.fx.repo_key)
+                .cloned()
+        };
+        let all = summary(env.admin.clone()).await;
+        assert_eq!(
+            mine(&all),
+            Some(PendingRepository {
+                key: env.fx.repo_key.clone(),
+                pending: 2,
+                review: 1,
+                drifted: 1,
+            })
+        );
+        assert_eq!(all.total, all.pending + all.review + all.drifted);
+        assert!(all.total >= 4);
+        // A user with no access to the private repository sees nothing of it.
+        let (u, name) = tdh::create_user(&env.fx.pool).await;
+        let outsider = tdh::make_auth(u, &name);
+        assert_eq!(mine(&summary(outsider.clone()).await), None);
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        assert_eq!(mine(&summary(outsider).await).map(|r| r.pending), Some(2));
+        let err = pending_summary(State(env.state.clone()), Extension(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        tdh::cleanup_user(&env.fx.pool, u).await;
         env.teardown().await;
     }
 
