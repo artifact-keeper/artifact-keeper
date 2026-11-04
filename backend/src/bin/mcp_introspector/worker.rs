@@ -28,13 +28,29 @@ pub struct Backend {
 impl Backend {
     /// `base` is the operator-configured AK URL (trusted configuration, so
     /// not run through the public-range guard the probe uses).
+    /// The backend may sit behind the deployment's proxy, so the process
+    /// proxy settings apply (unlike the probe's guarded client).
     pub fn new(base: &str, token: &str) -> Self {
-        let client = artifact_keeper_backend::services::http_client::plain_client_builder()
+        Self::with_builder(base, token, Self::builder())
+    }
+
+    fn builder() -> reqwest::ClientBuilder {
+        artifact_keeper_backend::services::http_client::plain_client_builder()
             .user_agent(crate::http::user_agent())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
-            .build()
-            .expect("HTTP client");
+    }
+
+    /// A backend reached without the process proxy settings: tests talk to
+    /// a local mock, which a `HTTP_PROXY` in the environment must not
+    /// redirect.
+    #[cfg(test)]
+    fn direct(base: &str, token: &str) -> Self {
+        Self::with_builder(base, token, Self::builder().no_proxy())
+    }
+
+    fn with_builder(base: &str, token: &str, builder: reqwest::ClientBuilder) -> Self {
+        let client = builder.build().expect("HTTP client");
         Self {
             client,
             base: base.trim_end_matches('/').to_string(),
@@ -227,7 +243,7 @@ mod tests {
 
     fn worker(base: &str, runner: Option<Box<dyn SandboxRunner>>) -> Worker {
         Worker {
-            backend: Backend::new(base, "tok"),
+            backend: Backend::direct(base, "tok"),
             worker_id: "w1".into(),
             runner,
             images: Images::default(),
@@ -342,7 +358,7 @@ mod tests {
             )
             .mount(&ak)
             .await;
-        let b = Backend::new(&format!("{}/", ak.uri()), "tok");
+        let b = Backend::direct(&format!("{}/", ak.uri()), "tok");
         assert_eq!(
             b.push("r", "com.acme/x", "1.0.0", &json!({}))
                 .await

@@ -215,7 +215,7 @@ impl Transport for HttpTransport {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{header, header_exists, method};
+    use wiremock::matchers::{header, header_exists, headers, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// The guard refuses loopback, so the in-process mock server is reached
@@ -275,7 +275,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(header("Mcp-Method", "server/discover"))
             .and(header("MCP-Protocol-Version", "2026-07-28"))
-            .and(header("Accept", "application/json, text/event-stream"))
+            // wiremock splits a request header on `,` before comparing, so
+            // a list-valued header is matched as its list of values (a
+            // single comma-joined value never matches).
+            .and(headers(
+                "Accept",
+                vec!["application/json", "text/event-stream"],
+            ))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Mcp-Session-Id", "s1")
@@ -286,8 +292,11 @@ mod tests {
         Mock::given(method("POST"))
             .and(header("Mcp-Method", "tools/list"))
             .and(header_exists("Mcp-Session-Id"))
-            .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(
+            // `set_body_raw`: `set_body_string` would replace the content
+            // type with `text/plain` whatever header was inserted before it.
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
                 "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"a\"}]}}\n\n",
+                "text/event-stream",
             ))
             .mount(&server)
             .await;
