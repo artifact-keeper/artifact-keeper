@@ -87,7 +87,7 @@ pub fn trusted_signers() -> Vec<String> {
 pub fn is_trusted(fingerprint: Option<&str>, trusted: &[String]) -> bool {
     fingerprint.is_some_and(|f| {
         let f = normalize_fingerprint(f);
-        trusted.iter().any(|t| *t == f)
+        trusted.contains(&f)
     })
 }
 
