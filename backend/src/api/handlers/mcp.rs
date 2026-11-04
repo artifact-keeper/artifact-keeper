@@ -544,7 +544,12 @@ pub(crate) fn served_entry(
     source["upstreamVerified"] = fmt::upstream_verified(upstream).into();
     if let Some(url) = upstream.and_then(|u| u.get("origin")) {
         source["kind"] = "upstream".into();
-        source["upstreamUrl"] = url.clone();
+        // Rows ingested before the origin was stored stripped may still
+        // carry userinfo: strip it on serve as well.
+        source["upstreamUrl"] = match url.as_str() {
+            Some(u) => crate::services::mcp_remote::display_upstream(u).into(),
+            None => url.clone(),
+        };
     }
     fmt::envelope(server, &registry, source)
 }

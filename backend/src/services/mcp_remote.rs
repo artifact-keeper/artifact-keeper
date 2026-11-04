@@ -872,6 +872,12 @@ async fn pin_packages(
     (pins, unresolved)
 }
 
+/// An upstream URL as it may be stored, served or audited: userinfo
+/// (embedded credentials) stripped. The raw URL is only ever used to fetch.
+pub fn display_upstream(url: &str) -> String {
+    crate::services::proxy_service::strip_url_userinfo(url).0
+}
+
 /// The metadata document of an ingested version. `mirror` is the Remote's
 /// `mcp_remote_mode` at ingest (`metadata.upstream.mode`).
 #[allow(clippy::too_many_arguments)]
@@ -886,7 +892,10 @@ pub fn ingest_metadata(
     mirror: bool,
 ) -> serde_json::Value {
     let mut doc = fmt::metadata_doc(&admitted.server, registry, policy, pins);
-    let kind = fmt::upstream_kind(origin, entry.ak_source);
+    // The stored (and served, `_meta...source.upstreamUrl`) origin never
+    // carries the upstream URL's userinfo credentials.
+    let origin = display_upstream(origin);
+    let kind = fmt::upstream_kind(&origin, entry.ak_source);
     doc["upstream"] = serde_json::json!({
         "origin": origin,
         "sha256": admitted.sha256,
@@ -1660,7 +1669,7 @@ async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
         None,
         serde_json::json!({
             "mode": run.settings.mcp_remote_mode,
-            "upstream": run.upstream,
+            "upstream": display_upstream(&run.upstream),
             "updated_since": since,
             "summary": summary,
         }),
@@ -1825,6 +1834,42 @@ mod tests {
             ak_sha256: None,
             ak_source: false,
         }
+    }
+
+    #[test]
+    fn upstream_userinfo_is_never_stored_or_served() {
+        // Review finding 2: the origin recorded on an ingested version (and
+        // served as `upstreamUrl`, and audited) drops the URL's userinfo.
+        let with_creds = concat!(
+            "https://",
+            "mirror-user",
+            ":",
+            "pw",
+            "@ak.example.test/mcp/x"
+        );
+        assert_eq!(
+            display_upstream(with_creds),
+            "https://ak.example.test/mcp/x"
+        );
+        assert_eq!(
+            display_upstream("https://ak.example.test/mcp/x"),
+            "https://ak.example.test/mcp/x"
+        );
+        let entry = up("a/b", "1.0.0", true, "2026-01-01T00:00:00Z");
+        let admitted = admit_upstream(&entry).unwrap();
+        let registry = registry_of(&entry, Utc::now());
+        let meta = ingest_metadata(
+            &admitted,
+            &registry,
+            PackagePolicy::OwnRepos,
+            &[],
+            &[],
+            with_creds,
+            &entry,
+            true,
+        );
+        let origin = meta["upstream"]["origin"].as_str().unwrap();
+        assert!(!origin.contains('@') && !origin.contains("pw"), "{origin}");
     }
 
     #[test]
