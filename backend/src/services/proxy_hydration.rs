@@ -176,6 +176,42 @@ pub trait Coordinator {
         coordinate_proxy_hydration(lease_key, check, produce, timeout_error).await
     }
 
+    /// [`Self::coordinate`] with the leader's fill on its own task (#5220).
+    ///
+    /// The elected leader's `produce` future is spawned instead of awaited in
+    /// place, and the leader's slot moves onto that task. The caller awaits
+    /// the task's result, so it is answered exactly as by [`Self::coordinate`],
+    /// but dropping the caller (its client disconnected, or a request timeout
+    /// fired) no longer cancels the fill: the task finishes the fetch and the
+    /// cache write, and only then frees the slot and wakes the followers. A
+    /// retry that arrives meanwhile joins as a follower and reads the filled
+    /// cache, instead of electing itself and fetching the object again.
+    ///
+    /// This is the first step of the #4533 design ("decouple the fill from
+    /// the client"), for the buffered path: the fill no longer depends on the
+    /// leader's client staying connected. The fill must bound itself (the
+    /// proxy wraps its upstream fetch in a deadline), because nothing cancels
+    /// it once the caller is gone.
+    #[allow(async_fn_in_trait)]
+    async fn coordinate_detached<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+        &self,
+        lease_key: &str,
+        check: Check,
+        produce: Produce,
+        timeout_error: TimeoutErr,
+    ) -> std::result::Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        Check: Fn() -> CheckFut,
+        CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+        Produce: FnOnce() -> ProduceFut,
+        ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        TimeoutErr: Fn() -> E,
+    {
+        coordinate_proxy_hydration_detached(lease_key, check, produce, timeout_error).await
+    }
+
     /// Streaming single-flight broadcast fan-out (#1631 layer 2, #1694).
     ///
     /// The streaming sibling of [`Self::coordinate`]. It is a *separate*
@@ -274,8 +310,99 @@ where
     ProduceFut: Future<Output = std::result::Result<T, E>>,
     TimeoutErr: Fn() -> E,
 {
+    coordinate_hydration_with(
+        lease_key,
+        check,
+        |lease| async move {
+            // `lease` lives until the fill returns, including when the
+            // future is dropped mid-`produce` (cancellation): Drop frees the
+            // slot and notifies followers in both cases.
+            let outcome = produce().await;
+            drop(lease);
+            outcome
+        },
+        timeout_error,
+    )
+    .await
+}
+
+/// [`coordinate_proxy_hydration`] with the leader's fill spawned onto its own
+/// task, which owns the leader's slot; see [`Coordinator::coordinate_detached`].
+pub async fn coordinate_proxy_hydration_detached<
+    T,
+    E,
+    Check,
+    CheckFut,
+    Produce,
+    ProduceFut,
+    TimeoutErr,
+>(
+    lease_key: &str,
+    check: Check,
+    produce: Produce,
+    timeout_error: TimeoutErr,
+) -> std::result::Result<T, E>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    Check: Fn() -> CheckFut,
+    CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+    Produce: FnOnce() -> ProduceFut,
+    ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+    TimeoutErr: Fn() -> E,
+{
+    use tracing::Instrument;
+
+    let on_timeout = &timeout_error;
+    coordinate_hydration_with(
+        lease_key,
+        check,
+        move |lease| {
+            // Spawned before the first await, so the fill starts even if the
+            // caller is dropped right after the election.
+            let fill = produce();
+            let task = tokio::spawn(
+                async move {
+                    let outcome = fill.await;
+                    // Followers wake only once the fill has committed.
+                    drop(lease);
+                    outcome
+                }
+                .instrument(tracing::Span::current()),
+            );
+            async move {
+                match task.await {
+                    Ok(outcome) => outcome,
+                    Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+                    // The runtime is shutting down and cancelled the fill.
+                    Err(_) => Err(on_timeout()),
+                }
+            }
+        },
+        on_timeout,
+    )
+    .await
+}
+
+/// The buffered single-flight loop behind [`coordinate_proxy_hydration`] and
+/// [`coordinate_proxy_hydration_detached`]: they differ only in how the
+/// elected leader runs its fill (`lead`, which receives the leader's slot and
+/// must hold it until the fill is done).
+async fn coordinate_hydration_with<T, E, Check, CheckFut, Lead, LeadFut, TimeoutErr>(
+    lease_key: &str,
+    check: Check,
+    lead: Lead,
+    timeout_error: TimeoutErr,
+) -> std::result::Result<T, E>
+where
+    Check: Fn() -> CheckFut,
+    CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+    Lead: FnOnce(LeaderLease) -> LeadFut,
+    LeadFut: Future<Output = std::result::Result<T, E>>,
+    TimeoutErr: Fn() -> E,
+{
     let deadline = Instant::now() + DEFAULT_PROXY_HYDRATION_WAIT_TIMEOUT;
-    let mut produce = Some(produce);
+    let mut lead = Some(lead);
 
     loop {
         if let Some(value) = check().await? {
@@ -297,9 +424,6 @@ where
                     .await;
             }
             LocalHydrationRole::Leader(lease) => {
-                // `lease` lives until this arm returns, including when the
-                // future is dropped mid-`produce` (cancellation): Drop frees
-                // the slot and notifies followers in both cases.
                 if let Some(value) = check().await? {
                     return Ok(value);
                 }
@@ -308,13 +432,12 @@ where
                     return Err(timeout_error());
                 }
 
-                let outcome = produce
+                return lead
                     .take()
                     .expect("proxy hydration producer should only run once")(
+                    lease
                 )
                 .await;
-                drop(lease);
-                return outcome;
             }
         }
     }
@@ -862,6 +985,7 @@ fn replay_handle(chunks: Vec<Bytes>, headers: StreamHeaders) -> StreamHandle {
 /// taken only by a process's in-process leader and is held until that
 /// leader's cache publish; a losing in-process leader blocks on it (see
 /// [`open_as_cluster_leader`]).
+#[derive(Clone)]
 pub struct AdvisoryLockCoordinator {
     /// The in-process buffered coordinator the cluster leader delegates to
     /// (unchanged local election + produce + sidecar commit).
@@ -910,42 +1034,80 @@ impl AdvisoryLockCoordinator {
     }
 
     /// Follower path for the buffered API: poll `check` on a bounded cadence
-    /// until the cluster leader commits (the entry appears) or `wait_timeout`
-    /// elapses. On deadline (a large/slow leader fetch), fall back to producing
-    /// locally through the inner buffered coordinator — a bounded duplicate
-    /// fetch that atomic-publish + content-addressing make safe. Factored out so
-    /// the poll loop is not duplicated.
-    async fn follow_buffered<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+    /// until the cluster leader commits (the entry appears, `Some`) or
+    /// `wait_timeout` elapses (`None`). On `None` (a large/slow leader fetch)
+    /// the caller falls back to producing locally through the inner buffered
+    /// coordinator — a bounded duplicate fetch that atomic-publish +
+    /// content-addressing make safe.
+    async fn await_remote_commit<T, E, Check, CheckFut>(
         &self,
-        lease_key: &str,
-        check: Check,
-        produce: Produce,
-        timeout_error: TimeoutErr,
-    ) -> std::result::Result<T, E>
+        check: &Check,
+    ) -> std::result::Result<Option<T>, E>
     where
         Check: Fn() -> CheckFut,
         CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
-        Produce: FnOnce() -> ProduceFut,
-        ProduceFut: Future<Output = std::result::Result<T, E>>,
-        TimeoutErr: Fn() -> E,
     {
         let deadline = Instant::now() + self.wait_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                // Leader is still producing (large/slow object): bounded fallback
-                // to a local election + produce (never an unbounded herd).
-                return self
-                    .inner
-                    .coordinate(lease_key, check, produce, timeout_error)
-                    .await;
+                return Ok(None);
             }
             tokio::time::sleep(self.poll_interval.min(remaining)).await;
             if let Some(value) = check().await? {
-                return Ok(value);
+                return Ok(Some(value));
             }
         }
     }
+
+    /// The cross-replica election shared by the buffered entry points.
+    async fn elect_buffered<T, E, Check, CheckFut>(
+        &self,
+        lease_key: &str,
+        check: &Check,
+    ) -> std::result::Result<BufferedRole<T>, E>
+    where
+        Check: Fn() -> CheckFut,
+        CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+    {
+        // Fast path: a warm hit needs no lock and no election (also preserves the
+        // presigned-redirect path, which short-circuits before the coordinator).
+        if let Some(value) = check().await? {
+            return Ok(BufferedRole::Cached(value));
+        }
+
+        let obj = lease_object_id(lease_key);
+        match self.lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await {
+            Ok(Some(lease)) => Ok(BufferedRole::ClusterLeader(lease)),
+            // Remote follower: wait for the leader's commit, bounded fallback.
+            Ok(None) => Ok(match self.await_remote_commit(check).await? {
+                Some(value) => BufferedRole::Cached(value),
+                None => BufferedRole::Local,
+            }),
+            Err(err) => {
+                // Lock infrastructure failure: degrade to per-process
+                // coordination. No worse than pre-#1609; never a hard failure.
+                tracing::warn!(
+                    error = %err,
+                    lease_key,
+                    "cross-replica hydration lock unavailable; falling back to per-process single-flight"
+                );
+                Ok(BufferedRole::Local)
+            }
+        }
+    }
+}
+
+/// Outcome of the cross-replica election on the buffered path.
+enum BufferedRole<T> {
+    /// The entry is in the cache (warm, or committed by a remote leader).
+    Cached(T),
+    /// This replica holds the cluster lock: run the in-process election and
+    /// release the lock after the fill.
+    ClusterLeader(crate::services::cluster_lock::ClusterLease),
+    /// Coordinate per process only (the remote wait ran out, or the lock is
+    /// unavailable).
+    Local,
 }
 
 impl Coordinator for AdvisoryLockCoordinator {
@@ -963,15 +1125,9 @@ impl Coordinator for AdvisoryLockCoordinator {
         ProduceFut: Future<Output = std::result::Result<T, E>>,
         TimeoutErr: Fn() -> E,
     {
-        // Fast path: a warm hit needs no lock and no election (also preserves the
-        // presigned-redirect path, which short-circuits before the coordinator).
-        if let Some(value) = check().await? {
-            return Ok(value);
-        }
-
-        let obj = lease_object_id(lease_key);
-        match self.lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await {
-            Ok(Some(lease)) => {
+        match self.elect_buffered(lease_key, &check).await? {
+            BufferedRole::Cached(value) => Ok(value),
+            BufferedRole::ClusterLeader(lease) => {
                 // Cluster leader: run the UNCHANGED in-process election + produce
                 // (whose sidecar commit is the linearization point), then release.
                 // If this future is cancelled mid-produce, `lease` drops here and
@@ -983,21 +1139,53 @@ impl Coordinator for AdvisoryLockCoordinator {
                 lease.release().await;
                 outcome
             }
-            Ok(None) => {
-                // Remote follower: wait for the leader's commit, bounded fallback.
-                self.follow_buffered(lease_key, check, produce, timeout_error)
-                    .await
-            }
-            Err(err) => {
-                // Lock infrastructure failure: degrade to per-process
-                // coordination. No worse than pre-#1609; never a hard failure.
-                tracing::warn!(
-                    error = %err,
-                    lease_key,
-                    "cross-replica hydration lock unavailable; falling back to per-process single-flight"
-                );
+            BufferedRole::Local => {
                 self.inner
                     .coordinate(lease_key, check, produce, timeout_error)
+                    .await
+            }
+        }
+    }
+
+    async fn coordinate_detached<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+        &self,
+        lease_key: &str,
+        check: Check,
+        produce: Produce,
+        timeout_error: TimeoutErr,
+    ) -> std::result::Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        Check: Fn() -> CheckFut,
+        CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+        Produce: FnOnce() -> ProduceFut,
+        ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        TimeoutErr: Fn() -> E,
+    {
+        match self.elect_buffered(lease_key, &check).await? {
+            BufferedRole::Cached(value) => Ok(value),
+            BufferedRole::ClusterLeader(lease) => {
+                // The cluster lock rides on the detached fill and is released
+                // after its commit, so a client that disconnects does not hand
+                // the object to another replica mid-fill. If the in-process
+                // election never runs the fill (a hit on re-check), the lock
+                // drops with the closure and its guard auto-releases.
+                let produce = move || {
+                    let fill = produce();
+                    async move {
+                        let outcome = fill.await;
+                        lease.release().await;
+                        outcome
+                    }
+                };
+                self.inner
+                    .coordinate_detached(lease_key, check, produce, timeout_error)
+                    .await
+            }
+            BufferedRole::Local => {
+                self.inner
+                    .coordinate_detached(lease_key, check, produce, timeout_error)
                     .await
             }
         }
@@ -1213,6 +1401,7 @@ async fn release_after_publish(lease: ClusterLease, published: Option<watch::Rec
 /// [`Coordinator`] method to the selected variant, keeping BOTH method signatures
 /// frozen (the contract shared with #1608) while letting config choose the impl
 /// at construction with a two-line change in `ProxyService::new`.
+#[derive(Clone)]
 pub enum HydrationCoordinator {
     /// Per-process buffered single-flight (pre-#1609 behavior / kill-switch off).
     Buffered(BufferedCoordinator),
@@ -1286,6 +1475,34 @@ impl Coordinator for HydrationCoordinator {
             }
             HydrationCoordinator::Advisory(c) => {
                 c.coordinate(lease_key, check, produce, timeout_error).await
+            }
+        }
+    }
+
+    async fn coordinate_detached<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+        &self,
+        lease_key: &str,
+        check: Check,
+        produce: Produce,
+        timeout_error: TimeoutErr,
+    ) -> std::result::Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        Check: Fn() -> CheckFut,
+        CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
+        Produce: FnOnce() -> ProduceFut,
+        ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        TimeoutErr: Fn() -> E,
+    {
+        match self {
+            HydrationCoordinator::Buffered(c) => {
+                c.coordinate_detached(lease_key, check, produce, timeout_error)
+                    .await
+            }
+            HydrationCoordinator::Advisory(c) => {
+                c.coordinate_detached(lease_key, check, produce, timeout_error)
+                    .await
             }
         }
     }
@@ -1915,6 +2132,121 @@ mod tests {
             Duration::from_millis(5),
             Duration::from_secs(5),
         )
+    }
+
+    /// #5220: the leader's caller is dropped mid-fill (its client went away).
+    /// The detached fill still commits, a retry that arrives during the fill
+    /// joins it and is served the filled value, and nothing fills twice. With
+    /// `cluster_lock`, the cluster lock stays held until the fill commits.
+    async fn assert_detached_fill_survives_a_dropped_leader<C: Coordinator>(
+        coordinator: &C,
+        cluster_lock: Option<&Arc<dyn ClusterLock>>,
+    ) {
+        let key = format!("proxy-cache:detached-{}", uuid::Uuid::new_v4());
+        let cache: Arc<Mutex<Option<u32>>> = Arc::default();
+        let fills = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let check = || {
+            let cache = Arc::clone(&cache);
+            async move { Ok::<_, &'static str>(*cache.lock().unwrap_or_else(|p| p.into_inner())) }
+        };
+        let fill = || {
+            let (cache, fills, release) =
+                (Arc::clone(&cache), Arc::clone(&fills), Arc::clone(&release));
+            move || async move {
+                fills.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(7);
+                Ok(7)
+            }
+        };
+
+        let leader = coordinator.coordinate_detached(&key, check, fill(), || "timeout");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), leader)
+                .await
+                .is_err(),
+            "the fill is parked, so the leader's caller times out and is dropped"
+        );
+        assert_eq!(fills.load(Ordering::SeqCst), 1);
+        assert!(map_contains(&key), "the detached fill still holds the slot");
+        let obj = lease_object_id(&key);
+        if let Some(lock) = cluster_lock {
+            let probe = lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await;
+            assert!(
+                matches!(probe, Ok(None)),
+                "the fill still holds the cluster lock"
+            );
+        }
+
+        let retry = coordinator.coordinate_detached(&key, check, fill(), || "timeout");
+        let finish_fill = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            release.notify_one();
+        };
+        let (served, ()) = tokio::join!(retry, finish_fill);
+        assert_eq!(served, Ok(7));
+        assert_eq!(
+            fills.load(Ordering::SeqCst),
+            1,
+            "the retry joined the running fill instead of filling again"
+        );
+        assert!(
+            !map_contains(&key),
+            "the slot is freed once the fill commits"
+        );
+        if let Some(lock) = cluster_lock {
+            let lease = lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, obj).await;
+            assert!(matches!(lease, Ok(Some(_))), "released after the commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_fill_survives_a_dropped_leader_in_process() {
+        let coordinator = HydrationCoordinator::Buffered(BufferedCoordinator::new());
+        assert_detached_fill_survives_a_dropped_leader(&coordinator, None).await;
+    }
+
+    #[tokio::test]
+    async fn detached_fill_survives_a_dropped_leader_across_replicas() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let coordinator = HydrationCoordinator::Advisory(advisory_over(&lock));
+        assert_detached_fill_survives_a_dropped_leader(&coordinator, Some(&lock)).await;
+    }
+
+    /// A panic in a detached fill reaches the caller, as it would in place,
+    /// and still frees the slot.
+    #[tokio::test]
+    async fn detached_fill_panic_propagates_and_frees_the_slot() {
+        let key = format!("proxy-cache:detached-panic-{}", uuid::Uuid::new_v4());
+        let caller = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                coordinate_proxy_hydration_detached(
+                    &key,
+                    || async { Ok::<Option<u32>, ()>(None) },
+                    || async { panic!("fill failed") },
+                    || (),
+                )
+                .await
+            })
+        };
+        let joined = caller.await;
+        assert!(joined.is_err_and(|e| e.is_panic()));
+        assert!(!map_contains(&key));
+    }
+
+    /// The lock is unavailable: the detached path degrades to the per-process
+    /// fill, as the in-place path does.
+    #[tokio::test]
+    async fn detached_fill_falls_back_to_local_when_the_lock_fails() {
+        let lock: Arc<dyn ClusterLock> =
+            Arc::new(crate::services::cluster_lock::ErroringClusterLock);
+        let key = format!("proxy-cache:detached-nolock-{}", uuid::Uuid::new_v4());
+        let served: Result<u32, ()> = advisory_over(&lock)
+            .coordinate_detached(&key, || async { Ok(None) }, || async { Ok(5) }, || ())
+            .await;
+        assert_eq!(served, Ok(5));
     }
 
     /// The core #1609 guarantee: K concurrent cold requests spread across ≥2

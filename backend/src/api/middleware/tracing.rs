@@ -555,6 +555,17 @@ async fn run_correlation_id(
         let uri = request.uri();
         crate::api::redact_sensitive_params(uri.path(), uri.query())
     };
+    // Logs `Request cancelled` if this future is dropped before the handler
+    // returns (the client disconnected or a timeout layer gave up), so such a
+    // request is not silent (#5220). Disarmed once the response exists.
+    let mut in_flight = InFlightRequest {
+        correlation_id: correlation_id.clone(),
+        method,
+        uri,
+        started,
+        span: request_span.clone(),
+        completed: false,
+    };
 
     // Scope the task-locals around the whole downstream future so audit
     // emitters anywhere under this request observe the same correlation ID
@@ -562,6 +573,7 @@ async fn run_correlation_id(
     // deep in the request can record onto the `http_request` span (#4455).
     let downstream = async move {
         let mut response = next.run(request).await;
+        in_flight.completed = true;
 
         if let Ok(value) = HeaderValue::from_str(correlation_id.as_str()) {
             response.headers_mut().insert(CORRELATION_ID_HEADER, value);
@@ -581,15 +593,14 @@ async fn run_correlation_id(
             // (`RATE_LIMIT_TRUSTED_PROXY_CIDRS` policy).
             let user = crate::api::middleware::request_span::recorded_user();
             let ip = crate::api::middleware::client_ip::current_client_ip();
-            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(
                 correlation_id = %correlation_id,
-                method = method.as_str(),
-                uri = uri.as_str(),
+                method = in_flight.method.as_str(),
+                uri = in_flight.uri.as_str(),
                 status = %response.status().as_u16(),
                 user = user.as_deref(),
                 ip = ip.map(tracing::field::display),
-                latency_ms,
+                latency_ms = in_flight.latency_ms(),
                 "Request completed"
             );
         }
@@ -601,6 +612,50 @@ async fn run_correlation_id(
         crate::api::middleware::request_span::with_request_span(request_span, downstream),
     )
     .await
+}
+
+/// The fields of a request's `Request completed` line, held while the
+/// handler runs. Dropped without `completed` set, it logs `Request cancelled`
+/// with the same fields (no `status`: nothing was answered): the client went
+/// away, or a timeout layer gave up, before the handler returned (#5220).
+///
+/// A drop guard because cancellation gives the middleware no other hook: the
+/// server drops the request future, and code after `next.run().await` never
+/// runs. The task-local scopes wrapping the future are still set while it is
+/// dropped, so `user` and `ip` resolve as they do for a completed request.
+struct InFlightRequest {
+    correlation_id: CorrelationId,
+    method: String,
+    uri: String,
+    started: std::time::Instant,
+    span: tracing::Span,
+    completed: bool,
+}
+
+impl InFlightRequest {
+    fn latency_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let _entered = self.span.enter();
+        let user = crate::api::middleware::request_span::recorded_user();
+        let ip = crate::api::middleware::client_ip::current_client_ip();
+        tracing::warn!(
+            correlation_id = %self.correlation_id,
+            method = self.method.as_str(),
+            uri = self.uri.as_str(),
+            user = user.as_deref(),
+            ip = ip.map(tracing::field::display),
+            latency_ms = self.latency_ms(),
+            "Request cancelled"
+        );
+    }
 }
 
 /// Health/readiness/liveness probe paths, exactly as wired in `api::routes`.

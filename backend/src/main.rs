@@ -978,7 +978,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Ok(storage_svc) => {
             let proxy_service = Arc::new(
                 ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
-                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs),
+                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs)
+                    .with_upstream_timeouts(config.proxy_upstream),
             );
             app_state.set_proxy_service(proxy_service);
             tracing::info!(

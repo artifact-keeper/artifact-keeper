@@ -581,6 +581,72 @@ impl DeviceAuthConfig {
     }
 }
 
+/// Timeouts of the HTTP client a Remote repository fetches its upstream with.
+///
+/// The connect and read timeouts apply to every upstream request the proxy
+/// makes, streamed or buffered. The fetch deadline bounds one buffered
+/// upstream fetch from the first byte sent to the last byte read: the read
+/// timeout restarts on every chunk, so an upstream that trickles bytes, or a
+/// connection that has stalled after its headers, is otherwise held for as
+/// long as it keeps the socket open. A streamed download is not bounded by the
+/// deadline, because its length is not bounded either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxyUpstreamTimeouts {
+    /// TCP and TLS connect timeout, in seconds. Env:
+    /// `PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS`, clamped to 1..=300. Default 10.
+    pub connect_secs: u64,
+    /// Longest wait for the response headers or for the next body chunk, in
+    /// seconds. Env: `PROXY_UPSTREAM_READ_TIMEOUT_SECS`, clamped to 1..=3600.
+    /// Default 60.
+    pub read_secs: u64,
+    /// Deadline of one buffered upstream fetch, in seconds. Env:
+    /// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, clamped to 1..=86400. Default
+    /// 300. The fill runs on its own task, so a client that gives up first
+    /// does not cancel it: its retry joins the fill or reads the filled cache.
+    pub fetch_deadline_secs: u64,
+}
+
+impl Default for ProxyUpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            connect_secs: 10,
+            read_secs: 60,
+            fetch_deadline_secs: 300,
+        }
+    }
+}
+
+impl ProxyUpstreamTimeouts {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            connect_secs: env_parse("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", d.connect_secs)
+                .clamp(1, 300),
+            read_secs: env_parse("PROXY_UPSTREAM_READ_TIMEOUT_SECS", d.read_secs).clamp(1, 3600),
+            fetch_deadline_secs: env_parse(
+                "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+                d.fetch_deadline_secs,
+            )
+            .clamp(1, 86_400),
+        }
+    }
+
+    /// The connect timeout as a [`std::time::Duration`].
+    pub fn connect(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.connect_secs)
+    }
+
+    /// The read timeout as a [`std::time::Duration`].
+    pub fn read(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.read_secs)
+    }
+
+    /// The buffered fetch deadline as a [`std::time::Duration`].
+    pub fn fetch_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.fetch_deadline_secs)
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -1021,6 +1087,10 @@ pub struct Config {
     /// Device Authorization Grant (RFC 8628) settings (#3461). Off unless
     /// `DEVICE_AUTH_ENABLED=true`; see [`DeviceAuthConfig`].
     pub device_auth: DeviceAuthConfig,
+
+    /// Upstream HTTP client timeouts of the proxy (#5220); see
+    /// [`ProxyUpstreamTimeouts`].
+    pub proxy_upstream: ProxyUpstreamTimeouts,
 
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
@@ -1679,6 +1749,7 @@ redacted_debug!(Config {
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
     show device_auth,
+    show proxy_upstream,
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
@@ -1839,6 +1910,7 @@ impl Default for Config {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             device_auth: DeviceAuthConfig::default(),
+            proxy_upstream: ProxyUpstreamTimeouts::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
@@ -2192,6 +2264,7 @@ impl Config {
                 Ok("false" | "0")
             ),
             device_auth: DeviceAuthConfig::from_env(),
+            proxy_upstream: ProxyUpstreamTimeouts::from_env(),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
                     .ok()
@@ -4711,6 +4784,52 @@ mod tests {
         assert_eq!(config.max_failed_attempts_per_user, 100);
         assert_eq!(config.max_failed_attempts_per_ip, 1);
         assert_eq!(config.failed_attempt_window_secs, 60);
+
+        for (key, value) in KEYS.iter().zip(saved) {
+            restore_env(key, value);
+        }
+    }
+
+    #[test]
+    fn test_proxy_upstream_timeouts_defaults_parse_and_clamp() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        const KEYS: &[&str] = &[
+            "PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS",
+            "PROXY_UPSTREAM_READ_TIMEOUT_SECS",
+            "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+        ];
+        let saved: Vec<Option<String>> = KEYS.iter().map(|k| env::var(k).ok()).collect();
+
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        let defaults = ProxyUpstreamTimeouts::from_env();
+        assert_eq!(defaults, ProxyUpstreamTimeouts::default());
+        assert_eq!(defaults.connect(), std::time::Duration::from_secs(10));
+        assert_eq!(defaults.read(), std::time::Duration::from_secs(60));
+        assert_eq!(
+            defaults.fetch_deadline(),
+            std::time::Duration::from_secs(300)
+        );
+
+        env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "5");
+        env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "30");
+        env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "45");
+        let set = ProxyUpstreamTimeouts::from_env();
+        assert_eq!(
+            (set.connect_secs, set.read_secs, set.fetch_deadline_secs),
+            (5, 30, 45)
+        );
+
+        // Zero would disable a timeout outright and a huge value would pin a
+        // stalled connection; both are clamped. Garbage keeps the default.
+        env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "0");
+        env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "999999");
+        env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "soon");
+        let clamped = ProxyUpstreamTimeouts::from_env();
+        assert_eq!(clamped.connect_secs, 1);
+        assert_eq!(clamped.read_secs, 3600);
+        assert_eq!(clamped.fetch_deadline_secs, 300);
 
         for (key, value) in KEYS.iter().zip(saved) {
             restore_env(key, value);
