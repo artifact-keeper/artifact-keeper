@@ -239,12 +239,19 @@ A permission rule (`POST /api/v1/permissions`) may carry
 `conditions.mcp_namespaces`, a list of 1 to 64 server-name patterns:
 
 ```json
-{"principal_type": "service_account", "principal_id": "<id>",
+{"principal_type": "user", "principal_id": "<the mapping's service_account_id>",
  "target_type": "repository", "target_id": "<mcp repo id>",
  "actions": ["read", "write"],
  "conditions": {"mcp_namespaces": ["io.github.{repository_owner}/*", "com.acme"],
                 "mcp_namespace_issuer": "https://token.actions.githubusercontent.com"}}
 ```
+
+The account a CI identity mapping signs in as is a `user` principal: CI
+OIDC mints it as a `users` row (`auth_provider: ci`), not as a service
+account, so `principal_type: "service_account"` with a mapping's
+`service_account_id` is refused (`400`, "does not exist as a
+service_account"). A service account created under `/api/v1/service-accounts`
+is granted with `principal_type: "service_account"`.
 
 The condition is accepted only on a `repository` target that is an MCP
 repository; on any other target (a project, a non-MCP repository) the write
