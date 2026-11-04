@@ -1861,6 +1861,9 @@ async fn publish_server(
     super::mcp_write::add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
         .await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
+    mcp_packages::refuse_unreadable_backing(&state.db, &ext, &settings, &server)
+        .await
+        .map_err(mcp_error)?;
     super::mcp_write::refuse_tombstoned(&state.db, repo.id, &server.name, &server.version).await?;
     // A version whose async resolution failed is replaced by this publish.
     crate::services::mcp_write::release_failed_version(
@@ -2720,6 +2723,9 @@ mod tests {
         async fn repo(&mut self, repo_type: &str, format: &str) -> RepoInfo {
             let (id, key, dir) = tdh::create_repo(&self.fx.pool, repo_type, format).await;
             self.extra_repos.push((id, dir.clone()));
+            // A publisher must be able to read a backing repository it pins
+            // from (`refuse_unreadable_backing`).
+            tdh::grant_repo_role(&self.fx.pool, id, self.fx.user_id, "reader").await;
             let mut info = tdh::make_repo_info(id, &key, &dir, repo_type, None);
             info.format = format.to_string();
             info
@@ -4512,6 +4518,67 @@ mod tests {
         let l2 = json(&l2);
         assert_eq!(names(&l2), vec!["com.acme/pc", "com.acme/pd"]);
         assert!(l2["metadata"].get("nextCursor").is_none(), "{l2}");
+        env.teardown().await;
+    }
+
+    /// #5253 existence oracle: a publisher with MCP write but no read on the
+    /// mapped backing repository gets the same `422 mcp_package_not_found`
+    /// for a package that exists there and for one that does not, and
+    /// nothing is stored. With read the answers are the precise ones again.
+    #[tokio::test]
+    async fn unreadable_backing_package_answers_like_a_missing_one() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (npm, _) = env.npm_backing(&["1.0.0"]).await;
+        let pkg = |v: &str| {
+            doc(
+                "com.acme/echo",
+                "1.0.0",
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            )
+        };
+        sqlx::query("DELETE FROM role_assignments WHERE repository_id = $1 AND user_id = $2")
+            .bind(npm.id)
+            .bind(env.fx.user_id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let (s_there, there) = env.publish(&pkg("1.0.0")).await;
+        let (s_missing, missing) = env.publish(&pkg("9.9.9")).await;
+        assert_eq!(
+            (s_there, there["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_package_not_found")
+            ),
+            "an existing package in an unreadable repository: {there}"
+        );
+        assert_eq!(s_missing, s_there);
+        assert_eq!(
+            there.to_string().replace("1.0.0", "V"),
+            missing
+                .to_string()
+                .replace("9.9.9", "V")
+                .replace("1.0.0", "V"),
+            "existing and missing answer alike"
+        );
+        assert!(!there.to_string().contains(&npm.key), "{there}");
+        let stored: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, 0);
+        // With read: the missing package names the repository, the
+        // existing one publishes.
+        tdh::grant_repo_role(&env.fx.pool, npm.id, env.fx.user_id, "reader").await;
+        let (s, b) = env.publish(&pkg("9.9.9")).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{b}");
+        assert!(b.to_string().contains(&npm.key), "{b}");
+        let (s, b) = env.publish(&pkg("1.0.0")).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
         env.teardown().await;
     }
 

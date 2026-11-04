@@ -706,6 +706,11 @@ async fn edit_impl(
     add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str()).await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
     let keep_pins = packages_unchanged(&current.stored.server, &server);
+    if !keep_pins {
+        mcp_packages::refuse_unreadable_backing(&state.db, &ext, &settings, &server)
+            .await
+            .map_err(mcp_error)?;
+    }
     let resolution = if keep_pins {
         Resolution {
             pins: current.stored.pins.clone(),

@@ -117,10 +117,23 @@ pub(crate) async fn caller_may_map(
     caller: &crate::api::middleware::auth::AuthExtension,
     repo_id: Uuid,
 ) -> crate::error::Result<bool> {
-    use crate::services::repository_service::{RepoAccess, RepositoryService};
     if !caller.can_access_repo(repo_id) {
         return Ok(false);
     }
+    principal_may_read(db, caller, repo_id).await
+}
+
+/// Whether the principal behind `caller` may read `repo_id`: an instance
+/// administrator, a public repository, or `read` through a grant or a role
+/// (an `internal` repository needs the grant, as in [`caller_may_map`]). The
+/// token's repository scope is not consulted: a publish token scoped to the
+/// MCP registry still publishes packages its principal can read.
+pub(crate) async fn principal_may_read(
+    db: &PgPool,
+    caller: &crate::api::middleware::auth::AuthExtension,
+    repo_id: Uuid,
+) -> crate::error::Result<bool> {
+    use crate::services::repository_service::{RepoAccess, RepositoryService};
     if caller.is_admin {
         return Ok(true);
     }
@@ -132,6 +145,67 @@ pub(crate) async fn caller_may_map(
     service
         .user_can_access_repo(repo_id, caller.user_id, RepoAccess::READ)
         .await
+}
+
+/// The `422 mcp_package_not_found` detail of a package whose backing
+/// repository the publisher cannot read. It names no repository and does not
+/// depend on whether the package exists.
+pub fn unreadable_package_detail(pkg: &mcp::Package) -> String {
+    format!(
+        "{} {}@{} is not in a backing repository this account can read; publish it to the \
+         mapped repository (or ask for read on it) first",
+        pkg.registry_type,
+        pkg.identifier,
+        pkg.version.as_deref().unwrap_or("")
+    )
+}
+
+/// Refuse a document naming a package whose mapped backing repository the
+/// publisher's principal cannot read ([`principal_may_read`]), before any
+/// lookup (#5253). Without it a publisher with MCP write but no read on the
+/// backing repository learned whether a package exists there (`422
+/// mcp_package_not_found` vs `200`, or `202 resolving` vs `200` through a
+/// Remote): the answer is now the same `422` whether the package exists or
+/// not. A caller who can read the repository keeps the precise answers.
+/// `open` resolves nothing, so it checks nothing.
+pub async fn refuse_unreadable_backing(
+    db: &PgPool,
+    caller: &crate::api::middleware::auth::AuthExtension,
+    settings: &McpSettings,
+    server: &ServerJson,
+) -> Result<(), McpError> {
+    if settings.policy == PackagePolicy::Open {
+        return Ok(());
+    }
+    let mut seen: BTreeMap<Uuid, bool> = BTreeMap::new();
+    for (index, pkg) in server.packages.iter().enumerate() {
+        // A bundle is matched by `fileSha256` (no name to probe), and one
+        // uploaded beside the version lives in this registry.
+        let Some(repo) = settings
+            .repos
+            .get(&pkg.registry_type)
+            .filter(|_| pkg.registry_type != "mcpb")
+        else {
+            continue;
+        };
+        let readable = match seen.get(&repo.id) {
+            Some(r) => *r,
+            None => {
+                let r = principal_may_read(db, caller, repo.id)
+                    .await
+                    .map_err(|e| McpError::Internal(e.to_string()))?;
+                seen.insert(repo.id, r);
+                r
+            }
+        };
+        if !readable {
+            return Err(McpError::PackageNotFound {
+                index,
+                detail: unreadable_package_detail(pkg),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Validate MCP settings submitted through the repository API (#5253) and

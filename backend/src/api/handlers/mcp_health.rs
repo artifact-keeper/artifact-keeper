@@ -238,6 +238,9 @@ mod tests {
         async fn repo(&mut self, format: &str) -> RepoInfo {
             let (id, key, dir) = tdh::create_repo(&self.fx.pool, "local", format).await;
             self.extra.push((id, dir.clone()));
+            // A publisher must be able to read the backing repositories it
+            // pins from (`refuse_unreadable_backing`).
+            tdh::grant_repo_role(&self.fx.pool, id, self.fx.user_id, "reader").await;
             let mut info = tdh::make_repo_info(id, &key, &dir, "local", None);
             info.format = format.to_string();
             info

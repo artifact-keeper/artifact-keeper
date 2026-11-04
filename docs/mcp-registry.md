@@ -402,6 +402,19 @@ the repository holds to every reader of the MCP registry). A repository the
 caller cannot read is refused with the same message as one that does not
 exist.
 
+The same rule holds for a publisher. A publish (or an admin edit that changes
+`packages`) naming a package whose mapped backing repository the publisher's
+account cannot read (instance administrator, public repository, or `read`
+through a grant or role; the token's repository scope is not consulted, so a
+token scoped to the MCP registry still publishes) is refused with
+`422 mcp_package_not_found`, with a detail that names no repository, before
+any lookup. A package that exists there and one that does not get the same
+answer, so publishing is not a way to learn what a private repository holds;
+a publisher who can read the repository gets the precise answers (the
+repository key, the not-pulled hint, `202 resolving` for a fill). `POST
+/validate` reports `outcome: unchecked` in that case instead. `mcpb` entries
+are matched by `fileSha256`, not by name, and are not checked this way.
+
 Server versions enter an MCP repository only through `POST .../publish`. The
 generic artifact upload routes (`PUT`/`POST /api/v1/repositories/{key}/artifacts/...`
 and `/api/v1/uploads`) refuse an MCP repository with `400`, except for a
