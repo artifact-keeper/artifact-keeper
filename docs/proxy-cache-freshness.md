@@ -180,6 +180,8 @@ above (#4640).
 
 ## See also
 
+- [cache-seed.md](cache-seed.md) — fill a Remote's cache from a list of paths
+  ahead of time, with a per-path inventory (#5284).
 - `backend/src/services/cache_classifier.rs` — classification rules and TTL
   constants (`MUTABLE_DEFAULT_TTL_SECS`, `NEGATIVE_CACHE_TTL_SECS`,
   `STALE_IF_ERROR_GRACE_SECS`, `STALE_IF_ERROR_GRACE_MAX_SECS`,
