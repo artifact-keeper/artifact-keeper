@@ -33,6 +33,114 @@ pub async fn version_tombstoned(
     .await
 }
 
+/// The SQL predicate (over `artifact_metadata m`) of a version whose first
+/// package resolution failed. An admin edit that re-resolves a version marks
+/// its resolution `afterEdit` ([`mark_resolution_after_edit`]): that version
+/// may have been served before the edit, so its failure never frees it.
+const FAILED_NEVER_SERVED: &str = "m.metadata->'resolution'->>'state' = 'failed' \
+     AND COALESCE(m.metadata->'resolution'->>'afterEdit', 'false') <> 'true'";
+
+/// Mark a re-resolution started by an admin edit (`PUT`) in the stored
+/// metadata `doc`: the edited version may have been served, so a failure of
+/// this resolution keeps the version number taken.
+pub fn mark_resolution_after_edit(doc: &mut serde_json::Value) {
+    if let Some(r) = doc.get_mut("resolution").and_then(|r| r.as_object_mut()) {
+        r.insert("afterEdit".into(), serde_json::Value::Bool(true));
+    }
+}
+
+/// The live server.json artifact of `name@version` in `repo_id` whose async
+/// package resolution FAILED (`metadata.resolution.state = "failed"`) on its
+/// first resolution. Such a version was never served (a resolving version is
+/// hidden, and a failed one never leaves that state), so it does not consume
+/// the version number: see [`version_reserved`] and
+/// [`release_failed_version`]. A failure after an admin edit does not count.
+pub async fn failed_version(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT a.id FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false \
+           AND {FAILED_NEVER_SERVED}"
+    )))
+    .bind(repo_id)
+    .bind(crate::formats::mcp::storage_path(name, version))
+    .fetch_optional(db)
+    .await
+}
+
+/// Whether `name@version` is taken in `repo_id`: it was ever stored
+/// ([`version_tombstoned`]) and is not a version whose resolution failed
+/// ([`failed_version`]). A taken version answers `409 mcp_version_exists`.
+pub async fn version_reserved(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) -> Result<bool, sqlx::Error> {
+    if !version_tombstoned(db, repo_id, name, version).await? {
+        return Ok(false);
+    }
+    Ok(failed_version(db, repo_id, name, version).await?.is_none())
+}
+
+/// Free `name@version` for a republish when its stored version failed to
+/// resolve: remove that artifact row (as a trash purge does; the
+/// content-addressed object is left to storage GC) and its tombstone, in one
+/// transaction. Whether a failed version was released. A version that was
+/// ever served, or that was deleted, keeps its tombstone.
+pub async fn release_failed_version(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = db.begin().await?;
+    let row: Option<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT a.id, a.checksum_sha256 FROM artifacts a \
+         JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false \
+           AND {FAILED_NEVER_SERVED} \
+         FOR UPDATE OF a"
+    )))
+    .bind(repo_id)
+    .bind(crate::formats::mcp::storage_path(name, version))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((id, checksum)) = row else {
+        return Ok(false);
+    };
+    for sql in [
+        "DELETE FROM promotion_approvals WHERE artifact_id = $1",
+        "DELETE FROM mcp_resolve_jobs WHERE artifact_id = $1",
+        "DELETE FROM artifacts WHERE id = $1",
+    ] {
+        sqlx::query(sql).bind(id).execute(&mut *tx).await?;
+    }
+    if let Err(e) = crate::services::package_service::prune_catalog_for_purged_artifact(
+        &mut tx, repo_id, &checksum,
+    )
+    .await
+    {
+        tracing::warn!(artifact_id = %id, error = %e, "MCP: catalog rows of a failed version not pruned");
+    }
+    sqlx::query(
+        "DELETE FROM mcp_version_tombstones \
+         WHERE repository_id = $1 AND name = $2 AND version = $3",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(version)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::info!(artifact_id = %id, server = %name, %version, "MCP: a version whose resolution failed was released for a republish");
+    Ok(true)
+}
+
 /// The containment probes (GIN-indexed `metadata @> ...`) that find a server
 /// version pinning `digest` of image `name` in `repo_id`, as the index digest
 /// or as the gated platform child.

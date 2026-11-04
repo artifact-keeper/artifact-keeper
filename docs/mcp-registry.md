@@ -117,7 +117,8 @@ as upstream does.
 Choices pinned for this release: list order is name then version as text
 (upstream's); a version is write-once (`409` on republish, even with identical
 bytes, and for ever after the version was deleted, trashed or purged: see
-[Tombstones](#tombstones)); `latest` is the newest version that is servable now, ordered as
+[Tombstones](#tombstones); a version whose package resolution failed is the
+exception); `latest` is the newest version that is servable now, ordered as
 upstream orders versions (SemVer by SemVer precedence, a `v` prefix allowed; a
 SemVer version always ranks above a non-SemVer one; two non-SemVer versions by
 `publishedAt`); `version=latest` picks each server's newest version first and
@@ -626,7 +627,25 @@ member by priority of a mapped Virtual) is **filled** instead of refused:
    transient one (`429`, `5xx`, timeout after 300 s) is retried with backoff
    (30 s doubling, at most 1 h) up to 8 attempts (`mcp_resolve_exhausted`).
    A failed version stays stored and hidden (`404 mcp_unresolvable` for a
-   holder) and the name@version stays taken: publish a new version.
+   holder) so its `resolution.error` can be read, but it does **not** take
+   the version number: it was never served, so `POST /validate` reports no
+   `mcp_version_exists` for it, a bundle may still be uploaded for it, and a
+   republish of the same `name@version` replaces it (the failed row and its
+   tombstone are removed in one transaction, then the publish runs as a new
+   one). A version that resolved (or was published with every package
+   pinned), or that was deleted, stays write-once (see
+   [Tombstones](#tombstones)), and so does a version whose re-resolution
+   after an admin edit (`PUT`) failed: it may have been served before the
+   edit (its `resolution` carries `afterEdit: true`).
+
+With a **Virtual** mapping the fill target is the Virtual's first Remote
+member, so a package that is not (yet) in the hosted member is looked up
+upstream. For an internal package that is a dependency-confusion path when
+its scope or name is not reserved upstream: map the hosted repository
+directly, or call `POST /validate` first and refuse to publish when it
+reports `outcome: fill` for an internal package. Publish the package before
+the server.json; if the fill fails, publish the package and then the same
+server version again.
 
 The state is in the version's metadata (`GET /api/v1/packages` rows and the
 artifact metadata API carry it), under `resolution`:
@@ -654,7 +673,10 @@ Every `name@version` a repository ever stored is recorded in
 row insert, so publish, peer replication and promotion are all covered). A
 publish (or a bundle upload) of a recorded `name@version` answers
 `409 mcp_version_exists`, whether the version is live, soft-deleted, in the
-trash, or purged from it. The ledger is removed only with the repository.
+trash, or purged from it. The ledger is removed only with the repository,
+with one exception: a live version whose package resolution failed (never
+served) is released by a republish of it (see
+[Packages in a Remote backing repository](#packages-in-a-remote-backing-repository)).
 
 ### `POST /validate`
 

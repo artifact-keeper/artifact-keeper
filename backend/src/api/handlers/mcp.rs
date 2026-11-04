@@ -1862,6 +1862,15 @@ async fn publish_server(
         .await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
     super::mcp_write::refuse_tombstoned(&state.db, repo.id, &server.name, &server.version).await?;
+    // A version whose async resolution failed is replaced by this publish.
+    crate::services::mcp_write::release_failed_version(
+        &state.db,
+        repo.id,
+        &server.name,
+        &server.version,
+    )
+    .await
+    .map_err(internal)?;
     let resolution = crate::services::mcp_resolver::resolve_document(
         &state,
         &settings,

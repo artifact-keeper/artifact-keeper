@@ -152,14 +152,16 @@ pub async fn refresh_catalog_row(db: &PgPool, artifact_id: Uuid) {
 }
 
 /// `409 mcp_version_exists` for a `name@version` this repository ever
-/// stored (the tombstone ledger outlives a delete and a trash purge).
+/// stored (the tombstone ledger outlives a delete and a trash purge),
+/// unless its async package resolution failed: a failed version was never
+/// served and does not consume the version number.
 pub async fn refuse_tombstoned(
     db: &PgPool,
     repo_id: Uuid,
     name: &str,
     version: &str,
 ) -> Result<(), Response> {
-    match writes::version_tombstoned(db, repo_id, name, version).await {
+    match writes::version_reserved(db, repo_id, name, version).await {
         Ok(false) => Ok(()),
         Ok(true) => Err(mcp_error(McpError::VersionExists)),
         Err(e) => Err(internal(e)),
@@ -524,7 +526,7 @@ async fn validate(
     let checked: Result<(fmt::ServerJson, Option<Resolution>), McpError> = async {
         let mut server = admit_document(&body, &settings)?;
         if scope.version_taken
-            && writes::version_tombstoned(&state.db, repo.id, &server.name, &server.version)
+            && writes::version_reserved(&state.db, repo.id, &server.name, &server.version)
                 .await
                 .map_err(|e| McpError::Internal(e.to_string()))?
         {
@@ -750,9 +752,13 @@ async fn edit_impl(
     let mut registry = current.stored.registry.clone();
     registry.updated_at = now;
     let doc = fmt::metadata_doc(&server, &registry, settings.policy, &resolution.pins);
-    let doc = resolver::metadata_with_resolution(&state.db, doc, &resolution, &ext, base.as_str())
-        .await
-        .map_err(mcp_error)?;
+    let mut doc =
+        resolver::metadata_with_resolution(&state.db, doc, &resolution, &ext, base.as_str())
+            .await
+            .map_err(mcp_error)?;
+    // The edited version may have been served: a failed re-resolution keeps
+    // its number taken (`release_failed_version` skips it).
+    writes::mark_resolution_after_edit(&mut doc);
     let hold_rows = match write_edit(
         state,
         &repo,
@@ -2866,6 +2872,78 @@ mod tests {
             (s, b["error"].as_str()),
             (StatusCode::NOT_FOUND, Some("mcp_unresolvable"))
         );
+
+        // 4. A failed version does not consume its number: /validate passes
+        // and a republish replaces it (2.0.0 is in the Remote's cache now).
+        let fixed = doc("com.acme/echo", "3.0.0", npm("2.0.0"));
+        let (s, b) = env
+            .json(env.member(), "POST", "/validate", Some(&fixed))
+            .await;
+        assert_eq!(
+            (s, b["valid"].as_bool()),
+            (StatusCode::OK, Some(true)),
+            "{b}"
+        );
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&fixed))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id3b = env.artifact("com.acme/echo", "3.0.0").await;
+        assert_ne!(id3b, id3, "the failed row was replaced");
+        let (s, b) = env
+            .json(
+                env.anon(),
+                "GET",
+                "/servers/com.acme/echo/versions/3.0.0",
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        // A served version is write-once again.
+        for v in ["3.0.0", "2.0.0"] {
+            let (s, b) = env
+                .json(
+                    env.member(),
+                    "POST",
+                    "/publish",
+                    Some(&doc("com.acme/echo", v, npm("2.0.0"))),
+                )
+                .await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (StatusCode::CONFLICT, Some("mcp_version_exists")),
+                "{v}"
+            );
+        }
+
+        // 5. A served version an admin edit re-resolves, whose fill then
+        // fails, stays taken: it was served before the edit.
+        let (s, b) = env
+            .json(
+                env.admin(),
+                "PUT",
+                tail1,
+                Some(&doc("com.acme/echo", "1.0.0", npm("4.0.0"))),
+            )
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let res = resolve_until_settled(&env, id1).await;
+        assert_eq!(res["state"], "failed", "{res}");
+        assert_eq!(res["afterEdit"], true, "{res}");
+        let (s, b) = env
+            .json(
+                env.member(),
+                "POST",
+                "/publish",
+                Some(&doc("com.acme/echo", "1.0.0", npm("2.0.0"))),
+            )
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_version_exists")),
+            "an edited, failed version is not released: {b}"
+        );
+        assert_eq!(env.artifact("com.acme/echo", "1.0.0").await, id1);
         env.teardown().await;
     }
 
