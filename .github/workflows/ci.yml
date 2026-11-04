@@ -1233,6 +1233,7 @@ jobs:
             --test conda_upload_scan_grading_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
+            --test listing_totals_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
             --test migration_storage_path_tests \
@@ -1316,6 +1317,7 @@ jobs:
             --test conda_upload_scan_grading_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
+            --test listing_totals_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
             --test migration_storage_path_tests \
