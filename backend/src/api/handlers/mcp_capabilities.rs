@@ -803,11 +803,11 @@ async fn claim_payload(
         return Ok(Err("unreadable server version".into()));
     };
     let repo = surface::mcp_repo(&state.db, &v.repository_key).await?;
-    if kind == JobKind::SandboxRun
-        && !surface::artifact_servable(state, &repo, v.artifact_id, base).await
-    {
-        // Only a version whose gates pass is ever executed: the bytes run
-        // are the bytes AK scanned.
+    // Only a version whose gates pass is ever introspected: a sandbox run
+    // executes exactly the bytes AK scanned, and a remote probe contacts a
+    // held, blocked or unapproved version's endpoints no more than a reader
+    // could.
+    if !surface::artifact_servable(state, &repo, v.artifact_id, base).await {
         return Ok(Err("server version is held".into()));
     }
     let served = fmt::rewrite_packages_for_serve(&stored.server, &stored.pins, stored.policy, base);
@@ -1428,6 +1428,77 @@ mod db_tests {
 
         for sql in [
             "DELETE FROM permissions WHERE target_id = $1",
+            "DELETE FROM repository_config WHERE repository_id = $1",
+            "DELETE FROM packages WHERE repository_id = $1",
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(env.fx.repo_id)
+                .execute(&env.fx.pool)
+                .await;
+        }
+        env.fx.teardown().await;
+    }
+
+    /// Review finding 13: a remote probe of a held version is never handed
+    /// to the worker (the same servability gate as a sandbox run).
+    #[tokio::test]
+    async fn probes_of_held_versions_are_not_handed_out() {
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        let publish = format!("/{}/v0.1/publish", env.fx.repo_key);
+        let (s, b) = call(
+            env.admin(),
+            "POST",
+            &publish,
+            Some(doc("1.0.0", json!({"tools": [{"name": "get_weather"}]}))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        let (s, b) = call(env.admin(), "POST", &env.url("/probe"), None).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND name = 'com.acme/weather'",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        let job = jobs::list_jobs(&env.fx.pool, artifact_id, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|j| j.kind() == Some(JobKind::RemoteProbe))
+            .expect("a queued probe");
+        let claim = jobs::Claim {
+            job,
+            token: "t".into(),
+        };
+        let base = "http://localhost";
+        assert!(
+            claim_payload(&env.fx.state, &claim, base)
+                .await
+                .unwrap()
+                .is_ok(),
+            "a servable version's probe is handed out"
+        );
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_source = 'admin' \
+             WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            claim_payload(&env.fx.state, &claim, base).await.unwrap(),
+            Err("server version is held".to_string())
+        );
+        for sql in [
+            "DELETE FROM mcp_introspection_jobs WHERE repository_id = $1",
             "DELETE FROM repository_config WHERE repository_id = $1",
             "DELETE FROM packages WHERE repository_id = $1",
         ] {
