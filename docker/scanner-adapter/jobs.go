@@ -70,12 +70,19 @@ func (s *JobStore) Create() (*Job, error) {
 	return job, nil
 }
 
-// Get returns the job for id and whether it exists.
+// Get returns a snapshot of the job for id and whether it exists. It is a
+// copy taken under the lock: the scan goroutine keeps updating the stored
+// job, and handing out the shared pointer let the report handler read Status
+// while Fail/Succeed wrote it (a data race go test -race reports).
 func (s *JobStore) Get(id string) (*Job, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	job, ok := s.jobs[id]
-	return job, ok
+	if !ok {
+		return nil, false
+	}
+	cp := *job
+	return &cp, true
 }
 
 // setStatus transitions a job's status (no-op if the id is gone).
