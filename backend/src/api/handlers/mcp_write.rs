@@ -688,6 +688,17 @@ async fn edit_impl(
     // The publish gates: deny list, then the namespace write gate.
     surface::name_write_gates(state, &ext, &repo, name, headers).await?;
     let current = live_version(&state.db, repo.id, name, version).await?;
+    // A version whose packages are still being filled has a fill job and a
+    // pending list an edit would drop: edit it once it has settled.
+    if current.stored.resolving {
+        return Err(problem(
+            409,
+            "mcp_version_resolving",
+            "this version's packages are still being resolved; edit it once it is resolved \
+             or failed",
+            serde_json::json!({}),
+        ));
+    }
     add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str()).await?;
     let keep_pins = packages_unchanged(&current.stored.server, &server);
     let resolution = if keep_pins {
@@ -736,10 +747,9 @@ async fn edit_impl(
     let mut registry = current.stored.registry.clone();
     registry.updated_at = now;
     let doc = fmt::metadata_doc(&server, &registry, settings.policy, &resolution.pins);
-    let doc =
-        resolver::metadata_with_resolution(&state.db, doc, &resolution, ext.user_id, base.as_str())
-            .await
-            .map_err(mcp_error)?;
+    let doc = resolver::metadata_with_resolution(&state.db, doc, &resolution, &ext, base.as_str())
+        .await
+        .map_err(mcp_error)?;
     let hold_rows = match write_edit(
         state,
         &repo,
@@ -760,6 +770,14 @@ async fn edit_impl(
             return Err(resp);
         }
     };
+    // New bytes are a new upload: the repository's upload quarantine hold
+    // applies as on a publish.
+    crate::services::quarantine_service::apply_upload_hold_hosted(
+        &state.db,
+        repo.id,
+        current.artifact_id,
+    )
+    .await;
     mcp_lint::record_after_write(
         &state.db,
         current.artifact_id,
@@ -839,6 +857,26 @@ async fn write_edit(
     surface::lock_server(&mut tx, repo.id, &current.name)
         .await
         .map_err(internal)?;
+    // The edit was prepared from a read outside the lock: a status change,
+    // soft delete or another edit committed since then wins, and this edit
+    // is refused rather than overwriting it.
+    let fresh = versions_of(&mut *tx, repo.id, &current.name)
+        .await?
+        .into_iter()
+        .find(|r| r.version == current.version)
+        .ok_or_else(not_found)?;
+    if fresh.checksum.trim() != current.checksum.trim()
+        || fresh.stored.registry != current.stored.registry
+        || fresh.stored.resolving != current.stored.resolving
+    {
+        return Err(problem(
+            409,
+            "mcp_edit_conflict",
+            "the version changed while this edit was prepared (a status change, delete or \
+             another edit); read it again and retry",
+            serde_json::json!({}),
+        ));
+    }
     sqlx::query(
         "UPDATE artifacts SET size_bytes = $2, checksum_sha256 = $3, storage_key = $4, \
          updated_at = NOW() WHERE id = $1",
@@ -1585,6 +1623,27 @@ mod tests {
         assert_eq!(bundle_invalid("x").status(), 400);
     }
 
+    /// D6: a Virtual's `/validate` (and other hosted-only routes) answers
+    /// 501 with a message naming the members, not a stale release note.
+    #[tokio::test]
+    async fn hosted_only_routes_explain_the_virtual_501() {
+        let mut repo = tdh::make_repo_info(
+            Uuid::new_v4(),
+            "v",
+            std::path::Path::new("/tmp"),
+            "virtual",
+            None,
+        );
+        repo.format = "mcp".into();
+        let resp = surface::reject_if_not_hosted_read(&repo).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        use http_body_util::BodyExt as _;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("member"), "{text}");
+        assert!(!text.contains("release"), "{text}");
+    }
+
     #[test]
     fn validation_result_shapes() {
         let err = McpError::PackageNotFound {
@@ -2323,6 +2382,115 @@ mod tests {
         env.teardown().await;
     }
 
+    /// Review findings 10 and 11: an edit prepared from a read the version
+    /// has moved past is refused (409, nothing overwritten); a resolving
+    /// version cannot be edited; an edit's new bytes get the upload hold.
+    #[tokio::test]
+    async fn edits_refuse_stale_reads_and_resolving_versions() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        env.config("quarantine_enabled", "true").await;
+        let d = doc("com.acme/e", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = env.artifact("com.acme/e", "1.0.0").await;
+        let qs = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT quarantine_status FROM artifacts WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&env.fx.pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(qs().await.as_deref(), Some("quarantined"));
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = NULL, quarantine_until = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let tail = "/servers/com.acme/e/versions/1.0.0";
+        let mut edited = d.clone();
+        edited["description"] = "Edited".into();
+        let (s, b) = env.json(env.admin(), "PUT", tail, Some(&edited)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            qs().await.as_deref(),
+            Some("quarantined"),
+            "an edit's new bytes are held like an upload"
+        );
+
+        // A stale read: the version is deprecated after the edit read it.
+        let repo = surface::resolve_mcp_repo(&env.fx.pool, &env.fx.repo_key)
+            .await
+            .unwrap();
+        let stale = live_version(&env.fx.pool, repo.id, "com.acme/e", "1.0.0")
+            .await
+            .unwrap();
+        let (s, _) = env
+            .json(
+                env.member(),
+                "PATCH",
+                "/servers/com.acme%2Fe/versions/1.0.0/status",
+                Some(&serde_json::json!({"status": "deprecated"})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        let resp = write_edit(
+            &env.state,
+            &repo,
+            &stale,
+            &meta,
+            "unused-key",
+            &"0".repeat(64),
+            1,
+            &Resolution::default(),
+            env.fx.user_id,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let status: String = sqlx::query_scalar(
+            "SELECT metadata->'registry'->>'status' FROM artifact_metadata WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "deprecated",
+            "the status change was not overwritten"
+        );
+
+        // A resolving version is not editable.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{resolution}', \
+             '{\"state\": \"resolving\", \"pending\": []}') WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        edited["description"] = "Again".into();
+        let (s, b) = env.json(env.admin(), "PUT", tail, Some(&edited)).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_version_resolving")),
+            "{b}"
+        );
+        env.teardown().await;
+    }
+
     /// Review finding 3: a bundle is served only while its owning version is
     /// served to readers. A held server.json (quarantine) or a soft-deleted
     /// version answers the byte-identical unknown-name 404 for its bundles.
@@ -2627,25 +2795,11 @@ mod tests {
             "1.0.0"
         );
         let id2 = env.artifact("com.acme/echo", "2.0.0").await;
-        let mut done = false;
-        for _ in 0..40 {
-            sqlx::query(
-                "UPDATE mcp_resolve_jobs SET next_attempt_at = NOW() WHERE artifact_id = $1",
-            )
-            .bind(id2)
-            .execute(&env.fx.pool)
-            .await
-            .unwrap();
-            resolver::run_due(&env.state).await;
-            let state: Option<String> = sqlx::query_scalar("SELECT metadata->'resolution'->>'state' FROM artifact_metadata WHERE artifact_id = $1")
-                .bind(id2).fetch_one(&env.fx.pool).await.unwrap();
-            if state.as_deref() == Some("resolved") {
-                done = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(done, "the resolver fills and pins 2.0.0");
+        let res = resolve_until_settled(&env, id2).await;
+        assert_eq!(
+            res["state"], "resolved",
+            "the resolver fills and pins 2.0.0: {res}"
+        );
         let (s, b) = env.json(env.anon(), "GET", tail2, None).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(
@@ -2675,14 +2829,7 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::ACCEPTED);
         let id3 = env.artifact("com.acme/echo", "3.0.0").await;
-        resolver::run_due(&env.state).await;
-        let res: serde_json::Value = sqlx::query_scalar(
-            "SELECT metadata->'resolution' FROM artifact_metadata WHERE artifact_id = $1",
-        )
-        .bind(id3)
-        .fetch_one(&env.fx.pool)
-        .await
-        .unwrap();
+        let res = resolve_until_settled(&env, id3).await;
         assert_eq!(res["state"], "failed", "{res}");
         assert_eq!(res["error"]["error"], "mcp_package_not_found");
         let (s, b) = env
@@ -2720,15 +2867,11 @@ mod tests {
     /// Run the resolver until `artifact_id` leaves `resolving`; its final
     /// `resolution` document.
     async fn resolve_until_settled(env: &Env, artifact_id: Uuid) -> serde_json::Value {
+        // Each round works THIS version's job directly (`run_job`), so other
+        // due jobs in the shared database never take its turn; a retryable
+        // attempt is driven again, up to a bounded number of rounds.
         for _ in 0..80 {
-            sqlx::query(
-                "UPDATE mcp_resolve_jobs SET next_attempt_at = NOW() WHERE artifact_id = $1",
-            )
-            .bind(artifact_id)
-            .execute(&env.fx.pool)
-            .await
-            .unwrap();
-            resolver::run_due(&env.state).await;
+            resolver::run_job(&env.state, artifact_id).await;
             let res: serde_json::Value = sqlx::query_scalar(
                 "SELECT COALESCE(metadata->'resolution', 'null'::jsonb) FROM artifact_metadata \
                  WHERE artifact_id = $1",

@@ -321,9 +321,10 @@ pub(crate) async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo,
     }
 }
 
-/// Hosted and Remote MCP repositories serve their stored rows (a Remote's
-/// are the upstream entries its sync ingested). A Virtual repository answers
-/// 501 until its read path lands.
+/// The routes only a Hosted or Remote MCP repository serves (`/validate`,
+/// bundle downloads, and the stored-row reads a Virtual dispatches to its
+/// own read path before reaching here). A Virtual repository answers `501
+/// mcp_not_implemented` on them: it has no rows or bundles of its own.
 pub(crate) fn reject_if_not_hosted_read(repo: &RepoInfo) -> Result<(), Response> {
     if matches!(repo.repo_type.as_str(), "local" | "staging" | "remote") {
         return Ok(());
@@ -331,7 +332,8 @@ pub(crate) fn reject_if_not_hosted_read(repo: &RepoInfo) -> Result<(), Response>
     Err(problem(
         501,
         "mcp_not_implemented",
-        "Virtual MCP registries are not available in this release",
+        "A Virtual MCP registry does not serve this endpoint: it has no documents or bundles \
+         of its own; call it on one of the Virtual's member repositories",
         serde_json::json!({}),
     ))
 }
@@ -1886,7 +1888,7 @@ async fn publish_server(
         &state.db,
         fmt::metadata_doc(&server, &registry, settings.policy, &pins),
         &resolution,
-        ext.user_id,
+        &ext,
         base.as_str(),
     )
     .await

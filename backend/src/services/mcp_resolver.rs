@@ -583,15 +583,72 @@ pub async fn bundle_facts(
     Ok(out)
 }
 
+/// The credential scope of the publish that queued a fill
+/// (`resolution.requestedScope`): the asynchronous fill runs with exactly
+/// this scope, never wider than the publishing token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestedScope {
+    /// The token's scopes; `None` for an unscoped credential.
+    pub scopes: Option<Vec<String>>,
+    /// The token's repository allowlist; `None` when unrestricted.
+    pub repositories: Option<Vec<Uuid>>,
+    #[serde(default)]
+    pub api_token: bool,
+}
+
+impl RequestedScope {
+    pub fn of(ext: &AuthExtension) -> Self {
+        Self {
+            scopes: ext.scopes.clone(),
+            repositories: match &ext.allowed_repo_ids {
+                crate::models::access_scope::AccessScope::Admin => None,
+                crate::models::access_scope::AccessScope::Restricted(ids) => Some(ids.clone()),
+            },
+            api_token: ext.is_api_token,
+        }
+    }
+
+    /// The scope of a job whose recorded scope is missing or unreadable:
+    /// nothing (fail closed).
+    pub fn none() -> Self {
+        Self {
+            scopes: Some(Vec::new()),
+            repositories: Some(Vec::new()),
+            api_token: true,
+        }
+    }
+
+    /// `auth` narrowed to this scope (pure).
+    pub fn apply(&self, mut auth: AuthExtension) -> AuthExtension {
+        auth.is_api_token = self.api_token;
+        auth.scopes = self.scopes.clone();
+        auth.allowed_repo_ids = match &self.repositories {
+            None => crate::models::access_scope::AccessScope::Admin,
+            Some(ids) => crate::models::access_scope::AccessScope::Restricted(ids.clone()),
+        };
+        auth
+    }
+
+    /// The recorded scope of a stored metadata document.
+    pub fn of_metadata(meta: &serde_json::Value) -> Self {
+        meta.pointer("/resolution/requestedScope")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_else(Self::none)
+    }
+}
+
 /// The stored metadata document of a publish: [`fmt::metadata_doc`] plus
-/// `bundles` and, when packages are still being filled, `resolution`.
+/// `bundles` and, when packages are still being filled, `resolution`
+/// (including the publishing credential's [`RequestedScope`]).
 pub async fn metadata_with_resolution(
     db: &PgPool,
     mut doc: serde_json::Value,
     res: &Resolution,
-    requested_by: Uuid,
+    requester: &AuthExtension,
     base_url: &str,
 ) -> Result<serde_json::Value, McpError> {
+    let requested_by = requester.user_id;
     let bundles = bundle_facts(db, &res.pins).await?;
     if !bundles.is_empty() {
         doc["bundles"] = bundles.into();
@@ -602,6 +659,7 @@ pub async fn metadata_with_resolution(
             "pending": res.pending,
             "requestedAt": Utc::now(),
             "requestedBy": requested_by,
+            "requestedScope": RequestedScope::of(requester),
             "baseUrl": base_url,
             "attempts": 0,
         });
@@ -726,8 +784,9 @@ async fn publisher(db: &PgPool, user_id: Uuid) -> Option<crate::models::user::Us
     .filter(|u| u.is_active)
 }
 
-fn auth_of(user: &crate::models::user::User) -> AuthExtension {
-    AuthExtension {
+/// The publisher's credential for a fill, narrowed to the recorded scope.
+fn auth_of(user: &crate::models::user::User, scope: &RequestedScope) -> AuthExtension {
+    scope.apply(AuthExtension {
         user_id: user.id,
         username: user.username.clone(),
         email: user.email.clone(),
@@ -737,7 +796,7 @@ fn auth_of(user: &crate::models::user::User) -> AuthExtension {
         scopes: None,
         allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         iat_ms: None,
-    }
+    })
 }
 
 /// One in-process GET through a format router, as the publisher. Returns the
@@ -813,12 +872,17 @@ async fn route_get(
 }
 
 /// Fill `p` through its Remote as `user`.
-pub async fn fill(state: &SharedState, p: &Pending, user: &crate::models::user::User) -> Fill {
+pub async fn fill(
+    state: &SharedState,
+    p: &Pending,
+    user: &crate::models::user::User,
+    scope: &RequestedScope,
+) -> Fill {
     let what = match &p.version {
         Some(v) => format!("{} {}@{}", p.registry_type, p.identifier, v),
         None => format!("{} {}", p.registry_type, p.identifier),
     };
-    let auth = auth_of(user);
+    let auth = auth_of(user, scope);
     // The fill runs as the publisher, who must be able to read the Remote
     // (the format routes run without the visibility middleware here).
     match mcp_packages::caller_may_map(&state.db, &auth, p.fill_repository_id).await {
@@ -960,6 +1024,35 @@ enum Step {
     Gone,
 }
 
+/// Work the job of `artifact_id` now, whatever else is due (tests: a shared
+/// database may hold other repositories' due jobs, which a [`run_due`] batch
+/// would take first). Returns whether the job was claimed and worked.
+#[cfg(test)]
+pub(crate) async fn run_job(state: &SharedState, artifact_id: Uuid) -> bool {
+    let job = sqlx::query_as::<_, Job>(
+        "UPDATE mcp_resolve_jobs j SET claim_token = gen_random_uuid(), claimed_by = $2, \
+           claim_expires_at = NOW() + make_interval(secs => $3), attempts = j.attempts + 1, \
+           updated_at = NOW() \
+         WHERE j.artifact_id = $1 \
+           AND (j.claim_expires_at IS NULL OR j.claim_expires_at < NOW()) \
+         RETURNING j.artifact_id, j.repository_id, j.requested_by, j.attempts, j.claim_token",
+    )
+    .bind(artifact_id)
+    .bind(crate::services::cluster_work::WorkerIdentity::for_process().as_str())
+    .bind(CLAIM_SECS as f64)
+    .fetch_optional(&state.db)
+    .await
+    .expect("claim the resolve job");
+    let Some(job) = job else {
+        return false;
+    };
+    let step = attempt(state, &job).await;
+    conclude(state, &job, step)
+        .await
+        .expect("record the resolve outcome");
+    true
+}
+
 /// Run one tick: claim due jobs and work them. Returns how many were worked.
 pub async fn run_due(state: &SharedState) -> usize {
     let jobs = match claim(&state.db, BATCH).await {
@@ -1026,9 +1119,12 @@ async fn attempt(state: &SharedState, job: &Job) -> Step {
         .and_then(|v| v.as_str())
         .unwrap_or("http://localhost")
         .to_string();
+    // The fill runs with the publishing credential's scope, not the account's
+    // full authority.
+    let scope = RequestedScope::of_metadata(&meta);
     let mut pins = Vec::new();
     for p in &pending {
-        match resolve_pending(state, &settings, p, &user, &base).await {
+        match resolve_pending(state, &settings, p, &user, &scope, &base).await {
             Ok(pin) => pins.push(pin),
             Err(step) => return step,
         }
@@ -1043,6 +1139,7 @@ async fn resolve_pending(
     settings: &McpSettings,
     p: &Pending,
     user: &crate::models::user::User,
+    scope: &RequestedScope,
     base: &str,
 ) -> Result<PackagePin, Step> {
     let pkg = p.package();
@@ -1085,7 +1182,7 @@ async fn resolve_pending(
     if let Some(pin) = look().await.map_err(to_step)? {
         return Ok(pin);
     }
-    match fill(state, p, user).await {
+    match fill(state, p, user, scope).await {
         Fill::Served => {}
         Fill::Refused(code, detail) => {
             return Err(Step::Failed {
@@ -1308,4 +1405,41 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
             run_due(&state).await;
         }
     });
+}
+
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review finding 12: the asynchronous fill runs with the publishing
+    /// token's scope (repository allowlist, scopes), recorded on the
+    /// resolution; a job without a readable record gets nothing.
+    #[test]
+    fn fills_run_with_the_publishing_scope() {
+        let (allowed, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut token = crate::api::handlers::test_db_helpers::make_auth(Uuid::new_v4(), "ci");
+        token.is_api_token = true;
+        token.scopes = Some(vec!["write:artifacts".into()]);
+        token.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![allowed]);
+        let scope = RequestedScope::of(&token);
+        let meta = serde_json::json!({"resolution": {"requestedScope": scope}});
+        let recorded = RequestedScope::of_metadata(&meta);
+        assert_eq!(recorded, scope);
+        let account = crate::api::handlers::test_db_helpers::make_auth(token.user_id, "ci");
+        assert!(
+            account.can_access_repo(other),
+            "the account alone is unrestricted"
+        );
+        let fill = recorded.apply(account.clone());
+        assert!(fill.can_access_repo(allowed));
+        assert!(!fill.can_access_repo(other));
+        assert!(!fill.has_scope("admin"));
+        assert!(fill.is_api_token);
+        let none = RequestedScope::of_metadata(&serde_json::json!({"resolution": {}}));
+        let blind = none.apply(account);
+        assert!(!blind.can_access_repo(allowed));
+        assert!(!blind.has_scope("read:artifacts"));
+    }
 }
