@@ -13221,6 +13221,65 @@ mod upstream_filter_virtual_tests {
             "an admitted path still reaches the fringe upstream"
         );
     }
+
+    /// #5282: a cache-only first member is skipped for a path it does not hold
+    /// exactly like a filtered one: its upstream receives nothing and the
+    /// second member answers.
+    #[tokio::test]
+    async fn virtual_resolves_a_miss_from_the_next_member_when_the_first_is_cache_only_5282() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let offline = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"offline-jar".to_vec()))
+            .expect(0)
+            .mount(&offline)
+            .await;
+        let online = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"\.jar$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"online-jar".to_vec()))
+            .mount(&online)
+            .await;
+        let (offline_id, _, offline_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &offline.uri(), 1).await;
+        let (online_id, _, online_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &online.uri(), 2).await;
+        crate::services::upstream_mode::save_upstream_mode(
+            &fx.pool,
+            offline_id,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly,
+        )
+        .await
+        .expect("store cache_only");
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/org/acme/lib/1.0/lib-1.0.jar", fx.repo_key)),
+        )
+        .await;
+        let offline_hits = hits(&offline, "/").await;
+
+        tdh::cleanup_member_repo(&fx.pool, offline_id, &offline_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, online_id, &online_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"online-jar");
+        assert_eq!(
+            offline_hits, 0,
+            "the cache-only member's upstream is never contacted"
+        );
+    }
 }
 
 /// #4100: scan-on-proxy for Maven (and Gradle, which rides the Maven route)

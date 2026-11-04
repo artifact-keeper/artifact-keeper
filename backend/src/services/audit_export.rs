@@ -513,6 +513,17 @@ pub mod details {
         /// trail, not just the values it ended at.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub age_gate_change: Option<AgeGateChangeDetails>,
+        /// An upstream-mode change on `PUT .../upstream-mode` (#5282): the
+        /// mode before and after (`online` / `cache_only`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub upstream_mode_change: Option<UpstreamModeChangeAudit>,
+    }
+
+    /// Before/after of a Remote's upstream mode (#5282).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct UpstreamModeChangeAudit {
+        pub previous_upstream_mode: String,
+        pub upstream_mode: String,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -1353,6 +1364,7 @@ mod tests {
             allow_public_with_upstream_credentials: None,
             upstream_auth_change: None,
             age_gate_change: None,
+            upstream_mode_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");
