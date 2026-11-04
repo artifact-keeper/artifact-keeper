@@ -211,6 +211,14 @@ Each ingest also logs an `INFO` line on the `security` target
 (`external findings ingested`) with the artifact, scan, scanner, acting user,
 finding and malicious counts and the new score.
 
+### MCP registry
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `MCP_PACKAGE_PINNED` | `artifact` (the server.json version) | A publish to an MCP registry resolved one `packages[]` entry to an artifact or image digest in a backing repository (#5253). One row per entry. Outcome `success`. | `repository`, `server`, `version`, `index`, `registry_type`, `submitted` (`identifier`, `version`), `resolved_repository`, `digest` (OCI) or `sha256`, `warnings` (e.g. `oci_tag_digest_mismatch`). |
+| `MCP_PIN_DRIFT_DETECTED` | `artifact` (the server.json version that pinned the tag) | An OCI tag that a published server version pinned moved to another digest, by a push or an upstream refresh (#5253). The version keeps serving the pinned digest; nothing is unpublished. Outcome `success`. | `backing_repository_id`, `name`, `tag`, `previous_digest`, `pinned_digest`, `observed_digest`, `mcp_server`, `mcp_version`. |
+| `MCP_SERVER_DOWNLOAD_REFUSED` | `artifact` (the server.json version) | The `/mcp/{repo}/v0.1` surface refused to hand a held server version to a client (#5253). Sampled: at most one row per (version, caller) per minute per replica. Outcome `denied`. | `repository`, `repository_id`, `server`, `version`, `hold_class` (`quarantine`, `scan_policy`, `backing`, `age_gate`, `unresolvable`, `resolving`, `unavailable`), `reason_disclosed` (whether the caller got the reason body), `anonymous`. |
+
 ### Proxy scan refusals
 
 | Action | Resource | Fires when | `details` |
