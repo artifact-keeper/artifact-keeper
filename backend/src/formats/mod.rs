@@ -22,6 +22,7 @@ pub mod incus;
 pub mod jetbrains_plugins;
 pub mod maven;
 pub mod maven_version;
+pub mod mcp;
 pub mod mlmodel;
 pub mod npm;
 pub mod nuget;
@@ -143,6 +144,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "protobuf" => Some(Box::new(protobuf::ProtobufHandler::new())),
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
         "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
+        "mcp" => Some(Box::new(mcp::McpHandler::new())),
         _ => None,
     }
 }
@@ -208,6 +210,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Protobuf => Box::new(protobuf::ProtobufHandler::new()),
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
         RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
+        RepositoryFormat::Mcp => Box::new(mcp::McpHandler::new()),
     }
 }
 
@@ -435,6 +438,11 @@ fn core_handler_metadata(
             "Pacman",
             "Arch Linux pacman packages",
             &[".pkg.tar.zst", ".pkg.tar.xz"],
+        ),
+        "mcp" => (
+            "MCP Registry",
+            "Model Context Protocol server registry (server.json, registry API v0.1)",
+            &[".json"],
         ),
         // Total fallback -- see the doc comment. A format that reaches this
         // arm is still listed, it just shows its raw key as the display name.

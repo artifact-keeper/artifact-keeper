@@ -65,6 +65,7 @@ mod tests {
         "opkg",
         "p2",
         "bazel",
+        "mcp",
     ];
 
     /// Additional alias keys that get_core_handler should also resolve.
@@ -223,6 +224,7 @@ mod tests {
             ("opkg", RepositoryFormat::Opkg),
             ("p2", RepositoryFormat::P2),
             ("bazel", RepositoryFormat::Bazel),
+            ("mcp", RepositoryFormat::Mcp),
         ];
 
         for (expected_key, format) in expected_keys {
@@ -733,6 +735,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mcp_handler_valid_server_json() {
+        let handler = get_core_handler("mcp").unwrap();
+        let content = Bytes::from(
+            r#"{"name":"com.acme/echo","description":"Echo","version":"1.0.0",
+                "remotes":[{"type":"streamable-http","url":"https://mcp.acme.test/mcp"}]}"#,
+        );
+        let path = "servers/com.acme/echo/1.0.0/server.json";
+        let result = handler.validate(path, &content).await;
+        assert!(result.is_ok(), "MCP validate failed: {:?}", result.err());
+        let meta = handler.parse_metadata(path, &content).await.unwrap();
+        assert_eq!(meta["name"], "com.acme/echo");
+        assert_eq!(meta["remote_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_handler_rejects_bad_name() {
+        let handler = get_core_handler("mcp").unwrap();
+        let content = Bytes::from(
+            r#"{"name":"no-slash","description":"Echo","version":"1.0.0",
+                "remotes":[{"type":"streamable-http","url":"https://mcp.acme.test/mcp"}]}"#,
+        );
+        assert!(handler
+            .validate("servers/no-slash/1.0.0/server.json", &content)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn test_conda_native_handler_valid_package() {
         let handler = get_core_handler("conda_native").unwrap();
         let content = Bytes::from("fake conda package");
@@ -856,6 +886,7 @@ mod tests {
             "opkg",
             "p2",
             "bazel",
+            "mcp",
             "chef",
             "puppet",
             "ansible",

@@ -102,6 +102,8 @@ impl AuditAction {
             AuditAction::LoginRateLimited => Outcome::Denied,
             // #4777: the scan-on-proxy gate refused the pull.
             AuditAction::ProxyScanBlocked => Outcome::Denied,
+            // #5253: the MCP surface refused a held server version.
+            AuditAction::McpServerDownloadRefused => Outcome::Denied,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -194,7 +196,9 @@ impl AuditAction {
             | AuditAction::EnvironmentDeleted
             | AuditAction::ExternalFindingsIngested
             | AuditAction::DeviceCodeIssued
-            | AuditAction::DeviceAuthorizationApproved => Outcome::Success,
+            | AuditAction::DeviceAuthorizationApproved
+            | AuditAction::McpPackagePinned
+            | AuditAction::McpPinDriftDetected => Outcome::Success,
         }
     }
 }

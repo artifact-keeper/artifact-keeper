@@ -860,7 +860,7 @@ impl ScanReferenceResolution {
 ///     marker `docker buildx` stamps onto attestation children),
 ///   * `annotations["vnd.docker.reference.type"]` is `attestation-manifest`,
 ///   * `artifactType` contains `in-toto` (SLSA/provenance attestations).
-fn is_excluded_index_child(child: &serde_json::Value) -> bool {
+pub(crate) fn is_excluded_index_child(child: &serde_json::Value) -> bool {
     let platform = child.get("platform");
     let os = platform
         .and_then(|p| p.get("os"))

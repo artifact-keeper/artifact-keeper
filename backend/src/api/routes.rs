@@ -121,6 +121,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/cocoapods", handlers::cocoapods::router())
         .nest("/hex", handlers::hex::router())
         .nest("/huggingface", handlers::huggingface::router())
+        .nest(handlers::mcp::MOUNT_PREFIX, handlers::mcp::router())
         .nest("/jetbrains", handlers::jetbrains::router())
         .nest("/chef", handlers::chef::router())
         .nest("/puppet", handlers::puppet::router())

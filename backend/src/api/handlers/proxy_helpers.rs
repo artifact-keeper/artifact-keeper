@@ -25154,6 +25154,7 @@ mod scan_on_upload_coverage_tests {
         ("terraform.rs", "upload_module"),
         ("terraform.rs", "upload_provider"),
         ("vscode.rs", "publish_extension"),
+        ("mcp.rs", "insert_server_rows"),
         ("oci_v2.rs", "upsert_manifest_artifact"),
         ("upload.rs", "complete_session_commit"),
         ("helm.rs", "upload_chart"),
@@ -25483,6 +25484,9 @@ mod scan_on_upload_coverage_tests {
         ("maven.rs", "upload"),
         ("npm.rs", "store_npm_version"),
         ("pacman.rs", "insert_package_rows"),
+        // #5253: the MCP publish inserts the server.json row, its metadata
+        // and the OCI retention holds in one admitted transaction.
+        ("mcp.rs", "insert_server_rows"),
         ("protobuf.rs", "upload"),
         ("pub_registry.rs", "upload_package"),
         ("puppet.rs", "publish_module"),

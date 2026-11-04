@@ -303,6 +303,7 @@ fn defers_to_package_route(path: &str) -> bool {
         "/cocoapods",
         "/hex",
         "/huggingface",
+        "/mcp",
         "/jetbrains",
         "/chef",
         "/puppet",

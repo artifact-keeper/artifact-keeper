@@ -84,6 +84,8 @@ pub enum RepositoryFormat {
     Lxc,
     // Linux distribution packages (#3343)
     Pacman,
+    // AI / agents: MCP server registry (#5253)
+    Mcp,
 }
 
 impl RepositoryFormat {
@@ -162,6 +164,7 @@ impl RepositoryFormat {
         RepositoryFormat::Incus,
         RepositoryFormat::Lxc,
         RepositoryFormat::Pacman,
+        RepositoryFormat::Mcp,
     ];
 
     /// The canonical snake_case key for this format.
@@ -229,6 +232,7 @@ impl RepositoryFormat {
             Self::Incus => "incus",
             Self::Lxc => "lxc",
             Self::Pacman => "pacman",
+            Self::Mcp => "mcp",
         }
     }
 

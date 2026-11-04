@@ -1370,6 +1370,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
             }
         })
+        // #5253: MCP registry read routes answer cross-origin preflights
+        // themselves (any origin, GET only, no credentials); the instance CORS
+        // layer above would otherwise answer them same-origin.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_cors_preflight,
+        ))
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))

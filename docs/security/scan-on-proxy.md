@@ -701,6 +701,7 @@ have no core proxy path to gate.
 | `protobuf` | `protobuf` | accepted | |
 | `incus` | `incus`, `lxc` | accepted | |
 | `pacman` | `pacman` | accepted | |
+| `mcp` | `mcp` | accepted | |
 <!-- coverage-table:end -->
 
 ## Known gaps

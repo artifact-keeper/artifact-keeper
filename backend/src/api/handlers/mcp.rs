@@ -1,0 +1,3064 @@
+//! MCP Registry API v0.1 (and the `/v0` alias) for hosted `mcp` repositories
+//! (#5253): `/mcp/{repo_key}/v0.1/...`.
+//!
+//! Reads go through [`decide_mcp_serve`](crate::formats::mcp::decide_mcp_serve):
+//! a held version is omitted from every listing and answers an exact read
+//! with the unknown-name 404 (the reason only for callers who hold the
+//! repository). Every non-2xx answer is `application/problem+json` with
+//! `Cache-Control: no-store`. Publishing resolves every package to this
+//! instance's own repositories (`services::mcp_packages`); nothing here opens
+//! an outbound connection.
+
+use std::collections::HashMap;
+
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, patch, post};
+use axum::Router;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
+
+use crate::api::extractors::RequestBaseUrl;
+use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
+use crate::api::SharedState;
+use crate::formats::mcp::{
+    self as fmt, BackingGate, GateAudience, GateOutcome, HoldKind, McpError, PackagePin,
+    PackagePolicy, RegistryState, ServeDecision, ServerStatus, StoredVersion, VersionState,
+};
+use crate::services::mcp_packages;
+
+pub const MOUNT_PREFIX: &str = "/mcp";
+/// The registry API versions served, each under `/{repo_key}/{version}`.
+pub const API_VERSIONS: &[&str] = &["v0.1", "v0"];
+
+type HandlerResult = Result<Response, Response>;
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// The route-local CORS policy of the read routes: any origin, no
+/// credentials, the headers a private-registry check sends.
+fn read_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+pub fn router() -> Router<SharedState> {
+    let mut read = Router::new();
+    let mut write = Router::new();
+    for v in API_VERSIONS {
+        let p = |tail: &str| format!("/:repo_key/{v}{tail}");
+        read = read
+            .route(&p("/servers"), get(list_servers))
+            .route(&p("/servers/:ns/versions"), get(list_versions_encoded))
+            .route(&p("/servers/:ns/:name/versions"), get(list_versions_split))
+            .route(
+                &p("/servers/:ns/versions/:version"),
+                get(get_version_encoded),
+            )
+            .route(
+                &p("/servers/:ns/:name/versions/:version"),
+                get(get_version_split),
+            )
+            .route(&p("/ping"), get(ping))
+            .route(&p("/health"), get(health))
+            .route(&p("/version"), get(version));
+        write = write
+            .route(&p("/publish"), post(publish_server))
+            .route(
+                &p("/servers/:ns/versions/:version/status"),
+                patch(update_version_status_encoded),
+            )
+            .route(
+                &p("/servers/:ns/:name/versions/:version/status"),
+                patch(update_version_status_split),
+            )
+            .route(
+                &p("/servers/:ns/status"),
+                patch(update_server_status_encoded),
+            )
+            .route(
+                &p("/servers/:ns/:name/status"),
+                patch(update_server_status_split),
+            );
+    }
+    read.layer(read_cors())
+        .merge(write.layer(DefaultBodyLimit::max(fmt::MCP_PUBLISH_MAX_BYTES)))
+        .layer(axum::middleware::map_response(ensure_problem))
+}
+
+/// The safety net behind "every refusal on this surface is problem+json with
+/// `no-store`": a refusal that did not come from this module's own builders
+/// (an extractor rejection, a method mismatch) is re-rendered.
+async fn ensure_problem(resp: Response) -> Response {
+    let status = resp.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let already = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/problem+json"));
+    if already {
+        return resp;
+    }
+    match status.as_u16() {
+        404 => not_found(),
+        405 => problem(
+            405,
+            "mcp_method_not_allowed",
+            "This method is not supported on this route",
+            serde_json::json!({}),
+        ),
+        413 => mcp_error(McpError::TooLarge),
+        400 | 415 | 422 => problem(
+            status.as_u16(),
+            "mcp_bad_request",
+            "The request is malformed",
+            serde_json::json!({}),
+        ),
+        _ => reproblem(resp),
+    }
+}
+
+/// Answer a CORS preflight for an MCP read route before the instance-wide
+/// CORS layer (same-origin by default) refuses it: that layer answers every
+/// preflight itself, so the route-local [`read_cors`] never sees one. Mounted
+/// outside the global CORS layer in `main.rs`.
+pub async fn mcp_cors_preflight(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if is_mcp_preflight(request.method(), request.uri().path(), request.headers()) {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET,OPTIONS")
+            .header(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "authorization,content-type",
+            )
+            .header(header::ACCESS_CONTROL_MAX_AGE, "600")
+            .body(Body::empty())
+            .unwrap();
+    }
+    next.run(request).await
+}
+
+/// A preflight (`OPTIONS` + `Access-Control-Request-Method: GET`) for a path
+/// under [`MOUNT_PREFIX`].
+pub fn is_mcp_preflight(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    method == Method::OPTIONS
+        && path.starts_with("/mcp/")
+        && headers
+            .get(header::ACCESS_CONTROL_REQUEST_METHOD)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m.eq_ignore_ascii_case("GET"))
+}
+
+// ---------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------
+
+fn with_refusal_headers(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+/// An RFC 9457 refusal with AK's machine code.
+pub fn problem(status: u16, code: &str, detail: &str, extra: serde_json::Value) -> Response {
+    let body = fmt::problem_body(status, code, detail, extra);
+    refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default())
+}
+
+fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    with_refusal_headers((status, body).into_response())
+}
+
+/// The unknown-name answer, byte for byte the reader-only refusal.
+pub fn not_found() -> Response {
+    refusal_bytes(404, fmt::NOT_FOUND_BODY.as_bytes().to_vec())
+}
+
+fn mcp_error(e: McpError) -> Response {
+    if let McpError::Internal(cause) | McpError::Misconfigured(cause) = &e {
+        tracing::error!(error = %cause, code = e.code(), "MCP registry request failed");
+    }
+    problem(e.status(), e.code(), &e.detail(), serde_json::json!({}))
+}
+
+fn internal(e: impl std::fmt::Display) -> Response {
+    mcp_error(McpError::Internal(e.to_string()))
+}
+
+/// Re-render a plain refusal from a shared gate (auth, hosted-only,
+/// promotion-only) as problem+json, keeping its status and challenge.
+fn reproblem(resp: Response) -> Response {
+    let status = resp.status();
+    let (code, detail) = match status.as_u16() {
+        401 => ("mcp_unauthorized", "Authentication required"),
+        403 => (
+            "mcp_forbidden",
+            "This credential may not publish to this repository (needs write:artifacts)",
+        ),
+        405 => (
+            "mcp_read_only",
+            "This repository does not accept publishes (remote repository)",
+        ),
+        409 => (
+            "mcp_promotion_only",
+            "This repository only accepts promoted artifacts",
+        ),
+        400 => (
+            "mcp_read_only",
+            "This repository does not accept publishes (virtual repository)",
+        ),
+        503 => ("mcp_unavailable", "Service temporarily unavailable"),
+        _ => ("mcp_internal_error", "internal error"),
+    };
+    let mut out = problem(status.as_u16(), code, detail, serde_json::json!({}));
+    if let Some(challenge) = resp.headers().get(header::WWW_AUTHENTICATE) {
+        out.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, challenge.clone());
+    }
+    out
+}
+
+fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_vec(value).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Shared lookups
+// ---------------------------------------------------------------------------
+
+/// The MCP repository named by the path. Any miss (unknown key, another
+/// format) is the unknown-name 404, so the surface does not tell an MCP
+/// repository from any other key.
+async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> {
+    match proxy_helpers::resolve_repo_by_key(db, key, &["mcp"], "an MCP registry").await {
+        Ok(repo) => Ok(repo),
+        Err(resp) if resp.status().is_server_error() => Err(reproblem(resp)),
+        Err(_) => Err(not_found()),
+    }
+}
+
+/// Remote and Virtual MCP repositories are refused at creation in this
+/// release; a row that exists anyway answers 501 rather than empty results.
+fn reject_if_not_hosted_read(repo: &RepoInfo) -> Result<(), Response> {
+    if matches!(repo.repo_type.as_str(), "local" | "staging") {
+        return Ok(());
+    }
+    Err(problem(
+        501,
+        "mcp_not_implemented",
+        "Remote and virtual MCP registries are not available in this release",
+        serde_json::json!({}),
+    ))
+}
+
+/// `ns/name` from either route spelling: the encoded single segment
+/// (`com.acme%2Fweather`, decoded by the extractor) or the literal slash.
+pub fn server_name(ns: &str, name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("{ns}/{n}"),
+        None => ns.to_string(),
+    }
+}
+
+/// Whether `caller` may read why a version is held.
+async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> GateAudience {
+    let Some(ext) = auth else {
+        return GateAudience::ReaderOnly;
+    };
+    match crate::api::handlers::quarantine::caller_passes_reason_gate(db, ext, repo_id).await {
+        Ok(true) => GateAudience::ReasonGated,
+        _ => GateAudience::ReaderOnly,
+    }
+}
+
+/// One stored server version row.
+#[derive(Debug, Clone)]
+struct VersionRow {
+    artifact_id: Uuid,
+    name: String,
+    version: String,
+    checksum: String,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<DateTime<Utc>>,
+    stored: StoredVersion,
+}
+
+type RawRow = (
+    Uuid,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<DateTime<Utc>>,
+    serde_json::Value,
+);
+
+fn rows_from_raw(raw: Vec<RawRow>) -> Vec<VersionRow> {
+    raw.into_iter()
+        .filter_map(|(artifact_id, name, version, checksum, qs, qu, meta)| {
+            let stored = StoredVersion::from_metadata(&meta);
+            if stored.is_none() {
+                tracing::warn!(artifact_id = %artifact_id, "MCP server version has no readable metadata; skipped");
+            }
+            Some(VersionRow {
+                artifact_id,
+                name,
+                version,
+                checksum,
+                quarantine_status: qs,
+                quarantine_until: qu,
+                stored: stored?,
+            })
+        })
+        .collect()
+}
+
+const ROW_COLUMNS: &str = "a.id, a.name, a.version, a.checksum_sha256, a.quarantine_status, \
+     a.quarantine_until, m.metadata";
+
+/// Every live version of `name` in `repo_id`, text-ordered by version.
+async fn versions_of<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<Vec<VersionRow>, Response> {
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.name = $2 AND a.is_deleted = false \
+           AND m.format = 'mcp' \
+         ORDER BY a.version"
+    );
+    let raw: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(repo_id)
+        .bind(name)
+        .fetch_all(db)
+        .await
+        .map_err(internal)?;
+    Ok(rows_from_raw(raw))
+}
+
+/// The server.json artifact's own hold, from the download gate.
+async fn own_hold(db: &PgPool, artifact_id: Uuid) -> Result<Option<HoldKind>, ()> {
+    match crate::services::quarantine_service::enforce_download_gate(db, artifact_id).await {
+        Ok(()) => Ok(None),
+        Err(e) => match mcp_packages::outcome_for_gate_error(&e) {
+            GateOutcome::Quarantine => Ok(Some(HoldKind::Quarantine)),
+            GateOutcome::ScanPolicy => Ok(Some(HoldKind::ScanPolicy)),
+            _ => Err(()),
+        },
+    }
+}
+
+fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String {
+    format!(
+        "{}/mcp/{}/v0.1/servers/{}/versions/{}",
+        base.trim_end_matches('/'),
+        repo_key,
+        urlencoding::encode(name),
+        urlencoding::encode(version)
+    )
+}
+
+/// Decide one row for `audience`, evaluating the version's own hold and every
+/// backing gate.
+async fn decide_row(
+    db: &PgPool,
+    row: &VersionRow,
+    policy_now: PackagePolicy,
+    include_deleted: bool,
+    audience: GateAudience,
+    instance: String,
+) -> ServeDecision {
+    let mut gates: Vec<BackingGate> = Vec::new();
+    let own = match own_hold(db, row.artifact_id).await {
+        Ok(h) => h,
+        Err(()) => {
+            gates.push(BackingGate {
+                package: "server.json".into(),
+                outcome: GateOutcome::Unavailable,
+            });
+            None
+        }
+    };
+    gates.extend(mcp_packages::backing_gates(db, &row.stored, policy_now).await);
+    let state = VersionState {
+        name: row.name.clone(),
+        version: row.version.clone(),
+        status: row.stored.registry.status,
+        own_hold: own,
+        include_deleted,
+        instance,
+    };
+    fmt::decide_mcp_serve(&state, &gates, audience)
+}
+
+/// The served entry of one row.
+fn served_entry(
+    row: &VersionRow,
+    repo: &RepoInfo,
+    base: &str,
+    answered_as_latest: bool,
+) -> serde_json::Value {
+    let server = fmt::rewrite_packages_for_serve(
+        &row.stored.server,
+        &row.stored.pins,
+        row.stored.policy,
+        base,
+    );
+    let mut registry = row.stored.registry.clone();
+    if answered_as_latest {
+        registry.is_latest = true;
+    }
+    fmt::envelope(
+        server,
+        &registry,
+        serde_json::json!({
+            "repository": repo.key,
+            "artifactId": row.artifact_id,
+            "sha256": row.checksum,
+            "packagePolicy": row.stored.policy.as_str(),
+        }),
+    )
+}
+
+/// The repository's package policy now (a read failure is fail-closed: the
+/// versions are gated as `own-repos`).
+async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy {
+    mcp_packages::load_settings(db, repo_id)
+        .await
+        .map(|s| s.policy)
+        .unwrap_or(PackagePolicy::OwnRepos)
+}
+
+// ---------------------------------------------------------------------------
+// Refusal audit (sampled)
+// ---------------------------------------------------------------------------
+
+const REFUSAL_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a refusal of `(artifact, caller)` should be audited now: at most
+/// once per [`REFUSAL_AUDIT_WINDOW`] per replica.
+fn refusal_audit_due(artifact_id: Uuid, caller: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+    static SEEN: OnceLock<Mutex<HashMap<(Uuid, String), Instant>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let now = Instant::now();
+    if seen.len() > 10_000 {
+        seen.retain(|_, at| now.duration_since(*at) < REFUSAL_AUDIT_WINDOW);
+    }
+    let key = (artifact_id, caller.to_string());
+    match seen.get(&key) {
+        Some(at) if now.duration_since(*at) < REFUSAL_AUDIT_WINDOW => false,
+        _ => {
+            seen.insert(key, now);
+            true
+        }
+    }
+}
+
+fn audit_refusal(
+    db: &PgPool,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    row: &VersionRow,
+    hold_class: &str,
+    audience: GateAudience,
+) {
+    let caller = auth
+        .map(|a| a.user_id.to_string())
+        .unwrap_or_else(|| "anonymous".to_string());
+    if !refusal_audit_due(row.artifact_id, &caller) {
+        return;
+    }
+    use crate::services::audit_service::{
+        audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+    };
+    let mut entry = AuditEntry::new(
+        AuditAction::McpServerDownloadRefused,
+        ResourceType::Artifact,
+    )
+    .resource(row.artifact_id)
+    .resource_name(format!("{}@{}", row.name, row.version))
+    .with_request_client_ip()
+    .details(serde_json::json!({
+        "repository": repo.key,
+        "repository_id": repo.id,
+        "server": row.name,
+        "version": row.version,
+        "hold_class": hold_class,
+        "reason_disclosed": audience == GateAudience::ReasonGated,
+        "anonymous": auth.is_none(),
+    }));
+    if let Some(a) = auth {
+        entry = entry.user(a.user_id);
+    }
+    tokio::spawn(audit_fire_and_forget(db.clone(), entry));
+}
+
+// ---------------------------------------------------------------------------
+// GET /servers
+// ---------------------------------------------------------------------------
+
+/// The parsed `GET /servers` query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListQuery {
+    pub limit: i64,
+    pub cursor: Option<(String, String)>,
+    pub search: Option<String>,
+    pub version: Option<String>,
+    pub updated_since: Option<DateTime<Utc>>,
+    pub include_deleted: bool,
+}
+
+fn parse_bool(key: &str, v: &str) -> Result<bool, McpError> {
+    match v {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(McpError::invalid(key, "must be true or false")),
+    }
+}
+
+/// Parse the listing query with upstream's rules: `limit` 1.. (default 30,
+/// values over 100 clamp, 0/negative/non-numeric 400), `search` >= 3
+/// characters (422), `updated_since` RFC 3339 (400) and forcing
+/// `include_deleted` (an explicit `include_deleted=false` with it is 400).
+pub fn parse_list_query(q: &HashMap<String, String>) -> Result<ListQuery, McpError> {
+    let limit = match q.get("limit").map(|s| s.trim()) {
+        None | Some("") => fmt::DEFAULT_LIMIT,
+        Some(s) => match s.parse::<i64>() {
+            Ok(n) if n >= 1 => n.min(fmt::MAX_LIMIT),
+            _ => return Err(McpError::invalid("limit", "must be a positive integer")),
+        },
+    };
+    let cursor = match q.get("cursor").filter(|c| !c.is_empty()) {
+        Some(c) => Some(fmt::decode_cursor(c)?),
+        None => None,
+    };
+    let search = match q.get("search").filter(|s| !s.is_empty()) {
+        Some(s) if s.chars().count() < 3 => return Err(McpError::SearchTooShort),
+        Some(s) if s.chars().count() > 200 => {
+            return Err(McpError::invalid(
+                "search",
+                "must be at most 200 characters",
+            ))
+        }
+        Some(s) => Some(s.clone()),
+        None => None,
+    };
+    let updated_since = match q.get("updated_since").filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            DateTime::parse_from_rfc3339(s)
+                .map_err(|_| McpError::invalid("updated_since", "must be an RFC 3339 timestamp"))?
+                .with_timezone(&Utc),
+        ),
+        None => None,
+    };
+    let include_deleted = match q.get("include_deleted") {
+        Some(v) => {
+            let b = parse_bool("include_deleted", v)?;
+            if !b && updated_since.is_some() {
+                return Err(McpError::invalid(
+                    "include_deleted",
+                    "updated_since always includes deleted versions",
+                ));
+            }
+            b
+        }
+        None => updated_since.is_some(),
+    };
+    let version = q.get("version").filter(|v| !v.is_empty()).cloned();
+    Ok(ListQuery {
+        limit,
+        cursor,
+        search,
+        version,
+        updated_since,
+        include_deleted,
+    })
+}
+
+/// One keyset batch of listing candidates.
+async fn fetch_listing_batch(
+    db: &PgPool,
+    repo_id: Uuid,
+    q: &ListQuery,
+    after: Option<&(String, String)>,
+    name_after: Option<&str>,
+    batch: i64,
+) -> Result<Vec<VersionRow>, Response> {
+    let pattern = q
+        .search
+        .as_deref()
+        .map(|s| format!("%{}%", super::escape_like_literal(s)));
+    let exact_version = q.version.as_deref().filter(|v| *v != "latest");
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
+           AND ($2::text IS NULL OR a.name ILIKE $2 ESCAPE '\\') \
+           AND ($3::text IS NULL OR a.version = $3) \
+           AND ($4::timestamptz IS NULL \
+                OR (m.metadata->'registry'->>'updatedAt')::timestamptz >= $4) \
+           AND ($5 OR COALESCE(m.metadata->'registry'->>'status', 'active') <> 'deleted') \
+           AND ($6::text IS NULL OR (a.name, a.version) > ($6, $7)) \
+           AND ($9::text IS NULL OR a.name > $9) \
+         ORDER BY a.name, a.version LIMIT $8"
+    );
+    let raw: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(repo_id)
+        .bind(pattern)
+        .bind(exact_version)
+        .bind(q.updated_since)
+        .bind(q.include_deleted)
+        .bind(after.map(|c| c.0.clone()))
+        .bind(after.map(|c| c.1.clone()).unwrap_or_default())
+        .bind(batch)
+        .bind(name_after)
+        .fetch_all(db)
+        .await
+        .map_err(internal)?;
+    Ok(rows_from_raw(raw))
+}
+
+/// The rows of `rows` the reader-only gate admits, in order. A gate that
+/// cannot be evaluated omits the whole batch (fail closed).
+async fn servable(
+    db: &PgPool,
+    repo_id: Uuid,
+    rows: Vec<VersionRow>,
+    policy_now: PackagePolicy,
+) -> Vec<VersionRow> {
+    let listing: Vec<mcp_packages::ListingRow> = rows
+        .iter()
+        .map(|r| mcp_packages::ListingRow {
+            artifact_id: r.artifact_id,
+            quarantine_status: r.quarantine_status.clone(),
+            quarantine_until: r.quarantine_until,
+            stored: r.stored.clone(),
+        })
+        .collect();
+    match mcp_packages::listing_refusals(db, repo_id, &listing, policy_now).await {
+        Ok(refused) => rows
+            .into_iter()
+            .filter(|r| !refused.contains(&r.artifact_id))
+            .collect(),
+        Err(mcp_packages::GateUnavailable) => {
+            tracing::warn!(repository_id = %repo_id, "MCP listing gate unavailable; batch omitted");
+            Vec::new()
+        }
+    }
+}
+
+async fn list_servers(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    base: RequestBaseUrl,
+) -> HandlerResult {
+    let repo = resolve_mcp_repo(&state.db, &repo_key).await?;
+    reject_if_not_hosted_read(&repo)?;
+    let q = parse_list_query(&query).map_err(mcp_error)?;
+    let policy_now = current_policy(&state.db, repo.id).await;
+    let (entries, next) = if q.version.as_deref() == Some("latest") {
+        list_latest(&state.db, &repo, &q, policy_now, base.as_str()).await?
+    } else {
+        list_versions_page(&state.db, &repo, &q, policy_now, base.as_str()).await?
+    };
+    Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, next)))
+}
+
+/// Upper bound on the keyset batches one listing request reads, so a
+/// repository whose rows are almost all held cannot turn one request into a
+/// full scan.
+const MAX_LISTING_BATCHES: usize = 50;
+
+async fn list_versions_page(
+    db: &PgPool,
+    repo: &RepoInfo,
+    q: &ListQuery,
+    policy_now: PackagePolicy,
+    base: &str,
+) -> Result<(Vec<serde_json::Value>, Option<String>), Response> {
+    let want = q.limit as usize;
+    let mut out: Vec<VersionRow> = Vec::new();
+    let mut after = q.cursor.clone();
+    let mut exhausted = false;
+    for _ in 0..MAX_LISTING_BATCHES {
+        let batch = fetch_listing_batch(db, repo.id, q, after.as_ref(), None, q.limit + 1).await?;
+        exhausted = (batch.len() as i64) <= q.limit;
+        if let Some(last) = batch.last() {
+            after = Some((last.name.clone(), last.version.clone()));
+        }
+        out.extend(servable(db, repo.id, batch, policy_now).await);
+        if out.len() > want || exhausted {
+            break;
+        }
+    }
+    let next = if out.len() > want {
+        let last = &out[want - 1];
+        Some(fmt::encode_cursor(&last.name, &last.version))
+    } else if !exhausted {
+        // The batch cap stopped the scan (almost every row held): resume
+        // after the last row read instead of presenting a short last page.
+        after.as_ref().map(|(n, v)| fmt::encode_cursor(n, v))
+    } else {
+        None
+    };
+    out.truncate(want);
+    Ok((
+        out.iter()
+            .map(|r| served_entry(r, repo, base, false))
+            .collect(),
+        next,
+    ))
+}
+
+/// `version=latest`: one entry per server, its newest servable version.
+async fn list_latest(
+    db: &PgPool,
+    repo: &RepoInfo,
+    q: &ListQuery,
+    policy_now: PackagePolicy,
+    base: &str,
+) -> Result<(Vec<serde_json::Value>, Option<String>), Response> {
+    let want = q.limit as usize;
+    let mut out: Vec<VersionRow> = Vec::new();
+    // The cursor names the last server answered; resume after its name.
+    let name_after = q.cursor.as_ref().map(|(name, _)| name.clone());
+    let mut after: Option<(String, String)> = None;
+    let mut exhausted = false;
+    // The last server whose versions were all read (resumable by name).
+    let mut last_done: Option<String> = None;
+    let mut current: Vec<VersionRow> = Vec::new();
+    let flush =
+        |group: &mut Vec<VersionRow>, out: &mut Vec<VersionRow>, done: &mut Option<String>| {
+            if let Some(first) = group.first() {
+                *done = Some(first.name.clone());
+            }
+            let candidates: Vec<(&str, Option<DateTime<Utc>>)> = group
+                .iter()
+                .map(|r| (r.version.as_str(), Some(r.stored.registry.published_at)))
+                .collect();
+            let keep = group
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.stored.registry.status != ServerStatus::Deleted)
+                .map(|(i, _)| i)
+                .max_by(|&i, &j| fmt::latest_order(candidates[i], candidates[j]));
+            if let Some(i) = keep {
+                out.push(group[i].clone());
+            }
+            group.clear();
+        };
+    for _ in 0..MAX_LISTING_BATCHES {
+        let batch =
+            fetch_listing_batch(db, repo.id, q, after.as_ref(), name_after.as_deref(), 200).await?;
+        exhausted = batch.len() < 200;
+        if let Some(last) = batch.last() {
+            after = Some((last.name.clone(), last.version.clone()));
+        }
+        for row in servable(db, repo.id, batch, policy_now).await {
+            if current.first().is_some_and(|c| c.name != row.name) {
+                flush(&mut current, &mut out, &mut last_done);
+            }
+            current.push(row);
+        }
+        if exhausted {
+            flush(&mut current, &mut out, &mut last_done);
+            break;
+        }
+        if out.len() > want {
+            break;
+        }
+    }
+    let next = if out.len() > want {
+        let last = &out[want - 1];
+        Some(fmt::encode_cursor(&last.name, &last.version))
+    } else if !exhausted {
+        last_done.as_deref().map(|n| fmt::encode_cursor(n, "-"))
+    } else {
+        None
+    };
+    out.truncate(want);
+    Ok((
+        out.iter()
+            .map(|r| served_entry(r, repo, base, true))
+            .collect(),
+        next,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// GET /servers/{name}/versions[/{version}]
+// ---------------------------------------------------------------------------
+
+fn include_deleted_param(q: &HashMap<String, String>) -> Result<bool, Response> {
+    match q.get("include_deleted") {
+        Some(v) => parse_bool("include_deleted", v).map_err(mcp_error),
+        None => Ok(false),
+    }
+}
+
+async fn list_versions_encoded(
+    State(state): State<SharedState>,
+    Path((repo_key, ns)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    base: RequestBaseUrl,
+) -> HandlerResult {
+    list_versions_impl(
+        &state,
+        &repo_key,
+        &server_name(&ns, None),
+        &q,
+        base.as_str(),
+    )
+    .await
+}
+
+async fn list_versions_split(
+    State(state): State<SharedState>,
+    Path((repo_key, ns, name)): Path<(String, String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    base: RequestBaseUrl,
+) -> HandlerResult {
+    let name = server_name(&ns, Some(&name));
+    list_versions_impl(&state, &repo_key, &name, &q, base.as_str()).await
+}
+
+async fn list_versions_impl(
+    state: &SharedState,
+    repo_key: &str,
+    name: &str,
+    q: &HashMap<String, String>,
+    base: &str,
+) -> HandlerResult {
+    let repo = resolve_mcp_repo(&state.db, repo_key).await?;
+    reject_if_not_hosted_read(&repo)?;
+    let include_deleted = include_deleted_param(q)?;
+    let policy_now = current_policy(&state.db, repo.id).await;
+    let mut entries = Vec::new();
+    for row in versions_of(&state.db, repo.id, name).await? {
+        let instance = instance_url(base, &repo.key, &row.name, &row.version);
+        let d = decide_row(
+            &state.db,
+            &row,
+            policy_now,
+            include_deleted,
+            GateAudience::ReaderOnly,
+            instance,
+        )
+        .await;
+        if d == ServeDecision::Serve {
+            entries.push(served_entry(&row, &repo, base, false));
+        }
+    }
+    if entries.is_empty() {
+        return Err(not_found());
+    }
+    Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, None)))
+}
+
+async fn get_version_encoded(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, version)): Path<(String, String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    base: RequestBaseUrl,
+) -> HandlerResult {
+    let name = server_name(&ns, None);
+    get_version_impl(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &name,
+        &version,
+        &q,
+        base.as_str(),
+    )
+    .await
+}
+
+async fn get_version_split(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, name, version)): Path<(String, String, String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    base: RequestBaseUrl,
+) -> HandlerResult {
+    let name = server_name(&ns, Some(&name));
+    get_version_impl(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &name,
+        &version,
+        &q,
+        base.as_str(),
+    )
+    .await
+}
+
+/// Candidates for `latest`, newest first: every non-deleted version.
+fn latest_candidates(mut rows: Vec<VersionRow>) -> Vec<VersionRow> {
+    rows.retain(|r| r.stored.registry.status != ServerStatus::Deleted);
+    rows.sort_by(|a, b| {
+        fmt::latest_order(
+            (b.version.as_str(), Some(b.stored.registry.published_at)),
+            (a.version.as_str(), Some(a.stored.registry.published_at)),
+        )
+    });
+    rows
+}
+
+async fn get_version_impl(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    name: &str,
+    version: &str,
+    q: &HashMap<String, String>,
+    base: &str,
+) -> HandlerResult {
+    let repo = resolve_mcp_repo(&state.db, repo_key).await?;
+    reject_if_not_hosted_read(&repo)?;
+    let include_deleted = include_deleted_param(q)?;
+    let rows = versions_of(&state.db, repo.id, name).await?;
+    let is_latest = version == "latest";
+    let candidates: Vec<VersionRow> = if is_latest {
+        latest_candidates(rows)
+    } else {
+        rows.into_iter().filter(|r| r.version == version).collect()
+    };
+    if candidates.is_empty() {
+        return Err(not_found());
+    }
+    let audience = audience(&state.db, auth, repo.id).await;
+    let policy_now = current_policy(&state.db, repo.id).await;
+    let mut first_refusal: Option<(Response, &VersionRow, &'static str)> = None;
+    for row in &candidates {
+        let instance = instance_url(base, &repo.key, &row.name, &row.version);
+        match decide_row(
+            &state.db,
+            row,
+            policy_now,
+            include_deleted,
+            audience,
+            instance,
+        )
+        .await
+        {
+            ServeDecision::Serve => {
+                let entry = served_entry(row, &repo, base, is_latest);
+                return Ok(json_ok(StatusCode::OK, &entry));
+            }
+            ServeDecision::Refuse {
+                status,
+                body,
+                hold_class,
+            } => {
+                let resp = refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default());
+                // An unevaluable gate on a newer candidate fails closed: do not
+                // fall back past a version that may be servable.
+                if status == 503 {
+                    audit_refusal(&state.db, auth, &repo, row, hold_class, audience);
+                    return Err(resp);
+                }
+                if first_refusal.is_none() {
+                    first_refusal = Some((resp, row, hold_class));
+                }
+            }
+        }
+    }
+    let (resp, row, hold_class) = first_refusal.expect("candidates is non-empty");
+    if hold_class != "deleted" {
+        audit_refusal(&state.db, auth, &repo, row, hold_class, audience);
+    }
+    // `latest` with nothing servable is the plain unknown-name answer for a
+    // reader; a repository holder learns why the newest version is held.
+    if is_latest && audience == GateAudience::ReaderOnly {
+        return Err(not_found());
+    }
+    Err(resp)
+}
+
+// ---------------------------------------------------------------------------
+// GET /ping, /health, /version
+// ---------------------------------------------------------------------------
+
+async fn ping() -> Response {
+    json_ok(StatusCode::OK, &serde_json::json!({"status": "ok"}))
+}
+
+async fn health(State(state): State<SharedState>) -> Response {
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(_) => json_ok(StatusCode::OK, &serde_json::json!({"status": "ok"})),
+        Err(_) => problem(
+            503,
+            "mcp_unavailable",
+            "The registry database is unavailable",
+            serde_json::json!({}),
+        ),
+    }
+}
+
+async fn version() -> Response {
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({"version": env!("CARGO_PKG_VERSION")}),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// POST /publish
+// ---------------------------------------------------------------------------
+
+/// The hosted-write gates every MCP write shares.
+async fn writable_repo(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    repo_key: &str,
+) -> Result<(AuthExtension, RepoInfo), Response> {
+    // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let ext = require_auth_basic_scope(auth, "mcp", "write:artifacts").map_err(reproblem)?;
+    let repo = resolve_mcp_repo(&state.db, repo_key).await?;
+    proxy_helpers::reject_write_if_not_hosted(&repo.repo_type).map_err(reproblem)?;
+    Ok((ext, repo))
+}
+
+/// A body the extractor refused: over the publish cap (413) or unreadable.
+fn body_rejection(status: StatusCode) -> Response {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        mcp_error(McpError::TooLarge)
+    } else {
+        mcp_error(McpError::invalid("", "the request body could not be read"))
+    }
+}
+
+/// Parse, validate, namespace-check and reduce a submitted document.
+fn admit_document(
+    body: &[u8],
+    settings: &mcp_packages::McpSettings,
+) -> Result<fmt::ServerJson, McpError> {
+    let mut server = fmt::parse_server_json(body)?;
+    fmt::validate_server_json(&server)?;
+    let namespace = fmt::namespace_of(&server.name).to_string();
+    if fmt::is_reserved_namespace(&server.name) {
+        return Err(McpError::ReservedNamespace { namespace });
+    }
+    if !fmt::namespace_allowed(&server.name, &settings.namespace_allow) {
+        return Err(McpError::NamespaceNotAllowed { namespace });
+    }
+    fmt::reduce_publisher_meta(&mut server)?;
+    Ok(server)
+}
+
+/// Insert the server.json row, its metadata and the OCI retention holds in
+/// one quota-admitted transaction: a version whose metadata could not be
+/// written must not exist (it would be invisible yet block a republish).
+async fn insert_server_rows(
+    db: &PgPool,
+    artifact: proxy_helpers::NewArtifact<'_>,
+    metadata: &serde_json::Value,
+    settings: &mcp_packages::McpSettings,
+    pins: &[PackagePin],
+    upload_hold_until: Option<DateTime<Utc>>,
+) -> Result<Uuid, Response> {
+    use crate::services::quarantine_service::{HoldSource, QuarantineState};
+    let repository_id = artifact.repository_id;
+    let path = artifact.path.to_string();
+    let name = artifact.name.to_string();
+    let mut tx = super::publish_quota::begin_admitted_publish(
+        db,
+        repository_id,
+        artifact.path,
+        artifact.size_bytes,
+    )
+    .await?;
+    let artifact_id = match proxy_helpers::insert_artifact_row(&mut tx, artifact).await {
+        Ok(id) => id,
+        Err(resp) => {
+            drop(tx);
+            // A concurrent publish of the same version won the unique path.
+            let exists: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 \
+                 AND is_deleted = false",
+            )
+            .bind(repository_id)
+            .bind(&path)
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
+            return Err(if exists.is_some() {
+                mcp_error(McpError::VersionExists)
+            } else {
+                resp
+            });
+        }
+    };
+    sqlx::query(
+        "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'mcp', $2)",
+    )
+    .bind(artifact_id)
+    .bind(metadata)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    mcp_packages::hold_pins(&mut tx, settings, pins)
+        .await
+        .map_err(internal)?;
+    // The upload-time quarantine hold commits with the row, so the version is
+    // never listed in the window before a post-commit hold would land.
+    if let Some(until) = upload_hold_until {
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = $2, quarantine_until = $3, \
+             quarantine_source = $4 WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .bind(QuarantineState::Quarantined.as_str())
+        .bind(until)
+        .bind(HoldSource::Upload.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    }
+    recompute_latest_in(&mut tx, repository_id, &name)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
+        .bind(repository_id)
+        .execute(db)
+        .await;
+    Ok(artifact_id)
+}
+
+/// `(version, publishedAt)`: what [`fmt::latest_order`] compares.
+type LatestKey<'a> = (&'a str, Option<DateTime<Utc>>);
+
+/// Take the per-server advisory lock every registry-state write of `name`
+/// serialises on, for the rest of the caller's transaction.
+async fn lock_server(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("mcp-latest/{repo_id}/{name}"))
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Recompute `registry.isLatest` for every version of `name`, inside the
+/// caller's transaction and under the per-server lock: the newest
+/// non-deleted version by [`fmt::latest_order`] (publish time breaks ties).
+async fn recompute_latest_in(
+    tx: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    lock_server(&mut *tx, repo_id, name).await?;
+    let rows: Vec<(Uuid, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT a.id, a.version, m.metadata->'registry' FROM artifacts a \
+         JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.name = $2 AND a.is_deleted = false \
+           AND m.format = 'mcp'",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_all(&mut *tx)
+    .await?;
+    let parsed: Vec<(Uuid, &str, Option<RegistryState>)> = rows
+        .iter()
+        .map(|(id, v, r)| (*id, v.as_str(), serde_json::from_value(r.clone()).ok()))
+        .collect();
+    let candidates: Vec<(usize, LatestKey<'_>)> = parsed
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, v, r))| match r {
+            Some(r) if r.status != ServerStatus::Deleted => Some((i, (*v, Some(r.published_at)))),
+            _ => None,
+        })
+        .collect();
+    let latest = candidates
+        .iter()
+        .max_by(|a, b| fmt::latest_order(a.1, b.1))
+        .map(|(i, _)| *i);
+    for (i, (id, _, r)) in parsed.iter().enumerate() {
+        let Some(r) = r else { continue };
+        let want = latest == Some(i);
+        if r.is_latest != want {
+            sqlx::query(
+                "UPDATE artifact_metadata SET metadata = \
+                 jsonb_set(metadata, '{registry,isLatest}', to_jsonb($2::boolean)) \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .bind(want)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// `MCP_PACKAGE_PINNED`, one row per resolved entry.
+fn audit_pins(
+    db: &PgPool,
+    user_id: Uuid,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    server: &fmt::ServerJson,
+    pins: &[PackagePin],
+) {
+    use crate::services::audit_service::{
+        audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+    };
+    for pin in pins {
+        let entry = AuditEntry::new(AuditAction::McpPackagePinned, ResourceType::Artifact)
+            .user(user_id)
+            .resource(artifact_id)
+            .resource_name(format!("{}@{}", server.name, server.version))
+            .with_request_client_ip()
+            .details(serde_json::json!({
+                "repository": repo.key,
+                "server": server.name,
+                "version": server.version,
+                "index": pin.index,
+                "registry_type": pin.registry_type,
+                "submitted": pin.submitted,
+                "resolved_repository": pin.resolved.repository,
+                "digest": pin.resolved.digest,
+                "sha256": pin.resolved.sha256,
+                "warnings": pin.resolved.warnings,
+            }));
+        tokio::spawn(audit_fire_and_forget(db.clone(), entry));
+    }
+}
+
+async fn stored_row(db: &PgPool, artifact_id: Uuid) -> Result<VersionRow, Response> {
+    let sql = format!(
+        "SELECT {ROW_COLUMNS} FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.id = $1"
+    );
+    let raw: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(artifact_id)
+        .fetch_all(db)
+        .await
+        .map_err(internal)?;
+    rows_from_raw(raw)
+        .pop()
+        .ok_or_else(|| internal("published version vanished"))
+}
+
+async fn publish_server(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(repo_key): Path<String>,
+    headers: HeaderMap,
+    base: RequestBaseUrl,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> HandlerResult {
+    let (ext, repo) = writable_repo(&state, auth, &repo_key).await?;
+    let body = body.map_err(|r| body_rejection(r.status()))?;
+    repo.reject_if_promotion_only(false).map_err(reproblem)?;
+    let settings = mcp_packages::load_settings(&state.db, repo.id)
+        .await
+        .map_err(mcp_error)?;
+    let server = admit_document(&body, &settings).map_err(mcp_error)?;
+    let pins = mcp_packages::resolve_packages(&state, &settings, &server, base.as_str())
+        .await
+        .map_err(mcp_error)?;
+
+    let bytes = fmt::canonical_bytes(&server);
+    let sha256 = fmt::sha256_hex(&bytes);
+    let path = fmt::storage_path(&server.name, &server.version);
+    crate::services::upload_service::validate_artifact_path(&path)
+        .map_err(|e| mcp_error(McpError::invalid("", e.to_string())))?;
+    proxy_helpers::ensure_unique_artifact_path(&state.db, repo.id, &path, "exists")
+        .await
+        .map_err(|resp| match resp.status() {
+            StatusCode::CONFLICT => mcp_error(McpError::VersionExists),
+            _ => reproblem(resp),
+        })?;
+    let key = fmt::storage_key(&server.name, &server.version, &sha256);
+    let size_bytes = bytes.len() as i64;
+    proxy_helpers::put_artifact_bytes(&state, &repo, &key, Bytes::from(bytes))
+        .await
+        .map_err(reproblem)?;
+
+    let registry = RegistryState::new_active(Utc::now());
+    let metadata = fmt::metadata_doc(&server, &registry, settings.policy, &pins);
+    // The repository's upload-time quarantine (Package Age Policy), applied
+    // inside the insert transaction below; the repository is hosted here.
+    let upload_hold_until = {
+        use crate::services::quarantine_service as qs;
+        let config = qs::resolve_config(&state.db, repo.id).await;
+        qs::should_quarantine(&config).then(|| qs::quarantine_until(&config, Utc::now()))
+    };
+    let artifact_id = insert_server_rows(
+        &state.db,
+        proxy_helpers::NewArtifact {
+            repository_id: repo.id,
+            path: &path,
+            name: &server.name,
+            version: &server.version,
+            size_bytes,
+            checksum_sha256: &sha256,
+            content_type: "application/json",
+            storage_key: &key,
+            uploaded_by: ext.user_id,
+        },
+        &metadata,
+        &settings,
+        &pins,
+        upload_hold_until,
+    )
+    .await?;
+    crate::services::scanner_service::trigger_scan_on_upload(
+        &state.db,
+        state.scanner_service.clone(),
+        repo.id,
+        artifact_id,
+    )
+    .await;
+    audit_pins(&state.db, ext.user_id, &repo, artifact_id, &server, &pins);
+    crate::services::package_service::register_published_package(
+        &state.db,
+        &state.event_bus,
+        repo.id,
+        "mcp",
+        &server.name,
+        &server.version,
+        size_bytes,
+        &sha256,
+        Some(&server.description),
+    )
+    .await;
+    super::queue_push_sync_tasks_for_upload(
+        &state.db,
+        &headers,
+        repo.id,
+        artifact_id,
+        &path,
+        size_bytes,
+    )
+    .await;
+    tracing::info!(
+        "MCP publish: {}@{} to repo {} ({} packages pinned)",
+        server.name,
+        server.version,
+        repo.key,
+        pins.len()
+    );
+    let row = stored_row(&state.db, artifact_id).await?;
+    Ok(json_ok(
+        StatusCode::OK,
+        &served_entry(&row, &repo, base.as_str(), false),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// PATCH .../status
+// ---------------------------------------------------------------------------
+
+/// `StatusUpdateRequest`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StatusUpdate {
+    status: String,
+    #[serde(default)]
+    status_message: Option<String>,
+}
+
+fn parse_status_update(body: &[u8]) -> Result<(ServerStatus, Option<String>), McpError> {
+    let u: StatusUpdate = serde_json::from_slice(body)
+        .map_err(|e| McpError::invalid("", format!("invalid status update: {e}")))?;
+    let status = ServerStatus::parse(&u.status)
+        .ok_or_else(|| McpError::invalid("status", "must be one of active, deprecated, deleted"))?;
+    Ok((status, u.status_message))
+}
+
+/// Apply a validated status change to one stored registry state.
+fn apply_status(
+    current: &RegistryState,
+    next: ServerStatus,
+    message: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<RegistryState, McpError> {
+    fmt::validate_status_change(current.status, next, message)?;
+    Ok(RegistryState {
+        status: next,
+        status_message: message.map(str::to_string),
+        status_changed_at: now,
+        updated_at: now,
+        ..current.clone()
+    })
+}
+
+async fn write_registry<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    artifact_id: Uuid,
+    r: &RegistryState,
+) -> Result<(), Response> {
+    sqlx::query(
+        "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{registry}', $2) \
+         WHERE artifact_id = $1",
+    )
+    .bind(artifact_id)
+    .bind(serde_json::to_value(r).unwrap_or_default())
+    .execute(db)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn update_version_status_encoded(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, version)): Path<(String, String, String)>,
+    base: RequestBaseUrl,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> HandlerResult {
+    let body = body.map_err(|r| body_rejection(r.status()))?;
+    let name = server_name(&ns, None);
+    update_status_impl(
+        &state,
+        auth,
+        &repo_key,
+        &name,
+        Some(&version),
+        &body,
+        base.as_str(),
+    )
+    .await
+}
+
+async fn update_version_status_split(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, name, version)): Path<(String, String, String, String)>,
+    base: RequestBaseUrl,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> HandlerResult {
+    let body = body.map_err(|r| body_rejection(r.status()))?;
+    let name = server_name(&ns, Some(&name));
+    update_status_impl(
+        &state,
+        auth,
+        &repo_key,
+        &name,
+        Some(&version),
+        &body,
+        base.as_str(),
+    )
+    .await
+}
+
+async fn update_server_status_encoded(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns)): Path<(String, String)>,
+    base: RequestBaseUrl,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> HandlerResult {
+    let body = body.map_err(|r| body_rejection(r.status()))?;
+    let name = server_name(&ns, None);
+    update_status_impl(&state, auth, &repo_key, &name, None, &body, base.as_str()).await
+}
+
+async fn update_server_status_split(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, name)): Path<(String, String, String)>,
+    base: RequestBaseUrl,
+    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+) -> HandlerResult {
+    let body = body.map_err(|r| body_rejection(r.status()))?;
+    let name = server_name(&ns, Some(&name));
+    update_status_impl(&state, auth, &repo_key, &name, None, &body, base.as_str()).await
+}
+
+/// One version (`version = Some`) or every version of a server. A
+/// whole-server change skips versions already in the target status and is
+/// refused when that leaves none.
+async fn update_status_impl(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    repo_key: &str,
+    name: &str,
+    version: Option<&str>,
+    body: &[u8],
+    base: &str,
+) -> HandlerResult {
+    let (_ext, repo) = writable_repo(state, auth, repo_key).await?;
+    let (next, message) = parse_status_update(body).map_err(mcp_error)?;
+    // One transaction under the per-server lock: every version changes or
+    // none does, and `isLatest` is recomputed from the state just written.
+    let mut tx = state.db.begin().await.map_err(internal)?;
+    lock_server(&mut tx, repo.id, name)
+        .await
+        .map_err(internal)?;
+    let rows: Vec<VersionRow> = versions_of(&mut *tx, repo.id, name)
+        .await?
+        .into_iter()
+        .filter(|r| version.is_none_or(|v| r.version == v))
+        .collect();
+    if rows.is_empty() {
+        return Err(not_found());
+    }
+    let now = Utc::now();
+    let mut changed = Vec::new();
+    for row in &rows {
+        match apply_status(&row.stored.registry, next, message.as_deref(), now) {
+            Ok(updated) => {
+                write_registry(&mut *tx, row.artifact_id, &updated).await?;
+                changed.push(row.artifact_id);
+            }
+            Err(e) if version.is_some() || row.stored.registry.status != next => {
+                return Err(mcp_error(e))
+            }
+            Err(_) => {}
+        }
+    }
+    if changed.is_empty() {
+        return Err(mcp_error(McpError::invalid(
+            "status",
+            format!("every version is already {}", next.as_str()),
+        )));
+    }
+    recompute_latest_in(&mut tx, repo.id, name)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    let mut entries = Vec::new();
+    for id in &changed {
+        let row = stored_row(&state.db, *id).await?;
+        entries.push(served_entry(&row, &repo, base, false));
+    }
+    let out = match version {
+        Some(_) => entries.pop().unwrap_or_default(),
+        None => serde_json::json!({"updatedCount": entries.len(), "servers": entries}),
+    };
+    Ok(json_ok(StatusCode::OK, &out))
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::Request;
+
+    // -----------------------------------------------------------------------
+    // Pure helpers
+    // -----------------------------------------------------------------------
+
+    fn q(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn list_query_rules() {
+        assert_eq!(parse_list_query(&q(&[])).unwrap().limit, fmt::DEFAULT_LIMIT);
+        assert_eq!(
+            parse_list_query(&q(&[("limit", "500")])).unwrap().limit,
+            fmt::MAX_LIMIT
+        );
+        assert_eq!(parse_list_query(&q(&[("limit", "7")])).unwrap().limit, 7);
+        for bad in ["0", "-1", "x", "1.5"] {
+            assert_eq!(
+                parse_list_query(&q(&[("limit", bad)]))
+                    .unwrap_err()
+                    .status(),
+                400,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            parse_list_query(&q(&[("cursor", "!!")]))
+                .unwrap_err()
+                .status(),
+            400
+        );
+        let c = fmt::encode_cursor("com.acme/a", "1.0.0");
+        assert_eq!(
+            parse_list_query(&q(&[("cursor", &c)])).unwrap().cursor,
+            Some(("com.acme/a".into(), "1.0.0".into()))
+        );
+        assert_eq!(
+            parse_list_query(&q(&[("search", "ab")])).unwrap_err(),
+            McpError::SearchTooShort
+        );
+        assert_eq!(
+            parse_list_query(&q(&[("search", "abc")]))
+                .unwrap()
+                .search
+                .as_deref(),
+            Some("abc")
+        );
+        let since = parse_list_query(&q(&[("updated_since", "2026-01-01T00:00:00Z")])).unwrap();
+        assert!(since.include_deleted && since.updated_since.is_some());
+        assert_eq!(
+            parse_list_query(&q(&[
+                ("updated_since", "2026-01-01T00:00:00Z"),
+                ("include_deleted", "false")
+            ]))
+            .unwrap_err()
+            .status(),
+            400
+        );
+        assert_eq!(
+            parse_list_query(&q(&[("updated_since", "yesterday")]))
+                .unwrap_err()
+                .status(),
+            400
+        );
+        assert_eq!(
+            parse_list_query(&q(&[("include_deleted", "maybe")]))
+                .unwrap_err()
+                .status(),
+            400
+        );
+        assert!(
+            parse_list_query(&q(&[("include_deleted", "true")]))
+                .unwrap()
+                .include_deleted
+        );
+        assert_eq!(
+            parse_list_query(&q(&[("version", "latest")]))
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!(server_name("com.acme/w", None), "com.acme/w");
+        assert_eq!(server_name("com.acme", Some("w")), "com.acme/w");
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("GET"),
+        );
+        assert!(is_mcp_preflight(
+            &Method::OPTIONS,
+            "/mcp/r/v0.1/servers",
+            &h
+        ));
+        assert!(!is_mcp_preflight(&Method::OPTIONS, "/npm/r/x", &h));
+        assert!(!is_mcp_preflight(&Method::GET, "/mcp/r/v0.1/servers", &h));
+        assert!(!is_mcp_preflight(
+            &Method::OPTIONS,
+            "/mcp/r/v0.1/servers",
+            &HeaderMap::new()
+        ));
+        let id = Uuid::new_v4();
+        assert!(refusal_audit_due(id, "anonymous"));
+        assert!(!refusal_audit_due(id, "anonymous"));
+        assert!(refusal_audit_due(id, "someone-else"));
+        assert_eq!(
+            instance_url("https://ak.test/", "r", "com.acme/w", "1.0.0"),
+            "https://ak.test/mcp/r/v0.1/servers/com.acme%2Fw/versions/1.0.0"
+        );
+        let now = Utc::now();
+        let cur = RegistryState::new_active(now);
+        let next = apply_status(&cur, ServerStatus::Deprecated, Some("use 2"), now).unwrap();
+        assert_eq!(
+            (next.status, next.status_message.as_deref()),
+            (ServerStatus::Deprecated, Some("use 2"))
+        );
+        assert!(apply_status(&cur, ServerStatus::Active, None, now).is_err());
+        assert!(parse_status_update(br#"{"status":"deleted"}"#).is_ok());
+        assert!(parse_status_update(br#"{"status":"held"}"#).is_err());
+        assert!(parse_status_update(br#"{"status":"active","extra":1}"#).is_err());
+        assert_eq!(body_rejection(StatusCode::PAYLOAD_TOO_LARGE).status(), 413);
+        assert_eq!(body_rejection(StatusCode::BAD_REQUEST).status(), 400);
+        for (status, want) in [
+            (401, 401),
+            (403, 403),
+            (405, 405),
+            (409, 409),
+            (400, 400),
+            (503, 503),
+            (500, 500),
+        ] {
+            let resp = reproblem(
+                Response::builder()
+                    .status(status)
+                    .header(header::WWW_AUTHENTICATE, "Basic realm=\"mcp\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            );
+            assert_eq!(resp.status().as_u16(), want);
+            assert_eq!(
+                resp.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
+    }
+
+    #[tokio::test]
+    async fn refusals_are_always_problem_json() {
+        for (status, ct) in [
+            (StatusCode::METHOD_NOT_ALLOWED, None),
+            (StatusCode::BAD_REQUEST, Some("text/plain")),
+            (StatusCode::NOT_FOUND, None),
+            (StatusCode::PAYLOAD_TOO_LARGE, None),
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, None),
+            (StatusCode::INTERNAL_SERVER_ERROR, None),
+        ] {
+            let mut b = Response::builder().status(status);
+            if let Some(ct) = ct {
+                b = b.header(header::CONTENT_TYPE, ct);
+            }
+            let out = ensure_problem(b.body(Body::empty()).unwrap()).await;
+            assert_eq!(out.status(), status);
+            assert_eq!(
+                out.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            assert_eq!(out.headers()[header::CACHE_CONTROL], "no-store");
+        }
+        let ok = ensure_problem(StatusCode::OK.into_response()).await;
+        assert!(ok.headers().get(header::CACHE_CONTROL).is_none());
+        let p = ensure_problem(not_found()).await;
+        assert_eq!(p.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// T6 ratchet: the MCP modules never build an HTTP client or call the
+    /// proxy fetch helpers, so no publisher-supplied URL is ever dereferenced.
+    #[test]
+    fn mcp_modules_never_build_an_http_client() {
+        for (file, src) in [
+            ("api/handlers/mcp.rs", include_str!("mcp.rs")),
+            ("formats/mcp.rs", include_str!("../../formats/mcp.rs")),
+            (
+                "services/mcp_packages.rs",
+                include_str!("../../services/mcp_packages.rs"),
+            ),
+        ] {
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for needle in [
+                concat!("reqwest", "::"),
+                concat!("Client", "::builder("),
+                concat!("proxy", "_fetch"),
+                concat!("http_client", "::"),
+                concat!("TcpStream", "::connect"),
+            ] {
+                assert!(
+                    !production.contains(needle),
+                    "{file} must not open outbound connections ({needle})"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-backed fixtures
+    // -----------------------------------------------------------------------
+
+    fn doc(name: &str, version: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut d = serde_json::json!({
+            "$schema": fmt::SCHEMA_URL,
+            "name": name,
+            "description": "Weather tools",
+            "version": version,
+        });
+        if let (Some(o), serde_json::Value::Object(e)) = (d.as_object_mut(), extra) {
+            o.extend(e);
+        }
+        if d.get("packages").is_none() && d.get("remotes").is_none() {
+            d["remotes"] = serde_json::json!([{"type": "streamable-http", "url": "https://mcp.acme.test/mcp"}]);
+        }
+        d
+    }
+
+    fn npm_pkg(identifier: &str, version: Option<&str>) -> serde_json::Value {
+        let mut p = serde_json::json!({
+            "registryType": "npm", "identifier": identifier, "transport": {"type": "stdio"},
+        });
+        if let Some(v) = version {
+            p["version"] = v.into();
+        }
+        p
+    }
+
+    async fn call(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        let mut b = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            b = b.header(header::CONTENT_TYPE, "application/json");
+        }
+        let body = body
+            .map(|v| Body::from(serde_json::to_vec(v).unwrap()))
+            .unwrap_or_else(Body::empty);
+        tdh::send_with_headers(app, b.body(body).unwrap()).await
+    }
+
+    fn json(b: &Bytes) -> serde_json::Value {
+        serde_json::from_slice(b).unwrap_or(serde_json::Value::Null)
+    }
+
+    struct Env {
+        fx: tdh::Fixture,
+        extra_repos: Vec<(Uuid, std::path::PathBuf)>,
+    }
+
+    impl Env {
+        async fn new() -> Option<Self> {
+            let fx = tdh::Fixture::setup("local", "mcp").await?;
+            Some(Self {
+                fx,
+                extra_repos: Vec::new(),
+            })
+        }
+        fn member(&self) -> Router {
+            self.fx.router_with_auth(super::router())
+        }
+        fn anon(&self) -> Router {
+            self.fx.router_anon(super::router())
+        }
+        fn url(&self, tail: &str) -> String {
+            format!("/{}/v0.1{tail}", self.fx.repo_key)
+        }
+        async fn publish(&self, d: &serde_json::Value) -> (StatusCode, serde_json::Value) {
+            let (s, b, _) = call(self.member(), "POST", &self.url("/publish"), Some(d)).await;
+            (s, json(&b))
+        }
+        async fn get(&self, app: Router, tail: &str) -> (StatusCode, Bytes, HeaderMap) {
+            call(app, "GET", &self.url(tail), None).await
+        }
+        async fn config(&self, key: &str, value: &str) {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+                 ON CONFLICT (repository_id, key) DO UPDATE SET value = $3",
+            )
+            .bind(self.fx.repo_id)
+            .bind(key)
+            .bind(value)
+            .execute(&self.fx.pool)
+            .await
+            .unwrap();
+        }
+        async fn repo(&mut self, repo_type: &str, format: &str) -> RepoInfo {
+            let (id, key, dir) = tdh::create_repo(&self.fx.pool, repo_type, format).await;
+            self.extra_repos.push((id, dir.clone()));
+            let mut info = tdh::make_repo_info(id, &key, &dir, repo_type, None);
+            info.format = format.to_string();
+            info
+        }
+        async fn npm_backing(&mut self, versions: &[&str]) -> (RepoInfo, Vec<Uuid>) {
+            let npm = self.repo("local", "npm").await;
+            let mut ids = Vec::new();
+            for v in versions {
+                ids.push(
+                    tdh::seed_artifact_with_checksum(
+                        &self.fx.state,
+                        &self.fx.pool,
+                        &npm,
+                        &format!("npm/echo-{v}.tgz"),
+                        &format!("@acme/echo/-/echo-{v}.tgz"),
+                        "@acme/echo",
+                        v,
+                        "application/octet-stream",
+                        Bytes::from_static(b"tgz"),
+                        self.fx.user_id,
+                        &"e".repeat(64),
+                    )
+                    .await,
+                );
+            }
+            self.config(
+                mcp_packages::REPOS_KEY,
+                &serde_json::json!({"npm": npm.key}).to_string(),
+            )
+            .await;
+            (npm, ids)
+        }
+        async fn hold(&self, artifact_id: Uuid, status: Option<&str>) {
+            sqlx::query("UPDATE artifacts SET quarantine_status = $2, quarantine_source = 'admin', quarantine_until = NULL WHERE id = $1")
+                .bind(artifact_id)
+                .bind(status)
+                .execute(&self.fx.pool)
+                .await
+                .unwrap();
+        }
+        async fn server_artifact(&self, name: &str, version: &str) -> Uuid {
+            tdh::artifact_id_at(
+                &self.fx.pool,
+                self.fx.repo_id,
+                &fmt::storage_path(name, version),
+            )
+            .await
+        }
+        async fn teardown(self) {
+            for (id, dir) in &self.extra_repos {
+                let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+                    .bind(id)
+                    .execute(&self.fx.pool)
+                    .await;
+                tdh::cleanup_member_repo(&self.fx.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM packages WHERE repository_id = $1")
+                .bind(self.fx.repo_id)
+                .execute(&self.fx.pool)
+                .await;
+            self.fx.teardown().await;
+        }
+    }
+
+    fn assert_refusal_headers(h: &HeaderMap) {
+        assert_eq!(h[header::CONTENT_TYPE], "application/problem+json");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+    }
+
+    // -----------------------------------------------------------------------
+    // Publish
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_npm_package_under_own_repos() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (npm, _) = env.npm_backing(&["1.0.0"]).await;
+        let d = doc(
+            "com.acme/echo",
+            "1.0.0",
+            serde_json::json!({"packages": [npm_pkg("@acme/echo", Some("1.0.0"))]}),
+        );
+        let (status, body) = env.publish(&d).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["server"]["packages"][0]["registryBaseUrl"],
+            format!("http://localhost/npm/{}", npm.key)
+        );
+        let official = &body["_meta"][fmt::OFFICIAL_META_KEY];
+        assert_eq!(
+            (official["status"].as_str(), official["isLatest"].as_bool()),
+            (Some("active"), Some(true))
+        );
+        let id = env.server_artifact("com.acme/echo", "1.0.0").await;
+        assert_eq!(
+            tdh::audit_count_eventually(&env.fx.pool, id, "MCP_PACKAGE_PINNED", 1).await,
+            1
+        );
+        assert!(
+            tdh::catalog_row(&env.fx.pool, env.fx.repo_id, "com.acme/echo")
+                .await
+                .is_some()
+        );
+
+        // Write-once: identical and different bytes both conflict.
+        let (status, body) = env.publish(&d).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_version_exists"))
+        );
+        let mut changed = d.clone();
+        changed["description"] = "Other".into();
+        assert_eq!(env.publish(&changed).await.0, StatusCode::CONFLICT);
+
+        // Reads: list, versions, exact, latest, /v0 alias, literal slash.
+        let (s, list, _) = env.get(env.anon(), "/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        let list = json(&list);
+        assert_eq!(list["metadata"]["count"], 1);
+        assert!(list["metadata"].get("nextCursor").is_none());
+        let (_, v0, _) = call(
+            env.anon(),
+            "GET",
+            &format!("/{}/v0/servers", env.fx.repo_key),
+            None,
+        )
+        .await;
+        assert_eq!(json(&v0), list);
+        for tail in [
+            "/servers/com.acme%2Fecho/versions/1.0.0",
+            "/servers/com.acme/echo/versions/1.0.0",
+            "/servers/com.acme%2Fecho/versions/latest",
+        ] {
+            let (s, b, _) = env.get(env.anon(), tail).await;
+            assert_eq!(s, StatusCode::OK, "{tail}");
+            assert_eq!(json(&b)["server"]["name"], "com.acme/echo");
+        }
+        let (s, b, _) = env.get(env.anon(), "/servers/com.acme/echo/versions").await;
+        assert_eq!(
+            (s, json(&b)["metadata"]["count"].as_i64()),
+            (StatusCode::OK, Some(1))
+        );
+        env.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn publish_refusals() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (status, _, h) = call(
+            env.anon(),
+            "POST",
+            &env.url("/publish"),
+            Some(&doc("com.acme/a", "1", serde_json::json!({}))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_refusal_headers(&h);
+        let (_npm, _) = env.npm_backing(&["1.0.0"]).await;
+        let pkg = |p: serde_json::Value| {
+            doc(
+                "com.acme/echo",
+                "1.0.0",
+                serde_json::json!({"packages": [p]}),
+            )
+        };
+        let mut external = npm_pkg("@acme/echo", Some("1.0.0"));
+        external["registryBaseUrl"] = "https://registry.npmjs.org".into();
+        let mcpb = serde_json::json!({"registryType": "mcpb", "identifier": "https://g.test/x.mcpb", "fileSha256": "a".repeat(64), "transport": {"type": "stdio"}});
+        let oci_latest = serde_json::json!({"registryType": "oci", "identifier": "ghcr.io/acme/mcp:latest", "transport": {"type": "stdio"}});
+        let oci_legacy = serde_json::json!({"registryType": "oci", "identifier": "ghcr.io/acme/mcp:1", "version": "1", "transport": {"type": "stdio"}});
+        for (d, status, code) in [
+            (pkg(external), 422, "mcp_external_registry"),
+            (pkg(mcpb), 422, "mcp_external_registry"),
+            (
+                pkg(npm_pkg("@acme/echo", None)),
+                422,
+                "mcp_package_version_unpinned",
+            ),
+            (
+                pkg(npm_pkg("@acme/missing", Some("1.0.0"))),
+                422,
+                "mcp_package_not_found",
+            ),
+            (pkg(oci_latest), 422, "mcp_oci_floating_tag"),
+            (pkg(oci_legacy), 422, "mcp_oci_legacy_fields"),
+            (
+                doc("io.modelcontextprotocol/x", "1", serde_json::json!({})),
+                403,
+                "mcp_namespace_reserved",
+            ),
+            (
+                doc("bad name", "1", serde_json::json!({})),
+                400,
+                "mcp_invalid_server_json",
+            ),
+        ] {
+            let (s, b, h) = call(env.member(), "POST", &env.url("/publish"), Some(&d)).await;
+            let b = json(&b);
+            assert_eq!(
+                (s.as_u16(), b["error"].as_str()),
+                (status, Some(code)),
+                "{b}"
+            );
+            assert_refusal_headers(&h);
+            assert_eq!(b["type"], "about:blank");
+        }
+        env.config(mcp_packages::NAMESPACE_ALLOW_KEY, r#"["com.acme"]"#)
+            .await;
+        assert_eq!(
+            env.publish(&doc("org.other/x", "1", serde_json::json!({})))
+                .await
+                .1["error"],
+            "mcp_namespace_not_allowed"
+        );
+        assert_eq!(
+            env.publish(&doc("com.acme.sub/x", "1", serde_json::json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        // 256 KiB + 1 answers 413 problem+json.
+        let big = Body::from(vec![b' '; fmt::MCP_PUBLISH_MAX_BYTES + 1]);
+        let req = Request::builder()
+            .method("POST")
+            .uri(env.url("/publish"))
+            .body(big)
+            .unwrap();
+        let (s, b, h) = tdh::send_with_headers(env.member(), req).await;
+        assert_eq!(
+            (s, json(&b)["error"].as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, Some("mcp_too_large"))
+        );
+        assert_refusal_headers(&h);
+
+        // A token without write:artifacts.
+        let mut ro = tdh::make_auth(env.fx.user_id, &env.fx.username);
+        ro.is_api_token = true;
+        ro.scopes = Some(vec!["read:artifacts".into()]);
+        let app = tdh::router_with_auth(super::router(), env.fx.state.clone(), ro);
+        assert_eq!(
+            call(
+                app,
+                "POST",
+                &env.url("/publish"),
+                Some(&doc("com.acme/a", "1", serde_json::json!({})))
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+
+        // Another format's repository is not an MCP registry.
+        let npm = env.repo("local", "npm").await;
+        let (s, b, _) = call(
+            env.member(),
+            "POST",
+            &format!("/{}/v0.1/publish", npm.key),
+            Some(&doc("com.acme/a", "1", serde_json::json!({}))),
+        )
+        .await;
+        assert_eq!(
+            (s, &b[..]),
+            (StatusCode::NOT_FOUND, fmt::NOT_FOUND_BODY.as_bytes())
+        );
+        env.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn open_policy_stores_and_serves_packages_verbatim() {
+        let Some(env) = Env::new().await else { return };
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let mut p = npm_pkg("@acme/elsewhere", Some("3.0.0"));
+        p["registryBaseUrl"] = "https://registry.npmjs.org".into();
+        let (s, body) = env
+            .publish(&doc(
+                "com.acme/open",
+                "1.0.0",
+                serde_json::json!({"packages": [p]}),
+            ))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["server"]["packages"][0]["registryBaseUrl"],
+            "https://registry.npmjs.org"
+        );
+        let (s, b, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fopen/versions/latest")
+            .await;
+        assert_eq!(
+            (
+                s,
+                json(&b)["_meta"][fmt::AK_SOURCE_META_KEY]["packagePolicy"].as_str()
+            ),
+            (StatusCode::OK, Some("open"))
+        );
+        // Switching back to own-repos leaves the version unresolvable.
+        env.config(mcp_packages::POLICY_KEY, "own-repos").await;
+        let (s, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fopen/versions/1.0.0")
+            .await;
+        assert_eq!(
+            (s, json(&b)["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("mcp_unresolvable"))
+        );
+        env.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // OCI
+    // -----------------------------------------------------------------------
+
+    fn index_body(seed: char) -> Vec<u8> {
+        let d = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": d(seed), "size": 1, "platform": {"os": "linux", "architecture": "amd64"}},
+                {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": d('9'), "size": 1, "platform": {"os": "linux", "architecture": "arm64"}},
+            ],
+        }))
+        .unwrap()
+    }
+
+    const INDEX_MT: &str = "application/vnd.oci.image.index.v1+json";
+
+    async fn seed_oci(env: &mut Env) -> (RepoInfo, String) {
+        let oci = env.repo("local", "docker").await;
+        let body = index_body('a');
+        let digest = format!("sha256:{}", fmt::sha256_hex(&body));
+        let key = crate::api::handlers::oci_v2::manifest_storage_key(&digest);
+        env.fx
+            .state
+            .storage_for_repo(&oci.storage_location())
+            .unwrap()
+            .put(&key, Bytes::from(body))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) VALUES ($1, 'acme/mcp', '1.2', $2, $3)")
+            .bind(oci.id).bind(&digest).bind(INDEX_MT).execute(&env.fx.pool).await.unwrap();
+        tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &env.fx.pool,
+            &oci,
+            "test-seed/oci-manifest-row",
+            "v2/acme/mcp/manifests/1.2",
+            "acme/mcp",
+            "1.2",
+            INDEX_MT,
+            Bytes::from_static(b"{}"),
+            env.fx.user_id,
+            fmt::sha256_hex(&index_body('a')).as_str(),
+        )
+        .await;
+        // The platform children a multi-arch push writes by digest.
+        for child in ['a', '9'] {
+            let hex = child.to_string().repeat(64);
+            tdh::seed_artifact_with_checksum(
+                &env.fx.state,
+                &env.fx.pool,
+                &oci,
+                &format!("test-seed/oci-child-{child}"),
+                &format!("v2/acme/mcp/manifests/sha256:{hex}"),
+                "acme/mcp",
+                &format!("sha256:{hex}"),
+                "application/vnd.oci.image.manifest.v1+json",
+                Bytes::from_static(b"{}"),
+                env.fx.user_id,
+                &hex,
+            )
+            .await;
+        }
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"oci": oci.key}).to_string(),
+        )
+        .await;
+        (oci, digest)
+    }
+
+    fn oci_doc(identifier: &str) -> serde_json::Value {
+        doc(
+            "com.acme/img",
+            "1.0.0",
+            serde_json::json!({"packages": [
+                {"registryType": "oci", "identifier": identifier, "transport": {"type": "stdio"}}
+            ]}),
+        )
+    }
+
+    #[tokio::test]
+    async fn oci_tag_is_pinned_held_and_drift_audited() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (oci, digest) = seed_oci(&mut env).await;
+        let (s, body) = env.publish(&oci_doc("ghcr.io/acme/mcp:1.2")).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let served = body["server"]["packages"][0]["identifier"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            served,
+            format!("localhost/{}/acme/mcp:1.2@{digest}", oci.key)
+        );
+        let resolved = &body["server"]["packages"][0]["_meta"][fmt::AK_RESOLVED_META_KEY];
+        assert_eq!(resolved["submittedIdentifier"], "ghcr.io/acme/mcp:1.2");
+        assert_eq!(resolved["children"].as_array().map(Vec::len), Some(2));
+        let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM oci_tags WHERE repository_id = $1 AND tag = $2 AND manifest_digest = $2)")
+            .bind(oci.id).bind(&digest).fetch_one(&env.fx.pool).await.unwrap();
+        assert!(held, "the digest-keyed retention row is written");
+
+        // The tag moves: the served digest does not, the drift is recorded.
+        let moved = index_body('b');
+        let moved_digest = format!("sha256:{}", fmt::sha256_hex(&moved));
+        crate::api::handlers::oci_v2::persist_tag_and_refs(
+            &env.fx.pool,
+            oci.id,
+            "acme/mcp",
+            "1.2",
+            &moved_digest,
+            INDEX_MT,
+            &crate::api::handlers::oci_v2::ManifestClass::Index,
+            &moved,
+        )
+        .await
+        .unwrap();
+        // A push rewrites the tag's manifest row in place.
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $2 WHERE repository_id = $1 AND path = 'v2/acme/mcp/manifests/1.2'")
+            .bind(oci.id)
+            .bind(fmt::sha256_hex(&moved))
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let (s, b, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fimg/versions/1.0.0")
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(json(&b)["server"]["packages"][0]["identifier"], served);
+        // The gate follows the pinned digest, not the rewritten tag row: a
+        // held platform child holds the version.
+        let children: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path LIKE 'v2/acme/mcp/manifests/sha256:%'")
+            .bind(oci.id)
+            .fetch_all(&env.fx.pool)
+            .await
+            .unwrap();
+        for child in &children {
+            env.hold(*child, Some("rejected")).await;
+        }
+        let (s, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fimg/versions/1.0.0")
+            .await;
+        assert_eq!(
+            (s, json(&b)["gate"].as_str()),
+            (StatusCode::NOT_FOUND, Some("scan_policy"))
+        );
+        for child in &children {
+            env.hold(*child, None).await;
+        }
+        let id = env.server_artifact("com.acme/img", "1.0.0").await;
+        let drift: serde_json::Value = sqlx::query_scalar(
+            "SELECT metadata->'packages'->0->'drift' FROM artifact_metadata WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(drift["observedDigest"], moved_digest);
+        assert_eq!(
+            tdh::audit_count(&env.fx.pool, id, "MCP_PIN_DRIFT_DETECTED").await,
+            1
+        );
+
+        // Floating and digest-only forms.
+        assert_eq!(
+            env.publish(&oci_doc("ghcr.io/acme/mcp")).await.1["error"],
+            "mcp_oci_floating_tag"
+        );
+        let mut by_digest = oci_doc(&format!("ghcr.io/acme/mcp@{digest}"));
+        by_digest["version"] = "2.0.0".into();
+        let (s, b) = env.publish(&by_digest).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["server"]["packages"][0]["identifier"],
+            format!("localhost/{}/acme/mcp@{digest}", oci.key)
+        );
+        let mut unknown = oci_doc("ghcr.io/acme/other:1");
+        unknown["version"] = "3.0.0".into();
+        assert_eq!(
+            env.publish(&unknown).await.1["error"],
+            "mcp_package_not_found"
+        );
+        env.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Held versions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn held_backing_package_hides_the_version() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let (npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for v in ["1.0.0", "2.0.0"] {
+            let d = doc(
+                "com.acme/db",
+                v,
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+
+        let (_, list, _) = env.get(env.anon(), "/servers").await;
+        let versions: Vec<String> = json(&list)["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["server"]["version"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(versions, vec!["1.0.0"]);
+        let (_, latest, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fdb/versions/latest")
+            .await;
+        assert_eq!(
+            json(&latest)["server"]["version"],
+            "1.0.0",
+            "latest falls back to the newest servable"
+        );
+        let (_, latest_list, _) = env.get(env.anon(), "/servers?version=latest").await;
+        assert_eq!(
+            json(&latest_list)["servers"][0]["server"]["version"],
+            "1.0.0"
+        );
+
+        let (_, unknown, unknown_h) = env
+            .get(env.anon(), "/servers/com.acme%2Fnope/versions/1.0.0")
+            .await;
+        let (s, held, held_h) = env
+            .get(env.anon(), "/servers/com.acme%2Fdb/versions/2.0.0")
+            .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(
+            held, unknown,
+            "anonymous held answer is byte-identical to an unknown name"
+        );
+        assert_eq!(&held[..], fmt::NOT_FOUND_BODY.as_bytes());
+        assert_refusal_headers(&held_h);
+        assert_refusal_headers(&unknown_h);
+
+        let (s, reason, h) = env
+            .get(env.member(), "/servers/com.acme%2Fdb/versions/2.0.0")
+            .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_refusal_headers(&h);
+        let r = json(&reason);
+        assert_eq!(
+            (
+                r["error"].as_str(),
+                r["gate"].as_str(),
+                r["package"].as_str()
+            ),
+            (
+                Some("mcp_backing_artifact_blocked"),
+                Some("quarantine"),
+                Some("npm:@acme/echo@2.0.0")
+            )
+        );
+        let text = String::from_utf8(reason.to_vec()).unwrap();
+        assert!(
+            !text.contains(&npm.key) && !text.contains(&ids[1].to_string()),
+            "{text}"
+        );
+        let id2 = env.server_artifact("com.acme/db", "2.0.0").await;
+        assert!(
+            tdh::audit_count_eventually(&env.fx.pool, id2, "MCP_SERVER_DOWNLOAD_REFUSED", 1).await
+                >= 1
+        );
+
+        // Both versions held: latest is the plain 404 for a reader.
+        env.hold(ids[0], Some("quarantined")).await;
+        let (s, b, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fdb/versions/latest")
+            .await;
+        assert_eq!(
+            (s, &b[..]),
+            (StatusCode::NOT_FOUND, fmt::NOT_FOUND_BODY.as_bytes())
+        );
+        assert_eq!(
+            env.get(env.anon(), "/servers/com.acme%2Fdb/versions")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+
+        // Releasing restores; the server.json's own hold is `mcp_pending_review`.
+        env.hold(ids[0], None).await;
+        env.hold(ids[1], None).await;
+        assert_eq!(
+            env.get(env.anon(), "/servers/com.acme%2Fdb/versions/2.0.0")
+                .await
+                .0,
+            StatusCode::OK
+        );
+        env.hold(id2, Some("quarantined")).await;
+        let (_, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fdb/versions/2.0.0")
+            .await;
+        assert_eq!(json(&b)["error"], "mcp_pending_review");
+        env.hold(id2, Some("rejected")).await;
+        let (_, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fdb/versions/2.0.0")
+            .await;
+        assert_eq!(json(&b)["error"], "mcp_rejected");
+        // A deleted backing artifact makes the version unresolvable.
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(ids[0])
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let (_, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fdb/versions/1.0.0")
+            .await;
+        assert_eq!(json(&b)["error"], "mcp_unresolvable");
+        env.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn unevaluable_gate_fails_closed_with_503() {
+        let Some(env) = Env::new().await else { return };
+        assert_eq!(
+            env.publish(&doc("com.acme/w", "1.0.0", serde_json::json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let row = versions_of(&env.fx.pool, env.fx.repo_id, "com.acme/w")
+            .await
+            .unwrap()
+            .remove(0);
+        let closed = tdh::try_pool().await.unwrap();
+        closed.close().await;
+        for audience in [GateAudience::ReaderOnly, GateAudience::ReasonGated] {
+            match decide_row(
+                &closed,
+                &row,
+                PackagePolicy::OwnRepos,
+                false,
+                audience,
+                "i".into(),
+            )
+            .await
+            {
+                ServeDecision::Refuse { status, body, .. } => {
+                    assert_eq!(
+                        (status, body["error"].as_str()),
+                        (503, Some("mcp_gate_unavailable"))
+                    );
+                }
+                ServeDecision::Serve => panic!("a gate that cannot be read must not serve"),
+            }
+        }
+        let listing = vec![mcp_packages::ListingRow {
+            artifact_id: row.artifact_id,
+            quarantine_status: None,
+            quarantine_until: None,
+            stored: row.stored.clone(),
+        }];
+        assert!(
+            mcp_packages::listing_refusals(
+                &closed,
+                env.fx.repo_id,
+                &listing,
+                PackagePolicy::OwnRepos
+            )
+            .await
+            .is_err()
+                || servable(
+                    &closed,
+                    env.fx.repo_id,
+                    vec![row.clone()],
+                    PackagePolicy::OwnRepos
+                )
+                .await
+                .is_empty()
+        );
+        env.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Listing, status, CORS
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn listing_paging_filters_and_status() {
+        let Some(env) = Env::new().await else { return };
+        let empty = env.get(env.anon(), "/servers").await;
+        assert_eq!(
+            json(&empty.1),
+            serde_json::json!({"servers": [], "metadata": {"count": 0}})
+        );
+        for name in ["com.acme/alpha", "com.acme/beta", "com.acme/weather"] {
+            for v in ["1.0.0", "1.10.0"] {
+                assert_eq!(
+                    env.publish(&doc(name, v, serde_json::json!({}))).await.0,
+                    StatusCode::OK
+                );
+            }
+        }
+        assert_eq!(
+            env.publish(&doc("com.acme/weather", "1.2.0", serde_json::json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        // One held row in the middle still yields full pages.
+        let held = env.server_artifact("com.acme/beta", "1.0.0").await;
+        env.hold(held, Some("quarantined")).await;
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let tail = match &cursor {
+                Some(c) => format!("/servers?limit=2&cursor={c}"),
+                None => "/servers?limit=2".into(),
+            };
+            let (s, b, _) = env.get(env.anon(), &tail).await;
+            assert_eq!(s, StatusCode::OK);
+            let b = json(&b);
+            pages += 1;
+            for e in b["servers"].as_array().unwrap() {
+                seen.push(format!(
+                    "{}@{}",
+                    e["server"]["name"].as_str().unwrap(),
+                    e["server"]["version"].as_str().unwrap()
+                ));
+            }
+            match b["metadata"]["nextCursor"].as_str() {
+                Some(c) => {
+                    assert_eq!(b["metadata"]["count"], 2);
+                    cursor = Some(c.to_string());
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(
+            seen,
+            vec![
+                "com.acme/alpha@1.0.0",
+                "com.acme/alpha@1.10.0",
+                "com.acme/beta@1.10.0",
+                "com.acme/weather@1.0.0",
+                "com.acme/weather@1.10.0",
+                "com.acme/weather@1.2.0"
+            ]
+        );
+        let (_, b, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fweather/versions")
+            .await;
+        let order: Vec<String> = json(&b)["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["server"]["version"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(order, vec!["1.0.0", "1.10.0", "1.2.0"]);
+        let (_, b, _) = env.get(env.anon(), "/servers?version=latest").await;
+        let latest: Vec<String> = json(&b)["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}@{}",
+                    e["server"]["name"].as_str().unwrap(),
+                    e["server"]["version"].as_str().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            latest,
+            vec![
+                "com.acme/alpha@1.10.0",
+                "com.acme/beta@1.10.0",
+                "com.acme/weather@1.10.0"
+            ]
+        );
+        let (_, b, _) = env.get(env.anon(), "/servers?version=latest&limit=2").await;
+        let b = json(&b);
+        assert_eq!(b["metadata"]["count"], 2);
+        let c = b["metadata"]["nextCursor"].as_str().unwrap().to_string();
+        let (_, b, _) = env
+            .get(
+                env.anon(),
+                &format!("/servers?version=latest&limit=2&cursor={c}"),
+            )
+            .await;
+        let b = json(&b);
+        assert_eq!(b["servers"][0]["server"]["name"], "com.acme/weather");
+        assert!(b["metadata"].get("nextCursor").is_none());
+        let (_, b, _) = env.get(env.anon(), "/servers?version=1.2.0").await;
+        assert_eq!(json(&b)["metadata"]["count"], 1);
+        let (s, b, h) = env.get(env.anon(), "/servers?search=ab").await;
+        assert_eq!(
+            (s, json(&b)["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_search_too_short")
+            )
+        );
+        assert_refusal_headers(&h);
+        let (_, b, _) = env.get(env.anon(), "/servers?search=wea").await;
+        assert_eq!(json(&b)["metadata"]["count"], 3);
+        let (_, b, _) = env.get(env.anon(), "/servers?search=%25%25%25").await;
+        assert_eq!(
+            json(&b)["metadata"]["count"],
+            0,
+            "a % in search is a literal"
+        );
+        assert_eq!(
+            env.get(env.anon(), "/servers?cursor=garbage!").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            env.get(env.anon(), "/servers?limit=0").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            env.get(
+                env.anon(),
+                "/servers?updated_since=2020-01-01T00:00:00Z&include_deleted=false"
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        // Status: deprecated stays listed, deleted leaves list and latest.
+        let patch = |tail: &str, body: serde_json::Value| {
+            let app = env.member();
+            let uri = env.url(tail);
+            async move { call(app, "PATCH", &uri, Some(&body)).await }
+        };
+        let (s, b, _) = patch(
+            "/servers/com.acme%2Fweather/versions/1.10.0/status",
+            serde_json::json!({"status": "deprecated", "statusMessage": "use 1.2"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{:?}", json(&b));
+        assert_eq!(
+            json(&b)["_meta"][fmt::OFFICIAL_META_KEY]["statusMessage"],
+            "use 1.2"
+        );
+        let (s, _, _) = patch(
+            "/servers/com.acme%2Fweather/versions/1.10.0/status",
+            serde_json::json!({"status": "deprecated"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "same-state transition");
+        let (s, _, _) = patch(
+            "/servers/com.acme/weather/versions/1.10.0/status",
+            serde_json::json!({"status": "deleted"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, b, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fweather/versions/latest")
+            .await;
+        assert_eq!(json(&b)["server"]["version"], "1.2.0");
+        assert_eq!(
+            env.get(env.anon(), "/servers/com.acme%2Fweather/versions/1.10.0")
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        let (s, b, _) = env
+            .get(
+                env.anon(),
+                "/servers/com.acme%2Fweather/versions/1.10.0?include_deleted=true",
+            )
+            .await;
+        assert_eq!(
+            (
+                s,
+                json(&b)["_meta"][fmt::OFFICIAL_META_KEY]["status"].as_str()
+            ),
+            (StatusCode::OK, Some("deleted"))
+        );
+        let (_, b, _) = env.get(env.anon(), "/servers?search=weather").await;
+        assert_eq!(json(&b)["metadata"]["count"], 2);
+        let (_, b, _) = env
+            .get(env.anon(), "/servers?search=weather&include_deleted=true")
+            .await;
+        assert_eq!(json(&b)["metadata"]["count"], 3);
+        let (_, b, _) = env
+            .get(
+                env.anon(),
+                "/servers?updated_since=2020-01-01T00:00:00Z&search=weather",
+            )
+            .await;
+        assert_eq!(json(&b)["metadata"]["count"], 3);
+        let is_latest: Vec<(String, bool)> = sqlx::query_as("SELECT a.version, (m.metadata->'registry'->>'isLatest')::boolean FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id WHERE a.repository_id = $1 AND a.name = 'com.acme/weather' ORDER BY a.version")
+            .bind(env.fx.repo_id).fetch_all(&env.fx.pool).await.unwrap();
+        assert_eq!(
+            is_latest,
+            vec![
+                ("1.0.0".into(), false),
+                ("1.10.0".into(), false),
+                ("1.2.0".into(), true)
+            ]
+        );
+        let (s, b, _) = patch(
+            "/servers/com.acme%2Falpha/status",
+            serde_json::json!({"status": "deprecated"}),
+        )
+        .await;
+        assert_eq!(
+            (s, json(&b)["updatedCount"].as_i64()),
+            (StatusCode::OK, Some(2))
+        );
+        assert_eq!(
+            patch(
+                "/servers/com.acme%2Fnope/status",
+                serde_json::json!({"status": "deprecated"})
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let anon = call(
+            env.anon(),
+            "PATCH",
+            &env.url("/servers/com.acme%2Falpha/status"),
+            Some(&serde_json::json!({"status": "active"})),
+        )
+        .await;
+        assert_eq!(anon.0, StatusCode::UNAUTHORIZED);
+        env.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn new_version_moves_is_latest() {
+        let Some(env) = Env::new().await else { return };
+        assert_eq!(
+            env.publish(&doc("com.acme/l", "1.0.0", serde_json::json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let (_, b) = env
+            .publish(&doc("com.acme/l", "1.1.0", serde_json::json!({})))
+            .await;
+        assert_eq!(b["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"], true);
+        let (_, b, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fl/versions/1.0.0")
+            .await;
+        assert_eq!(json(&b)["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"], false);
+        let (s, b, _) = env.get(env.anon(), "/ping").await;
+        assert_eq!(
+            (s, json(&b)["status"].as_str()),
+            (StatusCode::OK, Some("ok"))
+        );
+        assert_eq!(env.get(env.anon(), "/health").await.0, StatusCode::OK);
+        assert_eq!(
+            json(&env.get(env.anon(), "/version").await.1)["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        env.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn cors_and_security_headers() {
+        let Some(env) = Env::new().await else { return };
+        let app = env.anon().layer(axum::middleware::from_fn(
+            crate::api::middleware::security_headers::security_headers_middleware,
+        ));
+        let req = Request::builder()
+            .uri(env.url("/servers"))
+            .header(header::ORIGIN, "https://github.com")
+            .body(Body::empty())
+            .unwrap();
+        let (s, _, h) = tdh::send_with_headers(app.clone(), req).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        let preflight = Request::builder()
+            .method("OPTIONS")
+            .uri(env.url("/servers"))
+            .header(header::ORIGIN, "https://github.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+            .body(Body::empty())
+            .unwrap();
+        let (_, _, h) = tdh::send_with_headers(app, preflight).await;
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert!(h[header::ACCESS_CONTROL_ALLOW_METHODS]
+            .to_str()
+            .unwrap()
+            .contains("GET"));
+        assert!(h[header::ACCESS_CONTROL_ALLOW_HEADERS]
+            .to_str()
+            .unwrap()
+            .contains("authorization"));
+        // The outer preflight answer, ahead of a same-origin instance CORS layer.
+        let outer = Router::new()
+            .fallback(|| async { StatusCode::IM_A_TEAPOT })
+            .layer(CorsLayer::new())
+            .layer(axum::middleware::from_fn(mcp_cors_preflight));
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/mcp/r/v0.1/servers")
+            .header(header::ORIGIN, "https://github.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(Body::empty())
+            .unwrap();
+        let (s, _, h) = tdh::send_with_headers(outer.clone(), req).await;
+        assert_eq!(
+            (s, h[header::ACCESS_CONTROL_ALLOW_ORIGIN].to_str().unwrap()),
+            (StatusCode::OK, "*")
+        );
+        let (s, _, _) = tdh::send_with_headers(
+            outer,
+            Request::builder()
+                .uri("/other")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::IM_A_TEAPOT);
+        env.teardown().await;
+    }
+
+    /// Through the real visibility middleware: anonymous reads of a private
+    /// repository and a read-only grant's publish are refused before the
+    /// handler; a public repository is readable anonymously.
+    #[tokio::test]
+    async fn visibility_middleware_gates_the_surface() {
+        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use std::sync::Arc;
+        let Some(env) = Env::new().await else { return };
+        let auth_service = Arc::new(crate::services::auth_service::AuthService::new(
+            env.fx.pool.clone(),
+            Arc::new(env.fx.state.config.clone()),
+        ));
+        let vis = RepoVisibilityState {
+            auth_service: auth_service.clone(),
+            db: env.fx.pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            permission_service: Arc::new(
+                crate::services::permission_service::PermissionService::new(env.fx.pool.clone()),
+            ),
+        };
+        let app = Router::new()
+            .nest(MOUNT_PREFIX, super::router())
+            .with_state(env.fx.state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                vis,
+                repo_visibility_middleware,
+            ));
+        let get = |auth: Option<&str>| {
+            let mut b = Request::builder().uri(format!("/mcp/{}/v0.1/servers", env.fx.repo_key));
+            if let Some(a) = auth {
+                b = b.header(header::AUTHORIZATION, a);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            tdh::send(app.clone(), get(None)).await.0,
+            StatusCode::UNAUTHORIZED,
+            "private repository"
+        );
+        let (reader, reader_name) = tdh::create_user(&env.fx.pool).await;
+        tdh::grant_repo_role(&env.fx.pool, env.fx.repo_id, reader, "reader").await;
+        let _ = reader_name;
+        let bearer = tdh::bearer_for(&env.fx.state, reader).await;
+        assert_eq!(
+            tdh::send(app.clone(), get(Some(&bearer))).await.0,
+            StatusCode::OK
+        );
+        let publish = Request::builder()
+            .method("POST")
+            .uri(format!("/mcp/{}/v0.1/publish", env.fx.repo_key))
+            .header(header::AUTHORIZATION, &bearer)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&doc("com.acme/a", "1", serde_json::json!({}))).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            tdh::send(app.clone(), publish).await.0,
+            StatusCode::FORBIDDEN,
+            "read-only grant"
+        );
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let app2 = Router::new()
+            .nest(MOUNT_PREFIX, super::router())
+            .with_state(env.fx.state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                RepoVisibilityState {
+                    auth_service,
+                    db: env.fx.pool.clone(),
+                    repo_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                    repo_miss_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                    permission_service: Arc::new(
+                        crate::services::permission_service::PermissionService::new(
+                            env.fx.pool.clone(),
+                        ),
+                    ),
+                },
+                repo_visibility_middleware,
+            ));
+        assert_eq!(
+            tdh::send(app2, get(None)).await.0,
+            StatusCode::OK,
+            "public repository"
+        );
+        tdh::cleanup_user(&env.fx.pool, reader).await;
+        env.teardown().await;
+    }
+
+    /// T6: publisher URLs are never dereferenced, on publish or on any read.
+    #[tokio::test]
+    async fn mcp_no_outbound() {
+        let Some(env) = Env::new().await else { return };
+        let (mock, _guard) = tdh::non_loopback_mock_server().await;
+        let target = mock.uri();
+        let d = doc(
+            "com.acme/probe",
+            "1.0.0",
+            serde_json::json!({
+                "websiteUrl": format!("{target}/site"),
+                "repository": {"url": format!("{target}/repo"), "source": "github"},
+                "icons": [{"src": format!("{target}/icon.png")}],
+                "remotes": [{"type": "streamable-http", "url": "http://127.0.0.1:1/mcp"}, {"type": "sse", "url": format!("{target}/sse")}],
+            }),
+        );
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        for tail in [
+            "/servers",
+            "/servers/com.acme%2Fprobe/versions",
+            "/servers/com.acme%2Fprobe/versions/1.0.0",
+            "/servers/com.acme%2Fprobe/versions/latest",
+        ] {
+            assert_eq!(env.get(env.anon(), tail).await.0, StatusCode::OK, "{tail}");
+        }
+        let (s, _, _) = call(
+            env.member(),
+            "PATCH",
+            &env.url("/servers/com.acme%2Fprobe/versions/1.0.0/status"),
+            Some(&serde_json::json!({"status": "deprecated"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(mock.received_requests().await.unwrap_or_default().len(), 0);
+        let path: String =
+            sqlx::query_scalar("SELECT path FROM artifacts WHERE repository_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(path, "servers/com.acme/probe/1.0.0/server.json");
+        tdh::drop_mock_server(mock).await;
+        env.teardown().await;
+    }
+}

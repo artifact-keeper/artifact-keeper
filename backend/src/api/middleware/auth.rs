@@ -9654,6 +9654,7 @@ mod tests {
             "/huggingface//api/models/m/upload/main",
             StatusCode::NOT_FOUND,
         ),
+        (Method::POST, "/mcp//v0.1/publish", StatusCode::NOT_FOUND),
         (
             Method::POST,
             "/jetbrains//plugin/uploadPlugin",

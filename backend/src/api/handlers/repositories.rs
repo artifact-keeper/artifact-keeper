@@ -1115,6 +1115,20 @@ pub struct CreateRepositoryRequest {
     /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
     /// `false` for the default union semantics.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
+    /// must resolve to an artifact in a repository of this instance) or
+    /// `open` (packages stored and served verbatim, not gated). Stored in
+    /// `repository_config` under `mcp_package_policy`.
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): the backing repository key per `registryType`
+    /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
+    /// `{"npm": "npm-local", "oci": "docker-remote"}`. Stored under
+    /// `mcp_package_repos`.
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace prefixes a server name must start
+    /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
+    /// under `mcp_namespace_allow`.
+    pub mcp_namespace_allow: Option<Vec<String>>,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591). Each entry is an exact
     /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
@@ -1403,6 +1417,20 @@ pub struct UpdateRepositoryRequest {
     /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
     /// Virtual repositories; omit to leave it unchanged.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
+    /// must resolve to an artifact in a repository of this instance) or
+    /// `open` (packages stored and served verbatim, not gated). Stored in
+    /// `repository_config` under `mcp_package_policy`.
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): the backing repository key per `registryType`
+    /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
+    /// `{"npm": "npm-local", "oci": "docker-remote"}`. Stored under
+    /// `mcp_package_repos`.
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace prefixes a server name must start
+    /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
+    /// under `mcp_namespace_allow`.
+    pub mcp_namespace_allow: Option<Vec<String>>,
     /// Replace the trusted cross-origin OCI Bearer token realms for this
     /// Remote repository (#3591); same rules as on create. Omit to leave the
     /// list unchanged; send `[]` to clear it and restore the strict
@@ -1601,6 +1629,16 @@ pub struct RepositoryResponse {
     /// repositories; omitted for every other repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): the package policy (`own-repos` / `open`).
+    /// Omitted for every other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): backing repository key per `registryType`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace allowlist (empty: any name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_namespace_allow: Option<Vec<String>>,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591), canonical origins. Omitted
     /// when none are configured (the strict same-origin default applies).
@@ -2069,6 +2107,9 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         npm_virtual_isolate_hosted_names: None,
+        mcp_package_policy: None,
+        mcp_package_repos: None,
+        mcp_namespace_allow: None,
         oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
@@ -3311,6 +3352,45 @@ async fn apply_npm_scope_policy_config(
     Ok(())
 }
 
+/// Populate `RepositoryResponse.mcp_*` from `repository_config` (#5253). A
+/// no-op for non-MCP repositories. The policy echo is the effective policy
+/// (`own-repos` when unset).
+async fn with_mcp_settings(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    use crate::services::mcp_packages as mp;
+    if format != &RepositoryFormat::Mcp {
+        return Ok(response);
+    }
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config WHERE repository_id = $1 AND key = ANY($2)",
+    )
+    .bind(repo_id)
+    .bind([mp::POLICY_KEY, mp::REPOS_KEY, mp::NAMESPACE_ALLOW_KEY])
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let get = |k: &str| {
+        rows.iter()
+            .find(|(key, _)| key == k)
+            .and_then(|(_, v)| v.as_deref())
+    };
+    response.mcp_package_policy = Some(
+        get(mp::POLICY_KEY)
+            .and_then(crate::formats::mcp::PackagePolicy::parse)
+            .unwrap_or(crate::formats::mcp::PackagePolicy::OwnRepos)
+            .as_str()
+            .to_string(),
+    );
+    response.mcp_package_repos = get(mp::REPOS_KEY).and_then(|v| mp::parse_package_repos(v).ok());
+    response.mcp_namespace_allow =
+        get(mp::NAMESPACE_ALLOW_KEY).and_then(|v| mp::parse_namespace_allow(v).ok());
+    Ok(response)
+}
+
 /// Populate `RepositoryResponse` npm scope-policy fields from
 /// `repository_config` (#2424) so create/get/update echo the stored policy.
 /// A no-op for non-npm-Remote repositories and for repositories with no stored
@@ -3326,7 +3406,8 @@ async fn with_npm_scope_policy(
 ) -> Result<RepositoryResponse> {
     // The npm Virtual isolate toggle (#3767) rides the same echo, so every
     // handler that round-trips the scope policy round-trips it too.
-    let mut response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
+    let response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
+    let mut response = with_mcp_settings(db, repo_id, format, response).await?;
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
         return Ok(response);
     }
@@ -3919,6 +4000,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "vagrant" => Ok(RepositoryFormat::Vagrant),
         "opkg" => Ok(RepositoryFormat::Opkg),
         "pacman" => Ok(RepositoryFormat::Pacman),
+        "mcp" => Ok(RepositoryFormat::Mcp),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
         "protobuf" => Ok(RepositoryFormat::Protobuf),
@@ -4283,6 +4365,19 @@ pub async fn create_repository(
         &format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // MCP registries (#5253): hosted only in this release, settings validated
+    // up-front for the same reason; persisted once `repo.id` exists.
+    crate::services::mcp_packages::creatable(&format, repo_type.as_str())
+        .map_err(|m| AppError::Validation(m.to_string()))?;
+    let mcp_settings = crate::services::mcp_packages::settings_to_store(
+        &state.db,
+        &format,
+        payload.mcp_package_policy.as_deref(),
+        payload.mcp_package_repos.as_ref(),
+        payload.mcp_namespace_allow.as_deref(),
+        true,
+    )
+    .await?;
     // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
     // the same reason; persisted once `repo.id` exists.
     let oci_trusted_realms =
@@ -4529,6 +4624,9 @@ pub async fn create_repository(
     }
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    for (key, value) in &mcp_settings {
+        upsert_repo_config(&state.db, repo.id, key, value).await?;
     }
     if let Some(ref realms) = oci_trusted_realms {
         crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
@@ -5438,6 +5536,16 @@ pub async fn update_repository(
         &existing.format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // MCP registry settings (#5253): validated before the update.
+    let mcp_settings = crate::services::mcp_packages::settings_to_store(
+        &state.db,
+        &existing.format,
+        payload.mcp_package_policy.as_deref(),
+        payload.mcp_package_repos.as_ref(),
+        payload.mcp_namespace_allow.as_deref(),
+        false,
+    )
+    .await?;
     // Trusted cross-origin OCI bearer realms (#3591): validated before the
     // update for the same reason. Writing them is gated by the repository
     // `admin` check above, like every other credential-routing setting.
@@ -5541,6 +5649,9 @@ pub async fn update_repository(
     }
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    for (key, value) in &mcp_settings {
+        upsert_repo_config(&state.db, repo.id, key, value).await?;
     }
     if let Some(ref realms) = oci_trusted_realms {
         crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
@@ -17077,6 +17188,7 @@ mod tests {
             "bazel",
             "protobuf",
             "pacman",
+            "mcp",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
@@ -17278,6 +17390,9 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -18694,6 +18809,9 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -33107,6 +33225,9 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,

@@ -273,6 +273,15 @@ pub enum AuditAction {
     FindingAcknowledgementNotCarried,
     /// An acknowledgement reached its expiry and stopped applying.
     FindingAcknowledgementExpired,
+    /// An MCP server publish pinned one `packages[]` entry to an artifact or
+    /// image digest in a backing repository (#5253). One row per entry.
+    McpPackagePinned,
+    /// An OCI tag an MCP server version pinned moved to another digest. The
+    /// version keeps serving the pinned digest (#5253).
+    McpPinDriftDetected,
+    /// The MCP registry API refused to hand a held server version to a
+    /// client (#5253). Sampled per (version, caller) per minute.
+    McpServerDownloadRefused,
 }
 
 impl AuditAction {
@@ -386,6 +395,9 @@ impl AuditAction {
             AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
             AuditAction::DebianBackfillRun => "DEBIAN_BACKFILL_RUN",
             AuditAction::ProxyScanBlocked => "PROXY_SCAN_BLOCKED",
+            AuditAction::McpPackagePinned => "MCP_PACKAGE_PINNED",
+            AuditAction::McpPinDriftDetected => "MCP_PIN_DRIFT_DETECTED",
+            AuditAction::McpServerDownloadRefused => "MCP_SERVER_DOWNLOAD_REFUSED",
         }
     }
 }
@@ -1838,6 +1850,33 @@ mod proxy_scan_blocked_4777_tests {
     fn action_string_is_stable() {
         assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
+    }
+
+    /// #5253: the MCP registry vocabulary is a published contract
+    /// (`docs/audit-events.md`).
+    #[test]
+    fn mcp_action_names_and_outcomes() {
+        use crate::services::audit_export::Outcome;
+        for (action, name, outcome) in [
+            (
+                AuditAction::McpPackagePinned,
+                "MCP_PACKAGE_PINNED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpPinDriftDetected,
+                "MCP_PIN_DRIFT_DETECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDownloadRefused,
+                "MCP_SERVER_DOWNLOAD_REFUSED",
+                Outcome::Denied,
+            ),
+        ] {
+            assert_eq!(action.as_str(), name);
+            assert_eq!(action.outcome(), outcome);
+        }
     }
 }
 
