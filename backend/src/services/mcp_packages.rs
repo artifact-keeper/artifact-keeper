@@ -101,12 +101,44 @@ pub fn parse_namespace_allow(value: &str) -> Result<Vec<String>, String> {
     Ok(list)
 }
 
+/// Whether `caller` may name `repo_id` as a backing repository: the token
+/// scope must cover it, and the caller must be an instance administrator,
+/// the repository public, or hold `read` on it through a grant. An
+/// `internal` repository needs the grant too (as a Virtual member does,
+/// #4346): a mapping re-exports what it holds (existence, versions, digests)
+/// to every reader of the MCP registry, who may be a wider audience.
+async fn caller_may_map(
+    db: &PgPool,
+    caller: &crate::api::middleware::auth::AuthExtension,
+    repo_id: Uuid,
+) -> crate::error::Result<bool> {
+    use crate::services::repository_service::{RepoAccess, RepositoryService};
+    if !caller.can_access_repo(repo_id) {
+        return Ok(false);
+    }
+    if caller.is_admin {
+        return Ok(true);
+    }
+    let service = RepositoryService::new(db.clone());
+    let repo = service.get_by_id(repo_id).await?;
+    if repo.visibility.allows_anonymous_read() {
+        return Ok(true);
+    }
+    service
+        .user_can_access_repo(repo_id, caller.user_id, RepoAccess::READ)
+        .await
+}
+
 /// Validate MCP settings submitted through the repository API (#5253) and
 /// return the `repository_config` rows to write. Settings on a non-MCP
 /// repository are refused; creating an MCP repository records the default
-/// `own-repos` policy explicitly.
+/// `own-repos` policy explicitly. Every repository `mcp_package_repos` names
+/// must be one `caller` may read ([`caller_may_map`]); one that does not
+/// exist and one the caller may not read get the same answer, so the setting
+/// is not an existence oracle.
 pub async fn settings_to_store(
     db: &PgPool,
+    caller: &crate::api::middleware::auth::AuthExtension,
     format: &RepositoryFormat,
     policy: Option<&str>,
     repos: Option<&BTreeMap<String, String>>,
@@ -145,19 +177,22 @@ pub async fn settings_to_store(
             .await
             .map_err(|e| AppError::Database(e.detail()))?;
         for (ty, key) in map {
-            match found.iter().find(|r| &r.key == key) {
-                Some(r) if format_backs(ty, &r.format) => {}
-                Some(r) => {
-                    return Err(AppError::Validation(format!(
+            let unknown = || {
+                AppError::Validation(format!(
+                    "mcp_package_repos: repository '{key}' does not exist"
+                ))
+            };
+            let Some(r) = found.iter().find(|r| &r.key == key) else {
+                return Err(unknown());
+            };
+            if !caller_may_map(db, caller, r.id).await? {
+                return Err(unknown());
+            }
+            if !format_backs(ty, &r.format) {
+                return Err(AppError::Validation(format!(
                     "mcp_package_repos: `{ty}` needs a {ty} repository; '{key}' is a {} repository",
                     r.format
-                )))
-                }
-                None => {
-                    return Err(AppError::Validation(format!(
-                        "mcp_package_repos: repository '{key}' does not exist"
-                    )))
-                }
+                )));
             }
         }
         out.push((REPOS_KEY, text));
@@ -498,11 +533,11 @@ async fn find_oci_manifest(
         "SELECT repository_id, name, manifest_content_type FROM oci_tags \
          WHERE repository_id = ANY($1) AND name = ANY($2) AND manifest_digest = $3 \
          UNION ALL \
-         SELECT m.repository_id, a.name, m.content_type FROM oci_manifests m \
+         SELECT m.repository_id, split_part(a.name, ':', 1), m.content_type FROM oci_manifests m \
            JOIN artifacts a ON a.repository_id = m.repository_id \
          WHERE m.repository_id = ANY($1) AND m.digest = $3 \
            AND a.is_deleted = false AND a.checksum_sha256 = $4 \
-           AND a.name = ANY($2) AND a.path LIKE 'v2/%/manifests/%' \
+           AND split_part(a.name, ':', 1) = ANY($2) AND a.path LIKE 'v2/%/manifests/%' \
          LIMIT 1",
     )
     .bind(repo_ids)
@@ -724,18 +759,27 @@ pub async fn resolve_packages(
     Ok(pins)
 }
 
-/// The retention hold of an OCI pin in a hosted backing repository: a
-/// digest-keyed `oci_tags` row. `storage_gc_service` keeps every manifest an
-/// `oci_tags` row names, so a later tag move or tag delete cannot orphan the
-/// pinned manifest. Tag listings hide digest-shaped tags. A Remote repository
-/// already holds such a row from the pull.
+/// The retention hold of an OCI pin in a hosted backing repository.
+///
+/// * A digest-keyed `oci_tags` row: `storage_gc_service` keeps every manifest
+///   an `oci_tags` row names, so a later tag move or tag delete cannot orphan
+///   the pinned manifest. Tag listings hide digest-shaped tags.
+/// * A digest-path `artifacts` row (`v2/<name>/manifests/<digest>`), copied
+///   from the row that carries the digest now (a tag push writes only the
+///   tag-path row, and the next push of that tag rewrites it in place). It is
+///   the row the download gate and the scanner evaluate for the pinned bytes
+///   once the tag has moved, so a single-arch pin stays gateable. The copy
+///   keeps the source row's hold. Returns the id of a row it created (the
+///   caller scans it after commit), `None` when one already existed.
+///
+/// A Remote repository already holds both from the pull.
 pub async fn hold_oci_pin(
     conn: &mut sqlx::PgConnection,
     repo_id: Uuid,
     name: &str,
     digest: &str,
     media_type: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<Option<Uuid>, sqlx::Error> {
     sqlx::query(
         "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) \
          VALUES ($1, $2, $3, $3, $4) ON CONFLICT (repository_id, name, tag) DO NOTHING",
@@ -744,31 +788,59 @@ pub async fn hold_oci_pin(
     .bind(name)
     .bind(digest)
     .bind(media_type)
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
-    Ok(())
+    sqlx::query_scalar(
+        "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, \
+                                content_type, storage_key, uploaded_by, \
+                                quarantine_status, quarantine_until, quarantine_source) \
+         SELECT a.repository_id, $3, $2 || ':' || $4, $4, a.size_bytes, a.checksum_sha256, \
+                a.content_type, a.storage_key, a.uploaded_by, \
+                a.quarantine_status, a.quarantine_until, a.quarantine_source \
+         FROM artifacts a \
+         WHERE a.repository_id = $1 AND a.is_deleted = false AND a.checksum_sha256 = $5 \
+           AND a.path LIKE 'v2/%/manifests/%' \
+         ORDER BY (a.path = $3) DESC, a.path LIMIT 1 \
+         ON CONFLICT (repository_id, path) DO NOTHING \
+         RETURNING id",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(format!("v2/{name}/manifests/{digest}"))
+    .bind(digest)
+    .bind(hex_of(digest))
+    .fetch_optional(&mut *conn)
+    .await
 }
 
-/// Write the retention hold of every OCI pin whose backing repository is
-/// hosted.
+/// Write the retention hold of every OCI pin whose resolved repository is
+/// hosted. The resolved repository is where the manifest was found: for a
+/// Virtual mapping that is the member, which may be Local even though the
+/// mapped repository is not. Returns `(repository, artifact)` of each
+/// manifest row the holds created.
 pub async fn hold_pins(
     conn: &mut sqlx::PgConnection,
-    settings: &McpSettings,
     pins: &[PackagePin],
-) -> Result<(), sqlx::Error> {
+) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+    let mut created = Vec::new();
     for pin in pins.iter().filter(|p| p.registry_type == "oci") {
-        let hosted = settings
-            .repos
-            .get("oci")
-            .is_some_and(|r| !r.is_remote() && !r.is_virtual());
         let r = &pin.resolved;
-        if let (true, Some(name), Some(digest), Some(mt)) =
-            (hosted, &r.name, &r.digest, &r.media_type)
-        {
-            hold_oci_pin(conn, r.repository_id, name, digest, mt).await?;
+        let (Some(name), Some(digest), Some(mt)) = (&r.name, &r.digest, &r.media_type) else {
+            continue;
+        };
+        let repo_type: Option<String> =
+            sqlx::query_scalar("SELECT repo_type::text FROM repositories WHERE id = $1")
+                .bind(r.repository_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        if !matches!(repo_type.as_deref(), Some("local" | "staging")) {
+            continue;
+        }
+        if let Some(id) = hold_oci_pin(conn, r.repository_id, name, digest, mt).await? {
+            created.push((r.repository_id, id));
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +857,99 @@ pub fn outcome_for_gate_error(e: &crate::error::AppError) -> GateOutcome {
     }
 }
 
+/// What the backing gates are evaluated with.
+#[derive(Clone, Copy)]
+pub struct GateCtx<'a> {
+    pub db: &'a PgPool,
+    /// The age-gate service; `None` fails a gated Remote closed.
+    pub age_gate: Option<&'a crate::services::age_gate_service::AgeGateService>,
+    /// Whether an age-gate hold records (or bumps) the version's pending
+    /// review so an administrator can approve it, as a download of the
+    /// package through its Remote would. Exact reads only: listings stay
+    /// read-only.
+    pub record_reviews: bool,
+}
+
+impl<'a> GateCtx<'a> {
+    /// The context of a request served from `state`.
+    pub fn of(state: &'a crate::api::AppState, record_reviews: bool) -> Self {
+        Self {
+            db: &state.db,
+            age_gate: state.age_gate_service.as_deref(),
+            record_reviews,
+        }
+    }
+}
+
+/// A live artifact row a pin's gate evaluates.
+#[derive(Debug, Clone)]
+struct GateRow {
+    id: Uuid,
+    repository_id: Uuid,
+    checksum: String,
+    created_at: DateTime<Utc>,
+    quarantine_status: Option<String>,
+    quarantine_until: Option<DateTime<Utc>>,
+}
+
+type GateRowTuple = (
+    Uuid,
+    Uuid,
+    String,
+    DateTime<Utc>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+);
+
+fn gate_row(t: GateRowTuple) -> GateRow {
+    GateRow {
+        id: t.0,
+        repository_id: t.1,
+        checksum: t.2,
+        created_at: t.3,
+        quarantine_status: t.4,
+        quarantine_until: t.5,
+    }
+}
+
+const GATE_ROW_COLUMNS: &str = "id, repository_id, checksum_sha256::text, created_at, \
+     quarantine_status, quarantine_until";
+
+/// The artifact rows a pin's gate evaluates: the pinned rows for npm, PyPI,
+/// NuGet and Cargo; for OCI the rows carrying the pinned digest (and its
+/// gate child) NOW. A tag push rewrites its `v2/<name>/manifests/<tag>` row
+/// in place, so the ids recorded at publish may name another image by the
+/// time of a read; the digest-path row [`hold_oci_pin`] writes keeps the
+/// pinned bytes addressable. A pin with no live row cannot be gated and is
+/// unresolvable.
+async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::Error> {
+    let rows: Vec<GateRowTuple> = if pin.registry_type == "oci" {
+        let r = &pin.resolved;
+        let hexes: Vec<String> = [r.digest.as_deref(), r.gate_digest.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(|d| hex_of(d).to_string())
+            .collect();
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {GATE_ROW_COLUMNS} FROM artifacts WHERE repository_id = $1 \
+             AND is_deleted = false AND checksum_sha256 = ANY($2) \
+             AND path LIKE 'v2/%/manifests/%'"
+        )))
+        .bind(r.repository_id)
+        .bind(&hexes)
+        .fetch_all(db)
+        .await?
+    } else {
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {GATE_ROW_COLUMNS} FROM artifacts WHERE id = ANY($1) AND is_deleted = false"
+        )))
+        .bind(&pin.resolved.artifact_ids)
+        .fetch_all(db)
+        .await?
+    };
+    Ok(rows.into_iter().map(gate_row).collect())
+}
+
 /// Whether the pinned OCI manifest still exists in its repository.
 async fn oci_pin_present(db: &PgPool, pin: &PackagePin) -> Result<bool, sqlx::Error> {
     let r = &pin.resolved;
@@ -798,119 +963,268 @@ async fn oci_pin_present(db: &PgPool, pin: &PackagePin) -> Result<bool, sqlx::Er
     .await
 }
 
-/// A Remote OCI backing repository's stored proxy-scan verdict for the
-/// pinned digests (the verdict is keyed by the served manifest's content
-/// digest).
-async fn oci_proxy_verdict_blocks(db: &PgPool, pin: &PackagePin) -> Result<bool, ()> {
-    let r = &pin.resolved;
-    let repo_type: Option<String> =
-        sqlx::query_scalar("SELECT repo_type::text FROM repositories WHERE id = $1")
-            .bind(r.repository_id)
-            .fetch_optional(db)
+/// The policy inputs of one repository a pin's rows live in, read once per
+/// evaluation.
+#[derive(Debug, Clone)]
+struct RepoFacts {
+    age: crate::services::age_gate_service::AgeGateRepoParams,
+    /// A Remote repository's proxy-scan severity gate, when scan-on-proxy is
+    /// on for it.
+    scan_gate: Option<crate::services::proxy_scan_service::ProxySeverityGate>,
+}
+
+impl RepoFacts {
+    fn is_remote(&self) -> bool {
+        self.age.repo_type == crate::models::repository::RepositoryType::Remote
+    }
+}
+
+type FactsCache = HashMap<Uuid, RepoFacts>;
+
+async fn repo_facts<'c>(
+    db: &PgPool,
+    cache: &'c mut FactsCache,
+    repo_id: Uuid,
+) -> Result<&'c RepoFacts, ()> {
+    if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(repo_id) {
+        let age = crate::services::age_gate_service::resolve_repo_params(db, repo_id)
             .await
             .map_err(|_| ())?;
-    if repo_type.as_deref() != Some("remote") {
+        let scan_gate = if age.repo_type == crate::models::repository::RepositoryType::Remote {
+            crate::api::handlers::proxy_helpers::remote_scan_policy(db, repo_id)
+                .await
+                .map_err(|_| ())?
+                .map(|(_, gate)| gate)
+        } else {
+            None
+        };
+        slot.insert(RepoFacts { age, scan_gate });
+    }
+    Ok(&cache[&repo_id])
+}
+
+/// A stored proxy-scan verdict for `hex` refuses under `gate`. Unlike the
+/// best-effort helper the NuGet repair path uses, an unreadable verdict is an
+/// error here: the MCP gate fails closed.
+async fn stored_verdict_blocks(
+    db: &PgPool,
+    hex: &str,
+    gate: crate::services::proxy_scan_service::ProxySeverityGate,
+) -> Result<bool, ()> {
+    use crate::api::handlers::proxy_helpers::{stored_verdict_blocks_under_gate, PROXY_SCAN_TYPE};
+    use crate::services::proxy_scan_service::{verdict_blocks, ProxyScanService};
+    if gate.is_record_only() {
         return Ok(false);
     }
-    let Some((_, gate)) =
-        crate::api::handlers::proxy_helpers::remote_scan_policy(db, r.repository_id)
+    match ProxyScanService::new(db.clone())
+        .lookup_verdict(hex, PROXY_SCAN_TYPE)
+        .await
+    {
+        Ok(Some(row)) if verdict_blocks(&row.verdict) => {
+            Ok(stored_verdict_blocks_under_gate(Some(&row), gate))
+        }
+        Ok(_) => Ok(false),
+        Err(_) => Err(()),
+    }
+}
+
+/// The name the backing format's age gate keys a package on.
+fn age_gate_package_name(registry_type: &str, identifier: &str) -> String {
+    match registry_type {
+        "cargo" => identifier.to_ascii_lowercase(),
+        other => lookup_name(other, identifier),
+    }
+}
+
+/// The age gate of one pin in one gated Remote, evaluated without an
+/// upstream connection.
+///
+/// The basis is what this instance knows: under `first_seen` the recorded
+/// observation; under `upstream_publish_time` the publish time a review of
+/// the version recorded, and otherwise when this instance cached the
+/// artifact, which is never before its upstream publish (so the age is never
+/// overstated). Review rows are honoured exactly as the download path
+/// honours them ([`decide_age_gate_check`]): a rejection holds, a manual
+/// approval releases. Under [`GateCtx::record_reviews`] a hold records or
+/// bumps the pending review (with the publish time if known, never the cache
+/// time), so an administrator can approve it.
+///
+/// [`decide_age_gate_check`]: crate::services::age_gate_service::decide_age_gate_check
+async fn age_gate_outcome(
+    ctx: GateCtx<'_>,
+    facts: &RepoFacts,
+    pin: &PackagePin,
+    cached_at: DateTime<Utc>,
+) -> Result<Option<GateOutcome>, ()> {
+    use crate::services::age_gate_service::{
+        decide_age_gate_check, review_identity_match, upstream_fingerprint, AgeGateCheckAction,
+        AgeGateDecision, AgeGateMode, AgeGateService, ReviewIdentityMatch, ReviewPolicyView,
+    };
+    let params = &facts.age;
+    if !AgeGateService::gating_requested(params)
+        || crate::formats::age_gate_spec(&params.format).is_none()
+    {
+        // No gate asked for, or a format with no age-gate hook (OCI, NuGet).
+        return Ok(None);
+    }
+    AgeGateService::require_enforceable(params).map_err(|_| ())?;
+    let svc = ctx.age_gate.ok_or(())?;
+    let Some(version) = pin.submitted.version.as_deref() else {
+        return Ok(None);
+    };
+    let package = age_gate_package_name(&pin.registry_type, &pin.submitted.identifier);
+    let review = svc
+        .get_review(params.id, &package, version)
+        .await
+        .map_err(|_| ())?;
+    let fingerprint = upstream_fingerprint(params.upstream_url.as_deref());
+    let identity = review.as_ref().map(|r| {
+        review_identity_match(
+            r.basis_mode.as_deref(),
+            r.basis_upstream_fingerprint.as_deref(),
+            params.age_gate_mode,
+            &fingerprint,
+        )
+    });
+    let view = review
+        .as_ref()
+        .zip(identity)
+        .map(|(r, identity)| ReviewPolicyView {
+            status: r.status.clone(),
+            is_automatic: r.reviewed_by.is_none(),
+            identity,
+        });
+    let reviewed_publish = review
+        .as_ref()
+        .zip(identity)
+        .filter(|(_, id)| *id != ReviewIdentityMatch::Differs)
+        .and_then(|(r, _)| r.upstream_published_at);
+    let (basis, recorded_basis) = match params.age_gate_mode {
+        AgeGateMode::FirstSeen => {
+            let seen = svc
+                .lookup_first_seen(params, &package, version)
+                .await
+                .map_err(|_| ())?;
+            (seen, seen)
+        }
+        AgeGateMode::UpstreamPublishTime => (
+            Some(reviewed_publish.map_or(cached_at, |p| p.min(cached_at))),
+            reviewed_publish,
+        ),
+    };
+    let meets =
+        AgeGateService::meets_age_threshold(basis, params.age_gate_min_age_days, Utc::now());
+    match decide_age_gate_check(view.as_ref(), meets) {
+        AgeGateCheckAction::Allow
+        | AgeGateCheckAction::AllowAlreadyApproved
+        | AgeGateCheckAction::AllowAndAutoApprovePending => return Ok(None),
+        AgeGateCheckAction::BlockRejected
+        | AgeGateCheckAction::BlockAndResetReview
+        | AgeGateCheckAction::BlockAndRequestReview => {}
+    }
+    let review_id = if ctx.record_reviews {
+        match svc
+            .check(params, &package, version, recorded_basis)
             .await
             .map_err(|_| ())?
-    else {
-        return Ok(false);
-    };
-    for d in [r.digest.as_deref(), r.gate_digest.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        if crate::api::handlers::proxy_helpers::stored_vulnerable_verdict_blocks(
-            db,
-            hex_of(d),
-            gate,
-        )
-        .await
         {
-            return Ok(true);
+            AgeGateDecision::Allow => return Ok(None),
+            AgeGateDecision::Block { review_id, .. } => Some(review_id),
+        }
+    } else {
+        review.map(|r| r.id)
+    };
+    Ok(Some(GateOutcome::AgeGate {
+        review_id,
+        min_age_days: i64::from(params.age_gate_min_age_days),
+        requested_age_days: basis.map(|b| AgeGateService::package_age_days(b, Utc::now())),
+    }))
+}
+
+/// The gates a pin's rows face beyond the download gate, in the Remote
+/// repositories they were pulled through: the stored proxy-scan verdict (for
+/// OCI keyed by the pinned digest and its gate child, otherwise by each row's
+/// sha256), then the age gate. `Err` when a gate cannot be read.
+async fn remote_gates(
+    ctx: GateCtx<'_>,
+    cache: &mut FactsCache,
+    pin: &PackagePin,
+    rows: &[GateRow],
+) -> Result<Option<GateOutcome>, ()> {
+    let mut repos: Vec<Uuid> = rows.iter().map(|r| r.repository_id).collect();
+    repos.sort();
+    repos.dedup();
+    for repo_id in repos {
+        let facts = repo_facts(ctx.db, cache, repo_id).await?.clone();
+        if !facts.is_remote() {
+            continue;
+        }
+        let in_repo = || rows.iter().filter(move |r| r.repository_id == repo_id);
+        if let Some(gate) = facts.scan_gate {
+            let hexes: Vec<String> = if pin.registry_type == "oci" {
+                let r = &pin.resolved;
+                [r.digest.as_deref(), r.gate_digest.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|d| hex_of(d).to_string())
+                    .collect()
+            } else {
+                in_repo().map(|r| r.checksum.trim().to_string()).collect()
+            };
+            for hex in &hexes {
+                if stored_verdict_blocks(ctx.db, hex, gate).await? {
+                    return Ok(Some(GateOutcome::ScanPolicy));
+                }
+            }
+        }
+        let cached_at = in_repo()
+            .map(|r| r.created_at)
+            .max()
+            .unwrap_or_else(Utc::now);
+        if let Some(outcome) = age_gate_outcome(ctx, &facts, pin, cached_at).await? {
+            return Ok(Some(outcome));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
-/// The live manifest rows that carry a pinned OCI digest NOW. A tag push
-/// rewrites its `v2/<name>/manifests/<tag>` row in place, so the ids
-/// recorded at publish may name another image by the time of a read; the
-/// gate therefore looks the pinned digest (and its gate child) up afresh.
-/// A pin with no such row cannot be gated and is unresolvable.
-async fn oci_gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<Uuid>, sqlx::Error> {
-    let r = &pin.resolved;
-    let hexes: Vec<String> = [r.digest.as_deref(), r.gate_digest.as_deref()]
-        .into_iter()
-        .flatten()
-        .map(|d| hex_of(d).to_string())
-        .collect();
-    sqlx::query_scalar(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
-         AND checksum_sha256 = ANY($2) AND path LIKE 'v2/%/manifests/%'",
-    )
-    .bind(r.repository_id)
-    .bind(&hexes)
-    .fetch_all(db)
-    .await
-}
-
-/// The artifact rows a pin's gate evaluates: the pinned rows for npm, PyPI,
-/// NuGet and Cargo, the rows carrying the pinned digest for OCI.
-async fn pin_gate_ids(db: &PgPool, pin: &PackagePin) -> Result<Vec<Uuid>, sqlx::Error> {
+/// One pin's gate, as the exact-detail read evaluates it: for OCI the
+/// manifest's presence, then the download gate (quarantine, then scan
+/// policy) of every row carrying the pinned bytes, then the Remote gates
+/// (stored proxy verdict, age gate).
+async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin) -> GateOutcome {
     if pin.registry_type == "oci" {
-        oci_gate_rows(db, pin).await
-    } else {
-        live_artifacts(db, &pin.resolved.artifact_ids).await
-    }
-}
-
-/// Live (not soft-deleted) rows among `ids`.
-async fn live_artifacts(db: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>, sqlx::Error> {
-    sqlx::query_scalar("SELECT id FROM artifacts WHERE id = ANY($1) AND is_deleted = false")
-        .bind(ids)
-        .fetch_all(db)
-        .await
-}
-
-/// One pin's gate, as the exact-detail read evaluates it: the download gate
-/// (quarantine, then scan policy) of every pinned artifact row, and for OCI
-/// the manifest's presence and a Remote repository's stored proxy verdict.
-pub async fn backing_gate(db: &PgPool, pin: &PackagePin) -> GateOutcome {
-    if pin.registry_type == "oci" {
-        match oci_pin_present(db, pin).await {
+        match oci_pin_present(ctx.db, pin).await {
             Ok(true) => {}
             Ok(false) => return GateOutcome::Unresolvable,
             Err(_) => return GateOutcome::Unavailable,
         }
-        match oci_proxy_verdict_blocks(db, pin).await {
-            Ok(true) => return GateOutcome::ScanPolicy,
-            Ok(false) => {}
-            Err(()) => return GateOutcome::Unavailable,
-        }
     }
-    let live = match pin_gate_ids(db, pin).await {
-        Ok(live) => live,
+    let rows = match gate_rows(ctx.db, pin).await {
+        Ok(rows) => rows,
         Err(_) => return GateOutcome::Unavailable,
     };
-    if live.is_empty() {
+    if rows.is_empty() {
         return GateOutcome::Unresolvable;
     }
-    for id in live {
-        if let Err(e) = crate::services::quarantine_service::enforce_download_gate(db, id).await {
+    for row in &rows {
+        if let Err(e) =
+            crate::services::quarantine_service::enforce_download_gate(ctx.db, row.id).await
+        {
             return outcome_for_gate_error(&e);
         }
     }
-    GateOutcome::Allowed
+    match remote_gates(ctx, cache, pin, &rows).await {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => GateOutcome::Allowed,
+        Err(()) => GateOutcome::Unavailable,
+    }
 }
 
 /// [`backing_gate`] for every pin, plus `Unresolvable` for a package the
 /// stored document names but no pin covers.
 pub async fn backing_gates(
-    db: &PgPool,
+    ctx: GateCtx<'_>,
     stored: &mcp::StoredVersion,
     policy_now: PackagePolicy,
 ) -> Vec<BackingGate> {
@@ -924,10 +1238,11 @@ pub async fn backing_gates(
             outcome: GateOutcome::Unresolvable,
         });
     }
+    let mut cache = FactsCache::new();
     for pin in &stored.pins {
         gates.push(BackingGate {
             package: pin.label(),
-            outcome: backing_gate(db, pin).await,
+            outcome: backing_gate(ctx, &mut cache, pin).await,
         });
     }
     gates
@@ -950,17 +1265,18 @@ pub struct ListingRow {
 
 /// The rows of a listing batch the reader-only gate refuses, decided in one
 /// pass: the quarantine half from the fields in hand, the scan-policy half
-/// through `quarantine_service::listing_refusals` per owning repository, and
-/// each pinned backing artifact the same way. Any error refuses the whole
-/// batch (the caller omits it), matching `listing_refusals`' fail-closed
-/// contract.
+/// through `quarantine_service::listing_refusals_fresh` per owning repository
+/// (uncached: a listing here serves whole documents, so it must not lag a
+/// scan that just completed), each pinned backing artifact the same way,
+/// then the Remote gates. Any error refuses the whole batch (the caller omits
+/// it), matching `listing_refusals`' fail-closed contract.
 pub async fn listing_refusals(
-    db: &PgPool,
+    ctx: GateCtx<'_>,
     mcp_repo_id: Uuid,
     rows: &[ListingRow],
     policy_now: PackagePolicy,
 ) -> Result<HashSet<Uuid>, GateUnavailable> {
-    listing_refusals_inner(db, mcp_repo_id, rows, policy_now)
+    listing_refusals_inner(ctx, mcp_repo_id, rows, policy_now)
         .await
         .map_err(|()| GateUnavailable)
 }
@@ -971,12 +1287,13 @@ pub async fn listing_refusals(
 pub struct GateUnavailable;
 
 async fn listing_refusals_inner(
-    db: &PgPool,
+    ctx: GateCtx<'_>,
     mcp_repo_id: Uuid,
     rows: &[ListingRow],
     policy_now: PackagePolicy,
 ) -> Result<HashSet<Uuid>, ()> {
     use crate::services::quarantine_service::{self as qs, ListingCandidate};
+    let db = ctx.db;
     let own: Vec<ListingCandidate<'_>> = rows
         .iter()
         .map(|r| ListingCandidate {
@@ -985,48 +1302,42 @@ async fn listing_refusals_inner(
             quarantine_until: r.quarantine_until,
         })
         .collect();
-    let mut refused = qs::listing_refusals(db, mcp_repo_id, &own)
+    let mut refused = qs::listing_refusals_fresh(db, mcp_repo_id, &own)
         .await
         .map_err(|_| ())?;
 
     // Each gated pin's rows, looked up as the detail read does.
-    let mut pin_rows: HashMap<(Uuid, usize), Vec<Uuid>> = HashMap::new();
+    let mut pin_rows: HashMap<(Uuid, usize), Vec<GateRow>> = HashMap::new();
     for row in rows {
         if refused.contains(&row.artifact_id) || !gated(row, policy_now) {
             continue;
         }
         for pin in &row.stored.pins {
-            let ids = pin_gate_ids(db, pin).await.map_err(|_| ())?;
-            pin_rows.insert((row.artifact_id, pin.index), ids);
+            let found = gate_rows(db, pin).await.map_err(|_| ())?;
+            pin_rows.insert((row.artifact_id, pin.index), found);
         }
     }
-    let backing_ids: Vec<Uuid> = pin_rows.values().flatten().copied().collect();
-    type BackingRow = (Uuid, Uuid, Option<String>, Option<DateTime<Utc>>);
-    let backing: Vec<BackingRow> = sqlx::query_as(
-        "SELECT id, repository_id, quarantine_status, quarantine_until FROM artifacts \
-         WHERE id = ANY($1) AND is_deleted = false",
-    )
-    .bind(&backing_ids)
-    .fetch_all(db)
-    .await
-    .map_err(|_| ())?;
     let mut by_repo: HashMap<Uuid, Vec<ListingCandidate<'_>>> = HashMap::new();
-    for (id, repo, status, until) in &backing {
-        by_repo.entry(*repo).or_default().push(ListingCandidate {
-            artifact_id: *id,
-            quarantine_status: status.as_deref(),
-            quarantine_until: *until,
-        });
+    for r in pin_rows.values().flatten() {
+        by_repo
+            .entry(r.repository_id)
+            .or_default()
+            .push(ListingCandidate {
+                artifact_id: r.id,
+                quarantine_status: r.quarantine_status.as_deref(),
+                quarantine_until: r.quarantine_until,
+            });
     }
     let mut backing_refused = HashSet::new();
     for (repo, candidates) in &by_repo {
         backing_refused.extend(
-            qs::listing_refusals(db, *repo, candidates)
+            qs::listing_refusals_fresh(db, *repo, candidates)
                 .await
                 .map_err(|_| ())?,
         );
     }
 
+    let mut cache = FactsCache::new();
     for row in rows {
         if refused.contains(&row.artifact_id) || !gated(row, policy_now) {
             continue;
@@ -1036,14 +1347,16 @@ async fn listing_refusals_inner(
             if blocked {
                 break;
             }
-            let ids = pin_rows
+            let found = pin_rows
                 .get(&(row.artifact_id, pin.index))
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            blocked = ids.is_empty() || ids.iter().any(|id| backing_refused.contains(id));
+            blocked = found.is_empty() || found.iter().any(|r| backing_refused.contains(&r.id));
             if !blocked && pin.registry_type == "oci" {
-                blocked = !oci_pin_present(db, pin).await.map_err(|_| ())?
-                    || oci_proxy_verdict_blocks(db, pin).await?;
+                blocked = !oci_pin_present(db, pin).await.map_err(|_| ())?;
+            }
+            if !blocked {
+                blocked = remote_gates(ctx, &mut cache, pin, found).await?.is_some();
             }
         }
         if blocked {
@@ -1067,8 +1380,14 @@ pub struct PinDrift {
 }
 
 /// Mark every MCP pin of `(repo_id, name, tag)` whose digest is not
-/// `observed` with `packages[i].drift`, returning the versions marked. The
-/// pinned digest (what is served) is never changed.
+/// `observed` with `packages[i].drift`, returning the versions newly marked.
+/// A pin already marked with this `observed` digest is left alone (no second
+/// audit row), and a pin whose tag moved back to the pinned digest has its
+/// mark cleared. The pinned digest (what is served) is never changed.
+///
+/// One indexed probe (`metadata @> {"packages": [...]}` hits the GIN index on
+/// `artifact_metadata.metadata`), skipped outright on an instance without an
+/// MCP repository.
 pub async fn mark_pin_drift(
     db: &PgPool,
     repo_id: Uuid,
@@ -1076,14 +1395,20 @@ pub async fn mark_pin_drift(
     tag: &str,
     observed: &str,
 ) -> Result<Vec<PinDrift>, sqlx::Error> {
-    let probe = serde_json::json!([{ "resolved": {
+    let any_mcp: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE format = 'mcp')")
+            .fetch_one(db)
+            .await?;
+    if !any_mcp {
+        return Ok(Vec::new());
+    }
+    let probe = serde_json::json!({ "packages": [{ "resolved": {
         "repositoryId": repo_id, "name": name, "tag": tag,
-    }}]);
+    }}]});
     let rows: Vec<(Uuid, String, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT a.id, a.name, a.version, m.metadata->'packages' FROM artifacts a \
-         JOIN artifact_metadata m ON m.artifact_id = a.id \
-         WHERE m.format = 'mcp' AND a.is_deleted = false \
-           AND m.metadata->'packages' @> $1::jsonb",
+        "SELECT a.id, a.name, a.version, m.metadata->'packages' FROM artifact_metadata m \
+         JOIN artifacts a ON a.id = m.artifact_id \
+         WHERE m.metadata @> $1::jsonb AND m.format = 'mcp' AND a.is_deleted = false",
     )
     .bind(&probe)
     .fetch_all(db)
@@ -1091,26 +1416,41 @@ pub async fn mark_pin_drift(
     let now = Utc::now();
     let mut out = Vec::new();
     for (artifact_id, server, version, mut packages) in rows {
-        let mut pinned = None;
+        let mut changed = false;
+        let mut newly = None;
         if let Some(list) = packages.as_array_mut() {
             for p in list.iter_mut() {
                 let r = &p["resolved"];
                 let matches = r["repositoryId"] == serde_json::json!(repo_id)
                     && r["name"] == name
                     && r["tag"] == tag;
+                if !matches {
+                    continue;
+                }
                 let digest = r["digest"].as_str().unwrap_or_default().to_string();
-                if matches && digest != observed {
+                let marked = p.get("drift").filter(|d| !d.is_null()).cloned();
+                if digest == observed {
+                    if marked.is_some() {
+                        if let Some(o) = p.as_object_mut() {
+                            o.remove("drift");
+                        }
+                        changed = true;
+                    }
+                } else if marked.as_ref().and_then(|d| d["observedDigest"].as_str())
+                    != Some(observed)
+                {
                     p["drift"] = serde_json::json!({
                         "observedDigest": observed,
                         "observedAt": now,
                     });
-                    pinned = Some(digest);
+                    changed = true;
+                    newly = Some(digest);
                 }
             }
         }
-        let Some(pinned_digest) = pinned else {
+        if !changed {
             continue;
-        };
+        }
         sqlx::query(
             "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{packages}', $2) \
              WHERE artifact_id = $1",
@@ -1119,12 +1459,14 @@ pub async fn mark_pin_drift(
         .bind(&packages)
         .execute(db)
         .await?;
-        out.push(PinDrift {
-            artifact_id,
-            server,
-            version,
-            pinned_digest,
-        });
+        if let Some(pinned_digest) = newly {
+            out.push(PinDrift {
+                artifact_id,
+                server,
+                version,
+                pinned_digest,
+            });
+        }
     }
     Ok(out)
 }

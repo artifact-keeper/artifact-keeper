@@ -436,16 +436,42 @@ pub fn parse_server_json(bytes: &[u8]) -> std::result::Result<ServerJson, McpErr
 }
 
 /// Characters refused in any rendered string: control characters, bidi
-/// embeddings/overrides/isolates, zero-width characters and the BOM.
+/// marks, embeddings/overrides/isolates (incl. the Arabic letter mark),
+/// zero-width and invisible formatting characters (word joiner, invisible
+/// operators), line/paragraph separators, Unicode tag characters and the BOM.
 pub fn has_forbidden_chars(s: &str) -> bool {
     s.chars().any(|c| {
         c.is_control()
             || matches!(c,
-                '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
+                '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}')
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}')
     })
+}
+
+/// The first string (object key or value) under `v` that
+/// [`has_forbidden_chars`] refuses, as a JSON-pointer-ish path below `base`.
+fn forbidden_in_json(v: &serde_json::Value, base: &str) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) if has_forbidden_chars(s) => Some(base.to_string()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, item)| forbidden_in_json(item, &format!("{base}[{i}]"))),
+        serde_json::Value::Object(map) => map.iter().find_map(|(k, item)| {
+            let path = format!("{base}.{k}");
+            if has_forbidden_chars(k) {
+                Some(path)
+            } else {
+                forbidden_in_json(item, &path)
+            }
+        }),
+        _ => None,
+    }
 }
 
 type V = std::result::Result<(), McpError>;
@@ -917,6 +943,14 @@ pub fn reduce_publisher_meta(s: &mut ServerJson) -> V {
             format!("must be at most {PUBLISHER_META_MAX_BYTES} bytes"),
         ));
     }
+    // Publisher-provided metadata is served verbatim to clients that may
+    // render it, so it gets the same character rules as every other string.
+    if let Some(path) = forbidden_in_json(provided, &format!("_meta.{PUBLISHER_META_KEY}")) {
+        return Err(McpError::invalid(
+            path,
+            "control, bidirectional or zero-width characters are not allowed",
+        ));
+    }
     let mut kept = serde_json::Map::new();
     kept.insert(PUBLISHER_META_KEY.to_string(), provided.clone());
     s.meta = Some(kept);
@@ -1011,8 +1045,11 @@ pub fn decode_cursor(cursor: &str) -> std::result::Result<(String, String), McpE
 // Latest ordering
 // ---------------------------------------------------------------------------
 
-/// A strict SemVer 2.0.0 version split into core and prerelease.
+/// A strict SemVer 2.0.0 version split into core and prerelease, with the
+/// optional `v` prefix upstream accepts (`golang.org/x/mod/semver` with
+/// exactly three core parts, `internal/service/versioning.go`).
 fn parse_semver(v: &str) -> Option<([&str; 3], Vec<&str>)> {
+    let v = v.strip_prefix('v').unwrap_or(v);
     let v = v.split_once('+').map(|(c, _)| c).unwrap_or(v);
     let (core, pre) = match v.split_once('-') {
         Some((c, p)) => (c, Some(p)),
@@ -1022,7 +1059,10 @@ fn parse_semver(v: &str) -> Option<([&str; 3], Vec<&str>)> {
     let mut nums = [""; 3];
     for slot in nums.iter_mut() {
         let p = parts.next()?;
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+        if p.is_empty()
+            || !p.bytes().all(|b| b.is_ascii_digit())
+            || (p.len() > 1 && p.starts_with('0'))
+        {
             return None;
         }
         *slot = p;
@@ -1043,10 +1083,11 @@ fn parse_semver(v: &str) -> Option<([&str; 3], Vec<&str>)> {
     Some((nums, pre))
 }
 
-/// Order two versions for "which is latest": both SemVer -> SemVer order;
-/// a non-SemVer version ranks above every SemVer one (the upstream "always
-/// latest" rule); two non-SemVer versions are equal (the caller breaks the
-/// tie on `publishedAt`).
+/// Order two versions for "which is latest", as upstream's
+/// `CompareVersions` (`internal/service/versioning.go`): both SemVer ->
+/// SemVer order; one SemVer and one not -> the SemVer version is higher; two
+/// non-SemVer versions are equal (the caller breaks the tie on
+/// `publishedAt`).
 pub fn compare_versions_for_latest(a: &str, b: &str) -> Ordering {
     use crate::services::version_order::{
         compare_digit_runs, compare_semver_prerelease_identifier,
@@ -1074,8 +1115,8 @@ pub fn compare_versions_for_latest(a: &str, b: &str) -> Ordering {
                 }
             }
         }
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
 }
@@ -1929,7 +1970,19 @@ mod tests {
         );
         assert!(check(doc(serde_json::json!({"description": "é".repeat(100)}))).is_ok());
         for evil in [
-            '\u{202E}', '\u{200B}', '\u{FEFF}', '\n', '\u{2066}', '\u{0007}',
+            '\u{202E}',
+            '\u{200B}',
+            '\u{FEFF}',
+            '\n',
+            '\u{2066}',
+            '\u{0007}',
+            '\u{061C}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{E0001}',
+            '\u{E007F}',
         ] {
             let text = format!("a{evil}b");
             assert_eq!(
@@ -2379,6 +2432,23 @@ mod tests {
         assert!(reduce_publisher_meta(&mut s).is_err());
         let mut s = check(doc(serde_json::json!({}))).unwrap();
         assert!(reduce_publisher_meta(&mut s).is_ok());
+        // Publisher-provided strings (keys and values, nested) get the same
+        // character rules as the rest of the document.
+        for provided in [
+            serde_json::json!({"note": "a\u{202E}b"}),
+            serde_json::json!({"list": ["ok", "a\u{2028}b"]}),
+            serde_json::json!({"k\u{200B}": 1}),
+            serde_json::json!({"deep": {"x": "\u{E0041}"}}),
+        ] {
+            let mut s = check(doc(
+                serde_json::json!({"_meta": {PUBLISHER_META_KEY: provided}}),
+            ))
+            .unwrap();
+            assert!(
+                matches!(reduce_publisher_meta(&mut s), Err(McpError::Invalid { .. })),
+                "{provided}"
+            );
+        }
     }
 
     #[test]
@@ -2450,9 +2520,25 @@ mod tests {
             Less
         );
         assert_eq!(compare_versions_for_latest("1.0.0+b1", "1.0.0+b2"), Equal);
-        assert_eq!(compare_versions_for_latest("2025-weird", "9.9.9"), Greater);
-        assert_eq!(compare_versions_for_latest("1.0", "1.0.0"), Greater);
+        // Upstream CompareVersions: a SemVer version always outranks a
+        // non-SemVer one, whichever way round.
+        assert_eq!(compare_versions_for_latest("2025-weird", "9.9.9"), Less);
+        assert_eq!(compare_versions_for_latest("0.0.1", "2025-weird"), Greater);
+        assert_eq!(compare_versions_for_latest("1.0", "1.0.0"), Less);
         assert_eq!(compare_versions_for_latest("x", "y"), Equal);
+        // `v` prefix accepted, leading zeros are not SemVer.
+        assert_eq!(compare_versions_for_latest("v1.2.0", "1.10.0"), Less);
+        assert_eq!(compare_versions_for_latest("v2.0.0", "1.10.0"), Greater);
+        assert_eq!(compare_versions_for_latest("01.0.0", "0.0.1"), Less);
+        let t0 = Some(Utc::now());
+        assert_eq!(
+            pick_latest(&[
+                ("1.0.0", t0),
+                ("nightly", t0.map(|t| t + chrono::Duration::days(1)))
+            ]),
+            Some(0),
+            "a newer non-SemVer version does not displace a SemVer one"
+        );
         let t1 = Some(Utc::now());
         let t2 = t1.map(|t| t + chrono::Duration::seconds(1));
         assert_eq!(

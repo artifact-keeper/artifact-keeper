@@ -1765,7 +1765,7 @@ impl AgeGateService {
         ))
     }
 
-    async fn get_review(
+    pub(crate) async fn get_review(
         &self,
         repository_id: Uuid,
         package_name: &str,

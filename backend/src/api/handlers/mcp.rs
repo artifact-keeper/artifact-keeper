@@ -30,7 +30,7 @@ use crate::formats::mcp::{
     self as fmt, BackingGate, GateAudience, GateOutcome, HoldKind, McpError, PackagePin,
     PackagePolicy, RegistryState, ServeDecision, ServerStatus, StoredVersion, VersionState,
 };
-use crate::services::mcp_packages;
+use crate::services::mcp_packages::{self, GateCtx};
 
 pub const MOUNT_PREFIX: &str = "/mcp";
 /// The registry API versions served, each under `/{repo_key}/{version}`.
@@ -90,9 +90,54 @@ pub fn router() -> Router<SharedState> {
                 patch(update_server_status_split),
             );
     }
-    read.layer(read_cors())
+    // `ensure_problem` sits INSIDE the read routes' CORS layer, so a refusal
+    // it re-renders still carries `Access-Control-Allow-Origin`; the outer
+    // one covers the write routes and the router's own fallbacks.
+    read.layer(axum::middleware::map_response(ensure_problem))
+        .layer(read_cors())
         .merge(write.layer(DefaultBodyLimit::max(fmt::MCP_PUBLISH_MAX_BYTES)))
         .layer(axum::middleware::map_response(ensure_problem))
+}
+
+/// Outermost guard of the `/mcp/` surface (mounted in `main.rs` next to
+/// [`mcp_cors_preflight`]). The shared middleware in front of the MCP router
+/// (authentication, repository visibility, rate limiting, upload admission)
+/// answers with its own plain-text bodies; on an `/mcp/` path this re-renders
+/// such a refusal as `application/problem+json` with `Cache-Control:
+/// no-store` (keeping its `WWW-Authenticate` and `Retry-After`), and gives a
+/// read refusal the read routes' `Access-Control-Allow-Origin: *` so a
+/// browser client can read it. Every other path passes through untouched.
+pub async fn mcp_surface_guard(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let on_surface = request.uri().path().starts_with("/mcp/");
+    let read = matches!(*request.method(), Method::GET | Method::HEAD);
+    let resp = next.run(request).await;
+    if !on_surface {
+        return resp;
+    }
+    let retry_after = resp.headers().get(header::RETRY_AFTER).cloned();
+    let mut out = ensure_problem(resp).await;
+    if let Some(v) = retry_after {
+        out.headers_mut().entry(header::RETRY_AFTER).or_insert(v);
+    }
+    let status = out.status();
+    if read
+        && (status.is_client_error() || status.is_server_error())
+        && !out
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    {
+        // What [`read_cors`] adds to a response (an `Any` origin adds no
+        // `Vary`), so a refusal from the shared middleware carries the same
+        // headers as the router's own.
+        out.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+    }
+    out
 }
 
 /// The safety net behind "every refusal on this surface is problem+json with
@@ -227,6 +272,7 @@ fn reproblem(resp: Response) -> Response {
             "mcp_read_only",
             "This repository does not accept publishes (virtual repository)",
         ),
+        429 => ("mcp_rate_limited", "Too many requests; retry later"),
         503 => ("mcp_unavailable", "Service temporarily unavailable"),
         _ => ("mcp_internal_error", "internal error"),
     };
@@ -387,7 +433,7 @@ fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String
 /// Decide one row for `audience`, evaluating the version's own hold and every
 /// backing gate.
 async fn decide_row(
-    db: &PgPool,
+    ctx: GateCtx<'_>,
     row: &VersionRow,
     policy_now: PackagePolicy,
     include_deleted: bool,
@@ -395,7 +441,7 @@ async fn decide_row(
     instance: String,
 ) -> ServeDecision {
     let mut gates: Vec<BackingGate> = Vec::new();
-    let own = match own_hold(db, row.artifact_id).await {
+    let own = match own_hold(ctx.db, row.artifact_id).await {
         Ok(h) => h,
         Err(()) => {
             gates.push(BackingGate {
@@ -405,7 +451,7 @@ async fn decide_row(
             None
         }
     };
-    gates.extend(mcp_packages::backing_gates(db, &row.stored, policy_now).await);
+    gates.extend(mcp_packages::backing_gates(ctx, &row.stored, policy_now).await);
     let state = VersionState {
         name: row.name.clone(),
         version: row.version.clone(),
@@ -417,12 +463,16 @@ async fn decide_row(
     fmt::decide_mcp_serve(&state, &gates, audience)
 }
 
-/// The served entry of one row.
+/// The served entry of one row. `is_latest` is whether the row is its
+/// server's newest servable version now ([`newest_servable`]), not the
+/// stored flag: the stored flag ignores holds, so a held newer version would
+/// otherwise leave no entry marked latest while `/versions/latest` answers
+/// with this one.
 fn served_entry(
     row: &VersionRow,
     repo: &RepoInfo,
     base: &str,
-    answered_as_latest: bool,
+    is_latest: bool,
 ) -> serde_json::Value {
     let server = fmt::rewrite_packages_for_serve(
         &row.stored.server,
@@ -431,9 +481,7 @@ fn served_entry(
         base,
     );
     let mut registry = row.stored.registry.clone();
-    if answered_as_latest {
-        registry.is_latest = true;
-    }
+    registry.is_latest = is_latest;
     fmt::envelope(
         server,
         &registry,
@@ -606,15 +654,22 @@ pub fn parse_list_query(q: &HashMap<String, String>) -> Result<ListQuery, McpErr
     })
 }
 
-/// One keyset batch of listing candidates.
+/// One keyset batch of listing candidates, with what the scan read: rows
+/// whose metadata cannot be parsed are dropped from `rows`, so paging decides
+/// on `raw_len` and resumes after `last`.
+struct ListingBatch {
+    rows: Vec<VersionRow>,
+    raw_len: usize,
+    last: Option<(String, String)>,
+}
+
 async fn fetch_listing_batch(
     db: &PgPool,
     repo_id: Uuid,
     q: &ListQuery,
     after: Option<&(String, String)>,
-    name_after: Option<&str>,
     batch: i64,
-) -> Result<Vec<VersionRow>, Response> {
+) -> Result<ListingBatch, Response> {
     let pattern = q
         .search
         .as_deref()
@@ -629,7 +684,6 @@ async fn fetch_listing_batch(
                 OR (m.metadata->'registry'->>'updatedAt')::timestamptz >= $4) \
            AND ($5 OR COALESCE(m.metadata->'registry'->>'status', 'active') <> 'deleted') \
            AND ($6::text IS NULL OR (a.name, a.version) > ($6, $7)) \
-           AND ($9::text IS NULL OR a.name > $9) \
          ORDER BY a.name, a.version LIMIT $8"
     );
     let raw: Vec<RawRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
@@ -641,21 +695,29 @@ async fn fetch_listing_batch(
         .bind(after.map(|c| c.0.clone()))
         .bind(after.map(|c| c.1.clone()).unwrap_or_default())
         .bind(batch)
-        .bind(name_after)
         .fetch_all(db)
         .await
         .map_err(internal)?;
-    Ok(rows_from_raw(raw))
+    let raw_len = raw.len();
+    let last = raw.last().map(|r| (r.1.clone(), r.2.clone()));
+    Ok(ListingBatch {
+        rows: rows_from_raw(raw),
+        raw_len,
+        last,
+    })
 }
 
 /// The rows of `rows` the reader-only gate admits, in order. A gate that
 /// cannot be evaluated omits the whole batch (fail closed).
 async fn servable(
-    db: &PgPool,
+    ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
     policy_now: PackagePolicy,
 ) -> Vec<VersionRow> {
+    if rows.is_empty() {
+        return rows;
+    }
     let listing: Vec<mcp_packages::ListingRow> = rows
         .iter()
         .map(|r| mcp_packages::ListingRow {
@@ -665,7 +727,7 @@ async fn servable(
             stored: r.stored.clone(),
         })
         .collect();
-    match mcp_packages::listing_refusals(db, repo_id, &listing, policy_now).await {
+    match mcp_packages::listing_refusals(ctx, repo_id, &listing, policy_now).await {
         Ok(refused) => rows
             .into_iter()
             .filter(|r| !refused.contains(&r.artifact_id))
@@ -675,6 +737,84 @@ async fn servable(
             Vec::new()
         }
     }
+}
+
+/// How many of a server's newest candidates `latest` evaluates before it
+/// gives up on the server (a server whose newest versions are all held).
+const MAX_LATEST_WALK: usize = 100;
+const LATEST_WALK_CHUNK: usize = 10;
+
+/// A server's newest servable version (by [`fmt::latest_order`], `deleted`
+/// excluded) among `rows` (all of its versions), and how many rows the
+/// reader-only gate evaluated to find it. Rows in `known` are already known
+/// servable (they passed the gate in this request) and are not re-evaluated.
+async fn newest_servable(
+    ctx: GateCtx<'_>,
+    repo_id: Uuid,
+    rows: Vec<VersionRow>,
+    known: &std::collections::HashSet<Uuid>,
+    policy_now: PackagePolicy,
+) -> (Option<VersionRow>, usize) {
+    let candidates = latest_candidates(rows);
+    let mut evaluated = 0;
+    for chunk in candidates
+        .chunks(LATEST_WALK_CHUNK)
+        .take(MAX_LATEST_WALK / LATEST_WALK_CHUNK)
+    {
+        let unknown: Vec<VersionRow> = chunk
+            .iter()
+            .filter(|r| !known.contains(&r.artifact_id))
+            .cloned()
+            .collect();
+        evaluated += unknown.len();
+        let ok: std::collections::HashSet<Uuid> = servable(ctx, repo_id, unknown, policy_now)
+            .await
+            .into_iter()
+            .map(|r| r.artifact_id)
+            .collect();
+        if let Some(row) = chunk
+            .iter()
+            .find(|r| known.contains(&r.artifact_id) || ok.contains(&r.artifact_id))
+        {
+            return (Some(row.clone()), evaluated);
+        }
+    }
+    (None, evaluated)
+}
+
+/// The artifact ids among `rows` (servable rows of one response) that are
+/// their server's newest servable version.
+async fn latest_ids(
+    ctx: GateCtx<'_>,
+    repo_id: Uuid,
+    rows: &[VersionRow],
+    policy_now: PackagePolicy,
+) -> Result<std::collections::HashSet<Uuid>, Response> {
+    let known: std::collections::HashSet<Uuid> = rows.iter().map(|r| r.artifact_id).collect();
+    let names: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    let mut out = std::collections::HashSet::new();
+    for name in names {
+        let all = versions_of(ctx.db, repo_id, name).await?;
+        if let (Some(row), _) = newest_servable(ctx, repo_id, all, &known, policy_now).await {
+            out.insert(row.artifact_id);
+        }
+    }
+    Ok(out)
+}
+
+/// Serve `rows` (all servable) with each one's `isLatest` computed now.
+async fn served_entries(
+    ctx: GateCtx<'_>,
+    repo: &RepoInfo,
+    base: &str,
+    rows: &[VersionRow],
+    policy_now: PackagePolicy,
+) -> Result<Vec<serde_json::Value>, Response> {
+    let latest = latest_ids(ctx, repo.id, rows, policy_now).await?;
+    Ok(rows
+        .iter()
+        .map(|r| served_entry(r, repo, base, latest.contains(&r.artifact_id)))
+        .collect())
 }
 
 async fn list_servers(
@@ -687,21 +827,22 @@ async fn list_servers(
     reject_if_not_hosted_read(&repo)?;
     let q = parse_list_query(&query).map_err(mcp_error)?;
     let policy_now = current_policy(&state.db, repo.id).await;
+    let ctx = GateCtx::of(&state, false);
     let (entries, next) = if q.version.as_deref() == Some("latest") {
-        list_latest(&state.db, &repo, &q, policy_now, base.as_str()).await?
+        list_latest(ctx, &repo, &q, policy_now, base.as_str()).await?
     } else {
-        list_versions_page(&state.db, &repo, &q, policy_now, base.as_str()).await?
+        list_versions_page(ctx, &repo, &q, policy_now, base.as_str()).await?
     };
     Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, next)))
 }
 
-/// Upper bound on the keyset batches one listing request reads, so a
+/// Upper bound on the rows one listing request reads and gates, so a
 /// repository whose rows are almost all held cannot turn one request into a
-/// full scan.
-const MAX_LISTING_BATCHES: usize = 50;
+/// full scan. A scan the bound stops still answers a resume cursor.
+const MAX_LISTING_ROWS: usize = 1000;
 
 async fn list_versions_page(
-    db: &PgPool,
+    ctx: GateCtx<'_>,
     repo: &RepoInfo,
     q: &ListQuery,
     policy_now: PackagePolicy,
@@ -710,23 +851,24 @@ async fn list_versions_page(
     let want = q.limit as usize;
     let mut out: Vec<VersionRow> = Vec::new();
     let mut after = q.cursor.clone();
-    let mut exhausted = false;
-    for _ in 0..MAX_LISTING_BATCHES {
-        let batch = fetch_listing_batch(db, repo.id, q, after.as_ref(), None, q.limit + 1).await?;
-        exhausted = (batch.len() as i64) <= q.limit;
-        if let Some(last) = batch.last() {
-            after = Some((last.name.clone(), last.version.clone()));
+    let mut read = 0usize;
+    let exhausted = loop {
+        let batch = fetch_listing_batch(ctx.db, repo.id, q, after.as_ref(), q.limit + 1).await?;
+        read += batch.raw_len;
+        let exhausted = (batch.raw_len as i64) <= q.limit;
+        if let Some(last) = batch.last {
+            after = Some(last);
         }
-        out.extend(servable(db, repo.id, batch, policy_now).await);
-        if out.len() > want || exhausted {
-            break;
+        out.extend(servable(ctx, repo.id, batch.rows, policy_now).await);
+        if out.len() > want || exhausted || read >= MAX_LISTING_ROWS {
+            break exhausted;
         }
-    }
+    };
     let next = if out.len() > want {
         let last = &out[want - 1];
         Some(fmt::encode_cursor(&last.name, &last.version))
     } else if !exhausted {
-        // The batch cap stopped the scan (almost every row held): resume
+        // The row bound stopped the scan (almost every row held): resume
         // after the last row read instead of presenting a short last page.
         after.as_ref().map(|(n, v)| fmt::encode_cursor(n, v))
     } else {
@@ -734,16 +876,48 @@ async fn list_versions_page(
     };
     out.truncate(want);
     Ok((
-        out.iter()
-            .map(|r| served_entry(r, repo, base, false))
-            .collect(),
+        served_entries(ctx, repo, base, &out, policy_now).await?,
         next,
     ))
 }
 
-/// `version=latest`: one entry per server, its newest servable version.
-async fn list_latest(
+/// Server names of a listing, in order, after `name_after`.
+async fn fetch_server_names(
     db: &PgPool,
+    repo_id: Uuid,
+    search: Option<&str>,
+    name_after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<String>, Response> {
+    let pattern = search.map(|s| format!("%{}%", super::escape_like_literal(s)));
+    sqlx::query_scalar(
+        "SELECT a.name FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
+           AND ($2::text IS NULL OR a.name ILIKE $2 ESCAPE '\\') \
+           AND ($3::text IS NULL OR a.name > $3) \
+         GROUP BY a.name ORDER BY a.name LIMIT $4",
+    )
+    .bind(repo_id)
+    .bind(pattern)
+    .bind(name_after)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .map_err(internal)
+}
+
+/// Gate evaluations one `version=latest` listing spends before it answers
+/// with a resume cursor (each server costs at least one).
+const MAX_LATEST_BUDGET: usize = 1000;
+
+/// `version=latest`: one entry per server, its newest servable version.
+/// The newest is picked from all of a server's versions first; only then do
+/// `updated_since` (on the picked version) apply, so an older version is
+/// never presented as latest because the newest was not updated recently.
+/// The cursor names the last server decided; work is bounded by
+/// [`MAX_LATEST_BUDGET`] and a stopped scan answers a resume cursor.
+async fn list_latest(
+    ctx: GateCtx<'_>,
     repo: &RepoInfo,
     q: &ListQuery,
     policy_now: PackagePolicy,
@@ -751,63 +925,47 @@ async fn list_latest(
 ) -> Result<(Vec<serde_json::Value>, Option<String>), Response> {
     let want = q.limit as usize;
     let mut out: Vec<VersionRow> = Vec::new();
-    // The cursor names the last server answered; resume after its name.
-    let name_after = q.cursor.as_ref().map(|(name, _)| name.clone());
-    let mut after: Option<(String, String)> = None;
-    let mut exhausted = false;
-    // The last server whose versions were all read (resumable by name).
+    let mut name_after = q.cursor.as_ref().map(|(name, _)| name.clone());
     let mut last_done: Option<String> = None;
-    let mut current: Vec<VersionRow> = Vec::new();
-    let flush =
-        |group: &mut Vec<VersionRow>, out: &mut Vec<VersionRow>, done: &mut Option<String>| {
-            if let Some(first) = group.first() {
-                *done = Some(first.name.clone());
+    let mut budget = MAX_LATEST_BUDGET;
+    let mut more = false;
+    let none = std::collections::HashSet::new();
+    'scan: loop {
+        let names = fetch_server_names(
+            ctx.db,
+            repo.id,
+            q.search.as_deref(),
+            name_after.as_deref(),
+            (want + 1) as i64,
+        )
+        .await?;
+        let names_exhausted = names.len() <= want;
+        for name in names {
+            if out.len() == want || budget == 0 {
+                more = true;
+                break 'scan;
             }
-            let candidates: Vec<(&str, Option<DateTime<Utc>>)> = group
-                .iter()
-                .map(|r| (r.version.as_str(), Some(r.stored.registry.published_at)))
-                .collect();
-            let keep = group
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.stored.registry.status != ServerStatus::Deleted)
-                .map(|(i, _)| i)
-                .max_by(|&i, &j| fmt::latest_order(candidates[i], candidates[j]));
-            if let Some(i) = keep {
-                out.push(group[i].clone());
+            let all = versions_of(ctx.db, repo.id, &name).await?;
+            let (picked, evaluated) = newest_servable(ctx, repo.id, all, &none, policy_now).await;
+            budget = budget.saturating_sub(evaluated.max(1));
+            if let Some(row) = picked.filter(|r| {
+                q.updated_since
+                    .is_none_or(|since| r.stored.registry.updated_at >= since)
+            }) {
+                out.push(row);
             }
-            group.clear();
-        };
-    for _ in 0..MAX_LISTING_BATCHES {
-        let batch =
-            fetch_listing_batch(db, repo.id, q, after.as_ref(), name_after.as_deref(), 200).await?;
-        exhausted = batch.len() < 200;
-        if let Some(last) = batch.last() {
-            after = Some((last.name.clone(), last.version.clone()));
+            last_done = Some(name);
         }
-        for row in servable(db, repo.id, batch, policy_now).await {
-            if current.first().is_some_and(|c| c.name != row.name) {
-                flush(&mut current, &mut out, &mut last_done);
-            }
-            current.push(row);
-        }
-        if exhausted {
-            flush(&mut current, &mut out, &mut last_done);
+        if names_exhausted {
             break;
         }
-        if out.len() > want {
-            break;
-        }
+        name_after = last_done.clone();
     }
-    let next = if out.len() > want {
-        let last = &out[want - 1];
-        Some(fmt::encode_cursor(&last.name, &last.version))
-    } else if !exhausted {
+    let next = if more {
         last_done.as_deref().map(|n| fmt::encode_cursor(n, "-"))
     } else {
         None
     };
-    out.truncate(want);
     Ok((
         out.iter()
             .map(|r| served_entry(r, repo, base, true))
@@ -864,25 +1022,36 @@ async fn list_versions_impl(
     reject_if_not_hosted_read(&repo)?;
     let include_deleted = include_deleted_param(q)?;
     let policy_now = current_policy(&state.db, repo.id).await;
-    let mut entries = Vec::new();
-    for row in versions_of(&state.db, repo.id, name).await? {
-        let instance = instance_url(base, &repo.key, &row.name, &row.version);
-        let d = decide_row(
-            &state.db,
-            &row,
-            policy_now,
-            include_deleted,
-            GateAudience::ReaderOnly,
-            instance,
-        )
-        .await;
-        if d == ServeDecision::Serve {
-            entries.push(served_entry(&row, &repo, base, false));
-        }
+    let ctx = GateCtx::of(state, false);
+    let mut rows: Vec<VersionRow> = versions_of(&state.db, repo.id, name)
+        .await?
+        .into_iter()
+        .filter(|r| include_deleted || r.stored.registry.status != ServerStatus::Deleted)
+        .collect();
+    // Bounded work: at most the newest MAX_LISTING_ROWS versions are gated
+    // and listed (in version-text order, as before).
+    if rows.len() > MAX_LISTING_ROWS {
+        rows.sort_by(|a, b| {
+            fmt::latest_order(
+                (b.version.as_str(), Some(b.stored.registry.published_at)),
+                (a.version.as_str(), Some(a.stored.registry.published_at)),
+            )
+        });
+        rows.truncate(MAX_LISTING_ROWS);
+        rows.sort_by(|a, b| a.version.cmp(&b.version));
     }
-    if entries.is_empty() {
+    let served = servable(ctx, repo.id, rows, policy_now).await;
+    if served.is_empty() {
         return Err(not_found());
     }
+    // Every servable version is in hand: the newest of them is the latest.
+    let latest = latest_candidates(served.clone())
+        .first()
+        .map(|r| r.artifact_id);
+    let entries = served
+        .iter()
+        .map(|r| served_entry(r, &repo, base, Some(r.artifact_id) == latest))
+        .collect();
     Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, None)))
 }
 
@@ -953,30 +1122,36 @@ async fn get_version_impl(
     let rows = versions_of(&state.db, repo.id, name).await?;
     let is_latest = version == "latest";
     let candidates: Vec<VersionRow> = if is_latest {
-        latest_candidates(rows)
+        latest_candidates(rows.clone())
     } else {
-        rows.into_iter().filter(|r| r.version == version).collect()
+        rows.iter()
+            .filter(|r| r.version == version)
+            .cloned()
+            .collect()
     };
     if candidates.is_empty() {
         return Err(not_found());
     }
     let audience = audience(&state.db, auth, repo.id).await;
     let policy_now = current_policy(&state.db, repo.id).await;
+    let ctx = GateCtx::of(state, true);
     let mut first_refusal: Option<(Response, &VersionRow, &'static str)> = None;
     for row in &candidates {
         let instance = instance_url(base, &repo.key, &row.name, &row.version);
-        match decide_row(
-            &state.db,
-            row,
-            policy_now,
-            include_deleted,
-            audience,
-            instance,
-        )
-        .await
-        {
+        match decide_row(ctx, row, policy_now, include_deleted, audience, instance).await {
             ServeDecision::Serve => {
-                let entry = served_entry(row, &repo, base, is_latest);
+                // `latest` answers the newest servable version by
+                // construction; an exact version is latest when no newer
+                // version is servable (the reader-only listing gate).
+                let latest = is_latest || {
+                    let known = std::iter::once(row.artifact_id).collect();
+                    let listing = GateCtx::of(state, false);
+                    newest_servable(listing, repo.id, rows.clone(), &known, policy_now)
+                        .await
+                        .0
+                        .is_some_and(|l| l.artifact_id == row.artifact_id)
+                };
+                let entry = served_entry(row, &repo, base, latest);
                 return Ok(json_ok(StatusCode::OK, &entry));
             }
             ServeDecision::Refuse {
@@ -1013,30 +1188,47 @@ async fn get_version_impl(
 // GET /ping, /health, /version
 // ---------------------------------------------------------------------------
 
-async fn ping() -> Response {
-    json_ok(StatusCode::OK, &serde_json::json!({"status": "ok"}))
+/// The repository a `/ping`, `/health` or `/version` names must be a hosted
+/// MCP registry: any other key answers the unknown-name 404, as every other
+/// route of this surface does.
+async fn utility_repo(state: &SharedState, repo_key: &str) -> Result<(), Response> {
+    let repo = resolve_mcp_repo(&state.db, repo_key).await?;
+    reject_if_not_hosted_read(&repo)
 }
 
-async fn health(State(state): State<SharedState>) -> Response {
+async fn ping(State(state): State<SharedState>, Path(repo_key): Path<String>) -> HandlerResult {
+    utility_repo(&state, &repo_key).await?;
+    Ok(json_ok(
+        StatusCode::OK,
+        &serde_json::json!({"status": "ok"}),
+    ))
+}
+
+async fn health(State(state): State<SharedState>, Path(repo_key): Path<String>) -> HandlerResult {
+    utility_repo(&state, &repo_key).await?;
     match sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.db)
         .await
     {
-        Ok(_) => json_ok(StatusCode::OK, &serde_json::json!({"status": "ok"})),
-        Err(_) => problem(
+        Ok(_) => Ok(json_ok(
+            StatusCode::OK,
+            &serde_json::json!({"status": "ok"}),
+        )),
+        Err(_) => Err(problem(
             503,
             "mcp_unavailable",
             "The registry database is unavailable",
             serde_json::json!({}),
-        ),
+        )),
     }
 }
 
-async fn version() -> Response {
-    json_ok(
+async fn version(State(state): State<SharedState>, Path(repo_key): Path<String>) -> HandlerResult {
+    utility_repo(&state, &repo_key).await?;
+    Ok(json_ok(
         StatusCode::OK,
         &serde_json::json!({"version": env!("CARGO_PKG_VERSION")}),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,10 +1282,9 @@ async fn insert_server_rows(
     db: &PgPool,
     artifact: proxy_helpers::NewArtifact<'_>,
     metadata: &serde_json::Value,
-    settings: &mcp_packages::McpSettings,
     pins: &[PackagePin],
     upload_hold_until: Option<DateTime<Utc>>,
-) -> Result<Uuid, Response> {
+) -> Result<(Uuid, Vec<(Uuid, Uuid)>), Response> {
     use crate::services::quarantine_service::{HoldSource, QuarantineState};
     let repository_id = artifact.repository_id;
     let path = artifact.path.to_string();
@@ -1134,7 +1325,7 @@ async fn insert_server_rows(
     .execute(&mut *tx)
     .await
     .map_err(internal)?;
-    mcp_packages::hold_pins(&mut tx, settings, pins)
+    let hold_rows = mcp_packages::hold_pins(&mut tx, pins)
         .await
         .map_err(internal)?;
     // The upload-time quarantine hold commits with the row, so the version is
@@ -1160,7 +1351,47 @@ async fn insert_server_rows(
         .bind(repository_id)
         .execute(db)
         .await;
-    Ok(artifact_id)
+    Ok((artifact_id, hold_rows))
+}
+
+/// Whether `path` names a version that was deleted through the artifact API
+/// and still sits in the trash. Its name stays reserved until an
+/// administrator purges it, so a version is write-once across a generic
+/// delete too (a tombstone that outlives the purge comes later).
+async fn trashed_version_exists(db: &PgPool, repo_id: Uuid, path: &str) -> Result<bool, Response> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 AND path = $2 \
+         AND is_deleted = true)",
+    )
+    .bind(repo_id)
+    .bind(path)
+    .fetch_one(db)
+    .await
+    .map_err(internal)
+}
+
+/// Remove the stored bytes of a publish whose row was never written, unless
+/// a row (a concurrent identical publish that won) references the same
+/// content-addressed key. Best-effort.
+async fn discard_unreferenced_bytes(state: &SharedState, repo: &RepoInfo, key: &str) {
+    let referenced: Result<bool, _> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 AND storage_key = $2)",
+    )
+    .bind(repo.id)
+    .bind(key)
+    .fetch_one(&state.db)
+    .await;
+    if !matches!(referenced, Ok(false)) {
+        return;
+    }
+    match state.storage_for_repo(&repo.storage_location()) {
+        Ok(storage) => {
+            if let Err(e) = storage.delete(key).await {
+                tracing::warn!(key, error = %e, "MCP publish: could not remove unreferenced bytes");
+            }
+        }
+        Err(e) => tracing::warn!(key, error = %e, "MCP publish: storage unavailable for cleanup"),
+    }
 }
 
 /// `(version, publishedAt)`: what [`fmt::latest_order`] compares.
@@ -1306,6 +1537,9 @@ async fn publish_server(
     let path = fmt::storage_path(&server.name, &server.version);
     crate::services::upload_service::validate_artifact_path(&path)
         .map_err(|e| mcp_error(McpError::invalid("", e.to_string())))?;
+    if trashed_version_exists(&state.db, repo.id, &path).await? {
+        return Err(mcp_error(McpError::VersionExists));
+    }
     proxy_helpers::ensure_unique_artifact_path(&state.db, repo.id, &path, "exists")
         .await
         .map_err(|resp| match resp.status() {
@@ -1327,7 +1561,7 @@ async fn publish_server(
         let config = qs::resolve_config(&state.db, repo.id).await;
         qs::should_quarantine(&config).then(|| qs::quarantine_until(&config, Utc::now()))
     };
-    let artifact_id = insert_server_rows(
+    let inserted = insert_server_rows(
         &state.db,
         proxy_helpers::NewArtifact {
             repository_id: repo.id,
@@ -1341,11 +1575,17 @@ async fn publish_server(
             uploaded_by: ext.user_id,
         },
         &metadata,
-        &settings,
         &pins,
         upload_hold_until,
     )
-    .await?;
+    .await;
+    let (artifact_id, hold_rows) = match inserted {
+        Ok(ids) => ids,
+        Err(resp) => {
+            discard_unreferenced_bytes(&state, &repo, &key).await;
+            return Err(resp);
+        }
+    };
     crate::services::scanner_service::trigger_scan_on_upload(
         &state.db,
         state.scanner_service.clone(),
@@ -1353,6 +1593,18 @@ async fn publish_server(
         artifact_id,
     )
     .await;
+    // A digest-path manifest row a retention hold created is new to the
+    // scanner: scan it like a pushed manifest, so a scan policy that requires
+    // a scan does not hold the pinned image forever.
+    for (backing_repo, row) in hold_rows {
+        crate::services::scanner_service::trigger_scan_on_upload(
+            &state.db,
+            state.scanner_service.clone(),
+            backing_repo,
+            row,
+        )
+        .await;
+    }
     audit_pins(&state.db, ext.user_id, &repo, artifact_id, &server, &pins);
     crate::services::package_service::register_published_package(
         &state.db,
@@ -1383,10 +1635,29 @@ async fn publish_server(
         pins.len()
     );
     let row = stored_row(&state.db, artifact_id).await?;
+    let latest = row_is_latest(&state, &repo, &row, settings.policy).await;
     Ok(json_ok(
         StatusCode::OK,
-        &served_entry(&row, &repo, base.as_str(), false),
+        &served_entry(&row, &repo, base.as_str(), latest),
     ))
+}
+
+/// Whether `row` is its server's newest servable version (the reader-only
+/// gate), for a write's response. A read failure answers `false`.
+async fn row_is_latest(
+    state: &SharedState,
+    repo: &RepoInfo,
+    row: &VersionRow,
+    policy_now: PackagePolicy,
+) -> bool {
+    let Ok(all) = versions_of(&state.db, repo.id, &row.name).await else {
+        return false;
+    };
+    let ctx = GateCtx::of(state, false);
+    newest_servable(ctx, repo.id, all, &Default::default(), policy_now)
+        .await
+        .0
+        .is_some_and(|l| l.artifact_id == row.artifact_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,6 +1794,8 @@ async fn update_status_impl(
     base: &str,
 ) -> HandlerResult {
     let (_ext, repo) = writable_repo(state, auth, repo_key).await?;
+    // A status change is a write, gated like a publish.
+    repo.reject_if_promotion_only(false).map_err(reproblem)?;
     let (next, message) = parse_status_update(body).map_err(mcp_error)?;
     // One transaction under the per-server lock: every version changes or
     // none does, and `isLatest` is recomputed from the state just written.
@@ -1562,10 +1835,22 @@ async fn update_status_impl(
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
+    let policy_now = current_policy(&state.db, repo.id).await;
+    let all = versions_of(&state.db, repo.id, name).await?;
+    let latest = newest_servable(
+        GateCtx::of(state, false),
+        repo.id,
+        all,
+        &Default::default(),
+        policy_now,
+    )
+    .await
+    .0
+    .map(|r| r.artifact_id);
     let mut entries = Vec::new();
     for id in &changed {
         let row = stored_row(&state.db, *id).await?;
-        entries.push(served_entry(&row, &repo, base, false));
+        entries.push(served_entry(&row, &repo, base, Some(*id) == latest));
     }
     let out = match version {
         Some(_) => entries.pop().unwrap_or_default(),
@@ -2364,6 +2649,32 @@ mod tests {
             tdh::audit_count(&env.fx.pool, id, "MCP_PIN_DRIFT_DETECTED").await,
             1
         );
+        // The same observation again marks nothing new (no second audit).
+        assert!(mcp_packages::mark_pin_drift(
+            &env.fx.pool,
+            oci.id,
+            "acme/mcp",
+            "1.2",
+            &moved_digest
+        )
+        .await
+        .unwrap()
+        .is_empty());
+        // The tag back on the pinned digest clears the mark.
+        assert!(
+            mcp_packages::mark_pin_drift(&env.fx.pool, oci.id, "acme/mcp", "1.2", &digest)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let cleared: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata->'packages'->0->'drift' FROM artifact_metadata WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert!(cleared.is_none(), "{cleared:?}");
 
         // Floating and digest-only forms.
         assert_eq!(
@@ -2537,9 +2848,14 @@ mod tests {
             .remove(0);
         let closed = tdh::try_pool().await.unwrap();
         closed.close().await;
+        let ctx = GateCtx {
+            db: &closed,
+            age_gate: None,
+            record_reviews: false,
+        };
         for audience in [GateAudience::ReaderOnly, GateAudience::ReasonGated] {
             match decide_row(
-                &closed,
+                ctx,
                 &row,
                 PackagePolicy::OwnRepos,
                 false,
@@ -2564,16 +2880,11 @@ mod tests {
             stored: row.stored.clone(),
         }];
         assert!(
-            mcp_packages::listing_refusals(
-                &closed,
-                env.fx.repo_id,
-                &listing,
-                PackagePolicy::OwnRepos
-            )
-            .await
-            .is_err()
+            mcp_packages::listing_refusals(ctx, env.fx.repo_id, &listing, PackagePolicy::OwnRepos)
+                .await
+                .is_err()
                 || servable(
-                    &closed,
+                    ctx,
                     env.fx.repo_id,
                     vec![row.clone()],
                     PackagePolicy::OwnRepos
@@ -2968,6 +3279,16 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "private repository"
         );
+        // Behind the surface guard (as `main.rs` mounts it), the middleware's
+        // refusal is problem+json with `no-store` and keeps its challenge.
+        let guarded = app
+            .clone()
+            .layer(axum::middleware::from_fn(mcp_surface_guard));
+        let (s, b, h) = tdh::send_with_headers(guarded, get(None)).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_refusal_headers(&h);
+        assert_eq!(json(&b)["error"], "mcp_unauthorized");
+        assert!(h.contains_key(header::WWW_AUTHENTICATE));
         let (reader, reader_name) = tdh::create_user(&env.fx.pool).await;
         tdh::grant_repo_role(&env.fx.pool, env.fx.repo_id, reader, "reader").await;
         let _ = reader_name;
@@ -3059,6 +3380,753 @@ mod tests {
                 .unwrap();
         assert_eq!(path, "servers/com.acme/probe/1.0.0/server.json");
         tdh::drop_mock_server(mock).await;
+        env.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Review fixes (#5253 review)
+    // -----------------------------------------------------------------------
+
+    fn latest_flag(entry: &serde_json::Value) -> Option<bool> {
+        entry["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"].as_bool()
+    }
+
+    /// The age gate of a Remote a pinned package was pulled through holds
+    /// the version until the cached copy is old enough or a review approves
+    /// it; a rejection holds; no age-gate service fails closed.
+    #[tokio::test]
+    async fn backing_package_age_gate_holds_the_version() {
+        use crate::services::age_gate_service::AgeGateService;
+        use std::sync::Arc;
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let remote = env.repo("remote", "npm").await;
+        sqlx::query(
+            "UPDATE repositories SET age_gate_enabled = true, age_gate_min_age_days = 7 \
+             WHERE id = $1",
+        )
+        .bind(remote.id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let cached = tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &env.fx.pool,
+            &remote,
+            "npm/echo-age.tgz",
+            "@acme/echo/-/echo-1.0.0.tgz",
+            "@acme/echo",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"tgz"),
+            env.fx.user_id,
+            &"a".repeat(64),
+        )
+        .await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remote.key}).to_string(),
+        )
+        .await;
+        let d = doc(
+            "com.acme/aged",
+            "1.0.0",
+            serde_json::json!({"packages": [npm_pkg("@acme/echo", Some("1.0.0"))]}),
+        );
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        let row = versions_of(&env.fx.pool, env.fx.repo_id, "com.acme/aged")
+            .await
+            .unwrap()
+            .remove(0);
+        let svc = AgeGateService::new(
+            env.fx.pool.clone(),
+            Arc::new(crate::services::event_bus::EventBus::new(4)),
+        );
+        let ctx = |record_reviews| GateCtx {
+            db: &env.fx.pool,
+            age_gate: Some(&svc),
+            record_reviews,
+        };
+        let decide = |ctx, audience| {
+            decide_row(
+                ctx,
+                &row,
+                PackagePolicy::OwnRepos,
+                false,
+                audience,
+                "i".into(),
+            )
+        };
+        // Cached just now: held. The listing is read-only and omits it.
+        match decide(ctx(false), GateAudience::ReasonGated).await {
+            ServeDecision::Refuse { status, body, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(body["error"], "mcp_age_gate_blocked");
+                assert_eq!(body["gate"], "age_gate");
+                assert_eq!(body["min_age_days"], 7);
+                assert_eq!(body["requested_age_days"], 0);
+                assert!(body["review_id"].is_null(), "{body}");
+            }
+            ServeDecision::Serve => panic!("a package younger than the age gate must hold"),
+        }
+        match decide(ctx(false), GateAudience::ReaderOnly).await {
+            ServeDecision::Refuse { body, .. } => {
+                assert_eq!(
+                    serde_json::to_vec(&body).unwrap(),
+                    fmt::NOT_FOUND_BODY.as_bytes()
+                )
+            }
+            ServeDecision::Serve => panic!("held for readers too"),
+        }
+        assert!(servable(
+            ctx(false),
+            env.fx.repo_id,
+            vec![row.clone()],
+            PackagePolicy::OwnRepos
+        )
+        .await
+        .is_empty());
+        let reviews = || async {
+            sqlx::query_as::<_, (Uuid, String, Option<DateTime<Utc>>)>(
+                "SELECT id, status, upstream_published_at FROM age_gate_reviews \
+                 WHERE repository_id = $1 AND package_name = '@acme/echo' \
+                   AND package_version = '1.0.0'",
+            )
+            .bind(remote.id)
+            .fetch_all(&env.fx.pool)
+            .await
+            .unwrap()
+        };
+        assert!(reviews().await.is_empty(), "a listing records nothing");
+        // An exact read records a pending review an administrator can act on,
+        // with an unknown publish time (never the cache time).
+        let review_id = match decide(ctx(true), GateAudience::ReasonGated).await {
+            ServeDecision::Refuse { body, .. } => body["review_id"].as_str().unwrap().to_string(),
+            ServeDecision::Serve => panic!("still held"),
+        };
+        let recorded = reviews().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0.to_string(), review_id);
+        assert_eq!((recorded[0].1.as_str(), recorded[0].2), ("pending", None));
+        // A manual approval releases it, everywhere.
+        sqlx::query(
+            "UPDATE age_gate_reviews SET status = 'approved', reviewed_by = $2 WHERE id = $1",
+        )
+        .bind(recorded[0].0)
+        .bind(env.fx.user_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            decide(ctx(false), GateAudience::ReaderOnly).await,
+            ServeDecision::Serve
+        );
+        assert_eq!(
+            servable(
+                ctx(false),
+                env.fx.repo_id,
+                vec![row.clone()],
+                PackagePolicy::OwnRepos
+            )
+            .await
+            .len(),
+            1
+        );
+        // A rejection holds, old or not.
+        sqlx::query("UPDATE age_gate_reviews SET status = 'rejected' WHERE id = $1")
+            .bind(recorded[0].0)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '30 days' WHERE id = $1")
+            .bind(cached)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decide(ctx(false), GateAudience::ReasonGated).await,
+            ServeDecision::Refuse { body, .. } if body["error"] == "mcp_age_gate_blocked"
+        ));
+        // No review, cached 30 days ago: old enough.
+        sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(remote.id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            decide(ctx(false), GateAudience::ReaderOnly).await,
+            ServeDecision::Serve
+        );
+        // A gated Remote with no age-gate service cannot be evaluated: 503.
+        let blind = GateCtx {
+            db: &env.fx.pool,
+            age_gate: None,
+            record_reviews: false,
+        };
+        assert!(matches!(
+            decide(blind, GateAudience::ReaderOnly).await,
+            ServeDecision::Refuse { status: 503, .. }
+        ));
+        env.teardown().await;
+    }
+
+    /// A stored proxy-scan verdict of the Remote an npm package was pulled
+    /// through holds the version (it was only enforced for OCI pins).
+    #[tokio::test]
+    async fn remote_proxy_verdict_holds_a_non_oci_pin() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let remote = env.repo("remote", "npm").await;
+        let sha = format!("{:064x}", Uuid::new_v4().as_u128());
+        tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &env.fx.pool,
+            &remote,
+            "npm/echo-verdict.tgz",
+            "@acme/echo/-/echo-1.0.0.tgz",
+            "@acme/echo",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"tgz"),
+            env.fx.user_id,
+            &sha,
+        )
+        .await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remote.key}).to_string(),
+        )
+        .await;
+        let d = doc(
+            "com.acme/verdict",
+            "1.0.0",
+            serde_json::json!({"packages": [npm_pkg("@acme/echo", Some("1.0.0"))]}),
+        );
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        let tail = "/servers/com.acme%2Fverdict/versions/1.0.0";
+        assert_eq!(env.get(env.anon(), tail).await.0, StatusCode::OK);
+        tdh::enable_proxy_scan(&env.fx.pool, remote.id, "fail_open").await;
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+             critical_count, high_count, medium_count, low_count, max_severity) \
+             VALUES ($1, 'grype', 'vulnerable', 1, 1, 0, 0, 0, 'critical')",
+        )
+        .bind(&sha)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let (s, b, _) = env.get(env.member(), tail).await;
+        assert_eq!(
+            (s, json(&b)["gate"].as_str()),
+            (StatusCode::NOT_FOUND, Some("scan_policy"))
+        );
+        let (_, list, _) = env.get(env.anon(), "/servers").await;
+        assert_eq!(json(&list)["metadata"]["count"], 0);
+        for sql in ["DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1"] {
+            let _ = sqlx::query(sql).bind(&sha).execute(&env.fx.pool).await;
+        }
+        let _ = sqlx::query("DELETE FROM scan_configs WHERE repository_id = $1")
+            .bind(remote.id)
+            .execute(&env.fx.pool)
+            .await;
+        env.teardown().await;
+    }
+
+    /// A single-arch image pinned by tag through a Virtual mapping whose
+    /// member is Local: the member gets the retention hold, and the version
+    /// stays gateable (and served) after the tag moves.
+    #[tokio::test]
+    async fn single_arch_pin_through_a_virtual_survives_a_tag_move() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let member = env.repo("local", "docker").await;
+        let virt = env.repo("virtual", "docker").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(virt.id)
+        .bind(member.id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let image = |seed: char| {
+            let d = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": d(seed), "size": 1},
+                "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": d('7'), "size": 1}],
+            }))
+            .unwrap()
+        };
+        const IMAGE_MT: &str = "application/vnd.oci.image.manifest.v1+json";
+        let body = image('c');
+        let hex = fmt::sha256_hex(&body);
+        let digest = format!("sha256:{hex}");
+        env.fx
+            .state
+            .storage_for_repo(&member.storage_location())
+            .unwrap()
+            .put(
+                &crate::api::handlers::oci_v2::manifest_storage_key(&digest),
+                Bytes::from(body),
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type) VALUES ($1, 'acme/one', '1.0', $2, $3)")
+            .bind(member.id).bind(&digest).bind(IMAGE_MT).execute(&env.fx.pool).await.unwrap();
+        // A tag push writes only the tag-path manifest row.
+        crate::api::handlers::oci_v2::upsert_manifest_artifact(
+            &env.fx.pool,
+            member.id,
+            "acme/one",
+            "1.0",
+            &digest,
+            IMAGE_MT,
+            &crate::api::handlers::oci_v2::manifest_storage_key(&digest),
+            10,
+            Some(env.fx.user_id),
+            None,
+        )
+        .await
+        .unwrap();
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"oci": virt.key}).to_string(),
+        )
+        .await;
+        let mut d = oci_doc("ghcr.io/acme/one:1.0");
+        d["name"] = "com.acme/one".into();
+        let (s, b) = env.publish(&d).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        // The member (Local) holds the pin, though the mapping is Virtual.
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM oci_tags WHERE repository_id = $1 AND tag = $2 AND manifest_digest = $2)",
+        )
+        .bind(member.id)
+        .bind(&digest)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert!(held, "retention hold in the resolved (member) repository");
+        let digest_row: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 \
+             AND checksum_sha256 = $3 AND is_deleted = false",
+        )
+        .bind(member.id)
+        .bind(format!("v2/acme/one/manifests/{digest}"))
+        .bind(&hex)
+        .fetch_optional(&env.fx.pool)
+        .await
+        .unwrap();
+        let digest_row = digest_row.expect("the hold writes a digest-path manifest row");
+
+        // The tag moves: the push rewrites the tag-path row in place.
+        let moved = image('d');
+        let moved_digest = format!("sha256:{}", fmt::sha256_hex(&moved));
+        crate::api::handlers::oci_v2::upsert_manifest_artifact(
+            &env.fx.pool,
+            member.id,
+            "acme/one",
+            "1.0",
+            &moved_digest,
+            IMAGE_MT,
+            &crate::api::handlers::oci_v2::manifest_storage_key(&moved_digest),
+            10,
+            Some(env.fx.user_id),
+            None,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE oci_tags SET manifest_digest = $2 WHERE repository_id = $1 AND tag = '1.0'",
+        )
+        .bind(member.id)
+        .bind(&moved_digest)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let tail = "/servers/com.acme%2Fone/versions/1.0.0";
+        let (s, b, _) = env.get(env.anon(), tail).await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "still gateable after the tag move: {:?}",
+            json(&b)
+        );
+        // ... and gated on the pinned bytes' own row.
+        env.hold(digest_row, Some("rejected")).await;
+        let (s, b, _) = env.get(env.member(), tail).await;
+        assert_eq!(
+            (s, json(&b)["gate"].as_str()),
+            (StatusCode::NOT_FOUND, Some("scan_policy"))
+        );
+        env.teardown().await;
+    }
+
+    /// `isLatest` is the newest servable version on every read, and
+    /// `version=latest` picks the newest before `updated_since` filters.
+    #[tokio::test]
+    async fn is_latest_follows_holds_and_latest_ignores_older_updates() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (_npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for v in ["1.0.0", "2.0.0"] {
+            let d = doc(
+                "com.acme/lat",
+                v,
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+        let (_, list, _) = env.get(env.anon(), "/servers").await;
+        let list = json(&list);
+        assert_eq!(list["metadata"]["count"], 1);
+        assert_eq!(latest_flag(&list["servers"][0]), Some(true), "{list}");
+        let (_, versions, _) = env
+            .get(env.anon(), "/servers/com.acme%2Flat/versions")
+            .await;
+        assert_eq!(latest_flag(&json(&versions)["servers"][0]), Some(true));
+        let (_, exact, _) = env
+            .get(env.anon(), "/servers/com.acme%2Flat/versions/1.0.0")
+            .await;
+        assert_eq!(latest_flag(&json(&exact)), Some(true));
+        env.hold(ids[1], None).await;
+        let (_, exact, _) = env
+            .get(env.anon(), "/servers/com.acme%2Flat/versions/1.0.0")
+            .await;
+        assert_eq!(latest_flag(&json(&exact)), Some(false));
+        let (_, list, _) = env.get(env.anon(), "/servers").await;
+        let flags: Vec<Option<bool>> = json(&list)["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(latest_flag)
+            .collect();
+        assert_eq!(flags, vec![Some(false), Some(true)]);
+
+        // 2.0.0 was last updated long ago, 1.0.0 recently: the latest is
+        // still 2.0.0, which `updated_since` then filters out.
+        let v2 = env.server_artifact("com.acme/lat", "2.0.0").await;
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{registry,updatedAt}', \
+             to_jsonb('2020-01-01T00:00:00Z'::text)) WHERE artifact_id = $1",
+        )
+        .bind(v2)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let (_, l, _) = env
+            .get(
+                env.anon(),
+                "/servers?version=latest&updated_since=2025-01-01T00:00:00Z",
+            )
+            .await;
+        assert_eq!(json(&l)["metadata"]["count"], 0, "{}", json(&l));
+        let (_, l, _) = env.get(env.anon(), "/servers?version=latest").await;
+        assert_eq!(json(&l)["servers"][0]["server"]["version"], "2.0.0");
+        env.teardown().await;
+    }
+
+    /// Rows whose metadata cannot be read do not end a listing early, and a
+    /// `version=latest` listing pages by server with a resume cursor.
+    #[tokio::test]
+    async fn listing_cursor_survives_unreadable_rows() {
+        let Some(env) = Env::new().await else { return };
+        for name in ["com.acme/pa", "com.acme/pb", "com.acme/pc", "com.acme/pd"] {
+            assert_eq!(
+                env.publish(&doc(name, "1.0.0", serde_json::json!({})))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let pb = env.server_artifact("com.acme/pb", "1.0.0").await;
+        sqlx::query("UPDATE artifact_metadata SET metadata = '{}'::jsonb WHERE artifact_id = $1")
+            .bind(pb)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["server"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (_, p1, _) = env.get(env.anon(), "/servers?limit=2").await;
+        let p1 = json(&p1);
+        assert_eq!(names(&p1), vec!["com.acme/pa", "com.acme/pc"]);
+        let cursor = p1["metadata"]["nextCursor"]
+            .as_str()
+            .expect("a dropped row does not end the listing")
+            .to_string();
+        let (_, p2, _) = env
+            .get(env.anon(), &format!("/servers?limit=2&cursor={cursor}"))
+            .await;
+        let p2 = json(&p2);
+        assert_eq!(names(&p2), vec!["com.acme/pd"]);
+        assert!(p2["metadata"].get("nextCursor").is_none());
+
+        let (_, l1, _) = env.get(env.anon(), "/servers?version=latest&limit=1").await;
+        let l1 = json(&l1);
+        assert_eq!(names(&l1), vec!["com.acme/pa"]);
+        let c = l1["metadata"]["nextCursor"].as_str().unwrap().to_string();
+        let (_, l2, _) = env
+            .get(
+                env.anon(),
+                &format!("/servers?version=latest&limit=2&cursor={c}"),
+            )
+            .await;
+        let l2 = json(&l2);
+        assert_eq!(names(&l2), vec!["com.acme/pc", "com.acme/pd"]);
+        assert!(l2["metadata"].get("nextCursor").is_none(), "{l2}");
+        env.teardown().await;
+    }
+
+    /// Mapping a repository needs read on it, and an unreadable repository
+    /// answers exactly like a missing one.
+    #[tokio::test]
+    async fn mapping_needs_read_on_the_backing_repository() {
+        use crate::models::repository::RepositoryFormat;
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let npm = env.repo("local", "npm").await;
+        let pypi = env.repo("local", "pypi").await;
+        let (uid, uname) = tdh::create_user(&env.fx.pool).await;
+        let caller = tdh::make_auth(uid, &uname);
+        let try_map = |key: String| {
+            let pool = env.fx.pool.clone();
+            let caller = caller.clone();
+            async move {
+                let map: std::collections::BTreeMap<String, String> =
+                    [("npm".to_string(), key)].into_iter().collect();
+                mcp_packages::settings_to_store(
+                    &pool,
+                    &caller,
+                    &RepositoryFormat::Mcp,
+                    None,
+                    Some(&map),
+                    None,
+                    false,
+                )
+                .await
+                .map_err(|e| e.to_string())
+            }
+        };
+        let hidden = try_map(npm.key.clone()).await.unwrap_err();
+        let missing = try_map("ph-no-such-repo".into()).await.unwrap_err();
+        assert_eq!(
+            hidden.replace(&npm.key, "K"),
+            missing.replace("ph-no-such-repo", "K"),
+            "not readable answers as not found"
+        );
+        // An internal repository still needs a grant.
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(npm.id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert!(try_map(npm.key.clone()).await.is_err());
+        tdh::grant_repo_role(&env.fx.pool, npm.id, uid, "reader").await;
+        assert!(try_map(npm.key.clone()).await.is_ok());
+        // A format mismatch is only reported for a readable repository.
+        tdh::publish_repo(&env.fx.pool, pypi.id).await;
+        assert!(try_map(pypi.key.clone())
+            .await
+            .unwrap_err()
+            .contains("is a pypi repository"));
+        tdh::cleanup_user(&env.fx.pool, uid).await;
+        env.teardown().await;
+    }
+
+    /// Write paths: a status change is refused on a promotion-only
+    /// repository, a version deleted through the artifact API cannot be
+    /// republished while it is in the trash, and the utility routes answer
+    /// only for an MCP registry.
+    #[tokio::test]
+    async fn write_gates_and_utility_routes() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let d = doc("com.acme/wg", "1.0.0", serde_json::json!({}));
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        env.fx.set_promotion_only(true).await;
+        let (s, b, _) = call(
+            env.member(),
+            "PATCH",
+            &env.url("/servers/com.acme%2Fwg/versions/1.0.0/status"),
+            Some(&serde_json::json!({"status": "deprecated"})),
+        )
+        .await;
+        assert_eq!(
+            (s, json(&b)["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_promotion_only"))
+        );
+        env.fx.set_promotion_only(false).await;
+        let id = env.server_artifact("com.acme/wg", "1.0.0").await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let mut changed = d.clone();
+        changed["description"] = "Different bytes".into();
+        let (s, b) = env.publish(&changed).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_version_exists"))
+        );
+        let npm = env.repo("local", "npm").await;
+        for tail in ["ping", "health", "version"] {
+            let (s, b, h) = call(
+                env.anon(),
+                "GET",
+                &format!("/{}/v0.1/{tail}", npm.key),
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{tail}");
+            assert_eq!(&b[..], fmt::NOT_FOUND_BODY.as_bytes());
+            assert_refusal_headers(&h);
+        }
+        env.teardown().await;
+    }
+
+    /// Generic artifact writes into an MCP registry are refused (they would
+    /// bypass validation, namespace policy and pinning); trusted
+    /// replication still lands.
+    #[test]
+    fn generic_writes_into_an_mcp_registry_are_refused() {
+        use crate::api::handlers::repositories::reject_generic_write_to_mcp;
+        use crate::models::repository::RepositoryFormat;
+        let user = tdh::make_auth(Uuid::new_v4(), "u");
+        let admin = tdh::admin_auth(Uuid::new_v4(), "a");
+        let plain = HeaderMap::new();
+        let mut replication = HeaderMap::new();
+        replication.insert(
+            "x-artifact-keeper-replication",
+            HeaderValue::from_static("true"),
+        );
+        let refused = reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &user, &plain)
+            .expect_err("a member's generic write");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &admin, &plain).is_err());
+        assert!(reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &user, &replication).is_err());
+        assert!(reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &admin, &replication).is_ok());
+        assert!(reject_generic_write_to_mcp(&RepositoryFormat::Npm, &user, &plain).is_ok());
+    }
+
+    /// Refusals from the shared middleware on `/mcp/` paths are
+    /// problem+json with `no-store` and the read CORS headers; other paths
+    /// are untouched; a refusal the router re-renders keeps its CORS header.
+    #[tokio::test]
+    async fn surface_guard_and_cors_order() {
+        let plain = |status: StatusCode| async move {
+            let mut r = (status, "plain text").into_response();
+            r.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"ak\""),
+            );
+            r.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("7"));
+            r
+        };
+        let app = Router::new()
+            .route(
+                "/mcp/r/v0.1/servers",
+                get(move || plain(StatusCode::UNAUTHORIZED)),
+            )
+            .route(
+                "/mcp/r/v0.1/limited",
+                get(move || plain(StatusCode::TOO_MANY_REQUESTS)),
+            )
+            .route(
+                "/mcp/r/v0.1/hidden",
+                get(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route("/npm/r/x", get(move || plain(StatusCode::UNAUTHORIZED)))
+            .layer(axum::middleware::from_fn(mcp_surface_guard));
+        let send = |uri: &str| {
+            tdh::send_with_headers(
+                app.clone(),
+                Request::builder()
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://github.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let (s, b, h) = send("/mcp/r/v0.1/servers").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        assert_refusal_headers(&h);
+        assert_eq!(json(&b)["error"], "mcp_unauthorized");
+        assert_eq!(h[header::WWW_AUTHENTICATE], "Bearer realm=\"ak\"");
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        let (s, b, h) = send("/mcp/r/v0.1/limited").await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        assert_refusal_headers(&h);
+        assert_eq!(json(&b)["error"], "mcp_rate_limited");
+        assert_eq!(h[header::RETRY_AFTER], "7");
+        let (_, _, h) = send("/npm/r/x").await;
+        assert_eq!(h[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+        assert!(h.get(header::CACHE_CONTROL).is_none());
+
+        // A middleware 404 carries the headers of the router's own
+        // unknown-name answer, so the two cannot be told apart.
+        let (s, b, guarded) = send("/mcp/r/v0.1/hidden").await;
+        assert_eq!(
+            (s, &b[..]),
+            (StatusCode::NOT_FOUND, fmt::NOT_FOUND_BODY.as_bytes())
+        );
+        let own = Router::new()
+            .route("/mcp/r/v0.1/hidden", get(|| async { not_found() }))
+            .layer(read_cors());
+        let (_, own_b, own_h) = tdh::send_with_headers(
+            own,
+            Request::builder()
+                .uri("/mcp/r/v0.1/hidden")
+                .header(header::ORIGIN, "https://github.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(own_b, b);
+        let names = |h: &HeaderMap| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = h
+                .iter()
+                .filter(|(k, _)| *k != header::CONTENT_LENGTH && *k != header::DATE)
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&guarded), names(&own_h));
+
+        // Inside the router: a re-rendered refusal on a read route keeps the
+        // read CORS header (ensure_problem sits inside read_cors).
+        let Some(env) = Env::new().await else { return };
+        let (s, _, h) = tdh::send_with_headers(
+            env.anon(),
+            Request::builder()
+                .method("DELETE")
+                .uri(env.url("/servers"))
+                .header(header::ORIGIN, "https://github.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
+        assert_refusal_headers(&h);
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         env.teardown().await;
     }
 }

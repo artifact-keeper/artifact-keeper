@@ -4371,6 +4371,7 @@ pub async fn create_repository(
         .map_err(|m| AppError::Validation(m.to_string()))?;
     let mcp_settings = crate::services::mcp_packages::settings_to_store(
         &state.db,
+        &auth,
         &format,
         payload.mcp_package_policy.as_deref(),
         payload.mcp_package_repos.as_ref(),
@@ -5539,6 +5540,7 @@ pub async fn update_repository(
     // MCP registry settings (#5253): validated before the update.
     let mcp_settings = crate::services::mcp_packages::settings_to_store(
         &state.db,
+        &auth,
         &existing.format,
         payload.mcp_package_policy.as_deref(),
         payload.mcp_package_repos.as_ref(),
@@ -10064,6 +10066,7 @@ pub async fn upload_artifact(
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // #4186: refuse a conditional PUT whose precondition already fails
     // before reading its body. Not authoritative (the publishing transaction
@@ -10541,6 +10544,35 @@ pub(crate) async fn materialize_staged_for_repo<'a>(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
+/// MCP registries (#5253) accept a server version only through their publish
+/// route, which validates the document, applies the namespace policy and
+/// pins its packages. A generic write of `servers/<name>/<version>/...` would
+/// skip all of that (and squat the version), so the generic upload entry
+/// points refuse an MCP repository. A trusted peer replication (admin or
+/// service account) still lands, so MCP repositories replicate like any
+/// other.
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_generic_write_to_mcp(
+    format: &RepositoryFormat,
+    auth: &AuthExtension,
+    headers: &HeaderMap,
+) -> std::result::Result<(), Response> {
+    let trusted = replication_exemption_trusted(
+        super::is_replication_request(headers),
+        auth.is_admin,
+        auth.is_service_account,
+    );
+    if format == &RepositoryFormat::Mcp && !trusted {
+        return Err(AppError::Validation(
+            "MCP registries accept server versions only through \
+             POST /mcp/{repository}/v0.1/publish"
+                .to_string(),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
 pub(crate) async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
@@ -10924,6 +10956,7 @@ async fn upload_artifact_multipart_with_path(
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // The URL path is the artifact path unless empty, when the uploaded file
     // name is; either is known by the time the file field streams (#3916).
@@ -10973,6 +11006,7 @@ async fn upload_artifact_multipart(
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // The artifact path may arrive in a `path` field after the file, so the
     // file stages before its path is known (#3916).

@@ -1370,6 +1370,12 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
             }
         })
+        // #5253: a refusal the shared middleware gives on an `/mcp/` path is
+        // re-rendered as problem+json with `no-store` (and the read routes'
+        // CORS headers); every other path passes through untouched.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_surface_guard,
+        ))
         // #5253: MCP registry read routes answer cross-origin preflights
         // themselves (any origin, GET only, no credentials); the instance CORS
         // layer above would otherwise answer them same-origin.
