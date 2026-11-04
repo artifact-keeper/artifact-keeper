@@ -907,11 +907,14 @@ setting read-only otherwise. The same responses carry
 `mcp_caller_is_repo_admin`: `true` when the caller administers the
 repository (the repository `admin` action, through a grant or a role such
 as `repository-owner`, or an instance administrator). It is the check the
-routes themselves apply to repository administration (admin edit and delete
-of a version, catalog decisions, pins and bulk decisions, a sync trigger, an
+routes themselves apply to repository administration (admin edit of a
+version, catalog decisions, pins and bulk decisions, a sync trigger, an
 introspection request), so a UI can show those controls exactly when they
 will be accepted; a caller without it gets `403` (`mcp_forbidden` on the
-`/v0.1` surface). Also omitted for other formats and on the list.
+`/v0.1` surface). Soft delete (`DELETE .../versions/{version}`) and status
+changes need only repository `write` (plus the namespace gate), so a UI must
+not hide them behind this flag. Also omitted for other formats and on the
+list.
 
 ## Repository settings (Phase 2 and 3)
 
