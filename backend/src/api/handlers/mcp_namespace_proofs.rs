@@ -23,6 +23,14 @@ pub fn router() -> Router<SharedState> {
         .route("/:id/verify", post(verify))
 }
 
+/// The OpenAPI paths of the namespace-proof admin API.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(list, get_one, create, remove, verify),
+    components(schemas(CreateProof))
+)]
+pub struct McpNamespaceProofsApiDoc;
+
 /// One proof as stored.
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ProofRow {
@@ -59,7 +67,7 @@ fn to_json(r: &ProofRow) -> serde_json::Value {
     })
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateProof {
     pub namespace: String,
@@ -92,6 +100,18 @@ async fn fetch(state: &SharedState, id: Uuid) -> Result<ProofRow> {
     .ok_or_else(|| AppError::NotFound("Namespace proof not found".into()))
 }
 
+#[utoipa::path(
+    get,
+    operation_id = "mcp_list_namespace_proofs",
+    path = "",
+    context_path = "/api/v1/admin/mcp/namespace-proofs",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, body = Object, description = "`{items: [Proof]}`, at most 1000, by namespace"),
+        (status = 403, description = "Not an instance administrator"),
+    )
+)]
 async fn list(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -108,6 +128,20 @@ async fn list(
     ))
 }
 
+#[utoipa::path(
+    get,
+    operation_id = "mcp_get_namespace_proof",
+    path = "/{id}",
+    context_path = "/api/v1/admin/mcp/namespace-proofs",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Proof id")),
+    responses(
+        (status = 200, body = Object, description = "The proof"),
+        (status = 403, description = "Not an instance administrator"),
+        (status = 404, description = "Unknown proof"),
+    )
+)]
 async fn get_one(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -117,6 +151,20 @@ async fn get_one(
     Ok(Json(to_json(&fetch(&state, id).await?)))
 }
 
+#[utoipa::path(
+    post,
+    operation_id = "mcp_create_namespace_proof",
+    path = "",
+    context_path = "/api/v1/admin/mcp/namespace-proofs",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    request_body = CreateProof,
+    responses(
+        (status = 200, body = Object, description = "The new proof (`status: pending`) with its challenge"),
+        (status = 400, description = "Another method, or a namespace that is not reverse-DNS"),
+        (status = 403, description = "Not an instance administrator"),
+    )
+)]
 async fn create(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -139,6 +187,20 @@ async fn create(
     Ok(Json(to_json(&row)))
 }
 
+#[utoipa::path(
+    delete,
+    operation_id = "mcp_delete_namespace_proof",
+    path = "/{id}",
+    context_path = "/api/v1/admin/mcp/namespace-proofs",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Proof id")),
+    responses(
+        (status = 200, description = "Deleted"),
+        (status = 403, description = "Not an instance administrator"),
+        (status = 404, description = "Unknown proof"),
+    )
+)]
 async fn remove(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
@@ -157,6 +219,20 @@ async fn remove(
 }
 
 /// Check the proof now (outbound, SSRF-guarded), record and audit the result.
+#[utoipa::path(
+    post,
+    operation_id = "mcp_verify_namespace_proof",
+    path = "/{id}/verify",
+    context_path = "/api/v1/admin/mcp/namespace-proofs",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Proof id")),
+    responses(
+        (status = 200, body = Object, description = "The proof with `status` `verified` or `failed` (`last_error` says why)"),
+        (status = 403, description = "Not an instance administrator"),
+        (status = 404, description = "Unknown proof"),
+    )
+)]
 async fn verify(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,

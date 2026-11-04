@@ -37,10 +37,33 @@ pub fn repo_router() -> Router<SharedState> {
         )
 }
 
+/// The OpenAPI paths of the server-health roll-up.
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(health_encoded, health_split))]
+pub struct McpHealthApiDoc;
+
 fn not_found() -> AppError {
     AppError::NotFound("MCP server version not found".to_string())
 }
 
+#[utoipa::path(
+    get,
+    operation_id = "mcp_server_health",
+    path = "/{key}/mcp/servers/{name}/versions/{version}/health",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(
+        ("key" = String, Path, description = "MCP repository key (Local, Staging or Remote)"),
+        ("name" = String, Path, description = "Server name, URL-encoded (`com.acme%2Fweather`)"),
+        ("version" = String, Path, description = "Exact version"),
+        ("include_deleted" = Option<bool>, Query, description = "Also answer a soft-deleted version"),
+    ),
+    responses(
+        (status = 200, body = Object, description = "The version's health roll-up (see docs/mcp-registry.md, Server health)"),
+        (status = 400, description = "`include_deleted` is not `true` or `false`"),
+        (status = 404, description = "Not visible to the caller, not an MCP repository, unknown or deleted version"),
+    )
+)]
 async fn health_encoded(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -50,6 +73,25 @@ async fn health_encoded(
     health_impl(&state, auth.as_ref(), &key, &name, &version, &q).await
 }
 
+#[utoipa::path(
+    get,
+    operation_id = "mcp_server_health_split",
+    path = "/{key}/mcp/servers/{ns}/{name}/versions/{version}/health",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(
+        ("key" = String, Path, description = "MCP repository key (Local, Staging or Remote)"),
+        ("ns" = String, Path, description = "Server namespace (`com.acme`)"),
+        ("name" = String, Path, description = "Server name within the namespace (`weather`)"),
+        ("version" = String, Path, description = "Exact version"),
+        ("include_deleted" = Option<bool>, Query, description = "Also answer a soft-deleted version"),
+    ),
+    responses(
+        (status = 200, body = Object, description = "The version's health roll-up"),
+        (status = 400, description = "`include_deleted` is not `true` or `false`"),
+        (status = 404, description = "Not visible to the caller, not an MCP repository, unknown or deleted version"),
+    )
+)]
 async fn health_split(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,

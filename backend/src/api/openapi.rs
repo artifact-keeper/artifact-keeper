@@ -233,6 +233,18 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "mcp_remote",
             handlers::mcp_remote::McpRemoteApiDoc::openapi(),
         ),
+        (
+            "mcp_health",
+            handlers::mcp_health::McpHealthApiDoc::openapi(),
+        ),
+        (
+            "mcp_namespace_proofs",
+            handlers::mcp_namespace_proofs::McpNamespaceProofsApiDoc::openapi(),
+        ),
+        (
+            "mcp_introspection_worker",
+            handlers::mcp_capabilities::McpIntrospectionWorkerApiDoc::openapi(),
+        ),
         ("transfer", handlers::transfer::TransferApiDoc::openapi()),
         ("tree", handlers::tree::TreeApiDoc::openapi()),
         (

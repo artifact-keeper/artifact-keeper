@@ -86,6 +86,11 @@ pub fn router() -> Router<SharedState> {
 
 /// The worker routes, nested at `/api/v1/mcp/introspection` behind
 /// `auth_middleware`.
+/// The OpenAPI paths of the introspection worker API.
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(claim_job, complete_job))]
+pub struct McpIntrospectionWorkerApiDoc;
+
 pub fn worker_router() -> Router<SharedState> {
     Router::new()
         .route("/jobs/claim", post(claim_job))
@@ -756,6 +761,22 @@ pub fn job_limits(kind: JobKind) -> Value {
     }
 }
 
+#[utoipa::path(
+    post,
+    operation_id = "mcp_introspection_claim_job",
+    path = "/jobs/claim",
+    context_path = "/api/v1/mcp/introspection",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    request_body(content = Object, description = "`{kinds?: [\"remote_probe\" | \"sandbox_run\"], workerId?}`"),
+    responses(
+        (status = 200, body = Object, description = "A claimed job: jobId, claimToken, kind, target and limits"),
+        (status = 204, description = "Nothing is due"),
+        (status = 400, description = "Malformed request"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not an `mcp:introspect` API token (`mcp_forbidden`)"),
+    )
+)]
 async fn claim_job(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -829,6 +850,23 @@ async fn claim_payload(
     })))
 }
 
+#[utoipa::path(
+    post,
+    operation_id = "mcp_introspection_complete_job",
+    path = "/jobs/{id}/complete",
+    context_path = "/api/v1/mcp/introspection",
+    tag = "mcp",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "Job id")),
+    request_body(content = Object, description = "The worker's result: claimToken, outcome, the lists on success"),
+    responses(
+        (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, drift}` or `{status: \"retry\", notBefore}`"),
+        (status = 400, description = "Malformed result"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Not an `mcp:introspect` API token (`mcp_forbidden`)"),
+        (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim"),
+    )
+)]
 async fn complete_job(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
