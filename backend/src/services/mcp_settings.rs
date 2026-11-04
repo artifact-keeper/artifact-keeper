@@ -10,6 +10,10 @@
 //! can only be written by an instance administrator. While a lock is set,
 //! nobody else may change the locked setting (or the lock), so a repository
 //! administrator cannot relax the posture an instance administrator chose.
+//! The posture lock also covers `mcp_auto_approve_namespaces` (a standing
+//! approval is posture by another name) and namespace-spanning bulk
+//! approvals ([`spans_namespaces`]); the probe lock also covers
+//! `mcp_sandbox_introspection`.
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -184,24 +188,40 @@ pub fn validate_name_globs(key: &str, globs: &[String]) -> Result<Vec<String>> {
 /// `*` matches any run of characters (including `/`); everything else is
 /// literal, ASCII case-insensitive (server names are case-insensitive for
 /// policy purposes so `Com.Evil/x` cannot dodge `com.evil/*`).
+///
+/// Iterative two-pointer matcher: on a mismatch it resumes after the last
+/// `*`, one character further into the name, so the work is bounded by
+/// `pattern.len() * name.len()` (no exponential backtracking).
 pub fn glob_matches(pattern: &str, name: &str) -> bool {
-    fn go(p: &[u8], n: &[u8]) -> bool {
-        match p.split_first() {
-            None => n.is_empty(),
-            Some((b'*', rest)) => (0..=n.len()).any(|i| go(rest, &n[i..])),
-            Some((c, rest)) => n
-                .split_first()
-                .is_some_and(|(d, nr)| c.eq_ignore_ascii_case(d) && go(rest, nr)),
+    let (p, n) = (pattern.as_bytes(), name.as_bytes());
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // The position after the last `*` seen, and the name position it was
+    // tried against.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            pi += 1;
+            star = Some((pi, ni));
+        } else if pi < p.len() && p[pi].eq_ignore_ascii_case(&n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
         }
     }
-    // Collapse runs of `*` so the recursion stays linear in practice.
-    let mut p = String::with_capacity(pattern.len());
-    for c in pattern.chars() {
-        if !(c == '*' && p.ends_with('*')) {
-            p.push(c);
-        }
-    }
-    go(p.as_bytes(), name.as_bytes())
+    p[pi..].iter().all(|&c| c == b'*')
+}
+
+/// Whether a glob's namespace part (before the first `/`, or the whole glob
+/// when it has none) contains `*`: it then spans namespaces nobody named
+/// (`*`, `*/x`, `com.*`, `*.acme/*`), which a posture lock forbids to
+/// non-instance administrators.
+pub fn spans_namespaces(glob: &str) -> bool {
+    glob.split('/').next().unwrap_or_default().contains('*')
 }
 
 /// Whether any glob in `globs` matches `name`.
@@ -288,8 +308,14 @@ pub fn to_store(
         if locks.posture && s.mcp_remote_posture.is_some() {
             return Err(lock_refusal(REMOTE_POSTURE_KEY));
         }
+        if locks.posture && s.mcp_auto_approve_namespaces.is_some() {
+            return Err(lock_refusal(AUTO_APPROVE_KEY));
+        }
         if locks.probe && s.mcp_probe_remotes.is_some() {
             return Err(lock_refusal(PROBE_KEY));
+        }
+        if locks.probe && s.mcp_sandbox_introspection.is_some() {
+            return Err(lock_refusal(SANDBOX_KEY));
         }
     }
     let mut out = Vec::new();
@@ -557,6 +583,66 @@ mod tests {
             probe: true,
         };
         assert!(to_store(&probe, &mcp(), "local", false, probe_locked).is_err());
+    }
+
+    /// Review finding 6: the posture lock also covers the auto-approve list
+    /// (`["*"]` would otherwise approve everything under a locked
+    /// `approval_required`), and the probe lock covers sandbox runs.
+    #[test]
+    fn locks_cover_auto_approve_and_sandbox() {
+        let locked = Locks {
+            posture: true,
+            probe: true,
+        };
+        let auto = McpRepoSettings {
+            mcp_auto_approve_namespaces: Some(vec!["*".into()]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            to_store(&auto, &mcp(), "remote", false, locked),
+            Err(AppError::Authorization(_))
+        ));
+        assert!(to_store(&auto, &mcp(), "remote", true, locked).is_ok());
+        assert!(to_store(&auto, &mcp(), "remote", false, Locks::default()).is_ok());
+        let sandbox = McpRepoSettings {
+            mcp_sandbox_introspection: Some("on".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            to_store(&sandbox, &mcp(), "local", false, locked),
+            Err(AppError::Authorization(_))
+        ));
+        assert!(to_store(&sandbox, &mcp(), "local", true, locked).is_ok());
+        for (g, spans) in [
+            ("*", true),
+            ("*/x", true),
+            ("com.*", true),
+            ("*.acme/*", true),
+            ("com.acme", false),
+            ("com.acme/*", false),
+            ("com.acme/weather*", false),
+        ] {
+            assert_eq!(spans_namespaces(g), spans, "{g}");
+        }
+    }
+
+    /// Review finding 16: the matcher is linear-ish, not exponential, on a
+    /// pathological pattern, and keeps the old semantics.
+    #[test]
+    fn glob_matching_does_not_backtrack_exponentially() {
+        let pattern = format!("{}b", "*a".repeat(40));
+        let name = "a".repeat(200);
+        let start = std::time::Instant::now();
+        assert!(!glob_matches(&pattern, &name));
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        assert!(glob_matches("*a*b*", "xxaYYbzz"));
+        assert!(glob_matches("a*", "a"));
+        assert!(glob_matches("*", ""));
+        assert!(!glob_matches("a", ""));
+        assert!(!glob_matches("", "a"));
+        assert!(glob_matches("a*c", "abbbc"));
+        assert!(!glob_matches("a*c", "abbbd"));
+        assert!(glob_matches("A*/X", "a.b/x"));
     }
 
     #[test]

@@ -20,7 +20,8 @@ use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::services::mcp_catalog::{
-    self as catalog, BulkResult, CatalogItem, CatalogPage, CatalogQuery, Decision, DecisionResult,
+    self as catalog, BulkResult, CatalogItem, CatalogPage, CatalogQuery, CatalogView, Decision,
+    DecisionResult,
 };
 use crate::services::mcp_remote::{self, SyncError, SyncState, SyncSummary};
 use crate::services::repository_service::RepositoryService;
@@ -98,6 +99,25 @@ async fn administered_repo(
     remote_info(state, key).await
 }
 
+/// What of the catalog `auth` may see (see [`CatalogView`]): a repository
+/// administrator everything; a caller who holds the repository (the MCP
+/// surface's reason gate) the decision detail; anyone else who can see the
+/// repository only the upstream entries and their decisions.
+async fn catalog_view(state: &SharedState, auth: &AuthExtension, repo: &RepoInfo) -> CatalogView {
+    if require_repo_admin(auth, repo.id, &state.permission_service)
+        .await
+        .is_ok()
+    {
+        return CatalogView::Curator;
+    }
+    match crate::api::handlers::quarantine::caller_passes_reason_gate(&state.db, auth, repo.id)
+        .await
+    {
+        Ok(true) => CatalogView::Holder,
+        _ => CatalogView::Reader,
+    }
+}
+
 async fn remote_info(state: &SharedState, key: &str) -> Result<RepoInfo> {
     let repo = proxy_helpers::resolve_repo_by_key(&state.db, key, &["mcp"], "an MCP registry")
         .await
@@ -129,7 +149,12 @@ pub async fn list_catalog(
     let auth = require_auth(auth)?;
     let repo = readable_repo(&state, &auth, &key).await?;
     let filter = catalog::parse_query(&q)?;
-    Ok(Json(catalog::list(&state.db, &repo, &filter).await?))
+    let view = catalog_view(&state, &auth, &repo).await;
+    Ok(Json(
+        catalog::list(&state.db, &repo, &filter)
+            .await?
+            .for_view(view),
+    ))
 }
 
 async fn get_server(
@@ -140,7 +165,12 @@ async fn get_server(
 ) -> Result<Json<CatalogItem>> {
     let auth = require_auth(auth)?;
     let repo = readable_repo(state, &auth, key).await?;
-    Ok(Json(catalog::item_by_name(&state.db, &repo, name).await?))
+    let view = catalog_view(state, &auth, &repo).await;
+    Ok(Json(
+        catalog::item_by_name(&state.db, &repo, name)
+            .await?
+            .for_view(view),
+    ))
 }
 
 #[utoipa::path(
@@ -242,6 +272,19 @@ pub async fn bulk_approve(
 ) -> Result<Json<BulkResult>> {
     let auth = require_auth(auth)?;
     let repo = administered_repo(&state, &auth, &key).await?;
+    // Under an instance posture lock, only an instance administrator may
+    // bulk-approve across namespaces nobody named (`*`, `com.*`, ...).
+    if !auth.is_admin && crate::services::mcp_settings::spans_namespaces(req.pattern.trim()) {
+        let rows = crate::services::mcp_settings::load_rows(&state.db, repo.id).await?;
+        if crate::services::mcp_settings::locks_of(&rows).posture {
+            return Err(AppError::Authorization(format!(
+                "{} is locked by an instance administrator for this repository: a bulk \
+                 approval may not span namespaces (`{}`); name the namespace",
+                crate::services::mcp_settings::REMOTE_POSTURE_KEY,
+                req.pattern.trim()
+            )));
+        }
+    }
     Ok(Json(
         catalog::approve_pattern(
             &state,
@@ -325,8 +368,11 @@ pub async fn request_approval(
     let auth = require_auth(auth)?;
     let repo = readable_repo(&state, &auth, &key).await?;
     let note = body.and_then(|b| b.0.note);
+    let view = catalog_view(&state, &auth, &repo).await;
     Ok(Json(
-        catalog::request_approval(&state.db, &repo, id, auth.user_id, note.as_deref()).await?,
+        catalog::request_approval(&state.db, &repo, id, auth.user_id, note.as_deref())
+            .await?
+            .for_view(view),
     ))
 }
 
@@ -814,6 +860,171 @@ mod tests {
             .unwrap()
             .iter()
             .any(|i| i["id"] == a_id.as_str()));
+        env.teardown().await;
+    }
+
+    /// Review findings 6, 8, 18 and 19 on the management API: what a reader,
+    /// a holder and a curator see of the catalog; namespace-spanning bulk
+    /// approval under a posture lock; a bulk approval never overwrites a
+    /// decision written since its selection.
+    #[tokio::test]
+    async fn catalog_views_locks_and_bulk_races() {
+        let Some(env) = Env::new().await else { return };
+        let all = vec![
+            entry(
+                server("io.github.acme/a", "1.0.0", serde_json::json!({})),
+                T1,
+            ),
+            entry(server("com.other/c", "1.0.0", serde_json::json!({})), T1),
+        ];
+        env.serve(Mock::given(method("GET")).and(path("/v0.1/servers")), all)
+            .await;
+        env.sync().await;
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let a = env.item("io.github.acme%2Fa").await;
+        let a_id = a["id"].as_str().unwrap().to_string();
+        // The holder (a repository member) asks, with a note.
+        let holder = tdh::make_auth(env.fx.user_id, &env.fx.username);
+        let (s, b) = env
+            .call(
+                Some(holder.clone()),
+                "POST",
+                &format!("/r/{}/mcp/catalog/{a_id}/request-approval", env.fx.repo_key),
+                Some(serde_json::json!({"note": "secret project name"})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["approvalRequests"], serde_json::json!({"count": 1}));
+        let (reader_id, reader_name) = tdh::create_user(&env.fx.pool).await;
+        let reader = tdh::make_auth(reader_id, &reader_name);
+        let get = |auth: AuthExtension| {
+            let uri = format!(
+                "/r/{}/mcp/catalog/servers/io.github.acme%2Fa",
+                env.fx.repo_key
+            );
+            let env = &env;
+            async move { env.call(Some(auth), "GET", &uri, None).await }
+        };
+        let (s, r) = get(reader.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{r}");
+        assert_eq!(r["approvalRequests"], serde_json::json!({"count": 1}));
+        assert!(r.get("denied").is_none(), "{r}");
+        assert!(r["evaluatedBy"].is_null() && r["evaluationReason"].is_null());
+        assert_eq!(r["flags"], serde_json::json!({}));
+        let (_, h) = get(holder.clone()).await;
+        assert_eq!(h["approvalRequests"], serde_json::json!({"count": 1}));
+        assert_eq!(h["denied"], false);
+        let c = env.item("io.github.acme%2Fa").await;
+        assert_eq!(c["approvalRequests"]["lastNote"], "secret project name");
+        let (s, page) = env
+            .call(
+                Some(reader.clone()),
+                "GET",
+                &format!("/r/{}/mcp/catalog", env.fx.repo_key),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(page.to_string().find("secret project name").is_none());
+
+        // Posture lock: a repository owner may not bulk-approve `*`.
+        env.config(
+            crate::services::mcp_settings::REMOTE_POSTURE_LOCKED_KEY,
+            "true",
+        )
+        .await;
+        let (owner_id, owner_name) = tdh::create_user(&env.fx.pool).await;
+        tdh::grant_repo_role(&env.fx.pool, env.fx.repo_id, owner_id, "repository-owner").await;
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let bulk = |auth: AuthExtension, pattern: &str| {
+            let uri = format!("/r/{}/mcp/catalog/bulk-approve", env.fx.repo_key);
+            let body = serde_json::json!({"pattern": pattern});
+            let env = &env;
+            async move { env.call(Some(auth), "POST", &uri, Some(body)).await }
+        };
+        let (s, b) = bulk(owner.clone(), "*").await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+        let (s, b) = bulk(owner.clone(), "io.github.acme").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["approved"], 1);
+        let (s, b) = bulk(env.admin.clone(), "*").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+
+        // A row blocked after selection is not approved by the bulk write.
+        let c_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM curation_packages WHERE staging_repo_id = $1 \
+             AND package_name = 'com.other/c' AND version = '*'",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE curation_packages SET status = 'blocked' WHERE id = $1")
+            .bind(c_id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let approved = catalog::approve_rows_for_tests(
+            &env.fx.pool,
+            &[c_id],
+            &["pending", "review"],
+            env.admin.user_id,
+        )
+        .await;
+        assert!(approved.is_empty());
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM curation_packages WHERE id = $1")
+                .bind(c_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "blocked");
+
+        for u in [reader_id, owner_id] {
+            let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+                .bind(u)
+                .execute(&env.fx.pool)
+                .await;
+            tdh::cleanup_user(&env.fx.pool, u).await;
+        }
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&env.fx.pool)
+            .await;
+        env.teardown().await;
+    }
+
+    /// Review finding 17: a squat sorting before its target on the same
+    /// page is still caught, and both names go to review.
+    #[tokio::test]
+    async fn lookalikes_are_flagged_whatever_the_order() {
+        let Some(env) = Env::new().await else { return };
+        let all = vec![
+            entry(
+                server("io.github.acm3/tool", "1.0.0", serde_json::json!({})),
+                T1,
+            ),
+            entry(
+                server("io.github.acme/tool", "1.0.0", serde_json::json!({})),
+                T1,
+            ),
+        ];
+        env.serve(Mock::given(method("GET")).and(path("/v0.1/servers")), all)
+            .await;
+        let summary = env.sync().await;
+        assert_eq!(summary["flagged"], 2, "{summary}");
+        let squat = env.item("io.github.acm3%2Ftool").await;
+        let target = env.item("io.github.acme%2Ftool").await;
+        assert_eq!(squat["status"], "review", "{squat}");
+        assert_eq!(
+            squat["flags"]["typosquat"]["similarTo"],
+            "io.github.acme/tool"
+        );
+        assert_eq!(target["status"], "review", "{target}");
+        assert_eq!(
+            target["flags"]["typosquat"]["similarTo"],
+            "io.github.acm3/tool"
+        );
         env.teardown().await;
     }
 

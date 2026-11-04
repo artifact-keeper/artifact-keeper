@@ -177,7 +177,9 @@ pub struct CatalogItem {
     /// `pending` | `approved` | `blocked` | `review`.
     pub status: String,
     /// The name matches `mcp_server_deny`: never served, whatever `status`.
-    pub denied: bool,
+    /// Absent for callers who do not hold the repository ([`CatalogView`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denied: Option<bool>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub latest_version: Option<String>,
@@ -187,7 +189,9 @@ pub struct CatalogItem {
     /// `{"typosquat": {"similarTo": "<name>"}}` and similar ingest flags.
     #[schema(value_type = Object)]
     pub flags: serde_json::Value,
-    /// `{count, lastRequestedAt, lastRequestedBy, lastNote}`.
+    /// `{count}` for every caller; a repository administrator also gets
+    /// `{lastRequestedAt, lastRequestedBy, lastNote, requesters}` (one entry
+    /// per requester: `{at, note}`).
     #[schema(value_type = Object)]
     pub approval_requests: serde_json::Value,
     pub evaluation_reason: Option<String>,
@@ -196,6 +200,67 @@ pub struct CatalogItem {
     pub first_seen_at: DateTime<Utc>,
     pub pins: Vec<CatalogPin>,
     pub ingested: Vec<CatalogVersion>,
+}
+
+/// How much of a catalog item a caller may see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogView {
+    /// Can see the repository but does not hold it: the upstream entry and
+    /// its decision only. Decision reasons, who decided, ingest flags, the
+    /// deny-list match, unresolved packages and approval-request details are
+    /// stripped (`approvalRequests` keeps `count`).
+    Reader,
+    /// Holds the repository (the reason gate of the MCP surface): reasons,
+    /// flags and ingest detail, but not other users' identities or notes.
+    Holder,
+    /// A repository administrator: everything.
+    Curator,
+}
+
+impl CatalogItem {
+    /// The item as `view` may see it (pure).
+    pub fn for_view(mut self, view: CatalogView) -> Self {
+        if view == CatalogView::Curator {
+            return self;
+        }
+        let count = self
+            .approval_requests
+            .get("count")
+            .cloned()
+            .unwrap_or_else(|| 0.into());
+        self.approval_requests = if self
+            .approval_requests
+            .as_object()
+            .is_some_and(|o| o.is_empty())
+        {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "count": count })
+        };
+        self.evaluated_by = None;
+        if view == CatalogView::Holder {
+            return self;
+        }
+        self.denied = None;
+        self.flags = serde_json::json!({});
+        self.evaluation_reason = None;
+        for p in &mut self.pins {
+            p.evaluation_reason = None;
+            p.content_drift = None;
+        }
+        for v in &mut self.ingested {
+            v.unresolved = Vec::new();
+        }
+        self
+    }
+}
+
+impl CatalogPage {
+    /// The page as `view` may see it.
+    pub fn for_view(mut self, view: CatalogView) -> Self {
+        self.items = self.items.into_iter().map(|i| i.for_view(view)).collect();
+        self
+    }
 }
 
 /// One catalog page.
@@ -251,7 +316,7 @@ fn item_of(
     CatalogItem {
         id: row.id,
         namespace: crate::formats::mcp::namespace_of(&row.package_name).to_string(),
-        denied: cur::is_denied(&policy.deny, &row.package_name),
+        denied: Some(cur::is_denied(&policy.deny, &row.package_name)),
         status: row.status,
         title: text(m, "title"),
         description: text(m, "description"),
@@ -755,18 +820,15 @@ pub async fn approve_pattern(
     let reason = reason
         .map(str::to_string)
         .unwrap_or_else(|| format!("bulk-approved by pattern {pattern}"));
-    sqlx::query(
-        "UPDATE curation_packages SET status = 'approved', evaluation_reason = $2, \
-                evaluated_by = $3, evaluated_at = now(), \
-                metadata = metadata || '{\"needsIngest\": true}' \
-         WHERE id = ANY($1)",
-    )
-    .bind(&ids)
-    .bind(&reason)
-    .bind(actor)
-    .execute(&state.db)
-    .await
-    .map_err(db)?;
+    // Only rows still in the state they were selected in: a block (or any
+    // other decision) written concurrently since the SELECT wins.
+    let allowed: &[&str] = if include_review {
+        &[STATUS_PENDING, STATUS_REVIEW]
+    } else {
+        &[STATUS_PENDING]
+    };
+    let updated = approve_rows(&state.db, &ids, allowed, &reason, actor).await?;
+    take.retain(|t| updated.contains(&t.0));
     for (id, name) in &take {
         mcp_remote::audit(
             &state.db,
@@ -795,6 +857,43 @@ pub async fn approve_pattern(
         skipped_denied,
         skipped_review,
     })
+}
+
+/// Approve the rows `ids` that are still in one of `allowed` statuses (a
+/// decision written since they were selected wins); the ids approved.
+async fn approve_rows(
+    db_pool: &PgPool,
+    ids: &[Uuid],
+    allowed: &[&str],
+    reason: &str,
+    actor: Uuid,
+) -> Result<Vec<Uuid>> {
+    sqlx::query_scalar(
+        "UPDATE curation_packages SET status = 'approved', evaluation_reason = $2, \
+                evaluated_by = $3, evaluated_at = now(), \
+                metadata = metadata || '{\"needsIngest\": true}' \
+         WHERE id = ANY($1) AND status = ANY($4) RETURNING id",
+    )
+    .bind(ids)
+    .bind(reason)
+    .bind(actor)
+    .bind(allowed)
+    .fetch_all(db_pool)
+    .await
+    .map_err(db)
+}
+
+/// [`approve_rows`] for tests in other modules.
+#[cfg(test)]
+pub(crate) async fn approve_rows_for_tests(
+    db_pool: &PgPool,
+    ids: &[Uuid],
+    allowed: &[&str],
+    actor: Uuid,
+) -> Vec<Uuid> {
+    approve_rows(db_pool, ids, allowed, "test", actor)
+        .await
+        .expect("approve rows")
 }
 
 /// Ingest approved names in the background (a bulk approval), clearing each
@@ -844,20 +943,66 @@ pub async fn request_approval(
         ));
     }
     let note = note.map(|n| n.chars().take(500).collect::<String>());
+    let mut tx = db_pool.begin().await.map_err(db)?;
+    let current: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT metadata->'approvalRequests' FROM curation_packages WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db)?;
+    let next = next_approval_requests(current.as_ref(), user, note.as_deref(), Utc::now());
     sqlx::query(
-        "UPDATE curation_packages SET metadata = jsonb_set(metadata, '{approvalRequests}', \
-             jsonb_build_object( \
-               'count', COALESCE((metadata->'approvalRequests'->>'count')::int, 0) + 1, \
-               'lastRequestedAt', now(), 'lastRequestedBy', $2::text, 'lastNote', $3::text)) \
+        "UPDATE curation_packages SET metadata = jsonb_set(metadata, '{approvalRequests}', $2) \
          WHERE id = $1",
     )
     .bind(id)
-    .bind(user.to_string())
-    .bind(note)
-    .execute(db_pool)
+    .bind(next)
+    .execute(&mut *tx)
     .await
     .map_err(db)?;
+    tx.commit().await.map_err(db)?;
     item_by_name(db_pool, repo, &row.package_name).await
+}
+
+/// Requesters remembered per name; later requesters are counted only once
+/// the list has room.
+pub const MAX_REQUESTERS: usize = 100;
+
+/// The `approvalRequests` document after `user` asks (pure). Each requester
+/// keeps one entry (`requesters.<user id> = {at, note}`), so a reader can
+/// replace only their own note, and `count` is the number of distinct
+/// requesters: asking again updates the entry without counting twice.
+pub fn next_approval_requests(
+    current: Option<&serde_json::Value>,
+    user: Uuid,
+    note: Option<&str>,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let mut requesters = current
+        .and_then(|c| c.get("requesters"))
+        .and_then(|r| r.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut count = current
+        .and_then(|c| c.get("count"))
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    let key = user.to_string();
+    let entry = serde_json::json!({"at": now, "note": note});
+    if requesters.contains_key(&key) {
+        requesters.insert(key.clone(), entry);
+    } else if requesters.len() < MAX_REQUESTERS {
+        requesters.insert(key.clone(), entry);
+        count += 1;
+    }
+    serde_json::json!({
+        "count": count,
+        "lastRequestedAt": now,
+        "lastRequestedBy": key,
+        "lastNote": note,
+        "requesters": requesters,
+    })
 }
 
 /// What follows a status write on curation rows through the generic
@@ -1085,7 +1230,7 @@ mod tests {
             )],
             Vec::new(),
         );
-        assert!(item.denied);
+        assert_eq!(item.denied, Some(true));
         assert_eq!(item.namespace, "com.acme");
         assert_eq!(item.latest_version.as_deref(), Some("2.0.0"));
         assert_eq!(item.versions, ["2.0.0", "1.0.0"]);
@@ -1097,5 +1242,65 @@ mod tests {
             item.pins[0].evaluation_reason.as_deref(),
             Some("content drift")
         );
+
+        // Review finding 8: what a non-holder and a holder may see.
+        let mut full = item.clone();
+        full.evaluation_reason = Some("blocked: typosquat of com.acrne/w".into());
+        full.evaluated_by = Some(Uuid::new_v4());
+        full.approval_requests =
+            next_approval_requests(None, Uuid::new_v4(), Some("pls"), Utc::now());
+        full.ingested = vec![CatalogVersion {
+            version: "1.0.0".into(),
+            artifact_id: Uuid::new_v4(),
+            upstream_status: "active".into(),
+            unresolved: vec![serde_json::json!({"index": 0})],
+        }];
+        assert_eq!(full.clone().for_view(CatalogView::Curator), full);
+        let reader = full.clone().for_view(CatalogView::Reader);
+        assert_eq!(reader.denied, None);
+        assert_eq!(reader.flags, serde_json::json!({}));
+        assert_eq!(reader.evaluation_reason, None);
+        assert_eq!(reader.evaluated_by, None);
+        assert_eq!(reader.approval_requests, serde_json::json!({"count": 1}));
+        assert_eq!(reader.pins[0].evaluation_reason, None);
+        assert!(reader.ingested[0].unresolved.is_empty());
+        let json = serde_json::to_value(&reader).unwrap();
+        assert!(json.get("denied").is_none(), "{json}");
+        let holder = full.clone().for_view(CatalogView::Holder);
+        assert_eq!(holder.denied, Some(true));
+        assert!(holder.evaluation_reason.is_some());
+        assert_eq!(holder.evaluated_by, None);
+        assert_eq!(holder.approval_requests, serde_json::json!({"count": 1}));
+        assert_eq!(holder.ingested[0].unresolved.len(), 1);
+        // A name nobody requested keeps the empty object.
+        assert_eq!(
+            item.for_view(CatalogView::Reader).approval_requests,
+            serde_json::json!({})
+        );
+    }
+
+    /// Review finding 19: one entry per requester; nobody overwrites another
+    /// requester's note, and asking again does not count twice.
+    #[test]
+    fn approval_requests_are_per_requester() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let now = Utc::now();
+        let one = next_approval_requests(None, a, Some("need it"), now);
+        assert_eq!(one["count"], 1);
+        let two = next_approval_requests(Some(&one), b, Some("me too"), now);
+        assert_eq!(two["count"], 2);
+        assert_eq!(two["requesters"][a.to_string()]["note"], "need it");
+        assert_eq!(two["lastRequestedBy"], b.to_string());
+        let again = next_approval_requests(Some(&two), a, Some("still"), now);
+        assert_eq!(again["count"], 2, "a repeat request is not counted twice");
+        assert_eq!(again["requesters"][a.to_string()]["note"], "still");
+        assert_eq!(again["requesters"][b.to_string()]["note"], "me too");
+        // The requester list is bounded.
+        let mut doc = serde_json::json!({});
+        for _ in 0..(MAX_REQUESTERS + 5) {
+            doc = next_approval_requests(Some(&doc), Uuid::new_v4(), None, now);
+        }
+        assert_eq!(doc["requesters"].as_object().unwrap().len(), MAX_REQUESTERS);
+        assert_eq!(doc["count"], MAX_REQUESTERS as u64);
     }
 }

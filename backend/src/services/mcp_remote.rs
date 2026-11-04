@@ -601,10 +601,15 @@ impl<'a> RunCtx<'a> {
 
 /// Names a lookalike is compared with: approved names and names with
 /// ingested versions in this repository.
+/// The names a newly seen name is compared with for lookalikes: every name
+/// of the catalog that is not blocked (approved, pending or in review) and
+/// every name with stored versions. Pending names count too, so which of a
+/// squat and its target the sync saw first does not decide which is flagged.
 async fn protected_names(db: &PgPool, repo_id: Uuid) -> Result<Vec<String>, String> {
     sqlx::query_scalar(
         "SELECT package_name FROM curation_packages \
-         WHERE staging_repo_id = $1 AND format = 'mcp' AND version = '*' AND status = 'approved' \
+         WHERE staging_repo_id = $1 AND format = 'mcp' AND version = '*' \
+           AND status IN ('approved', 'pending', 'review') \
          UNION SELECT name FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
     )
     .bind(repo_id)
@@ -1284,6 +1289,11 @@ async fn apply_page(
                 if let Some(target) = &lookalike {
                     meta["flags"] = serde_json::json!({"typosquat": {"similarTo": target}});
                     summary.flagged += 1;
+                    // The name it looks like may itself be the squat: a
+                    // still-pending target goes to review as well.
+                    if flag_pending_lookalike(&run.state.db, run.repo.id, target, name).await? {
+                        summary.flagged += 1;
+                    }
                 }
                 summary.names_new += 1;
                 let row = upsert_row(
@@ -1298,9 +1308,10 @@ async fn apply_page(
                     None,
                 )
                 .await?;
+                // Later names (this page or the next) are compared with it.
+                run.protected.push(name.to_string());
                 if status == STATUS_APPROVED {
                     summary.auto_approved += 1;
-                    run.protected.push(name.to_string());
                     audit(
                         &run.state.db,
                         AuditAction::McpServerApproved,
@@ -1375,6 +1386,33 @@ async fn apply_page(
         }
     }
     Ok(())
+}
+
+/// Move the PENDING name row `target` to review, flagged as a lookalike of
+/// `similar_to`; whether it moved.
+async fn flag_pending_lookalike(
+    db: &PgPool,
+    repo_id: Uuid,
+    target: &str,
+    similar_to: &str,
+) -> Result<bool, String> {
+    let moved = sqlx::query(
+        "UPDATE curation_packages SET status = 'review', \
+                evaluation_reason = 'lookalike of ' || $3 || '; review before approving', \
+                metadata = jsonb_set(metadata, '{flags}', \
+                    COALESCE(metadata->'flags', '{}'::jsonb) || \
+                    jsonb_build_object('typosquat', jsonb_build_object('similarTo', $3::text))) \
+         WHERE staging_repo_id = $1 AND format = 'mcp' AND version = '*' \
+           AND package_name = $2 AND status = 'pending'",
+    )
+    .bind(repo_id)
+    .bind(target)
+    .bind(similar_to)
+    .execute(db)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(moved > 0)
 }
 
 fn absorb(into: &mut SyncSummary, from: &SyncSummary) {
