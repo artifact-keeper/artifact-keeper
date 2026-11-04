@@ -141,8 +141,9 @@ pub enum ReplicationMode {
 /// (#5293).
 pub const PULL_REPLICATION_NOT_IMPLEMENTED: &str =
     "pull replication is not implemented: no sync task is ever created for a `pull` \
-     subscription. Subscribe the pushing peer with `push` (each new artifact is sent \
-     as it is uploaded) or `mirror` (the whole repository on a schedule) instead";
+     subscription. Subscribe this repository to the receiving peer on the instance that \
+     holds it, with `push` or `mirror` (each new artifact is sent as it is uploaded; \
+     POST /api/v1/peers/{id}/repositories/{repo_id}/sync sends the whole repository)";
 
 impl ReplicationMode {
     /// The mode a subscription gets when the caller names none (#5293). It was
@@ -161,11 +162,10 @@ impl ReplicationMode {
         }
     }
 
-    /// Whether the sync worker ever creates tasks for a subscription in this
-    /// mode: `push` from the upload hook (`PUSH_MIRROR_SUBSCRIPTIONS_SQL`,
-    /// `get_repos_for_push_sync`) and `mirror` from the scheduler as well
-    /// (`get_repos_for_mirror_sync`). `none` is the explicit "subscribed, do
-    /// not replicate" mode, and `pull` has no producer at all.
+    /// Whether anything ever creates sync tasks for a subscription in this
+    /// mode: `push` and `mirror` both get one per new artifact from the upload
+    /// hook (`PUSH_MIRROR_SUBSCRIPTIONS_SQL`). `none` is the explicit
+    /// "subscribed, do not replicate" mode, and `pull` has no producer at all.
     pub fn produces_sync_tasks(self) -> bool {
         matches!(self, ReplicationMode::Push | ReplicationMode::Mirror)
     }

@@ -110,10 +110,10 @@ fn parse_replication_mode(s: &str) -> Option<ReplicationMode> {
 pub struct AssignRepoRequest {
     pub repository_id: Uuid,
     pub sync_enabled: Option<bool>,
-    /// `push` (the default: each new artifact is sent as it is uploaded),
-    /// `mirror` (the repository is replicated on `replication_schedule`) or
-    /// `none` (assigned, not replicated). `pull` is refused with 400: it is
-    /// not implemented and never created a sync task (#5293).
+    /// `push` (the default) or `mirror`, which both send each new artifact
+    /// to the peer as it is uploaded, or `none` (assigned, not replicated).
+    /// `pull` is refused with 400: it is not implemented and never created a
+    /// sync task (#5293).
     pub replication_mode: Option<String>,
     pub replication_schedule: Option<String>,
     /// Optional JSONB filter constraining which artifacts in the repository
