@@ -1226,13 +1226,16 @@ async fn proxy_hf_metadata_json(
         return Ok(None);
     };
 
-    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
+    // The real format reaches the cache classifier (#5283): model info and
+    // a tree at a commit sha are immutable, branch and tag forms are not.
+    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        crate::models::repository::RepositoryFormat::Huggingface,
     )
     .await
     .map_err(|resp| hub_upstream_refusal(repo, resp))?;
@@ -1295,13 +1298,14 @@ async fn fetch_upstream_commit_sha(
         "api/models/{model_id}/revision/{}",
         encode_upstream_revision(revision)
     );
-    let fetch = proxy_helpers::proxy_fetch_capped(
+    let fetch = proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        crate::models::repository::RepositoryFormat::Huggingface,
     );
 
     // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
@@ -4034,6 +4038,78 @@ mod tests {
             "a HEAD probe must transfer no bytes, got {}",
             collected.len()
         );
+    }
+
+    /// #5283: a file fetched by commit sha is immutable and is served from the
+    /// cache without contacting the Hub again, even with the repository's
+    /// mutable-path TTL set to expire at once; the same file fetched by
+    /// branch is revalidated. Before, every Remote download reached the cache
+    /// classifier as `Generic`, which has no arm, so both were revalidated.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_commit_pinned_resolve_is_never_revalidated() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let sha = "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf";
+        let model = "sentence-transformers/all-MiniLM-L6-v2";
+        let server = MockServer::start().await;
+        for (rev, hits) in [(sha, 1), ("main", 2)] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{model}/resolve/{rev}/model.safetensors")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"weights\"")
+                        .insert_header("x-repo-commit", sha)
+                        .set_body_bytes(b"weights".to_vec()),
+                )
+                .expect(hits)
+                .mount(&server)
+                .await;
+        }
+        // Every mutable path expires the moment it is cached.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '0')",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("set cache_ttl_secs");
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        for rev in [sha, "main"] {
+            for _ in 0..2 {
+                let req = axum::http::Request::builder()
+                    .uri(format!(
+                        "/{}/{model}/resolve/{rev}/model.safetensors",
+                        f.repo_key
+                    ))
+                    .body(Body::empty())
+                    .expect("build request");
+                let resp = app
+                    .clone()
+                    .oneshot(req)
+                    .await
+                    .expect("resolve must respond");
+                assert_eq!(resp.status(), StatusCode::OK, "{rev}");
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect body");
+                assert_eq!(&body[..], b"weights", "{rev}");
+            }
+        }
+
+        f.teardown().await;
+        // `expect(..)` is checked when the server drops: one upstream request
+        // for the sha path, two for the branch path.
+        server.verify().await;
     }
 
     /// `X-Repo-Commit` comes from the resolve response's OWN header when upstream
