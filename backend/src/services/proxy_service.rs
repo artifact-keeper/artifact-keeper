@@ -34,7 +34,7 @@ use crate::services::proxy_cache_cap::ProxyCacheCap;
 use crate::services::proxy_cache_scope::ProxyCacheScope;
 use crate::services::proxy_catalog;
 use crate::services::proxy_hydration::{
-    Coordinator, HydrationCoordinator, StreamHandle, StreamHeaders,
+    Coordinator, DetachedFillLimits, HydrationCoordinator, StreamHandle, StreamHeaders,
 };
 use crate::services::proxy_scan_service::{
     decide_cache_scan_gate, CacheScanGate, StoredProxyVerdict,
@@ -70,6 +70,27 @@ const UPSTREAM_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long an idle pooled upstream connection is kept before it is closed.
 const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Extra time a detached buffered fill gets after its upstream fetch deadline
+/// for the cache write and bookkeeping (#5220). Past it the fill is
+/// abandoned, so a stalled storage or database write releases the
+/// single-flight slot instead of holding it forever.
+const DETACHED_FILL_COMMIT_ALLOWANCE: Duration = Duration::from_secs(60);
+
+/// Message prefix of a follower that gave up waiting for a cache fill.
+const HYDRATION_WAIT_TIMEOUT_MESSAGE: &str = "Timed out waiting for proxy cache hydration";
+
+/// Message prefix of a detached fill abandoned at its deadline.
+const DETACHED_FILL_DEADLINE_MESSAGE: &str = "Proxy cache fill abandoned";
+
+/// Whether `err` came from waiting on a detached fill (a follower timeout, or
+/// the fill abandoned at its deadline) rather than from the fill itself, which
+/// has already applied stale-if-error to its own upstream failures.
+fn is_detached_fill_wait_error(err: &AppError) -> bool {
+    matches!(err, AppError::BadGateway(m)
+        if m.starts_with(HYDRATION_WAIT_TIMEOUT_MESSAGE)
+            || m.starts_with(DETACHED_FILL_DEADLINE_MESSAGE))
+}
+
 /// Apply the proxy's upstream connection settings (#5220) to `builder`: the
 /// configured connect and read timeouts, HTTP/2 keep-alive PINGs (also while
 /// the connection is idle in the pool, so a dead pooled connection is found
@@ -78,7 +99,7 @@ const UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// Remote with its own egress routing gets the same bounds.
 pub(crate) fn configure_upstream_client(
     builder: reqwest::ClientBuilder,
-    timeouts: &crate::config::ProxyUpstreamTimeouts,
+    timeouts: &crate::config::ProxyUpstreamSettings,
 ) -> reqwest::ClientBuilder {
     builder
         .connect_timeout(timeouts.connect())
@@ -90,7 +111,7 @@ pub(crate) fn configure_upstream_client(
 }
 
 /// The shared upstream HTTP client of a [`ProxyService`].
-fn build_upstream_http_client(timeouts: &crate::config::ProxyUpstreamTimeouts) -> Client {
+fn build_upstream_http_client(timeouts: &crate::config::ProxyUpstreamSettings) -> Client {
     configure_upstream_client(
         crate::services::http_client::base_client_builder(),
         timeouts,
@@ -3884,7 +3905,7 @@ pub(crate) struct UpstreamClient {
     egress_client_cache: EgressClientCache,
     /// Timeouts applied to the per-Remote egress clients this builds (#5220),
     /// the same as the shared `http_client` was built with.
-    timeouts: crate::config::ProxyUpstreamTimeouts,
+    timeouts: crate::config::ProxyUpstreamSettings,
     /// Test-only scope for the loopback exemption in
     /// [`UpstreamClient::ensure_initial_destination_allowed`]. Unit tests serve
     /// mock upstreams from `127.0.0.1`, which the outbound address policy
@@ -3949,14 +3970,14 @@ impl UpstreamClient {
             token_cache: RwLock::new(HashMap::new()),
             user_agent_cache: RwLock::new(HashMap::new()),
             egress_client_cache: RwLock::new(HashMap::new()),
-            timeouts: crate::config::ProxyUpstreamTimeouts::default(),
+            timeouts: crate::config::ProxyUpstreamSettings::default(),
             #[cfg(test)]
             test_loopback_ports: std::sync::Mutex::new(None),
         }
     }
 
     /// Set the timeouts the per-Remote egress clients are built with.
-    pub(crate) fn with_timeouts(mut self, timeouts: crate::config::ProxyUpstreamTimeouts) -> Self {
+    pub(crate) fn with_timeouts(mut self, timeouts: crate::config::ProxyUpstreamSettings) -> Self {
         self.timeouts = timeouts;
         self
     }
@@ -5312,11 +5333,15 @@ pub struct ProxyService {
     /// through [`Self::effective_stale_if_error_grace_secs`]. Tests keep the
     /// [`cache_classifier::STALE_IF_ERROR_GRACE_SECS`] default.
     stale_if_error_grace_secs: i64,
-    /// Upstream client timeouts (#5220), from
+    /// Upstream client timeouts and detached-fill limits (#5220), from
     /// [`crate::config::Config::proxy_upstream`] via
-    /// [`Self::with_upstream_timeouts`]. The fetch deadline bounds every
+    /// [`Self::with_upstream_settings`]. The fetch deadline bounds every
     /// buffered upstream fetch.
-    upstream_timeouts: crate::config::ProxyUpstreamTimeouts,
+    upstream_timeouts: crate::config::ProxyUpstreamSettings,
+    /// Permits for buffered fills running detached from their request
+    /// (#5220), `upstream_timeouts.max_detached_fills` of them. Shared by the
+    /// clones a detached fill holds.
+    detached_fill_permits: Arc<Semaphore>,
 }
 
 /// How long a [`ProxyService::uncached_serves`] entry is kept. The recorder
@@ -5434,7 +5459,7 @@ impl ProxyService {
 
     /// Create a new proxy service
     pub fn new(db: PgPool, storage: Arc<StorageService>, cache_scope: ProxyCacheScope) -> Self {
-        let upstream_timeouts = crate::config::ProxyUpstreamTimeouts::default();
+        let upstream_timeouts = crate::config::ProxyUpstreamSettings::default();
         let http_client = build_upstream_http_client(&upstream_timeouts);
 
         let cache_store = CacheStore::new(Arc::clone(&storage), cache_scope.clone());
@@ -5467,22 +5492,25 @@ impl ProxyService {
                 .build(),
             origin_policy_gate: true,
             stale_if_error_grace_secs: cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            detached_fill_permits: Arc::new(Semaphore::new(upstream_timeouts.max_detached_fills)),
             upstream_timeouts,
         }
     }
 
-    /// Apply the process's upstream client timeouts (#5220) from
+    /// Apply the process's upstream client timeouts and detached-fill limit
+    /// (#5220) from
     /// [`crate::config::Config::proxy_upstream`]. Rebuilds the upstream
     /// client, so it belongs on the construction path (`main.rs`), before the
     /// service fetches anything.
-    pub fn with_upstream_timeouts(
+    pub fn with_upstream_settings(
         mut self,
-        timeouts: crate::config::ProxyUpstreamTimeouts,
+        timeouts: crate::config::ProxyUpstreamSettings,
     ) -> Self {
         self.upstream_client = Arc::new(
             UpstreamClient::new(self.db.clone(), build_upstream_http_client(&timeouts))
                 .with_timeouts(timeouts),
         );
+        self.detached_fill_permits = Arc::new(Semaphore::new(timeouts.max_detached_fills));
         self.upstream_timeouts = timeouts;
         self
     }
@@ -6490,12 +6518,8 @@ impl ProxyService {
             }
             Ok(cached)
         };
-        let on_timeout = || {
-            AppError::Storage(format!(
-                "Timed out waiting for proxy cache hydration: {}",
-                cache_key
-            ))
-        };
+        let on_timeout =
+            || AppError::Storage(format!("{HYDRATION_WAIT_TIMEOUT_MESSAGE}: {}", cache_key));
 
         if check.is_some() || deferred.is_some() {
             // A caller-supplied identity check (#4829) or a fill the scan
@@ -6529,8 +6553,30 @@ impl ProxyService {
         // the fill does not depend on the leader's client). A client that
         // disconnects mid-fetch no longer cancels it, so the object still
         // lands in the cache and a retry joins the fill or reads the cache
-        // instead of fetching from scratch. The fill is bounded by the
-        // upstream fetch deadline, and keeps the request's correlation ID.
+        // instead of fetching from scratch. The upstream fetch has its own
+        // deadline; the whole fill (fetch plus cache write) is abandoned
+        // `DETACHED_FILL_COMMIT_ALLOWANCE` later, so a stalled storage or
+        // database write cannot hold the slot forever. Past
+        // `max_detached_fills` running at once the fill stays in the request.
+        // The fill keeps the request's correlation ID.
+        let fill_deadline =
+            self.upstream_timeouts.fetch_deadline() + DETACHED_FILL_COMMIT_ALLOWANCE;
+        let limits = DetachedFillLimits {
+            deadline: fill_deadline,
+            on_deadline: move || {
+                AppError::BadGateway(format!(
+                    "{DETACHED_FILL_DEADLINE_MESSAGE}: the cache fill exceeded its {}-second deadline",
+                    fill_deadline.as_secs()
+                ))
+            },
+            permits: Arc::clone(&self.detached_fill_permits),
+        };
+        // A follower can outwait its 65-second limit while a long detached
+        // fill is still running; that is the same transient failure as a
+        // fetch deadline, so it gets the same error class and stale-if-error.
+        let on_detached_timeout =
+            || AppError::BadGateway(format!("{HYDRATION_WAIT_TIMEOUT_MESSAGE}: {}", cache_key));
+        let full_url_for_stale = full_url.clone();
         let fill = OwnedBufferedFill {
             service: self.clone(),
             repo: repo.clone(),
@@ -6542,14 +6588,23 @@ impl ProxyService {
             max,
             correlation_id: crate::api::middleware::tracing::current_correlation_id(),
         };
-        self.coordinator
+        let outcome = self
+            .coordinator
             .coordinate_detached(
                 &hydration_lease_key,
                 check_cache,
                 move || fill.run(),
-                on_timeout,
+                limits,
+                on_detached_timeout,
             )
-            .await
+            .await;
+        match outcome {
+            Err(err) if is_detached_fill_wait_error(&err) => {
+                self.stale_if_error(repo, &full_url_for_stale, &cache_key, &metadata_key, err)
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// The upstream fetch and cache write of a buffered single-flight leader:
@@ -6845,42 +6900,52 @@ impl ProxyService {
                         .await;
                     return Err(upstream_err);
                 }
-                // Transient error (5xx / timeout / transport): RFC 5861
-                // stale-if-error — serve the stale body we already hold,
-                // but only inside the repository's configured grace
-                // window (#4581). Outside it, propagate the upstream
-                // error rather than keep serving content that may be
-                // arbitrarily old. The window is measured from the
-                // entry's stamped expiry (`body.stale_since`), matching
-                // `revalidate_verdict`.
-                if let Ok(Some(body)) = self
-                    .get_stale_cached_artifact(cache_key, metadata_key, None)
+                self.stale_if_error(repo, full_url, cache_key, metadata_key, upstream_err)
                     .await
-                {
-                    let stale_since = body.stale_since.unwrap_or_else(Utc::now);
-                    let grace = self.effective_stale_if_error_grace_secs(repo.id).await;
-                    if grace > 0 && Utc::now() < stale_since + chrono::Duration::seconds(grace) {
-                        tracing::warn!(
-                            "Upstream fetch failed for {}; serving stale cached copy \
-                             within the {}-second stale-if-error grace (#4581): {}",
-                            redact_url_for_diagnostics(full_url),
-                            grace,
-                            upstream_err
-                        );
-                        self.note_stale_served(repo).await;
-                        return Ok(body);
-                    }
-                    tracing::warn!(
-                        "Upstream fetch failed for {}; cached copy is past the \
-                         {}-second stale-if-error grace, propagating error: {}",
-                        redact_url_for_diagnostics(full_url),
-                        grace,
-                        upstream_err
-                    );
-                }
-                Err(upstream_err)
             }
         }
+    }
+
+    /// Transient error (5xx / timeout / transport): RFC 5861 stale-if-error —
+    /// serve the stale body we already hold, but only inside the repository's
+    /// configured grace window (#4581). Outside it, propagate the upstream
+    /// error rather than keep serving content that may be arbitrarily old.
+    /// The window is measured from the entry's stamped expiry
+    /// (`body.stale_since`), matching `revalidate_verdict`.
+    async fn stale_if_error(
+        &self,
+        repo: &Repository,
+        full_url: &str,
+        cache_key: &str,
+        metadata_key: &str,
+        upstream_err: AppError,
+    ) -> Result<CachedBody> {
+        if let Ok(Some(body)) = self
+            .get_stale_cached_artifact(cache_key, metadata_key, None)
+            .await
+        {
+            let stale_since = body.stale_since.unwrap_or_else(Utc::now);
+            let grace = self.effective_stale_if_error_grace_secs(repo.id).await;
+            if grace > 0 && Utc::now() < stale_since + chrono::Duration::seconds(grace) {
+                tracing::warn!(
+                    "Upstream fetch failed for {}; serving stale cached copy \
+                     within the {}-second stale-if-error grace (#4581): {}",
+                    redact_url_for_diagnostics(full_url),
+                    grace,
+                    upstream_err
+                );
+                self.note_stale_served(repo).await;
+                return Ok(body);
+            }
+            tracing::warn!(
+                "Upstream fetch failed for {}; cached copy is past the \
+                 {}-second stale-if-error grace, propagating error: {}",
+                redact_url_for_diagnostics(full_url),
+                grace,
+                upstream_err
+            );
+        }
+        Err(upstream_err)
     }
 
     /// Streaming sibling of [`Self::fetch_artifact`] that does NOT buffer
@@ -24155,6 +24220,71 @@ mod tests {
         assert_eq!(hits, 1, "served from the cache the detached fill wrote");
     }
 
+    /// #5220: with no detached-fill permit free (here the limit is zero), the
+    /// fill runs in the request as before: dropping the caller cancels it,
+    /// nothing is cached, and the next request fetches from upstream again.
+    #[tokio::test]
+    async fn test_buffered_fill_stays_in_the_request_without_a_detached_permit() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"slow-body".as_ref())
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = std::env::temp_dir().join(format!("in-request-fill-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = Arc::unwrap_or_clone(tdh::build_proxy_service_with_fs(
+            pool,
+            tmp.to_str().unwrap(),
+        ))
+        .with_upstream_settings(crate::config::ProxyUpstreamSettings {
+            max_detached_fills: 0,
+            ..Default::default()
+        });
+        let repo = wiremock_remote_repo("in-request-fill", &server.uri(), tmp.to_str().unwrap());
+
+        let first = proxy.fetch_artifact(&repo, "slow.tgz");
+        let upstream_reached = async {
+            while server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            served = first => panic!("the upstream answers late, so the caller is dropped first: {served:?}"),
+            () = upstream_reached => {}
+        }
+        // Well past the upstream's answer: a detached fill would have
+        // committed by now.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let (body, _) = proxy
+            .fetch_artifact(&repo, "slow.tgz")
+            .await
+            .expect("the later request is served");
+        assert_eq!(body.as_ref(), b"slow-body");
+        let hits = server.received_requests().await.expect("recording").len();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(hits, 2, "the cancelled in-request fill cached nothing");
+    }
+
     /// #5220: a buffered upstream fetch is bounded by the fetch deadline, not
     /// only by the read timeout that restarts on every chunk.
     #[tokio::test]
@@ -24183,10 +24313,11 @@ mod tests {
             pool,
             tmp.to_str().unwrap(),
         ))
-        .with_upstream_timeouts(crate::config::ProxyUpstreamTimeouts {
+        .with_upstream_settings(crate::config::ProxyUpstreamSettings {
             connect_secs: 5,
             read_secs: 60,
             fetch_deadline_secs: 1,
+            ..Default::default()
         });
         let repo = wiremock_remote_repo("fetch-deadline", &server.uri(), tmp.to_str().unwrap());
 
@@ -24254,7 +24385,8 @@ mod tests {
     }
 
     /// #4455: a buffered proxy fetch runs in a `proxy_fetch` phase span under
-    /// the request span, the upstream `CLIENT` span sits inside it, and the
+    /// the request span, the upstream `CLIENT` span sits in the detached fill
+    /// linked from it, and the
     /// cache lookup's outcome lands on the request span (last write wins:
     /// the second, cached fetch is a `hit`).
     #[tokio::test]
@@ -24324,11 +24456,20 @@ mod tests {
         }
         let upstream = exported.one("GET");
         assert_eq!(upstream.span_kind, opentelemetry::trace::SpanKind::Client);
+        // #5220: the cold fill runs detached, in its own `proxy_detached_fill`
+        // span that follows from (links to) the request's `proxy_fetch` span,
+        // so the request's spans end with the request.
+        let fill = exported.one("proxy_detached_fill");
+        assert_eq!(
+            upstream.parent_span_id,
+            fill.span_context.span_id(),
+            "the upstream CLIENT span is a child of the detached fill's span"
+        );
         assert!(
-            phases
+            fill.links.iter().any(|link| phases
                 .iter()
-                .any(|p| p.span_context.span_id() == upstream.parent_span_id),
-            "the upstream CLIENT span is a child of a proxy_fetch span"
+                .any(|p| p.span_context.span_id() == link.span_context.span_id())),
+            "the detached fill follows from a proxy_fetch span"
         );
     }
 

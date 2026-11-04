@@ -1884,6 +1884,71 @@ mod tests {
         assert!(!cancelled.contains_key("status"), "{cancelled:?}");
     }
 
+    /// A panic that unwinds through the middleware drops the same guard, but
+    /// the client did not cancel anything: it is logged as `Request panicked`
+    /// at ERROR, not as `Request cancelled`.
+    #[tokio::test]
+    async fn test_json_request_panicked_line_when_the_handler_panics() {
+        use axum::{body::Body, routing::get, Router};
+        use futures::FutureExt;
+        use tower::ServiceExt;
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info"))
+            .with(build_fmt_layer_with_writer(
+                LogFormat::Json,
+                false,
+                capture.clone(),
+            ));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let app = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    if std::hint::black_box(true) {
+                        panic!("handler bug");
+                    }
+                    "unreachable"
+                }),
+            )
+            .layer(axum::middleware::from_fn(
+                crate::api::middleware::tracing::correlation_id_middleware,
+            ))
+            .layer(
+                tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::http::Request<Body>| {
+                        crate::api::middleware::tracing::make_http_request_span(request, &[])
+                    },
+                ),
+            );
+        let request = axum::http::Request::builder()
+            .uri("/boom")
+            .header("x-correlation-id", "corr-5220-panic")
+            .body(Body::empty())
+            .unwrap();
+        let outcome = std::panic::AssertUnwindSafe(app.oneshot(request))
+            .catch_unwind()
+            .await;
+        assert!(outcome.is_err(), "the handler panics");
+
+        let lines = json_lines(&capture);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l["fields"]["message"] == "Request cancelled"),
+            "{lines:?}"
+        );
+        let panicked = lines
+            .iter()
+            .find(|l| l["fields"]["message"] == "Request panicked")
+            .unwrap_or_else(|| panic!("no Request panicked line in {lines:?}"));
+        assert_eq!(panicked["level"], "ERROR");
+        assert_eq!(panicked["correlation_id"], "corr-5220-panic");
+        assert_eq!(panicked["fields"]["method"], "GET");
+    }
+
     // ── build_otel_resource ─────────────────────────────────────────────
 
     #[test]

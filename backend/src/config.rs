@@ -581,17 +581,37 @@ impl DeviceAuthConfig {
     }
 }
 
-/// Timeouts of the HTTP client a Remote repository fetches its upstream with.
+/// How a Remote repository's upstream fetches are bounded (#5220).
 ///
 /// The connect and read timeouts apply to every upstream request the proxy
-/// makes, streamed or buffered. The fetch deadline bounds one buffered
-/// upstream fetch from the first byte sent to the last byte read: the read
-/// timeout restarts on every chunk, so an upstream that trickles bytes, or a
-/// connection that has stalled after its headers, is otherwise held for as
-/// long as it keeps the socket open. A streamed download is not bounded by the
-/// deadline, because its length is not bounded either.
+/// makes, streamed or buffered.
+///
+/// A cold buffered fetch runs on its own task, so a client that gives up does
+/// not cancel it: its retry joins the fill or reads the filled cache. Nothing
+/// else ends such a fill, so it carries its own bounds:
+///
+/// * The fetch deadline bounds the upstream fetch from the first byte sent to
+///   the last byte read. The read timeout restarts on every chunk, so without
+///   it an upstream that trickles bytes, or a connection that stalled after
+///   its headers, holds the fill for as long as the socket stays open. A
+///   fetch that hits the deadline is a transient failure, so stale-if-error
+///   still applies. The trade-off: a buffered object that cannot be fetched
+///   within the deadline (128 MiB at under ~220 KB/s with the 600-second
+///   default) is never cached, where an unbounded fetch would eventually
+///   finish. Raise it for slow upstreams with large buffered objects.
+/// * The cache write and bookkeeping after the fetch get a fixed extra
+///   allowance; past it the fill is abandoned, so a stalled storage or
+///   database write cannot hold the single-flight slot (and the cross-replica
+///   lock) forever.
+/// * At most `max_detached_fills` fills run detached at once. Past that, a
+///   fill runs in the request as before and ends if its client goes away, so
+///   clients that open many cold paths and disconnect cannot pile up buffered
+///   bodies and lock connections.
+///
+/// A streamed download is not bounded by the deadline, because its length is
+/// not bounded either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProxyUpstreamTimeouts {
+pub struct ProxyUpstreamSettings {
     /// TCP and TLS connect timeout, in seconds. Env:
     /// `PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS`, clamped to 1..=300. Default 10.
     pub connect_secs: u64,
@@ -601,22 +621,26 @@ pub struct ProxyUpstreamTimeouts {
     pub read_secs: u64,
     /// Deadline of one buffered upstream fetch, in seconds. Env:
     /// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, clamped to 1..=86400. Default
-    /// 300. The fill runs on its own task, so a client that gives up first
-    /// does not cancel it: its retry joins the fill or reads the filled cache.
+    /// 600.
     pub fetch_deadline_secs: u64,
+    /// Most buffered fills allowed to run detached from their request at once.
+    /// Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to 0..=1024. Default
+    /// 16. Zero keeps every fill in its request.
+    pub max_detached_fills: usize,
 }
 
-impl Default for ProxyUpstreamTimeouts {
+impl Default for ProxyUpstreamSettings {
     fn default() -> Self {
         Self {
             connect_secs: 10,
             read_secs: 60,
-            fetch_deadline_secs: 300,
+            fetch_deadline_secs: 600,
+            max_detached_fills: 16,
         }
     }
 }
 
-impl ProxyUpstreamTimeouts {
+impl ProxyUpstreamSettings {
     fn from_env() -> Self {
         let d = Self::default();
         Self {
@@ -628,6 +652,11 @@ impl ProxyUpstreamTimeouts {
                 d.fetch_deadline_secs,
             )
             .clamp(1, 86_400),
+            max_detached_fills: env_parse(
+                "PROXY_UPSTREAM_MAX_DETACHED_FILLS",
+                d.max_detached_fills,
+            )
+            .clamp(0, 1024),
         }
     }
 
@@ -1088,9 +1117,9 @@ pub struct Config {
     /// `DEVICE_AUTH_ENABLED=true`; see [`DeviceAuthConfig`].
     pub device_auth: DeviceAuthConfig,
 
-    /// Upstream HTTP client timeouts of the proxy (#5220); see
-    /// [`ProxyUpstreamTimeouts`].
-    pub proxy_upstream: ProxyUpstreamTimeouts,
+    /// Upstream timeouts and detached-fill limits of the proxy (#5220); see
+    /// [`ProxyUpstreamSettings`].
+    pub proxy_upstream: ProxyUpstreamSettings,
 
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
@@ -1910,7 +1939,7 @@ impl Default for Config {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             device_auth: DeviceAuthConfig::default(),
-            proxy_upstream: ProxyUpstreamTimeouts::default(),
+            proxy_upstream: ProxyUpstreamSettings::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
@@ -2264,7 +2293,7 @@ impl Config {
                 Ok("false" | "0")
             ),
             device_auth: DeviceAuthConfig::from_env(),
-            proxy_upstream: ProxyUpstreamTimeouts::from_env(),
+            proxy_upstream: ProxyUpstreamSettings::from_env(),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
                     .ok()
@@ -4791,34 +4820,42 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_upstream_timeouts_defaults_parse_and_clamp() {
+    fn test_proxy_upstream_settings_defaults_parse_and_clamp() {
         let _lock = ENV_MUTEX.lock().unwrap();
         const KEYS: &[&str] = &[
             "PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS",
             "PROXY_UPSTREAM_READ_TIMEOUT_SECS",
             "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+            "PROXY_UPSTREAM_MAX_DETACHED_FILLS",
         ];
         let saved: Vec<Option<String>> = KEYS.iter().map(|k| env::var(k).ok()).collect();
 
         for key in KEYS {
             env::remove_var(key);
         }
-        let defaults = ProxyUpstreamTimeouts::from_env();
-        assert_eq!(defaults, ProxyUpstreamTimeouts::default());
+        let defaults = ProxyUpstreamSettings::from_env();
+        assert_eq!(defaults, ProxyUpstreamSettings::default());
         assert_eq!(defaults.connect(), std::time::Duration::from_secs(10));
         assert_eq!(defaults.read(), std::time::Duration::from_secs(60));
         assert_eq!(
             defaults.fetch_deadline(),
-            std::time::Duration::from_secs(300)
+            std::time::Duration::from_secs(600)
         );
+        assert_eq!(defaults.max_detached_fills, 16);
 
         env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "5");
         env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "30");
         env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "45");
-        let set = ProxyUpstreamTimeouts::from_env();
+        env::set_var("PROXY_UPSTREAM_MAX_DETACHED_FILLS", "0");
+        let set = ProxyUpstreamSettings::from_env();
         assert_eq!(
-            (set.connect_secs, set.read_secs, set.fetch_deadline_secs),
-            (5, 30, 45)
+            (
+                set.connect_secs,
+                set.read_secs,
+                set.fetch_deadline_secs,
+                set.max_detached_fills
+            ),
+            (5, 30, 45, 0)
         );
 
         // Zero would disable a timeout outright and a huge value would pin a
@@ -4826,10 +4863,12 @@ mod tests {
         env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "0");
         env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "999999");
         env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "soon");
-        let clamped = ProxyUpstreamTimeouts::from_env();
+        env::set_var("PROXY_UPSTREAM_MAX_DETACHED_FILLS", "100000");
+        let clamped = ProxyUpstreamSettings::from_env();
         assert_eq!(clamped.connect_secs, 1);
         assert_eq!(clamped.read_secs, 3600);
-        assert_eq!(clamped.fetch_deadline_secs, 300);
+        assert_eq!(clamped.fetch_deadline_secs, 600);
+        assert_eq!(clamped.max_detached_fills, 1024);
 
         for (key, value) in KEYS.iter().zip(saved) {
             restore_env(key, value);

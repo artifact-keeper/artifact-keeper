@@ -646,6 +646,20 @@ impl Drop for InFlightRequest {
         let _entered = self.span.enter();
         let user = crate::api::middleware::request_span::recorded_user();
         let ip = crate::api::middleware::client_ip::current_client_ip();
+        // A panic unwinding through the middleware also drops the guard; that
+        // request was not cancelled by its client, so say what happened.
+        if std::thread::panicking() {
+            tracing::error!(
+                correlation_id = %self.correlation_id,
+                method = self.method.as_str(),
+                uri = self.uri.as_str(),
+                user = user.as_deref(),
+                ip = ip.map(tracing::field::display),
+                latency_ms = self.latency_ms(),
+                "Request panicked"
+            );
+            return;
+        }
         tracing::warn!(
             correlation_id = %self.correlation_id,
             method = self.method.as_str(),

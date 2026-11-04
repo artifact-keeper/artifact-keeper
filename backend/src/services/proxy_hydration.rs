@@ -189,15 +189,27 @@ pub trait Coordinator {
     ///
     /// This is the first step of the #4533 design ("decouple the fill from
     /// the client"), for the buffered path: the fill no longer depends on the
-    /// leader's client staying connected. The fill must bound itself (the
-    /// proxy wraps its upstream fetch in a deadline), because nothing cancels
-    /// it once the caller is gone.
+    /// leader's client staying connected. Because nothing cancels it once the
+    /// caller is gone, `limits` bounds it: the whole fill is abandoned after
+    /// [`DetachedFillLimits::deadline`] (freeing the slot, and the cluster lock
+    /// of the advisory variant), and when no detached-fill permit is free the
+    /// fill runs in the caller's task exactly as [`Self::coordinate`] would.
     #[allow(async_fn_in_trait)]
-    async fn coordinate_detached<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+    async fn coordinate_detached<
+        T,
+        E,
+        Check,
+        CheckFut,
+        Produce,
+        ProduceFut,
+        DeadlineErr,
+        TimeoutErr,
+    >(
         &self,
         lease_key: &str,
         check: Check,
         produce: Produce,
+        limits: DetachedFillLimits<DeadlineErr>,
         timeout_error: TimeoutErr,
     ) -> std::result::Result<T, E>
     where
@@ -207,9 +219,10 @@ pub trait Coordinator {
         CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
         Produce: FnOnce() -> ProduceFut,
         ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        DeadlineErr: FnOnce() -> E + Send + 'static,
         TimeoutErr: Fn() -> E,
     {
-        coordinate_proxy_hydration_detached(lease_key, check, produce, timeout_error).await
+        coordinate_proxy_hydration_detached(lease_key, check, produce, limits, timeout_error).await
     }
 
     /// Streaming single-flight broadcast fan-out (#1631 layer 2, #1694).
@@ -326,6 +339,19 @@ where
     .await
 }
 
+/// Bounds and admission of a fill run by [`Coordinator::coordinate_detached`].
+pub struct DetachedFillLimits<DeadlineErr> {
+    /// Hard bound on the whole fill (fetch, cache write and bookkeeping).
+    /// When it passes, the fill is dropped and its slot (and cluster lock) is
+    /// released, so a stalled write cannot keep every later request waiting.
+    pub deadline: Duration,
+    /// The error the caller gets for a fill abandoned at `deadline`.
+    pub on_deadline: DeadlineErr,
+    /// Permits for fills running detached at once. Without a free permit the
+    /// fill runs in the caller's task, so it is cancelled with the caller.
+    pub permits: Arc<tokio::sync::Semaphore>,
+}
+
 /// [`coordinate_proxy_hydration`] with the leader's fill spawned onto its own
 /// task, which owns the leader's slot; see [`Coordinator::coordinate_detached`].
 pub async fn coordinate_proxy_hydration_detached<
@@ -335,11 +361,13 @@ pub async fn coordinate_proxy_hydration_detached<
     CheckFut,
     Produce,
     ProduceFut,
+    DeadlineErr,
     TimeoutErr,
 >(
     lease_key: &str,
     check: Check,
     produce: Produce,
+    limits: DetachedFillLimits<DeadlineErr>,
     timeout_error: TimeoutErr,
 ) -> std::result::Result<T, E>
 where
@@ -349,8 +377,10 @@ where
     CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
     Produce: FnOnce() -> ProduceFut,
     ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+    DeadlineErr: FnOnce() -> E + Send + 'static,
     TimeoutErr: Fn() -> E,
 {
+    use futures::future::Either;
     use tracing::Instrument;
 
     let on_timeout = &timeout_error;
@@ -358,26 +388,73 @@ where
         lease_key,
         check,
         move |lease| {
-            // Spawned before the first await, so the fill starts even if the
-            // caller is dropped right after the election.
-            let fill = produce();
-            let task = tokio::spawn(
-                async move {
-                    let outcome = fill.await;
-                    // Followers wake only once the fill has committed.
+            let DetachedFillLimits {
+                deadline,
+                on_deadline,
+                permits,
+            } = limits;
+            // Boxed: a fill is a large future, and keeping it inline would
+            // make every caller's future (and stack frame) that large too.
+            let fill = Box::pin(produce());
+            let bounded = async move {
+                match tokio::time::timeout(deadline, fill).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        tracing::warn!(
+                            deadline_secs = deadline.as_secs(),
+                            "proxy cache fill exceeded its deadline; abandoning it and \
+                             releasing its single-flight slot"
+                        );
+                        Err(on_deadline())
+                    }
+                }
+            };
+            let Ok(permit) = permits.try_acquire_owned() else {
+                // Too many fills are already detached: run this one in the
+                // caller's task, so it ends if its client goes away.
+                tracing::debug!(
+                    lease_key,
+                    "detached proxy fill limit reached; filling in the request"
+                );
+                return Either::Left(async move {
+                    let outcome = bounded.await;
                     drop(lease);
                     outcome
-                }
-                .instrument(tracing::Span::current()),
+                });
+            };
+            // A span of its own that only follows from the request, so the
+            // request's span (and its duration) ends when the request does.
+            let span = tracing::info_span!(
+                parent: None,
+                "proxy_detached_fill",
+                lease_key,
+                correlation_id = tracing::field::Empty,
             );
-            async move {
+            span.follows_from(tracing::Span::current());
+            if let Some(id) = crate::api::middleware::tracing::current_correlation_id() {
+                span.record("correlation_id", tracing::field::display(&id));
+            }
+            // Spawned before the first await, so the fill starts even if the
+            // caller is dropped right after the election.
+            let task = tokio::spawn(
+                async move {
+                    let outcome = bounded.await;
+                    // Followers wake only once the fill has committed (or
+                    // was abandoned at its deadline).
+                    drop(lease);
+                    drop(permit);
+                    outcome
+                }
+                .instrument(span),
+            );
+            Either::Right(async move {
                 match task.await {
                     Ok(outcome) => outcome,
                     Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
                     // The runtime is shutting down and cancelled the fill.
                     Err(_) => Err(on_timeout()),
                 }
-            }
+            })
         },
         on_timeout,
     )
@@ -1147,11 +1224,21 @@ impl Coordinator for AdvisoryLockCoordinator {
         }
     }
 
-    async fn coordinate_detached<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+    async fn coordinate_detached<
+        T,
+        E,
+        Check,
+        CheckFut,
+        Produce,
+        ProduceFut,
+        DeadlineErr,
+        TimeoutErr,
+    >(
         &self,
         lease_key: &str,
         check: Check,
         produce: Produce,
+        limits: DetachedFillLimits<DeadlineErr>,
         timeout_error: TimeoutErr,
     ) -> std::result::Result<T, E>
     where
@@ -1161,6 +1248,7 @@ impl Coordinator for AdvisoryLockCoordinator {
         CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
         Produce: FnOnce() -> ProduceFut,
         ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        DeadlineErr: FnOnce() -> E + Send + 'static,
         TimeoutErr: Fn() -> E,
     {
         match self.elect_buffered(lease_key, &check).await? {
@@ -1180,12 +1268,12 @@ impl Coordinator for AdvisoryLockCoordinator {
                     }
                 };
                 self.inner
-                    .coordinate_detached(lease_key, check, produce, timeout_error)
+                    .coordinate_detached(lease_key, check, produce, limits, timeout_error)
                     .await
             }
             BufferedRole::Local => {
                 self.inner
-                    .coordinate_detached(lease_key, check, produce, timeout_error)
+                    .coordinate_detached(lease_key, check, produce, limits, timeout_error)
                     .await
             }
         }
@@ -1479,11 +1567,21 @@ impl Coordinator for HydrationCoordinator {
         }
     }
 
-    async fn coordinate_detached<T, E, Check, CheckFut, Produce, ProduceFut, TimeoutErr>(
+    async fn coordinate_detached<
+        T,
+        E,
+        Check,
+        CheckFut,
+        Produce,
+        ProduceFut,
+        DeadlineErr,
+        TimeoutErr,
+    >(
         &self,
         lease_key: &str,
         check: Check,
         produce: Produce,
+        limits: DetachedFillLimits<DeadlineErr>,
         timeout_error: TimeoutErr,
     ) -> std::result::Result<T, E>
     where
@@ -1493,15 +1591,16 @@ impl Coordinator for HydrationCoordinator {
         CheckFut: Future<Output = std::result::Result<Option<T>, E>>,
         Produce: FnOnce() -> ProduceFut,
         ProduceFut: Future<Output = std::result::Result<T, E>> + Send + 'static,
+        DeadlineErr: FnOnce() -> E + Send + 'static,
         TimeoutErr: Fn() -> E,
     {
         match self {
             HydrationCoordinator::Buffered(c) => {
-                c.coordinate_detached(lease_key, check, produce, timeout_error)
+                c.coordinate_detached(lease_key, check, produce, limits, timeout_error)
                     .await
             }
             HydrationCoordinator::Advisory(c) => {
-                c.coordinate_detached(lease_key, check, produce, timeout_error)
+                c.coordinate_detached(lease_key, check, produce, limits, timeout_error)
                     .await
             }
         }
@@ -2134,6 +2233,19 @@ mod tests {
         )
     }
 
+    /// Detached-fill limits that never get in a test's way: a long deadline
+    /// and plenty of permits.
+    fn roomy<E>(on_deadline: E) -> DetachedFillLimits<impl FnOnce() -> E + Send + 'static>
+    where
+        E: Send + 'static,
+    {
+        DetachedFillLimits {
+            deadline: Duration::from_secs(60),
+            on_deadline: move || on_deadline,
+            permits: Arc::new(tokio::sync::Semaphore::new(64)),
+        }
+    }
+
     /// #5220: the leader's caller is dropped mid-fill (its client went away).
     /// The detached fill still commits, a retry that arrives during the fill
     /// joins it and is served the filled value, and nothing fills twice. With
@@ -2161,7 +2273,8 @@ mod tests {
             }
         };
 
-        let leader = coordinator.coordinate_detached(&key, check, fill(), || "timeout");
+        let leader =
+            coordinator.coordinate_detached(&key, check, fill(), roomy("deadline"), || "timeout");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), leader)
                 .await
@@ -2179,7 +2292,8 @@ mod tests {
             );
         }
 
-        let retry = coordinator.coordinate_detached(&key, check, fill(), || "timeout");
+        let retry =
+            coordinator.coordinate_detached(&key, check, fill(), roomy("deadline"), || "timeout");
         let finish_fill = async {
             tokio::time::sleep(Duration::from_millis(30)).await;
             release.notify_one();
@@ -2226,6 +2340,7 @@ mod tests {
                     &key,
                     || async { Ok::<Option<u32>, ()>(None) },
                     || async { panic!("fill failed") },
+                    roomy(()),
                     || (),
                 )
                 .await
@@ -2244,9 +2359,135 @@ mod tests {
             Arc::new(crate::services::cluster_lock::ErroringClusterLock);
         let key = format!("proxy-cache:detached-nolock-{}", uuid::Uuid::new_v4());
         let served: Result<u32, ()> = advisory_over(&lock)
-            .coordinate_detached(&key, || async { Ok(None) }, || async { Ok(5) }, || ())
+            .coordinate_detached(
+                &key,
+                || async { Ok(None) },
+                || async { Ok(5) },
+                roomy(()),
+                || (),
+            )
             .await;
         assert_eq!(served, Ok(5));
+    }
+
+    /// #5220: a detached fill that never finishes (here: a cache write that
+    /// stalls after the fetch) is abandoned at its deadline. The caller gets
+    /// the deadline error, the slot (and the cluster lock) is released, and
+    /// the next request elects a new leader instead of waiting forever.
+    async fn assert_stalled_detached_fill_is_abandoned_at_its_deadline<C: Coordinator>(
+        coordinator: &C,
+        cluster_lock: Option<&Arc<dyn ClusterLock>>,
+    ) {
+        let key = format!("proxy-cache:detached-stall-{}", uuid::Uuid::new_v4());
+        let check = || async { Ok::<Option<u32>, &'static str>(None) };
+        let limits = DetachedFillLimits {
+            deadline: Duration::from_millis(100),
+            on_deadline: || "deadline",
+            permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+        let permits = Arc::clone(&limits.permits);
+        let started = Instant::now();
+        let stalled = coordinator
+            .coordinate_detached(
+                &key,
+                check,
+                std::future::pending::<Result<u32, &'static str>>,
+                limits,
+                || "timeout",
+            )
+            .await;
+        assert_eq!(stalled, Err("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!map_contains(&key), "the slot is released at the deadline");
+        assert_eq!(permits.available_permits(), 1, "the permit is returned");
+        if let Some(lock) = cluster_lock {
+            let lease = lock
+                .try_acquire(PROXY_HYDRATION_LOCK_CLASS, lease_object_id(&key))
+                .await;
+            assert!(matches!(lease, Ok(Some(_))), "the cluster lock is released");
+            drop(lease);
+        }
+
+        let next = coordinator
+            .coordinate_detached(
+                &key,
+                check,
+                || async { Ok(9) },
+                roomy("deadline"),
+                || "timeout",
+            )
+            .await;
+        assert_eq!(next, Ok(9), "a new leader is elected and fills");
+    }
+
+    #[tokio::test]
+    async fn stalled_detached_fill_is_abandoned_at_its_deadline_in_process() {
+        let coordinator = HydrationCoordinator::Buffered(BufferedCoordinator::new());
+        assert_stalled_detached_fill_is_abandoned_at_its_deadline(&coordinator, None).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_detached_fill_is_abandoned_at_its_deadline_across_replicas() {
+        let lock: Arc<dyn ClusterLock> = Arc::new(InMemoryClusterLock::default());
+        let coordinator = HydrationCoordinator::Advisory(advisory_over(&lock));
+        assert_stalled_detached_fill_is_abandoned_at_its_deadline(&coordinator, Some(&lock)).await;
+    }
+
+    /// #5220: with every detached-fill permit taken, the fill runs in the
+    /// caller's task as before: it still serves a connected caller, and it is
+    /// cancelled (slot freed, nothing committed) when the caller goes away.
+    #[tokio::test]
+    async fn detached_fill_runs_in_the_request_when_no_permit_is_free() {
+        let no_permits = || DetachedFillLimits {
+            deadline: Duration::from_secs(60),
+            on_deadline: || "deadline",
+            permits: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let coordinator = BufferedCoordinator::new();
+
+        let key = format!("proxy-cache:detached-full-{}", uuid::Uuid::new_v4());
+        let served = coordinator
+            .coordinate_detached(
+                &key,
+                || async { Ok::<Option<u32>, &'static str>(None) },
+                || async { Ok(3) },
+                no_permits(),
+                || "timeout",
+            )
+            .await;
+        assert_eq!(served, Ok(3), "a connected caller is served in place");
+
+        let key = format!("proxy-cache:detached-full-{}", uuid::Uuid::new_v4());
+        let committed = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(Notify::new());
+        let fill = {
+            let (committed, release) = (Arc::clone(&committed), Arc::clone(&release));
+            move || async move {
+                release.notified().await;
+                committed.store(true, Ordering::SeqCst);
+                Ok(4)
+            }
+        };
+        let caller = coordinator.coordinate_detached(
+            &key,
+            || async { Ok::<Option<u32>, &'static str>(None) },
+            fill,
+            no_permits(),
+            || "timeout",
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), caller)
+                .await
+                .is_err(),
+            "the caller gives up mid-fill"
+        );
+        assert!(!map_contains(&key), "the in-request fill was cancelled");
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "nothing runs on after the caller is gone"
+        );
     }
 
     /// The core #1609 guarantee: K concurrent cold requests spread across ≥2
