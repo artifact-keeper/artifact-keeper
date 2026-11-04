@@ -1582,7 +1582,8 @@ mod tests {
             ("none", true, "inactive"),
             ("push", false, "inactive"),
         ] {
-            let json = serde_json::to_value(SubscriptionResponse::from(row(mode, enabled))).unwrap();
+            let json =
+                serde_json::to_value(SubscriptionResponse::from(row(mode, enabled))).unwrap();
             assert_eq!(json["effective"], expected, "{mode} enabled={enabled}");
         }
     }

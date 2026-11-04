@@ -188,7 +188,10 @@ impl ReplicationMode {
 /// subscription API's `effective` field (#5293): `active` when it is enabled
 /// and its mode has a task producer, `inactive` otherwise. A `pull` row
 /// written before `pull` was refused reports `inactive`.
-pub fn subscription_effective_state(sync_enabled: bool, replication_mode: Option<&str>) -> &'static str {
+pub fn subscription_effective_state(
+    sync_enabled: bool,
+    replication_mode: Option<&str>,
+) -> &'static str {
     let replicates = matches!(replication_mode, Some("push") | Some("mirror"));
     if sync_enabled && replicates {
         "active"
@@ -1654,7 +1657,10 @@ mod tests {
         assert_eq!(subscription_effective_state(true, Some("mirror")), "active");
         assert_eq!(subscription_effective_state(true, Some("pull")), "inactive");
         assert_eq!(subscription_effective_state(true, Some("none")), "inactive");
-        assert_eq!(subscription_effective_state(false, Some("push")), "inactive");
+        assert_eq!(
+            subscription_effective_state(false, Some("push")),
+            "inactive"
+        );
         assert_eq!(subscription_effective_state(true, None), "inactive");
     }
 
@@ -1672,7 +1678,14 @@ mod tests {
         let repo_id = insert_test_repo(&pool, &suffix).await;
 
         let err = svc
-            .assign_repository(peer_id, repo_id, true, Some(ReplicationMode::Pull), None, None)
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Pull),
+                None,
+                None,
+            )
             .await
             .expect_err("pull must be refused");
         assert!(matches!(err, AppError::Validation(_)), "{err:?}");
@@ -1699,8 +1712,16 @@ mod tests {
             .unwrap();
 
         insert_legacy_pull_subscription(&pool, peer_id, repo_id).await;
-        assert!(svc.get_repos_for_push_sync(peer_id).await.unwrap().is_empty());
-        assert!(svc.get_repos_for_mirror_sync(peer_id).await.unwrap().is_empty());
+        assert!(svc
+            .get_repos_for_push_sync(peer_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(svc
+            .get_repos_for_mirror_sync(peer_id)
+            .await
+            .unwrap()
+            .is_empty());
         let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
         assert_eq!(
             subscription_effective_state(sub.sync_enabled, sub.replication_mode.as_deref()),
@@ -1718,7 +1739,10 @@ mod tests {
             .unwrap();
         let warned = warn_inactive_pull_replication(&pool).await;
         assert!(
-            warned.contains(&("subscription".to_string(), format!("{peer_name}/{repo_key}"))),
+            warned.contains(&(
+                "subscription".to_string(),
+                format!("{peer_name}/{repo_key}")
+            )),
             "{warned:?}"
         );
 

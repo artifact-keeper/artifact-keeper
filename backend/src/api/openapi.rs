@@ -1493,10 +1493,22 @@ mod tests {
             doc_api_paths("`PUT /api/v1/repositories/{key}/cache-ttl`, then\n curl https://x/api/v1/peers/abc/repositories?x=1."),
             ["/api/v1/repositories/{key}/cache-ttl", "/api/v1/peers/abc/repositories"]
         );
-        assert!(path_matches_template("/api/v1/peers/abc/repositories", "/api/v1/peers/{id}/repositories"));
-        assert!(path_matches_template("/api/v1/peers/{peer}/repositories", "/api/v1/peers/{id}/repositories"));
-        assert!(!path_matches_template("/api/v1/peers/abc", "/api/v1/peers/{id}/repositories"));
-        assert!(!path_matches_template("/api/v1/peerz/abc/repositories", "/api/v1/peers/{id}/repositories"));
+        assert!(path_matches_template(
+            "/api/v1/peers/abc/repositories",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        assert!(path_matches_template(
+            "/api/v1/peers/{peer}/repositories",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        assert!(!path_matches_template(
+            "/api/v1/peers/abc",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        assert!(!path_matches_template(
+            "/api/v1/peerz/abc/repositories",
+            "/api/v1/peers/{id}/repositories"
+        ));
         let vars = doc_env_vars(
             "set `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.0.0.0/8`, `HF_HUB_DISABLE_XET=1`, `cache-ttl`, `X`, `Mixed_Case`\n\
              ```yaml\n      SCANNER_OFFLINE: \"true\"\n      - GRYPE_DB_AUTO_UPDATE=false\n```\n\
