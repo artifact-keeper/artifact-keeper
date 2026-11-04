@@ -342,6 +342,12 @@ impl MigrationService {
             // Nexus names its R/CRAN format `r`; Artifactory and Artifact
             // Keeper call it `cran` (#2525).
             "r" => "cran".to_string(),
+            // Artifactory names its Helm OCI repositories `helmoci`; Artifact
+            // Keeper's format is `helm_oci`, served by the OCI handler. Without
+            // this mapping the source type fell through to `Unsupported` and
+            // the repository was rejected, even though the importer already
+            // routes `helm_oci` through the OCI import path (#5264).
+            "helmoci" => "helm_oci".to_string(),
             _ => lower,
         }
     }
@@ -370,6 +376,12 @@ impl MigrationService {
             // `.deb` under `pool/<component>/` and records its control file and
             // catalog row exactly as a native upload does (#4657).
             "debian" => FormatCompatibility::Full,
+            // Helm OCI is Full for the same reason Docker is: the source
+            // stores charts as OCI manifests and blobs, and the importer
+            // registers them in the OCI index exactly as a native push does
+            // (`is_oci_package_type` covers `helm_oci`), so `helm pull
+            // oci://...` resolves imported tags (#5264).
+            "helm_oci" => FormatCompatibility::Full,
             "conan" | "conda" => FormatCompatibility::Partial,
             _ => FormatCompatibility::Unsupported,
         }
@@ -2694,6 +2706,54 @@ mod tests {
         let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
         assert_eq!(config.package_type, "debian");
         assert_eq!(config.format_compatibility, FormatCompatibility::Full);
+    }
+
+    /// #5264: an Artifactory `helmoci` repository must prepare as AK's
+    /// `helm_oci` and be importable, and the prepared type must reach the OCI
+    /// import path rather than the generic one. Classic `helm` is unchanged.
+    #[test]
+    fn test_prepare_repository_migration_maps_artifactory_helmoci_5264() {
+        for source in ["helmoci", "HelmOCI", "helm_oci"] {
+            assert_eq!(
+                MigrationService::normalize_package_type(source),
+                "helm_oci",
+                "{source}"
+            );
+            assert_eq!(
+                MigrationService::get_format_compatibility(source),
+                FormatCompatibility::Full,
+                "{source}"
+            );
+            assert_eq!(
+                MigrationService::target_repository_format(source),
+                "helm_oci",
+                "{source}"
+            );
+            assert_eq!(MigrationService::index_limitation(source), None, "{source}");
+        }
+
+        let repo = RepositoryListItem {
+            key: "charts-oci".to_string(),
+            repo_type: "local".to_string(),
+            package_type: "helmoci".to_string(),
+            url: None,
+            description: None,
+            members: vec![],
+            upstream_url: None,
+        };
+        let config = MigrationService::prepare_repository_migration(&repo, None).unwrap();
+        assert_eq!(config.package_type, "helm_oci");
+        assert_eq!(config.format_compatibility, FormatCompatibility::Full);
+        assert!(
+            crate::services::migration_worker::is_oci_package_type(&config.package_type),
+            "a prepared helmoci repo must take the OCI import path"
+        );
+
+        // Classic Helm chart repositories keep their own handling.
+        assert_eq!(MigrationService::normalize_package_type("helm"), "helm");
+        assert!(!crate::services::migration_worker::is_oci_package_type(
+            &MigrationService::normalize_package_type("helm")
+        ));
     }
 
     #[test]
