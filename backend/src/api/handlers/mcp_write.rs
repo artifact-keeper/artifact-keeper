@@ -385,7 +385,9 @@ fn issue(e: &McpError) -> serde_json::Value {
 /// meaning the publish would answer `202` and fill a Remote).
 pub fn validation_result(outcome: Result<&Resolution, &McpError>) -> serde_json::Value {
     match outcome {
-        Err(e) => serde_json::json!({"valid": false, "issues": [issue(e)]}),
+        // `packages` is always present: empty when the document was refused
+        // before its packages were resolved.
+        Err(e) => serde_json::json!({"valid": false, "issues": [issue(e)], "packages": []}),
         Ok(res) => {
             let mut packages: Vec<serde_json::Value> = res
                 .pins
@@ -1591,6 +1593,8 @@ mod tests {
         };
         let v = validation_result(Err(&err));
         assert_eq!(v["valid"], false);
+        // D3: `packages` is always present, empty for a refused document.
+        assert_eq!(v["packages"], serde_json::json!([]));
         assert_eq!(v["issues"][0]["path"], "packages[1]");
         assert_eq!(v["issues"][0]["reference"], "mcp_package_not_found");
         assert_eq!(v["issues"][0]["severity"], "error");
