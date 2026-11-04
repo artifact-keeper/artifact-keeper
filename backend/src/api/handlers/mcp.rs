@@ -1548,7 +1548,10 @@ pub(super) fn admit_document(
     settings: &mcp_packages::McpSettings,
 ) -> Result<fmt::ServerJson, McpError> {
     let mut server = fmt::parse_server_json(body)?;
-    fmt::validate_server_json(&server)?;
+    // The installation check runs once the staged bundles are added
+    // (`fmt::check_installable`): a bundle-only document gets its `mcpb`
+    // entry from the upload.
+    fmt::validate_server_json_before_bundles(&server)?;
     let namespace = fmt::namespace_of(&server.name).to_string();
     if fmt::is_reserved_namespace(&server.name) {
         return Err(McpError::ReservedNamespace { namespace });
@@ -1857,6 +1860,7 @@ async fn publish_server(
     name_write_gates(&state, &ext, &repo, &server.name, &headers).await?;
     super::mcp_write::add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
         .await?;
+    fmt::check_installable(&server).map_err(mcp_error)?;
     super::mcp_write::refuse_tombstoned(&state.db, repo.id, &server.name, &server.version).await?;
     let resolution = crate::services::mcp_resolver::resolve_document(
         &state,

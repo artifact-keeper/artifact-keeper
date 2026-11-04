@@ -967,6 +967,33 @@ pub fn validate_server_json(s: &ServerJson) -> V {
 /// into a Remote repository, whose floating tags are pinned or hidden at
 /// sync rather than refused).
 pub fn validate_server_json_opts(s: &ServerJson, allow_floating_oci: bool) -> V {
+    validate_document(s, allow_floating_oci, true)
+}
+
+/// [`validate_server_json`] without the installation check
+/// ([`check_installable`]): a hosted publish adds the `mcpb` entries of the
+/// bundles uploaded beside the version first, so a bundle-only document has
+/// its `packages` only then. The caller runs [`check_installable`] after.
+pub fn validate_server_json_before_bundles(s: &ServerJson) -> V {
+    validate_document(s, false, false)
+}
+
+/// A server needs `packages`, `remotes` or a `websiteUrl` describing its
+/// installation. The upstream specification's "custom installation path"
+/// example has neither of the first two: such a server points at its setup
+/// guide with `websiteUrl`.
+pub fn check_installable(s: &ServerJson) -> V {
+    if s.packages.is_empty() && s.remotes.is_empty() && s.website_url.is_none() {
+        return Err(McpError::invalid(
+            "",
+            "a server needs `packages`, `remotes` or a `websiteUrl` describing its installation \
+             (or an MCPB bundle uploaded for this version)",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_document(s: &ServerJson, allow_floating_oci: bool, require_install: bool) -> V {
     if let Some(schema) = s.schema.as_deref() {
         check_http_url("$schema", Some(schema))?;
     }
@@ -999,13 +1026,8 @@ pub fn validate_server_json_opts(s: &ServerJson, allow_floating_oci: bool) -> V 
     for (i, icon) in s.icons.iter().enumerate() {
         validate_icon(i, icon)?;
     }
-    // The upstream specification's "custom installation path" example has
-    // neither: such a server points at its setup guide with `websiteUrl`.
-    if s.packages.is_empty() && s.remotes.is_empty() && s.website_url.is_none() {
-        return Err(McpError::invalid(
-            "",
-            "a server needs `packages`, `remotes` or a `websiteUrl` describing its installation",
-        ));
+    if require_install {
+        check_installable(s)?;
     }
     check_count("packages", s.packages.len(), MAX_PACKAGES)?;
     check_count("remotes", s.remotes.len(), MAX_REMOTES)?;

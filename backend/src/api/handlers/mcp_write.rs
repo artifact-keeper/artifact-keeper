@@ -531,11 +531,13 @@ async fn validate(
             return Err(McpError::VersionExists);
         }
         if !scope.packages {
+            fmt::check_installable(&server)?;
             return Ok((server, None));
         }
         add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
             .await
             .map_err(|_| McpError::Internal("bundle lookup failed".into()))?;
+        fmt::check_installable(&server)?;
         let res = resolver::resolve_document(
             &state,
             &settings,
@@ -700,6 +702,7 @@ async fn edit_impl(
         ));
     }
     add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str()).await?;
+    fmt::check_installable(&server).map_err(mcp_error)?;
     let keep_pins = packages_unchanged(&current.stored.server, &server);
     let resolution = if keep_pins {
         Resolution {
@@ -2263,8 +2266,27 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        // Publish without an mcpb entry: AK adds it.
-        let d = doc("com.acme/echo", "1.0.0", serde_json::json!([]));
+        // A bundle-only document (no packages, remotes or websiteUrl): AK
+        // adds the mcpb entry before the installation check. Without an
+        // uploaded bundle the same document is refused.
+        let mut d = doc("com.acme/echo", "1.0.0", serde_json::json!([]));
+        d.as_object_mut().unwrap().remove("remotes");
+        let mut none = d.clone();
+        none["version"] = "9.9.9".into();
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&none))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("mcp_invalid_server_json")),
+            "{b}"
+        );
+        let (s, b) = env.json(env.member(), "POST", "/validate", Some(&d)).await;
+        assert_eq!(
+            (s, b["valid"].as_bool()),
+            (StatusCode::OK, Some(true)),
+            "{b}"
+        );
         let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         let pkg = &b["server"]["packages"][0];

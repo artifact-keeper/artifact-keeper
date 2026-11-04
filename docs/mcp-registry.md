@@ -840,6 +840,10 @@ recorded signature) or another registry's `self_signed` bundle is
 `422 mcp_bundle_signature_required`. A
 document with no `mcpb` entry gets one `packages[]` entry per uploaded bundle
 (the `packageEntry` above), so `fileSha256` never has to be computed by hand.
+The entries are added before the "a server needs `packages`, `remotes` or a
+`websiteUrl`" check, so a bundle-only document (no `packages`, `remotes` or
+`websiteUrl`) is accepted once a bundle is uploaded for its version; without
+one it is `400 mcp_invalid_server_json`.
 The served `identifier` is the bundle's Artifact Keeper URL; on an exact read
 by an authenticated caller it carries a single-use download ticket
 (`?ticket=...`, five minutes), so a client handed the document can fetch the
