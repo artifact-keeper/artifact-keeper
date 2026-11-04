@@ -23,12 +23,10 @@ The design is recorded in
 | Type | Supported |
 |------|-----------|
 | Hosted (`local`, `staging`) | Yes |
-| Remote | No: creation is refused with `400` ("Agent Plugins repositories are hosted-only") |
-| Virtual | No: same `400` |
+| Remote | Yes, proxying another Artifact Keeper's hosted Agent Plugins repository (#5289). See [Remote repositories](#remote-repositories) |
+| Virtual | Not yet: creation is refused with `400` ("Agent Plugins virtual repositories are not supported yet"), and every route refuses one with `400` |
 
-There is no upstream marketplace protocol to proxy today, so only hosted
-repositories exist. Every route also refuses a non-hosted repository with
-`400`. The repository key `t` is reserved for this format because
+The repository key `t` is reserved for this format because
 `/agentplugins/t/...` is the token-in-path route.
 
 ## Layout
@@ -100,9 +98,10 @@ not a marker.
 | A marker manifest that is not a JSON object | `.claude-plugin/plugin.json is not a JSON object` |
 | A manifest `name` other than the slug | `... declares name "q" but the upload path names the plugin "p" ...` |
 | A manifest `version` other than the path version | `... declares version "0.9.0" but the upload path version is "1.0.0" ...` |
-| Remote or virtual repository | `Agent Plugins repositories are hosted-only; ...` |
+| Virtual repository | `Agent Plugins virtual repositories are not supported yet; ...` |
 
 Other answers: `401` without credentials, `403` without `write:artifacts`,
+`405` on a Remote repository (`Cannot publish to a remote (proxy) repository`),
 `409` for a version that exists (or a deleted one re-published with different
 bytes, below), `413` over `MAX_UPLOAD_SIZE`, `503` when the ingest-extraction
 slots are saturated, `507` over a storage quota.
@@ -303,6 +302,86 @@ The publish response reports the result as `marketplace_name`; install with
 
 `404` when the plugin has no servable version.
 
+## Remote repositories
+
+A Remote Agent Plugins repository proxies and caches a hosted Agent Plugins
+repository on another Artifact Keeper: a site behind a one-way link, a lab
+enclave or a regional cache serves the central instance's plugins with the
+same SHA-256 on every instance, without republishing them. The upstream is
+the central repository's base URL:
+
+```bash
+curl -X POST -u admin:password -H 'Content-Type: application/json' \
+  -d '{"key":"plugins-remote","name":"Central plugins","format":"agentplugins",
+       "repo_type":"remote","upstream_url":"https://central.example.com/agentplugins/plugins"}' \
+  https://site.example.org/api/v1/repositories
+```
+
+For a private central repository, configure upstream credentials on the
+Remote the same way as for any other Remote (Basic or bearer token), or use the
+token-in-path form as the upstream URL,
+`https://central.example.com/agentplugins/t/<token>/plugins`, with a
+repository-scoped, read-only token minted on the central instance.
+
+Clients use the Remote exactly like a hosted repository, with the same
+routes, documents and token-in-path variants:
+
+```bash
+claude plugin marketplace add https://site.example.org/agentplugins/plugins-remote/claude-marketplace.json
+ak agent plugins install deploy-tools --repo plugins-remote --harness cursor
+```
+
+How it works:
+
+- **Documents.** `marketplace.json`, the per-harness documents and
+  `{name}/index.json` are fetched from the upstream through the proxy cache
+  as mutable entries (revalidated after the cache TTL, five minutes by
+  default), then rewritten. Every archive `url` and `versions_url` points at
+  the Remote on this instance (keeping a `/t/<token>/` prefix when the
+  document is read through the token route); every `sha256` is the
+  upstream's, unchanged, so `claude plugin install` and the `ak` CLI verify
+  the same bytes on every instance. The marketplace `name` is derived from the
+  Remote's key (see [Marketplace name](#marketplace-name)), `owner.url` is
+  this instance, and `description` is the Remote's own description when it
+  has one, the upstream's otherwise. The ETag is computed over the rewritten
+  document.
+- **What is listed.** The Remote lists only what the upstream lists, in the
+  upstream's order. An entry is proxied only when it is an `archive` source
+  with valid coordinates, a SHA-256, and an `http(s)` URL whose path ends in
+  `/{name}/{version}/{name}-{version}.zip`. The host of that URL is not
+  compared (the upstream builds it from its own external URL); the Remote
+  always downloads from its own `upstream_url`. Any other entry (a git or
+  GitHub source, an archive on another layout) is left out, because the
+  Remote cannot fetch it through its upstream.
+- **Archives.** A download of `{name}/{version}/{name}-{version}.zip` reads
+  the upstream `{name}/index.json` (through the same proxy cache entry) for
+  the version's SHA-256 and size, fetches the zip from the upstream, and
+  checks its SHA-256 before anything is cached or served. Bytes that do not
+  match are answered with `502` and never cached; the next request asks the
+  upstream again. A matching archive is cached as immutable under
+  `{name}/{version}/{sha256}/{name}-{version}.zip`, so later downloads are
+  served without contacting the upstream. A version the upstream index does
+  not list is `404`. `HEAD` is answered from the index. Archives are checked
+  in memory before they are served, so a Remote proxies archives up to
+  256 MiB (Claude Code's own limit), under the shared proxy metadata memory
+  budget.
+- **Upstream down.** Cached archives keep being served as long as the
+  upstream index for the plugin can still be read from the cache: a
+  document whose TTL has lapsed is served stale while the upstream fails, for
+  the stale-if-error grace (`PROXY_STALE_IF_ERROR_GRACE_SECS`, one hour by
+  default, up to 30 days). Raise the grace, or the Remote's cache TTL, for a
+  site that must install from cache through a long upstream outage.
+- **Everything a Remote does.** The upstream filter (`include_patterns` /
+  `exclude_patterns`, matched against the upstream-relative path), the origin
+  policy, upstream credentials, the proxy cache cap and cache purge apply as
+  for every other Remote.
+- **Read-only.** Publishing to a Remote answers `405`.
+
+Not supported yet (#5289): Virtual repositories merging hosted and Remote
+members, proxying a GitHub-hosted marketplace (git sources would have to be
+re-archived, which changes the SHA-256), and scan-on-proxy for agent plugin
+archives.
+
 ## Client setup
 
 ### `AK_EXTERNAL_URL` and https
@@ -405,6 +484,7 @@ curl -X PUT -u user:password -H "X-Checksum-Sha256: $sha" \
 - Entries: `MAX_INGEST_ARCHIVE_ENTRIES` (default 10,000); declared uncompressed
   total: `MAX_INGEST_DECOMPRESSED_BYTES` (default 128 MiB); manifest files: 1
   MiB each.
-- Remote and virtual repositories, content policies (deny hooks, `bin/`, MCP),
-  Gemini CLI and OpenCode installers, and signature verification on install
-  are not supported yet.
+- Remote archives: 256 MiB each (above).
+- Virtual repositories, Remote repositories of a GitHub-hosted marketplace,
+  content policies (deny hooks, `bin/`, MCP), Gemini CLI and OpenCode
+  installers, and signature verification on install are not supported yet.

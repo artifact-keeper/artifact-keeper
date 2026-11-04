@@ -330,6 +330,12 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // so it gets a longer, finite lifetime.
         RepositoryFormat::Mcp => classify_mcp(&lower),
 
+        // Agent Plugins Remote (#5289): an archive is cached under
+        // `{name}/{version}/{sha256}/{name}-{version}.zip`, the digest the
+        // upstream index lists, so it is content-addressed. The marketplace
+        // documents and `{name}/index.json` gain versions over time.
+        RepositoryFormat::AgentPlugins => classify_agent_plugins(&lower),
+
         // Everything else: conservative default. Revalidate rather than risk
         // serving a stale index forever.
         _ => Mutability::mutable_default(),
@@ -827,6 +833,32 @@ fn classify_mcp(lower: &str) -> Mutability {
             }
         }
         _ => always_revalidate,
+    }
+}
+
+/// Agent Plugins (#5289): only a Remote's content-addressed archive cache
+/// path, `{name}/{version}/{sha256}/{name}-{version}.zip`, is immutable.
+/// The hosted artifact path (`{name}/{version}/{name}-{version}.zip`, three
+/// segments) is NOT: `classify` also drives the hosted delete guard, and a
+/// hosted plugin version stays deletable through the REST artifact delete.
+/// Documents (`marketplace.json`, `claude-marketplace.json`, ...,
+/// `{name}/index.json`) are mutable.
+fn classify_agent_plugins(lower: &str) -> Mutability {
+    let parts: Vec<&str> = lower.split('/').collect();
+    let content_addressed = match parts.as_slice() {
+        [name, version, digest, file] => {
+            !name.is_empty()
+                && !version.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && *file == format!("{name}-{version}.zip")
+        }
+        _ => false,
+    };
+    if content_addressed {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
     }
 }
 
@@ -1356,6 +1388,33 @@ mod tests {
             (Bazel, "modules/rules_cc/0.1.1/source.json", true),
             (Bazel, "modules/rules_cc/0.1.1/patches/fix.patch", true),
             (Bazel, "modules/rules_cc", false),
+            // Agent Plugins Remote (#5289): the content-addressed archive
+            // cache path is immutable; the hosted artifact path, the documents
+            // and a malformed digest segment are not.
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa000000000000000000000000000000000000000000000000000000000000/deploy-tools-1.2.0.zip",
+                true,
+            ),
+            (
+                AgentPlugins,
+                "deploy-tools/2.0.0-rc.1/6BFA000000000000000000000000000000000000000000000000000000000000/deploy-tools-2.0.0-rc.1.zip",
+                true,
+            ),
+            (AgentPlugins, "deploy-tools/1.2.0/deploy-tools-1.2.0.zip", false),
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa00000000000000000000000000000000000000000000000000000000000/deploy-tools-1.2.0.zip",
+                false,
+            ),
+            (
+                AgentPlugins,
+                "deploy-tools/1.2.0/6bfa000000000000000000000000000000000000000000000000000000000000/other-1.2.0.zip",
+                false,
+            ),
+            (AgentPlugins, "marketplace.json", false),
+            (AgentPlugins, "claude-marketplace.json", false),
+            (AgentPlugins, "deploy-tools/index.json", false),
         ]
     }
 
