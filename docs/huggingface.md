@@ -146,6 +146,17 @@ curl -X POST \
 The token needs `write:artifacts` and write permission on the repository.
 Uploads to Remote (405) and Virtual (400) repositories are refused.
 
+The body is streamed to storage while its SHA-256 is computed, so a
+multi-gigabyte GGUF or safetensors file does not have to fit in the server's
+memory. It is staged first (local upload scratch, or the repository's own
+object store when that backend streams natively) and written to its final
+key once it is complete. A file larger than `MAX_UPLOAD_SIZE` (default
+10 GiB) is refused with `413`, up front when `Content-Length` declares it and
+otherwise as soon as the limit is crossed, and leaves nothing behind. A
+published file is immutable: uploading to a path that already holds a file
+answers `409`, whatever the bytes. An empty body answers `400`. The response
+carries the stored file's `path`, `sha256` and `size`.
+
 Each revision is its own set of files: upload every file of a revision to
 that revision. The model can then be downloaded with the usual calls, with
 `HF_ENDPOINT` pointed at the Local repository:
