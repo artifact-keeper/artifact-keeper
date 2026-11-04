@@ -1322,10 +1322,12 @@ async fn complete_session_commit(
         &repo.format,
         repo.versioning_enabled,
     );
+    let overwrite_active = crate::services::artifact_service::overwrite_applies(&repo);
+    let mut retired = None;
     let mut attempt = 0;
     let (inserted_artifact_id, replaced) = loop {
         attempt += 1;
-        let gate = match &precondition {
+        let mut gate = match &precondition {
             Some(precondition) => {
                 match locked_precondition_gate(&mut tx, &session, precondition).await {
                     Ok(Some(gate)) => gate,
@@ -1351,6 +1353,27 @@ async fn complete_session_commit(
             }
             None => LockedPreconditionGate::default(),
         };
+        // #5188: on a mutable repository, different bytes at this path retire
+        // the old row in this transaction (new artifact id, its scan /
+        // approval state cascades away, its object goes to storage GC), as
+        // the whole-body PUT does in `finalize_upload`. A row with these same
+        // bytes is refreshed in place and keeps its id; a row a concurrent
+        // writer commits after this point is refused by `expect_absent` and
+        // retired on the second pass.
+        if overwrite_active {
+            match retire_for_overwrite(&mut tx, &repo, &session, &storage_key).await {
+                Ok((r, identical_live)) => {
+                    retired = r.or(retired);
+                    gate.replaces_current = identical_live;
+                    gate.expect_absent = !identical_live;
+                    gate.replaced_key = None;
+                }
+                Err(e) => {
+                    drop(tx);
+                    return Err(release_after_precommit_failure(&state.db, &session, e).await);
+                }
+            }
+        }
         let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -1359,7 +1382,14 @@ async fn complete_session_commit(
             ON CONFLICT (repository_id, path) DO UPDATE SET
                 name = $3, version = $4, size_bytes = $5, checksum_sha256 = $6,
                 content_type = $7, storage_key = $8, uploaded_by = $9,
-                updated_at = NOW(), is_deleted = false
+                updated_at = NOW(), is_deleted = false,
+                -- This path records no SHA-1/MD5: keep the old row's only
+                -- when the bytes are the same, never describe new bytes
+                -- with digests of the old ones.
+                checksum_sha1 = CASE WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                                     THEN artifacts.checksum_sha1 END,
+                checksum_md5 = CASE WHEN LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256)
+                                    THEN artifacts.checksum_md5 END
             WHERE (artifacts.is_deleted
                 OR $10
                 OR artifacts.version IS DISTINCT FROM EXCLUDED.version
@@ -1387,7 +1417,7 @@ async fn complete_session_commit(
         .fetch_optional(&mut *tx)
         .await;
         match inserted {
-            Ok(None) if gate.expect_absent && attempt == 1 => continue,
+            Ok(None) if (gate.expect_absent || overwrite_active) && attempt == 1 => continue,
             other => break (other, gate.replaced_key),
         }
     };
@@ -1575,6 +1605,10 @@ async fn complete_session_commit(
         .await;
         return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
+    crate::services::artifact_service::forget_retired_artifact(
+        state.search_service.as_ref(),
+        retired.as_ref(),
+    );
 
     // The upload-time quarantine hold every native upload route applies
     // (`finalize_upload`, Maven, npm), so an artifact pushed through the
@@ -1874,6 +1908,42 @@ struct LockedPreconditionGate {
     expect_absent: bool,
     /// The storage key of the live row a matched `If-Match` replaces.
     replaced_key: Option<String>,
+}
+
+/// [`retire_overwritten_artifact`] for a chunked completion on a mutable
+/// repository (#5188). Returns the retired row, if any, and whether a live row
+/// with the session's own bytes still holds the path (it is locked here).
+///
+/// [`retire_overwritten_artifact`]: crate::services::artifact_service::retire_overwritten_artifact
+async fn retire_for_overwrite(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    repo: &crate::models::repository::Repository,
+    session: &upload_service::UploadSession,
+    storage_key: &str,
+) -> crate::error::Result<(
+    Option<crate::services::artifact_service::RetiredArtifact>,
+    bool,
+)> {
+    let retired = crate::services::artifact_service::retire_overwritten_artifact(
+        tx,
+        session.repository_id,
+        &repo.storage_location(),
+        &session.artifact_path,
+        Some(&session.checksum_sha256),
+        storage_key,
+    )
+    .await?;
+    let identical_live = sqlx::query_scalar::<_, bool>(
+        "SELECT NOT is_deleted FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+    )
+    .bind(session.repository_id)
+    .bind(&session.artifact_path)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?
+    .unwrap_or(false);
+    Ok((retired, identical_live))
 }
 
 /// Lock the row at the session's path and evaluate `precondition` against it

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            FROM repositories\n            WHERE key = $1\n            ",
+  "query": "\n            SELECT\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, allow_overwrite,\n                project_id, created_at, updated_at\n            FROM repositories\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -358,6 +358,17 @@
       },
       {
         "ordinal": 23,
+        "name": "allow_overwrite",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repositories",
+            "name": "allow_overwrite"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "project_id",
         "type_info": "Uuid",
         "origin": {
@@ -368,7 +379,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -379,7 +390,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -392,7 +403,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -419,10 +430,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "6238b1d4a7f8f033eae2afc737340c8f2aa7560ed94978812a5a74c4c43a306e"
+  "hash": "d8d4ad29e4546813599df14d25bfd5201ad6e84e7955e17b1af41c356ef4df97"
 }

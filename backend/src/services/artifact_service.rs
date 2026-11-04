@@ -180,6 +180,11 @@ pub(crate) async fn enforce_path_immutability_with(
     checksum_sha256: &str,
     replaces_current: bool,
 ) -> Result<()> {
+    // #5188: a mutable repository replaces whatever is at the path, live or
+    // released, so neither check applies.
+    if repo.is_some_and(overwrite_applies) {
+        return Ok(());
+    }
     let versioning_active = repo
         .map(|r| versioning_applies(&r.format, r.versioning_enabled))
         .unwrap_or(false);
@@ -255,6 +260,114 @@ pub(crate) fn versioning_applies(format: &RepositoryFormat, versioning_enabled: 
             format,
             RepositoryFormat::Generic | RepositoryFormat::Mlmodel
         )
+}
+
+/// Whether an upload may replace the content already at its path (#5188):
+/// the repository opted in via `allow_overwrite` (DEFAULT false). Versioning
+/// wins when both are set, so a versioned repository still appends a revision
+/// rather than discarding history.
+pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
+    repo.allow_overwrite && !versioning_applies(&repo.format, repo.versioning_enabled)
+}
+
+/// The row a mutable-repository overwrite (#5188) retired, returned by
+/// [`retire_overwritten_artifact`].
+#[derive(Debug, Clone)]
+pub(crate) struct RetiredArtifact {
+    pub id: Uuid,
+    pub storage_key: String,
+}
+
+/// Retire the row at `(repository_id, path)` that a mutable-repository
+/// overwrite (#5188) replaces, inside the publishing transaction `tx`.
+///
+/// The row is deleted rather than updated in place, so the replacement gets a
+/// new artifact id. Scan results, findings, promotion approvals, quarantine
+/// state and every other per-artifact record are `ON DELETE CASCADE` on
+/// `artifacts(id)` (migration 125 made the approval FK cascade): none of them
+/// can stay attached to bytes they were never recorded for, and the
+/// replacement's own scan-on-upload runs against the new id. Because the
+/// delete is in `tx`, a later failure (quota admission, the INSERT, the
+/// commit) rolls it back and the old package stays as it was.
+///
+/// `keep_checksum`: a row whose SHA-256 equals it is left alone (identical
+/// bytes are not a replacement; the caller's upsert keeps its id and its
+/// approvals). `None` retires any row at the path.
+///
+/// When the retired row named a different object than `new_storage_key`, that
+/// object is journalled for storage GC in the same transaction; the candidate
+/// sweep deletes it only if nothing references the key by then.
+pub(crate) async fn retire_overwritten_artifact(
+    tx: &mut sqlx::PgConnection,
+    repository_id: Uuid,
+    location: &crate::storage::StorageLocation,
+    path: &str,
+    keep_checksum: Option<&str>,
+    new_storage_key: &str,
+) -> Result<Option<RetiredArtifact>> {
+    let retired = sqlx::query_as::<_, (Uuid, String)>(
+        "DELETE FROM artifacts \
+          WHERE repository_id = $1 AND path = $2 \
+            AND ($3::text IS NULL OR LOWER(TRIM(checksum_sha256)) <> LOWER(TRIM($3))) \
+         RETURNING id, storage_key",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(keep_checksum)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some((id, storage_key)) = retired else {
+        return Ok(None);
+    };
+    if storage_key != new_storage_key {
+        let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
+        sqlx::query(
+            "INSERT INTO oci_gc_candidates \
+                 (storage_key, storage_backend, storage_path, source_repository_id) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (storage_backend, storage_path, storage_key) \
+                 DO UPDATE SET recorded_at = NOW()",
+        )
+        .bind(&storage_key)
+        .bind(&scope.backend)
+        .bind(&scope.path)
+        .bind(repository_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    }
+    Ok(Some(RetiredArtifact { id, storage_key }))
+}
+
+/// Drop a retired overwrite's document from the search index (#5188). The
+/// replacement is indexed under its own new id; without this the old id would
+/// keep answering searches for the path. Fire-and-forget, post-commit.
+pub(crate) fn forget_retired_artifact(
+    search: Option<&Arc<OpenSearchService>>,
+    retired: Option<&RetiredArtifact>,
+) {
+    let (Some(search), Some(retired)) = (search, retired) else {
+        return;
+    };
+    let search = search.clone();
+    let id = retired.id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = search.remove_artifact(&id).await {
+            tracing::warn!(artifact_id = %id, error = %e, "Failed to remove overwritten artifact from search index");
+        }
+    });
+}
+
+/// The storage key a path-addressed format (Alpine, Pacman, flat RPM) writes a
+/// mutable-repository replacement (#5188) under. The replacement must not land
+/// on the key the live row still points at: storage cannot join the publish
+/// transaction, so writing the old key in place would leave the surviving row
+/// naming the new bytes whenever the publish fails after the put. A
+/// content-suffixed key keeps the old object intact until the retire commits
+/// and storage GC collects it.
+pub(crate) fn overwrite_storage_key(base_key: &str, checksum_sha256: &str) -> String {
+    format!("{base_key}.sha256-{}", checksum_sha256.to_ascii_lowercase())
 }
 
 /// Next auto-increment revision for a (repository_id, path) coordinate given
@@ -1455,6 +1568,7 @@ impl ArtifactService {
         let versioning_active = repo_for_upload
             .as_ref()
             .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
+        let overwrite_active = repo_for_upload.as_ref().is_some_and(overwrite_applies);
         // #2382: `.safetensors` uploads to Mlmodel repos get their header
         // summarised into `artifact_metadata` once the row exists.
         let safetensors_eligible = repo_for_upload.as_ref().is_some_and(|r| {
@@ -1518,6 +1632,7 @@ impl ArtifactService {
         // now exists and is locked by the refused upsert) and evaluates the
         // precondition against it.
         let mut attempt = 0;
+        let mut retired: Option<RetiredArtifact> = None;
         let artifact = loop {
             attempt += 1;
             let mut expect_absent = false;
@@ -1541,6 +1656,40 @@ impl ArtifactService {
                 expect_absent = live.is_none();
                 replaces_current = live.is_some() && precondition.replaces_current();
                 replaced_key = live.map(|(_, key, _)| key);
+            }
+            // #5188: on a mutable repository, different bytes at this path
+            // retire the old row (new id, its scan/approval state cascades
+            // away, its object goes to storage GC) in this transaction. What
+            // is left is either nothing or a row with these same bytes: the
+            // latter is refreshed in place and keeps its id. Anything a
+            // concurrent writer commits after this point is refused by
+            // `expect_absent` and retired on the second pass.
+            if let (true, Some(repo)) = (overwrite_active, repo_for_upload.as_ref()) {
+                if let Some(r) = retire_overwritten_artifact(
+                    &mut tx,
+                    repository_id,
+                    &repo.storage_location(),
+                    path,
+                    Some(checksum_sha256),
+                    storage_key,
+                )
+                .await?
+                {
+                    retired = Some(r);
+                }
+                let identical_live = sqlx::query_scalar::<_, bool>(
+                    "SELECT NOT is_deleted FROM artifacts \
+                     WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+                )
+                .bind(repository_id)
+                .bind(path)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .unwrap_or(false);
+                replaces_current = identical_live;
+                expect_absent = !identical_live;
+                replaced_key = None;
             }
             // Create artifact record.
             //
@@ -1629,8 +1778,10 @@ impl ArtifactService {
                     break artifact;
                 }
                 // #4186: a live row appeared under a conditional write that
-                // expected none; evaluate the precondition against it.
-                None if expect_absent && attempt == 1 => continue,
+                // expected none; evaluate the precondition against it. #5188:
+                // on a mutable repository, a row a concurrent writer committed
+                // after our read is retired on the second pass.
+                None if (expect_absent || overwrite_active) && attempt == 1 => continue,
                 None => {
                     // Drop `tx` (rolls back the quota admission). The content
                     // blob is content-addressed; if this upload orphaned it,
@@ -1647,6 +1798,7 @@ impl ArtifactService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        forget_retired_artifact(self.search_service.as_ref(), retired.as_ref());
 
         // #2367: append an immutable revision to `artifact_versions` for
         // versioning-enabled Generic/Mlmodel repos. Identical-bytes
@@ -6442,6 +6594,135 @@ mod tests {
             "flag-off repos must record no version history"
         );
 
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn test_overwrite_applies_gated_on_flag_and_yields_to_versioning() {
+        use crate::models::repository::{
+            ReplicationPriority, RepositoryType, RepositoryVisibility,
+        };
+        let now = chrono::Utc::now();
+        let mut repo = Repository {
+            id: Uuid::new_v4(),
+            key: "pypi-dev".to_string(),
+            name: "PyPI dev".to_string(),
+            description: None,
+            format: RepositoryFormat::Pypi,
+            repo_type: RepositoryType::Local,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/pypi-dev".to_string(),
+            upstream_url: None,
+            visibility: RepositoryVisibility::Private,
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Immediate,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 0,
+            versioning_enabled: false,
+            allow_overwrite: false,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(!overwrite_applies(&repo), "default is immutable");
+        repo.allow_overwrite = true;
+        assert!(overwrite_applies(&repo));
+        // Versioning keeps history instead of replacing it.
+        repo.format = RepositoryFormat::Generic;
+        repo.versioning_enabled = true;
+        assert!(!overwrite_applies(&repo));
+    }
+
+    /// #5188: on a repository with `allow_overwrite`, a different-bytes
+    /// re-upload to a released coordinate replaces it in place, and the
+    /// object it pointed at is handed to storage GC. Identical bytes keep the
+    /// same key and journal nothing.
+    #[tokio::test]
+    async fn allow_overwrite_replaces_released_coordinate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set allow_overwrite");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+        let path = "demo/1.0.0/demo-1.0.0-py3-none-any.whl";
+        let upload = |bytes: &'static [u8]| {
+            svc.upload_with_sync_options(
+                repo_id,
+                path,
+                "demo",
+                Some("1.0.0"),
+                "application/zip",
+                Bytes::from_static(bytes),
+                Some(user_id),
+                false,
+            )
+        };
+
+        let first = upload(b"build-1").await.expect("first upload");
+        let second = upload(b"build-2")
+            .await
+            .expect("different-bytes re-upload must replace, not 409");
+        assert_eq!(second.id, first.id, "same row is replaced in place");
+        assert_eq!(
+            second.checksum_sha256,
+            ArtifactService::calculate_sha256(b"build-2")
+        );
+        assert_ne!(second.storage_key, first.storage_key);
+
+        let journaled = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM oci_gc_candidates \
+                     WHERE storage_key = $1 AND source_repository_id = $2",
+                )
+                .bind(key)
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count candidates")
+            }
+        };
+        assert_eq!(
+            journaled(first.storage_key.clone()).await,
+            1,
+            "the replaced object must be handed to storage GC"
+        );
+
+        let third = upload(b"build-2").await.expect("identical re-upload");
+        assert_eq!(third.storage_key, second.storage_key);
+        assert_eq!(
+            journaled(second.storage_key.clone()).await,
+            0,
+            "an identical re-upload must not journal the live object"
+        );
+
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
