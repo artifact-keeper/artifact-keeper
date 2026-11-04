@@ -581,6 +581,106 @@ pub(crate) async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy 
 }
 
 // ---------------------------------------------------------------------------
+// The generic catalog (`/api/v1/packages`) view
+// ---------------------------------------------------------------------------
+
+/// What `/api/v1/packages` shows a caller of an MCP catalog row (#5253). The
+/// row records the newest version published or ingested, whatever its holds;
+/// the registry surface decides per reader ([`servable`]), and so does the
+/// catalog now.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CatalogView {
+    /// The row as stored. `servable` is whether readers are served that
+    /// version now (a holder sees a held version, flagged).
+    Keep { servable: bool },
+    /// A reader is shown the server's newest servable version instead.
+    Show {
+        version: String,
+        description: Option<String>,
+        metadata: serde_json::Value,
+    },
+    /// No version of the server is served to this reader: no row.
+    Hide,
+}
+
+/// The [`CatalogView`] of the MCP catalog row `name@version` in `repo_id` for
+/// `auth`. A holder (instance admin, or `read` through a grant or role: the
+/// reason gate) keeps the row; any other reader sees the newest version the
+/// reader-only gate serves, or nothing. A gate that cannot be evaluated
+/// hides the row from readers (fail closed).
+pub(crate) async fn catalog_view(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_id: Uuid,
+    name: &str,
+    version: &str,
+) -> CatalogView {
+    let Ok(rows) = versions_of(&state.db, repo_id, name).await else {
+        return CatalogView::Hide;
+    };
+    let ctx = GateCtx::of(state, false);
+    let policy = current_policy(&state.db, repo_id).await;
+    let own: Vec<VersionRow> = rows
+        .iter()
+        .filter(|r| r.version == version)
+        .cloned()
+        .collect();
+    let own_servable = !own.is_empty() && !servable(ctx, repo_id, own, policy).await.is_empty();
+    if own_servable || audience(&state.db, auth, repo_id).await == GateAudience::ReasonGated {
+        return CatalogView::Keep {
+            servable: own_servable,
+        };
+    }
+    let none = std::collections::HashSet::new();
+    let Some(row) = newest_servable(ctx, repo_id, rows, &none, policy).await.0 else {
+        return CatalogView::Hide;
+    };
+    let metadata: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+            .bind(row.artifact_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    let Some(metadata) = metadata else {
+        return CatalogView::Hide;
+    };
+    CatalogView::Show {
+        version: row.version.clone(),
+        description: metadata
+            .pointer("/server/description")
+            .and_then(|d| d.as_str())
+            .map(str::to_string),
+        metadata: fmt::catalog_metadata(&metadata),
+    }
+}
+
+/// The versions of `name` in `repo_id` a `/api/v1/packages/{id}/versions`
+/// caller may see: `None` for a holder (all of them), otherwise the versions
+/// readers are served now.
+pub(crate) async fn catalog_visible_versions(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_id: Uuid,
+    name: &str,
+) -> Option<std::collections::HashSet<String>> {
+    if audience(&state.db, auth, repo_id).await == GateAudience::ReasonGated {
+        return None;
+    }
+    let Ok(rows) = versions_of(&state.db, repo_id, name).await else {
+        return Some(Default::default());
+    };
+    let policy = current_policy(&state.db, repo_id).await;
+    Some(
+        servable(GateCtx::of(state, false), repo_id, rows, policy)
+            .await
+            .into_iter()
+            .map(|r| r.version)
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Refusal audit (sampled)
 // ---------------------------------------------------------------------------
 
@@ -2695,6 +2795,9 @@ mod tests {
         fn member(&self) -> Router {
             self.fx.router_with_auth(super::router())
         }
+        fn member_router(&self, router: Router<SharedState>) -> Router {
+            self.fx.router_with_auth(router)
+        }
         fn anon(&self) -> Router {
             self.fx.router_anon(super::router())
         }
@@ -4518,6 +4621,129 @@ mod tests {
         let l2 = json(&l2);
         assert_eq!(names(&l2), vec!["com.acme/pc", "com.acme/pd"]);
         assert!(l2["metadata"].get("nextCursor").is_none(), "{l2}");
+        env.teardown().await;
+    }
+
+    /// #5253: `/api/v1/packages` rows of an MCP registry follow the serve
+    /// decision. A reader (anonymous on a public registry) is shown the
+    /// server's newest servable version, never the held one's version or
+    /// description, and no row for a server with nothing servable (also not
+    /// by id); `/versions` lists only servable versions. A holder keeps the
+    /// stored row, flagged `servable: false`.
+    #[tokio::test]
+    async fn catalog_rows_follow_the_serve_decision() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let with_desc = |name: &str, v: &str, desc: &str| {
+            let mut d = doc(name, v, serde_json::json!({}));
+            d["description"] = desc.into();
+            d
+        };
+        for (name, v, desc) in [
+            ("com.acme/held", "1.0.0", "One"),
+            ("com.acme/held", "2.0.0", "Two secret"),
+            ("com.acme/gone", "1.0.0", "Gone secret"),
+        ] {
+            let (s, b) = env.publish(&with_desc(name, v, desc)).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        env.hold(
+            env.server_artifact("com.acme/held", "2.0.0").await,
+            Some("quarantined"),
+        )
+        .await;
+        env.hold(
+            env.server_artifact("com.acme/gone", "1.0.0").await,
+            Some("quarantined"),
+        )
+        .await;
+        let packages = |app: Router, uri: String| async move {
+            let (s, b, _) = call(app, "GET", &uri, None).await;
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            json(&b)
+        };
+        let list = format!("/?repository_key={}", env.fx.repo_key);
+        let api = || crate::api::handlers::packages::router();
+        let anon = packages(env.fx.router_anon(api()), list.clone()).await;
+        let rows: Vec<(String, String, String, bool)> = anon["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_string(),
+                    r["version"].as_str().unwrap().to_string(),
+                    r["description"].as_str().unwrap_or_default().to_string(),
+                    r["metadata"]["servable"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "com.acme/held".to_string(),
+                "1.0.0".to_string(),
+                "One".to_string(),
+                true
+            )],
+            "{anon}"
+        );
+        assert_eq!(anon["items"][0]["metadata"]["version"], "1.0.0");
+        assert_eq!(anon["pagination"]["total"], 1, "{anon}");
+        assert!(!anon.to_string().contains("secret"), "{anon}");
+        let member = packages(env.member_router(api()), list).await;
+        let mut seen: Vec<(String, String, bool)> = member["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_string(),
+                    r["version"].as_str().unwrap().to_string(),
+                    r["metadata"]["servable"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        seen.sort();
+        // (`com.acme/gone`, whose only version is quarantined, is not a live
+        // catalog row for anyone: `live_package_predicate`.)
+        assert_eq!(
+            seen,
+            [("com.acme/held".to_string(), "2.0.0".to_string(), false)]
+        );
+        let id_of = |name: &str| {
+            let pool = env.fx.pool.clone();
+            let repo = env.fx.repo_id;
+            let name = name.to_string();
+            async move {
+                let id: Uuid = sqlx::query_scalar(
+                    "SELECT id FROM packages WHERE repository_id = $1 AND name = $2",
+                )
+                .bind(repo)
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                id.to_string()
+            }
+        };
+        let (s, _, _) = call(
+            env.fx.router_anon(api()),
+            "GET",
+            &format!("/{}", id_of("com.acme/gone").await),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let versions = packages(
+            env.fx.router_anon(api()),
+            format!("/{}/versions", id_of("com.acme/held").await),
+        )
+        .await;
+        assert!(!versions.to_string().contains("2.0.0"), "{versions}");
         env.teardown().await;
     }
 

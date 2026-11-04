@@ -963,8 +963,17 @@ server version, `description` the server's. Its `metadata`:
 `remotes[].type`, `registryTypes` the distinct `packages[].registryType`,
 both sorted. It is written on publish and Remote ingest and refreshed on an
 admin edit, a status change, a soft delete and a mirrored upstream status
-change (when the row shows that version). Holds are not reflected: the
-catalog row exists while the `/v0.1` surface hides a held version.
+change (when the row shows that version).
+
+The rows follow the `/v0.1` serve decision for the caller. A holder (an
+instance administrator, or `read` through a grant or role) sees the stored
+row, with `metadata.servable: false` when readers are not served that version
+now. Any other reader is shown the server's newest servable version instead
+(its `version`, `description` and `metadata`, with `servable: true`), and no
+row at all when no version of the server is served: `GET
+/api/v1/packages/{id}` is then `404`, and the page's `total` leaves it out.
+`GET /api/v1/packages/{id}/versions` lists only servable versions for such a
+reader. A gate that cannot be evaluated hides the row (fail closed).
 
 **`GET /api/v1/formats`** (and `/api/v1/formats/{key}`): every format handler
 carries `repository_types`, the repository types it can be created as, in
