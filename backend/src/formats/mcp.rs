@@ -1618,6 +1618,22 @@ pub enum HoldKind {
     ScanPolicy,
     /// Resolution still running (Phase 2 async resolver).
     Resolving,
+    /// Remote repository: the server name (or this `name@version`) is not
+    /// approved yet (curation `pending`/`review`).
+    PendingApproval { review_id: Option<Uuid> },
+    /// Remote repository: the server name is blocked, or matches a
+    /// `mcp_server_deny` glob (deny always wins).
+    Denied { review_id: Option<Uuid> },
+    /// Remote repository: the upstream entry changed content under an already
+    /// ingested `name@version`; approval is revoked and re-queued.
+    ContentDrift { review_id: Option<Uuid> },
+    /// The server version itself is newer than the repository's age gate
+    /// allows (`FirstSeen` basis for server versions).
+    AgeGate {
+        review_id: Option<Uuid>,
+        min_age_days: i64,
+        requested_age_days: Option<i64>,
+    },
 }
 
 /// The server version's own state.
@@ -1762,6 +1778,47 @@ pub fn decide_mcp_serve(
                 "mcp_resolving",
                 "This server version's packages are still being resolved",
                 serde_json::json!({}),
+            )
+        }
+        Some(HoldKind::PendingApproval { review_id }) => {
+            return refuse(
+                "curation",
+                "mcp_pending_review",
+                "This server is awaiting approval in this registry",
+                serde_json::json!({"gate": "curation", "review_id": review_id}),
+            )
+        }
+        Some(HoldKind::Denied { review_id }) => {
+            return refuse(
+                "curation",
+                "mcp_rejected",
+                "This server is not approved in this registry",
+                serde_json::json!({"gate": "curation", "review_id": review_id}),
+            )
+        }
+        Some(HoldKind::ContentDrift { review_id }) => {
+            return refuse(
+                "content_drift",
+                "mcp_pending_review",
+                "This server version changed upstream and is awaiting re-approval",
+                serde_json::json!({"gate": "curation", "review_id": review_id}),
+            )
+        }
+        Some(HoldKind::AgeGate {
+            review_id,
+            min_age_days,
+            requested_age_days,
+        }) => {
+            return refuse(
+                "age_gate",
+                "mcp_age_gate_blocked",
+                "This server version is newer than the age policy allows",
+                serde_json::json!({
+                    "gate": "age_gate",
+                    "review_id": review_id,
+                    "min_age_days": min_age_days,
+                    "requested_age_days": requested_age_days,
+                }),
             )
         }
         None => {}
@@ -2816,6 +2873,44 @@ mod tests {
                 state(Active, Some(HoldKind::Resolving), false),
                 vec![],
                 Some((404, "mcp_resolving", "resolving")),
+            ),
+            (
+                state(
+                    Active,
+                    Some(HoldKind::PendingApproval {
+                        review_id: Some(Uuid::nil()),
+                    }),
+                    false,
+                ),
+                vec![],
+                Some((404, "mcp_pending_review", "curation")),
+            ),
+            (
+                state(Active, Some(HoldKind::Denied { review_id: None }), false),
+                vec![],
+                Some((404, "mcp_rejected", "curation")),
+            ),
+            (
+                state(
+                    Active,
+                    Some(HoldKind::ContentDrift { review_id: None }),
+                    false,
+                ),
+                vec![],
+                Some((404, "mcp_pending_review", "content_drift")),
+            ),
+            (
+                state(
+                    Active,
+                    Some(HoldKind::AgeGate {
+                        review_id: None,
+                        min_age_days: 3,
+                        requested_age_days: Some(1),
+                    }),
+                    false,
+                ),
+                vec![],
+                Some((404, "mcp_age_gate_blocked", "age_gate")),
             ),
             (
                 state(Active, None, false),

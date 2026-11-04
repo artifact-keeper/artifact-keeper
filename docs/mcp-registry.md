@@ -14,9 +14,11 @@ distribution, a container image) live in ordinary Artifact Keeper
 repositories, and by default the registry refuses any server whose packages
 are not there (see [Package policy](#package-policy)).
 
-This release serves **Local** and **Staging** repositories. Creating a Remote
-or Virtual `mcp` repository is refused with `400` (see
-[Remote and Virtual](#remote-and-virtual)).
+Every repository type is supported: **Local** and **Staging** (hosted,
+publish here), **Remote** (an allowlist populated from an upstream registry,
+deny by default) and **Virtual** (merges MCP repositories). See
+[Remote repositories](#remote-repositories) and
+[Virtual repositories](#virtual-repositories).
 
 ## Routes
 
@@ -325,9 +327,37 @@ and replicate like any other artifact.
 - Publishes are quota-admitted like any upload and capped at 256 KiB, 16
   packages, 8 remotes and 64 entries per list.
 
-## Remote and Virtual
+## Repository settings (Phase 2 and 3)
 
-Proxying the official registry (an allowlist populated from it, deny by
-default: an upstream server is invisible until approved) and Virtual
-repositories that merge MCP repositories come in a later release. Until then
-`POST /api/v1/repositories` refuses them with `400`.
+Set on `POST /api/v1/repositories` and `PATCH /api/v1/repositories/{key}`
+and echoed (effective value, defaults filled in) on every repository
+response. Each is a `repository_config` key of the same name. `null`/absent on
+a request leaves the stored value unchanged. A setting that does not apply to
+the repository type is refused with `400`; a response omits it.
+
+| Field | Types | Values (default first) | Meaning |
+| --- | --- | --- | --- |
+| `mcp_server_deny` | all | glob list (`[]`) | Server names refused on publish and hidden on serve. `*` matches any run of characters including `/`; matching is ASCII case-insensitive. Deny always wins, even over an approval. |
+| `mcp_remote_posture` | Remote | `approval_required` \| `allow_with_gates` | `approval_required` serves only approved names; `allow_with_gates` serves every name whose version passes the gates (lint, backing scan, age gate and typosquat still apply; flags route to review). |
+| `mcp_remote_posture_locked` | Remote | `false` \| `true` | Instance-administrator lock on `mcp_remote_posture`. |
+| `mcp_auto_approve_namespaces` | Remote | glob list (`[]`) | Names in these namespaces are approved on sync. |
+| `mcp_oci_floating_tag_policy` | Remote | `pin` \| `hide` | Upstream OCI entries tagged `latest` or untagged: pin the digest at sync and warn, or hide the version. |
+| `mcp_remote_mode` | Remote | `allowlist` \| `mirror` | `allowlist` ingests approved names only; `mirror` ingests every upstream name hourly (serving is still curated). |
+| `mcp_probe_remotes` | Local, Staging, Remote | `off` \| `hosted_only` \| `all` | Opt-in remote `tools/list` probe by the isolated introspector worker. |
+| `mcp_probe_remotes_locked` | Local, Staging, Remote | `false` \| `true` | Instance-administrator lock on `mcp_probe_remotes`. |
+| `mcp_require_oci_label` | all | `false` \| `true` | Refuse an OCI package whose image lacks a matching `io.modelcontextprotocol.server.name` label (otherwise a lint warning). |
+| `mcp_require_namespace_grant` | Local, Staging, Remote | `false` \| `true` | Publishing needs a namespace-conditioned grant, not just repository write. |
+| `mcp_sandbox_introspection` | Local, Staging, Remote | `off` \| `on` | Queue sandboxed stdio introspection runs for the isolated worker. |
+| `mcp_require_bundle_signature` | Local, Staging, Remote | `false` \| `true` | Refuse unsigned MCPB bundles. A present but invalid signature is always refused. |
+
+Locks: only an instance administrator may set or clear a `*_locked` field
+(`403` otherwise), and while a lock is set only an instance administrator may
+change the locked setting (`403`).
+
+## Remote repositories
+
+(Filled in by the Remote workstream.)
+
+## Virtual repositories
+
+(Filled in by the Virtual workstream.)

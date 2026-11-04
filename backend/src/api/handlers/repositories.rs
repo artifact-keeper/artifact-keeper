@@ -1129,6 +1129,10 @@ pub struct CreateRepositoryRequest {
     /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
     /// under `mcp_namespace_allow`.
     pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    #[serde(flatten)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591). Each entry is an exact
     /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
@@ -1431,6 +1435,10 @@ pub struct UpdateRepositoryRequest {
     /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
     /// under `mcp_namespace_allow`.
     pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    #[serde(flatten)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Replace the trusted cross-origin OCI Bearer token realms for this
     /// Remote repository (#3591); same rules as on create. Omit to leave the
     /// list unchanged; send `[]` to clear it and restore the strict
@@ -1639,6 +1647,10 @@ pub struct RepositoryResponse {
     /// MCP registries (#5253): namespace allowlist (empty: any name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    #[serde(flatten)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591), canonical origins. Omitted
     /// when none are configured (the strict same-origin default applies).
@@ -2110,6 +2122,7 @@ fn repo_to_response(
         mcp_package_policy: None,
         mcp_package_repos: None,
         mcp_namespace_allow: None,
+        mcp_settings: Default::default(),
         oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
@@ -3358,6 +3371,7 @@ async fn apply_npm_scope_policy_config(
 async fn with_mcp_settings(
     db: &sqlx::PgPool,
     repo_id: Uuid,
+    repo_type: &str,
     format: &RepositoryFormat,
     mut response: RepositoryResponse,
 ) -> Result<RepositoryResponse> {
@@ -3388,6 +3402,7 @@ async fn with_mcp_settings(
     response.mcp_package_repos = get(mp::REPOS_KEY).and_then(|v| mp::parse_package_repos(v).ok());
     response.mcp_namespace_allow =
         get(mp::NAMESPACE_ALLOW_KEY).and_then(|v| mp::parse_namespace_allow(v).ok());
+    response.mcp_settings = crate::services::mcp_settings::load(db, repo_id, repo_type).await?;
     Ok(response)
 }
 
@@ -3407,7 +3422,7 @@ async fn with_npm_scope_policy(
     // The npm Virtual isolate toggle (#3767) rides the same echo, so every
     // handler that round-trips the scope policy round-trips it too.
     let response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
-    let mut response = with_mcp_settings(db, repo_id, format, response).await?;
+    let mut response = with_mcp_settings(db, repo_id, repo_type.as_str(), format, response).await?;
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
         return Ok(response);
     }
@@ -4413,6 +4428,13 @@ pub async fn create_repository(
         true,
     )
     .await?;
+    let mcp_extra = crate::services::mcp_settings::to_store(
+        &payload.mcp_settings,
+        &format,
+        repo_type.as_str(),
+        auth.is_admin,
+        Default::default(),
+    )?;
     // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
     // the same reason; persisted once `repo.id` exists.
     let oci_trusted_realms =
@@ -4660,7 +4682,7 @@ pub async fn create_repository(
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
-    for (key, value) in &mcp_settings {
+    for (key, value) in mcp_settings.iter().chain(&mcp_extra) {
         upsert_repo_config(&state.db, repo.id, key, value).await?;
     }
     if let Some(ref realms) = oci_trusted_realms {
@@ -5587,6 +5609,18 @@ pub async fn update_repository(
         false,
     )
     .await?;
+    let mcp_extra = if payload.mcp_settings.is_empty() {
+        Vec::new()
+    } else {
+        let rows = crate::services::mcp_settings::load_rows(&state.db, existing.id).await?;
+        crate::services::mcp_settings::to_store(
+            &payload.mcp_settings,
+            &existing.format,
+            existing.repo_type.as_str(),
+            auth.is_admin,
+            crate::services::mcp_settings::locks_of(&rows),
+        )?
+    };
     // Trusted cross-origin OCI bearer realms (#3591): validated before the
     // update for the same reason. Writing them is gated by the repository
     // `admin` check above, like every other credential-routing setting.
@@ -5691,7 +5725,7 @@ pub async fn update_repository(
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
-    for (key, value) in &mcp_settings {
+    for (key, value) in mcp_settings.iter().chain(&mcp_extra) {
         upsert_repo_config(&state.db, repo.id, key, value).await?;
     }
     if let Some(ref realms) = oci_trusted_realms {
@@ -17491,6 +17525,7 @@ mod tests {
             mcp_package_policy: None,
             mcp_package_repos: None,
             mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -18910,6 +18945,7 @@ mod tests {
             mcp_package_policy: None,
             mcp_package_repos: None,
             mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -33392,6 +33428,7 @@ mod tests {
             mcp_package_policy: None,
             mcp_package_repos: None,
             mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,

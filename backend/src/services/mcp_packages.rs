@@ -209,8 +209,10 @@ pub async fn settings_to_store(
 /// Whether a repository of `format` and `repo_type` may be created in this
 /// release: MCP registries are hosted only (Local, Staging).
 pub fn creatable(format: &RepositoryFormat, repo_type: &str) -> Result<(), &'static str> {
-    if format == &RepositoryFormat::Mcp && !matches!(repo_type, "local" | "staging") {
-        return Err("MCP registries support Local and Staging repositories in this release");
+    if format == &RepositoryFormat::Mcp
+        && !matches!(repo_type, "local" | "staging" | "remote" | "virtual")
+    {
+        return Err("MCP registries support Local, Staging, Remote and Virtual repositories");
     }
     Ok(())
 }
@@ -1536,11 +1538,12 @@ mod tests {
     }
 
     #[test]
-    fn only_hosted_mcp_repositories_are_creatable() {
+    fn every_mcp_repository_type_is_creatable() {
         assert!(creatable(&RepositoryFormat::Mcp, "local").is_ok());
         assert!(creatable(&RepositoryFormat::Mcp, "staging").is_ok());
-        assert!(creatable(&RepositoryFormat::Mcp, "remote").is_err());
-        assert!(creatable(&RepositoryFormat::Mcp, "virtual").is_err());
+        assert!(creatable(&RepositoryFormat::Mcp, "remote").is_ok());
+        assert!(creatable(&RepositoryFormat::Mcp, "virtual").is_ok());
+        assert!(creatable(&RepositoryFormat::Mcp, "bogus").is_err());
         assert!(creatable(&RepositoryFormat::Npm, "remote").is_ok());
     }
 
