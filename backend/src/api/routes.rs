@@ -122,6 +122,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/hex", handlers::hex::router())
         .nest("/huggingface", handlers::huggingface::router())
         .nest("/jetbrains", handlers::jetbrains::router())
+        .nest("/agentplugins", handlers::agent_plugins::router())
         .nest("/chef", handlers::chef::router())
         .nest("/puppet", handlers::puppet::router())
         .nest("/ansible", handlers::ansible::router())

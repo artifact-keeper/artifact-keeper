@@ -84,6 +84,9 @@ pub enum RepositoryFormat {
     Lxc,
     // Linux distribution packages (#3343)
     Pacman,
+    // AI coding-agent plugin bundles (#5251)
+    #[sqlx(rename = "agentplugins")]
+    AgentPlugins,
 }
 
 impl RepositoryFormat {
@@ -162,6 +165,7 @@ impl RepositoryFormat {
         RepositoryFormat::Incus,
         RepositoryFormat::Lxc,
         RepositoryFormat::Pacman,
+        RepositoryFormat::AgentPlugins,
     ];
 
     /// The canonical snake_case key for this format.
@@ -229,6 +233,7 @@ impl RepositoryFormat {
             Self::Incus => "incus",
             Self::Lxc => "lxc",
             Self::Pacman => "pacman",
+            Self::AgentPlugins => "agentplugins",
         }
     }
 

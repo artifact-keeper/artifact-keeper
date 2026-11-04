@@ -65,6 +65,7 @@ mod tests {
         "opkg",
         "p2",
         "bazel",
+        "agentplugins",
     ];
 
     /// Additional alias keys that get_core_handler should also resolve.
@@ -223,6 +224,7 @@ mod tests {
             ("opkg", RepositoryFormat::Opkg),
             ("p2", RepositoryFormat::P2),
             ("bazel", RepositoryFormat::Bazel),
+            ("agentplugins", RepositoryFormat::AgentPlugins),
         ];
 
         for (expected_key, format) in expected_keys {
@@ -856,6 +858,7 @@ mod tests {
             "opkg",
             "p2",
             "bazel",
+            "agentplugins",
             "chef",
             "puppet",
             "ansible",
