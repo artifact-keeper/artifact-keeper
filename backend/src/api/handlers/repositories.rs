@@ -1670,6 +1670,13 @@ pub struct RepositoryResponse {
     /// enough). Omitted for other formats.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_caller_can_lock: Option<bool>,
+    /// MCP registries (#5253): whether the caller administers this
+    /// repository (the repository `admin` action, or an instance
+    /// administrator): the check the MCP routes apply to admin edits and
+    /// deletes, catalog decisions, pins, bulk decisions, sync triggers and
+    /// introspection requests. Omitted for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_caller_is_repo_admin: Option<bool>,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591), canonical origins. Omitted
     /// when none are configured (the strict same-origin default applies).
@@ -2143,6 +2150,7 @@ fn repo_to_response(
         mcp_namespace_allow: None,
         mcp_settings: Default::default(),
         mcp_caller_can_lock: None,
+        mcp_caller_is_repo_admin: None,
         oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
@@ -3385,12 +3393,38 @@ async fn apply_npm_scope_policy_config(
     Ok(())
 }
 
-/// `RepositoryResponse.mcp_caller_can_lock` (#5253): on an MCP registry,
-/// whether the caller is an instance administrator (only they may set the
-/// `*_locked` settings or change a locked one). Other formats: absent.
-fn with_mcp_caller(mut response: RepositoryResponse, instance_admin: bool) -> RepositoryResponse {
-    response.mcp_caller_can_lock = (response.format == "mcp").then_some(instance_admin);
+/// `RepositoryResponse.mcp_caller_can_lock` and `mcp_caller_is_repo_admin`
+/// (#5253): on an MCP registry, whether the caller is an instance
+/// administrator (only they may set the `*_locked` settings or change a
+/// locked one), and whether they administer the repository. Other formats:
+/// both absent.
+fn with_mcp_caller(
+    mut response: RepositoryResponse,
+    instance_admin: bool,
+    repo_admin: bool,
+) -> RepositoryResponse {
+    let mcp = response.format == "mcp";
+    response.mcp_caller_can_lock = mcp.then_some(instance_admin);
+    response.mcp_caller_is_repo_admin = mcp.then_some(instance_admin || repo_admin);
     response
+}
+
+/// Whether `auth` administers repository `repo_id`: [`require_repo_admin`]
+/// as a predicate, the single check behind every MCP admin route, so the
+/// `mcp_caller_is_repo_admin` echo and the routes cannot disagree. Queried
+/// only for an MCP registry (`false` otherwise, and for anonymous callers).
+pub(crate) async fn mcp_caller_is_repo_admin(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_id: Uuid,
+    format: &str,
+) -> bool {
+    match auth {
+        Some(a) if format == "mcp" => require_repo_admin(a, repo_id, &state.permission_service)
+            .await
+            .is_ok(),
+        _ => false,
+    }
 }
 
 /// Populate `RepositoryResponse.mcp_*` from `repository_config` (#5253). A
@@ -4932,7 +4966,8 @@ pub async fn create_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
-    let response = with_mcp_caller(response, auth.is_admin);
+    let repo_admin = mcp_caller_is_repo_admin(&state, Some(&auth), repo_id, &response.format).await;
+    let response = with_mcp_caller(response, auth.is_admin, repo_admin);
     Ok(Json(response))
 }
 
@@ -4999,7 +5034,13 @@ pub async fn get_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
-    let response = with_mcp_caller(response, auth.as_ref().is_some_and(|a| a.is_admin));
+    let repo_admin =
+        mcp_caller_is_repo_admin(&state, auth.as_ref(), repo_id, &response.format).await;
+    let response = with_mcp_caller(
+        response,
+        auth.as_ref().is_some_and(|a| a.is_admin),
+        repo_admin,
+    );
     Ok(Json(response))
 }
 
@@ -6080,7 +6121,8 @@ pub async fn update_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
-    let response = with_mcp_caller(response, auth.is_admin);
+    let repo_admin = mcp_caller_is_repo_admin(&state, Some(&auth), repo_id, &response.format).await;
+    let response = with_mcp_caller(response, auth.is_admin, repo_admin);
     Ok(Json(response))
 }
 
@@ -17558,6 +17600,7 @@ mod tests {
             mcp_namespace_allow: None,
             mcp_settings: Default::default(),
             mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -17619,6 +17662,7 @@ mod tests {
             mcp_namespace_allow: None,
             mcp_settings: Default::default(),
             mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -17628,15 +17672,33 @@ mod tests {
         };
         let resp = sample();
         assert_ne!(resp.format, "mcp");
-        assert_eq!(with_mcp_caller(resp, true).mcp_caller_can_lock, None);
-        let mut mcp = sample();
-        mcp.format = "mcp".into();
-        assert_eq!(with_mcp_caller(mcp, true).mcp_caller_can_lock, Some(true));
-        let mut mcp = sample();
-        mcp.format = "mcp".into();
-        let repo_admin = with_mcp_caller(mcp, false);
+        let other = with_mcp_caller(resp, true, true);
+        assert_eq!(
+            (other.mcp_caller_can_lock, other.mcp_caller_is_repo_admin),
+            (None, None)
+        );
+        let json = serde_json::to_value(&other).unwrap();
+        assert!(json.get("mcp_caller_is_repo_admin").is_none());
+        let mcp = || {
+            let mut m = sample();
+            m.format = "mcp".into();
+            m
+        };
+        let instance = with_mcp_caller(mcp(), true, false);
+        assert_eq!(
+            (
+                instance.mcp_caller_can_lock,
+                instance.mcp_caller_is_repo_admin
+            ),
+            (Some(true), Some(true)),
+            "an instance administrator administers every repository"
+        );
+        let repo_admin = with_mcp_caller(mcp(), false, true);
         let json = serde_json::to_value(&repo_admin).unwrap();
         assert_eq!(json["mcp_caller_can_lock"], false);
+        assert_eq!(json["mcp_caller_is_repo_admin"], true);
+        let reader = with_mcp_caller(mcp(), false, false);
+        assert_eq!(reader.mcp_caller_is_repo_admin, Some(false));
     }
 
     #[test]
@@ -19045,6 +19107,7 @@ mod tests {
             mcp_namespace_allow: None,
             mcp_settings: Default::default(),
             mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -23424,6 +23487,51 @@ mod tests {
         tdh::cleanup(&pool, other_id, dev_id).await;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    /// DB-backed (#5253): `mcp_caller_is_repo_admin` on an MCP repository is
+    /// `require_repo_admin` as a predicate: a `repository-owner` member and an
+    /// instance administrator see `true`, a developer member `false`.
+    #[tokio::test]
+    async fn mcp_caller_is_repo_admin_follows_require_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (dev_id, dev_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        tdh::grant_repo_role(&pool, repo_id, owner_id, "repository-owner").await;
+        tdh::grant_repo_role(&pool, repo_id, dev_id, "developer").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let dev = tdh::make_auth(dev_id, &dev_name);
+        let mut admin = tdh::make_auth(dev_id, &dev_name);
+        admin.is_admin = true;
+        for (auth, can_lock, is_admin) in [
+            (owner.clone(), false, true),
+            (dev.clone(), false, false),
+            (admin.clone(), true, true),
+        ] {
+            let agrees = require_repo_admin(&auth, repo_id, &state.permission_service)
+                .await
+                .is_ok();
+            assert_eq!(agrees, is_admin);
+            let Json(got) = get_repository(
+                State(state.clone()),
+                Extension(Some(auth)),
+                Path(key.clone()),
+            )
+            .await
+            .expect("get");
+            assert_eq!(
+                (got.mcp_caller_can_lock, got.mcp_caller_is_repo_admin),
+                (Some(can_lock), Some(is_admin))
+            );
+        }
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup_user(&pool, dev_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DB-backed (#4834): every repository-administration handler that still
@@ -33529,6 +33637,7 @@ mod tests {
             mcp_namespace_allow: None,
             mcp_settings: Default::default(),
             mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
