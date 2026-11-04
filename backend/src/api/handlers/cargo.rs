@@ -2907,6 +2907,11 @@ fn extract_index_fields(
 
     // Cargo publish API sends "version_req" but the sparse index format
     // requires "req".  Rename on the fly so clients can parse the index.
+    // A renamed dependency is sent as `name` = the real crate plus
+    // `explicit_name_in_toml` = the rename; the index spells it `name` = the
+    // rename plus `package` = the real crate (#5227). Converted here, from the
+    // stored publish metadata, so crates published before the fix are served
+    // correctly too.
     // See https://doc.rust-lang.org/cargo/reference/registry-index.html
     let deps = match meta.get("deps").cloned().unwrap_or(serde_json::json!([])) {
         serde_json::Value::Array(arr) => serde_json::Value::Array(
@@ -2915,6 +2920,14 @@ fn extract_index_fields(
                     if let serde_json::Value::Object(ref mut map) = dep {
                         if let Some(vr) = map.remove("version_req") {
                             map.entry("req").or_insert(vr);
+                        }
+                        if let Some(serde_json::Value::String(toml_name)) =
+                            map.remove("explicit_name_in_toml")
+                        {
+                            if let Some(package) = map.insert("name".to_string(), toml_name.into())
+                            {
+                                map.entry("package").or_insert(package);
+                            }
                         }
                     }
                     dep
@@ -5453,6 +5466,46 @@ mod tests {
                 "version_req must be absent for '{field}'"
             );
         }
+    }
+
+    #[test]
+    fn test_build_index_entry_renamed_dep_uses_toml_name_and_package_5227() {
+        // The publish API sends a renamed dependency as `name` = the real
+        // crate and `explicit_name_in_toml` = the rename; the index wants
+        // `name` = the rename and `package` = the real crate (#5227). The
+        // metadata stored at publish keeps the publish shape, so this
+        // conversion also repairs crates published before the fix.
+        let meta = serde_json::json!({
+            "deps": [
+                {"name": "rbase", "explicit_name_in_toml": "renamed",
+                 "version_req": "=1.0.0", "kind": "normal"},
+                {"name": "plain", "explicit_name_in_toml": null,
+                 "version_req": "^1", "kind": "normal"},
+                {"name": "plain2", "version_req": "^2", "kind": "normal"},
+                // Already in index shape (e.g. proxied): passes through.
+                {"name": "alias", "package": "real", "req": "^3", "kind": "normal"}
+            ],
+            "features": {}
+        });
+        let entry: serde_json::Value =
+            serde_json::from_str(&build_index_entry("rdep", "1.0.0", "aaa", Some(&meta))).unwrap();
+        let deps = entry["deps"].as_array().unwrap();
+
+        assert_eq!(deps[0]["name"], "renamed");
+        assert_eq!(deps[0]["package"], "rbase");
+        assert_eq!(deps[0]["req"], "=1.0.0");
+        for dep in deps {
+            assert!(
+                dep.get("explicit_name_in_toml").is_none(),
+                "explicit_name_in_toml is not an index field: {dep}"
+            );
+        }
+        assert_eq!(deps[1]["name"], "plain");
+        assert!(deps[1].get("package").is_none());
+        assert_eq!(deps[2]["name"], "plain2");
+        assert!(deps[2].get("package").is_none());
+        assert_eq!(deps[3]["name"], "alias");
+        assert_eq!(deps[3]["package"], "real");
     }
 
     // -----------------------------------------------------------------------
