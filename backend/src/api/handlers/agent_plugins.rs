@@ -520,6 +520,37 @@ async fn discard_unreferenced_object(state: &SharedState, repo: &RepoInfo, stora
     }
 }
 
+/// The storage key a published archive is written to:
+/// `agentplugins/{repository_id}/{sha256}/{name}/{version}/{name}-{version}.zip`
+/// on a shared cloud namespace (S3/GCS/Azure), the repo-scoped shape of the
+/// #2624 scheme npm (#4293) and Conan (#4694) use.
+///
+/// The content-only `agentplugins/{sha256}/...` key every repository used to
+/// share made a second repository publishing byte-identical archives (a
+/// staging and a production repository on one bucket) fail the
+/// cross-repository write guard with 409 "already owned by another
+/// repository" (#5267). The SHA-256 stays inside the per-repository prefix,
+/// so a losing concurrent publish of different bytes to the same version
+/// still writes its own object and never overwrites the winner's.
+/// Filesystem backends (one directory per repository) and
+/// `STORAGE_KEY_SCHEME=flat` keep `agentplugins/{sha256}/...`. Existing
+/// objects are untouched: downloads resolve the object through the
+/// `storage_key` its artifact row recorded.
+fn plugin_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: Uuid,
+    sha256: &str,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        FORMAT_KEY,
+        repo_id,
+        &format!("{sha256}/{artifact_path}"),
+    )
+}
+
 /// Read the optional `X-Checksum-Sha256` header, lowercased.
 fn declared_checksum(headers: &HeaderMap) -> Option<String> {
     headers
@@ -668,9 +699,16 @@ async fn publish_plugin(
         other => other.into_response(),
     })?;
 
-    // Content-addressed key: a concurrent publish of different bytes to the
+    // Repo-scoped on a shared cloud namespace (#5267) and content-addressed
+    // inside that prefix, so a concurrent publish of different bytes to the
     // same version cannot overwrite the object the winning row points at.
-    let storage_key = format!("{FORMAT_KEY}/{}/{artifact_path}", digests.sha256);
+    let storage_key = plugin_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &digests.sha256,
+        &artifact_path,
+    );
     proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -789,13 +827,18 @@ mod tests {
     const STANDARD: &[u8] =
         br#"{"$schema":"https://agent-plugins.org/schemas/plugin-1.0.0.json","name":"std-tools","version":"0.1.0","description":"Standard skills"}"#;
 
+    /// A Claude Code plugin zip. Every call returns distinct bytes (a nonce
+    /// in the command body), so tests running in parallel against one
+    /// database never publish identical archives; a test that needs the same
+    /// bytes twice clones the result (#5267).
     fn claude_zip(name: &str, version: &str) -> Vec<u8> {
+        let nonce = format!("# deploy {}", Uuid::new_v4());
         let manifest = format!(
             r#"{{"name":"{name}","version":"{version}","description":"Deploy commands","author":{{"name":"Example Team"}},"license":"MIT","keywords":["deploy"]}}"#
         );
         test_zip(&[
             (".claude-plugin/plugin.json", manifest.as_bytes()),
-            ("commands/deploy.md", b"# deploy"),
+            ("commands/deploy.md", nonce.as_bytes()),
             ("skills/deploy/SKILL.md", b"# skill"),
             ("hooks/hooks.json", b"{}"),
         ])
@@ -860,6 +903,26 @@ mod tests {
         let resp = require_token_caller(&None).unwrap_err();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(require_token_caller(&Some(tdh::make_auth(Uuid::nil(), "u"))).is_ok());
+    }
+
+    #[test]
+    fn plugin_storage_key_is_repo_scoped_on_shared_namespaces_5267() {
+        use crate::storage::StorageKeyScheme::{Flat, RepoScoped};
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let path = "p/1.0.0/p-1.0.0.zip";
+        let key = |scheme, backend, repo| plugin_storage_key(scheme, backend, repo, "abc", path);
+        assert_eq!(
+            key(RepoScoped, "s3", a),
+            format!("agentplugins/{a}/abc/p/1.0.0/p-1.0.0.zip")
+        );
+        assert_ne!(key(RepoScoped, "gcs", a), key(RepoScoped, "gcs", b));
+        for (scheme, backend) in [(RepoScoped, "filesystem"), (Flat, "s3"), (Flat, "azure")] {
+            assert_eq!(
+                key(scheme, backend, a),
+                "agentplugins/abc/p/1.0.0/p-1.0.0.zip",
+                "{scheme:?} on {backend}"
+            );
+        }
     }
 
     #[test]
@@ -1631,14 +1694,7 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "agentplugins").await;
-        sqlx::query(
-            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
-        )
-        .bind(repo_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let (repo_id, repo_key, dir) = cloud_repo(&pool).await;
         let (user_id, username) = tdh::create_user(&pool).await;
         tdh::grant_repo_access(&pool, repo_id, user_id).await;
         let (state, _mem) = tdh::build_state_with_presigning_cloud(pool.clone(), "s3");
@@ -1672,5 +1728,81 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(&body[..], &zip[..]);
         }
+    }
+
+    /// A hosted Agent Plugins repository on the `s3` backend; every such
+    /// repository shares the one in-memory bucket of a cloud test state.
+    async fn cloud_repo(pool: &PgPool) -> (Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "local", "agentplugins").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (repo_id, repo_key, dir)
+    }
+
+    /// Two repositories on one shared bucket (staging and production)
+    /// publishing byte-identical archives both succeed and each keeps its
+    /// own object: the content-addressed key is scoped per repository, so
+    /// the cross-repository write guard no longer answers the second 409
+    /// (#5267).
+    #[tokio::test]
+    async fn identical_archives_publish_to_two_repositories_5267() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (staging, staging_key, staging_dir) = cloud_repo(&pool).await;
+        let (prod, prod_key, prod_dir) = cloud_repo(&pool).await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, staging, user_id).await;
+        tdh::grant_repo_access(&pool, prod, user_id).await;
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let app = tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+        let zip = claude_zip("p", "1.0.0");
+        let uri = |key: &str| format!("/{key}/p/1.0.0/p-1.0.0.zip");
+        let mut puts = Vec::new();
+        let mut downloads = Vec::new();
+        for key in [&staging_key, &prod_key] {
+            let put = tdh::put(uri(key), Bytes::from(zip.clone()));
+            puts.push(tdh::send(app.clone(), put).await);
+        }
+        for key in [&staging_key, &prod_key] {
+            downloads.push(tdh::send(app.clone(), tdh::get(uri(key))).await);
+        }
+        let key_of = |repo: Uuid| {
+            sqlx::query_scalar::<_, String>(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1",
+            )
+            .bind(repo)
+            .fetch_one(&pool)
+        };
+        let (staging_obj, prod_obj) = (key_of(staging).await, key_of(prod).await);
+        let stored = mem.objects.lock().unwrap().len();
+        // The user goes with the last repository, once no row references it.
+        tdh::cleanup(&pool, staging, Uuid::nil()).await;
+        tdh::cleanup(&pool, prod, user_id).await;
+        let _ = std::fs::remove_dir_all(staging_dir);
+        let _ = std::fs::remove_dir_all(prod_dir);
+
+        for (status, body) in puts {
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        for (status, body) in downloads {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], &zip[..]);
+        }
+        let (staging_obj, prod_obj) = (staging_obj.unwrap(), prod_obj.unwrap());
+        assert_ne!(staging_obj, prod_obj, "each repository owns its own object");
+        assert!(staging_obj.starts_with(&format!("agentplugins/{staging}/")));
+        assert!(prod_obj.starts_with(&format!("agentplugins/{prod}/")));
+        assert_eq!(stored, 2, "two physical objects in the shared bucket");
     }
 }
