@@ -695,6 +695,7 @@ fn cfg(storage_path: &str) -> Config {
         auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        proxy_scan_queue_wait_secs: 60,
         http_header_read_timeout_secs: 10,
         http_listen_backlog: 0,
         upload_progress_window_secs: 60,
@@ -1538,6 +1539,28 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
         "proxy cache never committed (content + __cache_meta__.json sidecar) under {}",
         dir.display()
     );
+}
+
+/// Drop a wiremock [`MockServer`](wiremock::MockServer) from a task that may
+/// have just spent its whole Tokio coop budget.
+///
+/// `MockServer`'s `Drop` runs `futures::executor::block_on(self.verify())`,
+/// which takes a Tokio `RwLock`, on the test's own runtime thread. That lock
+/// charges the coop budget. A test whose last poll spent all 128 units gets
+/// `Pending` from it even though the lock is free, and the wake-up is deferred
+/// to the runtime, which cannot run because `block_on` has parked its thread.
+/// The test then hangs forever at 0% CPU: no timer can fire and no panic is
+/// raised.
+///
+/// Reading a body from the warm proxy cache spends one unit per 64 KiB when
+/// each `spawn_blocking` read has finished by the time it is polled, which a
+/// CPU-saturated machine makes possible, so a body of about 8 MiB or more can
+/// land the budget on exactly zero. Yielding first ends the poll, and the next
+/// one starts with a fresh budget. Use this instead of `drop(server)` after
+/// reading such a body.
+pub async fn drop_mock_server(server: wiremock::MockServer) {
+    tokio::task::yield_now().await;
+    drop(server);
 }
 
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".

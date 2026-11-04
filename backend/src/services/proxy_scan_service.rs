@@ -957,7 +957,87 @@ impl ProxyScanService {
         components_cataloged: Option<i32>,
         pin_identity: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
+        self.upsert_verdict(
+            checksum_sha256,
+            scan_type,
+            verdict,
+            findings_count,
+            critical_count,
+            high_count,
+            medium_count,
+            low_count,
+            max_severity,
+            scanner_version,
+            repository_id,
+            components_cataloged,
+            pin_identity,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`record_verdict_with_catalog`](Self::record_verdict_with_catalog) for a
+    /// scan that took a while (#5231): with `observed` set, the row is written only
+    /// if its `scanned_at` is still that value (`None` inside: there was no row),
+    /// so a verdict recorded since the scan started is not overwritten. Returns
+    /// whether the row was written. `observed: None` always writes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_verdict_if_unchanged(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+        pin_identity: Option<&str>,
+        observed: Option<Option<DateTime<Utc>>>,
+    ) -> Result<bool> {
+        self.upsert_verdict(
+            checksum_sha256,
+            scan_type,
+            verdict,
+            findings_count,
+            critical_count,
+            high_count,
+            medium_count,
+            low_count,
+            max_severity,
+            scanner_version,
+            repository_id,
+            components_cataloged,
+            pin_identity,
+            observed,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_verdict(
+        &self,
+        checksum_sha256: &str,
+        scan_type: &str,
+        verdict: &str,
+        findings_count: i32,
+        critical_count: i32,
+        high_count: i32,
+        medium_count: i32,
+        low_count: i32,
+        max_severity: Option<&str>,
+        scanner_version: Option<&str>,
+        repository_id: Option<Uuid>,
+        components_cataloged: Option<i32>,
+        pin_identity: Option<&str>,
+        observed: Option<Option<DateTime<Utc>>>,
+    ) -> Result<bool> {
+        let written = sqlx::query(
             r#"
             INSERT INTO proxy_scan_results (
                 checksum_sha256, scan_type, verdict,
@@ -979,6 +1059,7 @@ impl ProxyScanService {
                 components_cataloged = EXCLUDED.components_cataloged,
                 pin_identity = EXCLUDED.pin_identity,
                 scanned_at = now()
+            WHERE NOT $14 OR proxy_scan_results.scanned_at IS NOT DISTINCT FROM $15
             "#,
         )
         .bind(checksum_sha256)
@@ -994,12 +1075,16 @@ impl ProxyScanService {
         .bind(repository_id)
         .bind(components_cataloged)
         .bind(pin_identity)
+        .bind(observed.is_some())
+        .bind(observed.flatten())
         .execute(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .rows_affected()
+            > 0;
         forget_memoised_verdict(checksum_sha256, scan_type).await;
 
-        Ok(())
+        Ok(written)
     }
 
     /// The completeness recorded by

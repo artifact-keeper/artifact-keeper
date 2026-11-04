@@ -161,6 +161,11 @@ impl AuditAction {
             | AuditAction::DebianBackfillRun
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
+            | AuditAction::FindingAcknowledged
+            | AuditAction::FindingAcknowledgementRevoked
+            | AuditAction::FindingAcknowledgementCarried
+            | AuditAction::FindingAcknowledgementNotCarried
+            | AuditAction::FindingAcknowledgementExpired
             | AuditAction::QuarantineRejected
             | AuditAction::PromotionApprovalGranted
             | AuditAction::ArtifactPromoted

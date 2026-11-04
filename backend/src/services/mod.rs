@@ -47,6 +47,7 @@ pub mod environment_sbom;
 pub mod environment_service;
 pub mod event_bus;
 pub mod federated_email;
+pub mod finding_acknowledgements;
 pub mod grype_scanner;
 pub mod guest_access_policy;
 pub mod helm_lint_checker;

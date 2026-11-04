@@ -136,8 +136,13 @@ such as `credential_replaced` or `secret_rotated`.
 
 | Action | Resource | `details` |
 | --- | --- | --- |
-| `QUARANTINE_RELEASED` | `artifact` (or `repository` for a held proxy-cache entry) | `artifact_id`, `previous_status`; for a proxy-cache entry `repository`, `path`, `proxy_cache: true` |
+| `QUARANTINE_RELEASED` | `artifact` (or `repository` for a held proxy-cache entry) | `artifact_id`, `previous_status`; `released_by: finding_acknowledgement` when an acknowledgement cleared a scan-policy hold; for a proxy-cache entry `repository`, `path`, `proxy_cache: true` |
 | `QUARANTINE_REJECTED` | `artifact` | `artifact_id`, `previous_status`, `reason` |
+| `FINDING_ACKNOWLEDGED` | `scan_result` (the decision's id); the actor is the user, on REST and gRPC alike | `acknowledgement_id`, `lineage_id`, `repository_id` (null: every repository), `checksum_sha256`, `finding_class`, `advisory`, `component`, `component_version`, `max_severity`, `reason`, `expires_at`, `created_via`, `revoked_reason` |
+| `FINDING_ACKNOWLEDGEMENT_REVOKED` | `scan_result` (the decision's id); one row per decision the revoke reached, or for the decision a new one superseded (`revoked_reason: superseded`) | as `FINDING_ACKNOWLEDGED`, plus `left_effective` |
+| `FINDING_ACKNOWLEDGEMENT_CARRIED` | `scan_result` (the copy's id); the actor is the promoter | `acknowledgement` (as `FINDING_ACKNOWLEDGED`), `promotion` (`source_repository_id`, `source_artifact_id`, `artifact_id`, `target_repository_id`) |
+| `FINDING_ACKNOWLEDGEMENT_NOT_CARRIED` | `scan_result` (the source decision's id); the actor is the promoter, who could not acknowledge in the target | as `FINDING_ACKNOWLEDGEMENT_CARRIED` |
+| `FINDING_ACKNOWLEDGEMENT_EXPIRED` | `scan_result` (the decision's id); system actor. Written at least once: a crash can repeat a row | as `FINDING_ACKNOWLEDGED` |
 | `PROMOTION_APPROVAL_GRANTED` | `promotion_approval` | `approval_id`, `artifact_id`, `artifact_path`, `source_repository`, `target_repository`, `requested_by`, `promoted_artifact_id`, `promotion_id`, `skip_policy_check`, `notes` |
 | `PROMOTION_APPROVAL_DENIED` | `promotion_approval` | `approval_id`, `artifact_id`, `source_repository`, `target_repository`, `requested_by`, `notes` |
 | `ARTIFACT_PROMOTED` | `artifact` (the source artifact) | `artifact_id`, `artifact_path`, `source_repository`, `target_repository`, `promotion_id`, `skip_policy_check`, `bulk`, `gate_results` (`evaluated`, `failed`, `failed_rules`), `policy_violations` (count) |

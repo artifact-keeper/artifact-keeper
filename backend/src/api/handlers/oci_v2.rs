@@ -20190,8 +20190,49 @@ mod remote_blob_streaming_fallback_tests {
             assert_eq!(body.len(), layer.len());
         }
 
-        drop(server);
+        tdh::drop_mock_server(server).await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Spend the rest of this poll's coop budget without yielding, which is
+    /// the state a warm 9 MiB read can leave a test in.
+    async fn exhaust_coop_budget() {
+        while tokio::task::coop::has_budget_remaining() {
+            tokio::task::consume_budget().await;
+        }
+    }
+
+    /// Run `body` on its own current-thread runtime and report whether it
+    /// finished within `limit`. It needs a thread of its own because a hang
+    /// parks the runtime thread, where no Tokio timeout could fire.
+    fn finishes_within<F>(limit: std::time::Duration, body: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(body);
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(limit).is_ok()
+    }
+
+    /// `drop_mock_server` must return when the coop budget is already gone,
+    /// the state in which `MockServer`'s own `Drop` parks the runtime thread
+    /// forever (the 46-minute CI hang of the warm-cache test above).
+    #[test]
+    fn drop_mock_server_survives_an_exhausted_coop_budget() {
+        let finished = finishes_within(std::time::Duration::from_secs(30), async {
+            let server = wiremock::MockServer::start().await;
+            exhaust_coop_budget().await;
+            assert!(!tokio::task::coop::has_budget_remaining());
+            tdh::drop_mock_server(server).await;
+        });
+        assert!(finished, "drop_mock_server hung on an exhausted budget");
     }
 
     /// #3586: the Remote pull-through path must range both a cold stream and a
@@ -20589,7 +20630,7 @@ mod virtual_blob_streaming_fallback_tests {
             assert_eq!(body.len(), layer.len(), "full layer must stream through");
         }
 
-        drop(server);
+        tdh::drop_mock_server(server).await;
         cleanup(&pool, &[virt_id, member_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }

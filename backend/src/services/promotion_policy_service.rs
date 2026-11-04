@@ -173,65 +173,139 @@ struct ScanRow {
     findings_count: i32,
 }
 
-/// SQL for an artifact's severity counts, taken across the latest completed scan
-/// of EVERY scanner rather than the single most recently completed row.
-///
-/// The old form was `ORDER BY created_at DESC LIMIT 1` over all completed rows
-/// regardless of `scan_type`, so whichever engine happened to finish last
-/// supplied the entire CVE verdict and every other engine's findings were
-/// invisible to the gate. With more than one scanner enabled that is a silent
-/// fail-open: a clean-but-later scan hides an earlier scan's criticals.
-///
-/// Counts are combined with a per-severity `MAX`, not `SUM`: the per-scanner
-/// aggregates describe overlapping finding sets, so summing would double-count a
-/// CVE that two engines both report. `MAX` cannot weaken the gate — the
-/// thresholds in [`evaluate_cve_thresholds`] only test "greater than the allowed
-/// number", and a severity is non-zero here whenever any engine reported it.
-///
-/// `HAVING COUNT(*) > 0` preserves the caller's "no completed scan at all"
-/// signal: an aggregate with no `GROUP BY` would otherwise always return one
-/// all-zeros row, turning "never scanned" into "scanned and clean".
-const LATEST_SCAN_COUNTS_SQL: &str = r#"
-    WITH latest_per_type AS (
-        SELECT DISTINCT ON (scan_type)
-               critical_count, high_count, medium_count, low_count, findings_count
-        FROM scan_results
-        WHERE artifact_id = $1 AND status = 'completed'
-        ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
-    )
-    SELECT COALESCE(MAX(critical_count), 0)::int AS critical_count,
-           COALESCE(MAX(high_count), 0)::int     AS high_count,
-           COALESCE(MAX(medium_count), 0)::int   AS medium_count,
-           COALESCE(MAX(low_count), 0)::int      AS low_count,
-           COALESCE(MAX(findings_count), 0)::int AS findings_count
-    FROM latest_per_type
-    HAVING COUNT(*) > 0
-"#;
+/// Where a promotion is going, and whether the promoter could acknowledge there.
+#[derive(Debug, Clone, Copy)]
+pub struct PromotionGateContext {
+    pub target_repository_id: Uuid,
+    pub promoter_may_acknowledge: bool,
+}
 
-/// SQL for an artifact's open CVEs, sourced from `scan_findings` (the populated
-/// source), not the never-written `cve_history` table. An artifact's open CVEs
-/// are the unacknowledged, cve_id-bearing findings from its latest completed
-/// scan -- the same `scan_findings` shape the SBOM read path uses. The old
-/// `cve_history` read was always empty, so a "block on open CVEs" gate silently
-/// passed (#1620; data source also addresses #1561).
+/// The findings a promotion gate treats as open, as a CTE named `open_findings` with
+/// one row per finding in the scans the download gate grades
+/// (`artifact_current_scan_ids`). `$1` is the artifact, `$2` the repository the
+/// artifact is going to (NULL: the one it is in), and `$3` whether the promoter could
+/// acknowledge there.
 ///
-/// Scoped to the latest completed scan of EVERY scanner, for the same reason as
-/// [`LATEST_SCAN_COUNTS_SQL`]: joining findings to one single latest row hid the
-/// open CVEs of every other engine. `SELECT DISTINCT` already collapses a CVE
-/// that several engines report, so widening the join cannot produce duplicates.
-const OPEN_CVES_SQL: &str = r#"
-    WITH latest_scans AS (
-        SELECT DISTINCT ON (scan_type) id
-        FROM scan_results
-        WHERE artifact_id = $1 AND status = 'completed'
-        ORDER BY scan_type, completed_at DESC NULLS LAST, created_at DESC
+/// A gate on a promotion guards the target, so a decision covers a finding here only
+/// if it will apply there: a decision for every repository, one already live in the
+/// target, or one live in the source when the promoter could have made it in the
+/// target, in which case the carry moves it (#5153). A decision scoped to the source
+/// and a promoter who could not make it says nothing about the target, so the finding
+/// is open for the gate. Lapsed and revoked decisions cover nothing.
+///
+/// A decision live in the target speaks for the target, as it does at the download
+/// gate, and the carry leaves it in place. So one whose ceiling is below this finding
+/// keeps the finding open, whatever a wider or a source decision would accept.
+macro_rules! gate_open_findings_cte {
+    () => {
+        r#"
+    WITH open_findings AS (
+        SELECT sf.finding_class, sf.cve_id, sf.title, sf.affected_component,
+               sf.affected_version, sf.severity
+        FROM scan_findings sf
+        JOIN artifacts a ON a.id = sf.artifact_id
+        WHERE sf.artifact_id = $1
+          AND sf.scan_result_id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+          AND NOT EXISTS (
+              SELECT 1 FROM finding_acknowledgements fa
+              WHERE fa.checksum_sha256 = a.checksum_sha256
+                AND fa.revoked_at IS NULL
+                AND (fa.expires_at IS NULL OR fa.expires_at > NOW())
+                AND fa.finding_class = sf.finding_class
+                AND fa.advisory_key = finding_advisory_key(sf.cve_id, sf.title)
+                AND fa.component_key = finding_component_key(sf.affected_component)
+                AND fa.component_version_key = finding_component_key(sf.affected_version)
+                AND finding_severity_rank(sf.severity) <= fa.max_severity_rank
+                AND (fa.repository_id = COALESCE($2::uuid, a.repository_id)
+                     OR ((fa.repository_id IS NULL
+                          OR ($3::boolean AND fa.repository_id = a.repository_id))
+                         AND NOT EXISTS (
+                             SELECT 1 FROM finding_acknowledgements narrower
+                             WHERE narrower.repository_id = COALESCE($2::uuid, a.repository_id)
+                               AND narrower.checksum_sha256 = fa.checksum_sha256
+                               AND narrower.finding_class = fa.finding_class
+                               AND narrower.advisory_key = fa.advisory_key
+                               AND narrower.component_key = fa.component_key
+                               AND narrower.component_version_key = fa.component_version_key
+                               AND narrower.revoked_at IS NULL
+                               AND (narrower.expires_at IS NULL OR narrower.expires_at > NOW())
+                               AND finding_severity_rank(sf.severity) > narrower.max_severity_rank
+                         )))
+          )
     )
-    SELECT DISTINCT sf.cve_id
-    FROM scan_findings sf
-    JOIN latest_scans ls ON sf.scan_result_id = ls.id
-    WHERE sf.cve_id IS NOT NULL
-      AND NOT sf.is_acknowledged
-"#;
+"#
+    };
+}
+
+/// SQL for an artifact's open findings by severity (see [`gate_open_findings_cte`]).
+/// One finding per identity, at the highest severity any scan reported, so two engines
+/// reporting a CVE count once.
+///
+/// It used to read the counts stored on `scan_results`, which know nothing about
+/// acknowledgements, so a finding the download gate let through still blocked
+/// promotion. And because external submissions never leave the graded window, a
+/// vendor's retracted and acknowledged false positive blocked promotion for ever.
+/// A finding reported by a scan that did not finish counts, as at the download gate.
+///
+/// The stored counts still speak for a completed scan that claims findings and has no
+/// rows for them: a dedup copy from before its two inserts shared a transaction
+/// (#1035, #1058). Nothing can be acknowledged on such a row and a rescan replaces it,
+/// and reading it as clean would be the wrong way to fail.
+///
+/// The `HAVING` preserves the caller's "no completed scan at all" signal: an
+/// aggregate with no `GROUP BY` would otherwise always return one all-zeros row,
+/// turning "never scanned" into "scanned and clean".
+pub(crate) const OPEN_FINDING_COUNTS_SQL: &str = concat!(
+    gate_open_findings_cte!(),
+    r#"
+    , by_identity AS (
+        SELECT MAX(finding_severity_rank(severity)) AS severity_rank
+        FROM open_findings
+        GROUP BY finding_class,
+                 finding_advisory_key(cve_id, title),
+                 finding_component_key(affected_component),
+                 finding_component_key(affected_version)
+    ), rowless AS (
+        SELECT COALESCE(MAX(critical_count), 0) AS critical,
+               COALESCE(MAX(high_count), 0) AS high,
+               COALESCE(MAX(medium_count), 0) AS medium,
+               COALESCE(MAX(low_count), 0) AS low,
+               COALESCE(MAX(findings_count), 0) AS total
+        FROM scan_results sr
+        WHERE sr.artifact_id = $1 AND sr.status = 'completed' AND sr.findings_count > 0
+          AND sr.id IN (SELECT scan_result_id FROM artifact_current_scan_ids($1))
+          AND NOT EXISTS (SELECT 1 FROM scan_findings f WHERE f.scan_result_id = sr.id)
+    )
+    SELECT GREATEST((COUNT(*) FILTER (WHERE severity_rank = 4))::int, MAX(r.critical))::int
+               AS critical_count,
+           GREATEST((COUNT(*) FILTER (WHERE severity_rank = 3))::int, MAX(r.high))::int
+               AS high_count,
+           GREATEST((COUNT(*) FILTER (WHERE severity_rank = 2))::int, MAX(r.medium))::int
+               AS medium_count,
+           GREATEST((COUNT(*) FILTER (WHERE severity_rank = 1))::int, MAX(r.low))::int
+               AS low_count,
+           GREATEST(COUNT(by_identity.severity_rank)::int, MAX(r.total))::int
+               AS findings_count
+    FROM rowless r
+    LEFT JOIN by_identity ON TRUE
+    HAVING EXISTS (SELECT 1 FROM scan_results WHERE artifact_id = $1 AND status = 'completed')
+"#
+);
+
+/// SQL for an artifact's open CVEs: the cve_id-bearing findings open for this gate
+/// (see [`gate_open_findings_cte`]), not the never-written `cve_history` table, whose
+/// always-empty read let a "block on open CVEs" gate silently pass (#1620; data source
+/// also addresses #1561).
+///
+/// `SELECT DISTINCT` collapses a CVE that several engines report.
+const OPEN_CVES_SQL: &str = concat!(
+    gate_open_findings_cte!(),
+    r#"
+    SELECT DISTINCT cve_id
+    FROM open_findings
+    WHERE cve_id IS NOT NULL
+"#
+);
 
 /// Build the block-unscanned violation for a genuinely-unscanned artifact.
 /// Pure (no DB): the message is fixed and the detail payload carries the
@@ -538,12 +612,23 @@ impl PromotionPolicyService {
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> Result<PolicyEvaluationResult> {
+        self.evaluate_promotion(artifact_id, repository_id, None)
+            .await
+    }
+
+    /// [`Self::evaluate_artifact`] for a promotion into `gate`'s target.
+    pub async fn evaluate_promotion(
+        &self,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        gate: Option<PromotionGateContext>,
+    ) -> Result<PolicyEvaluationResult> {
         let mut violations = Vec::new();
         let mut action = PolicyAction::Allow;
         // (rule, why it passes) for every rule this evaluation applies.
         let mut applied: Vec<(String, String)> = Vec::new();
 
-        let cve_summary = self.get_cve_summary(artifact_id).await?;
+        let cve_summary = self.get_cve_summary_for(artifact_id, gate).await?;
         let license_summary = self.get_license_summary(artifact_id).await?;
         let scan_policy = self.get_scan_policy(repository_id).await?;
         let license_policy = self.get_license_policy(repository_id).await?;
@@ -799,9 +884,22 @@ impl PromotionPolicyService {
         Ok(classify_scan_state(&rows))
     }
 
+    #[cfg(test)]
     async fn get_cve_summary(&self, artifact_id: Uuid) -> Result<Option<CveSummary>> {
-        let scan: Option<ScanRow> = sqlx::query_as(LATEST_SCAN_COUNTS_SQL)
+        self.get_cve_summary_for(artifact_id, None).await
+    }
+
+    async fn get_cve_summary_for(
+        &self,
+        artifact_id: Uuid,
+        gate: Option<PromotionGateContext>,
+    ) -> Result<Option<CveSummary>> {
+        let target = gate.map(|g| g.target_repository_id);
+        let may_acknowledge = gate.is_some_and(|g| g.promoter_may_acknowledge);
+        let scan: Option<ScanRow> = sqlx::query_as(OPEN_FINDING_COUNTS_SQL)
             .bind(artifact_id)
+            .bind(target)
+            .bind(may_acknowledge)
             .fetch_optional(&self.db)
             .await?;
 
@@ -811,6 +909,8 @@ impl PromotionPolicyService {
 
         let open_cves: Vec<String> = sqlx::query_scalar(OPEN_CVES_SQL)
             .bind(artifact_id)
+            .bind(target)
+            .bind(may_acknowledge)
             .fetch_all(&self.db)
             .await?;
 
@@ -1034,10 +1134,10 @@ mod tests {
         // Guards the #1620 repoint: the query must read unacknowledged,
         // cve_id-bearing rows from the latest completed scan's scan_findings,
         // and must NOT touch the dead cve_history table.
-        assert!(OPEN_CVES_SQL.contains("FROM scan_findings"));
-        assert!(OPEN_CVES_SQL.contains("NOT sf.is_acknowledged"));
-        assert!(OPEN_CVES_SQL.contains("sf.cve_id IS NOT NULL"));
-        assert!(OPEN_CVES_SQL.contains("status = 'completed'"));
+        assert!(OPEN_CVES_SQL.contains("FROM scan_findings sf"));
+        assert!(OPEN_CVES_SQL.contains("FROM finding_acknowledgements fa"));
+        assert!(OPEN_CVES_SQL.contains("cve_id IS NOT NULL"));
+        assert!(OPEN_CVES_SQL.contains("artifact_current_scan_ids"));
         assert!(!OPEN_CVES_SQL.contains("cve_history"));
     }
 
@@ -1048,9 +1148,9 @@ mod tests {
         // engines enabled, whichever finished last supplied the entire CVE verdict
         // and the others' findings never reached the gate — so a clean scan that
         // completed after a critical-bearing one silently unblocked promotion.
-        for sql in [LATEST_SCAN_COUNTS_SQL, OPEN_CVES_SQL] {
+        for sql in [OPEN_FINDING_COUNTS_SQL, OPEN_CVES_SQL] {
             assert!(
-                sql.contains("DISTINCT ON (scan_type)"),
+                sql.contains("artifact_current_scan_ids"),
                 "query must window per scanner, not take one global latest row"
             );
             assert!(
@@ -1062,30 +1162,20 @@ mod tests {
         // an unfiltered aggregate always returns a row, which the caller would read
         // as a clean scan instead of `None`.
         assert!(
-            LATEST_SCAN_COUNTS_SQL.contains("HAVING COUNT(*) > 0"),
+            OPEN_FINDING_COUNTS_SQL.contains("HAVING EXISTS"),
             "no completed scan must still yield zero rows"
         );
-        // MAX, not SUM: per-scanner aggregates cover overlapping finding sets, so
-        // summing would double-count a CVE that two engines both report. Pin
-        // every count column -- leaving one un-aggregated would silently narrow
-        // the verdict back to a single scanner for that severity.
-        for col in [
-            "critical_count",
-            "high_count",
-            "medium_count",
-            "low_count",
-            "findings_count",
-        ] {
-            assert!(
-                LATEST_SCAN_COUNTS_SQL.contains(&format!("MAX({col})")),
-                "{col} must be aggregated across scanners"
-            );
-        }
-        assert!(!LATEST_SCAN_COUNTS_SQL.contains("SUM("));
+        // One finding per identity at its highest severity, not a row count: two
+        // engines reporting a CVE are one finding.
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("MAX(finding_severity_rank(severity))"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("GROUP BY finding_class"));
+        assert!(!OPEN_FINDING_COUNTS_SQL.contains("SUM("));
 
-        // The counts query feeds the same latest-completed-scan contract.
-        assert!(LATEST_SCAN_COUNTS_SQL.contains("FROM scan_results"));
-        assert!(LATEST_SCAN_COUNTS_SQL.contains("status = 'completed'"));
+        // Open findings: a decision counts only if it reaches the target (#5153).
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("FROM finding_acknowledgements fa"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("($3::boolean AND fa.repository_id"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("narrower.max_severity_rank"));
+        assert!(OPEN_FINDING_COUNTS_SQL.contains("status = 'completed'"));
     }
 
     // =======================================================================
@@ -2531,10 +2621,23 @@ mod tests {
             .await
             .expect("failed to insert scan_finding");
         }
+        // The counts come from open findings (#5153), so seed the highs as rows.
+        for i in 0..high {
+            sqlx::query(
+                "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, source) \
+                 VALUES ($1, $2, 'high', $3, 'test')",
+            )
+            .bind(scan_id)
+            .bind(artifact)
+            .bind(format!("seeded high {i}"))
+            .execute(pool)
+            .await
+            .expect("failed to insert a high finding");
+        }
         scan_id
     }
 
-    /// Executes the rewritten `LATEST_SCAN_COUNTS_SQL` and `OPEN_CVES_SQL`
+    /// Executes the rewritten `OPEN_FINDING_COUNTS_SQL` and `OPEN_CVES_SQL`
     /// against a real database with TWO scanners.
     ///
     /// The sibling test in this module pins the SQL *strings*, which guards

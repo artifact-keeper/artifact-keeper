@@ -303,6 +303,19 @@ pub fn record_proxy_scan_verdict(verdict: &'static str, action: &'static str) {
     .increment(1);
 }
 
+/// A proxied file that got no scan for now because the in-flight table had no
+/// room (#5231): `423` under `fail_closed`, served `pending` otherwise. `limit`
+/// names what was out of room.
+pub fn record_proxy_scan_queue_refused(limit: &'static str) {
+    counter!("ak_proxy_scan_queue_refused_total", "limit" => limit).increment(1);
+}
+
+/// A queued `fail_closed` proxy scan dropped because no request wanted it any
+/// more (#5231).
+pub fn record_proxy_scan_abandoned() {
+    counter!("ak_proxy_scan_abandoned_total").increment(1);
+}
+
 /// Record one committed artifact upload: `ak_artifact_uploads_total` and the
 /// `ak_artifact_upload_size_bytes` histogram. Called from
 /// `scanner_service::trigger_scan_on_upload`, the post-commit step every

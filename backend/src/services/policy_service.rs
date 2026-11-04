@@ -1046,8 +1046,10 @@ impl PolicyService {
                 ) AS has_completed_scan,
                 EXISTS (
                     SELECT 1
-                      FROM scan_findings
+                      FROM scan_findings_effective
                      WHERE artifact_id = $1
+                       AND scan_result_id IN
+                           (SELECT scan_result_id FROM artifact_current_scan_ids($1))
                        AND NOT is_acknowledged
                 ) AS has_unacknowledged_findings
             "#,
@@ -1117,12 +1119,17 @@ impl PolicyService {
                 let _threshold =
                     Severity::from_str_loose(&policy.max_severity).unwrap_or(Severity::Critical);
 
-                // Count non-acknowledged findings at or above the threshold
+                // Count non-acknowledged findings at or above the threshold, over
+                // the artifact's current scans rather than every scan it ever had
+                // (#5153, `artifact_current_scan_ids` in migration 312). A decision
+                // covers a finding whichever scan wrote it.
                 let violating_count: i64 = sqlx::query_scalar(
                     r#"
                     SELECT COUNT(*)
-                    FROM scan_findings
+                    FROM scan_findings_effective
                     WHERE artifact_id = $1
+                      AND scan_result_id IN
+                          (SELECT scan_result_id FROM artifact_current_scan_ids($1))
                       AND NOT is_acknowledged
                       AND severity IN (
                           SELECT unnest(CASE $2

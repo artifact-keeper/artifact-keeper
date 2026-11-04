@@ -3967,7 +3967,7 @@ entries:
         }
 
         // `.expect(1)` on the chart mock is verified on server drop.
-        drop(server);
+        tdh::drop_mock_server(server).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

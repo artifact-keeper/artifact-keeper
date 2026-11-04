@@ -3913,6 +3913,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "gitlfs" => Ok(RepositoryFormat::Gitlfs),
         "vscode" => Ok(RepositoryFormat::Vscode),
         "jetbrains" => Ok(RepositoryFormat::Jetbrains),
+        "agentplugins" => Ok(RepositoryFormat::AgentPlugins),
         "huggingface" => Ok(RepositoryFormat::Huggingface),
         "mlmodel" => Ok(RepositoryFormat::Mlmodel),
         "cran" => Ok(RepositoryFormat::Cran),
@@ -3948,6 +3949,38 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
             s
         ))),
     }
+}
+
+/// Refuse a repository type a format cannot serve.
+///
+/// Agent Plugins repositories (#5251) are hosted only: there is no upstream
+/// marketplace protocol to proxy and no merge rule for virtual members yet
+/// (D3 of the design). The key `t` is also refused for this format, because
+/// `/agentplugins/t/{token}/{repo}/...` is the token-in-path route (D8) and a
+/// repository named `t` would be ambiguous with it.
+fn validate_format_supports_repo_type(
+    format: &RepositoryFormat,
+    repo_type: &RepositoryType,
+    key: &str,
+) -> Result<()> {
+    if *format != RepositoryFormat::AgentPlugins {
+        return Ok(());
+    }
+    if !repo_type.is_hosted() {
+        return Err(AppError::Validation(format!(
+            "Agent Plugins repositories are hosted-only: repo_type {} is not supported \
+             (use local)",
+            repo_type.as_str()
+        )));
+    }
+    if key == "t" {
+        return Err(AppError::Validation(
+            "The key \"t\" is reserved for Agent Plugins repositories: \
+             /agentplugins/t/{token}/... is the token-in-path route"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// List repositories
@@ -4208,6 +4241,7 @@ pub async fn create_repository(
     let service = state.create_repository_service();
     let (format, plugin_format_key) = service.resolve_format(&payload.format).await?;
     let repo_type = parse_repo_type(&payload.repo_type)?;
+    validate_format_supports_repo_type(&format, &repo_type, &payload.key)?;
     let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
     // Computed before `format` is moved into the create request below.
     let is_hex_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Hex);
@@ -5376,6 +5410,11 @@ pub async fn update_repository(
         }
     }
     let key_changed = payload.key.as_deref().is_some_and(|k| k != existing.key);
+    // The create-time format rules (#5251: an Agent Plugins repository may
+    // not take the key `t`, which is its token route) hold for a rename too.
+    if let Some(new_key) = payload.key.as_deref().filter(|_| key_changed) {
+        validate_format_supports_repo_type(&existing.format, &existing.repo_type, new_key)?;
+    }
     if key_changed || project_change.is_some() {
         if let Some(project_id) = project_change.unwrap_or(existing.project_id) {
             let effective_key = payload.key.as_deref().unwrap_or(&existing.key);
@@ -17077,10 +17116,35 @@ mod tests {
             "bazel",
             "protobuf",
             "pacman",
+            "agentplugins",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
         }
+    }
+
+    #[test]
+    fn agent_plugins_repositories_are_hosted_only_5251() {
+        let ap = RepositoryFormat::AgentPlugins;
+        for ok in [RepositoryType::Local, RepositoryType::Staging] {
+            assert!(validate_format_supports_repo_type(&ap, &ok, "plugins").is_ok());
+        }
+        for bad in [RepositoryType::Remote, RepositoryType::Virtual] {
+            let err = validate_format_supports_repo_type(&ap, &bad, "plugins")
+                .expect_err("non-hosted agentplugins must be refused");
+            match err {
+                AppError::Validation(msg) => assert!(msg.contains("hosted-only"), "{msg}"),
+                other => panic!("expected a validation error, got {other:?}"),
+            }
+        }
+        assert!(validate_format_supports_repo_type(&ap, &RepositoryType::Local, "t").is_err());
+        // Other formats are untouched.
+        assert!(validate_format_supports_repo_type(
+            &RepositoryFormat::Jetbrains,
+            &RepositoryType::Remote,
+            "t"
+        )
+        .is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -30609,6 +30673,72 @@ mod tests {
 
         tdh::cleanup(&pool, created.id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #5251 review M3: renaming an Agent Plugins repository onto the
+    /// reserved key `t` (its token route) is refused like creating one, and
+    /// the stored key is unchanged; an ordinary rename still works.
+    #[tokio::test]
+    async fn agentplugins_rename_to_reserved_key_is_refused_5251() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-5251-u-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+        let key = format!("ph-5251-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(&key, "plugins", "agentplugins", serde_json::json!({})),
+        )
+        .await
+        .expect("create an agentplugins repository");
+
+        let rename: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"key": "t"}"#).expect("deserialize rename");
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(rename),
+        )
+        .await
+        .expect_err("renaming onto the token route must be refused");
+        let stored: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read key");
+
+        let renamed = format!("{key}-b");
+        let ok: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "key": renamed })).expect("rename body");
+        let ok = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(ok),
+        )
+        .await;
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("reserved")),
+            "expected the reserved-key Validation error, got {err:?}"
+        );
+        assert_eq!(stored, key, "a refused rename must leave the key untouched");
+        assert!(
+            ok.is_ok(),
+            "an ordinary rename must still succeed: {:?}",
+            ok.err()
+        );
     }
 
     // -----------------------------------------------------------------------

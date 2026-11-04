@@ -50,6 +50,7 @@
 	reverse_proxy /bazel/* backend:8080
 	reverse_proxy /huggingface/* backend:8080
 	reverse_proxy /jetbrains/* backend:8080
+	reverse_proxy /agentplugins/* backend:8080
 	reverse_proxy /vscode/* backend:8080
 	reverse_proxy /proto/* backend:8080
 	reverse_proxy /incus/* backend:8080

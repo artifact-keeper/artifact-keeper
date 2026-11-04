@@ -1601,6 +1601,7 @@ async fn update_cve_status_by_artifact_cve(
             status,
             Some(auth.user_id),
             body.reason.as_deref(),
+            auth.access_scope(),
         )
         .await?;
 

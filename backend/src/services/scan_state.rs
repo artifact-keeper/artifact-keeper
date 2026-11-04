@@ -94,7 +94,7 @@ impl ScanStateRow {
     /// * (legacy) its status is `failed` and its error message carries the
     ///   [`NOT_APPLICABLE_MARKER`] sentinel — historical rows written before the
     ///   dedicated status existed.
-    fn is_not_applicable(&self) -> bool {
+    pub(crate) fn is_not_applicable(&self) -> bool {
         if self.status == NOT_APPLICABLE_STATUS {
             return true;
         }
