@@ -849,6 +849,28 @@ async fn copy_storage_object_to_file(
 /// Where `docker/Dockerfile.backend` seeds the Grype vulnerability DB, and the
 /// value its `GRYPE_DB_CACHE_DIR` ENV points at. Kept in sync by
 /// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
+/// Paths excluded from every `dir:` workspace scan (#5262).
+///
+/// A Maven-built JAR embeds its own build POM at
+/// `META-INF/maven/<groupId>/<artifactId>/pom.xml`. Once the scan workspace
+/// unpacks the archive, syft's directory POM cataloger reads that file and
+/// catalogs every DECLARED dependency, including `provided` and `test` scope,
+/// as though it were shipped in the archive. A Maven plugin that declares
+/// `maven-core` as `provided` was then blocked on `maven-core`'s CVEs even
+/// though the consumer's Maven installation supplies that code.
+///
+/// Nothing that grades the archive's real contents is lost: the original
+/// archive stays in the workspace, and syft's java-archive cataloger names
+/// the archive and every bundled or shaded component from the
+/// `pom.properties` entries inside it (the same signal the #4100 identity
+/// check reads), and nested JARs remain archives it opens. Only the
+/// extracted build POMs, which describe what the project was BUILT against,
+/// are skipped.
+///
+/// Patterns are relative to the scan root; syft requires each to start with
+/// `./`, `*/` or `**/`.
+pub(crate) const GRYPE_DIR_EXCLUDES: &[&str] = &["**/META-INF/maven/**/pom.xml"];
+
 const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
 
 /// The DB-related env every grype child gets, scan or probe alike.
@@ -1142,7 +1164,7 @@ impl GrypeScanner {
         // catalog side channel (#3003 PR-2) rides the same single invocation
         // so the inline OCI proxy gate can tell "clean" from "graded nothing".
         let result = match self
-            .run_grype_with_catalog(&grype_target, Some(&bom_path), &[])
+            .run_grype_with_catalog(&grype_target, Some(&bom_path), &[], &[])
             .await
         {
             Ok(run) => {
@@ -1401,7 +1423,7 @@ impl GrypeScanner {
         // attempt mints a fresh one (#3565).
         let bom_path = workspace.with_extension("grype-bom.json");
         workspace.own_sidecar(bom_path.clone());
-        self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[])
+        self.run_grype_with_catalog(&dir_arg, Some(&bom_path), &[], GRYPE_DIR_EXCLUDES)
             .await
     }
 
@@ -1416,6 +1438,7 @@ impl GrypeScanner {
         scan_arg: &str,
         bom_path: Option<&Path>,
         auth_env: &[(&'static str, String)],
+        excludes: &[&str],
     ) -> Result<GrypeRun> {
         let mut command = tokio::process::Command::new("grype");
         // `tokio::process::Command` defaults `kill_on_drop` to `false`. This
@@ -1463,6 +1486,11 @@ impl GrypeScanner {
         // (dir-mode / oci-dir-mode) and anonymous registry scans.
         for (key, value) in auth_env {
             command.env(key, value);
+        }
+        // Path exclusions for `dir:` scans (#5262); empty for every other
+        // target.
+        for pattern in excludes {
+            command.args(["--exclude", pattern]);
         }
         let output = command
             .output()
@@ -1585,7 +1613,7 @@ impl GrypeScanner {
         // BOM sidecar is best-effort: `None` runs exactly today's
         // `[target, "-o", "json"]` invocation.
         let bom_path = self.bom_sidecar_path().await;
-        self.run_grype_with_catalog(target, bom_path.as_deref(), auth_env)
+        self.run_grype_with_catalog(target, bom_path.as_deref(), auth_env, &[])
             .await
     }
 
@@ -4145,6 +4173,134 @@ mod tests {
                 !p.name.starts_with('/'),
                 "a filesystem path reached the inventory: {:?}",
                 p
+            );
+        }
+    }
+
+    /// #5262: syft rejects an exclusion that does not start with `./`, `*/`
+    /// or `**/`, and the embedded-POM exclusion must stay scoped to build
+    /// POMs under `META-INF/maven/`, never `pom.properties`, which is how the
+    /// archive and its shaded components are identified.
+    #[test]
+    fn test_dir_excludes_are_valid_and_scoped_to_embedded_poms_5262() {
+        assert_eq!(GRYPE_DIR_EXCLUDES, &["**/META-INF/maven/**/pom.xml"]);
+        for pattern in GRYPE_DIR_EXCLUDES {
+            assert!(
+                ["./", "*/", "**/"].iter().any(|p| pattern.starts_with(p)),
+                "{pattern} must be root-relative for syft"
+            );
+            assert!(
+                !pattern.contains("pom.properties"),
+                "{pattern} must not hide archive identity"
+            );
+        }
+    }
+
+    /// A Maven-plugin-shaped JAR (#5262): its own `pom.properties`, a build
+    /// POM declaring `provided` and `test` dependencies, and one shaded
+    /// component carrying its own `pom.properties`.
+    fn maven_plugin_jar_with_embedded_pom() -> Bytes {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            let mut put = |path: &str, body: &str| {
+                zip.start_file(path, opts).unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            };
+            put("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n");
+            put(
+                "META-INF/maven/com.acme/acme-maven-plugin/pom.properties",
+                "groupId=com.acme\nartifactId=acme-maven-plugin\nversion=1.0.0\n",
+            );
+            put(
+                "META-INF/maven/com.acme/acme-maven-plugin/pom.xml",
+                r#"<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>acme-maven-plugin</artifactId>
+  <version>1.0.0</version>
+  <packaging>maven-plugin</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.maven</groupId>
+      <artifactId>maven-core</artifactId>
+      <version>3.2.5</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.maven</groupId>
+      <artifactId>maven-compat</artifactId>
+      <version>3.2.5</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+"#,
+            );
+            put(
+                "META-INF/maven/com.google.code.gson/gson/pom.properties",
+                "groupId=com.google.code.gson\nartifactId=gson\nversion=2.8.0\n",
+            );
+            put("com/acme/plugin/Mojo.class", "not real bytecode");
+            zip.finish().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// END-TO-END against the REAL grype binary (#5262): the fix is a grype
+    /// flag, so only the binary can prove it. The unpacked build POM's
+    /// `provided`/`test` declarations must not be cataloged as shipped
+    /// components, while the JAR's own identity and its shaded component
+    /// still are. Skips when grype is not installed or cannot run.
+    #[tokio::test]
+    async fn e2e_maven_embedded_pom_declarations_are_not_cataloged_5262() {
+        if std::process::Command::new("grype")
+            .arg("version")
+            .output()
+            .is_err()
+        {
+            eprintln!("grype not installed; skipping the embedded-POM catalog test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
+        let artifact = make_artifact("acme-maven-plugin-1.0.0.jar", "application/java-archive");
+
+        let output = match scanner
+            .scan(&artifact, None, &maven_plugin_jar_with_embedded_pom())
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("grype present but the scan could not run ({e}); skipping");
+                return;
+            }
+        };
+        let names: Vec<&str> = output.packages.iter().map(|p| p.name.as_str()).collect();
+
+        for declared in ["maven-core", "maven-compat"] {
+            assert!(
+                !names.contains(&declared),
+                "{declared} is only declared in the build POM and must not be \
+                 cataloged as shipped; inventory: {names:?}"
+            );
+            assert!(
+                !output.findings.iter().any(|f| f
+                    .affected_component
+                    .as_deref()
+                    .is_some_and(|c| c.contains(declared))),
+                "no finding may be raised against POM-only {declared}"
+            );
+        }
+        // Positive controls: excluding the POM must not cost the archive's
+        // own identity or its bundled (shaded) component.
+        for shipped in ["acme-maven-plugin", "gson"] {
+            assert!(
+                names.contains(&shipped),
+                "{shipped} is in the archive and must stay cataloged; \
+                 inventory: {names:?}"
             );
         }
     }
