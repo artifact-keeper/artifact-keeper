@@ -284,8 +284,13 @@ is `400`.
   the generic artifact API, the repository ACL or listings, and it does not
   make the repository count as having fine-grained rules. A namespace-scoped
   publisher that should also read a private registry needs a separate,
-  unconditioned `read` rule. The MCP write routes (publish, status change,
-  edit, delete, bundle upload, capability reports) run the namespace gate.
+  unconditioned `read` rule. On the `/mcp/<key>/...` surface of an MCP
+  repository the route-level write check counts the rule (as an applicable
+  rule granting its actions), and every MCP write route there (publish, status
+  change, delete, bundle upload, capability reports) then runs the namespace
+  gate on the server name. Routes that need repository administration (the
+  admin edit, `.../capabilities/probe`, the catalog) are not satisfied by a
+  namespace rule.
 
 ### Namespace proofs
 

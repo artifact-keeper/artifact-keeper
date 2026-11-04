@@ -3274,11 +3274,23 @@ pub async fn repo_visibility_middleware(
                 // public-repo write hole (any authed caller could PUT/DELETE)
                 // and the rules-less private-repo case (a read-only `viewer`
                 // member could write/delete). DB error fails closed (503).
-                match vis_state
-                    .permission_service
-                    .check_repository_action(ext.user_id, repo.id, action, false)
-                    .await
-                {
+                // #5253: on the MCP registry surface a namespace-conditioned
+                // rule counts here; the MCP write handler then decides the
+                // server name (`services::mcp_namespaces`). Anywhere else
+                // such a rule grants nothing.
+                let mcp_surface = repo.format == "mcp" && path.starts_with("/mcp/");
+                let decision = if mcp_surface {
+                    vis_state
+                        .permission_service
+                        .check_mcp_surface_action(ext.user_id, repo.id, action, false)
+                        .await
+                } else {
+                    vis_state
+                        .permission_service
+                        .check_repository_action(ext.user_id, repo.id, action, false)
+                        .await
+                };
+                match decision {
                     Ok(true) => {}
                     Ok(false) => return forbidden_permission_response(),
                     Err(_) => {

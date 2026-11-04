@@ -444,6 +444,36 @@ impl PermissionService {
         action: &str,
         is_admin: bool,
     ) -> Result<bool> {
+        self.check_repository_action_on(user_id, repository_id, action, is_admin, false)
+            .await
+    }
+
+    /// [`Self::check_repository_action`] for a request on the MCP registry
+    /// surface (`/mcp/<key>/...` of an MCP repository): a rule carrying
+    /// `conditions.mcp_namespaces` counts there as an applicable rule (its
+    /// IP condition still applies), because every MCP write handler then runs
+    /// the namespace write gate (`services::mcp_namespaces::authorize_write`)
+    /// that decides the server name. Everywhere else such a rule grants
+    /// nothing.
+    pub async fn check_mcp_surface_action(
+        &self,
+        user_id: Uuid,
+        repository_id: Uuid,
+        action: &str,
+        is_admin: bool,
+    ) -> Result<bool> {
+        self.check_repository_action_on(user_id, repository_id, action, is_admin, true)
+            .await
+    }
+
+    async fn check_repository_action_on(
+        &self,
+        user_id: Uuid,
+        repository_id: Uuid,
+        action: &str,
+        is_admin: bool,
+        mcp_surface: bool,
+    ) -> Result<bool> {
         if is_admin {
             return Ok(true);
         }
@@ -518,7 +548,14 @@ impl PermissionService {
                 END AS allowed,
                 {tally}
             "#,
-            condition_columns = condition_columns("p", "$4"),
+            condition_columns = if mcp_surface {
+                format!(
+                    "(p.conditions ? 'allowed_cidrs') AS conditioned, {} AS ip_ok",
+                    cidr_condition_expr("p", "$4")
+                )
+            } else {
+                condition_columns("p", "$4")
+            },
             tally = CONDITION_TALLY_SQL,
         );
         let (allowed, conditioned, matched): (bool, i64, i64) =

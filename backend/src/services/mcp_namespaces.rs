@@ -933,7 +933,16 @@ mod tests {
                 .unwrap(),
             "a namespace rule does not engage the generic ACL"
         );
-        // The MCP gate still honours it.
+        // The MCP surface's route-level check counts it (the handler's
+        // namespace gate then decides the name); the MCP gate honours it.
+        assert!(perms
+            .check_mcp_surface_action(user, repo, "write", false)
+            .await
+            .unwrap());
+        assert!(!perms
+            .check_mcp_surface_action(Uuid::new_v4(), repo, "write", false)
+            .await
+            .unwrap());
         assert!(
             authorize_write(&pool, &auth, repo, "com.acme/x", "write", None)
                 .await

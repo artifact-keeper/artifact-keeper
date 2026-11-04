@@ -142,10 +142,8 @@ async fn github_oidc_login_then_namespace_conditioned_publish() {
         let (h, token) = (&h, token.to_string());
         async move { h.send_as("POST", &uri, Some(&token), Some(doc)).await }
     };
-    assert_eq!(
-        publish(&token, "io.github.acme/tool").await.status,
-        StatusCode::OK
-    );
+    let first = publish(&token, "io.github.acme/tool").await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.json());
     let refused = publish(&token, "io.github.evil/tool").await;
     assert_eq!(
         (refused.status, refused.json()["error"].as_str()),
