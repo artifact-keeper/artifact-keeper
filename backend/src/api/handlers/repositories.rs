@@ -1131,7 +1131,11 @@ pub struct CreateRepositoryRequest {
     pub mcp_namespace_allow: Option<Vec<String>>,
     /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
     /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
     #[serde(flatten)]
+    #[schema(ignore)]
     pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591). Each entry is an exact
@@ -1437,7 +1441,11 @@ pub struct UpdateRepositoryRequest {
     pub mcp_namespace_allow: Option<Vec<String>>,
     /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
     /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
     #[serde(flatten)]
+    #[schema(ignore)]
     pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Replace the trusted cross-origin OCI Bearer token realms for this
     /// Remote repository (#3591); same rules as on create. Omit to leave the
@@ -1649,7 +1657,11 @@ pub struct RepositoryResponse {
     pub mcp_namespace_allow: Option<Vec<String>>,
     /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
     /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
     #[serde(flatten)]
+    #[schema(ignore)]
     pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591), canonical origins. Omitted

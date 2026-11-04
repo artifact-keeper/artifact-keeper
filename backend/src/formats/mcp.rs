@@ -2878,7 +2878,7 @@ mod tests {
                 state(
                     Active,
                     Some(HoldKind::PendingApproval {
-                        review_id: Some(Uuid::nil()),
+                        review_id: Some(Uuid::from_u128(7)),
                     }),
                     false,
                 ),
