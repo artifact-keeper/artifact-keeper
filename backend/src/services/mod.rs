@@ -30,6 +30,7 @@ pub mod conda_identity;
 pub mod conda_recipe;
 pub mod conda_scripts;
 pub mod conda_semantics;
+pub mod config_document;
 pub mod debian_backfill_service;
 pub mod declared_dependencies;
 pub mod dependency_track_service;

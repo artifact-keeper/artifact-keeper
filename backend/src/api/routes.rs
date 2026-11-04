@@ -1432,6 +1432,8 @@ fn api_v1_routes(
             // `/quality/checks` (auth-only, 400s without artifact_id) is the
             // separate #2334 contract and is unchanged.
             .nest("/quality-checks", handlers::quality_gates::admin_router())
+            // Config-as-code export / plan / apply (#5292).
+            .nest("/config", handlers::admin_config::router())
             .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MB
             .layer(middleware::from_fn_with_state(
                 auth_service.clone(),

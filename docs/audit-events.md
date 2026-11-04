@@ -163,11 +163,14 @@ such as `credential_replaced` or `secret_rotated`.
 | `WEBHOOK_SECRET_ROTATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `secret_rotated: true`, `previous_secret_expires_at` |
 | `SYNC_POLICY_CREATED` / `_DELETED` | `sync_policy` | `name`, `policy` (the policy without timestamps) |
 | `SYNC_POLICY_UPDATED` | `sync_policy` | `name`, `changed_fields`, `before`, `after` (written by update and by enable / disable) |
+| `CONFIG_IMPORTED` | `setting` (`resource_name: config_document`); one summary row per `POST /api/v1/admin/config/import?mode=apply` (#5292), on top of the per-repository rows each write records | `schema_version`, `completed`, `error` (null on success), `planned_create`, `planned_update` (keys), `unchanged` and `not_in_document` (counts), `created`, `updated`, `members_updated` (keys actually written), `prune` |
 
 A webhook `url` is recorded as scheme, host, port and path: userinfo, query
 string and fragment are dropped because receivers often carry a token there.
 `PROMOTION_REFUSED` and `PROMOTION_APPROVAL_DENIED` export with outcome
-`denied`; the others export as `success`.
+`denied`; a `CONFIG_IMPORTED` row for an apply that failed part way exports
+with outcome `failure`; the others export as `success`. `CONFIG_IMPORTED`
+never carries a value from the import's `secrets` map.
 
 ## Conda channel and environment actions
 

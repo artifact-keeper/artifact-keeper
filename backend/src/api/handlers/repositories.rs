@@ -13509,8 +13509,24 @@ pub async fn list_virtual_members(
     // full member set including key, name, and repo_type for repos they have
     // no rights to. Mirrors the write-side authz that add/remove/update apply.
     let auth = require_auth(auth)?;
+    let (members, notice) = visible_virtual_members(&state, &auth, &key).await?;
+    Ok(with_virtual_members_notice(
+        Json(VirtualMembersListResponse { members }),
+        notice,
+    ))
+}
+
+/// The members of virtual repository `key` that `auth` may see, in priority
+/// order, and whether the empty-listing notice applies (#4690). The body of
+/// [`list_virtual_members`], shared with the config-document export (#5292)
+/// so both read the membership through one visibility filter.
+pub(crate) async fn visible_virtual_members(
+    state: &SharedState,
+    auth: &AuthExtension,
+    key: &str,
+) -> Result<(Vec<VirtualMemberResponse>, bool)> {
     let service = RepositoryService::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
+    let repo = service.get_by_key(key).await?;
 
     if repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
@@ -13531,7 +13547,7 @@ pub async fn list_virtual_members(
     //    browser session holding no grant on a PRIVATE virtual repository
     //    could confirm it exists and read its membership — while `GET /{key}`
     //    on that same repository correctly 404s.
-    require_repo_access(&auth, repo.id)?;
+    require_repo_access(auth, repo.id)?;
     require_visible(&repo, &Some(auth.clone()), &service).await?;
 
     // Query members with their repository info
@@ -13572,7 +13588,7 @@ pub async fn list_virtual_members(
     // are `require_visible` exactly. Using `visibility_for_auth` here instead
     // got both halves wrong for a repo-scoped token -- see
     // `member_grant_visibility`.
-    let visibility = member_grant_visibility(Some(&auth));
+    let visibility = member_grant_visibility(Some(auth));
     let member_ids: Vec<Uuid> = members.iter().map(|row| row.member_repo_id).collect();
     let granted: std::collections::HashSet<Uuid> = service
         .filter_visible_repo_ids(&member_ids, &visibility)
@@ -13584,7 +13600,7 @@ pub async fn list_virtual_members(
         .filter(|row| {
             granted.contains(&row.member_repo_id)
                 && member_passes_token_scope(
-                    Some(&auth),
+                    Some(auth),
                     repo.id,
                     row.member_repo_id,
                     row.visibility,
@@ -13602,11 +13618,8 @@ pub async fn list_virtual_members(
     // itself says why. Keyed on the readable set being empty, never on how
     // many members were dropped, so it is the same for a virtual with no
     // members at all (#3452).
-    let notice = visible.is_empty() && holds_virtual_read_grant(&state, &auth, repo.id).await?;
-    Ok(with_virtual_members_notice(
-        Json(VirtualMembersListResponse { members }),
-        notice,
-    ))
+    let notice = visible.is_empty() && holds_virtual_read_grant(state, auth, repo.id).await?;
+    Ok((members, notice))
 }
 
 /// Add a member to a virtual repository

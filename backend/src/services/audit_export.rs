@@ -167,6 +167,7 @@ impl AuditAction {
             | AuditAction::StorageReindexRun
             | AuditAction::DebianBackfillRun
             | AuditAction::CacheSeeded
+            | AuditAction::ConfigImported
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
             | AuditAction::FindingAcknowledged
