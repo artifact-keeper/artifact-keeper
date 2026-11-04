@@ -1,0 +1,1108 @@
+# Vendored verbatim from modelcontextprotocol/registry
+# docs/reference/api/openapi.yaml at a75c727dfee39990ae9e8bd416335ac71502f2b5
+# (MIT, see info.license). Served by Artifact Keeper at
+# /mcp/{repo}/v0.1/openapi.yaml; see docs/mcp-registry.md for what differs.
+openapi: 3.1.0
+jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema"
+$id: https://modelcontextprotocol.io/schemas/draft/2025-12-01/server-registry-openapi
+info:
+  title: MCP Server Registry API
+  version: "2025-12-01"
+  summary: API for discovering and accessing MCP server metadata
+  description: |
+    Specification for a theoretical REST API that serves up metadata about MCP servers.
+  license:
+    name: MIT
+    identifier: MIT
+
+tags:
+  - name: servers
+    description: Operations for discovering and retrieving MCP servers
+  - name: publish
+    description: Operations for publishing MCP servers to the registry
+
+paths:
+  /v0.1/servers:
+    get:
+      tags: [servers]
+      summary: List MCP servers
+      description: |
+        Returns a paginated list with one record per server version. Without a version filter, results include superseded versions, including when search is provided.
+
+        The official registry orders results by server name, then by version string, both ascending. Versions are compared as text, not by semantic version or publication date; the first result for a server is not necessarily its latest version.
+
+        Use version=latest to return only the latest version of each matching server. Keep the same filters when following metadata.nextCursor.
+      parameters:
+        - name: cursor
+          in: query
+          description: |
+            Pagination cursor for retrieving next set of results.
+
+            Cursors are opaque strings returned in the `metadata.nextCursor` field of paginated responses. Always use the exact cursor value returned by the API.
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Maximum number of items to return
+          required: false
+          schema:
+            type: integer
+        - name: search
+          in: query
+          description: Search servers by name (substring match)
+          required: false
+          schema:
+            type: string
+            example: "filesystem"
+        - name: updated_since
+          in: query
+          description: Filter servers updated since timestamp (RFC3339 datetime)
+          required: false
+          schema:
+            type: string
+            format: date-time
+            example: "2025-08-07T13:15:04.280Z"
+        - name: version
+          in: query
+          description: Filter by version ('latest' for latest version, or an exact version like '1.2.3')
+          required: false
+          schema:
+            type: string
+            example: "1.2.3"
+        - name: include_deleted
+          in: query
+          description: Include deleted servers in results (default false, but always true when updated_since is provided)
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: A list of MCP servers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerList'
+  /v0.1/servers/{serverName}/versions:
+    get:
+      tags: [servers]
+      summary: List all versions of an MCP server
+      description: Returns all available versions for a specific MCP server, ordered by publication date (newest first)
+      parameters:
+        - name: serverName
+          in: path
+          required: true
+          description: URL-encoded server name (e.g., "com.example%2Fmy-server")
+          schema:
+            type: string
+            example: "com.example%2Fmy-server"
+        - name: include_deleted
+          in: query
+          description: Include deleted servers in results (default false)
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: A list of all versions for the server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerList'
+        '404':
+          description: Server not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Server not found"
+  /v0.1/servers/{serverName}/versions/{version}:
+    get:
+      tags: [servers]
+      summary: Get specific MCP server version
+      description: Returns detailed information about a specific version of an MCP server. Use the special version `latest` to get the latest version.
+      parameters:
+        - name: serverName
+          in: path
+          required: true
+          description: URL-encoded server name (e.g., "com.example%2Fmy-server")
+          schema:
+            type: string
+            example: "com.example%2Fmy-server"
+        - name: version
+          in: path
+          required: true
+          description: URL-encoded version to retrieve (e.g., "1.0.0" or "1.0.0%2B20130313144700" for versions with build metadata)
+          schema:
+            type: string
+            example: "1.0.0"
+        - name: include_deleted
+          in: query
+          description: Include deleted servers in results (default false)
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Detailed server information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerResponse'
+        '404':
+          description: Server or version not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Server not found"
+    put:
+      tags: [publish]
+      summary: Update specific MCP server version (Optional)
+      description: |
+        Update a specific version of an MCP server in the registry.
+
+        **Note**: This endpoint is optional for registry implementations and is not implemented by the official MCP registry. It is included in the specification to standardize the update mechanism for registry implementations that choose to support it.
+
+        Authentication mechanism is registry-specific and may vary between implementations.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: serverName
+          in: path
+          required: true
+          description: URL-encoded server name (e.g., "com.example%2Fmy-server")
+          schema:
+            type: string
+            example: "com.example%2Fmy-server"
+        - name: version
+          in: path
+          required: true
+          description: URL-encoded version to update (e.g., "1.0.0" or "1.0.0%2B20130313144700" for versions with build metadata)
+          schema:
+            type: string
+            example: "1.0.0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServerDetail'
+      responses:
+        '200':
+          description: Successfully updated server version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerResponse'
+        '401':
+          description: Unauthorized - Invalid or missing authentication token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid or expired Registry JWT token"
+        '403':
+          description: Forbidden - Insufficient permissions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "You do not have permission to update this server"
+        '404':
+          description: Server or version not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Server version not found"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Failed to update server version"
+        '501':
+          description: Not Implemented - Registry does not support updates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Updates are not supported by this registry"
+    delete:
+      tags: [publish]
+      summary: Delete specific MCP server version (Optional)
+      description: |
+        Delete a specific version of an MCP server from the registry.
+
+        **Note**: This endpoint is optional for registry implementations and is not implemented by the official MCP registry. It is included in the specification to standardize the deletion mechanism for registry implementations that choose to support it.
+
+        Authentication mechanism is registry-specific and may vary between implementations.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: serverName
+          in: path
+          required: true
+          description: URL-encoded server name (e.g., "com.example%2Fmy-server")
+          schema:
+            type: string
+            example: "com.example%2Fmy-server"
+        - name: version
+          in: path
+          required: true
+          description: URL-encoded version to delete (e.g., "1.0.0" or "1.0.0%2B20130313144700" for versions with build metadata)
+          schema:
+            type: string
+            example: "1.0.0"
+      responses:
+        '200':
+          description: Successfully deleted server version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerResponse'
+        '401':
+          description: Unauthorized - Invalid or missing authentication token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid or expired Registry JWT token"
+        '403':
+          description: Forbidden - Insufficient permissions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "You do not have permission to delete this server"
+        '404':
+          description: Server or version not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Server version not found"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Failed to delete server version"
+        '501':
+          description: Not Implemented - Registry does not support deletion
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Deletion is not supported by this registry"
+  /v0.1/servers/{serverName}/versions/{version}/status:
+    patch:
+      tags: [publish]
+      summary: Update server version status
+      description: |
+        Update the lifecycle status of a specific server version.
+
+        Requires `publish` or `edit` permission for the server namespace.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: serverName
+          in: path
+          required: true
+          description: URL-encoded server name (e.g., "com.example%2Fmy-server")
+          schema:
+            type: string
+            example: "com.example%2Fmy-server"
+        - name: version
+          in: path
+          required: true
+          description: URL-encoded version to update
+          schema:
+            type: string
+            example: "1.0.0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatusUpdateRequest'
+      responses:
+        '200':
+          description: Successfully updated server status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerResponse'
+        '400':
+          description: Bad request - Invalid status transition or no changes to apply
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "No changes to apply: status is already deprecated"
+        '401':
+          description: Unauthorized - Invalid or missing authentication token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid or expired Registry JWT token"
+        '403':
+          description: Forbidden - Insufficient permissions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "You do not have publish or edit permissions for this server"
+        '404':
+          description: Server version not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Server version not found"
+  /v0.1/servers/{serverName}/status:
+    patch:
+      tags: [publish]
+      summary: Update status for all server versions
+      description: |
+        Update the lifecycle status of all versions of a server in a single transaction.
+        Either all versions are updated or none on failure.
+
+        Requires `publish` or `edit` permission for the server namespace.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: serverName
+          in: path
+          required: true
+          description: URL-encoded server name (e.g., "com.example%2Fmy-server")
+          schema:
+            type: string
+            example: "com.example%2Fmy-server"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StatusUpdateRequest'
+      responses:
+        '200':
+          description: Successfully updated all versions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AllVersionsStatusResponse'
+        '400':
+          description: Bad request - Invalid status value
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid status value"
+        '401':
+          description: Unauthorized - Invalid or missing authentication token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid or expired Registry JWT token"
+        '403':
+          description: Forbidden - Insufficient permissions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "You do not have publish or edit permissions for this server"
+        '404':
+          description: Server not found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Server not found"
+  /v0.1/publish:
+    post:
+      tags: [publish]
+      summary: Publish MCP server (Optional)
+      description: |
+        Publish a new MCP server to the registry or update an existing one.
+
+        **Note**: This endpoint is optional for registry implementations. Read-only registries may not provide this functionality.
+
+        Authentication mechanism is registry-specific and may vary between implementations.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServerDetail'
+            examples:
+              basic_server:
+                summary: Basic server with NPM package
+                value:
+                  name: "io.modelcontextprotocol/filesystem"
+                  description: "Node.js server implementing Model Context Protocol (MCP) for filesystem operations."
+                  title: "Filesystem"
+                  repository:
+                    url: "https://github.com/modelcontextprotocol/servers"
+                    source: "github"
+                  version: "1.0.2"
+                  packages:
+                    - registryType: "npm"
+                      registryBaseUrl: "https://registry.npmjs.org"
+                      identifier: "@modelcontextprotocol/server-filesystem"
+                      version: "1.0.2"
+                  _meta:
+                    io.modelcontextprotocol.registry/publisher-provided:
+                      tool: "publisher-cli"
+                      version: "1.2.3"
+                      buildInfo:
+                        commit: "abc123def456"
+                        timestamp: "2023-12-01T10:30:00Z"
+              example_org_server:
+                summary: Server with example.com organization extensions
+                value:
+                  name: "com.example/demo-server"
+                  description: "Example MCP server demonstrating publisher extensions."
+                  title: "Demo Server"
+                  repository:
+                    url: "https://github.com/example/mcp-demo"
+                    source: "github"
+                  version: "1.0.0"
+                  packages:
+                    - registryType: "npm"
+                      registryBaseUrl: "https://registry.npmjs.org"
+                      identifier: "@example/mcp-demo-server"
+                      version: "1.0.0"
+                  _meta:
+                    io.modelcontextprotocol.registry/publisher-provided:
+                      contactEmail: "maintainer@example.com"
+                      buildMetadata:
+                        commit: "abc123"
+                        timestamp: "2024-01-15T10:30:00Z"
+                    com.example:
+                      marketplaceIcon: "https://example.com/icon.png"
+                      category: ["software_development"]
+                      documentationUrl: "https://docs.example.org"
+                      verifiedPublisher: true
+      responses:
+        '200':
+          description: Successfully published server
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerResponse'
+        '401':
+          description: Unauthorized - Invalid or missing authentication token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Invalid or expired Registry JWT token"
+        '403':
+          description: Forbidden - Insufficient permissions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "You do not have permission to publish this server"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Failed to publish server"
+        '501':
+          description: Not Implemented - Registry does not support publishing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Publishing is not supported by this registry"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Registry-specific authentication token. The authentication mechanism and token format may vary between registry implementations.
+        
+        Some registries may use JWT tokens, others may use API keys or OAuth. Consult your specific registry's authentication documentation.
+  schemas:
+    Repository:
+      type: object
+      description: "Repository metadata for the MCP server source code. Enables users and security experts to inspect the code, improving transparency."
+      required:
+        - url
+        - source
+      properties:
+        url:
+          type: string
+          format: uri
+          description: "Repository URL for browsing source code. Should support both web browsing and git clone operations."
+          example: "https://github.com/modelcontextprotocol/servers"
+        source:
+          type: string
+          description: "Repository hosting service identifier. Used by registries to determine validation and API access methods."
+          example: "github"
+        id:
+          type: string
+          description: "Repository identifier from the hosting service (e.g., GitHub repo ID). Owned and determined by the source forge. Should remain stable across repository renames and may be used to detect repository resurrection attacks - if a repository is deleted and recreated, the ID should change. For GitHub, use: gh api repos/<owner>/<repo> --jq '.id'"
+          example: "b94b5f7e-c7c6-d760-2c78-a5e9b8a5b8c9"
+        subfolder:
+          type: string
+          description: "Optional relative path from repository root to the server location within a monorepo or nested package structure. Must be a clean relative path."
+          example: "src/everything"
+
+    ServerList:
+      type: object
+      required:
+        - servers
+      properties:
+        servers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServerResponse'
+        metadata:
+          type: object
+          properties:
+            nextCursor:
+              type: string
+              description: |
+                Pagination cursor for retrieving the next page of results.
+                Use this exact value in the `cursor` query parameter of your next request. If null or empty, there are no more results.
+            count:
+              type: integer
+              description: Number of items in current page
+              example: 30
+
+    Package:
+      type: object
+      required:
+        - registryType
+        - identifier
+        - transport
+      properties:
+        registryType:
+          type: string
+          description: Registry type indicating how to download packages (e.g., 'npm', 'pypi', 'cargo', 'oci', 'nuget', 'mcpb')
+          examples:
+            - "npm"
+            - "pypi"
+            - "cargo"
+            - "oci"
+            - "nuget"
+            - "mcpb"
+        registryBaseUrl:
+          type: string
+          format: uri
+          description: Base URL of the package registry
+          examples:
+            - "https://registry.npmjs.org"
+            - "https://pypi.org"
+            - "https://crates.io"
+            - "https://docker.io"
+            - "https://api.nuget.org/v3/index.json"
+            - "https://github.com"
+            - "https://gitlab.com"
+        identifier:
+          type: string
+          description: Package identifier - either a package name (for registries) or URL (for direct downloads)
+          examples:
+            - "@modelcontextprotocol/server-brave-search"
+            - "https://github.com/example/releases/download/v1.0.0/package.mcpb"
+        version:
+          type: string
+          description: "Package version. Must be a specific version. Version ranges are rejected (e.g., '^1.2.3', '~1.2.3', '>=1.2.3', '1.x', '1.*')."
+          example: "1.0.2"
+          minLength: 1
+          maxLength: 255
+          not:
+            const: "latest"
+        fileSha256:
+          type: string
+          description: "SHA-256 hash of the package file for integrity verification. Required for MCPB packages and optional for other package types. Authors are responsible for generating correct SHA-256 hashes when creating server.json. If present, MCP clients must validate the downloaded file matches the hash before running packages to ensure file integrity."
+          example: "fe333e598595000ae021bd27117db32ec69af6987f507ba7a63c90638ff633ce"
+          pattern: "^[a-f0-9]{64}$"
+        runtimeHint:
+          type: string
+          description: A hint to help clients determine the appropriate runtime for the package. This field should be provided when `runtimeArguments` are present.
+          examples: [npx, uvx, docker, dnx]
+        transport:
+          $ref: '#/components/schemas/LocalTransport'
+          description: Transport protocol configuration for the package
+        runtimeArguments:
+          type: array
+          description: A list of arguments to be passed to the package's runtime command (such as docker or npx). The `runtimeHint` field should be provided when `runtimeArguments` are present.
+          items:
+            $ref: '#/components/schemas/Argument'
+        packageArguments:
+          type: array
+          description: A list of arguments to be passed to the package's binary.
+          items:
+            $ref: '#/components/schemas/Argument'
+        environmentVariables:
+          type: array
+          description: A mapping of environment variables to be set when running the package.
+          items:
+            $ref: '#/components/schemas/KeyValueInput'
+
+    Input:
+      type: object
+      properties:
+        description:
+          description: A description of the input, which clients can use to provide context to the user.
+          type: string
+        isRequired:
+          type: boolean
+          default: false
+        format:
+          type: string
+          description: "Specifies the input format. Supported values include `filepath`, which should be interpreted as a file on the user's filesystem.\n\nWhen the input is converted to a string, booleans should be represented by the strings \"true\" and \"false\", and numbers should be represented as decimal values."
+          enum: [string, number, boolean, filepath]
+          default: string
+        value:
+          type: string
+          description: |
+            The value for the input. If this is not set, the user may be prompted to provide a value. If a value is set, it should not be configurable by end users.
+
+            Identifiers wrapped in `{curly_braces}` will be replaced with the corresponding properties from the input `variables` map. If an identifier in braces is not found in `variables`, or if `variables` is not provided, the `{curly_braces}` substring should remain unchanged.
+        isSecret:
+          type: boolean
+          description: Indicates whether the input is a secret value (e.g., password, token). If true, clients should handle the value securely.
+          default: false
+        default:
+          type: string
+          description: "The default value for the input.  This should be a valid value for the input.  If you want to provide input examples or guidance, use the `placeholder` field instead."
+        placeholder:
+          type: string
+          description: "A placeholder for the input to be displaying during configuration. This is used to provide examples or guidance about the expected form or content of the input."
+        choices:
+          type: array
+          description: A list of possible values for the input. If provided, the user must select one of these values.
+          items:
+            type: string
+          example: []
+
+    InputWithVariables:
+      allOf:
+        - $ref: '#/components/schemas/Input'
+        - type: object
+          properties:
+            variables:
+              type: object
+              description: A map of variable names to their values. Keys in the input `value` that are wrapped in `{curly_braces}` will be replaced with the corresponding variable values.
+              additionalProperties:
+                $ref: '#/components/schemas/Input'
+
+    PositionalArgument:
+      description: A positional input is a value inserted verbatim into the command line.
+      allOf:
+        - $ref: '#/components/schemas/InputWithVariables'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum: [positional]
+              example: "positional"
+            valueHint:
+              type: string
+              description: "An identifier for the positional argument. It is not part of the command line. It may be used by client configuration as a label identifying the argument. It is also used to identify the value in transport URL variable substitution."
+              example: file_path
+            isRepeated:
+              type: boolean
+              description: Whether the argument can be repeated multiple times in the command line.
+              default: false
+          anyOf:
+            - required:
+                - valueHint
+            - required:
+                - value
+
+    NamedArgument:
+      description: A command-line `--flag={value}`.
+      allOf:
+        - $ref: '#/components/schemas/InputWithVariables'
+        - type: object
+          required:
+            - type
+            - name
+          properties:
+            type:
+              type: string
+              enum: [named]
+              example: "named"
+            name:
+              type: string
+              description: The flag name, including any leading dashes.
+              example: "--port"
+            isRepeated:
+              type: boolean
+              description: Whether the argument can be repeated multiple times.
+              default: false
+
+    KeyValueInput:
+      allOf:
+        - $ref: '#/components/schemas/InputWithVariables'
+        - type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+              description: Name of the header or environment variable.
+              example: SOME_VARIABLE
+
+    Argument:
+      description: "Warning: Arguments construct command-line parameters that may contain user-provided input. This creates potential command injection risks if clients execute commands in a shell environment. For example, a malicious argument value like ';rm -rf ~/Development' could execute dangerous commands. Clients should prefer non-shell execution methods (e.g., posix_spawn) when possible to eliminate injection risks entirely. Where not possible, clients should obtain consent from users or agents to run the resolved command before execution."
+      anyOf:
+        - $ref: '#/components/schemas/PositionalArgument'
+        - $ref: '#/components/schemas/NamedArgument'
+
+    StdioTransport:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          enum: [stdio]
+          description: Transport type
+          example: "stdio"
+
+    StreamableHttpTransport:
+      type: object
+      required:
+        - type
+        - url
+      properties:
+        type:
+          type: string
+          enum: [streamable-http]
+          description: Transport type
+          example: "streamable-http"
+        url:
+          type: string
+          description: "URL template for the streamable-http transport. Must start with http://, https://, or a template variable (e.g., {baseUrl}). Variables in {curly_braces} are resolved based on context: In Package context, they reference argument valueHints, argument names, or environment variable names from the parent Package. In Remote context, they reference variables from the transport's 'variables' object. After variable substitution, this should produce a valid URI."
+          example: "https://api.example.com/mcp"
+          pattern: "^(https?://[^\\s]+|\\{[a-zA-Z_][a-zA-Z0-9_]*\\}[^\\s]*)$"
+        headers:
+          type: array
+          description: HTTP headers to include
+          items:
+            $ref: '#/components/schemas/KeyValueInput'
+
+    SseTransport:
+      type: object
+      required:
+        - type
+        - url
+      properties:
+        type:
+          type: string
+          enum: [sse]
+          description: Transport type
+          example: "sse"
+        url:
+          type: string
+          description: "Server-Sent Events endpoint URL template. Must start with http://, https://, or a template variable (e.g., {baseUrl}). Variables in {curly_braces} are resolved based on context: In Package context, they reference argument valueHints, argument names, or environment variable names from the parent Package. In Remote context, they reference variables from the transport's 'variables' object. After variable substitution, this should produce a valid URI."
+          example: "https://mcp-fs.example.com/sse"
+          pattern: "^(https?://[^\\s]+|\\{[a-zA-Z_][a-zA-Z0-9_]*\\}[^\\s]*)$"
+        headers:
+          type: array
+          description: HTTP headers to include
+          items:
+            $ref: '#/components/schemas/KeyValueInput'
+
+    LocalTransport:
+      anyOf:
+        - $ref: '#/components/schemas/StdioTransport'
+        - $ref: '#/components/schemas/StreamableHttpTransport'
+        - $ref: '#/components/schemas/SseTransport'
+      description: Transport protocol configuration for local/package context
+
+    RemoteTransport:
+      allOf:
+        - anyOf:
+            - $ref: '#/components/schemas/StreamableHttpTransport'
+            - $ref: '#/components/schemas/SseTransport'
+        - type: object
+          properties:
+            variables:
+              type: object
+              description: "Configuration variables that can be referenced in URL template {curly_braces}. The key is the variable name, and the value defines the variable properties."
+              additionalProperties:
+                $ref: '#/components/schemas/Input'
+      description: Transport protocol configuration for remote context - extends StreamableHttpTransport or SseTransport with variables
+
+    Icon:
+      type: object
+      description: An optionally-sized icon that can be displayed in a user interface.
+      required:
+        - src
+      properties:
+        src:
+          type: string
+          format: uri
+          description: "A standard URI pointing to an icon resource. Must be an HTTPS URL. Consumers SHOULD take steps to ensure URLs serving icons are from the same domain as the server or a trusted domain. Consumers SHOULD take appropriate precautions when consuming SVGs as they can contain executable JavaScript."
+          example: "https://example.com/icon.png"
+          maxLength: 255
+        mimeType:
+          type: string
+          description: "Optional MIME type override if the source MIME type is missing or generic. Must be one of: image/png, image/jpeg, image/jpg, image/svg+xml, image/webp."
+          enum: [image/png, image/jpeg, image/jpg, image/svg+xml, image/webp]
+          example: "image/png"
+        sizes:
+          type: array
+          description: "Optional array of strings that specify sizes at which the icon can be used. Each string should be in WxH format (e.g., '48x48', '96x96') or 'any' for scalable formats like SVG. If not provided, the client should assume that the icon can be used at any size."
+          items:
+            type: string
+            pattern: "^(\\d+x\\d+|any)$"
+          examples:
+            - ["48x48", "96x96"]
+            - ["any"]
+        theme:
+          type: string
+          description: "Optional specifier for the theme this icon is designed for. 'light' indicates the icon is designed to be used with a light background, and 'dark' indicates the icon is designed to be used with a dark background. If not provided, the client should assume the icon can be used with any theme."
+          enum: [light, dark]
+
+    ServerDetail:
+      description: Schema for a static representation of an MCP server. Used in various contexts related to discovery, installation, and configuration.
+      type: object
+      required:
+        - name
+        - description
+        - version
+      properties:
+        name:
+          type: string
+          description: "Server name in reverse-DNS format. Must contain exactly one forward slash separating namespace from server name."
+          example: "io.github.user/weather"
+          minLength: 3
+          maxLength: 200
+          pattern: "^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$"
+        description:
+          type: string
+          description: "Clear human-readable explanation of server functionality. Should focus on capabilities, not implementation details."
+          example: "MCP server providing weather data and forecasts via OpenWeatherMap API"
+          minLength: 1
+          maxLength: 100
+        title:
+          type: string
+          description: "Optional human-readable title or display name for the MCP server. MCP subregistries or clients MAY choose to use this for display purposes."
+          example: "Weather API"
+          minLength: 1
+          maxLength: 100
+        repository:
+          $ref: '#/components/schemas/Repository'
+          description: "Optional repository metadata for the MCP server source code. Recommended for transparency and security inspection."
+        version:
+          type: string
+          example: "1.0.2"
+          description: "Version string for this server. SHOULD follow semantic versioning (e.g., '1.0.2', '2.1.0-alpha'). Equivalent of Implementation.version in MCP specification. Non-semantic versions are allowed but may not sort predictably. Version ranges are rejected (e.g., '^1.2.3', '~1.2.3', '>=1.2.3', '1.x', '1.*')."
+          maxLength: 255
+        websiteUrl:
+          type: string
+          format: uri
+          description: "Optional URL to the server's homepage, documentation, or project website. This provides a central link for users to learn more about the server. Particularly useful when the server has custom installation instructions or setup requirements."
+          example: "https://modelcontextprotocol.io/examples"
+        icons:
+          type: array
+          description: "Optional set of sized icons that the client can display in a user interface. Clients that support rendering icons MUST support at least the following MIME types: image/png and image/jpeg (safe, universal compatibility). Clients SHOULD also support: image/svg+xml (scalable but requires security precautions) and image/webp (modern, efficient format)."
+          items:
+            $ref: '#/components/schemas/Icon'
+        $schema:
+          type: string
+          format: uri
+          description: JSON Schema URI for this server.json format
+          example: "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
+        packages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Package'
+        remotes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RemoteTransport'
+        _meta:
+          type: object
+          description: "Extension metadata using reverse DNS namespacing for vendor-specific data"
+          properties:
+            io.modelcontextprotocol.registry/publisher-provided:
+              type: object
+              description: "Publisher-provided metadata for downstream registries"
+              additionalProperties: true
+              example:
+                tool: "publisher-cli"
+                version: "1.2.3"
+                buildInfo:
+                  commit: "abc123def456"
+                  timestamp: "2023-12-01T10:30:00Z"
+                  pipelineId: "build-789"
+
+    ServerResponse:
+      description: API response format with separated server data and registry metadata
+      type: object
+      required:
+        - server
+      properties:
+        server:
+          $ref: '#/components/schemas/ServerDetail'
+        _meta:
+          type: object
+          description: Registry-managed metadata
+          properties:
+            io.modelcontextprotocol.registry/official:
+              type: object
+              description: Official MCP registry metadata
+              properties:
+                status:
+                  type: string
+                  enum: ["active", "deprecated", "deleted"]
+                  description: Server lifecycle status
+                  example: "active"
+                statusMessage:
+                  type: string
+                  description: Optional message explaining the status (e.g., deprecation reason)
+                  example: "Please upgrade to version 2.0.0"
+                  maxLength: 500
+                statusChangedAt:
+                  type: string
+                  format: date-time
+                  description: Timestamp when the server status was last updated
+                  example: "2023-12-01T10:30:00Z"
+                publishedAt:
+                  type: string
+                  format: date-time
+                  description: Timestamp when the server was first published to the registry
+                  example: "2023-12-01T10:30:00Z"
+                updatedAt:
+                  type: string
+                  format: date-time
+                  description: Timestamp when the server entry was last updated
+                  example: "2023-12-01T11:00:00Z"
+                isLatest:
+                  type: boolean
+                  description: Whether this is the latest version of the server
+                  example: true
+              additionalProperties: false
+          additionalProperties: true
+
+    StatusUpdateRequest:
+      description: Request body for updating server status
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: ["active", "deprecated", "deleted"]
+          description: New server lifecycle status
+          example: "deprecated"
+        statusMessage:
+          type: string
+          description: Optional message explaining the status change (e.g., deprecation reason)
+          example: "Please upgrade to version 2.0.0"
+          maxLength: 500
+
+    AllVersionsStatusResponse:
+      description: Response from bulk status update for all versions
+      type: object
+      required:
+        - updatedCount
+        - servers
+      properties:
+        updatedCount:
+          type: integer
+          description: Number of versions updated
+          example: 3
+        servers:
+          type: array
+          description: List of all updated server versions
+          items:
+            $ref: '#/components/schemas/ServerResponse'

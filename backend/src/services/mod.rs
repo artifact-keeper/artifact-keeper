@@ -63,6 +63,8 @@ pub mod ldap_service;
 pub mod ldap_sync_service;
 pub mod manifest_blob_refs_backfill;
 pub mod maven_flat_attribution;
+pub mod mcp_namespace_proofs;
+pub mod mcp_namespaces;
 pub mod mcp_packages;
 pub mod mcp_settings;
 pub mod metadata_checker;

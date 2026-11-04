@@ -1401,6 +1401,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
             artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
 
+    // #5253: optional host-level MCP registry (`/v0.1/...`, `/v0/...`).
+    let app = artifact_keeper_backend::api::handlers::mcp_edges::mount_default_repo(
+        app,
+        artifact_keeper_backend::api::handlers::mcp_edges::default_repo_from_env(
+            std::env::var("MCP_DEFAULT_REPO").ok().as_deref(),
+        ),
+    );
+
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so
     // that long-lived workers (email dispatcher, webhook producer)

@@ -70,7 +70,8 @@ pub fn router() -> Router<SharedState> {
             )
             .route(&p("/ping"), get(ping))
             .route(&p("/health"), get(health))
-            .route(&p("/version"), get(version));
+            .route(&p("/version"), get(version))
+            .merge(super::mcp_edges::read_routes(v));
         write = write
             .route(&p("/publish"), post(publish_server))
             .route(
@@ -229,7 +230,7 @@ pub fn problem(status: u16, code: &str, detail: &str, extra: serde_json::Value) 
     refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default())
 }
 
-fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
+pub(crate) fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     with_refusal_headers((status, body).into_response())
 }
@@ -239,20 +240,20 @@ pub fn not_found() -> Response {
     refusal_bytes(404, fmt::NOT_FOUND_BODY.as_bytes().to_vec())
 }
 
-fn mcp_error(e: McpError) -> Response {
+pub(crate) fn mcp_error(e: McpError) -> Response {
     if let McpError::Internal(cause) | McpError::Misconfigured(cause) = &e {
         tracing::error!(error = %cause, code = e.code(), "MCP registry request failed");
     }
     problem(e.status(), e.code(), &e.detail(), serde_json::json!({}))
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
+pub(crate) fn internal(e: impl std::fmt::Display) -> Response {
     mcp_error(McpError::Internal(e.to_string()))
 }
 
 /// Re-render a plain refusal from a shared gate (auth, hosted-only,
 /// promotion-only) as problem+json, keeping its status and challenge.
-fn reproblem(resp: Response) -> Response {
+pub(crate) fn reproblem(resp: Response) -> Response {
     let status = resp.status();
     let (code, detail) = match status.as_u16() {
         401 => ("mcp_unauthorized", "Authentication required"),
@@ -284,7 +285,7 @@ fn reproblem(resp: Response) -> Response {
     out
 }
 
-fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
+pub(crate) fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
@@ -300,7 +301,7 @@ fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
 /// The MCP repository named by the path. Any miss (unknown key, another
 /// format) is the unknown-name 404, so the surface does not tell an MCP
 /// repository from any other key.
-async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> {
+pub(crate) async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> {
     match proxy_helpers::resolve_repo_by_key(db, key, &["mcp"], "an MCP registry").await {
         Ok(repo) => Ok(repo),
         Err(resp) if resp.status().is_server_error() => Err(reproblem(resp)),
@@ -332,7 +333,11 @@ pub fn server_name(ns: &str, name: Option<&str>) -> String {
 }
 
 /// Whether `caller` may read why a version is held.
-async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> GateAudience {
+pub(crate) async fn audience(
+    db: &PgPool,
+    auth: Option<&AuthExtension>,
+    repo_id: Uuid,
+) -> GateAudience {
     let Some(ext) = auth else {
         return GateAudience::ReaderOnly;
     };
@@ -344,17 +349,17 @@ async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> G
 
 /// One stored server version row.
 #[derive(Debug, Clone)]
-struct VersionRow {
-    artifact_id: Uuid,
-    name: String,
-    version: String,
-    checksum: String,
-    quarantine_status: Option<String>,
-    quarantine_until: Option<DateTime<Utc>>,
-    stored: StoredVersion,
+pub(crate) struct VersionRow {
+    pub(crate) artifact_id: Uuid,
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) checksum: String,
+    pub(crate) quarantine_status: Option<String>,
+    pub(crate) quarantine_until: Option<DateTime<Utc>>,
+    pub(crate) stored: StoredVersion,
 }
 
-type RawRow = (
+pub(crate) type RawRow = (
     Uuid,
     String,
     String,
@@ -364,7 +369,7 @@ type RawRow = (
     serde_json::Value,
 );
 
-fn rows_from_raw(raw: Vec<RawRow>) -> Vec<VersionRow> {
+pub(crate) fn rows_from_raw(raw: Vec<RawRow>) -> Vec<VersionRow> {
     raw.into_iter()
         .filter_map(|(artifact_id, name, version, checksum, qs, qu, meta)| {
             let stored = StoredVersion::from_metadata(&meta);
@@ -384,11 +389,12 @@ fn rows_from_raw(raw: Vec<RawRow>) -> Vec<VersionRow> {
         .collect()
 }
 
-const ROW_COLUMNS: &str = "a.id, a.name, a.version, a.checksum_sha256, a.quarantine_status, \
+pub(crate) const ROW_COLUMNS: &str =
+    "a.id, a.name, a.version, a.checksum_sha256, a.quarantine_status, \
      a.quarantine_until, m.metadata";
 
 /// Every live version of `name` in `repo_id`, text-ordered by version.
-async fn versions_of<'e>(
+pub(crate) async fn versions_of<'e>(
     db: impl sqlx::PgExecutor<'e>,
     repo_id: Uuid,
     name: &str,
@@ -420,7 +426,7 @@ async fn own_hold(db: &PgPool, artifact_id: Uuid) -> Result<Option<HoldKind>, ()
     }
 }
 
-fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String {
+pub(crate) fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String {
     format!(
         "{}/mcp/{}/v0.1/servers/{}/versions/{}",
         base.trim_end_matches('/'),
@@ -432,7 +438,7 @@ fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String
 
 /// Decide one row for `audience`, evaluating the version's own hold and every
 /// backing gate.
-async fn decide_row(
+pub(crate) async fn decide_row(
     ctx: GateCtx<'_>,
     row: &VersionRow,
     policy_now: PackagePolicy,
@@ -468,7 +474,7 @@ async fn decide_row(
 /// stored flag: the stored flag ignores holds, so a held newer version would
 /// otherwise leave no entry marked latest while `/versions/latest` answers
 /// with this one.
-fn served_entry(
+pub(crate) fn served_entry(
     row: &VersionRow,
     repo: &RepoInfo,
     base: &str,
@@ -496,7 +502,7 @@ fn served_entry(
 
 /// The repository's package policy now (a read failure is fail-closed: the
 /// versions are gated as `own-repos`).
-async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy {
+pub(crate) async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy {
     mcp_packages::load_settings(db, repo_id)
         .await
         .map(|s| s.policy)
@@ -533,7 +539,7 @@ fn refusal_audit_due(artifact_id: Uuid, caller: &str) -> bool {
     }
 }
 
-fn audit_refusal(
+pub(crate) fn audit_refusal(
     db: &PgPool,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
@@ -657,13 +663,13 @@ pub fn parse_list_query(q: &HashMap<String, String>) -> Result<ListQuery, McpErr
 /// One keyset batch of listing candidates, with what the scan read: rows
 /// whose metadata cannot be parsed are dropped from `rows`, so paging decides
 /// on `raw_len` and resumes after `last`.
-struct ListingBatch {
-    rows: Vec<VersionRow>,
-    raw_len: usize,
-    last: Option<(String, String)>,
+pub(crate) struct ListingBatch {
+    pub(crate) rows: Vec<VersionRow>,
+    pub(crate) raw_len: usize,
+    pub(crate) last: Option<(String, String)>,
 }
 
-async fn fetch_listing_batch(
+pub(crate) async fn fetch_listing_batch(
     db: &PgPool,
     repo_id: Uuid,
     q: &ListQuery,
@@ -709,7 +715,7 @@ async fn fetch_listing_batch(
 
 /// The rows of `rows` the reader-only gate admits, in order. A gate that
 /// cannot be evaluated omits the whole batch (fail closed).
-async fn servable(
+pub(crate) async fn servable(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
@@ -748,7 +754,7 @@ const LATEST_WALK_CHUNK: usize = 10;
 /// excluded) among `rows` (all of its versions), and how many rows the
 /// reader-only gate evaluated to find it. Rows in `known` are already known
 /// servable (they passed the gate in this request) and are not re-evaluated.
-async fn newest_servable(
+pub(crate) async fn newest_servable(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
@@ -819,11 +825,22 @@ async fn served_entries(
 
 async fn list_servers(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     base: RequestBaseUrl,
 ) -> HandlerResult {
     let repo = resolve_mcp_repo(&state.db, &repo_key).await?;
+    if repo.repo_type == "virtual" {
+        return super::mcp_virtual::list_servers(
+            &state,
+            auth.as_ref(),
+            &repo,
+            &query,
+            base.as_str(),
+        )
+        .await;
+    }
     reject_if_not_hosted_read(&repo)?;
     let q = parse_list_query(&query).map_err(mcp_error)?;
     let policy_now = current_policy(&state.db, repo.id).await;
@@ -839,7 +856,7 @@ async fn list_servers(
 /// Upper bound on the rows one listing request reads and gates, so a
 /// repository whose rows are almost all held cannot turn one request into a
 /// full scan. A scan the bound stops still answers a resume cursor.
-const MAX_LISTING_ROWS: usize = 1000;
+pub(crate) const MAX_LISTING_ROWS: usize = 1000;
 
 async fn list_versions_page(
     ctx: GateCtx<'_>,
@@ -882,7 +899,7 @@ async fn list_versions_page(
 }
 
 /// Server names of a listing, in order, after `name_after`.
-async fn fetch_server_names(
+pub(crate) async fn fetch_server_names(
     db: &PgPool,
     repo_id: Uuid,
     search: Option<&str>,
@@ -908,7 +925,7 @@ async fn fetch_server_names(
 
 /// Gate evaluations one `version=latest` listing spends before it answers
 /// with a resume cursor (each server costs at least one).
-const MAX_LATEST_BUDGET: usize = 1000;
+pub(crate) const MAX_LATEST_BUDGET: usize = 1000;
 
 /// `version=latest`: one entry per server, its newest servable version.
 /// The newest is picked from all of a server's versions first; only then do
@@ -978,7 +995,7 @@ async fn list_latest(
 // GET /servers/{name}/versions[/{version}]
 // ---------------------------------------------------------------------------
 
-fn include_deleted_param(q: &HashMap<String, String>) -> Result<bool, Response> {
+pub(crate) fn include_deleted_param(q: &HashMap<String, String>) -> Result<bool, Response> {
     match q.get("include_deleted") {
         Some(v) => parse_bool("include_deleted", v).map_err(mcp_error),
         None => Ok(false),
@@ -987,12 +1004,14 @@ fn include_deleted_param(q: &HashMap<String, String>) -> Result<bool, Response> 
 
 async fn list_versions_encoded(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, ns)): Path<(String, String)>,
     Query(q): Query<HashMap<String, String>>,
     base: RequestBaseUrl,
 ) -> HandlerResult {
     list_versions_impl(
         &state,
+        auth.as_ref(),
         &repo_key,
         &server_name(&ns, None),
         &q,
@@ -1003,24 +1022,54 @@ async fn list_versions_encoded(
 
 async fn list_versions_split(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, ns, name)): Path<(String, String, String)>,
     Query(q): Query<HashMap<String, String>>,
     base: RequestBaseUrl,
 ) -> HandlerResult {
     let name = server_name(&ns, Some(&name));
-    list_versions_impl(&state, &repo_key, &name, &q, base.as_str()).await
+    list_versions_impl(&state, auth.as_ref(), &repo_key, &name, &q, base.as_str()).await
 }
 
 async fn list_versions_impl(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo_key: &str,
     name: &str,
     q: &HashMap<String, String>,
     base: &str,
 ) -> HandlerResult {
     let repo = resolve_mcp_repo(&state.db, repo_key).await?;
-    reject_if_not_hosted_read(&repo)?;
     let include_deleted = include_deleted_param(q)?;
+    if repo.repo_type == "virtual" {
+        return super::mcp_virtual::list_versions(state, auth, &repo, name, include_deleted, base)
+            .await;
+    }
+    reject_if_not_hosted_read(&repo)?;
+    let served = servable_versions(state, &repo, name, include_deleted).await?;
+    if served.is_empty() {
+        return Err(not_found());
+    }
+    // Every servable version is in hand: the newest of them is the latest.
+    let latest = latest_candidates(served.clone())
+        .first()
+        .map(|r| r.artifact_id);
+    let entries = served
+        .iter()
+        .map(|r| served_entry(r, &repo, base, Some(r.artifact_id) == latest))
+        .collect();
+    Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, None)))
+}
+
+/// Every servable version of `name` in `repo` (the reader-only listing
+/// gate), in version-text order: the per-repository core of
+/// `GET /servers/{name}/versions`, shared with the Virtual read path.
+pub(crate) async fn servable_versions(
+    state: &SharedState,
+    repo: &RepoInfo,
+    name: &str,
+    include_deleted: bool,
+) -> Result<Vec<VersionRow>, Response> {
     let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(state, false);
     let mut rows: Vec<VersionRow> = versions_of(&state.db, repo.id, name)
@@ -1040,19 +1089,7 @@ async fn list_versions_impl(
         rows.truncate(MAX_LISTING_ROWS);
         rows.sort_by(|a, b| a.version.cmp(&b.version));
     }
-    let served = servable(ctx, repo.id, rows, policy_now).await;
-    if served.is_empty() {
-        return Err(not_found());
-    }
-    // Every servable version is in hand: the newest of them is the latest.
-    let latest = latest_candidates(served.clone())
-        .first()
-        .map(|r| r.artifact_id);
-    let entries = served
-        .iter()
-        .map(|r| served_entry(r, &repo, base, Some(r.artifact_id) == latest))
-        .collect();
-    Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, None)))
+    Ok(servable(ctx, repo.id, rows, policy_now).await)
 }
 
 async fn get_version_encoded(
@@ -1096,7 +1133,7 @@ async fn get_version_split(
 }
 
 /// Candidates for `latest`, newest first: every non-deleted version.
-fn latest_candidates(mut rows: Vec<VersionRow>) -> Vec<VersionRow> {
+pub(crate) fn latest_candidates(mut rows: Vec<VersionRow>) -> Vec<VersionRow> {
     rows.retain(|r| r.stored.registry.status != ServerStatus::Deleted);
     rows.sort_by(|a, b| {
         fmt::latest_order(
@@ -1117,11 +1154,91 @@ async fn get_version_impl(
     base: &str,
 ) -> HandlerResult {
     let repo = resolve_mcp_repo(&state.db, repo_key).await?;
-    reject_if_not_hosted_read(&repo)?;
     let include_deleted = include_deleted_param(q)?;
-    let rows = versions_of(&state.db, repo.id, name).await?;
+    if repo.repo_type == "virtual" {
+        return super::mcp_virtual::get_version(
+            state,
+            auth,
+            &repo,
+            name,
+            version,
+            include_deleted,
+            base,
+        )
+        .await;
+    }
+    reject_if_not_hosted_read(&repo)?;
     let is_latest = version == "latest";
-    let candidates: Vec<VersionRow> = if is_latest {
+    let audience = audience(&state.db, auth, repo.id).await;
+    match walk_candidates(
+        state,
+        auth,
+        &repo,
+        name,
+        version,
+        include_deleted,
+        audience,
+        base,
+    )
+    .await?
+    {
+        CandidateWalk::Served { row, all } => {
+            // `latest` answers the newest servable version by construction;
+            // an exact version is latest when no newer version is servable
+            // (the reader-only listing gate).
+            let latest = is_latest || is_newest_servable(state, &repo, &row, all).await;
+            Ok(json_ok(
+                StatusCode::OK,
+                &served_entry(&row, &repo, base, latest),
+            ))
+        }
+        CandidateWalk::Refused(resp) => {
+            // `latest` with nothing servable is the plain unknown-name answer
+            // for a reader; a repository holder learns why the newest
+            // version is held.
+            if is_latest && audience == GateAudience::ReaderOnly {
+                return Err(not_found());
+            }
+            Err(resp)
+        }
+        CandidateWalk::NotFound => Err(not_found()),
+    }
+}
+
+/// What one repository answers for an exact or `latest` read of `name`.
+pub(crate) enum CandidateWalk {
+    /// A candidate passed every gate; `all` is every version of the server
+    /// (for the `isLatest` computation).
+    Served {
+        row: VersionRow,
+        all: Vec<VersionRow>,
+    },
+    /// Every candidate is held: the first refusal for `audience` (or the
+    /// fail-closed 503 of an unevaluable gate), already audited.
+    Refused(Response),
+    /// No version of that name (or no candidate for `latest`).
+    NotFound,
+}
+
+/// The per-repository detail decision: evaluate the candidates of
+/// `name`@`version` (`latest`: every non-deleted version, newest first) in
+/// `repo` with [`decide_row`] until one is servable. An unevaluable gate on a
+/// newer candidate fails closed (503), never falling back past a version that
+/// may be servable. Shared by the hosted, Remote and Virtual read paths, so a
+/// hold expressed in [`decide_row`] applies to every repository type.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn walk_candidates(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    name: &str,
+    version: &str,
+    include_deleted: bool,
+    audience: GateAudience,
+    base: &str,
+) -> Result<CandidateWalk, Response> {
+    let rows = versions_of(&state.db, repo.id, name).await?;
+    let candidates: Vec<VersionRow> = if version == "latest" {
         latest_candidates(rows.clone())
     } else {
         rows.iter()
@@ -1130,9 +1247,8 @@ async fn get_version_impl(
             .collect()
     };
     if candidates.is_empty() {
-        return Err(not_found());
+        return Ok(CandidateWalk::NotFound);
     }
-    let audience = audience(&state.db, auth, repo.id).await;
     let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(state, true);
     let mut first_refusal: Option<(Response, &VersionRow, &'static str)> = None;
@@ -1140,19 +1256,10 @@ async fn get_version_impl(
         let instance = instance_url(base, &repo.key, &row.name, &row.version);
         match decide_row(ctx, row, policy_now, include_deleted, audience, instance).await {
             ServeDecision::Serve => {
-                // `latest` answers the newest servable version by
-                // construction; an exact version is latest when no newer
-                // version is servable (the reader-only listing gate).
-                let latest = is_latest || {
-                    let known = std::iter::once(row.artifact_id).collect();
-                    let listing = GateCtx::of(state, false);
-                    newest_servable(listing, repo.id, rows.clone(), &known, policy_now)
-                        .await
-                        .0
-                        .is_some_and(|l| l.artifact_id == row.artifact_id)
-                };
-                let entry = served_entry(row, &repo, base, latest);
-                return Ok(json_ok(StatusCode::OK, &entry));
+                return Ok(CandidateWalk::Served {
+                    row: row.clone(),
+                    all: rows,
+                })
             }
             ServeDecision::Refuse {
                 status,
@@ -1160,11 +1267,9 @@ async fn get_version_impl(
                 hold_class,
             } => {
                 let resp = refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default());
-                // An unevaluable gate on a newer candidate fails closed: do not
-                // fall back past a version that may be servable.
                 if status == 503 {
-                    audit_refusal(&state.db, auth, &repo, row, hold_class, audience);
-                    return Err(resp);
+                    audit_refusal(&state.db, auth, repo, row, hold_class, audience);
+                    return Ok(CandidateWalk::Refused(resp));
                 }
                 if first_refusal.is_none() {
                     first_refusal = Some((resp, row, hold_class));
@@ -1174,14 +1279,26 @@ async fn get_version_impl(
     }
     let (resp, row, hold_class) = first_refusal.expect("candidates is non-empty");
     if hold_class != "deleted" {
-        audit_refusal(&state.db, auth, &repo, row, hold_class, audience);
+        audit_refusal(&state.db, auth, repo, row, hold_class, audience);
     }
-    // `latest` with nothing servable is the plain unknown-name answer for a
-    // reader; a repository holder learns why the newest version is held.
-    if is_latest && audience == GateAudience::ReaderOnly {
-        return Err(not_found());
-    }
-    Err(resp)
+    Ok(CandidateWalk::Refused(resp))
+}
+
+/// Whether `row` is the newest servable version among `all` (every version
+/// of its server in `repo`), by the reader-only listing gate.
+pub(crate) async fn is_newest_servable(
+    state: &SharedState,
+    repo: &RepoInfo,
+    row: &VersionRow,
+    all: Vec<VersionRow>,
+) -> bool {
+    let policy_now = current_policy(&state.db, repo.id).await;
+    let known = std::iter::once(row.artifact_id).collect();
+    let listing = GateCtx::of(state, false);
+    newest_servable(listing, repo.id, all, &known, policy_now)
+        .await
+        .0
+        .is_some_and(|l| l.artifact_id == row.artifact_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1310,9 @@ async fn get_version_impl(
 /// route of this surface does.
 async fn utility_repo(state: &SharedState, repo_key: &str) -> Result<(), Response> {
     let repo = resolve_mcp_repo(&state.db, repo_key).await?;
+    if repo.repo_type == "virtual" {
+        return Ok(());
+    }
     reject_if_not_hosted_read(&repo)
 }
 
@@ -1244,6 +1364,7 @@ async fn writable_repo(
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let ext = require_auth_basic_scope(auth, "mcp", "write:artifacts").map_err(reproblem)?;
     let repo = resolve_mcp_repo(&state.db, repo_key).await?;
+    super::mcp_virtual::reject_write_if_virtual(&repo)?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type).map_err(reproblem)?;
     Ok((ext, repo))
 }
@@ -1528,6 +1649,15 @@ async fn publish_server(
         .await
         .map_err(mcp_error)?;
     let server = admit_document(&body, &settings).map_err(mcp_error)?;
+    super::mcp_edges::require_namespace_write(
+        &state,
+        &ext,
+        repo.id,
+        &server.name,
+        "write",
+        &headers,
+    )
+    .await?;
     let pins = mcp_packages::resolve_packages(&state, &settings, &server, base.as_str())
         .await
         .map_err(mcp_error)?;
@@ -1719,6 +1849,7 @@ async fn update_version_status_encoded(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, ns, version)): Path<(String, String, String)>,
+    headers: HeaderMap,
     base: RequestBaseUrl,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> HandlerResult {
@@ -1730,7 +1861,7 @@ async fn update_version_status_encoded(
         &repo_key,
         &name,
         Some(&version),
-        &body,
+        (&body, &headers),
         base.as_str(),
     )
     .await
@@ -1740,6 +1871,7 @@ async fn update_version_status_split(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, ns, name, version)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     base: RequestBaseUrl,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> HandlerResult {
@@ -1751,7 +1883,7 @@ async fn update_version_status_split(
         &repo_key,
         &name,
         Some(&version),
-        &body,
+        (&body, &headers),
         base.as_str(),
     )
     .await
@@ -1761,24 +1893,44 @@ async fn update_server_status_encoded(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, ns)): Path<(String, String)>,
+    headers: HeaderMap,
     base: RequestBaseUrl,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> HandlerResult {
     let body = body.map_err(|r| body_rejection(r.status()))?;
     let name = server_name(&ns, None);
-    update_status_impl(&state, auth, &repo_key, &name, None, &body, base.as_str()).await
+    update_status_impl(
+        &state,
+        auth,
+        &repo_key,
+        &name,
+        None,
+        (&body, &headers),
+        base.as_str(),
+    )
+    .await
 }
 
 async fn update_server_status_split(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, ns, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
     base: RequestBaseUrl,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> HandlerResult {
     let body = body.map_err(|r| body_rejection(r.status()))?;
     let name = server_name(&ns, Some(&name));
-    update_status_impl(&state, auth, &repo_key, &name, None, &body, base.as_str()).await
+    update_status_impl(
+        &state,
+        auth,
+        &repo_key,
+        &name,
+        None,
+        (&body, &headers),
+        base.as_str(),
+    )
+    .await
 }
 
 /// One version (`version = Some`) or every version of a server. A
@@ -1790,12 +1942,13 @@ async fn update_status_impl(
     repo_key: &str,
     name: &str,
     version: Option<&str>,
-    body: &[u8],
+    (body, headers): (&[u8], &HeaderMap),
     base: &str,
 ) -> HandlerResult {
-    let (_ext, repo) = writable_repo(state, auth, repo_key).await?;
+    let (ext, repo) = writable_repo(state, auth, repo_key).await?;
     // A status change is a write, gated like a publish.
     repo.reject_if_promotion_only(false).map_err(reproblem)?;
+    super::mcp_edges::require_namespace_write(state, &ext, repo.id, name, "write", headers).await?;
     let (next, message) = parse_status_update(body).map_err(mcp_error)?;
     // One transaction under the per-server lock: every version changes or
     // none does, and `isLatest` is recomputed from the state just written.
@@ -2060,6 +2213,11 @@ mod tests {
                 "services/mcp_packages.rs",
                 include_str!("../../services/mcp_packages.rs"),
             ),
+            (
+                "api/handlers/mcp_virtual.rs",
+                include_str!("mcp_virtual.rs"),
+            ),
+            ("api/handlers/mcp_edges.rs", include_str!("mcp_edges.rs")),
         ] {
             let production = src.split("#[cfg(test)]").next().unwrap_or(src);
             for needle in [

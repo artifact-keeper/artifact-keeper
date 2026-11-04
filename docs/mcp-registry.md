@@ -36,6 +36,23 @@ URL-encoded (`com.acme%2Fweather`) or with a literal slash
 | `PATCH /v0.1/servers/{serverName}/versions/{version}/status` | write | `{"status": "active" \| "deprecated" \| "deleted", "statusMessage": "..."}` |
 | `PATCH /v0.1/servers/{serverName}/status` | write | The same for every version; answers `{updatedCount, servers}`. |
 | `GET /v0.1/ping`, `/health`, `/version` | read | `{"status":"ok"}`, a database-checked health answer, `{"version": "<AK version>"}`. |
+| `GET /v0.1/openapi.yaml` | read | The upstream registry API specification (`info.version: 2025-12-01`), vendored verbatim; `Content-Type: application/yaml`. See [OpenAPI document](#openapi-document). |
+| `GET /v0.1/x/com.artifactkeeper/holds` | repository holder | Held versions with their hold class and reason, for CI tooling. See [Holds listing](#holds-listing). |
+| `POST /v0/auth/github-oidc` (also `/v0.1`) | none (the OIDC token is the credential) | `mcp-publisher login github-oidc`. See [GitHub Actions login](#github-actions-login-mcp-publisher-login-github-oidc). |
+| `ANY /v0/auth/*` (other) | none | `501 mcp_auth_not_supported`: use an Artifact Keeper token. |
+
+Administration (instance administrators, under `/api/v1/admin`):
+
+| Method and path | What it does |
+| --- | --- |
+| `GET /api/v1/admin/mcp/namespace-proofs` | `{"items": [Proof]}`, at most 1000, by namespace. |
+| `POST /api/v1/admin/mcp/namespace-proofs` | `{"namespace": "com.acme", "method": "dns" \| "http"}` -> `Proof` (`status: pending`). `400` for another method or a namespace that is not reverse-DNS. |
+| `GET /api/v1/admin/mcp/namespace-proofs/{id}` | `Proof`, `404` unknown. |
+| `POST /api/v1/admin/mcp/namespace-proofs/{id}/verify` | Run the check now; `Proof` with `status` `verified` or `failed` (`last_error` says why). |
+| `DELETE /api/v1/admin/mcp/namespace-proofs/{id}` | `200`, `404` unknown. |
+
+Namespace grants are ordinary permission rules (`/api/v1/permissions`) with
+`conditions.mcp_namespaces`; see [Namespace grants](#namespace-grants).
 
 The list envelope is upstream's:
 `{"servers": [{"server": {...}, "_meta": {...}}], "metadata": {"nextCursor": "...", "count": N}}`.
@@ -110,7 +127,115 @@ repository may restrict names further with a namespace allowlist
 
 Upstream's ownership proofs (DNS, GitHub OIDC, `mcpName` in `package.json`)
 are not applied: in a private registry the repository's permissions decide who
-may publish.
+may publish (optionally per namespace, see [Namespace grants](#namespace-grants)).
+
+### GitHub Actions login (`mcp-publisher login github-oidc`)
+
+`POST /mcp/<repo>/v0/auth/github-oidc` (and `/v0.1/...`) is upstream's
+exchange, bridged to Artifact Keeper's CI OIDC exchange
+(`/api/v1/auth/ci/token`, same providers, identity mappings and service
+accounts):
+
+- Request: `Content-Type: application/json`, body `{"oidc_token": "<GitHub Actions ID token>"}`
+  (at most 16 KiB), no `Authorization` header. The route is outside the
+  repository visibility check, so it works for a private repository; the
+  repository segment does not change what is minted.
+- `200`: `{"registry_token": "<Artifact Keeper access token>", "expires_at": <unix seconds>}`
+  (upstream's `auth.TokenResponse`). The token is the CI identity mapping's
+  service-account token (provider `token_ttl_secs`, default 900 s; no
+  refresh).
+- `401 mcp_unauthorized` (problem+json) when the token is not accepted: no
+  enabled provider for its issuer, a bad signature, audience or expiry, or no
+  mapping matches. `400 mcp_bad_request` for another body; `503` when the
+  instance sheds load.
+- Every other `/auth/*` route (`none`, `github-at`, `dns`, `http`, ...)
+  answers `501 mcp_auth_not_supported`.
+
+Set it up once: an administrator creates a CI OIDC provider for
+`https://token.actions.githubusercontent.com` whose `audience` is the
+registry URL's scheme and host, lowercased, without a path
+(`https://ak.example.com`; that is the audience `mcp-publisher` requests),
+and an identity mapping (claim filters such as `repository_owner`), then
+grants the mapping's service account `write` on the repository, typically as
+a namespace grant. In the workflow (`permissions: id-token: write`):
+
+```bash
+mcp-publisher login github-oidc --registry https://ak.example.com/mcp/mcp-local
+mcp-publisher publish
+```
+
+### Namespace grants
+
+A permission rule (`POST /api/v1/permissions`) may carry
+`conditions.mcp_namespaces`, a list of 1 to 64 server-name patterns:
+
+```json
+{"principal_type": "service_account", "principal_id": "<id>",
+ "target_type": "repository", "target_id": "<mcp repo id>",
+ "actions": ["read", "write"],
+ "conditions": {"mcp_namespaces": ["io.github.{repository_owner}/*", "com.acme"]}}
+```
+
+- On an MCP write (publish, status change; edit and delete use the same
+  gate) the rule applies only when the server name matches a pattern. `*`
+  matches any run of characters including `/`, matching is ASCII
+  case-insensitive, and a pattern without `/` means the namespace's servers
+  (`com.acme` = `com.acme/*`, not `com.acmecorp/*`). Patterns contain letters,
+  digits, `.`, `_`, `-`, `*`, at most one `/`, and `{claim}` placeholders
+  (lowercase claim names); anything else is `400` at write time.
+- `{claim}` is replaced by that claim of the CI OIDC assertion the calling
+  token was exchanged for (through `/auth/github-oidc` or
+  `/api/v1/auth/ci/token`; the bounded string claims are kept with the token
+  until it expires). A value is used only when it is a plain label
+  (`[A-Za-z0-9._-]`, at most 256 characters), so a claim can never widen a
+  pattern; a missing claim, an unusable value, or a credential that did not
+  come from a CI exchange makes the pattern match nothing.
+- Without `mcp_require_namespace_grant`, a matching namespace rule is an
+  applicable rule like any other, and a non-matching one does not apply to
+  that write (the decision falls to the caller's other rules, then to its
+  role assignments, exactly as for an IP-conditioned rule).
+- With `mcp_require_namespace_grant: true` on the repository, repository
+  `write` is not enough: only an instance administrator or a matching
+  namespace rule granting the action (`write`, or `admin`) may write.
+- A refused write answers `403 mcp_namespace_not_granted`
+  (`"this credential holds no grant for namespace 'com.other' in this repository"`).
+- Creating, changing or deleting a rule audits `MCP_NAMESPACE_GRANTED` for
+  each pattern added and `MCP_NAMESPACE_REVOKED` for each pattern removed.
+- The condition is ignored by every check other than MCP writes. The generic
+  artifact delete route (`DELETE /api/v1/repositories/{key}/artifacts/...`)
+  is not namespace-aware in this release.
+
+### Namespace proofs
+
+An administrator may record proof that the owner of a domain controls a
+reverse-DNS namespace (`com.acme` is `acme.com`, `io.github.acme` is
+`acme.github.io`). A proof is evidence shown and audited; it grants nothing
+(namespace grants do).
+
+`Proof`:
+
+```json
+{"id": "<uuid>", "namespace": "com.acme", "domain": "acme.com", "method": "dns",
+ "status": "pending", "last_error": null, "created_by": "<uuid>",
+ "created_at": "...", "last_checked_at": null, "verified_at": null,
+ "challenge": {"type": "TXT", "name": "_ak-mcp-challenge.acme.com",
+               "value": "ak-mcp-verification=<64 hex>"}}
+```
+
+For `method: "http"` the challenge is
+`{"url": "https://acme.com/.well-known/ak-mcp-challenge", "content": "ak-mcp-verification=<64 hex>"}`:
+the file must contain that value on a line of its own.
+
+`POST .../{id}/verify` is the only time Artifact Keeper contacts the domain:
+the DNS check asks a DNS-over-HTTPS resolver (JSON API,
+`MCP_NAMESPACE_PROOF_DOH_URL`, default `https://cloudflare-dns.com/dns-query`)
+for the TXT record; the HTTP check fetches the well-known URL. Both go through
+the outbound URL policy and the SSRF-guarding DNS resolver (no private,
+loopback, link-local or metadata addresses), follow no redirects, read at most
+64 KiB and time out after 10 seconds. The outcome is stored (`verified` with
+`verified_at`, or `failed` with `last_error`; re-verifying a verified proof
+that no longer checks out marks it failed) and audited as
+`MCP_NAMESPACE_PROOF_VERIFIED` or `MCP_NAMESPACE_PROOF_FAILED`.
 
 ## Clients
 
@@ -125,6 +250,15 @@ may publish.
 
 The read routes answer CORS with `Access-Control-Allow-Origin: *`, methods
 `GET, OPTIONS` and headers `Authorization, Content-Type`, without credentials.
+
+**Host-level registry (`MCP_DEFAULT_REPO`).** Off by default. Set
+`MCP_DEFAULT_REPO=<repo_key>` and `https://<ak>/v0.1/...` and
+`https://<ak>/v0/...` (and nothing else) are served exactly as
+`https://<ak>/mcp/<repo_key>/v0.1/...`, so a client can be given the bare
+host. The rewrite happens before routing (authentication and visibility see
+the repository path); no other Artifact Keeper route starts with `/v0`. A value
+that is not a plain repository key is ignored with a warning. Served
+coordinates and `instance` URLs keep the `/mcp/<repo_key>` form.
 
 Behind a reverse proxy, forward `Host`/`X-Forwarded-Host` and
 `X-Forwarded-Proto` (or set `AK_EXTERNAL_URL`): the served package
@@ -360,4 +494,97 @@ change the locked setting (`403`).
 
 ## Virtual repositories
 
-(Filled in by the Virtual workstream.)
+A Virtual `mcp` repository merges MCP members (Local, Staging, Remote; nested
+Virtuals are flattened in priority order) on the same `/mcp/<key>/v0.1`
+routes. It resolves nothing and contacts nothing itself: every version it
+serves is a member's stored version, decided by that member's own gates
+(holds, backing packages, curation and deny lists of the member) with the same
+functions the member's own routes use. What a member would not serve, the
+Virtual does not serve.
+
+Serving order: hosted members (Local, Staging) by priority, then Remote
+members by priority. Only members the caller may read take part, except in
+the shadowing rule below.
+
+- **Detail** (`/servers/{name}/versions/{version}`, including `latest`): the
+  first member in serving order that serves that name and version answers;
+  a member that holds it is skipped. `latest` is the first member's newest
+  servable version (first match, not the newest across members).
+- **Hosted shadows remote.** When any hosted member holds a version of a name
+  (any version, any status, even one this caller cannot read), the name is
+  never served from a Remote member, so an upstream server cannot take over
+  an internal name (dependency confusion).
+- **`/servers/{name}/versions`**: the union of the serving members' servable
+  versions, each version once (from the first member that serves it), in
+  version-text order; `isLatest` marks the version `latest` answers.
+- **`/servers`**: each `(name, version)` once, from the member a detail read
+  would answer it from; member by member in serving order, each member's rows
+  in name-then-version order. `version=latest` lists one entry per name, the
+  one `latest` answers. `search`, `updated_since`, `include_deleted` and
+  `limit` behave as on a hosted repository.
+- **Cursor**: `nextCursor` is
+  `base64url("m:<member_key>:<member_cursor>")` (no padding), where
+  `<member_cursor>` is that member's own `base64url("<name>:<version>")`
+  cursor, or empty to start at the member's first row. A cursor naming a key
+  that is not (or no longer) a member, or anything else malformed, is `400`
+  (`mcp_invalid_server_json`, `detail: "cursor: invalid cursor"`).
+- **Entries** are the member's served form; the
+  `com.artifactkeeper.registry/source` block names the member (`repository`)
+  and adds `virtualRepository: "<virtual key>"`.
+- **Holds**: a reader gets the unknown-name `404` (byte-identical) for
+  anything not served. A caller who holds the member that refused (the
+  reason-gate predicate, evaluated per member) gets that member's reason
+  body; a gate that cannot be evaluated on a member answers `503` and the
+  walk does not fall past it.
+- **`mcp_server_deny` on the Virtual** hides matching names on top of the
+  members' own deny lists: omitted from listings, `404` on detail
+  (`mcp_rejected` with `gate: curation` for a holder of the Virtual).
+- **Writes** (`/publish`, status `PATCH`) answer
+  `405 mcp_read_only` ("publish to one of its hosted members").
+- `/ping`, `/health`, `/version` and `/openapi.yaml` answer as on any MCP
+  repository; the holds listing answers `404` on a Virtual (ask its members).
+
+### Holds listing
+
+`GET /mcp/<repo>/v0.1/x/com.artifactkeeper/holds` (and `/v0/...`) lists the
+versions a client would not be handed, for CI tooling ("why is my server not
+in the gallery?"). Query: `cursor`, `limit`, `search` with the `/servers`
+rules (deleted versions are not holds and are not listed).
+
+- Only a **repository holder** (the reason-gate predicate above) gets the
+  list. Every other caller, including an anonymous reader of a public
+  repository, gets the unknown-name `404`: an empty list would read as
+  "nothing is held". A Virtual answers `404`.
+- `200`, `Cache-Control: no-store`:
+
+```json
+{"holds": [
+   {"status": 404, "error": "mcp_backing_artifact_blocked",
+    "detail": "A package this server version runs is held pending review",
+    "name": "com.acme/db", "version": "2.0.0", "hold": "backing",
+    "package": "npm:@acme/db-tool@2.0.0", "gate": "quarantine",
+    "instance": "https://ak.example.com/mcp/mcp-local/v0.1/servers/com.acme%2Fdb/versions/2.0.0"}
+ ],
+ "metadata": {"count": 1, "nextCursor": "..."}}
+```
+
+  Each entry is the reason-gated refusal body of an exact read (without the
+  RFC 9457 `type`/`title`), with `status` the HTTP status that read answers
+  (`404`, or `503` with `error: mcp_gate_unavailable` when a gate cannot be
+  evaluated). Members by hold: `hold` (`quarantine`, `scan_policy`,
+  `backing`, `age_gate`, `unresolvable`, `resolving`, `curation`,
+  `content_drift`), `gate`, `package`, `review_id`, `min_age_days`,
+  `requested_age_days`, as in [What a client sees](#what-a-client-sees).
+- At most 1000 rows are gated per request; a scan stopped by that bound
+  answers a `nextCursor`.
+
+### OpenAPI document
+
+`GET /mcp/<repo>/v0.1/openapi.yaml` serves upstream's
+`docs/reference/api/openapi.yaml` (`modelcontextprotocol/registry` at
+`a75c727d`, MIT) verbatim, as `application/yaml`, readable like the
+repository. It describes `/v0.1/servers`, `/versions`, `/versions/{version}`,
+the status routes and `/publish`, which is what Artifact Keeper implements;
+Artifact Keeper's additions (problem+json `error` members, the holds
+listing, `/auth/github-oidc`, `/x/com.artifactkeeper/*`) are documented here,
+not in that file.

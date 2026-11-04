@@ -254,6 +254,10 @@ pub fn create_router(state: SharedState) -> Router {
             "/v2",
             handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
         )
+        // #5253: the MCP registry's credential exchange (`/mcp/{repo}/v0/auth/*`);
+        // the OIDC assertion in the body is the credential, so it sits outside
+        // the repository visibility middleware.
+        .merge(handlers::mcp_edges::public_router())
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
 
@@ -1406,6 +1410,11 @@ fn api_v1_routes(
             .nest("/monitoring", handlers::monitoring::router())
             .nest("/sso", handlers::sso_admin::router())
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
+            // #5253: MCP namespace proofs (admin-initiated DNS/HTTP checks).
+            .nest(
+                "/mcp/namespace-proofs",
+                handlers::mcp_namespace_proofs::router(),
+            )
             .nest("/smtp", handlers::smtp::router())
             // Maintenance banner CRUD (#2155); the public read is `/banners`.
             .nest("/banners", handlers::banners::admin_router())
