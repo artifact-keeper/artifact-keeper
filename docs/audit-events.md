@@ -266,6 +266,31 @@ To answer "who asked for this blocked package", filter the audit log on
 The row's `user_id` is the user who started the seed. The per-path inventory
 stays on the job (`GET .../cache/seed/{job_id}`), not in the audit row.
 
+### Upstream contact
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `UPSTREAM_FETCHED` | `repository` (the Remote the request was made for) | The proxy sends a request to an upstream (#5286): a cache-miss fetch, a revalidation, an OCI bearer-token exchange or its retry. One row per request actually sent; a cache hit sends nothing and writes nothing, and a single-flight fill writes one row however many clients wait on it. Off by default; see below. Outcome `failure` for `not_found`, `error` and `timeout`, else `success`. | `repository`, `repository_id`, `caller` (`proxy`, `revalidate`, `oci_token`), `method`, `host`, `port`, `path` (the URL path only: never userinfo, query string or fragment), `redirected_to_host` (the host the request ended on when a redirect left the requested one, else `null`), `conditional` (sent with `If-None-Match` / `If-Modified-Since`), `status` (`null` when no response arrived), `result` (`ok`, `not_modified`, `not_found`, `auth_challenge`, `error`, `timeout`), `error_type` (the transport error class: `timeout`, `connect`, `redirect`, `body`, `request`, `_OTHER`), `bytes` (the body length the upstream announced in `Content-Length`; `0` for a `HEAD` or `304`, `null` for a chunked body), `duration_ms` (to response headers), `principal` (the username of the client request that caused it, `null` when anonymous or outside a request). |
+
+`AUDIT_UPSTREAM_FETCHES` selects what is written: `off` (the default, no rows
+and no bookkeeping), `errors` (only `not_found`, `error` and `timeout`) or
+`all` (every request; what an air-gapped deployment sets, so the seed
+window's upstream traffic can be listed and the absence of any after the cut
+shown from the audit log). `auth_challenge` is the `401` an OCI registry
+answers an anonymous first request with; the token exchange and retry that
+follow are rows of their own.
+
+The row is written off the request path by a bounded background task, so it
+adds no latency and a failed insert never fails the request (it is logged at
+`WARN`). When the writer pool is saturated the insert runs inline instead of
+being dropped. The row's `user_id`, `ip_address` and correlation id are those
+of the client request that caused the upstream request, when there was one.
+
+Not yet recorded: upstream requests made outside the proxy service (the
+`test-upstream` probe, curation sync, the popularity source, the npm change
+feed and the npm `/-/` and audit passthroughs, the Go sumdb proxy, the AWS
+token exchange).
+
 ## Compatibility policy
 
 Within `schema_version: 1`:

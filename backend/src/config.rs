@@ -581,6 +581,32 @@ impl DeviceAuthConfig {
     }
 }
 
+/// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
+/// Env `AUDIT_UPSTREAM_FETCHES`: `off` (the default), `errors` (failed
+/// requests only: `not_found`, `error`, `timeout`) or `all` (every request,
+/// what an air-gapped deployment sets to inventory its seed window). An
+/// unrecognised value falls back to `off`, like the other knobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamFetchAuditMode {
+    #[default]
+    Off,
+    Errors,
+    All,
+}
+
+impl std::str::FromStr for UpstreamFetchAuditMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, ()> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "errors" => Ok(Self::Errors),
+            "all" => Ok(Self::All),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -1482,6 +1508,12 @@ pub struct Config {
     /// 3600.
     pub proxy_stale_if_error_grace_secs: i64,
 
+    // -- upstream contact audit (#5286) --
+    /// Which upstream requests the proxy records as `UPSTREAM_FETCHED` audit
+    /// rows. Env `AUDIT_UPSTREAM_FETCHES`, default `off`; see
+    /// [`UpstreamFetchAuditMode`].
+    pub audit_upstream_fetches: UpstreamFetchAuditMode,
+
     // -- OCI virtual-resolution negative cache (#1424) --
     /// Freshness window in milliseconds for negative OCI virtual-resolution
     /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000,
@@ -1747,6 +1779,7 @@ redacted_debug!(Config {
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
     show proxy_stale_if_error_grace_secs,
+    show audit_upstream_fetches,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
     show npm_virtual_negative_cache_ttl_ms,
@@ -1914,6 +1947,7 @@ impl Default for Config {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             proxy_stale_if_error_grace_secs:
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: UpstreamFetchAuditMode::Off,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
@@ -2392,6 +2426,10 @@ impl Config {
             .clamp(
                 0,
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS,
+            ),
+            audit_upstream_fetches: env_parse(
+                "AUDIT_UPSTREAM_FETCHES",
+                UpstreamFetchAuditMode::Off,
             ),
             // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
             // above) so a fat-fingered enormous value can't pin a 404 on a

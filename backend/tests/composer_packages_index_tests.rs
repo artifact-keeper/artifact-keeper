@@ -181,6 +181,7 @@ fn test_config(storage_path: &str) -> Config {
         proxy_singleflight_lock_wait_timeout_secs: 65,
         proxy_stale_if_error_grace_secs:
             artifact_keeper_backend::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+        audit_upstream_fetches: Default::default(),
         oci_virtual_negative_cache_ttl_ms:
             artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         npm_virtual_negative_cache_ttl_ms:
