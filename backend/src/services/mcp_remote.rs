@@ -544,6 +544,10 @@ pub struct RunCtx<'a> {
     /// package of an ingested version is then unresolved.
     pub packages: Result<McpSettings, String>,
     pub protected: Vec<String>,
+    /// Whether this run pages from a watermark (`updated_since`): its pages
+    /// carry only recently updated versions, so a name newly ingestible on
+    /// one of them is ingested from its per-server version list.
+    pub incremental: bool,
 }
 
 impl<'a> RunCtx<'a> {
@@ -576,6 +580,7 @@ impl<'a> RunCtx<'a> {
             policy,
             packages,
             protected,
+            incremental: false,
         })
     }
 
@@ -1241,14 +1246,91 @@ pub async fn ingest_entry(
     }
 }
 
-/// Fetch and ingest every upstream version of `name`.
+/// Fetch and ingest every upstream version of `name`. The per-server
+/// version list holds only servable versions, so each version the catalog
+/// summary records (the listing pages carry deleted ones) that the list
+/// lacks and that is not stored yet is read on its own with
+/// `include_deleted=true`: a version already deleted upstream is then stored
+/// with status `deleted`, as in `mirror` mode.
 pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, String> {
-    let page = parse_page(&run.fetch(&versions_path(name)).await?)?;
+    // A name whose every version is deleted upstream has no list (`404`):
+    // its summarised versions are still read one by one.
+    let (page, list_err) = match run.fetch(&versions_path(name)).await {
+        Ok(bytes) => (parse_page(&bytes)?, None),
+        Err(e) => (UpstreamPage::default(), Some(e)),
+    };
     let mut summary = SyncSummary::default();
+    let mut read_alone = 0usize;
+    let mut listed: Vec<&str> = Vec::new();
     for entry in page.entries.iter().filter(|e| e.name == name) {
+        listed.push(entry.version.as_str());
         summary.count(ingest_entry(run, entry).await?);
     }
-    Ok(summary)
+    for version in unlisted_versions(&run.state.db, run.repo.id, name, &listed).await? {
+        let path = fmt::storage_path(name, &version);
+        if existing_version(&run.state.db, run.repo.id, &path)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        let fetched = run
+            .fetch(&format!(
+                "{}?include_deleted=true",
+                version_path(name, &version)
+            ))
+            .await;
+        let entry = fetched.ok().and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|doc| parse_entry(&doc))
+                .filter(|e| e.name == name && e.version == version)
+        });
+        match entry {
+            Some(e) => {
+                read_alone += 1;
+                summary.count(ingest_entry(run, &e).await?);
+            }
+            None => {
+                tracing::debug!(server = %name, version = %version, "MCP sync: summarised version not readable upstream");
+            }
+        }
+    }
+    match list_err {
+        Some(e) if read_alone == 0 => Err(e),
+        _ => Ok(summary),
+    }
+}
+
+/// The versions of `name` its catalog summary records that are not in
+/// `listed`.
+async fn unlisted_versions(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+    listed: &[&str],
+) -> Result<Vec<String>, String> {
+    let versions: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT metadata->'versions' FROM curation_packages \
+         WHERE staging_repo_id = $1 AND format = 'mcp' AND package_name = $2 AND version = '*'",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(db_err)?
+    .flatten();
+    Ok(versions
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|v| !listed.contains(v))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Fetch and ingest one upstream version.
@@ -1296,8 +1378,12 @@ async fn apply_page(
             &entries,
         );
         let denied = run.denied(name);
+        // Whether the name just became ingestible (new, or promoted by a
+        // glob) on a page that may not carry all of its versions.
+        let mut fresh = false;
         let row = match name_row {
             None => {
+                fresh = run.incremental;
                 let lookalike = lookalike_of(name, &run.protected);
                 let (status, reason) =
                     initial_status(lookalike.as_deref(), !denied && auto_approved(&auto, name));
@@ -1355,6 +1441,7 @@ async fn apply_page(
                 )
                 .await?;
                 if promote {
+                    fresh = true;
                     summary.auto_approved += 1;
                     audit(
                         &run.state.db,
@@ -1390,14 +1477,18 @@ async fn apply_page(
                 summary.count(ingest_entry(run, entry).await?);
             }
         }
-        if whole && row.metadata.get("needsIngest").is_some() {
+        if whole && (fresh || row.metadata.get("needsIngest").is_some()) {
             // The page carried only the recently updated versions.
             match ingest_name(run, name).await {
                 Ok(s) => {
                     absorb(summary, &s);
                     clear_needs_ingest(&run.state.db, row.id).await?;
                 }
-                Err(e) => summary.errors.push(e),
+                Err(e) => {
+                    // An approved name retries through `backfill`.
+                    mark_needs_ingest(&run.state.db, row.id).await?;
+                    summary.errors.push(e);
+                }
             }
         }
     }
@@ -1429,6 +1520,79 @@ async fn flag_pending_lookalike(
     .map_err(db_err)?
     .rows_affected();
     Ok(moved > 0)
+}
+
+/// Set `metadata.needsIngest` on a row: the next sync's [`backfill`] ingests
+/// it (an approved row).
+async fn mark_needs_ingest(db: &PgPool, id: Uuid) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE curation_packages SET metadata = metadata || '{\"needsIngest\": true}' \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Approve the stored `pending` names that a `mcp_auto_approve_namespaces`
+/// glob matches and that are not denied, whether or not this run's pages
+/// carried them: an incremental page carries only names updated upstream
+/// since the watermark, so a glob added after a name was first seen would
+/// otherwise never apply. Names in `review` (lookalikes) stay there. Each
+/// promoted row is marked `needsIngest`, so [`backfill`] ingests its
+/// versions in the same run.
+async fn promote_matching(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), String> {
+    let globs = run
+        .settings
+        .mcp_auto_approve_namespaces
+        .clone()
+        .unwrap_or_default();
+    if globs.is_empty() {
+        return Ok(());
+    }
+    let pending: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, package_name FROM curation_packages \
+         WHERE staging_repo_id = $1 AND format = 'mcp' AND version = '*' \
+           AND status = 'pending' ORDER BY package_name",
+    )
+    .bind(run.repo.id)
+    .fetch_all(&run.state.db)
+    .await
+    .map_err(db_err)?;
+    let ids: Vec<Uuid> = pending
+        .iter()
+        .filter(|(_, name)| !run.denied(name) && auto_approved(&globs, name))
+        .map(|(id, _)| *id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let promoted: Vec<(Uuid, String)> = sqlx::query_as(
+        "UPDATE curation_packages SET status = 'approved', \
+                evaluation_reason = 'auto-approved namespace', \
+                evaluated_by = NULL, evaluated_at = now(), \
+                metadata = metadata || '{\"needsIngest\": true}' \
+         WHERE id = ANY($1) AND status = 'pending' RETURNING id, package_name",
+    )
+    .bind(&ids)
+    .fetch_all(&run.state.db)
+    .await
+    .map_err(db_err)?;
+    for (id, name) in promoted {
+        summary.auto_approved += 1;
+        audit(
+            &run.state.db,
+            AuditAction::McpServerApproved,
+            run.repo,
+            Some(&name),
+            None,
+            None,
+            serde_json::json!({"review_id": id, "reason": "auto_approve_namespace"}),
+        );
+    }
+    Ok(())
 }
 
 fn absorb(into: &mut SyncSummary, from: &SyncSummary) {
@@ -1648,6 +1812,7 @@ async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
     } else {
         st.updated_since
     };
+    run.incremental = since.is_some();
     let mut cursor = st.resume_cursor.clone();
     let mut summary = SyncSummary::default();
     let mut max_seen: Option<DateTime<Utc>> = None;
@@ -1693,6 +1858,9 @@ async fn run_locked(run: &mut RunCtx<'_>) -> Result<SyncSummary, SyncError> {
         }
     }
     summary.complete = stopped_at.is_none() && summary.errors.is_empty();
+    if let Err(e) = promote_matching(run, &mut summary).await {
+        summary.errors.push(e);
+    }
     for step in [
         backfill(run, &mut summary).await,
         re_resolve(run, &mut summary).await,

@@ -4347,7 +4347,7 @@ pub async fn list_repositories(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
     )
 )]
 pub async fn create_repository(
@@ -5509,7 +5509,7 @@ pub async fn get_repository_storage_tree(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
     )
 )]
 pub async fn update_repository(
@@ -7324,7 +7324,12 @@ pub async fn list_artifacts(
     // the listing is reconstructed from there. Without this, packages pulled
     // through a remote repo fill up storage but never appear in the UI, so they
     // can't be browsed or scanned (#1548, web #424).
-    if repo.repo_type == RepositoryType::Remote {
+    //
+    // An MCP Remote is the exception: its sync ingests every server version
+    // it serves as a real `artifacts` row (`servers/<name>/<version>/server.json`),
+    // and its proxy cache holds only upstream listing pages, which are not
+    // artifacts of the repository. It takes the flat listing below (#5253).
+    if repo.repo_type == RepositoryType::Remote && repo.format != RepositoryFormat::Mcp {
         return list_remote_cached_artifacts(
             &state,
             &repo,

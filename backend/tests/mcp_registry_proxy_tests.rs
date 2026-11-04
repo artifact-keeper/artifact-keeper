@@ -25,7 +25,7 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path, query_param, query_param_is_missing};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use artifact_keeper_backend::api::handlers::{mcp, mcp_remote};
+use artifact_keeper_backend::api::handlers::{mcp, mcp_remote, repositories};
 use artifact_keeper_backend::api::middleware::auth::AuthExtension;
 use artifact_keeper_backend::api::{AppState, SharedState};
 use artifact_keeper_backend::config::Config;
@@ -155,6 +155,10 @@ impl Harness {
         Router::new()
             .nest("/mcp", mcp::router())
             .nest("/api/v1/repositories", mcp_remote::repo_router())
+            .route(
+                "/api/v1/repositories/:key/artifacts",
+                axum::routing::get(repositories::list_artifacts),
+            )
             .with_state(self.state.clone())
             .layer(Extension::<Option<AuthExtension>>(auth))
     }
@@ -290,6 +294,104 @@ impl Harness {
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Harness {
+    /// The `path`s of `GET /api/v1/repositories/{key}/artifacts`, sorted.
+    async fn artifact_paths(&self) -> Vec<String> {
+        let uri = format!("/api/v1/repositories/{}/artifacts?per_page=100", self.key);
+        let (s, b) = self.call(Some(self.admin.clone()), "GET", &uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let mut paths: Vec<String> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["path"].as_str().unwrap().to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// The `(version, upstreamStatus)` of every ingested version of `name`.
+    async fn ingested(&self, name: &str) -> Vec<(String, String)> {
+        self.item(name).await["ingested"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                (
+                    v["version"].as_str().unwrap().to_string(),
+                    v["upstreamStatus"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// An upstream entry with status `deleted` (not the latest).
+fn deleted_entry(server: serde_json::Value, updated: &str) -> serde_json::Value {
+    let mut e = entry(server, updated);
+    e["_meta"]["io.modelcontextprotocol.registry/official"]["status"] = "deleted".into();
+    e["_meta"]["io.modelcontextprotocol.registry/official"]["isLatest"] = false.into();
+    e
+}
+
+/// Mount an upstream like the official registry: the first pass's listing
+/// (no watermark) carries `entries`, every incremental pass
+/// (`updated_since`) gets an empty page because nothing changed, each
+/// per-server version list holds only the servable (non-deleted) versions,
+/// and a deleted version is readable alone only with `include_deleted=true`.
+async fn mount_quiet_upstream(upstream: &MockServer, entries: &[serde_json::Value]) {
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param_is_missing("updated_since"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(entries.to_vec(), None)))
+        .with_priority(1)
+        .mount(upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(Vec::new(), None)))
+        .mount(upstream)
+        .await;
+    let mut by_name: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    for e in entries {
+        by_name
+            .entry(e["server"]["name"].as_str().unwrap().to_string())
+            .or_default()
+            .push(e.clone());
+    }
+    for (name, list) in by_name {
+        let enc = urlencoding::encode(&name).into_owned();
+        let live: Vec<serde_json::Value> = list
+            .iter()
+            .filter(|e| {
+                e["_meta"]["io.modelcontextprotocol.registry/official"]["status"] != "deleted"
+            })
+            .cloned()
+            .collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/v0.1/servers/{enc}/versions")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(live, None)))
+            .mount(upstream)
+            .await;
+        for e in list {
+            let version = e["server"]["version"].as_str().unwrap();
+            let deleted =
+                e["_meta"]["io.modelcontextprotocol.registry/official"]["status"] == "deleted";
+            let mut m = Mock::given(method("GET")).and(path(format!(
+                "/v0.1/servers/{enc}/versions/{}",
+                urlencoding::encode(version)
+            )));
+            if deleted {
+                m = m.and(query_param("include_deleted", "true"));
+            }
+            m.respond_with(ResponseTemplate::new(200).set_body_json(e.clone()))
+                .mount(upstream)
+                .await;
+        }
     }
 }
 
@@ -672,6 +774,14 @@ async fn mirror_sync_pages_with_cursor_and_updated_since() {
     );
     // Mirror mode ingests every name; serving is still curated.
     assert!(h.listed_names().await.is_empty());
+    // Every stored document is an artifact of the Remote, served or not.
+    assert_eq!(
+        h.artifact_paths().await,
+        [
+            "servers/com.acme/a/1.0.0/server.json",
+            "servers/com.acme/b/2.0.0/server.json"
+        ]
+    );
     let (s, state) = h.admin_json("GET", "/sync", None).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(state["updatedSince"], "2026-10-02T00:00:00Z");
@@ -1035,5 +1145,121 @@ async fn floating_oci_tags_are_pinned_and_warned_or_hidden() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
     assert_eq!(v["error"], "mcp_unresolvable");
+    h.teardown().await;
+}
+
+/// A glob added to `mcp_auto_approve_namespaces` after a name was first seen
+/// approves it on the next sync, although that incremental pass carries no
+/// entry of the name (nothing changed upstream); its versions are then
+/// ingested, served, and listed as artifacts of the Remote. A name the glob
+/// does not match stays pending.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn auto_approve_glob_added_later_approves_on_a_quiet_sync() {
+    let h = Harness::new(false).await;
+    mount_quiet_upstream(
+        &h.upstream,
+        &[
+            entry(server("io.github.other/echo", "1.0.0", "Echo"), T1),
+            entry(server("io.github.other/echo", "1.1.0", "Echo"), T2),
+            entry(server("io.github.acme/weather", "1.0.0", "Weather"), T1),
+        ],
+    )
+    .await;
+    let first = h.sync().await;
+    assert_eq!(
+        (first["namesNew"].as_u64(), first["autoApproved"].as_u64()),
+        (Some(2), Some(0)),
+        "{first}"
+    );
+    assert_eq!(h.item("io.github.other/echo").await["status"], "pending");
+    assert!(h.listed_names().await.is_empty());
+    assert!(h.artifact_paths().await.is_empty());
+
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.other/*"]"#)
+        .await;
+    let second = h.sync().await;
+    assert_eq!(second["entries"], 0, "a quiet incremental pass: {second}");
+    assert_eq!(second["autoApproved"], 1, "{second}");
+    assert_eq!(second["ingested"], 2, "{second}");
+    let item = h.item("io.github.other/echo").await;
+    assert_eq!(item["status"], "approved");
+    assert_eq!(item["evaluationReason"], "auto-approved namespace");
+    assert_eq!(h.item("io.github.acme/weather").await["status"], "pending");
+    assert_eq!(
+        h.listed_names().await,
+        ["io.github.other/echo@1.0.0", "io.github.other/echo@1.1.0"]
+    );
+    // The ingested documents are the Remote's artifacts (not the cached
+    // upstream listing pages).
+    assert_eq!(
+        h.artifact_paths().await,
+        [
+            "servers/io.github.other/echo/1.0.0/server.json",
+            "servers/io.github.other/echo/1.1.0/server.json"
+        ]
+    );
+    // Idempotent: nothing more to approve or ingest.
+    let third = h.sync().await;
+    assert_eq!(
+        (third["autoApproved"].as_u64(), third["ingested"].as_u64()),
+        (Some(0), Some(0)),
+        "{third}"
+    );
+    h.teardown().await;
+}
+
+/// In `allowlist` mode an approval ingests the versions already deleted
+/// upstream too (the per-server version list omits them; each is read alone
+/// with `include_deleted=true`), stored as `deleted` and served only to
+/// `include_deleted` reads, and listed as artifacts of the Remote.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn allowlist_approval_stores_versions_deleted_upstream() {
+    let h = Harness::new(false).await;
+    mount_quiet_upstream(
+        &h.upstream,
+        &[
+            deleted_entry(server("io.github.acme/w", "0.9.0", "Old"), T1),
+            entry(server("io.github.acme/w", "1.0.0", "Current"), T2),
+        ],
+    )
+    .await;
+    h.sync().await;
+    let id = h.item("io.github.acme/w").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (s, b) = h
+        .admin_json("POST", &format!("/catalog/{id}/approve"), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(b["ingestError"].is_null(), "{b}");
+    assert_eq!(
+        h.ingested("io.github.acme/w").await,
+        [
+            ("0.9.0".to_string(), "deleted".to_string()),
+            ("1.0.0".to_string(), "active".to_string())
+        ]
+    );
+    assert_eq!(h.listed_names().await, ["io.github.acme/w@1.0.0"]);
+    let (s, _) = h
+        .read(None, "/servers/io.github.acme%2Fw/versions/0.9.0")
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = h
+        .read(
+            None,
+            "/servers/io.github.acme%2Fw/versions/0.9.0?include_deleted=true",
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        h.artifact_paths().await,
+        [
+            "servers/io.github.acme/w/0.9.0/server.json",
+            "servers/io.github.acme/w/1.0.0/server.json"
+        ]
+    );
     h.teardown().await;
 }
