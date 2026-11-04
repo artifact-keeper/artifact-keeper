@@ -119,7 +119,12 @@ pub fn router() -> Router<SharedState> {
 /// such a refusal as `application/problem+json` with `Cache-Control:
 /// no-store` (keeping its `WWW-Authenticate` and `Retry-After`), and gives a
 /// read refusal the read routes' `Access-Control-Allow-Origin: *` so a
-/// browser client can read it. Every other path passes through untouched.
+/// browser client can read it. A read answer never carries
+/// `Access-Control-Allow-Credentials`: the instance CORS layer (development
+/// mode, `allow_credentials`) adds it to every response it handles, and a
+/// read route is any-origin without credentials, so the header is dropped
+/// and an origin the instance layer echoed becomes `*` again. Every other
+/// path passes through untouched.
 pub async fn mcp_surface_guard(
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -136,6 +141,16 @@ pub async fn mcp_surface_guard(
         out.headers_mut().entry(header::RETRY_AFTER).or_insert(v);
     }
     let status = out.status();
+    if read {
+        let h = out.headers_mut();
+        h.remove(header::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+        if h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            );
+        }
+    }
     if read
         && (status.is_client_error() || status.is_server_error())
         && !out
@@ -4724,5 +4739,50 @@ mod tests {
         assert_refusal_headers(&h);
         assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         env.teardown().await;
+    }
+
+    /// D3: behind an instance CORS layer with credentials (the development
+    /// configuration in `main.rs`), a read answer is still any-origin
+    /// without credentials; other paths keep the instance policy.
+    #[tokio::test]
+    async fn read_routes_never_allow_credentials() {
+        let instance = CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::predicate(|_, _| true))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::AUTHORIZATION])
+            .allow_credentials(true);
+        let read = Router::new()
+            .route("/mcp/r/v0.1/servers", get(|| async { "ok" }))
+            .route(
+                "/mcp/r/v0.1/servers/x/versions",
+                get(|| async { not_found() }),
+            )
+            .layer(read_cors());
+        let app = read
+            .route("/api/v1/x", get(|| async { "ok" }))
+            .layer(instance)
+            .layer(axum::middleware::from_fn(mcp_surface_guard));
+        let send = |uri: &str| {
+            tdh::send_with_headers(
+                app.clone(),
+                Request::builder()
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://vscode.dev")
+                    .header(header::AUTHORIZATION, "Bearer x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        for uri in ["/mcp/r/v0.1/servers", "/mcp/r/v0.1/servers/x/versions"] {
+            let (_, _, h) = send(uri).await;
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*", "{uri}");
+            assert!(
+                h.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).is_none(),
+                "{uri}: {h:?}"
+            );
+        }
+        let (_, _, h) = send("/api/v1/x").await;
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://vscode.dev");
+        assert_eq!(h[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
     }
 }
