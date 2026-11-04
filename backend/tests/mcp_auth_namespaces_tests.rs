@@ -107,7 +107,8 @@ async fn github_oidc_login_then_namespace_conditioned_publish() {
                 "principal_type": "user", "principal_id": account,
                 "target_type": "repository", "target_id": repo_id,
                 "actions": ["read", "write"],
-                "conditions": {"mcp_namespaces": ["io.github.{repository_owner}/*"]},
+                "conditions": {"mcp_namespaces": ["io.github.{repository_owner}/*"],
+                               "mcp_namespace_issuer": issuer.issuer()},
             })),
         )
         .await;

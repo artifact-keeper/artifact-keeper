@@ -14,6 +14,12 @@
 //! never widen the pattern); a missing or unusable claim, or a credential
 //! that was not minted by a CI exchange, makes that pattern match nothing.
 //!
+//! Claims are bound to their issuer: a rule whose patterns interpolate
+//! claims must name `conditions.mcp_namespace_issuer`, and its claims are
+//! taken only from a session whose verified assertion came from that issuer
+//! (`iss`), so another CI provider's `repository_owner` cannot satisfy a
+//! pattern written for GitHub's.
+//!
 //! With the repository setting `mcp_require_namespace_grant` the plain
 //! repository `write` is no longer enough: only an instance administrator or
 //! a matching namespace-conditioned rule may write. Without it, a matching
@@ -32,6 +38,42 @@ use crate::error::{AppError, Result};
 
 /// The condition key on `permissions.conditions`.
 pub const CONDITION_KEY: &str = "mcp_namespaces";
+/// The issuer condition key: the `iss` interpolated claims must come from.
+pub const ISSUER_KEY: &str = "mcp_namespace_issuer";
+
+/// An issuer URL in comparable form (trailing `/` dropped).
+pub fn normalize_issuer(iss: &str) -> &str {
+    iss.trim().trim_end_matches('/')
+}
+
+/// Validate the issuer condition against the rule's patterns: required when
+/// any pattern interpolates a claim, refused without `mcp_namespaces`.
+pub fn validate_issuer(patterns: Option<&[String]>, issuer: Option<&str>) -> Result<()> {
+    match (patterns, issuer) {
+        (None, Some(_)) => Err(AppError::Validation(format!(
+            "conditions.{ISSUER_KEY} only applies together with conditions.{CONDITION_KEY}"
+        ))),
+        (Some(ps), None) if needs_claims(ps) => Err(AppError::Validation(format!(
+            "conditions.{CONDITION_KEY} interpolates CI claims: name the issuer they must come \
+             from in conditions.{ISSUER_KEY} (e.g. https://token.actions.githubusercontent.com)"
+        ))),
+        (_, Some(i)) => {
+            let i = normalize_issuer(i);
+            let ok = (i.starts_with("https://") || i.starts_with("http://"))
+                && i.len() <= 512
+                && !i.chars().any(char::is_whitespace);
+            if ok {
+                Ok(())
+            } else {
+                Err(AppError::Validation(format!(
+                    "conditions.{ISSUER_KEY} must be an http(s) issuer URL of at most 512 \
+                     characters"
+                )))
+            }
+        }
+        _ => Ok(()),
+    }
+}
 pub const MAX_PATTERNS: usize = 64;
 pub const MAX_PATTERN_LEN: usize = 200;
 /// Claims kept per CI session, and their size limits.
@@ -145,6 +187,27 @@ pub struct RuleGrant {
     pub actions: Vec<String>,
     /// `conditions.mcp_namespaces`, when the rule carries it.
     pub namespaces: Option<Vec<String>>,
+    /// `conditions.mcp_namespace_issuer`: the only issuer whose session
+    /// claims this rule's patterns interpolate.
+    pub issuer: Option<String>,
+}
+
+/// The claims a rule may interpolate: the session's, when the session's
+/// verified issuer is the rule's; none otherwise (pure).
+fn claims_for<'c>(
+    rule: &RuleGrant,
+    claims: &'c HashMap<String, String>,
+    empty: &'c HashMap<String, String>,
+) -> &'c HashMap<String, String> {
+    let bound = match (rule.issuer.as_deref(), claims.get("iss")) {
+        (Some(want), Some(got)) => normalize_issuer(want) == normalize_issuer(got),
+        _ => false,
+    };
+    if bound {
+        claims
+    } else {
+        empty
+    }
 }
 
 /// What a namespace-aware MCP write decision found.
@@ -180,11 +243,15 @@ pub fn decide(
     claims: &HashMap<String, String>,
 ) -> NamespaceDecision {
     let grants = |acts: &[String]| grants_action(acts, action);
+    let empty = HashMap::new();
     let applicable: Vec<&RuleGrant> = rules
         .iter()
         .filter(|r| match &r.namespaces {
             None => true,
-            Some(ps) => ps.iter().any(|p| pattern_matches(p, name, claims)),
+            Some(ps) => {
+                let claims = claims_for(r, claims, &empty);
+                ps.iter().any(|p| pattern_matches(p, name, claims))
+            }
         })
         .collect();
     if applicable
@@ -355,6 +422,10 @@ async fn applicable_rules(db: &PgPool, user_id: Uuid, repo_id: Uuid) -> Result<V
         .map(|(actions, conditions)| RuleGrant {
             actions,
             namespaces: namespaces_of(&conditions),
+            issuer: conditions
+                .get(ISSUER_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         })
         .collect())
 }
@@ -547,7 +618,48 @@ mod tests {
         RuleGrant {
             actions: strs(actions),
             namespaces: ns.map(strs),
+            issuer: None,
         }
+    }
+
+    /// Review finding 14: interpolated claims count only from a session of
+    /// the rule's issuer, and the issuer is required for such a rule.
+    #[test]
+    fn claims_are_bound_to_the_rule_issuer() {
+        const GH: &str = "https://token.actions.githubusercontent.com";
+        let mut r = rule(&["write"], Some(&["io.github.{repository_owner}/*"]));
+        r.issuer = Some(GH.into());
+        let claims = |iss: &str| {
+            HashMap::from([
+                ("repository_owner".to_string(), "acme".to_string()),
+                ("iss".to_string(), iss.to_string()),
+            ])
+        };
+        use NamespaceDecision::*;
+        let d = |c: &HashMap<String, String>| {
+            decide(
+                std::slice::from_ref(&r),
+                &[],
+                "write",
+                "io.github.acme/x",
+                c,
+            )
+        };
+        assert_eq!(d(&claims(GH)), NamespaceGrant);
+        assert_eq!(d(&claims(&format!("{GH}/"))), NamespaceGrant);
+        assert_eq!(d(&claims("https://gitlab.example.test")), Denied);
+        let mut unbound = r.clone();
+        unbound.issuer = None;
+        assert_eq!(
+            decide(&[unbound], &[], "write", "io.github.acme/x", &claims(GH)),
+            Denied
+        );
+        let ps = strs(&["io.github.{repository_owner}/*"]);
+        assert!(validate_issuer(Some(&ps), None).is_err());
+        assert!(validate_issuer(Some(&ps), Some(GH)).is_ok());
+        assert!(validate_issuer(Some(&ps), Some("not a url")).is_err());
+        assert!(validate_issuer(None, Some(GH)).is_err());
+        assert!(validate_issuer(Some(&strs(&["com.acme/*"])), None).is_ok());
     }
 
     #[test]
@@ -656,7 +768,10 @@ mod tests {
                 .await;
         sqlx::query("UPDATE permissions SET conditions = $2 WHERE id = $1")
             .bind(rule)
-            .bind(serde_json::json!({"mcp_namespaces": ["io.github.{repository_owner}/*"]}))
+            .bind(
+                serde_json::json!({"mcp_namespaces": ["io.github.{repository_owner}/*"],
+                                     "mcp_namespace_issuer": "https://ci.example.test"}),
+            )
             .execute(&pool)
             .await
             .unwrap();
@@ -665,7 +780,7 @@ mod tests {
             &pool,
             &token,
             user,
-            &serde_json::json!({"repository_owner": "acme"}),
+            &serde_json::json!({"repository_owner": "acme", "iss": "https://ci.example.test"}),
             60,
         )
         .await;

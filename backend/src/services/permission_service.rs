@@ -77,6 +77,11 @@ pub struct PermissionConditions {
     /// handlers accept it only on an MCP repository target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_namespaces: Option<Vec<String>>,
+    /// The CI OIDC issuer (`iss`) whose session claims `mcp_namespaces`
+    /// patterns may interpolate (#5253). Required when a pattern names a
+    /// `{claim}`; only valid together with `mcp_namespaces`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_namespace_issuer: Option<String>,
 }
 
 impl PermissionConditions {
@@ -98,6 +103,10 @@ impl PermissionConditions {
         if let Some(patterns) = &self.mcp_namespaces {
             crate::services::mcp_namespaces::validate_patterns(patterns)?;
         }
+        crate::services::mcp_namespaces::validate_issuer(
+            self.mcp_namespaces.as_deref(),
+            self.mcp_namespace_issuer.as_deref(),
+        )?;
         Ok(())
     }
 
@@ -3059,7 +3068,7 @@ mod tests {
     #[test]
     fn test_conditions_validate_mcp_namespaces() {
         let ok: PermissionConditions =
-            serde_json::from_str(r#"{"mcp_namespaces": ["io.github.{repository_owner}/*"]}"#)
+            serde_json::from_str(r#"{"mcp_namespaces": ["io.github.{repository_owner}/*"], "mcp_namespace_issuer": "https://token.actions.githubusercontent.com"}"#)
                 .unwrap();
         assert!(ok.validate().is_ok());
         for bad in [
