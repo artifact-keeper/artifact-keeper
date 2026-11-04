@@ -283,8 +283,11 @@ is `400`.
   not applicable: it grants nothing (not `read`, not `write`, not `delete`) to
   the generic artifact API, the repository ACL or listings, and it does not
   make the repository count as having fine-grained rules. A namespace-scoped
-  publisher that should also read a private registry needs a separate,
-  unconditioned `read` rule. On the `/mcp/<key>/...` surface of an MCP
+  publisher that should also read a private registry needs an unconditioned
+  `read` rule through another principal: a group the user belongs to, or a
+  role assignment. It cannot be a second rule for the same user, because
+  there is one rule per principal and repository (and `read` in the
+  conditioned rule itself grants nothing here, as above). On the `/mcp/<key>/...` surface of an MCP
   repository the route-level write check counts the rule (as an applicable
   rule granting its actions), and every MCP write route there (publish, status
   change, delete, bundle upload, capability reports) then runs the namespace
@@ -926,10 +929,10 @@ the repository type is refused with `400`; a response omits it.
 
 | Field | Types | Values (default first) | Meaning |
 | --- | --- | --- | --- |
-| `mcp_server_deny` | all | glob list (`[]`) | Full server names refused on publish, edit and bundle upload, and hidden on serve. `*` matches any run of characters including `/`; matching is ASCII case-insensitive. Deny always wins, even over an approval. An entry with neither `/` nor `*` (a bare namespace) is refused with `400` (it would match no name; write `com.acme/*`). |
+| `mcp_server_deny` | all | glob list (`[]`) | Full server names refused on publish, edit and bundle upload, and hidden on serve. `*` matches any run of characters including `/`; matching is ASCII case-insensitive. Deny always wins, even over an approval. An entry with neither `/` nor `*` (a bare namespace) is refused with `422` (it would match no name; write `com.acme/*`); other bad syntax is `400`. |
 | `mcp_remote_posture` | Remote | `approval_required` \| `allow_with_gates` | `approval_required` serves only approved names; `allow_with_gates` serves every name whose version passes the gates (lint, backing scan, age gate and typosquat still apply; flags route to review). |
 | `mcp_remote_posture_locked` | Remote | `false` \| `true` | Instance-administrator lock on `mcp_remote_posture`. |
-| `mcp_auto_approve_namespaces` | Remote | glob list (`[]`) | Globs over the **full** server name approved on sync: `io.github.modelcontextprotocol/*` (one namespace), `com.acme.*/*` (every sub-namespace of `com.acme`, not `com.acme` itself), `com.acme/weather` (one server). Same matching as `mcp_server_deny`; a bare namespace (`com.acme`) is refused with `400`. A denied, blocked or lookalike name is never auto-approved. |
+| `mcp_auto_approve_namespaces` | Remote | glob list (`[]`) | Globs over the **full** server name approved on sync: `io.github.modelcontextprotocol/*` (one namespace), `com.acme.*/*` (every sub-namespace of `com.acme`, not `com.acme` itself), `com.acme/weather` (one server). Same matching as `mcp_server_deny`; a bare namespace (`com.acme`) is refused with `422`. A denied, blocked or lookalike name is never auto-approved. |
 | `mcp_oci_floating_tag_policy` | Remote | `pin` \| `hide` | Upstream OCI entries tagged `latest` or untagged: pin the digest at sync and warn, or hide the version. |
 | `mcp_remote_mode` | Remote | `allowlist` \| `mirror` | `allowlist` ingests approved names only; `mirror` ingests every upstream name hourly (serving is still curated). |
 | `mcp_probe_remotes` | Local, Staging, Remote | `off` \| `hosted_only` \| `all` | Opt-in remote `tools/list` probe by the isolated introspector worker. |
@@ -1176,8 +1179,8 @@ decision detail but not other users: `evaluatedBy` is `null` and
 public Remote) sees the upstream entries and their status only: `denied` is
 absent, `flags` is `{}`, `evaluationReason`, `evaluatedBy` and each pin's
 `evaluationReason`/`contentDrift` are `null`, `ingested[].unresolved` is
-`[]`, `summary.lint` is absent, and `approvalRequests` is `{count}` (`{}`
-when nobody asked).
+`[]`, `summary.lint` is absent, and `approvalRequests` is `{count}`.
+`count` is always present, `0` when nobody asked, in every view.
 
 `summary` carries the risk inputs of a name without a per-row call: the
 sync caches `transports` (package `transport.type` and remote `type`,
@@ -1211,7 +1214,7 @@ CatalogItem    { id: uuid, name, namespace,
                  upstreamUpdatedAt: RFC 3339 | null,
                  summary: CatalogSummary | null,
                  flags: { typosquat?: { similarTo: string } },
-                 approvalRequests: { count?,          // everyone
+                 approvalRequests: { count,           // everyone (0 when nobody asked)
                                      lastRequestedAt?, lastRequestedBy?, lastNote?,
                                      requesters?: { <user id>: { at, note } } },  // administrators only
                  evaluationReason: string | null, evaluatedAt: RFC 3339 | null,

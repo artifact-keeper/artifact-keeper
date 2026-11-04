@@ -261,17 +261,9 @@ impl CatalogItem {
         let count = self
             .approval_requests
             .get("count")
-            .cloned()
-            .unwrap_or_else(|| 0.into());
-        self.approval_requests = if self
-            .approval_requests
-            .as_object()
-            .is_some_and(|o| o.is_empty())
-        {
-            serde_json::json!({})
-        } else {
-            serde_json::json!({ "count": count })
-        };
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        self.approval_requests = serde_json::json!({ "count": count });
         self.evaluated_by = None;
         if view == CatalogView::Holder {
             return self;
@@ -337,6 +329,16 @@ fn object(v: &serde_json::Value, k: &str) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+/// The stored `approvalRequests` document with `count` always present
+/// (`{"count": 0}` when nobody asked).
+fn approval_requests_of(m: &serde_json::Value) -> serde_json::Value {
+    let mut doc = object(m, "approvalRequests");
+    if doc.get("count").and_then(|c| c.as_u64()).is_none() {
+        doc["count"] = 0.into();
+    }
+    doc
+}
+
 /// The item of one name row (pure).
 fn item_of(
     row: NameRow,
@@ -370,7 +372,7 @@ fn item_of(
             .filter(|v| v.is_object())
             .and_then(|v| serde_json::from_value(v.clone()).ok()),
         flags: object(m, "flags"),
-        approval_requests: object(m, "approvalRequests"),
+        approval_requests: approval_requests_of(m),
         evaluation_reason: row.evaluation_reason,
         evaluated_at: row.evaluated_at,
         evaluated_by: row.evaluated_by,
@@ -1587,7 +1589,7 @@ mod tests {
             (sum.transports, sum.registry_types, sum.secrets_count),
             (vec!["stdio".to_string()], vec!["npm".to_string()], 2)
         );
-        assert_eq!(item.approval_requests, serde_json::json!({}));
+        assert_eq!(item.approval_requests, serde_json::json!({"count": 0}));
         assert_eq!(item.pins[0].id, pin_id);
         assert!(item.pins[0].content_drift.is_some());
         assert_eq!(
@@ -1649,11 +1651,17 @@ mod tests {
                 .review,
             1
         );
-        // A name nobody requested keeps the empty object.
-        assert_eq!(
-            item.for_view(CatalogView::Reader).approval_requests,
-            serde_json::json!({})
-        );
+        // A name nobody requested has `{count: 0}` in every view.
+        for view in [
+            CatalogView::Reader,
+            CatalogView::Holder,
+            CatalogView::Curator,
+        ] {
+            assert_eq!(
+                item.clone().for_view(view).approval_requests,
+                serde_json::json!({"count": 0})
+            );
+        }
     }
 
     /// Review finding 19: one entry per requester; nobody overwrites another

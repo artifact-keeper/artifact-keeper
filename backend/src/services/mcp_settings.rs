@@ -177,7 +177,7 @@ pub fn validate_globs(key: &str, globs: &[String]) -> Result<Vec<String>> {
 pub fn validate_name_globs(key: &str, globs: &[String]) -> Result<Vec<String>> {
     let out = validate_globs(key, globs)?;
     if let Some(msg) = bare_namespace_refusal(key, &out) {
-        return Err(AppError::Validation(msg));
+        return Err(AppError::UnprocessableEntity(msg));
     }
     Ok(out)
 }
@@ -489,8 +489,14 @@ mod tests {
             )
         };
         assert!(names(&["io.github.modelcontextprotocol/*", "com.acme.*/*", "*"]).is_ok());
-        let err = names(&["com.acme"]).unwrap_err().to_string();
-        assert!(err.contains("com.acme/*"), "{err}");
+        let err = names(&["com.acme"]).unwrap_err();
+        // A bare namespace is `422`, as in the bulk routes; bad syntax `400`.
+        assert!(matches!(err, AppError::UnprocessableEntity(_)), "{err:?}");
+        assert!(err.to_string().contains("com.acme/*"), "{err}");
+        assert!(matches!(
+            names(&["a b"]).unwrap_err(),
+            AppError::Validation(_)
+        ));
         assert!(glob_matches("a/b", "a/b"));
         assert!(!glob_matches("a/b", "a/bc"));
         assert!(!glob_matches("com.evil/*", "com.evilx/y"));
