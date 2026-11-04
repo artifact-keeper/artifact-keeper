@@ -1027,6 +1027,7 @@ mod tests {
     fn repo(format: RepositoryFormat, repo_type: RepositoryType) -> Repository {
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "images".to_string(),
             name: "Container images".to_string(),

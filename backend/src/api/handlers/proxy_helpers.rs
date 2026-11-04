@@ -4765,7 +4765,7 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
         r.replication_priority,
         r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
         r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
+        r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled, r.allow_overwrite,
         r.project_id, r.created_at, r.updated_at
       FROM reach
       JOIN repositories r ON r.id = reach.member_repo_id
@@ -9714,6 +9714,7 @@ pub(crate) fn build_remote_repo_with_format(
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
         versioning_enabled: false,
+        allow_overwrite: false,
         project_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),

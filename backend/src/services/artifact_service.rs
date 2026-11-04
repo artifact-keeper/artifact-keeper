@@ -184,6 +184,11 @@ pub(crate) async fn enforce_path_immutability_with(
     checksum_sha256: &str,
     replaces_current: bool,
 ) -> Result<()> {
+    // #5188: a mutable repository replaces whatever is at the path, live or
+    // released, so neither check applies.
+    if repo.is_some_and(overwrite_applies) {
+        return Ok(());
+    }
     let versioning_active = repo
         .map(|r| versioning_applies(&r.format, r.versioning_enabled))
         .unwrap_or(false);
@@ -259,6 +264,14 @@ pub(crate) fn versioning_applies(format: &RepositoryFormat, versioning_enabled: 
             format,
             RepositoryFormat::Generic | RepositoryFormat::Mlmodel
         )
+}
+
+/// Whether an upload may replace the content already at its path (#5188):
+/// the repository opted in via `allow_overwrite` (DEFAULT false). Versioning
+/// wins when both are set, so a versioned repository still appends a revision
+/// rather than discarding history.
+pub(crate) fn overwrite_applies(repo: &Repository) -> bool {
+    repo.allow_overwrite && !versioning_applies(&repo.format, repo.versioning_enabled)
 }
 
 /// Next auto-increment revision for a (repository_id, path) coordinate given
@@ -417,7 +430,7 @@ async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
 /// storage GC candidate. Recorded in the publishing transaction so it exists
 /// exactly when the replace commits. Idempotent; the candidate sweep drops
 /// the row without touching the object if anything still references the key.
-async fn record_replaced_object_gc_candidate(
+pub(crate) async fn record_replaced_object_gc_candidate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo: &Repository,
     old_key: &str,
@@ -1443,6 +1456,7 @@ impl ArtifactService {
         let versioning_active = repo_for_upload
             .as_ref()
             .is_some_and(|r| versioning_applies(&r.format, r.versioning_enabled));
+        let overwrite_active = repo_for_upload.as_ref().is_some_and(overwrite_applies);
         // #2382: `.safetensors` uploads to Mlmodel repos get their header
         // summarised into `artifact_metadata` once the row exists.
         let safetensors_eligible = repo_for_upload.as_ref().is_some_and(|r| {
@@ -1529,6 +1543,23 @@ impl ArtifactService {
                 expect_absent = live.is_none();
                 replaces_current = live.is_some() && precondition.replaces_current();
                 replaced_key = live.map(|(_, key, _)| key);
+            }
+            // #5188: a mutable repository replaces the row at this path (live
+            // or tombstone) through the same `replaces_current` arm, which
+            // also hands the old object to storage GC below.
+            if overwrite_active {
+                if replaced_key.is_none() {
+                    replaced_key = sqlx::query_scalar::<_, String>(
+                        "SELECT storage_key FROM artifacts \
+                         WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+                    )
+                    .bind(repository_id)
+                    .bind(path)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                replaces_current = replaced_key.is_some();
             }
             // Create artifact record.
             //
@@ -1617,8 +1648,10 @@ impl ArtifactService {
                     break artifact;
                 }
                 // #4186: a live row appeared under a conditional write that
-                // expected none; evaluate the precondition against it.
-                None if expect_absent && attempt == 1 => continue,
+                // expected none; evaluate the precondition against it. #5188:
+                // on a mutable repository, a row a concurrent writer committed
+                // after our read is simply replaced on the second pass.
+                None if (expect_absent || overwrite_active) && attempt == 1 => continue,
                 None => {
                     // Drop `tx` (rolls back the quota admission). The content
                     // blob is content-addressed; if this upload orphaned it,
@@ -6227,6 +6260,135 @@ mod tests {
             "flag-off repos must record no version history"
         );
 
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn test_overwrite_applies_gated_on_flag_and_yields_to_versioning() {
+        use crate::models::repository::{
+            ReplicationPriority, RepositoryType, RepositoryVisibility,
+        };
+        let now = chrono::Utc::now();
+        let mut repo = Repository {
+            id: Uuid::new_v4(),
+            key: "pypi-dev".to_string(),
+            name: "PyPI dev".to_string(),
+            description: None,
+            format: RepositoryFormat::Pypi,
+            repo_type: RepositoryType::Local,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/pypi-dev".to_string(),
+            upstream_url: None,
+            visibility: RepositoryVisibility::Private,
+            is_public: false,
+            quota_bytes: None,
+            promotion_only: false,
+            replication_priority: ReplicationPriority::Immediate,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 3600,
+            curation_auto_fetch: false,
+            age_gate_enabled: false,
+            age_gate_min_age_days: 0,
+            versioning_enabled: false,
+            allow_overwrite: false,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(!overwrite_applies(&repo), "default is immutable");
+        repo.allow_overwrite = true;
+        assert!(overwrite_applies(&repo));
+        // Versioning keeps history instead of replacing it.
+        repo.format = RepositoryFormat::Generic;
+        repo.versioning_enabled = true;
+        assert!(!overwrite_applies(&repo));
+    }
+
+    /// #5188: on a repository with `allow_overwrite`, a different-bytes
+    /// re-upload to a released coordinate replaces it in place, and the
+    /// object it pointed at is handed to storage GC. Identical bytes keep the
+    /// same key and journal nothing.
+    #[tokio::test]
+    async fn allow_overwrite_replaces_released_coordinate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, storage_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set allow_overwrite");
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(
+            crate::storage::filesystem::FilesystemStorage::new(storage_dir.clone()),
+        );
+        let svc = ArtifactService::new(pool.clone(), storage);
+        let path = "demo/1.0.0/demo-1.0.0-py3-none-any.whl";
+        let upload = |bytes: &'static [u8]| {
+            svc.upload_with_sync_options(
+                repo_id,
+                path,
+                "demo",
+                Some("1.0.0"),
+                "application/zip",
+                Bytes::from_static(bytes),
+                Some(user_id),
+                false,
+            )
+        };
+
+        let first = upload(b"build-1").await.expect("first upload");
+        let second = upload(b"build-2")
+            .await
+            .expect("different-bytes re-upload must replace, not 409");
+        assert_eq!(second.id, first.id, "same row is replaced in place");
+        assert_eq!(
+            second.checksum_sha256,
+            ArtifactService::calculate_sha256(b"build-2")
+        );
+        assert_ne!(second.storage_key, first.storage_key);
+
+        let journaled = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM oci_gc_candidates \
+                     WHERE storage_key = $1 AND source_repository_id = $2",
+                )
+                .bind(key)
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count candidates")
+            }
+        };
+        assert_eq!(
+            journaled(first.storage_key.clone()).await,
+            1,
+            "the replaced object must be handed to storage GC"
+        );
+
+        let third = upload(b"build-2").await.expect("identical re-upload");
+        assert_eq!(third.storage_key, second.storage_key);
+        assert_eq!(
+            journaled(second.storage_key.clone()).await,
+            0,
+            "an identical re-upload must not journal the live object"
+        );
+
+        sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .ok();
         tdh::cleanup(&pool, repo_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
