@@ -403,6 +403,7 @@ async fn post_capabilities(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(p): Path<HashMap<String, String>>,
     base: RequestBaseUrl,
+    headers: axum::http::HeaderMap,
     body: Result<Bytes, axum::extract::rejection::BytesRejection>,
 ) -> HandlerResult {
     let p = version_path(&p);
@@ -432,14 +433,22 @@ async fn post_capabilities(
         }
     })?;
     let t = target(&state, Some(&ext), &p, base.as_str()).await?;
-    crate::api::handlers::repositories::require_repo_action(
-        &ext,
-        t.repo.id,
-        "write",
-        &state.permission_service,
+    // A capability report is an MCP write of this server name: the token's
+    // repository scope, then the namespace write gate every other MCP write
+    // runs (plain write, or a matching `mcp_namespaces` grant;
+    // `mcp_require_namespace_grant`).
+    if !ext.can_access_repo(t.repo.id) {
+        return Err(problem(
+            403,
+            "mcp_forbidden",
+            "This token is not scoped to this repository",
+            json!({}),
+        ));
+    }
+    crate::api::handlers::mcp_edges::require_namespace_write(
+        &state, &ext, t.repo.id, &p.name, "write", &headers,
     )
-    .await
-    .map_err(app_error)?;
+    .await?;
     let report = parse_report(&body, Utc::now())?;
     let snap = NewSnapshot {
         repository_id: t.repo.id,
@@ -1351,6 +1360,82 @@ mod db_tests {
             .bind(env.fx.repo_id)
             .execute(&env.fx.pool)
             .await;
+        env.fx.teardown().await;
+    }
+
+    /// Review finding 4: a capability report runs the MCP namespace write
+    /// gate (`mcp_require_namespace_grant`, `conditions.mcp_namespaces`).
+    #[tokio::test]
+    async fn capability_reports_run_the_namespace_gate() {
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        let publish = format!("/{}/v0.1/publish", env.fx.repo_key);
+        let (s, b) = call(
+            env.admin(),
+            "POST",
+            &publish,
+            Some(doc("1.0.0", json!({"tools": [{"name": "get_weather"}]}))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let member = || {
+            tdh::router_with_auth(
+                surface::router(),
+                env.fx.state.clone(),
+                tdh::make_auth(env.fx.user_id, &env.fx.username),
+            )
+        };
+        let report = json!({"source": "ci_reported", "tools": [{"name": "get_weather"}]});
+        // A plain repository member may report.
+        let (s, b) = call(member(), "POST", &env.url(""), Some(report.clone())).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+        // Under mcp_require_namespace_grant the plain write no longer does.
+        env.config(
+            crate::services::mcp_settings::REQUIRE_NAMESPACE_GRANT_KEY,
+            "true",
+        )
+        .await;
+        let (s, b) = call(member(), "POST", &env.url(""), Some(report.clone())).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("mcp_namespace_not_granted")),
+            "{b}"
+        );
+        // A grant for another namespace does not help; a matching one does.
+        let rule = tdh::grant_permission(
+            &env.fx.pool,
+            "user",
+            env.fx.user_id,
+            "repository",
+            env.fx.repo_id,
+            &["write"],
+        )
+        .await;
+        let set_ns = |ns: &'static str| {
+            sqlx::query("UPDATE permissions SET conditions = $2 WHERE id = $1")
+                .bind(rule)
+                .bind(json!({"mcp_namespaces": [ns]}))
+                .execute(&env.fx.pool)
+        };
+        set_ns("com.other").await.unwrap();
+        let (s, _) = call(member(), "POST", &env.url(""), Some(report.clone())).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        set_ns("com.acme").await.unwrap();
+        let (s, b) = call(member(), "POST", &env.url(""), Some(report)).await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+
+        for sql in [
+            "DELETE FROM permissions WHERE target_id = $1",
+            "DELETE FROM repository_config WHERE repository_id = $1",
+            "DELETE FROM packages WHERE repository_id = $1",
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(env.fx.repo_id)
+                .execute(&env.fx.pool)
+                .await;
+        }
         env.fx.teardown().await;
     }
 }
