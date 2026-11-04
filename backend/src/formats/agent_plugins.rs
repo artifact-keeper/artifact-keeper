@@ -152,12 +152,21 @@ pub fn validate_slug(slug: &str) -> std::result::Result<(), String> {
 /// Parse a version as strict SemVer 2.0 (no `v` prefix, no leading zeros,
 /// exactly three numeric components).
 pub fn parse_semver(version: &str) -> std::result::Result<semver::Version, String> {
-    semver::Version::parse(version).map_err(|e| {
+    let parsed = semver::Version::parse(version).map_err(|e| {
         format!(
             "Invalid plugin version {version:?}: versions must be SemVer 2.0 \
              (for example 1.2.0 or 2.0.0-rc.1): {e}"
         )
-    })
+    })?;
+    // `1.0.0` and `1.0.0+hotfix` have equal precedence under SemVer, so they
+    // cannot be two immutable versions with a well-defined latest.
+    if !parsed.build.is_empty() {
+        return Err(format!(
+            "Invalid plugin version {version:?}: build metadata has no precedence; \
+             use a pre-release or a new version"
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Validate the three path coordinates of a publish or download URL.
@@ -851,7 +860,8 @@ fn plugin_entry(ctx: &IndexContext, v: &IndexedVersion) -> Value {
 ///
 /// One generator serves all five variants: `marketplace.json` carries the AK
 /// `$schema`, the per-harness documents omit it and keep only the plugins
-/// section 5 of the design assigns them. `generated_at` is the publish time
+/// section 5 of the design assigns them. Each document lists, per plugin, the
+/// highest SemVer version among the versions it may list. `generated_at` is the publish time
 /// of the newest version listed, so the body (and its ETag) only changes when
 /// the listed data does.
 pub fn build_marketplace(
@@ -859,10 +869,15 @@ pub fn build_marketplace(
     ctx: &IndexContext,
     versions: &[IndexedVersion],
 ) -> Value {
-    let listed: Vec<&IndexedVersion> = latest_per_plugin(versions)
-        .into_iter()
+    // Latest among the versions this document may list, so a plugin whose
+    // newest version dropped a harness still lists its newest compatible one
+    // in that harness's document.
+    let compatible: Vec<IndexedVersion> = versions
+        .iter()
         .filter(|v| kind.includes(&v.metadata.harnesses))
+        .cloned()
         .collect();
+    let listed: Vec<&IndexedVersion> = latest_per_plugin(&compatible);
     let generated_at = listed.iter().map(|v| v.published_at).max();
     let mut doc = Map::new();
     if kind == Marketplace::All {
@@ -1085,12 +1100,23 @@ mod tests {
 
     #[test]
     fn semver_is_strict() {
-        for ok in ["1.2.0", "0.0.1", "2.0.0-rc.1", "1.0.0+build.5"] {
+        for ok in ["1.2.0", "0.0.1", "2.0.0-rc.1", "2.0.0-rc.1.2"] {
             assert!(parse_semver(ok).is_ok(), "{ok}");
         }
-        for bad in ["v1.2.0", "1.2", "01.2.0", "1.2.0.0", "latest", ""] {
+        for bad in [
+            "v1.2.0",
+            "1.2",
+            "01.2.0",
+            "1.2.0.0",
+            "latest",
+            "",
+            "1.0.0+hotfix",
+        ] {
             assert!(parse_semver(bad).is_err(), "{bad}");
         }
+        assert!(parse_semver("1.0.0+build.5")
+            .unwrap_err()
+            .contains("build metadata has no precedence"));
     }
 
     #[test]
@@ -1479,6 +1505,21 @@ mod tests {
             latest.iter().find(|v| v.name == "alpha").unwrap().version,
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn latest_is_chosen_per_document_among_compatible_versions() {
+        let vs = vec![
+            version("p", "1.0.0", &["claude", "cursor"], 1),
+            version("p", "2.0.0", &["cursor"], 2),
+        ];
+        let c = ctx(None);
+        let claude = build_marketplace(Marketplace::Claude, &c, &vs);
+        assert_eq!(claude["plugins"][0]["version"], "1.0.0");
+        let cursor = build_marketplace(Marketplace::Cursor, &c, &vs);
+        assert_eq!(cursor["plugins"][0]["version"], "2.0.0");
+        let all = build_marketplace(Marketplace::All, &c, &vs);
+        assert_eq!(all["plugins"][0]["version"], "2.0.0");
     }
 
     #[test]

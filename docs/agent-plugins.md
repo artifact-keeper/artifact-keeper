@@ -43,7 +43,9 @@ from the URL, not from a manifest inside the zip.
 - `{name}` (the slug) matches `^[a-z0-9][a-z0-9-]*$` and is at most 64
   characters.
 - `{version}` is strict SemVer 2.0 (`1.2.0`, `2.0.0-rc.1`; no `v` prefix, no
-  two-part versions).
+  two-part versions) without build metadata: `1.0.0` and `1.0.0+hotfix` have
+  the same SemVer precedence, so they could not both be immutable versions
+  with a well-defined latest. Use a pre-release or a new version instead.
 - The file name must be exactly `{name}-{version}.zip`.
 
 ### The plugin root
@@ -73,20 +75,37 @@ not a marker.
 
 ## Publish rules
 
-`PUT` refuses the upload with `400` when:
+`PUT` answers `400` for each of these, and this list is complete:
 
-- no marker is found ("Not an agent plugin bundle");
-- the body is empty, is not a zip, has more entries or a larger declared
-  uncompressed size than the ingest caps (`MAX_INGEST_ARCHIVE_ENTRIES`,
-  default 10,000; `MAX_INGEST_DECOMPRESSED_BYTES`, default 128 MiB), contains
-  duplicate entry names, or contains an entry that is absolute, has a `..`
-  segment, uses a backslash, or is a symbolic link;
-- the slug, the SemVer version or the file name break the layout rules;
-- a marker manifest is not a JSON object;
-- a manifest's `name` differs from the slug, or its `version` differs from the
-  path version;
-- the plugin root cannot be determined;
-- `X-Checksum-Sha256` is sent and does not match the body.
+| Class | Example message |
+|-------|-----------------|
+| Empty body | `Empty upload body` |
+| `X-Checksum-Sha256` does not match the body | `X-Checksum-Sha256 mismatch: declared ... but the body hashes to ...` |
+| Invalid slug (`^[a-z0-9][a-z0-9-]*$`, at most 64) | `Invalid plugin name "P": ...` |
+| Version is not SemVer 2.0 | `Invalid plugin version "1.0": versions must be SemVer 2.0 ...` |
+| Version carries build metadata | `... build metadata has no precedence; use a pre-release or a new version` |
+| File name is not `{name}-{version}.zip` | `Invalid file name "other.zip": ...` |
+| Path rejected by the shared artifact-path check (too long, null bytes) | `artifact_path ...` |
+| Body is not a zip | `Invalid ZIP archive: ...` |
+| More entries than `MAX_INGEST_ARCHIVE_ENTRIES` (default 10,000) | `ZIP archive contains too many entries ...` |
+| Declared uncompressed total above `MAX_INGEST_DECOMPRESSED_BYTES` (default 128 MiB) | `ZIP archive expands to more than ... bytes ...` |
+| Duplicate entry names | `ZIP archive contains duplicate entry names` |
+| Entry name that cannot be decoded | `ZIP archive entry N has an undecodable name: ...` |
+| Entry that is absolute, drive-qualified or has a `..` segment | `ZIP archive entry "../x" is an absolute path or escapes the archive root` |
+| Entry name with a backslash | `... contains a backslash; use '/' as the separator` |
+| Symbolic link entry | `... is a symbolic link; plugin bundles may not contain links` |
+| Plugin root ambiguous (two or more top-level directories, no root manifest) | `The plugin root cannot be determined: ...` |
+| No harness manifest at the plugin root | `Not an agent plugin bundle: ...` |
+| A manifest larger than 1 MiB | `... exceeds the maximum manifest size of 1048576 bytes` |
+| A marker manifest that is not a JSON object | `.claude-plugin/plugin.json is not a JSON object` |
+| A manifest `name` other than the slug | `... declares name "q" but the upload path names the plugin "p" ...` |
+| A manifest `version` other than the path version | `... declares version "0.9.0" but the upload path version is "1.0.0" ...` |
+| Remote or virtual repository | `Agent Plugins repositories are hosted-only; ...` |
+
+Other answers: `401` without credentials, `403` without `write:artifacts`,
+`409` for a version that exists (or a deleted one re-published with different
+bytes, below), `413` over `MAX_UPLOAD_SIZE`, `503` when the ingest-extraction
+slots are saturated, `507` over a storage quota.
 
 **Why manifest `name` and `version` must match the path.** Claude Code
 resolves an installed plugin's version from its `plugin.json` first and the
@@ -100,7 +119,10 @@ The same holds for `name`, which agents use to identify the installed plugin.
 
 Published versions are immutable: re-publishing an existing version is `409`.
 Remove a version with the ordinary REST artifact delete; every document drops
-it on the next request.
+it on the next request. A deleted version can only be re-published with
+identical content (restoring it); publish a new version otherwise. Claude Code
+re-downloads only when the version string changes, so new bytes under an old
+version would never reach existing installs.
 
 ```bash
 curl -X DELETE -u user:password \
@@ -108,8 +130,17 @@ curl -X DELETE -u user:password \
 ```
 
 Everything that applies to hosted artifacts applies here: repository
-visibility, scan-on-upload and quarantine holds, publish quota, download
-statistics, the Packages catalog, push replication to mesh peers, and audit.
+visibility, scan-on-upload and quarantine holds, scan policies, publish quota,
+download statistics, the Packages catalog, push replication to mesh peers, and
+audit.
+
+Only versions published through this route (or replicated from a peer that
+did) are indexed and downloadable under `/agentplugins`. A file written into
+the repository through the generic REST upload
+(`PUT /api/v1/repositories/{key}/artifacts/{path}`) was never validated as a
+plugin bundle, so it is ignored by every document and by the download route,
+even at a path that looks like a version. The generic route is not refused
+for this format, because push replication delivers through it.
 
 ## Endpoints
 
@@ -158,9 +189,13 @@ Publish response:
 ## Index documents
 
 The documents are generated from the database on every request, never stored,
-so a delete or a quarantine hold shows up immediately. A version the download
-gate refuses (quarantined, or under an active upload hold) is left out of every
-document. Each response carries an `ETag`; a matching `If-None-Match` is
+so a delete, a quarantine hold or a scan-policy decision shows up immediately.
+A version the download gate refuses is left out of every document: the
+documents and the download route apply the same gate, quarantine and upload
+holds first, then the repository's scan policies (`block_unscanned`,
+`block_on_fail`, `max_severity`). Refused versions are skipped before the
+latest version is chosen, so a plugin whose newest version is blocked is
+listed at its newest downloadable version. Each response carries an `ETag`; a matching `If-None-Match` is
 answered with `304`. Plain routes send `Cache-Control: no-cache` (cache, but
 revalidate).
 
@@ -174,9 +209,11 @@ Membership:
 | `codex-marketplace.json` | `codex` or `standard` |
 | `vscode-marketplace.json` | `standard` |
 
-Each document lists one entry per plugin: its highest SemVer version, with
-pre-releases ordered by SemVer rules (`2.0.0-rc.1 < 2.0.0`, but
-`2.0.0-rc.1 > 1.9.0`). A Standard-layout plugin's skills load in Claude Code;
+Each document lists one entry per plugin: the highest SemVer version among the
+versions that document may list, with pre-releases ordered by SemVer rules
+(`2.0.0-rc.1 < 2.0.0`, but `2.0.0-rc.1 > 1.9.0`). A plugin whose 2.0.0 is
+Cursor-only and whose 1.0.0 also supports Claude Code is listed at 2.0.0 in
+`cursor-marketplace.json` and at 1.0.0 in `claude-marketplace.json`. A Standard-layout plugin's skills load in Claude Code;
 its `mcp.json` is not read by Claude Code, which only reads `.mcp.json`.
 
 ### `marketplace.json`

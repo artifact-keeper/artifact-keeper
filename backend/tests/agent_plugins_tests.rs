@@ -206,6 +206,29 @@ async fn publish_index_download_delete_reindex() {
     let (s3, b3) = r.publish("std", "0.1.0", standard).await;
     let (dup, _) = r.publish("hello", "1.1.0", v2.clone()).await;
 
+    // Generic REST uploads are never indexed or served under /agentplugins:
+    // a traversal zip at a version-shaped path, and a second file under an
+    // existing version's coordinates.
+    let traversal = zip(&[(".claude-plugin/plugin.json", b"{}"), ("../evil", b"x")]);
+    let mut rest_statuses = Vec::new();
+    for path in ["hello/2.0.0/hello-2.0.0.zip", "hello/1.1.0/other.zip"] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/repositories/{key}/artifacts/{path}"))
+            .header("authorization", &r.basic)
+            .body(Body::from(traversal.clone()))
+            .unwrap();
+        rest_statuses.push(call(&r.app, req).await.0);
+    }
+    let (rest_dl, _, _) = call(
+        &r.app,
+        get(
+            &format!("/agentplugins/{key}/hello/2.0.0/hello-2.0.0.zip"),
+            None,
+        ),
+    )
+    .await;
+
     let (claude_status, _, claude) = call(
         &r.app,
         get(
@@ -264,6 +287,11 @@ async fn publish_index_download_delete_reindex() {
     assert_eq!(b3["harnesses"], serde_json::json!(["standard"]));
     assert_eq!(dup, StatusCode::CONFLICT);
 
+    assert!(
+        rest_statuses.iter().all(|s| s.is_success()),
+        "the generic REST uploads themselves are accepted: {rest_statuses:?}"
+    );
+    assert_eq!(rest_dl, StatusCode::NOT_FOUND);
     assert_eq!(claude_status, StatusCode::OK);
     assert_eq!(names(&claude), vec!["hello", "std"]);
     let hello = &claude["plugins"][0];

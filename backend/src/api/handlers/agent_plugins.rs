@@ -130,61 +130,117 @@ fn not_found(what: &str) -> Response {
     (StatusCode::NOT_FOUND, format!("{what} not found")).into_response()
 }
 
+/// The rows the format serves: written by a native publish (or replicated
+/// from one, which carries the same metadata document), so their
+/// `artifact_metadata.format` is `agentplugins` and their path is exactly the
+/// canonical `{name}/{version}/{name}-{version}.zip`. Anything else in the
+/// repository (a generic REST upload under another path, or one with no
+/// agent-plugin metadata) was never validated as a bundle and is neither
+/// indexed nor downloaded through `/agentplugins` (#5251 review M2).
+const ARCHIVE_ROWS_SQL: &str = "SELECT a.id, a.name, a.version, a.size_bytes, a.checksum_sha256, \
+            a.storage_key, a.created_at, am.metadata, a.quarantine_status, a.quarantine_until \
+     FROM artifacts a \
+     JOIN artifact_metadata am ON am.artifact_id = a.id \
+     WHERE a.repository_id = $1 AND a.is_deleted = false \
+       AND am.format = 'agentplugins' AND a.version IS NOT NULL \
+       AND a.path = a.name || '/' || a.version || '/' || a.name || '-' || a.version || '.zip' \
+       AND ($2::text IS NULL OR a.path = $2) \
+     ORDER BY a.name, a.version, a.created_at, a.id";
+
 #[derive(sqlx::FromRow)]
-struct VersionRow {
+struct ArchiveRow {
+    id: Uuid,
     name: String,
-    version: Option<String>,
+    version: String,
     size_bytes: i64,
     checksum_sha256: String,
+    storage_key: String,
     created_at: chrono::DateTime<chrono::Utc>,
-    metadata: Option<serde_json::Value>,
+    metadata: serde_json::Value,
     quarantine_status: Option<String>,
     quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Every servable version in the repository. A version the download gate
-/// would refuse (quarantined, or under an active upload hold) is left out,
-/// with the exact predicate `quarantine_service::check_download_allowed`
-/// applies, so no index advertises an archive its download refuses.
-async fn servable_versions(db: &PgPool, repo_id: Uuid) -> Result<Vec<IndexedVersion>, Response> {
-    let rows = sqlx::query_as::<_, VersionRow>(
-        "SELECT a.name, a.version, a.size_bytes, a.checksum_sha256, a.created_at, \
-                am.metadata, a.quarantine_status, a.quarantine_until \
-         FROM artifacts a \
-         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
-         WHERE a.repository_id = $1 AND a.is_deleted = false",
+/// Native archive rows of a repository, or the one at `path`.
+async fn archive_rows(
+    db: &PgPool,
+    repo_id: Uuid,
+    path: Option<&str>,
+) -> Result<Vec<ArchiveRow>, Response> {
+    sqlx::query_as::<_, ArchiveRow>(ARCHIVE_ROWS_SQL)
+        .bind(repo_id)
+        .bind(path)
+        .fetch_all(db)
+        .await
+        .map_err(crate::api::handlers::db_err)
+}
+
+/// Whether any enabled scan policy applies to the repository. A read error
+/// answers `true`, which only costs the per-row policy evaluation.
+async fn scan_policy_applies(db: &PgPool, repo_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM scan_policies sp WHERE sp.is_enabled = true \
+           AND (sp.repository_id = $1 OR sp.repository_id IS NULL))",
     )
     .bind(repo_id)
-    .fetch_all(db)
+    .fetch_one(db)
     .await
-    .map_err(crate::api::handlers::db_err)?;
-    let now = chrono::Utc::now();
-    Ok(rows
-        .into_iter()
-        .filter(|r| {
-            crate::services::quarantine_service::check_download_allowed(
-                r.quarantine_status.as_deref(),
-                r.quarantine_until,
-                now,
-            )
-            .is_ok()
-        })
-        .filter_map(|r| {
-            let version = r.version?;
-            let metadata: PluginMetadata = r
-                .metadata
-                .and_then(|m| serde_json::from_value(m).ok())
-                .unwrap_or_default();
-            Some(IndexedVersion {
-                name: r.name,
-                version,
-                sha256: r.checksum_sha256,
-                size_bytes: r.size_bytes,
-                published_at: r.created_at,
-                metadata,
-            })
-        })
-        .collect())
+    .unwrap_or(true)
+}
+
+/// The download gate for one archive: quarantine and upload holds, then the
+/// scan policy (`block_unscanned`, `block_on_fail`, `max_severity`), exactly
+/// as `quarantine_service::enforce_download_gate` decides it. The download
+/// handler AND the index builder call this one function, so an index never
+/// advertises a version its download refuses (#5251 review M1).
+async fn archive_gate(
+    db: &PgPool,
+    repo_id: Uuid,
+    row: &ArchiveRow,
+    policy_applies: bool,
+) -> crate::error::Result<()> {
+    crate::services::quarantine_service::enforce_download_gate_for_row(
+        db,
+        &crate::services::quarantine_service::DownloadGateRow {
+            artifact_id: row.id,
+            repository_id: repo_id,
+            quarantine_status: row.quarantine_status.as_deref(),
+            quarantine_until: row.quarantine_until,
+            scan_policy_applies: policy_applies,
+        },
+    )
+    .await
+}
+
+/// Every servable version in the repository: native archive rows whose
+/// download the gate would allow. A refused version is left out before the
+/// documents pick each plugin's latest version, so the newest version that
+/// can actually be downloaded is the one advertised.
+async fn servable_versions(db: &PgPool, repo_id: Uuid) -> Result<Vec<IndexedVersion>, Response> {
+    let rows = archive_rows(db, repo_id, None).await?;
+    let policy_applies = scan_policy_applies(db, repo_id).await;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if ap::parse_semver(&row.version).is_err()
+            || archive_gate(db, repo_id, &row, policy_applies)
+                .await
+                .is_err()
+        {
+            continue;
+        }
+        let Ok(metadata) = serde_json::from_value::<PluginMetadata>(row.metadata) else {
+            continue;
+        };
+        out.push(IndexedVersion {
+            name: row.name,
+            version: row.version,
+            sha256: row.checksum_sha256,
+            size_bytes: row.size_bytes,
+            published_at: row.created_at,
+            metadata,
+        });
+    }
+    Ok(out)
 }
 
 async fn repo_description(db: &PgPool, repo_id: Uuid) -> Option<String> {
@@ -358,14 +414,6 @@ async fn versions_index_with_token(
 // GET / HEAD the zip
 // ---------------------------------------------------------------------------
 
-#[derive(sqlx::FromRow)]
-struct StoredArchive {
-    id: Uuid,
-    size_bytes: i64,
-    checksum_sha256: String,
-    storage_key: String,
-}
-
 /// Serve a stored archive.
 ///
 /// The body is ALWAYS streamed from storage by this handler, never answered
@@ -386,18 +434,13 @@ async fn serve_download(
         return Err(not_found("Plugin archive"));
     }
     let path = ap::artifact_path(&name, &version);
-    let artifact = sqlx::query_as::<_, StoredArchive>(
-        "SELECT id, size_bytes, checksum_sha256, storage_key FROM artifacts \
-         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
-    )
-    .bind(repo.id)
-    .bind(&path)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(crate::api::handlers::db_err)?
-    .ok_or_else(|| not_found("Plugin archive"))?;
-
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id)
+    let artifact = archive_rows(&state.db, repo.id, Some(&path))
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| not_found("Plugin archive"))?;
+    let policy_applies = scan_policy_applies(&state.db, repo.id).await;
+    archive_gate(&state.db, repo.id, &artifact, policy_applies)
         .await
         .map_err(|e| e.into_response())?;
 
@@ -458,6 +501,24 @@ async fn download_with_token(
 // ---------------------------------------------------------------------------
 // PUT the zip (publish)
 // ---------------------------------------------------------------------------
+
+/// Delete a stored object no artifact row references (the leftover of a
+/// publish that did not commit). Best-effort.
+async fn discard_unreferenced_object(state: &SharedState, repo: &RepoInfo, storage_key: &str) {
+    let referenced: Option<bool> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 AND storage_key = $2)",
+    )
+    .bind(repo.id)
+    .bind(storage_key)
+    .fetch_one(&state.db)
+    .await
+    .ok();
+    if referenced == Some(false) {
+        if let Ok(storage) = state.storage_for_repo(&repo.storage_location()) {
+            let _ = storage.delete(storage_key).await;
+        }
+    }
+}
 
 /// Read the optional `X-Checksum-Sha256` header, lowercased.
 fn declared_checksum(headers: &HeaderMap) -> Option<String> {
@@ -532,16 +593,29 @@ async fn publish_plugin(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
-    // Versions are immutable (D6): refuse before reading the body.
-    let ensure_unique = || {
-        proxy_helpers::ensure_unique_artifact_path(
-            &state.db,
-            repo.id,
-            &artifact_path,
-            "Plugin version already exists; published versions are immutable",
+    // Versions are immutable (D6): refuse before reading the body. This check
+    // does not touch a trashed version; the trash entry is only purged once
+    // the upload has validated (review L2).
+    let already_published = || async {
+        let live: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 \
+             AND is_deleted = false",
         )
+        .bind(repo.id)
+        .bind(&artifact_path)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+        match live {
+            Some(_) => Err((
+                StatusCode::CONFLICT,
+                "Plugin version already exists; published versions are immutable",
+            )
+                .into_response()),
+            None => Ok(()),
+        }
     };
-    ensure_unique().await?;
+    already_published().await?;
 
     // Stream the body to a bounded staging area while hashing it (#1608).
     let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
@@ -571,7 +645,28 @@ async fn publish_plugin(
     meta.sha256 = digests.sha256.clone();
     meta.size_bytes = size_bytes;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // A deleted version stays immutable (review L3): only the identical bytes
+    // may be re-published (an idempotent restore), because Claude Code only
+    // re-downloads when the version string changes.
+    super::cleanup_soft_deleted_artifact_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::AgentPlugins,
+        repo.id,
+        &artifact_path,
+        &digests.sha256,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::error::AppError::Conflict(_) => (
+            StatusCode::CONFLICT,
+            format!(
+                "{name} {version} was deleted; a deleted version can only be re-published \
+                 with identical content. Publish a new version instead"
+            ),
+        )
+            .into_response(),
+        other => other.into_response(),
+    })?;
 
     // Content-addressed key: a concurrent publish of different bytes to the
     // same version cannot overwrite the object the winning row points at.
@@ -586,34 +681,61 @@ async fn publish_plugin(
     )
     .await?;
 
-    // Quota admission and the upload hold run inside `insert_artifact`.
-    let inserted = proxy_helpers::insert_artifact(
-        &state.db,
-        proxy_helpers::NewArtifact {
-            repository_id: repo.id,
-            path: &artifact_path,
-            name: &name,
-            version: &version,
+    // The row and its metadata commit together, inside the transaction that
+    // admits the publish against the quotas: the harness tags decide which
+    // documents list the version, so a row without them must never be
+    // visible (review L1).
+    let stored = serde_json::to_value(&meta).unwrap_or_default();
+    let committed: Result<Uuid, Response> = async {
+        let mut tx = super::publish_quota::begin_admitted_publish(
+            &state.db,
+            repo.id,
+            &artifact_path,
             size_bytes,
-            checksum_sha256: &digests.sha256,
-            content_type: "application/zip",
-            storage_key: &storage_key,
-            uploaded_by: user_id,
-        },
-    )
+        )
+        .await?;
+        let id = proxy_helpers::insert_artifact_row(
+            &mut tx,
+            proxy_helpers::NewArtifact {
+                repository_id: repo.id,
+                path: &artifact_path,
+                name: &name,
+                version: &version,
+                size_bytes,
+                checksum_sha256: &digests.sha256,
+                content_type: "application/zip",
+                storage_key: &storage_key,
+                uploaded_by: user_id,
+            },
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, $2, $3)",
+        )
+        .bind(id)
+        .bind(FORMAT_KEY)
+        .bind(&stored)
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
+        tx.commit().await.map_err(crate::api::handlers::db_err)?;
+        Ok(id)
+    }
     .await;
-    let artifact_id = match inserted {
+    let artifact_id = match committed {
         Ok(id) => id,
-        // Lost a race with a concurrent publish of the same version.
         Err(resp) => {
-            ensure_unique().await?;
+            // Nothing committed: drop the object this attempt wrote unless a
+            // row (a concurrent publish of the identical bytes) uses it, then
+            // answer the lost race as the 409 it is (review L8).
+            discard_unreferenced_object(&state, &repo, &storage_key).await;
+            already_published().await?;
             return Err(resp);
         }
     };
-
-    let stored = serde_json::to_value(&meta).unwrap_or_default();
-    proxy_helpers::record_artifact_metadata(&state.db, artifact_id, repo.id, FORMAT_KEY, &stored)
+    crate::services::quarantine_service::apply_upload_hold_hosted(&state.db, repo.id, artifact_id)
         .await;
+
     crate::services::scanner_service::trigger_scan_on_upload(
         &state.db,
         state.scanner_service.clone(),
@@ -891,6 +1013,12 @@ mod tests {
                 None,
             ),
             ("bad semver", "p/1.0/p-1.0.zip".into(), ok.clone(), None),
+            (
+                "build metadata",
+                "p/1.0.0+hotfix/p-1.0.0+hotfix.zip".into(),
+                ok.clone(),
+                None,
+            ),
             ("bad slug", "P/1.0.0/P-1.0.0.zip".into(), ok.clone(), None),
             (
                 "wrong filename",
@@ -1088,10 +1216,61 @@ mod tests {
         assert_eq!(plugin_names(&after_delete), Vec::<String>::new());
     }
 
-    /// Token routes: 200 with an authenticated caller, archive URLs keep the
-    /// `/t/{token}/` prefix, `private, no-store`; 401 without a caller.
+    /// The production composition: the router nested at `/agentplugins`
+    /// under `repo_visibility_middleware`, so path tokens are really
+    /// validated.
+    fn full_stack(state: &crate::api::SharedState) -> Router {
+        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        let vis = RepoVisibilityState {
+            auth_service: std::sync::Arc::new(crate::services::auth_service::AuthService::new(
+                state.db.clone(),
+                std::sync::Arc::new(state.config.clone()),
+            )),
+            db: state.db.clone(),
+            repo_cache: state.repo_cache.clone(),
+            repo_miss_cache: state.repo_miss_cache.clone(),
+            permission_service: state.permission_service.clone(),
+        };
+        Router::new()
+            .nest("/agentplugins", super::router())
+            .layer(axum::middleware::from_fn_with_state(
+                vis,
+                repo_visibility_middleware,
+            ))
+            .with_state(state.clone())
+    }
+
+    /// Mint a read token for `user_id`, restricted to `repo_id` exactly as
+    /// `POST /api/v1/repositories/{key}/tokens` does.
+    async fn repo_read_token(fx: &tdh::Fixture, repo_id: Uuid, name: &str) -> (String, Uuid) {
+        let auth = crate::services::auth_service::AuthService::new(
+            fx.pool.clone(),
+            std::sync::Arc::new(fx.state.config.clone()),
+        );
+        let (token, id) = auth
+            .generate_api_token(fx.user_id, name, vec!["read:artifacts".into()], Some(30))
+            .await
+            .expect("mint token");
+        sqlx::query("UPDATE api_tokens SET repository_restricted = true WHERE id = $1")
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_token_repositories (token_id, repo_id) VALUES ($1, $2)")
+            .bind(id)
+            .bind(repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        (token, id)
+    }
+
+    /// Token routes through the real visibility middleware on a private
+    /// repository: a valid repository-scoped token reads documents and
+    /// archives (URLs keep the prefix, `private, no-store`); a bogus,
+    /// expired, revoked or other-repository token is refused.
     #[tokio::test]
-    async fn token_routes_5251() {
+    async fn token_routes_validate_real_tokens_5251() {
         let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
             return;
         };
@@ -1103,39 +1282,67 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+        sqlx::query("UPDATE repositories SET visibility = 'private' WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let (other_id, _, other_dir) = tdh::create_repo(&fx.pool, "local", "agentplugins").await;
+        let (valid, _) = repo_read_token(&fx, fx.repo_id, "ap-valid").await;
+        let (expired, expired_id) = repo_read_token(&fx, fx.repo_id, "ap-expired").await;
+        let (revoked, revoked_id) = repo_read_token(&fx, fx.repo_id, "ap-revoked").await;
+        let (elsewhere, _) = repo_read_token(&fx, other_id, "ap-elsewhere").await;
+        sqlx::query("UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 day' WHERE id = $1")
+            .bind(expired_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+            .bind(revoked_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+
+        let app = full_stack(&fx.state);
         let key = fx.repo_key.clone();
-        let doc_uri = format!("/t/ak_tok/{key}/claude-marketplace.json");
-        let (ok, body, headers) = tdh::send_with_headers(
-            fx.router_with_auth(super::router()),
-            tdh::get(doc_uri.clone()),
-        )
-        .await;
+        let doc = |t: &str| format!("/agentplugins/t/{t}/{key}/claude-marketplace.json");
+        let (ok, body, headers) = tdh::send_with_headers(app.clone(), tdh::get(doc(&valid))).await;
         let (idx, _) = tdh::send(
-            fx.router_with_auth(super::router()),
-            tdh::get(format!("/t/ak_tok/{key}/deploy-tools/index.json")),
-        )
-        .await;
-        let (dl, _) = tdh::send(
-            fx.router_with_auth(super::router()),
+            app.clone(),
             tdh::get(format!(
-                "/t/ak_tok/{key}/deploy-tools/1.0.0/deploy-tools-1.0.0.zip"
+                "/agentplugins/t/{valid}/{key}/deploy-tools/index.json"
             )),
         )
         .await;
-        let (anon, _, anon_headers) =
-            tdh::send_with_headers(fx.router_anon(super::router()), tdh::get(doc_uri)).await;
-        let (anon_idx, _) = tdh::send(
-            fx.router_anon(super::router()),
-            tdh::get(format!("/t/ak_tok/{key}/deploy-tools/index.json")),
-        )
-        .await;
-        let (anon_dl, _) = tdh::send(
-            fx.router_anon(super::router()),
+        let (dl, dl_body) = tdh::send(
+            app.clone(),
             tdh::get(format!(
-                "/t/ak_tok/{key}/deploy-tools/1.0.0/deploy-tools-1.0.0.zip"
+                "/agentplugins/t/{valid}/{key}/deploy-tools/1.0.0/deploy-tools-1.0.0.zip"
             )),
         )
         .await;
+        let mut refused = Vec::new();
+        for (label, t) in [
+            ("bogus", "ak_not_a_real_token".to_string()),
+            ("expired", expired),
+            ("revoked", revoked),
+            ("other repository", elsewhere),
+        ] {
+            refused.push((label, tdh::send(app.clone(), tdh::get(doc(&t))).await.0));
+        }
+        let (anon, _) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/agentplugins/{key}/claude-marketplace.json")),
+        )
+        .await;
+        // Without the middleware (a misrouted request), a token route with no
+        // authenticated caller still refuses.
+        let (bare, _) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/t/x/{key}/claude-marketplace.json")),
+        )
+        .await;
+        tdh::cleanup_member_repo(&fx.pool, other_id, &other_dir).await;
         fx.teardown().await;
 
         assert_eq!(ok, StatusCode::OK);
@@ -1144,14 +1351,240 @@ mod tests {
         let doc: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             doc["plugins"][0]["source"]["url"],
-            format!("http://localhost/agentplugins/t/ak_tok/{key}/deploy-tools/1.0.0/deploy-tools-1.0.0.zip")
+            format!(
+                "http://localhost/agentplugins/t/{valid}/{key}/deploy-tools/1.0.0/deploy-tools-1.0.0.zip"
+            )
         );
         assert_eq!(idx, StatusCode::OK);
         assert_eq!(dl, StatusCode::OK);
+        assert!(!dl_body.is_empty());
+        for (label, status) in refused {
+            assert!(
+                matches!(status, StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND),
+                "{label} token must be refused, got {status}"
+            );
+        }
         assert_eq!(anon, StatusCode::UNAUTHORIZED);
-        assert_eq!(anon_headers[CACHE_CONTROL], "private, no-store");
-        assert_eq!(anon_idx, StatusCode::UNAUTHORIZED);
-        assert_eq!(anon_dl, StatusCode::UNAUTHORIZED);
+        assert_eq!(bare, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Review M1: with a `block_unscanned` policy the freshly published (never
+    /// scanned) version is refused by the download gate, so no index lists
+    /// it; once it is allowed again it is advertised as latest.
+    #[tokio::test]
+    async fn index_skips_versions_the_scan_policy_refuses_5251() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let (s1, _) = publish(&fx, "p", "1.0.0", claude_zip("p", "1.0.0")).await;
+        // Treat 1.0.0 as scanned clean: the policy then lets it through.
+        sqlx::query(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, \
+             findings_count, critical_count, high_count, medium_count, low_count, info_count, \
+             completed_at) \
+             SELECT id, repository_id, 'dependency', 'completed', 0, 0, 0, 0, 0, 0, NOW() \
+             FROM artifacts WHERE repository_id = $1 AND version = '1.0.0'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("record a clean scan for 1.0.0");
+        let policy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, \
+             block_on_fail, is_enabled) VALUES ($1, $2, 'critical', true, false, true) RETURNING id",
+        )
+        .bind(format!("ap-5251-{}", Uuid::new_v4()))
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("create block_unscanned policy");
+        let (s2, _) = publish(&fx, "p", "1.1.0", claude_zip("p", "1.1.0")).await;
+        let app = || fx.router_anon(super::router());
+        let key = fx.repo_key.clone();
+        let (dl_new, _) = tdh::send(app(), tdh::get(format!("/{key}/p/1.1.0/p-1.1.0.zip"))).await;
+        let (dl_old, _) = tdh::send(app(), tdh::get(format!("/{key}/p/1.0.0/p-1.0.0.zip"))).await;
+        let (_, claude) = get_json(app(), format!("/{key}/claude-marketplace.json")).await;
+        let (_, idx) = get_json(app(), format!("/{key}/p/index.json")).await;
+        sqlx::query("DELETE FROM scan_policies WHERE id = $1")
+            .bind(policy_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let (_, after) = get_json(app(), format!("/{key}/claude-marketplace.json")).await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!((s1, s2), (StatusCode::CREATED, StatusCode::CREATED));
+        assert_eq!(dl_new, StatusCode::FORBIDDEN, "unscanned 1.1.0 is refused");
+        assert_eq!(dl_old, StatusCode::OK, "scanned 1.0.0 is served");
+        assert_eq!(claude["plugins"][0]["version"], "1.0.0");
+        assert_eq!(idx["latest"], "1.0.0");
+        assert_eq!(idx["versions"].as_array().unwrap().len(), 1);
+        assert_eq!(after["plugins"][0]["version"], "1.1.0");
+    }
+
+    /// Review M2: rows a native publish did not write (no agentplugins
+    /// metadata, or a path other than the canonical one) are neither indexed
+    /// nor downloaded, and the index is stable across reads.
+    #[tokio::test]
+    async fn only_native_rows_are_indexed_and_served_5251() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let (s1, published) = publish(&fx, "hello", "1.0.0", claude_zip("hello", "1.0.0")).await;
+        let repo = fx.repo_info("local", None);
+        let traversal = test_zip(&[(".claude-plugin/plugin.json", b"{}"), ("../evil", b"x")]);
+        // (A) a generic upload at the canonical path of an unpublished version.
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "generic/hello-2.0.0.zip",
+            "hello/2.0.0/hello-2.0.0.zip",
+            "hello",
+            "2.0.0",
+            "application/zip",
+            Bytes::from(traversal.clone()),
+            fx.user_id,
+        )
+        .await;
+        // (B) a second row with the same coordinates under another file name,
+        // even carrying agentplugins metadata.
+        let other = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "generic/other.zip",
+            "hello/1.0.0/other.zip",
+            "hello",
+            "1.0.0",
+            "application/zip",
+            Bytes::from(traversal),
+            fx.user_id,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             VALUES ($1, 'agentplugins', '{\"harnesses\":[\"claude\"]}')",
+        )
+        .bind(other)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let app = || fx.router_anon(super::router());
+        let key = fx.repo_key.clone();
+        let (_, idx) = get_json(app(), format!("/{key}/hello/index.json")).await;
+        let mut etags = std::collections::BTreeSet::new();
+        for _ in 0..4 {
+            let (_, _, h) =
+                tdh::send_with_headers(app(), tdh::get(format!("/{key}/marketplace.json"))).await;
+            etags.insert(h[ETAG].to_str().unwrap().to_string());
+        }
+        let (_, all) = get_json(app(), format!("/{key}/marketplace.json")).await;
+        let (dl_foreign, _) = tdh::send(
+            app(),
+            tdh::get(format!("/{key}/hello/2.0.0/hello-2.0.0.zip")),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(
+            idx["latest"], "1.0.0",
+            "the generic 2.0.0 row is not a version"
+        );
+        assert_eq!(idx["versions"].as_array().unwrap().len(), 1);
+        assert_eq!(idx["versions"][0]["sha256"], published["sha256"]);
+        assert_eq!(all["plugins"][0]["source"]["sha256"], published["sha256"]);
+        assert_eq!(etags.len(), 1, "the index must be stable across reads");
+        assert_eq!(dl_foreign, StatusCode::NOT_FOUND);
+    }
+
+    /// Review L2 and L3: a refused publish leaves a trashed version in the
+    /// trash; a deleted version can be restored with identical bytes but not
+    /// replaced with different ones.
+    #[tokio::test]
+    async fn deleted_versions_stay_immutable_5251() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let original = claude_zip("p", "1.0.0");
+        let (s1, _) = publish(&fx, "p", "1.0.0", original.clone()).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        let (empty, _) = publish(&fx, "p", "1.0.0", Vec::new()).await;
+        let trashed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = true",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        let changed = test_zip(&[
+            (".claude-plugin/plugin.json", br#"{"name":"p"}"#),
+            ("commands/new.md", b"# new"),
+        ]);
+        let (different, different_body) = publish(&fx, "p", "1.0.0", changed).await;
+        let (identical, _) = publish(&fx, "p", "1.0.0", original).await;
+        fx.teardown().await;
+
+        assert_eq!(s1, StatusCode::CREATED);
+        assert_eq!(empty, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            trashed, 1,
+            "a refused publish must not purge the trash entry"
+        );
+        assert_eq!(different, StatusCode::CONFLICT, "{different_body}");
+        assert!(different_body
+            .as_str()
+            .unwrap_or_default()
+            .contains("Publish a new version instead"));
+        assert_eq!(
+            identical,
+            StatusCode::CREATED,
+            "identical bytes restore the version"
+        );
+    }
+
+    /// Review L8: a publish that did not commit removes its own object, but
+    /// never one a row still references.
+    #[tokio::test]
+    async fn uncommitted_publish_objects_are_discarded_5251() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let storage = fx.state.storage_for_repo(&repo.storage_location()).unwrap();
+        storage
+            .put("agentplugins/orphan", Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            "agentplugins/kept",
+            "p/1.0.0/p-1.0.0.zip",
+            "p",
+            "1.0.0",
+            "application/zip",
+            Bytes::from_static(b"y"),
+            fx.user_id,
+        )
+        .await;
+        discard_unreferenced_object(&fx.state, &repo, "agentplugins/orphan").await;
+        discard_unreferenced_object(&fx.state, &repo, "agentplugins/kept").await;
+        let orphan = storage.exists("agentplugins/orphan").await.unwrap_or(true);
+        let kept = storage.exists("agentplugins/kept").await.unwrap_or(false);
+        fx.teardown().await;
+        assert!(!orphan, "an unreferenced object is removed");
+        assert!(kept, "a referenced object is kept");
     }
 
     /// Non-hosted repositories are refused on every route (D3).
