@@ -9085,6 +9085,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         #[allow(clippy::disallowed_methods)]
         // streaming-invariant: test helper exempt — buffering a small error body in a test assertion is not an artifact path (#1608)
@@ -9142,6 +9143,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.storage_path, "/data/vscode-local");
         assert_eq!(repo.repo_type, "hosted");
@@ -9166,6 +9168,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert!(repo.upstream_url.is_some());

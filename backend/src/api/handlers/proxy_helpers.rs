@@ -405,6 +405,9 @@ pub struct RepoInfo {
     pub age_gate_mode: String,
     pub curation_enabled: bool,
     pub curation_default_action: String,
+    /// Per-repository mutability (#5188). When true, a file-drop upload to an
+    /// occupied path replaces the content instead of returning 409.
+    pub allow_overwrite: bool,
 }
 
 impl RepoInfo {
@@ -452,7 +455,7 @@ pub async fn resolve_repo_by_key(
         "SELECT id, key, storage_backend, storage_path, format::text as format, \
          repo_type::text as repo_type, upstream_url, promotion_only, \
          age_gate_enabled, age_gate_min_age_days, age_gate_mode, \
-         curation_enabled, curation_default_action \
+         curation_enabled, curation_default_action, allow_overwrite \
          FROM repositories WHERE key = $1",
     )
     .bind(repo_key)
@@ -495,6 +498,7 @@ pub async fn resolve_repo_by_key(
         curation_default_action: repo
             .try_get("curation_default_action")
             .unwrap_or_else(|_| "allow".to_string()),
+        allow_overwrite: repo.try_get("allow_overwrite").unwrap_or(false),
     })
 }
 
@@ -5544,6 +5548,7 @@ pub fn repo_info_from_member(m: &crate::models::repository::Repository) -> RepoI
         age_gate_mode: "upstream_publish_time".to_string(),
         curation_enabled: m.curation_enabled,
         curation_default_action: m.curation_default_action.clone(),
+        allow_overwrite: m.allow_overwrite,
     }
 }
 
@@ -9702,6 +9707,26 @@ pub async fn ensure_unique_artifact_path(
     artifact_path: &str,
     conflict_message: &str,
 ) -> Result<(), Response> {
+    ensure_unique_artifact_path_mutable(db, repo_id, artifact_path, conflict_message, false).await
+}
+
+/// [`ensure_unique_artifact_path`] for file-drop formats that carry their own
+/// publish-time 409 (Debian/RPM/Alpine/Pacman). When `allow_overwrite` is true
+/// the path's live row is treated as replaceable: the duplicate 409 is skipped
+/// and the existing live row is removed so the caller's INSERT does not trip the
+/// `UNIQUE(repository_id, path)` constraint and replaces the content at the path
+/// (#5188). These formats key storage by path (alpine/pacman) or content-address
+/// with an `ON CONFLICT DO UPDATE` upsert (rpm), so the prior object is either
+/// overwritten in place or handed to storage GC's candidate sweep. Default
+/// `false` keeps every other caller write-once.
+#[allow(clippy::result_large_err)]
+pub async fn ensure_unique_artifact_path_mutable(
+    db: &PgPool,
+    repo_id: Uuid,
+    artifact_path: &str,
+    conflict_message: &str,
+    allow_overwrite: bool,
+) -> Result<(), Response> {
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
     )
@@ -9712,7 +9737,19 @@ pub async fn ensure_unique_artifact_path(
     .map_err(|e| internal_error("Database", e))?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
+        if !allow_overwrite {
+            return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
+        }
+        // Mutable repo: drop the live row so the re-upload's INSERT replaces it
+        // instead of colliding on UNIQUE(repository_id, path).
+        sqlx::query(
+            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(artifact_path)
+        .execute(db)
+        .await
+        .map_err(|e| internal_error("Database", e))?;
     }
 
     super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
@@ -19464,6 +19501,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 
@@ -20202,6 +20240,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let loc = info.storage_location();
         assert_eq!(loc.backend, "filesystem");
@@ -22380,6 +22419,68 @@ mod tests {
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
 
+    // #5188: a mutable (allow_overwrite) file-drop repo must NOT 409 on a
+    // re-upload to an occupied path, and must drop the live row so the
+    // caller's INSERT replaces it instead of colliding on UNIQUE(path).
+    #[tokio::test]
+    async fn test_ensure_unique_artifact_path_mutable_replaces_live_row() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (repo_id, _, _) = db_helpers::create_repo(&pool, "local", "alpine").await;
+
+        let path = "x86_64/pkg-1.0.0.apk";
+        let live = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path,
+                name: "pkg",
+                version: "1.0.0",
+                size_bytes: 1,
+                checksum_sha256: "a",
+                content_type: "application/vnd.alpine.package",
+                storage_key: "alpine/pkg/1.0.0",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert");
+
+        // allow_overwrite = false → still 409.
+        let err = ensure_unique_artifact_path_mutable(
+            &pool,
+            repo_id,
+            path,
+            "Package already exists",
+            false,
+        )
+        .await
+        .expect_err("conflict expected when immutable");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+
+        // allow_overwrite = true → passes AND the prior live row is gone.
+        ensure_unique_artifact_path_mutable(&pool, repo_id, path, "Package already exists", true)
+            .await
+            .expect("mutable repo must not conflict");
+
+        let still_live: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&pool)
+        .await
+        .expect("query");
+        assert!(
+            still_live != Some(live),
+            "the superseded live row must be removed so the re-upload's INSERT does not collide"
+        );
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
     // ── put_artifact_bytes + serve_local_artifact roundtrip ─────────────
 
     #[tokio::test]
@@ -22406,6 +22507,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let bytes = Bytes::from_static(b"package-data");
@@ -22528,6 +22630,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let payload = b"streamed-artifact-body".repeat(64);
@@ -22697,6 +22800,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let opts = DownloadResponseOpts {
@@ -22749,6 +22853,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         // state.proxy_service is None: should short-circuit to Ok(None).
@@ -22802,6 +22907,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
 
         let opts = DownloadResponseOpts {
@@ -22856,6 +22962,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let bytes = Bytes::from_static(b"abc123");
         put_artifact_bytes(&state, &repo, "pypi/foo/1.0/foo.whl", bytes.clone())
@@ -22923,6 +23030,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let bytes = Bytes::from_static(b"rpmbytes");
         put_artifact_bytes(&state, &repo, "rpm/ab.rpm", bytes.clone())
@@ -22991,6 +23099,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let bytes = Bytes::from_static(b"dirbytes");
         put_artifact_bytes(&state, &repo, "rpm/packages/hello.rpm", bytes.clone())
@@ -27570,6 +27679,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         let params = age_gate_params(&info);
         assert!(params.age_gate_enabled);
@@ -28235,6 +28345,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 
