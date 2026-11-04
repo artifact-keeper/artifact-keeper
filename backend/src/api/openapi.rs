@@ -229,6 +229,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             handlers::dependency_track::DependencyTrackApiDoc::openapi(),
         ),
         ("peer", handlers::peer::PeerApiDoc::openapi()),
+        (
+            "mcp_remote",
+            handlers::mcp_remote::McpRemoteApiDoc::openapi(),
+        ),
         ("transfer", handlers::transfer::TransferApiDoc::openapi()),
         ("tree", handlers::tree::TreeApiDoc::openapi()),
         (

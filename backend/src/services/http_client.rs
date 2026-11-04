@@ -265,7 +265,7 @@ pub async fn read_json_capped<T: serde::de::DeserializeOwned>(
 
 /// The body-reading half of [`read_json_capped`]: the response bytes, or an
 /// error once they would exceed `max_bytes`.
-async fn read_body_capped(
+pub(crate) async fn read_body_capped(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, String> {

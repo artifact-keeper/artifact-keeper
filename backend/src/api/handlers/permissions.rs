@@ -508,12 +508,21 @@ pub async fn create_permission(
     state
         .event_bus
         .emit("permission.created", permission.id, None);
+    let snapshot = permission_rule_audit_snapshot(&permission);
+    crate::services::mcp_namespaces::audit_grant_change(
+        &state.db,
+        &auth,
+        permission.id,
+        None,
+        Some(&snapshot),
+    )
+    .await;
     audit_permission_rule(
         &state,
         &auth,
         AuditAction::PermissionRuleCreated,
         permission.id,
-        permission_rule_audit_snapshot(&permission),
+        snapshot,
     )
     .await;
 
@@ -669,6 +678,14 @@ pub async fn update_permission(
         .emit("permission.updated", permission.id, None);
     let before = permission_rule_audit_snapshot(&before);
     let after = permission_rule_audit_snapshot(&permission);
+    crate::services::mcp_namespaces::audit_grant_change(
+        &state.db,
+        &auth,
+        permission.id,
+        Some(&before),
+        Some(&after),
+    )
+    .await;
     audit_permission_rule(
         &state,
         &auth,
@@ -736,14 +753,17 @@ pub async fn delete_permission(
 
     state.permission_service.invalidate_cache();
     state.event_bus.emit("permission.deleted", id, None);
+    let removed = removed
+        .as_ref()
+        .map_or(serde_json::Value::Null, permission_rule_audit_snapshot);
+    crate::services::mcp_namespaces::audit_grant_change(&state.db, &auth, id, Some(&removed), None)
+        .await;
     audit_permission_rule(
         &state,
         &auth,
         AuditAction::PermissionRuleDeleted,
         id,
-        removed
-            .as_ref()
-            .map_or(serde_json::Value::Null, permission_rule_audit_snapshot),
+        removed,
     )
     .await;
 

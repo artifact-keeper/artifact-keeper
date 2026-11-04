@@ -68,6 +68,12 @@ pub struct PermissionConditions {
     /// for the rule to apply. `None` (absent) means no IP restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// MCP server-name patterns (#5253): on an MCP registry write the rule
+    /// applies only to server names matching one of them; patterns may
+    /// interpolate CI OIDC claims (`io.github.{repository_owner}/*`). See
+    /// `services::mcp_namespaces`. Ignored by every other check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_namespaces: Option<Vec<String>>,
 }
 
 impl PermissionConditions {
@@ -85,6 +91,9 @@ impl PermissionConditions {
                 crate::api::middleware::rate_limit::CidrRange::parse(cidr)
                     .map_err(|e| AppError::Validation(format!("conditions.allowed_cidrs: {e}")))?;
             }
+        }
+        if let Some(patterns) = &self.mcp_namespaces {
+            crate::services::mcp_namespaces::validate_patterns(patterns)?;
         }
         Ok(())
     }
@@ -2982,6 +2991,7 @@ mod tests {
         assert!(PermissionConditions::default().validate().is_ok());
         let ok = PermissionConditions {
             allowed_cidrs: Some(vec!["10.0.0.0/8".to_string(), "fc00::/7".to_string()]),
+            ..Default::default()
         };
         assert!(ok.validate().is_ok());
     }
@@ -2990,6 +3000,7 @@ mod tests {
     fn test_conditions_validate_rejects_empty_cidr_list() {
         let empty = PermissionConditions {
             allowed_cidrs: Some(vec![]),
+            ..Default::default()
         };
         let err = empty.validate().unwrap_err();
         assert!(
@@ -3003,10 +3014,29 @@ mod tests {
         for bad in ["10.0.0.0/33", "not-a-cidr", "10.0.0.0/x"] {
             let c = PermissionConditions {
                 allowed_cidrs: Some(vec![bad.to_string()]),
+                ..Default::default()
             };
             assert!(
                 matches!(c.validate(), Err(AppError::Validation(_))),
                 "{bad} must fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conditions_validate_mcp_namespaces() {
+        let ok: PermissionConditions =
+            serde_json::from_str(r#"{"mcp_namespaces": ["io.github.{repository_owner}/*"]}"#)
+                .unwrap();
+        assert!(ok.validate().is_ok());
+        for bad in [
+            r#"{"mcp_namespaces": []}"#,
+            r#"{"mcp_namespaces": ["a b"]}"#,
+        ] {
+            let c: PermissionConditions = serde_json::from_str(bad).unwrap();
+            assert!(
+                matches!(c.validate(), Err(AppError::Validation(_))),
+                "{bad}"
             );
         }
     }
@@ -3023,6 +3053,7 @@ mod tests {
     fn test_conditions_round_trip_json_shape() {
         let c = PermissionConditions {
             allowed_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
+            ..Default::default()
         };
         assert_eq!(
             c.to_json(),

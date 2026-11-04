@@ -2473,8 +2473,22 @@ fn is_non_mutating_format_post(path: &str) -> bool {
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
         // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
         Some("npm") => is_npm_audit_tail(segments),
+        // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
+        Some("mcp") => is_mcp_validate_tail(segments),
         _ => false,
     }
+}
+
+/// `<repo_key>/v0/validate` or `<repo_key>/v0.1/validate` — the remaining
+/// segments of the MCP registry's dry-run validation path after the leading
+/// `mcp` (#5253). `mcp-publisher validate` posts a server.json there with no
+/// credential; the handler writes nothing and scopes what it checks to what
+/// the caller may read. Exact match only.
+fn is_mcp_validate_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && matches!(segments.next(), Some("v0" | "v0.1"))
+        && segments.next() == Some("validate")
+        && segments.next().is_none()
 }
 
 /// The strict subset of [`is_non_mutating_format_post`] that a **public**
@@ -2499,6 +2513,13 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 ///   `GET`s, so a public npm registry answered every audit with 401. The
 ///   handlers only look up advisories and never change AK state. Publish,
 ///   dist-tag and unpublish stay writes (they are `PUT`/`DELETE`).
+///
+/// * **MCP validate** — `POST /mcp/<repo_key>/{v0,v0.1}/validate` (#5253), the
+///   registry's dry run. `mcp-publisher validate` sends no credential; the
+///   handler writes nothing, and checks that depend on what the caller may
+///   read (version taken, package resolution) are skipped for an anonymous
+///   caller. A private registry still answers an anonymous caller 401, as
+///   every read does.
 ///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
@@ -2551,6 +2572,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
         // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
         Some("npm") => is_npm_audit_tail(segments),
+        // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
+        Some("mcp") => is_mcp_validate_tail(segments),
         _ => false,
     }
 }
@@ -9070,6 +9093,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_5253_mcp_validate_post_is_anonymous_readable_and_non_mutating() {
+        for path in ["/mcp/reg/v0/validate", "/mcp/reg/v0.1/validate"] {
+            assert!(is_anonymous_readable_format_post(path), "{path}");
+            assert!(is_non_mutating_format_post(path), "{path}");
+        }
+        for path in [
+            "/mcp/reg/v0.1/publish",
+            "/mcp/reg/v0.1/validate/",
+            "/mcp/reg/v0.2/validate",
+            "/mcp//v0.1/validate",
+            "/mcp/reg/validate",
+            "/mcp/reg/v0.1/servers/a/validate",
+            "/npm/reg/v0.1/validate",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_5253_mcp_validate_post_no_auth_passes_public_and_401s_private() {
+        let mcp = |is_public| CachedRepo {
+            format: "mcp".to_string(),
+            ..make_cached_repo(is_public)
+        };
+        for (key, public, want) in [
+            ("pubmcp", true, StatusCode::OK),
+            ("privmcp", false, StatusCode::UNAUTHORIZED),
+        ] {
+            let state = make_vis_state(Some((key.to_string(), mcp(public)))).await;
+            for v in ["v0", "v0.1"] {
+                let req = axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/mcp/{key}/{v}/validate"))
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap();
+                let resp = run_through_visibility(state.clone(), req).await;
+                assert_eq!(resp.status(), want, "{key} {v}");
+            }
+            // Publish stays an anonymous-write 401 on either.
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/mcp/{key}/v0.1/publish"))
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} publish");
+        }
+    }
+
     #[tokio::test]
     async fn test_4317_npm_audit_post_no_auth_passes_on_public_repo() {
         let state = make_vis_state(Some(("pubnpm".to_string(), npm_cached_repo(true)))).await;
@@ -9718,6 +9792,7 @@ mod tests {
             "/huggingface//api/models/m/upload/main",
             StatusCode::NOT_FOUND,
         ),
+        (Method::POST, "/mcp//v0.1/publish", StatusCode::NOT_FOUND),
         (
             Method::POST,
             "/jetbrains//plugin/uploadPlugin",

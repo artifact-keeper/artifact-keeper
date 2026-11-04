@@ -1115,6 +1115,28 @@ pub struct CreateRepositoryRequest {
     /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
     /// `false` for the default union semantics.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
+    /// must resolve to an artifact in a repository of this instance) or
+    /// `open` (packages stored and served verbatim, not gated). Stored in
+    /// `repository_config` under `mcp_package_policy`.
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): the backing repository key per `registryType`
+    /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
+    /// `{"npm": "npm-local", "oci": "docker-remote"}`. Stored under
+    /// `mcp_package_repos`.
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace prefixes a server name must start
+    /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
+    /// under `mcp_namespace_allow`.
+    pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
+    #[serde(flatten)]
+    #[schema(ignore)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591). Each entry is an exact
     /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
@@ -1403,6 +1425,28 @@ pub struct UpdateRepositoryRequest {
     /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
     /// Virtual repositories; omit to leave it unchanged.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
+    /// must resolve to an artifact in a repository of this instance) or
+    /// `open` (packages stored and served verbatim, not gated). Stored in
+    /// `repository_config` under `mcp_package_policy`.
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): the backing repository key per `registryType`
+    /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
+    /// `{"npm": "npm-local", "oci": "docker-remote"}`. Stored under
+    /// `mcp_package_repos`.
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace prefixes a server name must start
+    /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
+    /// under `mcp_namespace_allow`.
+    pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
+    #[serde(flatten)]
+    #[schema(ignore)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Replace the trusted cross-origin OCI Bearer token realms for this
     /// Remote repository (#3591); same rules as on create. Omit to leave the
     /// list unchanged; send `[]` to clear it and restore the strict
@@ -1601,6 +1645,31 @@ pub struct RepositoryResponse {
     /// repositories; omitted for every other repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): the package policy (`own-repos` / `open`).
+    /// Omitted for every other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): backing repository key per `registryType`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace allowlist (empty: any name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
+    #[serde(flatten)]
+    #[schema(ignore)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
+    /// MCP registries (#5253): whether the caller may set or clear the
+    /// instance locks (`mcp_remote_posture_locked`,
+    /// `mcp_probe_remotes_locked`) and change a locked setting: `true` only
+    /// for an instance administrator (repository administration is not
+    /// enough). Omitted for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_caller_can_lock: Option<bool>,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591), canonical origins. Omitted
     /// when none are configured (the strict same-origin default applies).
@@ -2069,6 +2138,11 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         npm_virtual_isolate_hosted_names: None,
+        mcp_package_policy: None,
+        mcp_package_repos: None,
+        mcp_namespace_allow: None,
+        mcp_settings: Default::default(),
+        mcp_caller_can_lock: None,
         oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
@@ -3311,6 +3385,55 @@ async fn apply_npm_scope_policy_config(
     Ok(())
 }
 
+/// `RepositoryResponse.mcp_caller_can_lock` (#5253): on an MCP registry,
+/// whether the caller is an instance administrator (only they may set the
+/// `*_locked` settings or change a locked one). Other formats: absent.
+fn with_mcp_caller(mut response: RepositoryResponse, instance_admin: bool) -> RepositoryResponse {
+    response.mcp_caller_can_lock = (response.format == "mcp").then_some(instance_admin);
+    response
+}
+
+/// Populate `RepositoryResponse.mcp_*` from `repository_config` (#5253). A
+/// no-op for non-MCP repositories. The policy echo is the effective policy
+/// (`own-repos` when unset).
+async fn with_mcp_settings(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &str,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    use crate::services::mcp_packages as mp;
+    if format != &RepositoryFormat::Mcp {
+        return Ok(response);
+    }
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config WHERE repository_id = $1 AND key = ANY($2)",
+    )
+    .bind(repo_id)
+    .bind([mp::POLICY_KEY, mp::REPOS_KEY, mp::NAMESPACE_ALLOW_KEY])
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let get = |k: &str| {
+        rows.iter()
+            .find(|(key, _)| key == k)
+            .and_then(|(_, v)| v.as_deref())
+    };
+    response.mcp_package_policy = Some(
+        get(mp::POLICY_KEY)
+            .and_then(crate::formats::mcp::PackagePolicy::parse)
+            .unwrap_or(crate::formats::mcp::PackagePolicy::OwnRepos)
+            .as_str()
+            .to_string(),
+    );
+    response.mcp_package_repos = get(mp::REPOS_KEY).and_then(|v| mp::parse_package_repos(v).ok());
+    response.mcp_namespace_allow =
+        get(mp::NAMESPACE_ALLOW_KEY).and_then(|v| mp::parse_namespace_allow(v).ok());
+    response.mcp_settings = crate::services::mcp_settings::load(db, repo_id, repo_type).await?;
+    Ok(response)
+}
+
 /// Populate `RepositoryResponse` npm scope-policy fields from
 /// `repository_config` (#2424) so create/get/update echo the stored policy.
 /// A no-op for non-npm-Remote repositories and for repositories with no stored
@@ -3326,7 +3449,8 @@ async fn with_npm_scope_policy(
 ) -> Result<RepositoryResponse> {
     // The npm Virtual isolate toggle (#3767) rides the same echo, so every
     // handler that round-trips the scope policy round-trips it too.
-    let mut response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
+    let response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
+    let mut response = with_mcp_settings(db, repo_id, repo_type.as_str(), format, response).await?;
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
         return Ok(response);
     }
@@ -3920,6 +4044,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "vagrant" => Ok(RepositoryFormat::Vagrant),
         "opkg" => Ok(RepositoryFormat::Opkg),
         "pacman" => Ok(RepositoryFormat::Pacman),
+        "mcp" => Ok(RepositoryFormat::Mcp),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
         "protobuf" => Ok(RepositoryFormat::Protobuf),
@@ -3966,7 +4091,7 @@ fn validate_format_supports_repo_type(
     if *format != RepositoryFormat::AgentPlugins {
         return Ok(());
     }
-    if !repo_type.is_hosted() {
+    if !crate::formats::supported_repo_types(format.handler_key()).contains(&repo_type.as_str()) {
         return Err(AppError::Validation(format!(
             "Agent Plugins repositories are hosted-only: repo_type {} is not supported \
              (use local)",
@@ -4317,6 +4442,27 @@ pub async fn create_repository(
         &format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // MCP registries (#5253): hosted only in this release, settings validated
+    // up-front for the same reason; persisted once `repo.id` exists.
+    crate::services::mcp_packages::creatable(&format, repo_type.as_str())
+        .map_err(|m| AppError::Validation(m.to_string()))?;
+    let mcp_settings = crate::services::mcp_packages::settings_to_store(
+        &state.db,
+        &auth,
+        &format,
+        payload.mcp_package_policy.as_deref(),
+        payload.mcp_package_repos.as_ref(),
+        payload.mcp_namespace_allow.as_deref(),
+        true,
+    )
+    .await?;
+    let mcp_extra = crate::services::mcp_settings::to_store(
+        &payload.mcp_settings,
+        &format,
+        repo_type.as_str(),
+        auth.is_admin,
+        Default::default(),
+    )?;
     // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
     // the same reason; persisted once `repo.id` exists.
     let oci_trusted_realms =
@@ -4564,6 +4710,9 @@ pub async fn create_repository(
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
+    for (key, value) in mcp_settings.iter().chain(&mcp_extra) {
+        upsert_repo_config(&state.db, repo.id, key, value).await?;
+    }
     if let Some(ref realms) = oci_trusted_realms {
         crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
             .await?;
@@ -4783,6 +4932,7 @@ pub async fn create_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
+    let response = with_mcp_caller(response, auth.is_admin);
     Ok(Json(response))
 }
 
@@ -4849,6 +4999,7 @@ pub async fn get_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
+    let response = with_mcp_caller(response, auth.as_ref().is_some_and(|a| a.is_admin));
     Ok(Json(response))
 }
 
@@ -5477,6 +5628,29 @@ pub async fn update_repository(
         &existing.format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // MCP registry settings (#5253): validated before the update.
+    let mcp_settings = crate::services::mcp_packages::settings_to_store(
+        &state.db,
+        &auth,
+        &existing.format,
+        payload.mcp_package_policy.as_deref(),
+        payload.mcp_package_repos.as_ref(),
+        payload.mcp_namespace_allow.as_deref(),
+        false,
+    )
+    .await?;
+    let mcp_extra = if payload.mcp_settings.is_empty() {
+        Vec::new()
+    } else {
+        let rows = crate::services::mcp_settings::load_rows(&state.db, existing.id).await?;
+        crate::services::mcp_settings::to_store(
+            &payload.mcp_settings,
+            &existing.format,
+            existing.repo_type.as_str(),
+            auth.is_admin,
+            crate::services::mcp_settings::locks_of(&rows),
+        )?
+    };
     // Trusted cross-origin OCI bearer realms (#3591): validated before the
     // update for the same reason. Writing them is gated by the repository
     // `admin` check above, like every other credential-routing setting.
@@ -5580,6 +5754,9 @@ pub async fn update_repository(
     }
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    for (key, value) in mcp_settings.iter().chain(&mcp_extra) {
+        upsert_repo_config(&state.db, repo.id, key, value).await?;
     }
     if let Some(ref realms) = oci_trusted_realms {
         crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
@@ -5903,6 +6080,7 @@ pub async fn update_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
+    let response = with_mcp_caller(response, auth.is_admin);
     Ok(Json(response))
 }
 
@@ -9992,6 +10170,7 @@ pub async fn upload_artifact(
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // #4186: refuse a conditional PUT whose precondition already fails
     // before reading its body. Not authoritative (the publishing transaction
@@ -10469,6 +10648,35 @@ pub(crate) async fn materialize_staged_for_repo<'a>(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
+/// MCP registries (#5253) accept a server version only through their publish
+/// route, which validates the document, applies the namespace policy and
+/// pins its packages. A generic write of `servers/<name>/<version>/...` would
+/// skip all of that (and squat the version), so the generic upload entry
+/// points refuse an MCP repository. A trusted peer replication (admin or
+/// service account) still lands, so MCP repositories replicate like any
+/// other.
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_generic_write_to_mcp(
+    format: &RepositoryFormat,
+    auth: &AuthExtension,
+    headers: &HeaderMap,
+) -> std::result::Result<(), Response> {
+    let trusted = replication_exemption_trusted(
+        super::is_replication_request(headers),
+        auth.is_admin,
+        auth.is_service_account,
+    );
+    if format == &RepositoryFormat::Mcp && !trusted {
+        return Err(AppError::Validation(
+            "MCP registries accept server versions only through \
+             POST /mcp/{repository}/v0.1/publish"
+                .to_string(),
+        )
+        .into_response());
+    }
+    Ok(())
+}
+
 pub(crate) async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
@@ -10852,6 +11060,7 @@ async fn upload_artifact_multipart_with_path(
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // The URL path is the artifact path unless empty, when the uploaded file
     // name is; either is known by the time the file field streams (#3916).
@@ -10901,6 +11110,7 @@ async fn upload_artifact_multipart(
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // The artifact path may arrive in a `path` field after the file, so the
     // file stages before its path is known (#3916).
@@ -17117,6 +17327,7 @@ mod tests {
             "protobuf",
             "pacman",
             "agentplugins",
+            "mcp",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
@@ -17342,6 +17553,11 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -17355,6 +17571,72 @@ mod tests {
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
         assert!(json.contains("\"promotion_only\":false"));
+    }
+
+    #[test]
+    fn test_mcp_caller_can_lock_only_on_mcp_and_only_for_instance_admins() {
+        let sample = || RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
+            repodata_mode: None,
+            versioning_enabled: false,
+            has_trusted_gpg_key: false,
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            key: "my-repo".to_string(),
+            name: "My Repo".to_string(),
+            description: Some("desc".to_string()),
+            format: "maven".to_string(),
+            format_key: None,
+            repo_type: "local".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
+            is_public: true,
+            allow_anonymous_access: true,
+            promotion_only: false,
+            storage_backend: "filesystem".to_string(),
+            storage_used_bytes: 1024,
+            member_storage_used_bytes: None,
+            quota_bytes: Some(1048576),
+            upstream_url: None,
+            upstream_url_has_credentials: false,
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
+            public_with_upstream_credentials: false,
+            allow_public_with_upstream_credentials: false,
+            quarantine_enabled: None,
+            quarantine_duration_minutes: None,
+            custom_user_agent: None,
+            project_id: None,
+            apt_origin: None,
+            apt_label: None,
+            apt_release_version: None,
+            apt_description: None,
+            npm_allowed_scopes: None,
+            npm_allow_unscoped: None,
+            npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
+            oci_trusted_bearer_realms: None,
+            debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let resp = sample();
+        assert_ne!(resp.format, "mcp");
+        assert_eq!(with_mcp_caller(resp, true).mcp_caller_can_lock, None);
+        let mut mcp = sample();
+        mcp.format = "mcp".into();
+        assert_eq!(with_mcp_caller(mcp, true).mcp_caller_can_lock, Some(true));
+        let mut mcp = sample();
+        mcp.format = "mcp".into();
+        let repo_admin = with_mcp_caller(mcp, false);
+        let json = serde_json::to_value(&repo_admin).unwrap();
+        assert_eq!(json["mcp_caller_can_lock"], false);
     }
 
     #[test]
@@ -18758,6 +19040,11 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -33237,6 +33524,11 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
