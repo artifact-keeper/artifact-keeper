@@ -24,6 +24,17 @@
 //! and that certificate must be valid at signing time. Whether the
 //! certificate chains to a trusted root is not decided here; the result
 //! records the signer, issuer, fingerprint and whether it is self-signed.
+//!
+//! Trust is an explicit allowlist: a verified signature is `valid` only
+//! when its certificate's SHA-256 fingerprint is listed in
+//! [`TRUSTED_SIGNERS_ENV`] (set by the instance operator); any other
+//! verified signature is `self_signed` -- it proves the bytes match what
+//! the holder of that certificate signed, and nothing about who that is.
+//!
+//! Against signature wrapping, the SignedData is parsed strictly (no
+//! unsigned attributes, every `certificates` entry a certificate, the signer
+//! identified by issuer and serial), the signature block may not carry ZIP
+//! records, and the manifest is read only from the signed bytes.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -42,6 +53,85 @@ pub const MANIFEST_KEEP_MAX_BYTES: usize = 64 * 1024;
 const SIG_HEADER: &[u8] = b"MCPB_SIG_V1";
 const SIG_FOOTER: &[u8] = b"MCPB_SIG_END";
 const EOCD_MAGIC: &[u8] = b"PK\x05\x06";
+const CDIR_MAGIC: &[u8] = b"PK\x01\x02";
+
+/// Environment variable listing the trusted MCPB signer certificates:
+/// SHA-256 fingerprints of the signing certificate (DER), hex, separated by
+/// commas or whitespace (`:` separators and case are ignored).
+pub const TRUSTED_SIGNERS_ENV: &str = "MCP_TRUSTED_BUNDLE_SIGNERS";
+
+/// A fingerprint in canonical form: lower-case hex without separators.
+pub fn normalize_fingerprint(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != ':')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Parse a trusted-signer list (pure): every 64-hex-digit entry, normalized.
+pub fn parse_trusted_signers(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(normalize_fingerprint)
+        .filter(|f| f.len() == 64 && f.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
+}
+
+/// The operator's trusted signer fingerprints ([`TRUSTED_SIGNERS_ENV`]).
+pub fn trusted_signers() -> Vec<String> {
+    std::env::var(TRUSTED_SIGNERS_ENV)
+        .map(|v| parse_trusted_signers(&v))
+        .unwrap_or_default()
+}
+
+/// Whether `fingerprint` is on `trusted`.
+pub fn is_trusted(fingerprint: Option<&str>, trusted: &[String]) -> bool {
+    fingerprint.is_some_and(|f| {
+        let f = normalize_fingerprint(f);
+        trusted.iter().any(|t| *t == f)
+    })
+}
+
+/// The trust decision on a verified signature: `valid` when the signer's
+/// fingerprint is on `trusted`, else `self_signed`. Other states are kept.
+pub fn apply_trust(info: &mut SignatureInfo, trusted: &[String]) {
+    if matches!(
+        info.state,
+        SignatureState::Valid | SignatureState::SelfSigned
+    ) {
+        info.state = if is_trusted(info.fingerprint.as_deref(), trusted) {
+            SignatureState::Valid
+        } else {
+            SignatureState::SelfSigned
+        };
+    }
+}
+
+/// The trust state of RECORDED signature facts (`metadata.signature` of a
+/// stored bundle) against `trusted` now: `valid` only for a verified
+/// signature whose fingerprint is trusted; `None` facts are `unsigned`.
+pub fn recorded_state(facts: Option<&serde_json::Value>, trusted: &[String]) -> SignatureState {
+    let Some(f) = facts else {
+        return SignatureState::Unsigned;
+    };
+    match f.get("state").and_then(|v| v.as_str()) {
+        Some("valid") | Some("self_signed") => {
+            if is_trusted(f.get("fingerprint").and_then(|v| v.as_str()), trusted) {
+                SignatureState::Valid
+            } else {
+                SignatureState::SelfSigned
+            }
+        }
+        Some("invalid") => SignatureState::Invalid,
+        _ => SignatureState::Unsigned,
+    }
+}
+
+/// Whether the signature block region carries ZIP records (an end record or
+/// a central directory header): a ZIP reader looking past the signed archive
+/// would find them, so such a bundle is refused.
+fn block_has_zip_records(block: &[u8]) -> bool {
+    rfind(block, EOCD_MAGIC).is_some() || rfind(block, CDIR_MAGIC).is_some()
+}
 const EOCD_MIN: usize = 22;
 
 // OID contents (without tag and length).
@@ -314,11 +404,15 @@ fn parse_der_time(t: &Tlv<'_>) -> Option<DateTime<Utc>> {
 // Verification
 // ---------------------------------------------------------------------------
 
-/// `metadata.bundles[].signature.state`.
+/// `metadata.bundles[].signature.state`: `valid` (verifies, and the signer
+/// is on the operator's trusted list), `self_signed` (verifies against the
+/// certificate the bundle carries, which nothing vouches for), `unsigned`,
+/// `invalid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SignatureState {
     Valid,
+    SelfSigned,
     Unsigned,
     Invalid,
 }
@@ -396,14 +490,24 @@ fn parse_signed_data(der: &[u8]) -> Result<(Vec<&[u8]>, Signer<'_>), BundleError
     if encap.first().map(|t| t.value) != Some(OID_DATA) || encap.len() > 1 {
         return Err(bad("the signature must be detached over data"));
     }
+    // Only `[0] certificates` may sit between encapContentInfo and
+    // signerInfos, and every entry of it must be a certificate: anything
+    // else (CRLs, attribute certificates, opaque blobs) could smuggle bytes
+    // into the block.
     let mut certs = Vec::new();
     for t in &sd[3..sd.len() - 1] {
-        if t.tag == 0xA0 {
-            for c in children(t.value)? {
-                if c.tag == 0x30 {
-                    certs.push(c.raw);
-                }
+        if t.tag != 0xA0 {
+            return Err(bad(
+                "the signature carries something other than certificates",
+            ));
+        }
+        for c in children(t.value)? {
+            if c.tag != 0x30 {
+                return Err(bad(
+                    "the signature's certificate set holds a non-certificate",
+                ));
             }
+            certs.push(c.raw);
         }
     }
     let infos = children(expect(sd[sd.len() - 1], 0x31)?.value)?;
@@ -411,9 +515,13 @@ fn parse_signed_data(der: &[u8]) -> Result<(Vec<&[u8]>, Signer<'_>), BundleError
         return Err(bad("exactly one signer is supported"));
     }
     let si = children(expect(infos[0], 0x30)?.value)?;
-    // version, sid, digestAlgorithm, [0] signedAttrs, signatureAlgorithm, signature, [1]?
+    // version, sid, digestAlgorithm, [0] signedAttrs, signatureAlgorithm,
+    // signature. Unsigned attributes (`[1]`) are refused: nothing covers them.
     if si.len() < 6 {
         return Err(bad("the signer has no signed attributes"));
+    }
+    if si.len() > 6 {
+        return Err(bad("the signer carries unsigned attributes"));
     }
     let (issuer_raw, serial) = match si[1].tag {
         0x30 => {
@@ -480,32 +588,42 @@ fn common_name(name: &x509_cert::name::Name) -> String {
     name.to_string()
 }
 
-/// Verify the signature of a split bundle (pure).
+/// Verify the signature of a split bundle (pure). A signature that
+/// verifies is reported `valid` here; [`apply_trust`] decides whether it
+/// stays `valid` or is `self_signed`.
 pub fn verify_signature(split: &SplitBundle<'_>) -> SignatureInfo {
-    if split.malformed {
-        return SignatureInfo::invalid("the signature block is malformed");
-    }
-    let Some(der) = split.signature else {
-        return SignatureInfo::unsigned();
-    };
-    match verify_der(der, &signed_content_candidates(split)) {
-        Ok(info) => info,
-        Err(e) => SignatureInfo::invalid(e.0),
-    }
+    verify_split(split, &signed_content_candidates(split)).0
 }
 
-fn verify_der(der: &[u8], contents: &[Cow<'_, [u8]>]) -> Result<SignatureInfo, BundleError> {
-    let digests: Vec<Option<[u8; 32]>> = contents
+/// The verification result and the index of the candidate the signature
+/// covers (`None` unless it verifies).
+fn verify_split(
+    split: &SplitBundle<'_>,
+    candidates: &[Cow<'_, [u8]>],
+) -> (SignatureInfo, Option<usize>) {
+    if split.malformed {
+        return (
+            SignatureInfo::invalid("the signature block is malformed"),
+            None,
+        );
+    }
+    let Some(der) = split.signature else {
+        return (SignatureInfo::unsigned(), None);
+    };
+    let digests: Vec<Option<[u8; 32]>> = candidates
         .iter()
         .map(|c| Some(Sha256::digest(&c[..]).into()))
         .collect();
-    verify_der_digests(der, &digests)
+    match verify_der_digests(der, &digests) {
+        Ok((info, at)) => (info, Some(at)),
+        Err(e) => (SignatureInfo::invalid(e.0), None),
+    }
 }
 
 fn verify_der_digests(
     der: &[u8],
     contents: &[Option<[u8; 32]>],
-) -> Result<SignatureInfo, BundleError> {
+) -> Result<(SignatureInfo, usize), BundleError> {
     use x509_cert::der::{Decode, Encode};
     let (certs, signer) = parse_signed_data(der)?;
     if signer.digest_alg != OID_SHA256 {
@@ -519,17 +637,18 @@ fn verify_der_digests(
         return Err(bad("the signed content type is not data"));
     }
     let digest = digest.ok_or_else(|| bad("the signature has no message digest"))?;
-    if !contents.iter().flatten().any(|c| c.as_slice() == digest) {
-        return Err(bad("the bundle was changed after it was signed"));
-    }
-    let parsed: Vec<(x509_cert::Certificate, &[u8])> = certs
+    let matched = contents
         .iter()
-        .filter_map(|raw| {
-            x509_cert::Certificate::from_der(raw)
-                .ok()
-                .map(|c| (c, *raw))
-        })
-        .collect();
+        .position(|c| c.is_some_and(|c| c.as_slice() == digest))
+        .ok_or_else(|| bad("the bundle was changed after it was signed"))?;
+    let mut parsed: Vec<(x509_cert::Certificate, &[u8])> = Vec::with_capacity(certs.len());
+    for raw in &certs {
+        let c = x509_cert::Certificate::from_der(raw)
+            .map_err(|_| bad("the signature carries an unreadable certificate"))?;
+        parsed.push((c, *raw));
+    }
+    // The signing certificate is the one the SignerInfo names (issuer and
+    // serial number); no fallback to another certificate.
     let (cert, cert_raw) = parsed
         .iter()
         .find(|(c, _)| {
@@ -537,7 +656,6 @@ fn verify_der_digests(
             signer.issuer_raw == Some(issuer.as_slice())
                 && signer.serial == Some(c.tbs_certificate.serial_number.as_bytes())
         })
-        .or_else(|| parsed.first())
         .ok_or_else(|| bad("the signature carries no signing certificate"))?;
     // The signature covers the DER of the attributes as a SET (RFC 5652
     // 5.4): the received encoding with the [0] tag replaced.
@@ -553,15 +671,18 @@ fn verify_der_digests(
     }
     let subject = &cert.tbs_certificate.subject;
     let issuer = &cert.tbs_certificate.issuer;
-    Ok(SignatureInfo {
-        state: SignatureState::Valid,
-        signer: Some(common_name(subject)),
-        issuer: Some(common_name(issuer)),
-        fingerprint: Some(hex::encode(Sha256::digest(cert_raw))),
-        self_signed: Some(subject.to_der().ok() == issuer.to_der().ok()),
-        signed_at,
-        reason: None,
-    })
+    Ok((
+        SignatureInfo {
+            state: SignatureState::Valid,
+            signer: Some(common_name(subject)),
+            issuer: Some(common_name(issuer)),
+            fingerprint: Some(hex::encode(Sha256::digest(cert_raw))),
+            self_signed: Some(subject.to_der().ok() == issuer.to_der().ok()),
+            signed_at,
+            reason: None,
+        },
+        matched,
+    ))
 }
 
 /// `contents` re-tagged as a DER `SET` (tag `0x31`, definite length).
@@ -615,23 +736,34 @@ pub struct BundleFacts {
     pub manifest: serde_json::Value,
 }
 
-/// Inspect a bundle: hash it, verify its signature, read its manifest. The
-/// manifest of a bundle whose signature block is present is read from the
-/// archive in front of the block (signers before upstream #194), or from the
-/// whole file: the current signer grows the ZIP comment length over the
-/// block, so only the whole file is a well-formed archive.
+/// Inspect a bundle: hash it, verify its signature, read its manifest, and
+/// decide the signer's trust against the operator's list. The manifest of a
+/// bundle whose signature block is present is read only from the signed
+/// bytes (the archive with its ZIP comment length restored, or as it is for
+/// signers before upstream #194), never from the whole file, and a block
+/// that carries ZIP records is refused.
 pub fn inspect(bytes: &[u8]) -> Result<BundleFacts, BundleError> {
+    inspect_with(bytes, &trusted_signers())
+}
+
+/// [`inspect`] against an explicit trusted-signer list (pure).
+pub fn inspect_with(bytes: &[u8], trusted: &[String]) -> Result<BundleFacts, BundleError> {
     let split = split_signature(bytes);
-    let manifest = read_manifest(split.archive).or_else(|e| {
-        if split.block_len == 0 {
-            return Err(e);
-        }
-        read_manifest(bytes)
-    })?;
+    if split.block_len > 0 && block_has_zip_records(&bytes[split.archive.len()..]) {
+        return Err(bad("the signature block carries ZIP records"));
+    }
+    let candidates = signed_content_candidates(&split);
+    let (mut signature, matched) = verify_split(&split, &candidates);
+    apply_trust(&mut signature, trusted);
+    let manifest = if split.block_len == 0 {
+        read_manifest(bytes)?
+    } else {
+        read_manifest(&candidates[matched.unwrap_or(0)])?
+    };
     Ok(BundleFacts {
         file_sha256: hex::encode(Sha256::digest(bytes)),
         size: bytes.len() as u64,
-        signature: verify_signature(&split),
+        signature,
         manifest: manifest_for_metadata(&manifest),
     })
 }
@@ -640,11 +772,13 @@ pub fn inspect(bytes: &[u8]) -> Result<BundleFacts, BundleError> {
 /// block and the ZIP end record (a signature block is a few KiB).
 const TAIL_BYTES: u64 = 1024 * 1024;
 
-/// A `Read + Seek` view of the first `len` bytes of a file.
+/// A `Read + Seek` view of the first `len` bytes of a file, with the two
+/// bytes at `fix.0` read as `fix.1` (the restored ZIP comment length).
 struct Window<R> {
     inner: R,
     len: u64,
     pos: u64,
+    fix: Option<(u64, [u8; 2])>,
 }
 
 impl<R: std::io::Read + std::io::Seek> std::io::Read for Window<R> {
@@ -655,6 +789,14 @@ impl<R: std::io::Read + std::io::Seek> std::io::Read for Window<R> {
             return Ok(0);
         }
         let got = self.inner.read(&mut buf[..n])?;
+        if let Some((at, bytes)) = self.fix {
+            for (k, b) in bytes.iter().enumerate() {
+                let p = at + k as u64;
+                if p >= self.pos && p < self.pos + got as u64 {
+                    buf[(p - self.pos) as usize] = *b;
+                }
+            }
+        }
         self.pos += got as u64;
         Ok(got)
     }
@@ -685,6 +827,15 @@ impl<R: std::io::Read + std::io::Seek> std::io::Seek for Window<R> {
 /// and the digests are streamed. `file_sha256` is the caller's (computed
 /// while staging).
 pub fn inspect_file(path: &std::path::Path, file_sha256: &str) -> Result<BundleFacts, BundleError> {
+    inspect_file_with(path, file_sha256, &trusted_signers())
+}
+
+/// [`inspect_file`] against an explicit trusted-signer list.
+pub fn inspect_file_with(
+    path: &std::path::Path,
+    file_sha256: &str,
+    trusted: &[String],
+) -> Result<BundleFacts, BundleError> {
     use std::io::{Seek, SeekFrom};
     let io = |e: std::io::Error| bad(format!("the bundle could not be read: {e}"));
     let mut file = std::fs::File::open(path).map_err(io)?;
@@ -697,43 +848,60 @@ pub fn inspect_file(path: &std::path::Path, file_sha256: &str) -> Result<BundleF
         .read_to_end(&mut tail)
         .map_err(io)?;
     let split = split_signature(&tail);
+    if split.block_len > 0 && block_has_zip_records(&tail[split.archive.len()..]) {
+        return Err(bad("the signature block carries ZIP records"));
+    }
     let archive_len = tail_start + split.archive.len() as u64;
-    // As in [`inspect`]: the archive in front of the block, else the whole
-    // file (the current signer's comment length covers the block).
-    let mut read_window = |len: u64| -> Result<serde_json::Value, BundleError> {
-        file.seek(SeekFrom::Start(0)).map_err(io)?;
-        read_manifest_from(Window {
-            inner: std::io::BufReader::new(&mut file),
-            len,
-            pos: 0,
-        })
-    };
-    let manifest = match read_window(archive_len) {
-        Ok(m) => m,
-        Err(_) if split.block_len > 0 => read_window(size)?,
-        Err(e) => return Err(e),
-    };
-    let signature = if split.malformed {
-        SignatureInfo::invalid("the signature block is malformed")
-    } else if let Some(der) = split.signature {
-        // The EOCD sits in the tail; stream both candidate digests.
-        let fix = rfind(split.archive, EOCD_MAGIC)
+    // The restored ZIP comment length (current signer), as in
+    // [`signed_content_candidates`]; the EOCD sits in the tail.
+    let fix = if split.block_len > 0 {
+        rfind(split.archive, EOCD_MAGIC)
             .filter(|&i| i + EOCD_MIN <= split.archive.len())
             .and_then(|i| {
                 let at = i + 20;
                 let cur = u16::from_le_bytes([split.archive[at], split.archive[at + 1]]) as usize;
                 cur.checked_sub(split.block_len)
                     .map(|orig| (tail_start + at as u64, (orig as u16).to_le_bytes()))
-            });
+            })
+    } else {
+        None
+    };
+    let (mut signature, matched) = if split.malformed {
+        (
+            SignatureInfo::invalid("the signature block is malformed"),
+            None,
+        )
+    } else if let Some(der) = split.signature {
         file.seek(SeekFrom::Start(0)).map_err(io)?;
         let (restored, as_is) = stream_digests(&mut file, archive_len, fix).map_err(io)?;
         match verify_der_digests(der, &[restored, Some(as_is)]) {
-            Ok(info) => info,
-            Err(e) => SignatureInfo::invalid(e.0),
+            Ok((info, at)) => (info, Some(at)),
+            Err(e) => (SignatureInfo::invalid(e.0), None),
         }
     } else {
-        SignatureInfo::unsigned()
+        (SignatureInfo::unsigned(), None)
     };
+    apply_trust(&mut signature, trusted);
+    // As in [`inspect`]: the whole file when unsigned, else only the signed
+    // bytes -- the restored archive (candidate 0) or the archive as it is.
+    let window_fix = match (split.block_len, matched) {
+        (0, _) => None,
+        (_, Some(1)) => None,
+        (_, Some(_)) => fix,
+        (_, None) => fix,
+    };
+    let window_len = if split.block_len == 0 {
+        size
+    } else {
+        archive_len
+    };
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    let manifest = read_manifest_from(Window {
+        inner: std::io::BufReader::new(&mut file),
+        len: window_len,
+        pos: 0,
+        fix: window_fix,
+    })?;
     Ok(BundleFacts {
         file_sha256: file_sha256.to_string(),
         size,
@@ -813,7 +981,16 @@ mod tests {
     #[test]
     fn signed_bundles_verify_in_both_layouts() {
         for (label, bytes) in [("current", SIGNED), ("legacy", LEGACY)] {
-            let facts = inspect(bytes).unwrap();
+            // Verified, but the signer is on no trusted list: self_signed.
+            let untrusted = inspect_with(bytes, &[]).unwrap();
+            assert_eq!(
+                untrusted.signature.state,
+                SignatureState::SelfSigned,
+                "{label}: {:?}",
+                untrusted.signature.reason
+            );
+            let fp = untrusted.signature.fingerprint.clone().unwrap();
+            let facts = inspect_with(bytes, &[fp]).unwrap();
             let sig = &facts.signature;
             assert_eq!(
                 sig.state,
@@ -828,9 +1005,141 @@ mod tests {
             assert!(sig.signed_at.is_some());
             assert_eq!(facts.manifest["version"], "1.0.0");
         }
-        let json = serde_json::to_value(inspect(SIGNED).unwrap().signature).unwrap();
-        assert_eq!(json["state"], "valid");
+        let json = serde_json::to_value(inspect_with(SIGNED, &[]).unwrap().signature).unwrap();
+        assert_eq!(json["state"], "self_signed");
         assert!(json.get("reason").is_none());
+    }
+
+    /// Review finding 9: trust is the operator's fingerprint allowlist, and
+    /// recorded facts are re-judged against the list as it is now.
+    #[test]
+    fn trusted_signer_list() {
+        let fp = inspect_with(SIGNED, &[])
+            .unwrap()
+            .signature
+            .fingerprint
+            .unwrap();
+        let colons: String = fp
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap().to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(":");
+        let list = parse_trusted_signers(&format!("nothex, {colons}\n{}", "ab".repeat(31)));
+        assert_eq!(list, vec![fp.clone()]);
+        assert!(is_trusted(Some(&fp), &list));
+        assert!(!is_trusted(None, &list));
+        let facts = serde_json::json!({"state": "valid", "fingerprint": fp});
+        assert_eq!(recorded_state(Some(&facts), &list), SignatureState::Valid);
+        assert_eq!(
+            recorded_state(Some(&facts), &[]),
+            SignatureState::SelfSigned
+        );
+        let unsigned = serde_json::json!({"state": "unsigned"});
+        assert_eq!(
+            recorded_state(Some(&unsigned), &list),
+            SignatureState::Unsigned
+        );
+        assert_eq!(recorded_state(None, &list), SignatureState::Unsigned);
+        let mut info = SignatureInfo::unsigned();
+        apply_trust(&mut info, &list);
+        assert_eq!(info.state, SignatureState::Unsigned);
+    }
+
+    /// DER element `tag` around `content`.
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let n = content.len();
+        if n < 0x80 {
+            out.push(n as u8);
+        } else {
+            let b = (n as u32).to_be_bytes();
+            let skip = b.iter().take_while(|x| **x == 0).count();
+            out.push(0x80 | (4 - skip) as u8);
+            out.extend_from_slice(&b[skip..]);
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// The legacy fixture with its SignedData rewritten by `edit`, which gets
+    /// the SignedData's elements and returns them changed.
+    fn resigned(edit: impl Fn(Vec<Vec<u8>>) -> Vec<Vec<u8>>) -> Vec<u8> {
+        let split = split_signature(LEGACY);
+        let der = split.signature.unwrap();
+        let (ci, _) = read_tlv(der).unwrap();
+        let ci = children(ci.value).unwrap();
+        let (inner, _) = read_tlv(ci[1].value).unwrap();
+        let sd: Vec<Vec<u8>> = children(inner.value)
+            .unwrap()
+            .iter()
+            .map(|t| t.raw.to_vec())
+            .collect();
+        let sd = tlv(0x30, &edit(sd).concat());
+        let new_der = tlv(0x30, &[ci[0].raw.to_vec(), tlv(0xA0, &sd)].concat());
+        let mut out = split.archive.to_vec();
+        out.extend_from_slice(SIG_HEADER);
+        out.extend_from_slice(&(new_der.len() as u32).to_le_bytes());
+        out.extend_from_slice(&new_der);
+        out.extend_from_slice(SIG_FOOTER);
+        out
+    }
+
+    /// Review finding 7: signature wrapping. Unsigned attributes, a
+    /// certificate set holding something other than certificates, extra
+    /// SignedData fields, and ZIP records inside the block are refused.
+    #[test]
+    fn signature_wrapping_is_refused() {
+        // The rewrite itself round-trips.
+        let same = resigned(|sd| sd);
+        assert_eq!(
+            inspect_with(&same, &[]).unwrap().signature.state,
+            SignatureState::SelfSigned
+        );
+        let reason = |bytes: &[u8]| inspect_with(bytes, &[]).unwrap().signature.reason.unwrap();
+        // An unsigned attribute appended to the SignerInfo.
+        let unsigned_attr = resigned(|mut sd| {
+            let last = sd.pop().unwrap();
+            let (set, _) = read_tlv(&last).unwrap();
+            let (si, _) = read_tlv(set.value).unwrap();
+            let mut si_body = si.value.to_vec();
+            si_body.extend_from_slice(&tlv(0xA1, &tlv(0x30, &[0x06, 0x01, 0x2A])));
+            sd.push(tlv(0x31, &tlv(0x30, &si_body)));
+            sd
+        });
+        assert!(reason(&unsigned_attr).contains("unsigned attributes"));
+        // A non-certificate entry in the certificate set.
+        let odd_cert = resigned(|mut sd| {
+            let (certs, _) = read_tlv(&sd[3]).unwrap();
+            let mut body = certs.value.to_vec();
+            body.extend_from_slice(&tlv(0x04, b"blob"));
+            sd[3] = tlv(0xA0, &body);
+            sd
+        });
+        assert!(reason(&odd_cert).contains("non-certificate"));
+        // A CRL set ([1]) between the certificates and the signer infos.
+        let crls = resigned(|mut sd| {
+            let at = sd.len() - 1;
+            sd.insert(at, tlv(0xA1, &[]));
+            sd
+        });
+        assert!(reason(&crls).contains("other than certificates"));
+        // A forged end record / central directory inside the block.
+        for magic in [EOCD_MAGIC, CDIR_MAGIC] {
+            let forged = resigned(|mut sd| {
+                let (certs, _) = read_tlv(&sd[3]).unwrap();
+                let mut body = certs.value.to_vec();
+                body.extend_from_slice(&tlv(0x04, magic));
+                sd[3] = tlv(0xA0, &body);
+                sd
+            });
+            let err = inspect_with(&forged, &[]).unwrap_err();
+            assert!(err.0.contains("ZIP records"), "{err}");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("f.mcpb");
+            std::fs::write(&path, &forged).unwrap();
+            assert!(inspect_file_with(&path, "x", &[]).is_err());
+        }
     }
 
     #[test]
@@ -948,8 +1257,8 @@ mod tests {
             let path = dir.path().join(format!("{label}.mcpb"));
             std::fs::write(&path, bytes).unwrap();
             let sha = hex::encode(Sha256::digest(bytes));
-            let from_file = inspect_file(&path, &sha).unwrap();
-            assert_eq!(from_file, inspect(bytes).unwrap(), "{label}");
+            let from_file = inspect_file_with(&path, &sha, &[]).unwrap();
+            assert_eq!(from_file, inspect_with(bytes, &[]).unwrap(), "{label}");
         }
         let path = dir.path().join("junk.mcpb");
         std::fs::write(&path, b"junk").unwrap();

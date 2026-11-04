@@ -362,6 +362,7 @@ fn issue(e: &McpError) -> serde_json::Value {
         | McpError::OciFloatingTag { index }
         | McpError::ExternalRegistry { index, .. }
         | McpError::PackageNotFound { index, .. }
+        | McpError::BundleSignatureRequired { index, .. }
         | McpError::PackageVersionUnpinned { index }
         | McpError::OciNotAnImage { index } => ("semantic", format!("packages[{index}]")),
         McpError::ReservedNamespace { .. } | McpError::NamespaceNotAllowed { .. } => {
@@ -1059,7 +1060,16 @@ pub fn signature_refusal(
             "mcp_bundle_unsigned",
             "this registry requires signed MCPB bundles (mcpb sign)".to_string(),
         )),
-        mcpb::SignatureState::Unsigned => None,
+        // A signature that verifies against a certificate nothing vouches
+        // for does not satisfy the requirement: only a signer on the
+        // operator's trusted list (`MCP_TRUSTED_BUNDLE_SIGNERS`) does.
+        mcpb::SignatureState::SelfSigned if require_signature => Some((
+            "mcp_bundle_signer_untrusted",
+            "this registry requires MCPB bundles signed by a trusted signer; this signer's \
+             certificate fingerprint is not on the instance's trusted signer list"
+                .to_string(),
+        )),
+        mcpb::SignatureState::Unsigned | mcpb::SignatureState::SelfSigned => None,
     }
 }
 
@@ -1528,6 +1538,14 @@ mod tests {
         );
         sig.state = mcpb::SignatureState::Valid;
         assert!(signature_refusal(&sig, true).is_none());
+        // Review finding 9: a self-signed (untrusted) signer is stored when
+        // signatures are optional and refused when they are required.
+        sig.state = mcpb::SignatureState::SelfSigned;
+        assert!(signature_refusal(&sig, false).is_none());
+        assert_eq!(
+            signature_refusal(&sig, true).unwrap().0,
+            "mcp_bundle_signer_untrusted"
+        );
     }
 
     #[test]
@@ -2162,7 +2180,8 @@ mod tests {
         let (s, b) = put(env.member(), up("echo.mcpb"), SIGNED).await;
         let b: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(s, StatusCode::CREATED, "{b}");
-        assert_eq!(b["signature"]["state"], "valid");
+        // The fixture signer is not on a trusted list: self_signed.
+        assert_eq!(b["signature"]["state"], "self_signed");
         assert_eq!(b["manifest"]["tools"][0]["name"], "echo");
         let sha = b["fileSha256"].as_str().unwrap().to_string();
         assert_eq!(
@@ -2201,7 +2220,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(meta["bundles"][0]["fileSha256"], sha.as_str());
-        assert_eq!(meta["bundles"][0]["signature"]["state"], "valid");
+        assert_eq!(meta["bundles"][0]["signature"]["state"], "self_signed");
         assert_eq!(meta["bundles"][0]["manifest"]["name"], "echo-mcpb");
         // An exact read by a credentialed caller tickets the URL.
         let (_, b) = env
@@ -2369,6 +2388,98 @@ mod tests {
             unknown,
             "a deleted version's bundle is the unknown 404"
         );
+        env.teardown().await;
+    }
+
+    /// Review finding 5: `mcp_require_bundle_signature` of the PUBLISHING
+    /// repository applies to bundles pinned through the `mcpb` mapping: a
+    /// Generic repository's `.mcpb` (no recorded signature) and another MCP
+    /// registry's bundle whose signer is not trusted are refused.
+    #[tokio::test]
+    async fn bundle_mapping_honours_the_publishing_signature_policy() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (gen_id, gen_key) = env.repo("local", "generic").await;
+        let (mcp_id, mcp_key) = env.repo("local", "mcp").await;
+        let gen_sha = "c".repeat(64);
+        let mcp_sha = "d".repeat(64);
+        let seed = |repo: Uuid, path: &'static str, sha: String| {
+            let pool = env.fx.pool.clone();
+            let user = env.fx.user_id;
+            async move {
+                super::super::proxy_helpers::insert_artifact(
+                    &pool,
+                    super::super::proxy_helpers::NewArtifact {
+                        repository_id: repo,
+                        path,
+                        name: "com.acme/tool",
+                        version: "1.0.0",
+                        size_bytes: 4,
+                        checksum_sha256: &sha,
+                        content_type: "application/zip",
+                        storage_key: path,
+                        uploaded_by: user,
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| panic!("seed {path}"))
+            }
+        };
+        seed(gen_id, "tools/tool.mcpb", gen_sha.clone()).await;
+        let mcp_bundle = seed(
+            mcp_id,
+            "servers/com.acme/tool/1.0.0/bundles/tool.mcpb",
+            mcp_sha.clone(),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata) VALUES ($1, 'mcpb', $2)",
+        )
+        .bind(mcp_bundle)
+        .bind(
+            serde_json::json!({"file": "tool.mcpb", "fileSha256": mcp_sha,
+            "signature": {"state": "valid", "fingerprint": "e".repeat(64)}}),
+        )
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let entry = |sha: &str| {
+            serde_json::json!([{"registryType": "mcpb", "identifier": "https://x.test/tool.mcpb",
+                "fileSha256": sha, "transport": {"type": "stdio"}}])
+        };
+        let validate = |sha: &str| doc("com.acme/tool", "1.0.0", entry(sha));
+        for (key, sha) in [(&gen_key, &gen_sha), (&mcp_key, &mcp_sha)] {
+            env.config(
+                mcp_packages::REPOS_KEY,
+                &serde_json::json!({"mcpb": key}).to_string(),
+            )
+            .await;
+            env.config(
+                crate::services::mcp_settings::REQUIRE_BUNDLE_SIGNATURE_KEY,
+                "false",
+            )
+            .await;
+            let (s, b) = env
+                .json(env.admin(), "POST", "/validate", Some(&validate(sha)))
+                .await;
+            assert_eq!(s, StatusCode::OK, "{key}: {b}");
+            assert_eq!(b["valid"], true, "{key}: {b}");
+            env.config(
+                crate::services::mcp_settings::REQUIRE_BUNDLE_SIGNATURE_KEY,
+                "true",
+            )
+            .await;
+            let (s, b) = env
+                .json(env.admin(), "POST", "/validate", Some(&validate(sha)))
+                .await;
+            assert_eq!(s, StatusCode::OK, "{key}: {b}");
+            assert_eq!(b["valid"], false, "{key}: {b}");
+            assert!(
+                b.to_string().contains("trusted signer"),
+                "{key}: the refusal names the policy: {b}"
+            );
+        }
         env.teardown().await;
     }
 

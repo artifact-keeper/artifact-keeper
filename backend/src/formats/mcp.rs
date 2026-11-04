@@ -110,6 +110,10 @@ pub enum McpError {
     ExternalRegistry { index: usize, detail: String },
     /// Package not present in its backing repository (422).
     PackageNotFound { index: usize, detail: String },
+    /// An `mcpb` bundle that does not satisfy the publishing repository's
+    /// `mcp_require_bundle_signature` (unsigned, or a signer not on the
+    /// trusted list) (422).
+    BundleSignatureRequired { index: usize, detail: String },
     /// npm/pypi/nuget/cargo package without an exact `version` (422).
     PackageVersionUnpinned { index: usize },
     /// Pinned OCI manifest is not a runnable image or index (422).
@@ -157,6 +161,7 @@ impl McpError {
             | McpError::OciFloatingTag { .. }
             | McpError::ExternalRegistry { .. }
             | McpError::PackageNotFound { .. }
+            | McpError::BundleSignatureRequired { .. }
             | McpError::PackageVersionUnpinned { .. }
             | McpError::OciNotAnImage { .. }
             | McpError::SearchTooShort => 422,
@@ -177,6 +182,7 @@ impl McpError {
             McpError::OciFloatingTag { .. } => "mcp_oci_floating_tag",
             McpError::ExternalRegistry { .. } => "mcp_external_registry",
             McpError::PackageNotFound { .. } => "mcp_package_not_found",
+            McpError::BundleSignatureRequired { .. } => "mcp_bundle_signature_required",
             McpError::PackageVersionUnpinned { .. } => "mcp_package_version_unpinned",
             McpError::OciNotAnImage { .. } => "mcp_oci_not_an_image",
             McpError::ReservedNamespace { .. } => "mcp_namespace_reserved",
@@ -208,7 +214,8 @@ impl McpError {
                  tagless image references are not accepted (AK pins the digest at publish)"
             ),
             McpError::ExternalRegistry { index, detail }
-            | McpError::PackageNotFound { index, detail } => {
+            | McpError::PackageNotFound { index, detail }
+            | McpError::BundleSignatureRequired { index, detail } => {
                 format!("packages[{index}]: {detail}")
             }
             McpError::PackageVersionUnpinned { index } => format!(

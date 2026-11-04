@@ -429,9 +429,39 @@ pub async fn resolve_bundle(
         });
     }
     let sha = pkg.file_sha256.as_deref().unwrap_or_default();
-    if let Some((id, name, version, file)) =
+    // The PUBLISHING repository's signature policy applies to every bundle
+    // it pins, wherever the bundle lives, judged on the bundle's recorded
+    // signature facts against the trusted signer list as it is now. A
+    // Generic repository's `.mcpb` has no recorded facts (unsigned).
+    let require = require_bundle_signature(db, target.repo_id).await?;
+    let check = |facts: Option<&serde_json::Value>| -> Result<(), McpError> {
+        if !require {
+            return Ok(());
+        }
+        match crate::services::mcpb::recorded_state(
+            facts,
+            &crate::services::mcpb::trusted_signers(),
+        ) {
+            crate::services::mcpb::SignatureState::Valid => Ok(()),
+            state => Err(McpError::BundleSignatureRequired {
+                index,
+                detail: format!(
+                    "this registry requires MCPB bundles signed by a trusted signer \
+                     (mcp_require_bundle_signature); the bundle with fileSha256 {sha} is {}",
+                    match state {
+                        crate::services::mcpb::SignatureState::SelfSigned =>
+                            "signed by a signer that is not on the trusted signer list",
+                        crate::services::mcpb::SignatureState::Invalid => "invalidly signed",
+                        _ => "unsigned",
+                    }
+                ),
+            }),
+        }
+    };
+    if let Some((id, name, version, file, facts)) =
         find_bundle(db, target.repo_id, Some((target.name, target.version)), sha).await?
     {
+        check(facts.as_ref())?;
         return Ok(bundle_pin(
             index,
             pkg,
@@ -446,7 +476,7 @@ pub async fn resolve_bundle(
         let found = if repo.format == "mcp" {
             find_bundle(db, repo.id, None, sha)
                 .await?
-                .map(|(id, n, v, f)| (id, bundle_route(&repo.key, &n, &v, &f)))
+                .map(|(id, n, v, f, facts)| (id, bundle_route(&repo.key, &n, &v, &f), facts))
         } else {
             sqlx::query_as::<_, (Uuid, String)>(
                 "SELECT id, path FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
@@ -457,9 +487,10 @@ pub async fn resolve_bundle(
             .fetch_optional(db)
             .await
             .map_err(db_err)?
-            .map(|(id, path)| (id, format!("general/{}/{}", repo.key, path)))
+            .map(|(id, path)| (id, format!("general/{}/{}", repo.key, path), None))
         };
-        if let Some((id, route)) = found {
+        if let Some((id, route, facts)) = found {
+            check(facts.as_ref())?;
             return Ok(bundle_pin(index, pkg, &repo.key, repo.id, id, sha, route));
         }
     }
@@ -473,16 +504,32 @@ pub async fn resolve_bundle(
     })
 }
 
-/// A live bundle of `repo_id` with `sha` (optionally of one `name@version`):
-/// `(artifact id, name, version, file)`.
+/// Whether `repo_id` sets `mcp_require_bundle_signature`.
+async fn require_bundle_signature(db: &PgPool, repo_id: Uuid) -> Result<bool, McpError> {
+    let v: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = $2",
+    )
+    .bind(repo_id)
+    .bind(crate::services::mcp_settings::REQUIRE_BUNDLE_SIGNATURE_KEY)
+    .fetch_optional(db)
+    .await
+    .map_err(db_err)?;
+    Ok(v.as_deref().map(str::trim) == Some("true"))
+}
+
+/// A live bundle found by [`find_bundle`]: `(artifact id, name, version,
+/// file, recorded signature facts)`.
+type FoundBundle = (Uuid, String, String, String, Option<serde_json::Value>);
+
+/// A live bundle of `repo_id` with `sha` (optionally of one `name@version`).
 async fn find_bundle(
     db: &PgPool,
     repo_id: Uuid,
     of: Option<(&str, &str)>,
     sha: &str,
-) -> Result<Option<(Uuid, String, String, String)>, McpError> {
-    let row: Option<(Uuid, String, String, String)> = sqlx::query_as(
-        "SELECT a.id, a.name, a.version, a.path FROM artifacts a \
+) -> Result<Option<FoundBundle>, McpError> {
+    let row: Option<FoundBundle> = sqlx::query_as(
+        "SELECT a.id, a.name, a.version, a.path, m.metadata->'signature' FROM artifacts a \
          JOIN artifact_metadata m ON m.artifact_id = a.id \
          WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcpb' \
            AND a.checksum_sha256 = $2 AND ($3::text IS NULL OR (a.name = $3 AND a.version = $4)) \
@@ -495,9 +542,9 @@ async fn find_bundle(
     .fetch_optional(db)
     .await
     .map_err(db_err)?;
-    Ok(row.map(|(id, name, version, path)| {
+    Ok(row.map(|(id, name, version, path, facts)| {
         let file = path.rsplit('/').next().unwrap_or_default().to_string();
-        (id, name, version, file)
+        (id, name, version, file, facts)
     }))
 }
 
