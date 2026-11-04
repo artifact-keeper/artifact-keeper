@@ -1295,7 +1295,7 @@ async fn remote_pins_packages_pulled_through_backing_remotes() {
             "nuget",
             "https://api.nuget.org/v3/index.json",
             "Acme.Echo",
-            "v3-flatcontainer/acme.echo/1.0.0/acme.echo.1.0.0.nupkg",
+            "v3/flatcontainer/acme.echo/1.0.0/acme.echo.1.0.0.nupkg",
         ),
         (
             "cargo",

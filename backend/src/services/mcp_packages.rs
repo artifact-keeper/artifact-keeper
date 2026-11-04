@@ -409,15 +409,15 @@ fn name_predicate(registry_type: &str) -> &'static str {
     match registry_type {
         // PEP 503: compare normalised forms; `$2` arrives normalised.
         "pypi" => "lower(regexp_replace(a.name, '[-_.]+', '-', 'g')) = $2 AND a.version = $3",
-        // NuGet ids are case-insensitive; versions are compared in their
-        // normalised form afterwards ([`version_matches`]), so `1.0` finds
-        // `1.0.0`. `$3` is only bound.
-        "nuget" => "lower(a.name) = lower($2) AND $3::text IS NOT NULL",
-        // Cargo: crate names are case-insensitive and `-`/`_` name the same
-        // crate (crates.io refuses a second crate differing only there).
-        "cargo" => {
-            "lower(replace(a.name, '-', '_')) = lower(replace($2, '-', '_')) AND a.version = $3"
-        }
+        // NuGet: the download routes match `LOWER(name) = <id lowercased>`
+        // and the stored version exactly, and a client requests the
+        // normalised version (`$3` arrives normalised, [`lookup_version`]):
+        // a row stored as `1.0` is never served for `1.0.0`.
+        "nuget" => "lower(a.name) = lower($2) AND a.version = $3",
+        // Cargo: the download route lowercases the requested name and
+        // matches it and the version exactly; `-` and `_` are different
+        // crates to it (a Local repository can hold both).
+        "cargo" => "a.name = lower($2) AND a.version = $3",
         // npm: exact (scoped names included), after percent-decoding.
         _ => "a.name = $2 AND a.version = $3",
     }
@@ -436,21 +436,21 @@ pub(crate) fn lookup_name(registry_type: &str, identifier: &str) -> String {
     }
 }
 
-/// Whether a stored version names the submitted one: NuGet compares the
-/// normalised forms (`1.0`, `1.0.0` and `1.0.0.0` are one version),
-/// everything else exact (the SQL predicate already matched it).
-pub(crate) fn version_matches(registry_type: &str, submitted: &str, stored: &str) -> bool {
-    if registry_type != "nuget" {
-        return true;
+/// The version text a backing format's download route is asked for, so the
+/// pin is looked up as the route looks it up: NuGet clients request the
+/// normalised version in lowercase
+/// ([`NugetHandler::normalized_version`]); every other
+/// format the version as written. `None` for a NuGet version that does not
+/// normalise (no client requests it).
+///
+/// [`NugetHandler::normalized_version`]: crate::formats::nuget::NugetHandler::normalized_version
+pub(crate) fn lookup_version(registry_type: &str, submitted: &str) -> Option<String> {
+    if registry_type == "nuget" {
+        // A V3 client requests the normalised version in lowercase.
+        return crate::formats::nuget::NugetHandler::normalized_version(submitted)
+            .map(|v| v.to_ascii_lowercase());
     }
-    use crate::formats::nuget::NugetHandler;
-    match (
-        NugetHandler::normalized_version(submitted),
-        NugetHandler::normalized_version(stored),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => submitted.eq_ignore_ascii_case(stored),
-    }
+    Some(submitted.to_string())
 }
 
 /// The base URL AK serves `registry_type` from `repo_key` under.
@@ -495,24 +495,24 @@ async fn resolve_artifact_package(
         .as_deref()
         .ok_or(McpError::PackageVersionUnpinned { index })?;
     let repo_ids = content_repo_ids(db, repo).await?;
+    // A Virtual serves the first member (by priority) holding the version,
+    // so its rows come first and the pinned digest is that member's.
     let sql = format!(
-        "SELECT a.id, a.checksum_sha256, a.version FROM artifacts a \
+        "SELECT a.id, a.checksum_sha256 FROM artifacts a \
          WHERE a.repository_id = ANY($1) AND a.is_deleted = false AND {} \
-         ORDER BY a.path",
+         ORDER BY array_position($1, a.repository_id), a.path",
         name_predicate(&pkg.registry_type)
     );
-    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-        .bind(&repo_ids)
-        .bind(lookup_name(&pkg.registry_type, &pkg.identifier))
-        .bind(version)
-        .fetch_all(db)
-        .await
-        .map_err(db_err)?;
-    let rows: Vec<(Uuid, String)> = rows
-        .into_iter()
-        .filter(|(_, _, stored)| version_matches(&pkg.registry_type, version, stored))
-        .map(|(id, sha, _)| (id, sha))
-        .collect();
+    let rows: Vec<(Uuid, String)> = match lookup_version(&pkg.registry_type, version) {
+        Some(lookup) => sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(&repo_ids)
+            .bind(lookup_name(&pkg.registry_type, &pkg.identifier))
+            .bind(lookup)
+            .fetch_all(db)
+            .await
+            .map_err(db_err)?,
+        None => Vec::new(),
+    };
     let Some((_, sha256)) = rows.first().cloned() else {
         return Err(McpError::PackageNotFound {
             index,
@@ -1998,10 +1998,26 @@ mod tests {
         );
         assert!(name_predicate("pypi").contains("regexp_replace"));
         assert!(name_predicate("nuget").contains("lower(a.name)"));
-        assert!(name_predicate("cargo").contains("replace(a.name, '-', '_')"));
-        assert!(version_matches("nuget", "1.0", "1.0.0"));
-        assert!(!version_matches("nuget", "1.0", "1.1.0"));
-        assert!(version_matches("npm", "1.0", "anything"));
+        // S4: as the download routes look a package up (#5253).
+        assert_eq!(
+            name_predicate("cargo"),
+            "a.name = lower($2) AND a.version = $3"
+        );
+        assert_eq!(
+            name_predicate("nuget"),
+            "lower(a.name) = lower($2) AND a.version = $3"
+        );
+        assert_eq!(lookup_version("nuget", "1.0").as_deref(), Some("1.0.0"));
+        assert_eq!(
+            lookup_version("nuget", "1.0.0-Beta").as_deref(),
+            Some("1.0.0-beta")
+        );
+        assert_eq!(lookup_version("nuget", "not-a-version"), None);
+        assert_eq!(lookup_version("npm", "1.0").as_deref(), Some("1.0"));
+        assert_eq!(
+            lookup_version("cargo", "1.0.0-RC.1").as_deref(),
+            Some("1.0.0-RC.1")
+        );
         assert_eq!(lookup_name("npm", "%40acme%2Fx"), "@acme/x");
         assert_eq!(name_predicate("npm"), "a.name = $2 AND a.version = $3");
         assert_eq!(lookup_name("pypi", "Acme_SDK"), "acme-sdk");

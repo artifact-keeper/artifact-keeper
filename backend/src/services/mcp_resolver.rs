@@ -194,11 +194,13 @@ pub enum CacheKey {
     PypiFiles {
         prefix: String,
     },
-    /// A NuGet package: a V3 flat-container path ending in `/<file>`
-    /// (`{id}.{version}.nupkg`), or the key a V2 upstream's
-    /// `package/{id}/{version}` download is cached under (`v2_path`).
+    /// A NuGet package: the V3 flat-container path
+    /// (`v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg`, every segment
+    /// lowercase, the version normalised: what a NuGet client requests), or
+    /// the key a V2 upstream's `package/{id}/{version}` download is cached
+    /// under (`v2_path`).
     Nupkg {
-        file: String,
+        v3_path: String,
         v2_path: String,
     },
 }
@@ -222,11 +224,13 @@ pub fn cache_key(registry_type: &str, identifier: &str, version: &str) -> Option
             name.to_ascii_lowercase()
         ))),
         "nuget" => {
+            // A version NuGet cannot normalise is never requested by a
+            // client: nothing to pin.
             let id = name.to_ascii_lowercase();
-            let v = crate::formats::nuget::NugetHandler::normalized_version(version)
-                .unwrap_or_else(|| version.to_ascii_lowercase());
+            let v = crate::formats::nuget::NugetHandler::normalized_version(version)?
+                .to_ascii_lowercase();
             Some(CacheKey::Nupkg {
-                file: format!("{id}.{v}.nupkg"),
+                v3_path: format!("v3/flatcontainer/{id}/{v}/{id}.{v}.nupkg"),
                 v2_path: format!("v2/package/{id}/{v}/package.nupkg"),
             })
         }
@@ -275,14 +279,21 @@ async fn find_cached(
     let Some(key) = cache_key(&pkg.registry_type, &pkg.identifier, version) else {
         return Ok(None);
     };
+    // Proxy-cache paths are exact, case-sensitive storage keys (the format
+    // handlers look an entry up by its exact key), so the match is exact:
+    // folding case would pin, say, `1.0.0-RC.1` for a `1.0.0-rc.1` request.
+    // PyPI matches the files of the normalised project whose name carries
+    // the version (filtered exactly below), so the row cap cannot cut the
+    // right file off.
+    use crate::api::handlers::escape_like_literal;
     let pattern = match &key {
-        CacheKey::Exact(p) => crate::api::handlers::escape_like_literal(p),
-        CacheKey::PypiFiles { prefix } => {
-            format!("{}%", crate::api::handlers::escape_like_literal(prefix))
-        }
-        CacheKey::Nupkg { file, .. } => {
-            format!("%/{}", crate::api::handlers::escape_like_literal(file))
-        }
+        CacheKey::Exact(p) => escape_like_literal(p),
+        CacheKey::PypiFiles { prefix } => format!(
+            "{}%{}%",
+            escape_like_literal(prefix),
+            escape_like_literal(version)
+        ),
+        CacheKey::Nupkg { v3_path, .. } => escape_like_literal(v3_path),
     };
     // A NuGet V2 upstream caches the package under its own key.
     let exact = match &key {
@@ -292,7 +303,7 @@ async fn find_cached(
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT path, checksum_sha256 FROM proxy_cache_artifacts \
          WHERE repository_id = $1 AND checksum_sha256 IS NOT NULL \
-           AND (lower(path) LIKE lower($2) ESCAPE '\\' OR lower(path) = lower($3)) \
+           AND (path LIKE $2 ESCAPE '\\' OR path = $3) \
          ORDER BY path LIMIT 200",
     )
     .bind(remote.id)

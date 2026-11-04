@@ -443,11 +443,24 @@ package first, then publish the server.json. A publish answers `422` with one
 
 What is served for a pinned package:
 
-Names and versions are matched the way each backing format stores them: an
-npm identifier is percent-decoded (`%40acme%2Fx` is `@acme/x`), PyPI names are
-PEP 503-normalised, NuGet ids are case-insensitive and versions are compared
-in NuGet's normalised form (`1.0`, `1.0.0` and `1.0.0.0` are one version),
-Cargo names are case-insensitive with `-` and `_` equivalent.
+Names and versions are matched exactly as the backing format's download
+route resolves the identifier and version a client requests, never wider, so
+the pinned bytes are the bytes that route serves:
+
+| Format | Name | Version |
+| --- | --- | --- |
+| npm | exact (case-sensitive), after percent-decoding (`%40acme%2Fx` is `@acme/x`, as the router decodes a request path) | exact |
+| PyPI | PEP 503-normalised (`Acme_SDK` is `acme-sdk`) | exact |
+| NuGet | case-insensitive | NuGet's normalised form in lowercase, as a V3 client requests it (`1.0` is requested as `1.0.0`), compared exactly with the stored version: a package stored as `1.0` or `1.0.0-Beta` is not served for `1.0.0` or `1.0.0-beta` and is not pinned. A version NuGet cannot normalise is not pinned. |
+| Cargo | case-insensitive; `-` and `_` are different crates (a Local repository can hold both) | exact |
+
+A Virtual backing repository pins the first member, by priority, that holds
+the version: the member a download through the Virtual is served from.
+A proxy-cache entry ([Packages in a Remote backing
+repository](#packages-in-a-remote-backing-repository)) matches by its exact,
+case-sensitive cache path (`1.0.0-RC.1` is not `1.0.0-rc.1`); a NuGet entry by
+its whole flat-container or V2 path (a file name alone is ambiguous:
+`x.1`@`0.0.1` and `x`@`1.0.0.1` share `x.1.0.0.1.nupkg`).
 
 - **npm, PyPI, NuGet, Cargo**: `identifier` and `version` unchanged,
   `registryBaseUrl` set to the backing repository
@@ -606,8 +619,9 @@ on a promotion-only repository (`409 mcp_promotion_only`).
 A package pulled through a Remote is held in the Remote's proxy cache, not as
 an artifact row. Publish finds it there (npm tarball
 `<name>/-/<base>-<version>.tgz`, PyPI distribution file
-`simple/<normalised project>/<file>`, NuGet `.nupkg` under
-`v3/flatcontainer/<id>/<version>/` or, from a V2 feed upstream,
+`simple/<normalised project>/<file>`, NuGet
+`v3/flatcontainer/<id>/<version>/<id>.<version>.nupkg` (lowercase, the
+normalised version) or, from a V2 feed upstream,
 `v2/package/<id>/<version>/package.nupkg`, Cargo
 `api/v1/crates/<name>/<version>/download`) and pins its cache path and sha256; the gate
 then evaluates exactly those cached bytes: the cache entry's Package Age

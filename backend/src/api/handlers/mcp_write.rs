@@ -3227,10 +3227,20 @@ mod tests {
         assert_eq!(
             cache_key("nuget", "Echo.Pkg", "1.0"),
             Some(CacheKey::Nupkg {
-                file: "echo.pkg.1.0.0.nupkg".into(),
+                v3_path: "v3/flatcontainer/echo.pkg/1.0.0/echo.pkg.1.0.0.nupkg".into(),
                 v2_path: "v2/package/echo.pkg/1.0.0/package.nupkg".into(),
             })
         );
+        // The file name alone is ambiguous (`x.1`@`0.0.1` and `x`@`1.0.0.1`
+        // share `x.1.0.0.1.nupkg`): the key is the whole path.
+        assert_eq!(
+            cache_key("nuget", "x", "1.0.0.1"),
+            Some(CacheKey::Nupkg {
+                v3_path: "v3/flatcontainer/x/1.0.0.1/x.1.0.0.1.nupkg".into(),
+                v2_path: "v2/package/x/1.0.0.1/package.nupkg".into(),
+            })
+        );
+        assert_eq!(cache_key("nuget", "x", "not-a-version"), None);
         assert_eq!(
             cache_key("cargo", "Echo-Crate", "1.0.0"),
             Some(CacheKey::Exact(

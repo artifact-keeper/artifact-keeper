@@ -4521,6 +4521,128 @@ mod tests {
         env.teardown().await;
     }
 
+    /// S4 (#5253): a pin matches exactly what the backing format's download
+    /// route serves for the identifier and version a client requests, and
+    /// nothing wider. Cargo: case-insensitive, but `foo-bar` is not
+    /// `foo_bar`. NuGet: case-insensitive id, the normalised lowercase version
+    /// a V3 client requests, compared exactly with the stored version (so
+    /// `1.0` pins the row stored as `1.0.0`, never the one stored as `1.0`).
+    #[tokio::test]
+    async fn pins_match_what_the_download_route_serves() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let cargo = env.repo("local", "cargo").await;
+        let nuget = env.repo("local", "nuget").await;
+        let seed =
+            |repo: RepoInfo, path: &'static str, name: &'static str, v: &'static str, sha: char| {
+                let state = env.fx.state.clone();
+                let pool = env.fx.pool.clone();
+                let user = env.fx.user_id;
+                async move {
+                    tdh::seed_artifact_with_checksum(
+                        &state,
+                        &pool,
+                        &repo,
+                        &format!("s4/{path}"),
+                        path,
+                        name,
+                        v,
+                        "application/octet-stream",
+                        Bytes::from_static(b"pkg"),
+                        user,
+                        &sha.to_string().repeat(64),
+                    )
+                    .await
+                }
+            };
+        seed(
+            cargo.clone(),
+            "crates/foo_bar/1.0.0.crate",
+            "foo_bar",
+            "1.0.0",
+            'a',
+        )
+        .await;
+        seed(nuget.clone(), "x/1.0/x.1.0.nupkg", "x", "1.0", 'b').await;
+        seed(nuget.clone(), "x/1.0.0/x.1.0.0.nupkg", "x", "1.0.0", 'c').await;
+        seed(
+            nuget.clone(),
+            "y/1.0.0-Beta/y.1.0.0-Beta.nupkg",
+            "y",
+            "1.0.0-Beta",
+            'd',
+        )
+        .await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"cargo": cargo.key, "nuget": nuget.key}).to_string(),
+        )
+        .await;
+        let publish =
+            |server: &'static str, ty: &'static str, id: &'static str, v: &'static str| {
+                doc(
+                    server,
+                    "1.0.0",
+                    serde_json::json!({"packages": [{"registryType": ty, "identifier": id,
+                    "version": v, "transport": {"type": "stdio"}}]}),
+                )
+            };
+        let pinned = |server: &'static str| {
+            let pool = env.fx.pool.clone();
+            let repo = env.fx.repo_id;
+            async move {
+                let sha: Option<String> = sqlx::query_scalar(
+                    "SELECT m.metadata#>>'{packages,0,resolved,sha256}' FROM artifacts a \
+                     JOIN artifact_metadata m ON m.artifact_id = a.id \
+                     WHERE a.repository_id = $1 AND a.name = $2",
+                )
+                .bind(repo)
+                .bind(server)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                sha.unwrap_or_default()
+            }
+        };
+        // Cargo: another crate behind a `-`/`_` swap is not pinned.
+        let (s, b) = env
+            .publish(&publish("com.acme/c1", "cargo", "foo-bar", "1.0.0"))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_package_not_found")
+            ),
+            "{b}"
+        );
+        let (s, b) = env
+            .publish(&publish("com.acme/c2", "cargo", "Foo_Bar", "1.0.0"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(pinned("com.acme/c2").await, "a".repeat(64));
+        // NuGet: `1.0` is requested as `1.0.0`; the `1.0.0` row is pinned.
+        let (s, b) = env
+            .publish(&publish("com.acme/n1", "nuget", "X", "1.0"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(pinned("com.acme/n1").await, "c".repeat(64));
+        // A row stored as `1.0.0-Beta` is never served for `1.0.0-beta`.
+        let (s, b) = env
+            .publish(&publish("com.acme/n2", "nuget", "y", "1.0.0-beta"))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_package_not_found")
+            ),
+            "{b}"
+        );
+        env.teardown().await;
+    }
+
     /// #5253 existence oracle: a publisher with MCP write but no read on the
     /// mapped backing repository gets the same `422 mcp_package_not_found`
     /// for a package that exists there and for one that does not, and
