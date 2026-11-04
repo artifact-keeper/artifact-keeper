@@ -1406,10 +1406,12 @@ async fn download_bundle_split(
 }
 
 /// `GET .../versions/{v}/bundles/{file}`: a bundle of a published version,
-/// gated by its own download gate (quarantine, scan policy). A bundle of a
-/// version that is not published, or that is `deleted`, answers the
-/// unknown-name 404, as does a held bundle for every caller (its reason is
-/// on the artifact API). Streamed from storage.
+/// gated first by the owning version's reader serve decision (a version not
+/// served to readers -- unknown, `deleted`, held, a refusing backing gate --
+/// answers the unknown-name 404 for its bundles), then by the bundle's own
+/// download gate (quarantine, scan policy). A held bundle answers the same
+/// 404 for every caller (its reason is on the artifact API). Streamed from
+/// storage.
 async fn download_bundle(
     state: &SharedState,
     repo_key: &str,
@@ -1422,12 +1424,38 @@ async fn download_bundle(
     if check_bundle_coordinates(name, version, file).is_err() {
         return Err(not_found());
     }
-    let published = versions_of(&state.db, repo.id, name)
+    // The owning version's serve decision gates its bundles: a version a
+    // reader would not be served (deleted, held, a refusing backing gate)
+    // answers the same unknown-name 404 for its bundles, so the bundle route
+    // is not an oracle for held versions. An unevaluable gate stays 503.
+    let Some(owner) = versions_of(&state.db, repo.id, name)
         .await?
         .into_iter()
-        .any(|r| r.version == version && r.stored.registry.status != ServerStatus::Deleted);
-    if !published {
+        .find(|r| r.version == version)
+    else {
         return Err(not_found());
+    };
+    let policy_now = surface::current_policy(&state.db, repo.id).await;
+    match surface::decide_row(
+        mcp_packages::GateCtx::of(state, false),
+        &owner,
+        policy_now,
+        false,
+        fmt::GateAudience::ReaderOnly,
+        String::new(),
+    )
+    .await
+    {
+        fmt::ServeDecision::Serve => {}
+        fmt::ServeDecision::Refuse { status: 503, .. } => {
+            return Err(problem(
+                503,
+                "mcp_gate_unavailable",
+                "The registry could not evaluate this bundle's gates; retry later",
+                serde_json::json!({}),
+            ))
+        }
+        fmt::ServeDecision::Refuse { .. } => return Err(not_found()),
     }
     let row: Option<(Uuid, String, i64, String)> = sqlx::query_as(
         "SELECT a.id, a.storage_key, a.size_bytes, a.checksum_sha256 FROM artifacts a \
@@ -2269,6 +2297,78 @@ mod tests {
             n
         };
         assert_eq!(rejected, 2);
+        env.teardown().await;
+    }
+
+    /// Review finding 3: a bundle is served only while its owning version is
+    /// served to readers. A held server.json (quarantine) or a soft-deleted
+    /// version answers the byte-identical unknown-name 404 for its bundles.
+    #[tokio::test]
+    async fn bundle_download_follows_the_version_serve_decision() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let up = "/servers/com.acme/echo/versions/1.0.0/bundles/echo.mcpb";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(env.url(up))
+            .body(Body::from(SIGNED))
+            .unwrap();
+        assert_eq!(tdh::send(env.member(), req).await.0, StatusCode::CREATED);
+        let d = doc("com.acme/echo", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let get = || env.call(env.anon(), "GET", up, Body::empty());
+        assert_eq!(get().await.0, StatusCode::OK);
+        let unknown = env
+            .call(
+                env.anon(),
+                "GET",
+                "/servers/com.acme/nope/versions/1.0.0/bundles/echo.mcpb",
+                Body::empty(),
+            )
+            .await;
+        assert_eq!(unknown.0, StatusCode::NOT_FOUND);
+
+        // Hold the server.json version (not the bundle): the bundle is gone.
+        let id = env.artifact("com.acme/echo", "1.0.0").await;
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_source = 'admin' \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            get().await,
+            unknown,
+            "a held version's bundle is the unknown 404"
+        );
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = NULL, quarantine_source = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(get().await.0, StatusCode::OK);
+
+        // Soft delete: the bundle follows the version.
+        let (s, b) = env
+            .json(
+                env.member(),
+                "DELETE",
+                "/servers/com.acme/echo/versions/1.0.0",
+                None,
+            )
+            .await;
+        assert!(s.is_success(), "{s} {b}");
+        assert_eq!(
+            get().await,
+            unknown,
+            "a deleted version's bundle is the unknown 404"
+        );
         env.teardown().await;
     }
 
