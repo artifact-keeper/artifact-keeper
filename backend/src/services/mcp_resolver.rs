@@ -310,6 +310,24 @@ async fn find_cached(
     }))
 }
 
+/// A pin on a package the proxy cache of `mapped`'s fill target holds (the
+/// mapped Remote itself, or a Virtual's first Remote member); `None` when
+/// `mapped` has no Remote to pull through or the package is not cached.
+/// Remote MCP ingest uses it after the `artifacts` lookup misses: npm, PyPI,
+/// NuGet and Cargo packages pulled through a Remote live only in its proxy
+/// cache.
+pub async fn cached_pin_through(
+    db: &PgPool,
+    mapped: &BackingRepo,
+    index: usize,
+    pkg: &fmt::Package,
+) -> Result<Option<PackagePin>, McpError> {
+    match fill_target(db, mapped).await? {
+        Some(remote) => cached_pin(db, mapped, &remote, index, pkg).await,
+        None => Ok(None),
+    }
+}
+
 /// A pin on a package `remote` (the mapped repository or its Remote member)
 /// has in its proxy cache.
 async fn cached_pin(

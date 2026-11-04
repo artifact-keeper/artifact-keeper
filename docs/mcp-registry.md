@@ -1060,6 +1060,12 @@ deleted later. Each run:
    pulled through it yet, policy `hide`) is recorded in
    `metadata.ingest.unresolved` and the version is `unresolvable`: stored,
    never served. Each run retries the resolution of up to 100 such versions.
+   A package pulled through a Remote backing repository (or a Virtual's
+   first Remote member) is found in that Remote's proxy cache, as on a
+   publish ([Packages in a Remote backing
+   repository](#packages-in-a-remote-backing-repository)); the sync never
+   fills one itself, so pull it through the Remote and the next sync pins
+   and serves the version.
 4. **Never overwrites** an ingested `name@version`. Changed upstream bytes
    keep the stored document, re-queue that version (a `name@version` row in
    `review` with `contentDrift: {storedSha256, upstreamSha256, detectedAt}`),

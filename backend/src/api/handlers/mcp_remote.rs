@@ -1565,9 +1565,12 @@ mod tests {
             .await
             .unwrap();
         assert!(due.contains(&env.fx.repo_key));
-        crate::services::mcp_remote::run_due(
+        // Only this test's repository: the shared test database holds other
+        // tests' Remotes, which are due too, and syncing them here would hold
+        // their sync locks under those tests (409 on their own sync).
+        crate::services::mcp_remote::sync_each(
             &env.state,
-            3600,
+            std::slice::from_ref(&env.fx.repo_key),
             &tokio_util::sync::CancellationToken::new(),
         )
         .await;

@@ -282,6 +282,7 @@ impl Harness {
         for id in self.extra.iter().chain([&self.repo_id]) {
             for sql in [
                 "DELETE FROM curation_packages WHERE staging_repo_id = $1",
+                "DELETE FROM proxy_cache_artifacts WHERE repository_id = $1",
                 "DELETE FROM oci_tags WHERE repository_id = $1",
                 "DELETE FROM packages WHERE repository_id = $1",
                 "DELETE FROM artifact_metadata WHERE artifact_id IN \
@@ -1261,5 +1262,134 @@ async fn allowlist_approval_stores_versions_deleted_upstream() {
             "servers/io.github.acme/w/1.0.0/server.json"
         ]
     );
+    h.teardown().await;
+}
+
+/// A Remote MCP repository pins npm, PyPI, NuGet and Cargo packages that
+/// were pulled through its Remote backing repositories: those live only in
+/// the backing Remote's proxy cache, not in `artifacts`. Before the pull the
+/// version is ingested unresolved (hidden); the next sync re-resolves it
+/// from the cache and serves it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn remote_pins_packages_pulled_through_backing_remotes() {
+    let mut h = Harness::new(false).await;
+    // (registryType, repository format, upstream, identifier, cache path)
+    let cases = [
+        (
+            "npm",
+            "npm",
+            "https://registry.npmjs.org",
+            "@acme/echo-npm",
+            "@acme/echo-npm/-/echo-npm-1.0.0.tgz",
+        ),
+        (
+            "pypi",
+            "pypi",
+            "https://pypi.org",
+            "Echo_Pkg",
+            "simple/echo-pkg/echo_pkg-1.0.0-py3-none-any.whl",
+        ),
+        (
+            "nuget",
+            "nuget",
+            "https://api.nuget.org/v3/index.json",
+            "Acme.Echo",
+            "v3-flatcontainer/acme.echo/1.0.0/acme.echo.1.0.0.nupkg",
+        ),
+        (
+            "cargo",
+            "cargo",
+            "https://crates.io",
+            "echo-rs",
+            "api/v1/crates/echo-rs/1.0.0/download",
+        ),
+    ];
+    let mut mapping = serde_json::Map::new();
+    let mut backing = Vec::new();
+    let mut entries = Vec::new();
+    for (ty, format, upstream, identifier, cache_path) in cases {
+        let id = Uuid::new_v4();
+        let key = format!("{ty}-remote-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', $4::repository_format, $5, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("{}/{key}", h.dir))
+        .bind(format)
+        .bind(upstream)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        h.extra.push(id);
+        mapping.insert(ty.to_string(), key.clone().into());
+        backing.push((id, cache_path));
+        let mut doc = server(&format!("io.github.acme/echo-{ty}"), "1.0.0", "Echo");
+        doc["packages"] = serde_json::json!([{
+            "registryType": ty, "registryBaseUrl": upstream, "identifier": identifier,
+            "version": "1.0.0", "transport": {"type": "stdio"},
+        }]);
+        entries.push(entry(doc, T1));
+    }
+    h.config(
+        "mcp_package_repos",
+        &serde_json::Value::Object(mapping).to_string(),
+    )
+    .await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme/*"]"#)
+        .await;
+    mount_quiet_upstream(&h.upstream, &entries).await;
+
+    let first = h.sync().await;
+    assert_eq!(first["unresolved"], 4, "not pulled through yet: {first}");
+    assert!(h.listed_names().await.is_empty());
+    for (ty, ..) in cases {
+        let item = h.item(&format!("io.github.acme/echo-{ty}")).await;
+        assert_eq!(
+            item["ingested"][0]["unresolved"][0]["error"], "mcp_package_not_found",
+            "{ty}: {item}"
+        );
+    }
+
+    // Pull every package through its Remote (the proxy cache rows a
+    // pull-through writes), then sync again.
+    for (id, cache_path) in &backing {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes, checksum_sha256) VALUES ($1, $2, $3, $4, 1, $5)",
+        )
+        .bind(id)
+        .bind(cache_path)
+        .bind(format!("proxy-cache/{id}/p"))
+        .bind(format!("proxy-cache/{id}/p.meta"))
+        .bind("cd".repeat(32))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    let second = h.sync().await;
+    assert_eq!(second["reResolved"], 4, "{second}");
+    let mut served = h.listed_names().await;
+    served.sort();
+    assert_eq!(
+        served,
+        [
+            "io.github.acme/echo-cargo@1.0.0",
+            "io.github.acme/echo-npm@1.0.0",
+            "io.github.acme/echo-nuget@1.0.0",
+            "io.github.acme/echo-pypi@1.0.0"
+        ]
+    );
+    for (ty, ..) in cases {
+        let item = h.item(&format!("io.github.acme/echo-{ty}")).await;
+        assert!(
+            item["ingested"][0]["unresolved"]
+                .as_array()
+                .is_some_and(|u| u.is_empty()),
+            "{ty}: {item}"
+        );
+    }
     h.teardown().await;
 }

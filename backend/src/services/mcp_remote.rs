@@ -881,9 +881,30 @@ async fn pin_packages(
             });
             continue;
         }
-        let candidate = for_resolution(pkg, settings.repos.get(&pkg.registry_type));
-        match mcp_packages::resolve_package(run.state, settings, index, &candidate, "", true).await
-        {
+        let mapped = settings.repos.get(&pkg.registry_type);
+        let candidate = for_resolution(pkg, mapped);
+        let mut found =
+            mcp_packages::resolve_package(run.state, settings, index, &candidate, "", true).await;
+        // A package pulled through a Remote backing repository (or a
+        // Virtual's Remote member) lives in its proxy cache, not in
+        // `artifacts` (OCI pulls write manifest rows and resolve above).
+        if let (Err(McpError::PackageNotFound { .. }), Some(repo)) = (&found, mapped) {
+            if pkg.registry_type != "oci" {
+                match crate::services::mcp_resolver::cached_pin_through(
+                    &run.state.db,
+                    repo,
+                    index,
+                    &candidate,
+                )
+                .await
+                {
+                    Ok(Some(pin)) => found = Ok(pin),
+                    Ok(None) => {}
+                    Err(e) => found = Err(e),
+                }
+            }
+        }
+        match found {
             Ok(mut pin) => {
                 pin.submitted.identifier = pkg.identifier.clone();
                 pins.push(pin);
@@ -1966,12 +1987,23 @@ pub async fn run_due(
             return;
         }
     };
+    sync_each(state, &keys, lost).await;
+}
+
+/// Sync the repositories `keys` in order (the scheduler's pass over the due
+/// ones), stopping between repositories when the scheduler lease is lost.
+/// A repository another run holds is skipped.
+pub async fn sync_each(
+    state: &SharedState,
+    keys: &[String],
+    lost: &tokio_util::sync::CancellationToken,
+) {
     for key in keys {
         if lost.is_cancelled() {
             return;
         }
         let repo =
-            match proxy_helpers::resolve_repo_by_key(&state.db, &key, &["mcp"], "an MCP registry")
+            match proxy_helpers::resolve_repo_by_key(&state.db, key, &["mcp"], "an MCP registry")
                 .await
             {
                 Ok(r) => r,
