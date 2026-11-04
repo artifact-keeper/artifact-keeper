@@ -3390,6 +3390,23 @@ fn generic_archive_expects_catalog(lower_filename: &str) -> bool {
     ScanWorkspace::is_archive(lower_filename)
 }
 
+/// Why the CVE engine cannot grade a hosted `filename` of `repository_format`,
+/// for the files it could only ever report zero findings on. A Helm chart
+/// ships templates and values, no packages: the images it names carry them
+/// and are graded where they are pulled. The scan is recorded
+/// `not_applicable` with this reason rather than as a clean grade
+pub(crate) fn hosted_cve_ungradeable_reason(
+    repository_format: &str,
+    filename: &str,
+) -> Option<&'static str> {
+    let lower = filename.to_ascii_lowercase();
+    (repository_format == "helm" && (lower.ends_with(".tgz") || lower.ends_with(".tar.gz")))
+        .then_some(
+            "not scannable: a Helm chart ships no packages the CVE engine can grade, \
+             the images it names are graded where they are pulled",
+        )
+}
+
 /// Package-shaped archive extensions: files that are packages by
 /// construction, so an empty catalog means a package nobody could read.
 const PACKAGE_SHAPED_ARCHIVE_SUFFIXES: &[&str] = &[
@@ -10031,7 +10048,11 @@ impl ScannerService {
             // was falsely BLOCKED (#1648). We now INSERT a terminal
             // `not_applicable` row so the artifact classifies as scanned-OK
             // (not unscanned) and the operator sees a deterministic record.
-            if !scanner.is_applicable_for_target(&target) {
+            let ungradeable = scanner
+                .is_cve_authoritative()
+                .then(|| hosted_cve_ungradeable_reason(&repository_format, upload_filename))
+                .flatten();
+            if ungradeable.is_some() || !scanner.is_applicable_for_target(&target) {
                 info!(
                     "Scanner {} not applicable for artifact {} (content_type={}, path={}), skipping",
                     scanner.name(),
@@ -10039,10 +10060,12 @@ impl ScannerService {
                     artifact.content_type,
                     artifact.path,
                 );
-                let reason = format!(
-                    "Scanner {} does not apply to this artifact format",
-                    scanner.name(),
-                );
+                let reason = ungradeable.map(str::to_string).unwrap_or_else(|| {
+                    format!(
+                        "Scanner {} does not apply to this artifact format",
+                        scanner.name(),
+                    )
+                });
                 match prepared_action {
                     PreparedScanAction::Reuse(target_id) => {
                         if let Err(e) = self
@@ -29499,6 +29522,116 @@ tonic-build = "0.12"
         ) -> Result<ScanOutput> {
             panic!("an inapplicable scanner must never be invoked");
         }
+    }
+
+    /// CVE-authoritative and applicable, so only the format rule can keep it
+    /// from running
+    struct CveScannerThatMustNotRun;
+
+    #[async_trait]
+    impl Scanner for CveScannerThatMustNotRun {
+        fn name(&self) -> &str {
+            "cve-must-not-run"
+        }
+
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+
+        fn is_applicable(&self, _artifact: &Artifact) -> bool {
+            true
+        }
+
+        async fn scan(
+            &self,
+            _artifact: &Artifact,
+            _metadata: Option<&ArtifactMetadata>,
+            _content: &Bytes,
+        ) -> Result<ScanOutput> {
+            panic!("the CVE engine must not grade a Helm chart");
+        }
+    }
+
+    #[test]
+    fn test_hosted_cve_ungradeable_reason_names_helm_charts_only() {
+        assert!(hosted_cve_ungradeable_reason("helm", "nginx-1.0.0.tgz").is_some());
+        assert!(hosted_cve_ungradeable_reason("helm", "charts/NGINX-1.0.0.TAR.GZ").is_some());
+        assert!(hosted_cve_ungradeable_reason("helm", "index.yaml").is_none());
+        assert!(hosted_cve_ungradeable_reason("npm", "nginx-1.0.0.tgz").is_none());
+        assert!(hosted_cve_ungradeable_reason("generic", "nginx-1.0.0.tgz").is_none());
+    }
+
+    /// A Helm chart uploaded with scan-on-upload records the CVE engine as
+    /// `not_applicable`, saying why, instead of a zero-finding clean
+    #[tokio::test]
+    async fn test_hosted_helm_chart_records_the_cve_engine_not_applicable() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let checksum = fresh_checksum();
+        let storage_key = format!("helm-chart/{artifact_id}.tgz");
+        fx.state
+            .storage
+            .put(&storage_key, Bytes::from_static(b"chart"))
+            .await
+            .expect("store chart bytes");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'nginx', 'nginx-1.0.0.tgz', 5, $3, 'application/gzip', $4, false)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&checksum)
+        .bind(&storage_key)
+        .execute(&fx.pool)
+        .await
+        .expect("insert chart");
+        let scanner = ScannerService {
+            db: fx.pool.clone(),
+            scanners: vec![Arc::new(CveScannerThatMustNotRun)],
+            scan_result_service: Arc::new(ScanResultService::new(fx.pool.clone())),
+            scan_config_service: Arc::new(ScanConfigService::new(fx.pool.clone())),
+            storage: fx.state.storage.clone(),
+            storage_registry: fx.state.storage_registry.clone(),
+            storage_base_path: fx.storage_dir.to_string_lossy().into_owned(),
+            scan_workspace_path: fx
+                .storage_dir
+                .join("scan-workspace")
+                .to_string_lossy()
+                .into_owned(),
+            dependency_track: None,
+        };
+
+        scanner
+            .scan_artifact_with_options(artifact_id, true, true)
+            .await
+            .expect("scan orchestration succeeds");
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT status, error_message FROM scan_results WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .fetch_all(&fx.pool)
+                .await
+                .expect("read scan rows");
+        cleanup_scan_state(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "not_applicable");
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Helm chart"),
+            "{rows:?}"
+        );
     }
 
     /// #1470 regression: on the InsertFresh path (auto-scan-on-upload, no
