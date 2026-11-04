@@ -28,6 +28,12 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+-- The trigger takes SHARE ROW EXCLUSIVE on `artifacts` and the backfill
+-- below reads it: bound the wait (docs/operations/online-migrations.md) so a
+-- long transaction fails this migration (retried at the next start) instead
+-- of queueing every artifact write behind it.
+SET LOCAL lock_timeout = '5s';
+
 DROP TRIGGER IF EXISTS mcp_version_tombstone ON artifacts;
 CREATE TRIGGER mcp_version_tombstone
     AFTER INSERT ON artifacts
