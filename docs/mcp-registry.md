@@ -153,7 +153,9 @@ Behaviour pinned by the end-to-end suite (clients may rely on it):
   mcp_search_too_short`.
 - A write without `write:artifacts` is `403 mcp_forbidden` ("This token does
   not carry the write:artifacts scope"); a token minted for other repositories
-  is `403 mcp_forbidden` ("This token is not scoped to this repository").
+  is `403 mcp_forbidden`. The `detail` text depends on which check refuses it
+  ("This token is not scoped to this repository" or "This credential may not
+  write to this repository"), so clients should match on `code`, not `detail`.
 
 ## Authentication and publishing
 
