@@ -48,6 +48,9 @@ pub const PUBLISHER_META_KEY: &str = "io.modelcontextprotocol.registry/publisher
 pub const OFFICIAL_META_KEY: &str = "io.modelcontextprotocol.registry/official";
 pub const AK_SOURCE_META_KEY: &str = "com.artifactkeeper.registry/source";
 pub const AK_RESOLVED_META_KEY: &str = "com.artifactkeeper/resolved";
+/// Publisher-declared capabilities (tools/resources/prompts), kept next to
+/// the publisher-provided member (`services::mcp_capabilities`).
+pub const AK_CAPABILITIES_META_KEY: &str = "com.artifactkeeper/capabilities";
 pub const SCHEMA_URL: &str =
     "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json";
 pub const DEFAULT_LIMIT: i64 = 30;
@@ -925,7 +928,13 @@ pub fn reduce_publisher_meta(s: &mut ServerJson) -> V {
     let Some(meta) = s.meta.take() else {
         return Ok(());
     };
+    let declared = keep_declared_capabilities(&meta)?;
     let Some(provided) = meta.get(PUBLISHER_META_KEY) else {
+        s.meta = declared.map(|d| {
+            let mut kept = serde_json::Map::new();
+            kept.insert(AK_CAPABILITIES_META_KEY.to_string(), d);
+            kept
+        });
         return Ok(());
     };
     if !provided.is_object() {
@@ -953,8 +962,33 @@ pub fn reduce_publisher_meta(s: &mut ServerJson) -> V {
     }
     let mut kept = serde_json::Map::new();
     kept.insert(PUBLISHER_META_KEY.to_string(), provided.clone());
+    if let Some(d) = declared {
+        kept.insert(AK_CAPABILITIES_META_KEY.to_string(), d);
+    }
     s.meta = Some(kept);
     Ok(())
+}
+
+/// The top-level `_meta[com.artifactkeeper/capabilities]` block, kept when
+/// present (an object, same character rules as every rendered string). Its
+/// shape and size are checked by `services::mcp_capabilities` at publish.
+fn keep_declared_capabilities(
+    meta: &serde_json::Map<String, serde_json::Value>,
+) -> std::result::Result<Option<serde_json::Value>, McpError> {
+    let Some(block) = meta.get(AK_CAPABILITIES_META_KEY) else {
+        return Ok(None);
+    };
+    let path = format!("_meta.{AK_CAPABILITIES_META_KEY}");
+    if !block.is_object() {
+        return Err(McpError::invalid(path, "must be an object"));
+    }
+    if let Some(at) = forbidden_in_json(block, &path) {
+        return Err(McpError::invalid(
+            at,
+            "control, bidirectional or zero-width characters are not allowed",
+        ));
+    }
+    Ok(Some(block.clone()))
 }
 
 /// The stored form of a document: `serde_json` serialises a `Value`'s object
@@ -2504,6 +2538,38 @@ mod tests {
             assert!(
                 matches!(reduce_publisher_meta(&mut s), Err(McpError::Invalid { .. })),
                 "{provided}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_capabilities_meta_is_kept() {
+        let caps = serde_json::json!({"tools": [{"name": "a"}]});
+        let mut s = check(doc(serde_json::json!({"_meta": {
+            AK_CAPABILITIES_META_KEY: caps, "com.example/x": 1,
+        }})))
+        .unwrap();
+        reduce_publisher_meta(&mut s).unwrap();
+        let meta = s.meta.as_ref().unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[AK_CAPABILITIES_META_KEY], caps);
+        let mut s = check(doc(serde_json::json!({"_meta": {
+            AK_CAPABILITIES_META_KEY: caps, PUBLISHER_META_KEY: {"tool": "cli"},
+        }})))
+        .unwrap();
+        reduce_publisher_meta(&mut s).unwrap();
+        assert_eq!(s.meta.as_ref().unwrap().len(), 2);
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!({"tools": [{"name": "a", "description": "x\u{200B}"}]}),
+        ] {
+            let mut s = check(doc(
+                serde_json::json!({"_meta": {AK_CAPABILITIES_META_KEY: bad}}),
+            ))
+            .unwrap();
+            assert!(
+                matches!(reduce_publisher_meta(&mut s), Err(McpError::Invalid { .. })),
+                "{bad}"
             );
         }
     }

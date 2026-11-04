@@ -36,6 +36,12 @@ URL-encoded (`com.acme%2Fweather`) or with a literal slash
 | `PATCH /v0.1/servers/{serverName}/versions/{version}/status` | write | `{"status": "active" \| "deprecated" \| "deleted", "statusMessage": "..."}` |
 | `PATCH /v0.1/servers/{serverName}/status` | write | The same for every version; answers `{updatedCount, servers}`. |
 | `GET /v0.1/ping`, `/health`, `/version` | read | `{"status":"ok"}`, a database-checked health answer, `{"version": "<AK version>"}`. |
+| `GET /v0.1/servers/{serverName}/versions/{version}/capabilities` | read | Capability snapshots of a version (see [Capabilities and introspection](#capabilities-and-introspection)). |
+| `POST /v0.1/servers/{serverName}/versions/{version}/capabilities` | write | Report a CI- or gateway-observed capability list. `201`. |
+| `GET /v0.1/servers/{serverName}/versions/{version}/capabilities/diff` | read | Tool, resource and prompt diff between two snapshots (approval queue). |
+| `POST /v0.1/servers/{serverName}/versions/{version}/capabilities/probe` | repository admin | Queue introspection jobs when the repository's settings allow them. `202`. |
+| `POST /api/v1/mcp/introspection/jobs/claim` | `mcp:introspect` token | Worker API: claim the next job (`200`) or nothing due (`204`). |
+| `POST /api/v1/mcp/introspection/jobs/{id}/complete` | `mcp:introspect` token | Worker API: post a job's result. |
 
 The list envelope is upstream's:
 `{"servers": [{"server": {...}, "_meta": {...}}], "metadata": {"nextCursor": "...", "count": N}}`.
@@ -361,3 +367,440 @@ change the locked setting (`403`).
 ## Virtual repositories
 
 (Filled in by the Virtual workstream.)
+
+## Capabilities and introspection
+
+A **capability snapshot** records what one server version advertises: its
+`tools`, `resources`, `prompts` (MCP spec objects, stored as received) and
+`instructions`, with where the list came from. Snapshots feed the Tools tab,
+the approval queue's tool diff and the `tool_drift` finding. **No snapshot
+ever marks a server safe**: tool lists vary by the caller's authorization,
+annotations such as `destructiveHint` are asserted by the server, and a
+declared list is a claim, not an observation. Every response repeats this in
+a `notice` member.
+
+| `source` | Produced by | Badge |
+| --- | --- | --- |
+| `publisher_declared` | `_meta["com.artifactkeeper/capabilities"]` of the published server.json, or an MCPB bundle's `manifest.json` (`tools[]`, `prompts[]`, `tools_generated`) | declared |
+| `ci_reported` | the publisher's pipeline, `POST .../capabilities` | CI-reported |
+| `gateway_reported` | an operator's Docker MCP Gateway / ToolHive inventory, `POST .../capabilities` (see `ak-mcp-introspector push`) | gateway-reported |
+| `remote_probe` | the `ak-mcp-introspector` worker against a `remotes[]` URL | observed (remote) |
+| `sandbox_run` | the `ak-mcp-introspector` worker running a stdio package in a sandbox | observed (sandbox) |
+
+The **current** snapshot is the newest successful (`outcome: ok`) one of the
+best source in this order: `sandbox_run`, `remote_probe`, `gateway_reported`,
+`ci_reported`, `publisher_declared`. History is kept.
+
+### Declaring capabilities at publish
+
+Add a `com.artifactkeeper/capabilities` member to the document's `_meta`
+(top level, or inside `io.modelcontextprotocol.registry/publisher-provided`,
+which is where an upstream registry keeps it). It is served back as part of
+the document.
+
+```json
+"_meta": {
+  "com.artifactkeeper/capabilities": {
+    "protocolVersion": "2026-07-28",
+    "generatedBy": "make tools-json",
+    "tools": [{"name": "get_forecast", "description": "...", "inputSchema": {"type": "object"},
+               "annotations": {"readOnlyHint": true}}],
+    "resources": [{"uri": "weather://stations", "name": "stations"}],
+    "prompts": [{"name": "summarise", "arguments": []}],
+    "instructions": "..."
+  }
+}
+```
+
+Rules (publish answers `400` with the field path otherwise): an object of at
+most 128 KiB; each list at most 1000 entries; every tool and prompt has a
+non-empty string `name` (at most 256 bytes), every resource a `uri` (at most
+2048 bytes), unique per list; `instructions` a string of at most 64 KiB; the
+same character rules as every other rendered string (no control,
+bidirectional or zero-width characters). MCPB bundles stored by the bundle
+upload (`metadata.bundles[*].manifest`) are recorded as one declared snapshot
+per bundle (`origin: "mcpb:<fileSha256>"`). Declared snapshots are recorded
+once per (version, origin, content); a Remote's ingest and the bundle upload
+call the same builder (`services::mcp_capabilities::record_declared_snapshot`).
+
+### Hashing and drift
+
+Each item is hashed over the canonical (key-sorted) JSON of its identity
+members only: tools `name, title, description, inputSchema, outputSchema,
+annotations`; resources `uri, name, title, description, mimeType,
+annotations`; prompts `name, title, description, arguments`. `_meta` and any
+other member are carried but never count as a change. The per-item hashes
+are sorted, so order does not matter. `toolsHash` is the hash of the tool
+list; `contentHash` covers tools, resources, prompts and instructions.
+
+When a new successful snapshot of a version differs (`contentHash`) from the
+previous successful one **of the same source** (and, for declarations, the
+same origin), AK records a `tool_drift` finding and audits `MCP_TOOLS_DRIFT`.
+The finding is an `external` scan result (scanner `ak-mcp-capabilities`,
+`source: mcp-capabilities`, class `policy`) on the server.json artifact, so
+the findings UI, acknowledgement and the scan-policy gate apply unchanged:
+
+| Source of the changed snapshot | Severity |
+| --- | --- |
+| `remote_probe`, `sandbox_run` | `high` (same version, different tools: the remote rug pull) |
+| `ci_reported`, `gateway_reported` | `medium` |
+| `publisher_declared` | `low` |
+
+Title: `tool_drift: <source> snapshot of <name>@<version> changed (<old hash
+prefix> -> <new hash prefix>)`; the description carries the diff summary and
+both snapshot ids. A version whose repository has a scan policy that blocks
+on `high` is therefore held until the finding is acknowledged.
+
+### `GET .../servers/{serverName}/versions/{version}/capabilities`
+
+Read access as for the version itself. A caller who may read why a version is
+held (the repository's members and administrators) sees every stored
+version, held or not, so the approval queue can show pending versions; every
+other caller sees only a version that is servable now, and anything else is
+the unknown-name `404` byte for byte. `{version}` is an exact version
+(`latest` is not resolved here).
+
+Query: `source` (one of the sources: restricts `current` and the list),
+`snapshot` (a snapshot id: answered as `current`), `limit` (history length,
+default 50, max 200).
+
+```json
+{
+  "repository": "mcp-local",
+  "server": "com.acme/weather",
+  "version": "1.0.0",
+  "artifactId": "uuid",
+  "current": {
+    "id": "uuid",
+    "source": "remote_probe",
+    "provenance": "observed by remote probe",
+    "origin": "remote:0",
+    "observed": true,
+    "authState": "none",
+    "outcome": "ok",
+    "protocolVersion": "2026-07-28",
+    "observedAt": "2026-11-03T10:00:00Z",
+    "ttlMs": 3600000,
+    "cacheScope": "public",
+    "counts": {"tools": 3, "resources": 0, "prompts": 1},
+    "toolsHash": "hex", "contentHash": "hex",
+    "workerVersion": "ak-mcp-introspector/1.11.3",
+    "reportedBy": null,
+    "details": {"era": "modern", "serverInfo": {"name": "...", "version": "..."}},
+    "createdAt": "2026-11-03T10:00:01Z",
+    "tools": [], "resources": [], "prompts": [], "instructions": null
+  },
+  "snapshots": [ /* summaries, newest first: `current` without tools/resources/prompts/instructions */ ],
+  "introspection": {
+    "remoteProbe": "off", "probeEnabled": false,
+    "sandbox": "off", "sandboxEnabled": false,
+    "jobs": [ /* members/administrators only, see below */ ]
+  },
+  "notice": "Capability lists are untrusted. ..."
+}
+```
+
+`current` is `null` when no successful snapshot exists. Field values:
+`authState` `none` | `auth_required` (the server answered `401`/`403`: not
+observable without credentials) | `caller_specific` (a page was
+`cacheScope: private`: the list may differ per user) | `unknown` (reports and
+declarations); `outcome` `ok` | `auth_required` | `rate_limited` | `timeout`
+| `start_failed` | `needs_config` (the sandboxed server would not start or
+answer without configuration) | `refused` (redirect, private address, over
+the size cap) | `unsupported` | `error`. Failed attempts are listed in
+`snapshots` (with empty lists and `details.error`) but are never `current`.
+`details` by source: declared `{generatedBy}` or `{bundleArtifactId,
+fileSha256, signature, toolsGenerated, promptsGenerated}`; observed `{era:
+modern|legacy, serverInfo, capabilities, droppedItems?, truncated?, jobId,
+target, error?}` plus, for the sandbox, `{runner, image, notes}`.
+
+A job entry: `{id, kind: remote_probe|sandbox_run, target: "remote:<i>" |
+"package:<i>", status: pending|claimed|completed|failed|cancelled, attempts,
+maxAttempts, notBefore, claimedBy, leaseExpiresAt, lastError, snapshotId,
+completedAt, createdAt}`.
+
+### `POST .../servers/{serverName}/versions/{version}/capabilities`
+
+A CI pipeline or gateway reports what it observed. Needs `write:artifacts`
+and repository `write`; the version must be visible to the caller. Allowed on
+Local, Staging and Remote repositories (it does not change the served
+document). Body at most 1 MiB, nesting at most 64 levels.
+
+```json
+{
+  "source": "ci_reported",
+  "generatedBy": "github-actions/acme/weather",
+  "observedAt": "2026-11-03T09:58:00Z",
+  "protocolVersion": "2026-07-28",
+  "authState": "none",
+  "ttlMs": 3600000,
+  "cacheScope": "public",
+  "tools": [], "resources": [], "prompts": [], "instructions": "..."
+}
+```
+
+`source` is required and must be `ci_reported` or `gateway_reported`; every
+other member is optional (`observedAt` defaults to now and may not be more
+than 5 minutes in the future; `authState` defaults to `unknown`;
+`cacheScope` is `public` or `private`; `ttlMs` a non-negative integer). Item
+rules are the declaration rules above. The display label is set by AK, never
+by the caller: `reported by CI (<username>[, <generatedBy>])` /
+`reported by a gateway (...)`.
+
+`201`:
+
+```json
+{"snapshot": { /* as `current` above */ }, "previousSnapshotId": "uuid|null",
+ "drift": {"scanId": "uuid"} }
+```
+
+`drift` is `null` unless this report differs from the previous one of the
+same source. Errors: `400 mcp_invalid_capabilities` (`detail` names the
+field), `401 mcp_unauthorized`, `403 mcp_forbidden`, `404` (unknown or
+invisible version), `413 mcp_too_large`. Audited `MCP_CAPABILITIES_INGESTED`.
+
+### `GET .../servers/{serverName}/versions/{version}/capabilities/diff`
+
+Query: `to` and `from`, each a snapshot id of this server (any version) or a
+version string (that version's current snapshot); `source` restricts which
+snapshot "current" means. Defaults: `to` = the path version's current
+snapshot; `from` = the previous successful snapshot of the same source for
+the same version, else the current snapshot (same source) of the previous
+version (version order as for `latest`). Both sides must be visible to the
+caller as above. `404 mcp_capabilities_not_found` when there is no `to`.
+
+```json
+{
+  "from": { /* snapshot summary */ } ,
+  "to": { /* snapshot summary */ },
+  "fromVersion": "0.9.0", "toVersion": "1.0.0",
+  "summary": {
+    "text": "Tools: +1 added, 1 changed (`delete_repo` now destructiveHint: true)",
+    "tools": {"added": 1, "removed": 0, "changed": 1, "unchanged": 4},
+    "resources": {"added": 0, "removed": 0, "changed": 0, "unchanged": 0},
+    "prompts": {"added": 0, "removed": 0, "changed": 0, "unchanged": 1},
+    "instructionsChanged": false,
+    "destructiveAdded": ["delete_repo"],
+    "identical": false
+  },
+  "tools": {
+    "added":   [{"key": "delete_repo", "item": { /* Tool */ }}],
+    "removed": [{"key": "...", "item": {}}],
+    "changed": [{"key": "update_repo", "fields": ["description", "annotations"],
+                 "before": {}, "after": {}}],
+    "unchanged": 4
+  },
+  "resources": { /* same shape, key = uri */ },
+  "prompts":   { /* same shape */ },
+  "instructionsChanged": false,
+  "notice": "..."
+}
+```
+
+`from` is `null` (and everything is `added`) when there is no baseline.
+`destructiveAdded` lists tools that are new with `destructiveHint: true` or
+whose `destructiveHint` became `true`. The approval queue calls this with the
+`artifact_id`'s version and shows `summary.text`.
+
+### `POST .../servers/{serverName}/versions/{version}/capabilities/probe`
+
+Repository `admin` (or instance administrator). Queues the jobs the
+repository's settings allow for this version (an open job per target is not
+duplicated). `202 {"queued": ["uuid"], "jobs": [ /* open jobs */ ]}`;
+`409 mcp_introspection_disabled` when both `mcp_probe_remotes` and
+`mcp_sandbox_introspection` are off for the repository. Publishing a version
+queues the same jobs automatically.
+
+### Introspection jobs
+
+| Kind | Queued for | When |
+| --- | --- | --- |
+| `remote_probe` | each `remotes[]` entry of type `streamable-http` with a concrete `http(s)` URL (no `{template}` variables, no userinfo). Legacy `sse` remotes are not probed. | `mcp_probe_remotes`: `all` (Local, Staging, Remote), `hosted_only` (Local and Staging only), `off` (never, the default). Re-queued every `max(ttlMs, 6 h)` after the last probe, because a remote can change its tools without a version bump. |
+| `sandbox_run` | each stdio `packages[]` entry of type `npm`, `pypi` or `oci` that the package policy pinned to an AK repository | `mcp_sandbox_introspection: on`. Never re-queued (the bytes are version pinned). Handed out only while the version is servable (its own and its backing packages' gates pass), so the bytes executed are the bytes AK scanned. |
+
+Attempts: 3. `timeout`, `rate_limited` and `error` results are retried after
+`2^attempts` minutes (a `429`'s `Retry-After`, clamped to 1 minute .. 24 h);
+a claim not completed within 10 minutes returns to the queue. The scheduler
+pass (every 15 minutes, idempotent) reaps expired claims and re-queues due
+probes.
+
+### Worker API (`/api/v1/mcp/introspection`)
+
+Authenticated with an API token minted with the **`mcp:introspect`** scope
+(admin-only to mint; a token with `*`/`admin` or an interactive session does
+not qualify: `403 mcp_forbidden`). Mint it for a dedicated service account.
+
+`POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
+"workerId": "pod-a"}` (both optional) answers `204` when nothing is due, or
+`200`:
+
+```json
+{
+  "jobId": "uuid",
+  "claimToken": "opaque, single use",
+  "kind": "remote_probe",
+  "attempt": 1,
+  "leaseExpiresAt": "2026-11-03T10:10:00Z",
+  "repository": "mcp-local",
+  "server": {"name": "com.acme/weather", "version": "1.0.0", "artifactId": "uuid"},
+  "akBaseUrl": "https://ak.example.com",
+  "target": {"type": "remote", "index": 0, "transport": "streamable-http", "url": "https://mcp.acme.com/mcp"},
+  "limits": {"connectTimeoutMs": 10000, "totalTimeoutMs": 30000, "maxResponseBytes": 1048576,
+             "maxItems": 1000, "followRedirects": false}
+}
+```
+
+A `sandbox_run` target is `{"type": "package", "index": 0, "registryType":
+"npm", "package": { /* the package exactly as AK serves it: registryBaseUrl /
+OCI identifier rewritten to akBaseUrl */ }}` with limits `{"wallClockMs":
+120000, "maxResponseBytes": 1048576, "maxItems": 1000, "network":
+"ak-only"}`. The publisher's `remotes[].headers` are never handed out.
+`akBaseUrl` is the base URL the worker reached the backend on.
+
+`POST /jobs/{id}/complete`:
+
+```json
+{
+  "claimToken": "...",
+  "outcome": "ok",
+  "authState": "none",
+  "protocolVersion": "2026-07-28",
+  "observedAt": "2026-11-03T10:00:00Z",
+  "ttlMs": 3600000,
+  "cacheScope": "public",
+  "tools": [], "resources": [], "prompts": [], "instructions": null,
+  "workerVersion": "ak-mcp-introspector/1.11.3",
+  "retryAfterMs": null,
+  "error": null,
+  "details": {}
+}
+```
+
+A failed outcome carries no lists. `200 {"status": "stored", "snapshotId",
+"contentHash", "drift": {"scanId"} | null}` or `200 {"status": "retry",
+"notBefore"}`; `409 mcp_claim_invalid` when the token does not match the
+current claim (expired, re-claimed or already completed); `400` for a
+malformed result.
+
+### The `ak-mcp-introspector` worker
+
+A separate binary of the backend crate (`cargo build --release --bin
+ak-mcp-introspector`). It is not part of the backend image and the server
+process never runs it: it holds no database or storage credentials and talks
+to the backend only through the worker API.
+
+```text
+ak-mcp-introspector run [--sandbox] [--once] [--poll-secs 30]
+    AK_URL, AK_MCP_INTROSPECTOR_TOKEN (mcp:introspect), AK_MCP_INTROSPECTOR_ID
+ak-mcp-introspector probe <url>                      # one probe, printed; no backend
+ak-mcp-introspector convert --from <inventory> <file> # print a report body
+ak-mcp-introspector push --from <inventory> --repo <key> --server <name> --version <v> <file>
+    AK_URL, AK_TOKEN (write:artifacts)
+ak-mcp-introspector render-sandbox <job.json>         # print the guest spec and runner command
+```
+
+**Remote probe.** Per job: the URL must pass `validate_outbound_url` (public
+addresses only; the worker refuses to start while `UPSTREAM_ALLOW_PRIVATE_IPS`
+or `AK_SSRF_ALLOW_PRIVATE_CIDRS` is set); connections go through
+`SsrfGuardResolver` (the address is re-checked at connect, closing DNS
+rebinding); redirects are refused (`refused`); proxy variables are ignored;
+10 s connect, 30 s per request and 30 s for the whole probe; every response
+read is capped at 1 MiB; at most 1000 items per list and 50 pages. Requests
+carry only `Content-Type`, `Accept: application/json, text/event-stream`,
+`MCP-Protocol-Version`, `Mcp-Method`, a legacy server's own
+`Mcp-Session-Id`, and `User-Agent: ak-mcp-introspector/<version> (+<docs>;
+capability probe; never calls tools)`. Never a header from the server.json,
+never credentials.
+
+Protocol: `server/discover` with `_meta` `io.modelcontextprotocol/
+protocolVersion: 2026-07-28`, `clientInfo` and empty `clientCapabilities`;
+then `tools/list`, `resources/list`, `prompts/list` for the capabilities the
+server advertises, following `nextCursor`. JSON and SSE answers are both
+read. A `-32022` `UnsupportedProtocolVersionError` whose `supported` list
+names a legacy version, or any other error / non-modern `4xx` (the fallback
+does not key on one code), falls back to `initialize` (`2025-11-25`,
+`2025-06-18`, `2025-03-26`, `2024-11-05`), `notifications/initialized`, then
+the lists. `401`/`403` -> `auth_required`; `429` -> `rate_limited` with
+`Retry-After`; `ttlMs` (smallest seen) and `cacheScope` (`private` ->
+`authState: caller_specific`) are reported. The client can only send
+`server/discover`, `initialize`, `notifications/initialized` and the three
+list methods: `tools/call`, `resources/read` and `prompts/get` are refused in
+code. Server-to-client requests over stdio are answered "method not found".
+
+**Sandbox runner** (`--sandbox`). A pluggable `SandboxRunner` renders a
+runner-neutral guest spec:
+
+- npm: image `AK_MCP_SANDBOX_NODE_IMAGE` (default `node:22-alpine`),
+  `npx --yes --registry=<registryBaseUrl> <identifier>@<version> <args>` and
+  `npm_config_registry=<registryBaseUrl>`;
+- pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
+  `ghcr.io/astral-sh/uv:python3.12-alpine`), `uvx --no-config
+  --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
+- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:...` itself, no
+  network.
+
+Only what AK serves is run: a `registryBaseUrl` or OCI identifier that is not
+this AK instance is refused; publisher `runtimeArguments` are dropped;
+environment variables that steer a package manager or runtime (`NPM_CONFIG_*`,
+`UV_*`, `PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
+`HOME`, ...) are dropped. Every `isSecret` value, every required value
+without a default and every `{template}` value is the placeholder
+`AK_PLACEHOLDER_<NAME>`. The whole run, install included, is capped at 120 s,
+after which the guest is killed. A guest that exits before answering is
+reported `needs_config`.
+
+Runners:
+
+- **OCI runner** (default): `AK_MCP_SANDBOX_ENGINE` (`podman` default, or
+  `docker`), `AK_MCP_SANDBOX_RUNTIME` (`runsc`, gVisor, by default; `kata-fc`
+  or another microVM runtime works the same way; an empty runtime is refused
+  unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`, because a plain
+  container is not a boundary for attacker-chosen install scripts),
+  `AK_MCP_SANDBOX_NETWORK` (default `ak-mcp-sandbox`), `AK_MCP_SANDBOX_MEMORY`
+  (`1g`), `AK_MCP_SANDBOX_CPUS` (`1`). Rendered as `<engine> run --rm -i
+  --name=ak-mcp-sbx-<job> --runtime=runsc --network=<net | none>
+  --read-only --tmpfs=/tmp:rw,exec,nosuid,nodev,size=512m
+  --user=65532:65532 --cap-drop=ALL --security-opt=no-new-privileges
+  --pids-limit=256 --memory=1g --cpus=1 --pull=missing --stop-timeout=1
+  --workdir=/tmp -e ... <image> <argv>`.
+- **External runner**: `AK_MCP_SANDBOX_COMMAND=/path/to/launcher` is started
+  as `<launcher> '<guest spec JSON>'` and must connect the guest's stdio to
+  its own (a Firecracker launcher, a Kubernetes job wrapper). The spec:
+  `{jobId, image, argv, env: [[name, value]], network: "ak-only" | "none",
+  akBaseUrl, wallClockMs, notes}`.
+
+**Inventory adapters** (`convert` / `push`, posted as `gateway_reported`):
+`docker-gateway` (the array `docker mcp tools ls --format=json` prints),
+`docker-catalog` (`tools.json` of the `docker/mcp-registry` catalog;
+`arguments` become an `inputSchema`), `toolhive` (`thv mcp list tools
+--format json`, or a ToolHive registry entry's list of tool names;
+`set_during_runtime` is skipped), `static` (`{tools, resources, prompts,
+instructions}`, e.g. Cisco MCP Scanner static JSON).
+
+### Deploying the worker
+
+1. Mint the credential: create a service account, then an API token for it
+   with exactly the `mcp:introspect` scope (an instance administrator must
+   mint it).
+2. Run the binary where its egress is restricted. Remote probes: a pod whose
+   NetworkPolicy allows the AK service and `0.0.0.0/0` **except** RFC 1918,
+   CGNAT (`100.64.0.0/10`), link-local (`169.254.0.0/16`, including cloud
+   metadata), loopback and the IPv6 equivalents. The in-process guard is
+   defence in depth, not a substitute.
+3. Sandbox (optional, `--sandbox`): a node with gVisor (`runsc` registered
+   with podman/docker) or a microVM runtime, and a container network that
+   reaches only the AK host (for example an internal network whose sole
+   route is an egress proxy allowing the AK hostname). Mirror the runner
+   images through an AK OCI repository and point the image variables at
+   them. The worker needs the engine socket; isolate the node accordingly.
+4. Turn it on per repository: `mcp_probe_remotes` (`hosted_only` / `all`)
+   and/or `mcp_sandbox_introspection: on`. Both default to off and can be
+   locked by an instance administrator.
+
+The repository ships no container image or compose service for the worker;
+build it with `cargo build --release --bin ak-mcp-introspector` and package
+it with your deployment.
+
+Audit: `MCP_CAPABILITIES_INGESTED` for every stored snapshot (declared,
+reported or observed; the reporter as actor when there is one) and
+`MCP_TOOLS_DRIFT` for every drift finding.

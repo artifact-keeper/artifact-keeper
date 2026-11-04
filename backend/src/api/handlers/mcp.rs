@@ -44,7 +44,7 @@ type HandlerResult = Result<Response, Response>;
 
 /// The route-local CORS policy of the read routes: any origin, no
 /// credentials, the headers a private-registry check sends.
-fn read_cors() -> CorsLayer {
+pub(crate) fn read_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::OPTIONS])
@@ -96,6 +96,8 @@ pub fn router() -> Router<SharedState> {
     read.layer(axum::middleware::map_response(ensure_problem))
         .layer(read_cors())
         .merge(write.layer(DefaultBodyLimit::max(fmt::MCP_PUBLISH_MAX_BYTES)))
+        // Capability snapshots, diff and probe requests (#5253, C2).
+        .merge(super::mcp_capabilities::router())
         .layer(axum::middleware::map_response(ensure_problem))
 }
 
@@ -1272,6 +1274,7 @@ fn admit_document(
         return Err(McpError::NamespaceNotAllowed { namespace });
     }
     fmt::reduce_publisher_meta(&mut server)?;
+    super::mcp_capabilities::admit_declared(&server)?;
     Ok(server)
 }
 
@@ -1606,6 +1609,7 @@ async fn publish_server(
         .await;
     }
     audit_pins(&state.db, ext.user_id, &repo, artifact_id, &server, &pins);
+    super::mcp_capabilities::after_publish(&state.db, artifact_id, ext.user_id).await;
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
@@ -1859,6 +1863,72 @@ async fn update_status_impl(
     Ok(json_ok(StatusCode::OK, &out))
 }
 
+// ---------------------------------------------------------------------------
+// Shared with the capability routes (`mcp_capabilities.rs`)
+// ---------------------------------------------------------------------------
+
+/// The MCP repository named by a path, as every route of this surface
+/// resolves it (unknown key: the unknown-name 404).
+pub(crate) async fn mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> {
+    resolve_mcp_repo(db, key).await
+}
+
+/// The stored `name@version` of `repo` that `auth` may see, with the stored
+/// document: a reason-gated caller (the repository's holders and admins)
+/// sees every stored version, so the approval queue can diff a held one; a
+/// reader sees only a version that is servable to readers now, and
+/// everything else is the unknown-name 404.
+pub(crate) async fn visible_version(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    name: &str,
+    version: &str,
+    base: &str,
+) -> Result<(Uuid, StoredVersion, GateAudience), Response> {
+    let row = versions_of(&state.db, repo.id, name)
+        .await?
+        .into_iter()
+        .find(|r| r.version == version)
+        .ok_or_else(not_found)?;
+    let audience = audience(&state.db, auth, repo.id).await;
+    if audience == GateAudience::ReasonGated || servable_row(state, repo, &row, base).await {
+        return Ok((row.artifact_id, row.stored, audience));
+    }
+    Err(not_found())
+}
+
+async fn servable_row(state: &SharedState, repo: &RepoInfo, row: &VersionRow, base: &str) -> bool {
+    let policy_now = current_policy(&state.db, repo.id).await;
+    let instance = instance_url(base, &repo.key, &row.name, &row.version);
+    matches!(
+        decide_row(
+            GateCtx::of(state, false),
+            row,
+            policy_now,
+            false,
+            GateAudience::ReaderOnly,
+            instance,
+        )
+        .await,
+        ServeDecision::Serve
+    )
+}
+
+/// Whether the stored version `artifact_id` of `repo` is servable to readers
+/// now (the sandbox only ever runs a version whose gates pass).
+pub(crate) async fn artifact_servable(
+    state: &SharedState,
+    repo: &RepoInfo,
+    artifact_id: Uuid,
+    base: &str,
+) -> bool {
+    match stored_row(&state.db, artifact_id).await {
+        Ok(row) => servable_row(state, repo, &row, base).await,
+        Err(_) => false,
+    }
+}
+
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
@@ -2059,6 +2129,15 @@ mod tests {
             (
                 "services/mcp_packages.rs",
                 include_str!("../../services/mcp_packages.rs"),
+            ),
+            ("api/handlers/mcp_capabilities.rs", include_str!("mcp_capabilities.rs")),
+            (
+                "services/mcp_capabilities.rs",
+                include_str!("../../services/mcp_capabilities.rs"),
+            ),
+            (
+                "services/mcp_introspection.rs",
+                include_str!("../../services/mcp_introspection.rs"),
             ),
         ] {
             let production = src.split("#[cfg(test)]").next().unwrap_or(src);
