@@ -1448,6 +1448,21 @@ pub async fn promote_artifact(
     )
     .await?;
 
+    if crate::services::mcp_write::copy_reuses_recorded_version(
+        &state.db,
+        &target_repo.format,
+        target_repo.id,
+        &artifact.path,
+        &artifact.name,
+        artifact.version.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    {
+        return Err(AppError::Conflict(
+            crate::services::mcp_write::COPY_REUSES_VERSION.to_string(),
+        ));
+    }
     super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
 
     // Carry the SOURCE artifact's origin onto the copy (#4152). Without an
@@ -1906,6 +1921,26 @@ pub async fn promote_artifacts_bulk(
         };
 
         let new_artifact_id = Uuid::new_v4();
+        // A recorded MCP server version is write-once (#5253): refused
+        // before the trashed row at the target path is cleared.
+        let reused = crate::services::mcp_write::copy_reuses_recorded_version(
+            &state.db,
+            &target_repo.format,
+            target_repo.id,
+            &artifact.path,
+            &artifact.name,
+            artifact.version.as_deref(),
+        )
+        .await;
+        if !matches!(reused, Ok(false)) {
+            failed += 1;
+            let msg = match reused {
+                Ok(_) => crate::services::mcp_write::COPY_REUSES_VERSION.to_string(),
+                Err(e) => crate::api::handlers::db_err_message(&e).to_string(),
+            };
+            results.push(failed_response(source_display, target_display, msg));
+            continue;
+        }
         super::cleanup_soft_deleted_artifact(&state.db, target_repo.id, &artifact.path).await;
         // Same origin carry-over as the single-promote path (#4152): the
         // copy records where the SOURCE artifact's bytes came from, not a

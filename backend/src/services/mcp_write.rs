@@ -33,6 +33,34 @@ pub async fn version_tombstoned(
     .await
 }
 
+/// Whether copying an artifact at `path` (`name@version`) into `target_repo_id`
+/// would store a server version the MCP repository recorded before
+/// (promotion, #5253). The copy would replace a trashed row or bring a
+/// purged version back, possibly with other bytes; it is refused before the
+/// trashed row at the target path is cleared (the insert guard of migration
+/// 327 refuses it as well). Always `false` for other formats and other
+/// paths.
+pub async fn copy_reuses_recorded_version(
+    db: &PgPool,
+    target_format: &crate::models::repository::RepositoryFormat,
+    target_repo_id: Uuid,
+    path: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    if target_format != &crate::models::repository::RepositoryFormat::Mcp
+        || !(path.starts_with("servers/") && path.ends_with("/server.json"))
+    {
+        return Ok(false);
+    }
+    version_tombstoned(db, target_repo_id, name, version.unwrap_or_default()).await
+}
+
+/// The refusal text of [`copy_reuses_recorded_version`].
+pub const COPY_REUSES_VERSION: &str =
+    "this MCP server version was stored in the target repository before (deleted, trashed or \
+     purged); a server version is write-once";
+
 /// The SQL predicate (over `artifact_metadata m`) of a version whose first
 /// package resolution failed. An admin edit that re-resolves a version marks
 /// its resolution `afterEdit` ([`mark_resolution_after_edit`]): that version

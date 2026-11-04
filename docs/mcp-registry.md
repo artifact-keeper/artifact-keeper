@@ -713,7 +713,12 @@ Every `name@version` a repository ever stored is recorded in
 row insert, so publish, peer replication and promotion are all covered). A
 publish (or a bundle upload) of a recorded `name@version` answers
 `409 mcp_version_exists`, whether the version is live, soft-deleted, in the
-trash, or purged from it. The ledger is removed only with the repository,
+trash, or purged from it. The ledger has no link to the artifact row, so a
+trash purge does not touch it, and it binds every writer, not only publish: a
+database trigger (migration 327) refuses any insert of a server.json row for
+a recorded `name@version`, a promotion into an MCP repository is refused
+with `409` before it would replace a trashed row, and a Remote sync never
+ingests a purged version again, whatever upstream serves under it now. The ledger is removed only with the repository,
 with one exception: a live version whose package resolution failed (never
 served) is released by a republish of it (see
 [Packages in a Remote backing repository](#packages-in-a-remote-backing-repository)).

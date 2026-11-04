@@ -1393,3 +1393,96 @@ async fn remote_pins_packages_pulled_through_backing_remotes() {
     }
     h.teardown().await;
 }
+
+/// S2 leftover (#5253): a Remote version deleted and purged from the trash
+/// is never ingested again, whatever upstream serves under its
+/// `name@version` now: the tombstone ledger outlives the purge, the sync
+/// consults it, and the database refuses a server.json row for a recorded
+/// version (migration 327) from any writer.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn purged_remote_version_is_never_reingested() {
+    let h = Harness::new(false).await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme/*"]"#)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param_is_missing("updated_since"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acme/p", "1.0.0", "Original"), T1)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers"))
+        .and(query_param("updated_since", T1))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acme/p", "1.0.0", "Swapped"), T2)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v0.1/servers/io.github.acme%2Fp/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            vec![entry(server("io.github.acme/p", "1.0.0", "Swapped"), T2)],
+            None,
+        )))
+        .mount(&h.upstream)
+        .await;
+    h.sync().await;
+    let tail = "/servers/io.github.acme%2Fp/versions/1.0.0";
+    assert_eq!(h.read(None, tail).await.0, StatusCode::OK);
+    let path = "servers/io.github.acme/p/1.0.0/server.json";
+    let (id, sha): (Uuid, String) = sqlx::query_as(
+        "SELECT id, checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(h.repo_id)
+    .bind(path)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    // Soft delete, then the trash purge's row removal.
+    sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+        .bind(id)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    for sql in [
+        "DELETE FROM artifact_metadata WHERE artifact_id = $1",
+        "DELETE FROM artifacts WHERE id = $1 AND is_deleted = true",
+    ] {
+        sqlx::query(sql).bind(id).execute(&h.pool).await.unwrap();
+    }
+    let summary = h.sync().await;
+    assert_eq!(summary["ingested"], 0, "{summary}");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2")
+            .bind(h.repo_id)
+            .bind(path)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0, "the purged version was ingested again: {summary}");
+    assert_eq!(h.read(None, tail).await.0, StatusCode::NOT_FOUND);
+    // Any other writer (a promotion copy, a replicated row) is refused by
+    // the database, with the duplicate-key class callers map to 409.
+    let err = sqlx::query(
+        "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+         checksum_sha256, content_type, storage_key) \
+         VALUES ($1, $2, $3, 'io.github.acme/p', '1.0.0', 2, $4, 'application/json', 'k')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(h.repo_id)
+    .bind(path)
+    .bind("b".repeat(64))
+    .execute(&h.pool)
+    .await
+    .expect_err("a recorded name@version is refused");
+    let db = err.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("23505"), "{db}");
+    assert!(err.to_string().contains("duplicate key"), "{err}");
+    assert_ne!(sha, "b".repeat(64));
+    h.teardown().await;
+}

@@ -1241,6 +1241,22 @@ pub async fn ingest_entry(
                 IngestOutcome::Unchanged
             })
         }
+        // Stored once and purged from the trash since: the ledger keeps the
+        // `name@version` taken, so upstream's bytes (whatever they are now)
+        // are never ingested under it again (the insert guard of migration
+        // 327 refuses it too).
+        None if crate::services::mcp_write::version_tombstoned(
+            &run.state.db,
+            run.repo.id,
+            &entry.name,
+            &entry.version,
+        )
+        .await
+        .map_err(db_err)? =>
+        {
+            tracing::info!(server = %entry.name, version = %entry.version, "MCP sync: a purged version is not re-ingested");
+            Ok(IngestOutcome::Tombstoned)
+        }
         None => {
             let (pins, unresolved) = pin_packages(run, &admitted.server, None).await;
             let policy = run
@@ -1292,6 +1308,14 @@ pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, St
         if existing_version(&run.state.db, run.repo.id, &path)
             .await?
             .is_some()
+            || crate::services::mcp_write::version_tombstoned(
+                &run.state.db,
+                run.repo.id,
+                name,
+                &version,
+            )
+            .await
+            .map_err(db_err)?
         {
             continue;
         }
