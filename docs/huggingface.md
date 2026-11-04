@@ -159,6 +159,17 @@ snapshot_download("my-org/my-model", revision="v1")  # a revision uploaded as up
 hf_hub_download("my-org/my-model", "config.json")
 ```
 
+## Model-file scanning
+
+Files uploaded to a Local repository are judged by the model-file scanner
+(scan type `model`): pickle-bearing files (`pytorch_model.bin`, `.pt`,
+`.ckpt`, `.pkl`, ...) are walked for imports that would run code on
+`torch.load`, and safetensors and GGUF headers are checked for malformed or
+inconsistent structure. A pickle importing a primitive such as `os.system` is
+a critical `malicious` finding. Files proxied by a Remote repository are not
+judged yet. See [Model-file scanning](security/model-file-scanning.md) for
+what is checked, the limits, and what it does not catch.
+
 ## Limitations
 
 The supported surface above is derived from the handler
