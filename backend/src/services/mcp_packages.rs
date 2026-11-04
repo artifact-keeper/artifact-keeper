@@ -36,11 +36,11 @@ pub struct BackingRepo {
 }
 
 impl BackingRepo {
-    fn is_remote(&self) -> bool {
+    pub fn is_remote(&self) -> bool {
         self.repo_type == "remote"
     }
 
-    fn is_virtual(&self) -> bool {
+    pub fn is_virtual(&self) -> bool {
         self.repo_type == "virtual"
     }
 }
@@ -61,6 +61,11 @@ fn db_err(e: impl std::fmt::Display) -> McpError {
 /// packages of `registry_type`: the format's handler must be the registry
 /// type's (`yarn`/`pnpm` repositories back `npm`, `docker`/`podman` back `oci`).
 pub fn format_backs(registry_type: &str, format: &str) -> bool {
+    // MCPB bundles live in an MCP registry (uploaded beside a server
+    // version) or as plain files in a Generic repository.
+    if registry_type == "mcpb" {
+        return matches!(format, "mcp" | "generic");
+    }
     if !mcp::ARTIFACT_REGISTRY_TYPES.contains(&registry_type) && registry_type != "oci" {
         return false;
     }
@@ -73,9 +78,9 @@ pub fn parse_package_repos(value: &str) -> Result<BTreeMap<String, String>, Stri
     let map: BTreeMap<String, String> = serde_json::from_str(value)
         .map_err(|_| "must be a JSON object of registryType to repository key".to_string())?;
     for (ty, key) in &map {
-        if !(mcp::ARTIFACT_REGISTRY_TYPES.contains(&ty.as_str()) || ty == "oci") {
+        if !(mcp::ARTIFACT_REGISTRY_TYPES.contains(&ty.as_str()) || ty == "oci" || ty == "mcpb") {
             return Err(format!(
-                "`{ty}` is not a registryType AK can back (npm, pypi, nuget, cargo, oci)"
+                "`{ty}` is not a registryType AK can back (npm, pypi, nuget, cargo, oci, mcpb)"
             ));
         }
         if key.trim().is_empty() {
@@ -107,7 +112,7 @@ pub fn parse_namespace_allow(value: &str) -> Result<Vec<String>, String> {
 /// `internal` repository needs the grant too (as a Virtual member does,
 /// #4346): a mapping re-exports what it holds (existence, versions, digests)
 /// to every reader of the MCP registry, who may be a wider audience.
-async fn caller_may_map(
+pub(crate) async fn caller_may_map(
     db: &PgPool,
     caller: &crate::api::middleware::auth::AuthExtension,
     repo_id: Uuid,
@@ -307,7 +312,7 @@ pub async fn load_settings(db: &PgPool, repo_id: Uuid) -> Result<McpSettings, Mc
 
 /// The repositories whose rows a backing repository serves: its virtual
 /// members for a Virtual, itself otherwise.
-async fn content_repo_ids(db: &PgPool, repo: &BackingRepo) -> Result<Vec<Uuid>, McpError> {
+pub(crate) async fn content_repo_ids(db: &PgPool, repo: &BackingRepo) -> Result<Vec<Uuid>, McpError> {
     if !repo.is_virtual() {
         return Ok(vec![repo.id]);
     }
@@ -327,19 +332,47 @@ fn name_predicate(registry_type: &str) -> &'static str {
     match registry_type {
         // PEP 503: compare normalised forms; `$2` arrives normalised.
         "pypi" => "lower(regexp_replace(a.name, '[-_.]+', '-', 'g')) = $2 AND a.version = $3",
-        // NuGet ids and versions are case-insensitive.
-        "nuget" => "lower(a.name) = lower($2) AND lower(a.version) = lower($3)",
-        // Cargo stores the lower-cased crate name.
-        "cargo" => "lower(a.name) = lower($2) AND a.version = $3",
-        // npm: exact (scoped names included).
+        // NuGet ids are case-insensitive; versions are compared in their
+        // normalised form afterwards ([`version_matches`]), so `1.0` finds
+        // `1.0.0`. `$3` is only bound.
+        "nuget" => "lower(a.name) = lower($2) AND $3::text IS NOT NULL",
+        // Cargo: crate names are case-insensitive and `-`/`_` name the same
+        // crate (crates.io refuses a second crate differing only there).
+        "cargo" => {
+            "lower(replace(a.name, '-', '_')) = lower(replace($2, '-', '_')) AND a.version = $3"
+        }
+        // npm: exact (scoped names included), after percent-decoding.
         _ => "a.name = $2 AND a.version = $3",
     }
 }
 
-fn lookup_name(registry_type: &str, identifier: &str) -> String {
+/// The name a backing format stores `identifier` under: PEP 503 for PyPI,
+/// percent-decoded for npm (`%40acme%2Fx` is `@acme/x`; an npm name never
+/// contains `%`).
+pub(crate) fn lookup_name(registry_type: &str, identifier: &str) -> String {
     match registry_type {
         "pypi" => crate::formats::pypi::PypiHandler::normalize_name(identifier),
+        "npm" if identifier.contains('%') => urlencoding::decode(identifier)
+            .map(|d| d.into_owned())
+            .unwrap_or_else(|_| identifier.to_string()),
         _ => identifier.to_string(),
+    }
+}
+
+/// Whether a stored version names the submitted one: NuGet compares the
+/// normalised forms (`1.0`, `1.0.0` and `1.0.0.0` are one version),
+/// everything else exact (the SQL predicate already matched it).
+pub(crate) fn version_matches(registry_type: &str, submitted: &str, stored: &str) -> bool {
+    if registry_type != "nuget" {
+        return true;
+    }
+    use crate::formats::nuget::NugetHandler;
+    match (
+        NugetHandler::normalized_version(submitted),
+        NugetHandler::normalized_version(stored),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => submitted.eq_ignore_ascii_case(stored),
     }
 }
 
@@ -386,18 +419,23 @@ async fn resolve_artifact_package(
         .ok_or(McpError::PackageVersionUnpinned { index })?;
     let repo_ids = content_repo_ids(db, repo).await?;
     let sql = format!(
-        "SELECT a.id, a.checksum_sha256 FROM artifacts a \
+        "SELECT a.id, a.checksum_sha256, a.version FROM artifacts a \
          WHERE a.repository_id = ANY($1) AND a.is_deleted = false AND {} \
          ORDER BY a.path",
         name_predicate(&pkg.registry_type)
     );
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+    let rows: Vec<(Uuid, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(&repo_ids)
         .bind(lookup_name(&pkg.registry_type, &pkg.identifier))
         .bind(version)
         .fetch_all(db)
         .await
         .map_err(db_err)?;
+    let rows: Vec<(Uuid, String)> = rows
+        .into_iter()
+        .filter(|(_, _, stored)| version_matches(&pkg.registry_type, version, stored))
+        .map(|(id, sha, _)| (id, sha))
+        .collect();
     let Some((_, sha256)) = rows.first().cloned() else {
         return Err(McpError::PackageNotFound {
             index,
@@ -431,6 +469,8 @@ async fn resolve_artifact_package(
             gate_digest: None,
             resolved_at: Utc::now(),
             warnings: Vec::new(),
+            cache_path: None,
+            download_path: None,
         },
         drift: None,
     })
@@ -484,6 +524,16 @@ fn oci_backing_path(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Resu
                 r.host, repo.key
             ));
         }
+    } else if !repo.is_virtual() {
+        // A Local/Staging repository holds only what was pushed to this
+        // instance: an image named on another host is external, whatever
+        // its path (#5253 e2e).
+        return Err(format!(
+            "image host '{}' is not this registry; name the image as {}/{}/<image>:<tag>",
+            r.host,
+            mcp::host_of(base_url),
+            repo.key
+        ));
     }
     Ok(r.path.clone())
 }
@@ -706,6 +756,8 @@ async fn resolve_oci_package(
             gate_digest: Some(gate_digest),
             resolved_at: Utc::now(),
             warnings,
+            cache_path: None,
+            download_path: None,
         },
         drift: None,
     })
@@ -734,31 +786,50 @@ pub async fn resolve_packages(
     }
     let mut pins = Vec::with_capacity(server.packages.len());
     for (index, pkg) in server.packages.iter().enumerate() {
-        let Some(repo) = settings.repos.get(&pkg.registry_type) else {
-            let mapped: Vec<&str> = settings.repos.keys().map(String::as_str).collect();
-            return Err(McpError::ExternalRegistry {
-                index,
-                detail: format!(
-                    "registryType '{}' has no backing repository in this registry (mapped: {}); \
-                     publish the package to an AK repository and map it in the repository's \
-                     MCP package settings",
-                    pkg.registry_type,
-                    if mapped.is_empty() {
-                        "none".to_string()
-                    } else {
-                        mapped.join(", ")
-                    }
-                ),
-            });
-        };
-        let pin = if pkg.registry_type == "oci" {
-            resolve_oci_package(state, index, pkg, repo, base_url).await?
-        } else {
-            resolve_artifact_package(&state.db, index, pkg, repo, base_url).await?
-        };
-        pins.push(pin);
+        pins.push(resolve_one(state, settings, index, pkg, base_url).await?);
     }
     Ok(pins)
+}
+
+/// The `422 mcp_external_registry` of a `registryType` with no backing
+/// repository.
+pub fn unmapped(settings: &McpSettings, index: usize, registry_type: &str) -> McpError {
+    let mapped: Vec<&str> = settings.repos.keys().map(String::as_str).collect();
+    McpError::ExternalRegistry {
+        index,
+        detail: format!(
+            "registryType '{registry_type}' has no backing repository in this registry \
+             (mapped: {}); publish the package to an AK repository and map it in the \
+             repository's MCP package settings",
+            if mapped.is_empty() {
+                "none".to_string()
+            } else {
+                mapped.join(", ")
+            }
+        ),
+    }
+}
+
+/// Resolve and pin one `packages[]` entry against its backing repository.
+pub async fn resolve_one(
+    state: &crate::api::SharedState,
+    settings: &McpSettings,
+    index: usize,
+    pkg: &mcp::Package,
+    base_url: &str,
+) -> Result<PackagePin, McpError> {
+    let Some(repo) = settings
+        .repos
+        .get(&pkg.registry_type)
+        .filter(|_| pkg.registry_type != "mcpb")
+    else {
+        return Err(unmapped(settings, index, &pkg.registry_type));
+    };
+    if pkg.registry_type == "oci" {
+        resolve_oci_package(state, index, pkg, repo, base_url).await
+    } else {
+        resolve_artifact_package(&state.db, index, pkg, repo, base_url).await
+    }
 }
 
 /// The retention hold of an OCI pin in a hosted backing repository.
@@ -892,6 +963,21 @@ struct GateRow {
     created_at: DateTime<Utc>,
     quarantine_status: Option<String>,
     quarantine_until: Option<DateTime<Utc>>,
+    /// A `proxy_cache_artifacts` row (a cache pin), not an `artifacts` row:
+    /// its hold is the cache entry's Package Age Policy hold, and `id` is not
+    /// an artifact id the download gate knows.
+    cached: bool,
+}
+
+impl GateRow {
+    /// A cache row's quarantine hold: held until `quarantine_until` unless an
+    /// administrator released it (`quarantine_status` carries the release
+    /// marker for these rows).
+    fn cache_held(&self, now: DateTime<Utc>) -> bool {
+        self.cached
+            && self.quarantine_status.is_none()
+            && self.quarantine_until.is_some_and(|until| until > now)
+    }
 }
 
 type GateRowTuple = (
@@ -911,6 +997,7 @@ fn gate_row(t: GateRowTuple) -> GateRow {
         created_at: t.3,
         quarantine_status: t.4,
         quarantine_until: t.5,
+        cached: false,
     }
 }
 
@@ -925,6 +1012,30 @@ const GATE_ROW_COLUMNS: &str = "id, repository_id, checksum_sha256::text, create
 /// pinned bytes addressable. A pin with no live row cannot be gated and is
 /// unresolvable.
 async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::Error> {
+    if let Some(path) = pin.resolved.cache_path.as_deref() {
+        // A cache pin is present while the Remote still caches the pinned
+        // bytes at its path; a refresh to other bytes (or an eviction) makes
+        // it unresolvable rather than gating something else.
+        let rows: Vec<GateRowTuple> = sqlx::query_as(
+            "SELECT id, repository_id, checksum_sha256, cached_at, \
+                    CASE WHEN quarantine_released_at IS NULL THEN NULL ELSE 'released' END, \
+                    quarantine_until \
+             FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2 \
+               AND checksum_sha256 = $3",
+        )
+        .bind(pin.resolved.repository_id)
+        .bind(path)
+        .bind(pin.resolved.sha256.as_deref().unwrap_or_default())
+        .fetch_all(db)
+        .await?;
+        return Ok(rows
+            .into_iter()
+            .map(|t| GateRow {
+                cached: true,
+                ..gate_row(t)
+            })
+            .collect());
+    }
     let rows: Vec<GateRowTuple> = if pin.registry_type == "oci" {
         let r = &pin.resolved;
         let hexes: Vec<String> = [r.digest.as_deref(), r.gate_digest.as_deref()]
@@ -1209,7 +1320,14 @@ async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin
     if rows.is_empty() {
         return GateOutcome::Unresolvable;
     }
+    let now = Utc::now();
     for row in &rows {
+        if row.cached {
+            if row.cache_held(now) {
+                return GateOutcome::Quarantine;
+            }
+            continue;
+        }
         if let Err(e) =
             crate::services::quarantine_service::enforce_download_gate(ctx.db, row.id).await
         {
@@ -1320,7 +1438,15 @@ async fn listing_refusals_inner(
         }
     }
     let mut by_repo: HashMap<Uuid, Vec<ListingCandidate<'_>>> = HashMap::new();
+    let mut backing_refused = HashSet::new();
+    let now = Utc::now();
     for r in pin_rows.values().flatten() {
+        if r.cached {
+            if r.cache_held(now) {
+                backing_refused.insert(r.id);
+            }
+            continue;
+        }
         by_repo
             .entry(r.repository_id)
             .or_default()
@@ -1330,7 +1456,6 @@ async fn listing_refusals_inner(
                 quarantine_until: r.quarantine_until,
             });
     }
-    let mut backing_refused = HashSet::new();
     for (repo, candidates) in &by_repo {
         backing_refused.extend(
             qs::listing_refusals_fresh(db, *repo, candidates)
@@ -1592,8 +1717,11 @@ mod tests {
             },
         };
         let r = mcp::parse_oci_identifier("ghcr.io/acme/mcp:1.2").unwrap();
+        assert!(oci_backing_path(&r, &repo("local", None), "https://ak.test")
+            .unwrap_err()
+            .contains("not this registry"));
         assert_eq!(
-            oci_backing_path(&r, &repo("local", None), "https://ak.test").unwrap(),
+            oci_backing_path(&r, &repo("virtual", None), "https://ak.test").unwrap(),
             "acme/mcp"
         );
         assert!(oci_backing_path(

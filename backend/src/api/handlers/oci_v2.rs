@@ -14485,6 +14485,14 @@ async fn handle_delete_manifest(
     } else {
         OciIndexDeleteScope::NamedReference
     };
+    // #5253: a digest an MCP server version pins stays deletable by tag (the
+    // pin's digest-keyed retention row keeps the manifest), but not by
+    // digest: that would leave the published server version unresolvable.
+    if scope == OciIndexDeleteScope::ContentAddressed {
+        if let Some(resp) = mcp_pin_blocks_delete(state, &repo, &digest).await {
+            return resp;
+        }
+    }
     if let Err(e) = delete_oci_manifest_and_artifacts(
         &state.db,
         repo.id,
@@ -14513,6 +14521,37 @@ async fn handle_delete_manifest(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// The refusal of a by-digest manifest delete whose digest a live MCP server
+/// version pins (#5253), or `None` when the delete may proceed. `405
+/// UNSUPPORTED`: the distribution spec's answer for a delete the registry
+/// does not allow. The message names no MCP repository or server (the caller
+/// may not be able to read them). A lookup failure refuses (fail closed).
+async fn mcp_pin_blocks_delete(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Option<Response> {
+    if !matches!(repo.repo_type.as_str(), "local" | "staging") {
+        return None;
+    }
+    match crate::services::mcp_write::digest_pinned_by_mcp(&state.db, repo.id, &repo.image, digest)
+        .await
+    {
+        Ok(false) => None,
+        Ok(true) => Some(oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "this manifest is pinned by a published MCP server version and cannot be deleted by \
+             digest; delete the tag instead, or remove the server version first",
+        )),
+        Err(e) => Some(oci_error(
+            crate::api::handlers::db_status(&e),
+            "INTERNAL_ERROR",
+            crate::api::handlers::db_err_message(&e),
+        )),
+    }
 }
 
 /// Which OCI index rows a manifest delete is allowed to remove.

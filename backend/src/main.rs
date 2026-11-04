@@ -1228,6 +1228,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5253: the MCP registry's async package resolver (fills Remote backing
+    // repositories for versions published `resolving`). Every replica ticks;
+    // jobs are row-claimed.
+    artifact_keeper_backend::services::mcp_resolver::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),

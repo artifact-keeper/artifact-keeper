@@ -54,6 +54,7 @@ fn read_cors() -> CorsLayer {
 pub fn router() -> Router<SharedState> {
     let mut read = Router::new();
     let mut write = Router::new();
+    let mut bundles = Router::new();
     for v in API_VERSIONS {
         let p = |tail: &str| format!("/:repo_key/{v}{tail}");
         read = read
@@ -89,6 +90,12 @@ pub fn router() -> Router<SharedState> {
                 &p("/servers/:ns/:name/status"),
                 patch(update_server_status_split),
             );
+        // Phase 2/3 write path (#5253): bundle download on the read routes,
+        // validate/edit/delete under the document limit, bundle upload
+        // streamed with its own cap.
+        read = read.merge(super::mcp_write::read_routes(v));
+        write = write.merge(super::mcp_write::document_routes(v));
+        bundles = bundles.merge(super::mcp_write::bundle_routes(v));
     }
     // `ensure_problem` sits INSIDE the read routes' CORS layer, so a refusal
     // it re-renders still carries `Access-Control-Allow-Origin`; the outer
@@ -96,6 +103,7 @@ pub fn router() -> Router<SharedState> {
     read.layer(axum::middleware::map_response(ensure_problem))
         .layer(read_cors())
         .merge(write.layer(DefaultBodyLimit::max(fmt::MCP_PUBLISH_MAX_BYTES)))
+        .merge(bundles)
         .layer(axum::middleware::map_response(ensure_problem))
 }
 
@@ -229,7 +237,7 @@ pub fn problem(status: u16, code: &str, detail: &str, extra: serde_json::Value) 
     refusal_bytes(status, serde_json::to_vec(&body).unwrap_or_default())
 }
 
-fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
+pub(super) fn refusal_bytes(status: u16, body: Vec<u8>) -> Response {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     with_refusal_headers((status, body).into_response())
 }
@@ -239,20 +247,20 @@ pub fn not_found() -> Response {
     refusal_bytes(404, fmt::NOT_FOUND_BODY.as_bytes().to_vec())
 }
 
-fn mcp_error(e: McpError) -> Response {
+pub(super) fn mcp_error(e: McpError) -> Response {
     if let McpError::Internal(cause) | McpError::Misconfigured(cause) = &e {
         tracing::error!(error = %cause, code = e.code(), "MCP registry request failed");
     }
     problem(e.status(), e.code(), &e.detail(), serde_json::json!({}))
 }
 
-fn internal(e: impl std::fmt::Display) -> Response {
+pub(super) fn internal(e: impl std::fmt::Display) -> Response {
     mcp_error(McpError::Internal(e.to_string()))
 }
 
 /// Re-render a plain refusal from a shared gate (auth, hosted-only,
 /// promotion-only) as problem+json, keeping its status and challenge.
-fn reproblem(resp: Response) -> Response {
+pub(super) fn reproblem(resp: Response) -> Response {
     let status = resp.status();
     let (code, detail) = match status.as_u16() {
         401 => ("mcp_unauthorized", "Authentication required"),
@@ -284,7 +292,7 @@ fn reproblem(resp: Response) -> Response {
     out
 }
 
-fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
+pub(super) fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
@@ -300,7 +308,7 @@ fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
 /// The MCP repository named by the path. Any miss (unknown key, another
 /// format) is the unknown-name 404, so the surface does not tell an MCP
 /// repository from any other key.
-async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> {
+pub(super) async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> {
     match proxy_helpers::resolve_repo_by_key(db, key, &["mcp"], "an MCP registry").await {
         Ok(repo) => Ok(repo),
         Err(resp) if resp.status().is_server_error() => Err(reproblem(resp)),
@@ -310,7 +318,7 @@ async fn resolve_mcp_repo(db: &PgPool, key: &str) -> Result<RepoInfo, Response> 
 
 /// Remote and Virtual MCP repositories are refused at creation in this
 /// release; a row that exists anyway answers 501 rather than empty results.
-fn reject_if_not_hosted_read(repo: &RepoInfo) -> Result<(), Response> {
+pub(super) fn reject_if_not_hosted_read(repo: &RepoInfo) -> Result<(), Response> {
     if matches!(repo.repo_type.as_str(), "local" | "staging") {
         return Ok(());
     }
@@ -332,7 +340,7 @@ pub fn server_name(ns: &str, name: Option<&str>) -> String {
 }
 
 /// Whether `caller` may read why a version is held.
-async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> GateAudience {
+pub(super) async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> GateAudience {
     let Some(ext) = auth else {
         return GateAudience::ReaderOnly;
     };
@@ -344,14 +352,14 @@ async fn audience(db: &PgPool, auth: Option<&AuthExtension>, repo_id: Uuid) -> G
 
 /// One stored server version row.
 #[derive(Debug, Clone)]
-struct VersionRow {
-    artifact_id: Uuid,
-    name: String,
-    version: String,
-    checksum: String,
+pub(super) struct VersionRow {
+    pub(super) artifact_id: Uuid,
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) checksum: String,
     quarantine_status: Option<String>,
     quarantine_until: Option<DateTime<Utc>>,
-    stored: StoredVersion,
+    pub(super) stored: StoredVersion,
 }
 
 type RawRow = (
@@ -388,7 +396,7 @@ const ROW_COLUMNS: &str = "a.id, a.name, a.version, a.checksum_sha256, a.quarant
      a.quarantine_until, m.metadata";
 
 /// Every live version of `name` in `repo_id`, text-ordered by version.
-async fn versions_of<'e>(
+pub(super) async fn versions_of<'e>(
     db: impl sqlx::PgExecutor<'e>,
     repo_id: Uuid,
     name: &str,
@@ -420,7 +428,7 @@ async fn own_hold(db: &PgPool, artifact_id: Uuid) -> Result<Option<HoldKind>, ()
     }
 }
 
-fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String {
+pub(super) fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String {
     format!(
         "{}/mcp/{}/v0.1/servers/{}/versions/{}",
         base.trim_end_matches('/'),
@@ -432,7 +440,7 @@ fn instance_url(base: &str, repo_key: &str, name: &str, version: &str) -> String
 
 /// Decide one row for `audience`, evaluating the version's own hold and every
 /// backing gate.
-async fn decide_row(
+pub(super) async fn decide_row(
     ctx: GateCtx<'_>,
     row: &VersionRow,
     policy_now: PackagePolicy,
@@ -452,6 +460,9 @@ async fn decide_row(
         }
     };
     gates.extend(mcp_packages::backing_gates(ctx, &row.stored, policy_now).await);
+    // A version whose packages are still being filled is held as
+    // `resolving` (its pending packages have no pin yet).
+    let own = own.or(row.stored.resolving.then_some(HoldKind::Resolving));
     let state = VersionState {
         name: row.name.clone(),
         version: row.version.clone(),
@@ -468,7 +479,7 @@ async fn decide_row(
 /// stored flag: the stored flag ignores holds, so a held newer version would
 /// otherwise leave no entry marked latest while `/versions/latest` answers
 /// with this one.
-fn served_entry(
+pub(super) fn served_entry(
     row: &VersionRow,
     repo: &RepoInfo,
     base: &str,
@@ -496,7 +507,7 @@ fn served_entry(
 
 /// The repository's package policy now (a read failure is fail-closed: the
 /// versions are gated as `own-repos`).
-async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy {
+pub(super) async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy {
     mcp_packages::load_settings(db, repo_id)
         .await
         .map(|s| s.policy)
@@ -533,7 +544,7 @@ fn refusal_audit_due(artifact_id: Uuid, caller: &str) -> bool {
     }
 }
 
-fn audit_refusal(
+pub(super) fn audit_refusal(
     db: &PgPool,
     auth: Option<&AuthExtension>,
     repo: &RepoInfo,
@@ -1096,7 +1107,7 @@ async fn get_version_split(
 }
 
 /// Candidates for `latest`, newest first: every non-deleted version.
-fn latest_candidates(mut rows: Vec<VersionRow>) -> Vec<VersionRow> {
+pub(super) fn latest_candidates(mut rows: Vec<VersionRow>) -> Vec<VersionRow> {
     rows.retain(|r| r.stored.registry.status != ServerStatus::Deleted);
     rows.sort_by(|a, b| {
         fmt::latest_order(
@@ -1151,7 +1162,9 @@ async fn get_version_impl(
                         .0
                         .is_some_and(|l| l.artifact_id == row.artifact_id)
                 };
-                let entry = served_entry(row, &repo, base, latest);
+                let mut entry = served_entry(row, &repo, base, latest);
+                super::mcp_write::ticket_bundle_urls(state, auth, &row.stored, &mut entry, base)
+                    .await;
                 return Ok(json_ok(StatusCode::OK, &entry));
             }
             ServeDecision::Refuse {
@@ -1236,7 +1249,7 @@ async fn version(State(state): State<SharedState>, Path(repo_key): Path<String>)
 // ---------------------------------------------------------------------------
 
 /// The hosted-write gates every MCP write shares.
-async fn writable_repo(
+pub(super) async fn writable_repo(
     state: &SharedState,
     auth: Option<AuthExtension>,
     repo_key: &str,
@@ -1249,7 +1262,7 @@ async fn writable_repo(
 }
 
 /// A body the extractor refused: over the publish cap (413) or unreadable.
-fn body_rejection(status: StatusCode) -> Response {
+pub(super) fn body_rejection(status: StatusCode) -> Response {
     if status == StatusCode::PAYLOAD_TOO_LARGE {
         mcp_error(McpError::TooLarge)
     } else {
@@ -1258,7 +1271,7 @@ fn body_rejection(status: StatusCode) -> Response {
 }
 
 /// Parse, validate, namespace-check and reduce a submitted document.
-fn admit_document(
+pub(super) fn admit_document(
     body: &[u8],
     settings: &mcp_packages::McpSettings,
 ) -> Result<fmt::ServerJson, McpError> {
@@ -1278,12 +1291,13 @@ fn admit_document(
 /// Insert the server.json row, its metadata and the OCI retention holds in
 /// one quota-admitted transaction: a version whose metadata could not be
 /// written must not exist (it would be invisible yet block a republish).
-async fn insert_server_rows(
+pub(super) async fn insert_server_rows(
     db: &PgPool,
     artifact: proxy_helpers::NewArtifact<'_>,
     metadata: &serde_json::Value,
     pins: &[PackagePin],
     upload_hold_until: Option<DateTime<Utc>>,
+    resolve_for: Option<Uuid>,
 ) -> Result<(Uuid, Vec<(Uuid, Uuid)>), Response> {
     use crate::services::quarantine_service::{HoldSource, QuarantineState};
     let repository_id = artifact.repository_id;
@@ -1328,6 +1342,12 @@ async fn insert_server_rows(
     let hold_rows = mcp_packages::hold_pins(&mut tx, pins)
         .await
         .map_err(internal)?;
+    // A version stored `resolving` commits with its fill job (#5253).
+    if let Some(user) = resolve_for {
+        crate::services::mcp_resolver::enqueue(&mut tx, artifact_id, repository_id, user)
+            .await
+            .map_err(internal)?;
+    }
     // The upload-time quarantine hold commits with the row, so the version is
     // never listed in the window before a post-commit hold would land.
     if let Some(until) = upload_hold_until {
@@ -1358,7 +1378,7 @@ async fn insert_server_rows(
 /// and still sits in the trash. Its name stays reserved until an
 /// administrator purges it, so a version is write-once across a generic
 /// delete too (a tombstone that outlives the purge comes later).
-async fn trashed_version_exists(db: &PgPool, repo_id: Uuid, path: &str) -> Result<bool, Response> {
+pub(super) async fn trashed_version_exists(db: &PgPool, repo_id: Uuid, path: &str) -> Result<bool, Response> {
     sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 AND path = $2 \
          AND is_deleted = true)",
@@ -1373,7 +1393,7 @@ async fn trashed_version_exists(db: &PgPool, repo_id: Uuid, path: &str) -> Resul
 /// Remove the stored bytes of a publish whose row was never written, unless
 /// a row (a concurrent identical publish that won) references the same
 /// content-addressed key. Best-effort.
-async fn discard_unreferenced_bytes(state: &SharedState, repo: &RepoInfo, key: &str) {
+pub(super) async fn discard_unreferenced_bytes(state: &SharedState, repo: &RepoInfo, key: &str) {
     let referenced: Result<bool, _> = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM artifacts WHERE repository_id = $1 AND storage_key = $2)",
     )
@@ -1399,7 +1419,7 @@ type LatestKey<'a> = (&'a str, Option<DateTime<Utc>>);
 
 /// Take the per-server advisory lock every registry-state write of `name`
 /// serialises on, for the rest of the caller's transaction.
-async fn lock_server(
+pub(super) async fn lock_server(
     conn: &mut sqlx::PgConnection,
     repo_id: Uuid,
     name: &str,
@@ -1414,7 +1434,7 @@ async fn lock_server(
 /// Recompute `registry.isLatest` for every version of `name`, inside the
 /// caller's transaction and under the per-server lock: the newest
 /// non-deleted version by [`fmt::latest_order`] (publish time breaks ties).
-async fn recompute_latest_in(
+pub(super) async fn recompute_latest_in(
     tx: &mut sqlx::PgConnection,
     repo_id: Uuid,
     name: &str,
@@ -1465,7 +1485,7 @@ async fn recompute_latest_in(
 }
 
 /// `MCP_PACKAGE_PINNED`, one row per resolved entry.
-fn audit_pins(
+pub(super) fn audit_pins(
     db: &PgPool,
     user_id: Uuid,
     repo: &RepoInfo,
@@ -1498,7 +1518,7 @@ fn audit_pins(
     }
 }
 
-async fn stored_row(db: &PgPool, artifact_id: Uuid) -> Result<VersionRow, Response> {
+pub(super) async fn stored_row(db: &PgPool, artifact_id: Uuid) -> Result<VersionRow, Response> {
     let sql = format!(
         "SELECT {ROW_COLUMNS} FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
          WHERE a.id = $1"
@@ -1527,10 +1547,27 @@ async fn publish_server(
     let settings = mcp_packages::load_settings(&state.db, repo.id)
         .await
         .map_err(mcp_error)?;
-    let server = admit_document(&body, &settings).map_err(mcp_error)?;
-    let pins = mcp_packages::resolve_packages(&state, &settings, &server, base.as_str())
-        .await
-        .map_err(mcp_error)?;
+    let mut server = admit_document(&body, &settings).map_err(mcp_error)?;
+    super::mcp_write::add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
+        .await?;
+    super::mcp_write::refuse_tombstoned(&state.db, repo.id, &server.name, &server.version)
+        .await?;
+    let resolution = crate::services::mcp_resolver::resolve_document(
+        &state,
+        &settings,
+        crate::services::mcp_resolver::Target {
+            repo_id: repo.id,
+            repo_key: &repo.key,
+            name: &server.name,
+            version: &server.version,
+        },
+        &server,
+        base.as_str(),
+    )
+    .await
+    .map_err(mcp_error)?;
+    let pins = resolution.pins.clone();
+    let resolving = !resolution.pending.is_empty();
 
     let bytes = fmt::canonical_bytes(&server);
     let sha256 = fmt::sha256_hex(&bytes);
@@ -1553,7 +1590,15 @@ async fn publish_server(
         .map_err(reproblem)?;
 
     let registry = RegistryState::new_active(Utc::now());
-    let metadata = fmt::metadata_doc(&server, &registry, settings.policy, &pins);
+    let metadata = crate::services::mcp_resolver::metadata_with_resolution(
+        &state.db,
+        fmt::metadata_doc(&server, &registry, settings.policy, &pins),
+        &resolution,
+        ext.user_id,
+        base.as_str(),
+    )
+    .await
+    .map_err(mcp_error)?;
     // The repository's upload-time quarantine (Package Age Policy), applied
     // inside the insert transaction below; the repository is hosted here.
     let upload_hold_until = {
@@ -1577,6 +1622,7 @@ async fn publish_server(
         &metadata,
         &pins,
         upload_hold_until,
+        resolving.then_some(ext.user_id),
     )
     .await;
     let (artifact_id, hold_rows) = match inserted {
@@ -1634,17 +1680,16 @@ async fn publish_server(
         repo.key,
         pins.len()
     );
+    super::mcp_write::audit_published(&state.db, ext.user_id, &repo, artifact_id, &server, &resolution);
     let row = stored_row(&state.db, artifact_id).await?;
     let latest = row_is_latest(&state, &repo, &row, settings.policy).await;
-    Ok(json_ok(
-        StatusCode::OK,
-        &served_entry(&row, &repo, base.as_str(), latest),
-    ))
+    let entry = served_entry(&row, &repo, base.as_str(), latest);
+    Ok(super::mcp_write::publish_answer(entry, &resolution))
 }
 
 /// Whether `row` is its server's newest servable version (the reader-only
 /// gate), for a write's response. A read failure answers `false`.
-async fn row_is_latest(
+pub(super) async fn row_is_latest(
     state: &SharedState,
     repo: &RepoInfo,
     row: &VersionRow,
@@ -1682,7 +1727,7 @@ fn parse_status_update(body: &[u8]) -> Result<(ServerStatus, Option<String>), Mc
 }
 
 /// Apply a validated status change to one stored registry state.
-fn apply_status(
+pub(super) fn apply_status(
     current: &RegistryState,
     next: ServerStatus,
     message: Option<&str>,
@@ -1698,7 +1743,7 @@ fn apply_status(
     })
 }
 
-async fn write_registry<'e>(
+pub(super) async fn write_registry<'e>(
     db: impl sqlx::PgExecutor<'e>,
     artifact_id: Uuid,
     r: &RegistryState,
@@ -1793,7 +1838,7 @@ async fn update_status_impl(
     body: &[u8],
     base: &str,
 ) -> HandlerResult {
-    let (_ext, repo) = writable_repo(state, auth, repo_key).await?;
+    let (ext, repo) = writable_repo(state, auth, repo_key).await?;
     // A status change is a write, gated like a publish.
     repo.reject_if_promotion_only(false).map_err(reproblem)?;
     let (next, message) = parse_status_update(body).map_err(mcp_error)?;
@@ -1813,11 +1858,13 @@ async fn update_status_impl(
     }
     let now = Utc::now();
     let mut changed = Vec::new();
+    let mut transitions = Vec::new();
     for row in &rows {
         match apply_status(&row.stored.registry, next, message.as_deref(), now) {
             Ok(updated) => {
                 write_registry(&mut *tx, row.artifact_id, &updated).await?;
                 changed.push(row.artifact_id);
+                transitions.push((row, row.stored.registry.status, updated));
             }
             Err(e) if version.is_some() || row.stored.registry.status != next => {
                 return Err(mcp_error(e))
@@ -1835,6 +1882,9 @@ async fn update_status_impl(
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
+    for (row, from, to) in &transitions {
+        super::mcp_write::audit_status_changed(&state.db, ext.user_id, &repo, row, *from, to);
+    }
     let policy_now = current_policy(&state.db, repo.id).await;
     let all = versions_of(&state.db, repo.id, name).await?;
     let latest = newest_servable(
@@ -2572,7 +2622,14 @@ mod tests {
             return;
         };
         let (oci, digest) = seed_oci(&mut env).await;
-        let (s, body) = env.publish(&oci_doc("ghcr.io/acme/mcp:1.2")).await;
+        // A Local backing repository holds only images pushed to this
+        // instance: another host is external, even when the path exists.
+        assert_eq!(
+            env.publish(&oci_doc("ghcr.io/acme/mcp:1.2")).await.1["error"],
+            "mcp_external_registry"
+        );
+        let own = |tail: &str| format!("localhost/{}/acme/{tail}", oci.key);
+        let (s, body) = env.publish(&oci_doc(&own("mcp:1.2"))).await;
         assert_eq!(s, StatusCode::OK, "{body}");
         let served = body["server"]["packages"][0]["identifier"]
             .as_str()
@@ -2583,7 +2640,7 @@ mod tests {
             format!("localhost/{}/acme/mcp:1.2@{digest}", oci.key)
         );
         let resolved = &body["server"]["packages"][0]["_meta"][fmt::AK_RESOLVED_META_KEY];
-        assert_eq!(resolved["submittedIdentifier"], "ghcr.io/acme/mcp:1.2");
+        assert_eq!(resolved["submittedIdentifier"], own("mcp:1.2"));
         assert_eq!(resolved["children"].as_array().map(Vec::len), Some(2));
         let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM oci_tags WHERE repository_id = $1 AND tag = $2 AND manifest_digest = $2)")
             .bind(oci.id).bind(&digest).fetch_one(&env.fx.pool).await.unwrap();
@@ -2678,10 +2735,10 @@ mod tests {
 
         // Floating and digest-only forms.
         assert_eq!(
-            env.publish(&oci_doc("ghcr.io/acme/mcp")).await.1["error"],
+            env.publish(&oci_doc(&own("mcp"))).await.1["error"],
             "mcp_oci_floating_tag"
         );
-        let mut by_digest = oci_doc(&format!("ghcr.io/acme/mcp@{digest}"));
+        let mut by_digest = oci_doc(&own(&format!("mcp@{digest}")));
         by_digest["version"] = "2.0.0".into();
         let (s, b) = env.publish(&by_digest).await;
         assert_eq!(s, StatusCode::OK, "{b}");
@@ -2689,7 +2746,7 @@ mod tests {
             b["server"]["packages"][0]["identifier"],
             format!("localhost/{}/acme/mcp@{digest}", oci.key)
         );
-        let mut unknown = oci_doc("ghcr.io/acme/other:1");
+        let mut unknown = oci_doc(&own("other:1"));
         unknown["version"] = "3.0.0".into();
         assert_eq!(
             env.publish(&unknown).await.1["error"],

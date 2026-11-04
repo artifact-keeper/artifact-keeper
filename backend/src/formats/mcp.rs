@@ -550,7 +550,7 @@ pub fn check_version(path: &str, v: &str) -> V {
     Ok(())
 }
 
-fn check_name(name: &str) -> V {
+pub fn check_name(name: &str) -> V {
     let len = name.chars().count();
     if !(3..=200).contains(&len) {
         return Err(McpError::invalid("name", "must be 3 to 200 characters"));
@@ -1361,6 +1361,15 @@ pub struct ResolvedPin {
     pub resolved_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// A package pulled through a Remote backing repository: its path in the
+    /// Remote's proxy cache (`proxy_cache_artifacts`), where the gate finds
+    /// the pinned bytes (proxied content has no `artifacts` row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
+    /// An `mcpb` bundle: the route it is downloaded from, relative to the
+    /// instance base URL (`mcp/<repo>/v0.1/servers/.../bundles/<file>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1440,6 +1449,10 @@ pub struct StoredVersion {
     pub registry: RegistryState,
     pub policy: PackagePolicy,
     pub pins: Vec<PackagePin>,
+    /// The version's packages are still being resolved
+    /// (`metadata.resolution.state == "resolving"`): held as
+    /// [`HoldKind::Resolving`].
+    pub resolving: bool,
 }
 
 impl StoredVersion {
@@ -1459,11 +1472,13 @@ impl StoredVersion {
             Some(v) => serde_json::from_value(v.clone()).ok()?,
             None => Vec::new(),
         };
+        let resolving = doc.pointer("/resolution/state").and_then(|v| v.as_str()) == Some("resolving");
         Some(Self {
             server,
             registry,
             policy,
             pins,
+            resolving,
         })
     }
 
@@ -1541,7 +1556,10 @@ pub fn rewrite_packages_for_serve(
             continue;
         };
         let r = &pin.resolved;
-        if pin.registry_type == "oci" {
+        if let Some(path) = r.download_path.as_deref() {
+            // An `mcpb` bundle: served from this instance.
+            pkg.insert("identifier".into(), format!("{base}/{path}").into());
+        } else if pin.registry_type == "oci" {
             let (Some(name), Some(digest)) = (r.name.as_deref(), r.digest.as_deref()) else {
                 continue;
             };
@@ -2631,6 +2649,8 @@ mod tests {
                 gate_digest: None,
                 resolved_at: Utc::now(),
                 warnings: vec![],
+                cache_path: None,
+                download_path: None,
             },
             drift: None,
         }

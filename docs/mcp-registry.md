@@ -32,7 +32,12 @@ URL-encoded (`com.acme%2Fweather`) or with a literal slash
 | `GET /v0.1/servers` | read | List server versions. Query: `cursor`, `limit` (default 30, max 100; larger values clamp, `0`/negative/non-numeric is `400`), `search` (case-insensitive substring of the name, at least 3 characters or `422`), `version` (`latest` or an exact version), `updated_since` (RFC 3339; implies `include_deleted`, and `include_deleted=false` with it is `400`), `include_deleted`. |
 | `GET /v0.1/servers/{serverName}/versions` | read | Every servable version, ordered by version text. `404` when none is servable. |
 | `GET /v0.1/servers/{serverName}/versions/{version}` | read | One version; `{version}` may be `latest` (the newest servable version). |
-| `POST /v0.1/publish` | write | Publish a server.json. `200` with `{server, _meta}` exactly as it will be served. |
+| `POST /v0.1/publish` | write | Publish a server.json. `200` with `{server, _meta}` exactly as it will be served; `202` with the same plus `"status": "resolving"` when a package is still being filled into a Remote backing repository (see [Write path](#write-path-phase-2-and-3)). |
+| `POST /v0.1/validate` | read | Dry run of a publish: `200` with `{valid, issues, packages}`; nothing is written. |
+| `PUT /v0.1/servers/{serverName}/versions/{version}` | repository admin | Replace a version's document (admin edit). |
+| `DELETE /v0.1/servers/{serverName}/versions/{version}` | write | Soft delete: status `deleted`, tombstoned. |
+| `PUT /v0.1/servers/{serverName}/versions/{version}/bundles/{file}.mcpb` | write | Upload an MCPB bundle for a version before publishing it. |
+| `GET /v0.1/servers/{serverName}/versions/{version}/bundles/{file}.mcpb` | read | Download a bundle of a published version. |
 | `PATCH /v0.1/servers/{serverName}/versions/{version}/status` | write | `{"status": "active" \| "deprecated" \| "deleted", "statusMessage": "..."}` |
 | `PATCH /v0.1/servers/{serverName}/status` | write | The same for every version; answers `{updatedCount, servers}`. |
 | `GET /v0.1/ping`, `/health`, `/version` | read | `{"status":"ok"}`, a database-checked health answer, `{"version": "<AK version>"}`. |
@@ -57,8 +62,8 @@ as upstream does.
 
 Choices pinned for this release: list order is name then version as text
 (upstream's); a version is write-once (`409` on republish, even with identical
-bytes, and also while a version deleted through the artifact API is in the
-trash); `latest` is the newest version that is servable now, ordered as
+bytes, and for ever after the version was deleted, trashed or purged: see
+[Tombstones](#tombstones)); `latest` is the newest version that is servable now, ordered as
 upstream orders versions (SemVer by SemVer precedence, a `v` prefix allowed; a
 SemVer version always ranks above a non-SemVer one; two non-SemVer versions by
 `publishedAt`); `version=latest` picks each server's newest version first and
@@ -159,7 +164,8 @@ Settings are part of the repository API (`POST`/`PATCH /api/v1/repositories`):
 
 Each `mcp_package_repos` value must be an existing repository whose format
 serves that registry type (an `npm`, `yarn` or `pnpm` repository for `npm`; a
-`docker`/`podman`/`oras` repository for `oci`, and so on); it may be Local,
+`docker`/`podman`/`oras` repository for `oci`, an `mcp` or `generic` repository
+for `mcpb`, and so on); it may be Local,
 Remote or Virtual. The caller saving the setting must be able to read each
 repository it names: an administrator, or `read` through a grant; a public
 repository needs no grant, an `internal` one does (the mapping re-exports what
@@ -179,14 +185,20 @@ package first, then publish the server.json. A publish answers `422` with one
 
 | `error` | When |
 | --- | --- |
-| `mcp_external_registry` | The `registryType` has no backing repository (this includes `mcpb` in this release), `registryBaseUrl` names anything other than this instance's backing repository, or an OCI image's host is not the backing Remote's upstream. |
-| `mcp_package_not_found` | The exact package version (npm, PyPI, NuGet, Cargo) or image tag/digest (OCI) is not in the backing repository. For a Remote backing repository, pull it through Artifact Keeper first. |
+| `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. |
+| `mcp_package_not_found` | The exact package version (npm, PyPI, NuGet, Cargo) or image tag/digest (OCI) is not in a hosted backing repository, or an `mcpb` entry's `fileSha256` matches no uploaded bundle. A package missing from a Remote backing repository is not refused: it is filled (`202`, see [Write path](#write-path-phase-2-and-3)). |
 | `mcp_package_version_unpinned` | An npm, PyPI, NuGet or Cargo entry has no `version`. |
 | `mcp_oci_floating_tag` | An OCI identifier is `:latest` or has no tag and no digest. |
 | `mcp_oci_legacy_fields` | An OCI entry carries `version`, `registryBaseUrl` or `fileSha256` (the tag or digest belongs in `identifier`). |
 | `mcp_oci_not_an_image` | The pinned manifest is not a runnable image or image index. |
 
 What is served for a pinned package:
+
+Names and versions are matched the way each backing format stores them: an
+npm identifier is percent-decoded (`%40acme%2Fx` is `@acme/x`), PyPI names are
+PEP 503-normalised, NuGet ids are case-insensitive and versions are compared
+in NuGet's normalised form (`1.0`, `1.0.0` and `1.0.0.0` are one version),
+Cargo names are case-insensitive with `-` and `_` equivalent.
 
 - **npm, PyPI, NuGet, Cargo**: `identifier` and `version` unchanged,
   `registryBaseUrl` set to the backing repository
@@ -225,10 +237,15 @@ warning `oci_tag_digest_mismatch`.
 For a Local OCI repository (including the Local member a Virtual mapping
 resolved the image in) the pin also writes a digest-keyed tag row, which
 keeps storage GC from collecting the pinned manifest when its tag moves or is
-deleted. Known limit in this release: an explicit
-`DELETE /v2/<name>/manifests/sha256:<digest>` still removes the manifest; the
-server version then becomes `unresolvable` and is hidden (below), it does not
-error.
+deleted. A `DELETE /v2/<name>/manifests/sha256:<digest>` of a digest that a
+server version (in any status, `deleted` included, as long as its artifact is
+not in the trash) pins as its index or gated child digest is refused in a
+Local or Staging repository with `405` and the OCI error body
+`{"errors":[{"code":"UNSUPPORTED","message":"this manifest is pinned by a published MCP server version ..."}]}`
+(the message names no MCP repository or server). Deleting the tag is still
+allowed (the retention row keeps the manifest). There is no override flag: to
+free the digest, move the server version's artifact to the trash through the
+artifact API; a restored version is then `unresolvable`.
 
 Switching a repository from `open` to `own-repos` does not resolve versions
 already published: they are `unresolvable` until republished as a new version.
@@ -309,7 +326,6 @@ and replicate like any other artifact.
 
 ## Not in this release
 
-- Refusing a `DELETE` by digest of a pinned manifest (see above).
 - Drift detection for tag writes made by promotion and migration imports
   (pushes and Remote refreshes are covered).
 
@@ -326,6 +342,221 @@ and replicate like any other artifact.
   characters (U+E0000-U+E007F). URLs must be absolute `http`/`https`.
 - Publishes are quota-admitted like any upload and capped at 256 KiB, 16
   packages, 8 remotes and 64 entries per list.
+
+## Write path (Phase 2 and 3)
+
+Every route here is under `/mcp/<repo_key>/v0.1` and `/v0` (identical), with
+both `{serverName}` spellings. Every refusal is `application/problem+json`
+with `Cache-Control: no-store` and an `error` code. Writes need repository
+`write` (an API token needs `write:artifacts`) on a Local or Staging MCP
+repository (`405 mcp_read_only` on Remote, `400` on Virtual) and are refused
+on a promotion-only repository (`409 mcp_promotion_only`).
+
+### Packages in a Remote backing repository
+
+A package pulled through a Remote is held in the Remote's proxy cache, not as
+an artifact row. Publish finds it there (npm tarball, PyPI distribution file,
+NuGet `.nupkg`, Cargo `.crate`) and pins its cache path and sha256; the gate
+then evaluates exactly those cached bytes: the cache entry's Package Age
+Policy hold (quarantine), the Remote's stored proxy-scan verdict for that
+sha256, and the Remote's age gate. If the Remote refreshes the path to other
+bytes, or evicts it, the version is `unresolvable` (hidden) until the package
+is pulled again; nothing else is ever served in its place. OCI pulls through
+a Remote write manifest records, which publish already finds.
+
+A package that is not in the Remote yet (directly mapped, or the first Remote
+member by priority of a mapped Virtual) is **filled** instead of refused:
+
+1. Publish stores the version and answers **`202 Accepted`** with the served
+   entry plus two members:
+   ```json
+   {"server": {...}, "_meta": {...}, "status": "resolving", "pendingPackages": [0]}
+   ```
+   Already-pinned packages are rewritten as usual; pending ones are served as
+   submitted (no client sees the version yet).
+2. The version is held as `resolving`: omitted from every listing and
+   `latest`, exact reads answer the plain `404` (a repository holder gets
+   `404 mcp_resolving`, `hold: "resolving"`).
+3. A background job (every replica runs it; jobs are claimed with `FOR UPDATE
+   SKIP LOCKED` and a claim token; tick `MCP_RESOLVER_INTERVAL_SECS`, default
+   15 s) requests the package from the Remote through the Remote's own
+   download route, in process, as the publisher: the Remote's curation rules,
+   age gate, scan-on-proxy and quarantine apply exactly as for a client pull.
+   The publisher must be able to read the Remote. npm: the tarball
+   `<name>/-/<base>-<version>.tgz`; PyPI: `/pypi/<project>/<version>/json`,
+   then its first wheel (else first file); NuGet: the flat-container
+   `.nupkg`; Cargo: `/api/v1/crates/<name>/<version>/download`; OCI: the
+   manifest by tag or digest (with a five-minute pull token of the publisher
+   pinned to the Remote).
+4. Then it looks again and pins. When every pending package is pinned the
+   version is served (`MCP_PACKAGE_PINNED` audited per package).
+5. A definitive refusal fails the version: upstream `404`/`410`
+   (`mcp_package_not_found`), `401`/`403`/`451` from the Remote (access,
+   curation or age policy: `mcp_package_refused`), a mapping removed
+   (`mcp_external_registry`), the publishing account gone or disabled. A
+   transient one (`429`, `5xx`, timeout after 300 s) is retried with backoff
+   (30 s doubling, at most 1 h) up to 8 attempts (`mcp_resolve_exhausted`).
+   A failed version stays stored and hidden (`404 mcp_unresolvable` for a
+   holder) and the name@version stays taken: publish a new version.
+
+The state is in the version's metadata (`GET /api/v1/packages` rows and the
+artifact metadata API carry it), under `resolution`:
+
+```json
+{"state": "resolving" | "resolved" | "failed",
+ "pending": [{"index": 0, "registryType": "npm", "identifier": "@acme/x", "version": "1.0.0",
+              "fillRepository": "npm-remote", "fillRepositoryId": "...", "fillFormat": "npm"}],
+ "requestedAt": "...", "requestedBy": "<user id>", "baseUrl": "https://ak.example.com",
+ "attempts": 1, "lastError": "...",
+ "resolvedAt": "...", "failedAt": "...",
+ "error": {"error": "mcp_package_not_found", "detail": "...", "index": 0}}
+```
+
+Note: `mcp-publisher publish` accepts only `200`/`201` and prints a `202` as an
+error even though the publish was stored; pull packages through the Remote
+first (then publish answers `200`), or use `curl`.
+
+### Tombstones
+
+Every `name@version` a repository ever stored is recorded in
+`mcp_version_tombstones` (written by a database trigger on every server.json
+row insert, so publish, peer replication and promotion are all covered). A
+publish (or a bundle upload) of a recorded `name@version` answers
+`409 mcp_version_exists`, whether the version is live, soft-deleted, in the
+trash, or purged from it. The ledger is removed only with the repository.
+
+### `POST /validate`
+
+Body: a server.json (256 KiB cap, `413`). No credential is needed beyond
+reading the registry (`mcp-publisher validate` and its fallback after a `422`
+send none); nothing is written, pinned, held or filled. Always `200` for a
+document, with upstream's `ValidationResult` plus `packages`:
+
+```json
+{"valid": false,
+ "issues": [{"type": "schema" | "semantic", "path": "packages[0]",
+             "message": "packages[0]: npm @acme/x@1.0.0 is not in repository 'npm-local'",
+             "severity": "error" | "info", "reference": "mcp_package_not_found"}],
+ "packages": [{"index": 0, "registryType": "npm", "outcome": "pinned" | "fill" | "unchecked",
+               "fillRepository": "npm-remote"}]}
+```
+
+`reference` is the error code the publish would answer. Validation stops at
+the first error (one `error` issue); a package that a publish would fill is an
+`info` issue (`mcp_package_fill`) with `valid: true`. What is checked depends
+on the caller, so `/validate` reveals nothing a read would not:
+
+- everyone: parsing, schema, caps, characters, reserved and allowlisted
+  namespaces;
+- a repository holder (administrator, or `read` through a grant): also
+  whether `name@version` is taken (`mcp_version_exists`; a reader could
+  otherwise learn of a held version);
+- an authenticated caller who can read every mapped backing repository: also
+  package resolution. Anyone else gets `outcome: "unchecked"` per package and
+  an `info` issue `mcp_packages_unchecked`.
+
+### `PUT .../versions/{version}` (admin edit)
+
+Needs repository administration (instance administrator or the `admin`
+action on the repository; `403 mcp_forbidden` otherwise). Body: the full
+server.json, validated exactly as a publish (`400`/`403`/`422` as there); its
+`name` and `version` must be the route's (`400`). An unknown or trashed
+version is `404`. The stored document is replaced (new content-addressed
+bytes, new sha256, scanned again); registry state is kept and `updatedAt`
+bumped. When `packages[]` is unchanged the pins are kept as they are;
+otherwise every package is resolved again (and may answer `202` with
+`status: "resolving"` exactly as a publish). Identical bytes answer `200`
+without a write. Audited `MCP_SERVER_EDITED`
+(`previous_sha256`, `sha256`, `packages_changed`, `resolving`).
+
+### `DELETE .../versions/{version}` (soft delete)
+
+Needs repository `write` (as a status change). Optional body
+`{"statusMessage": "..."}` (at most 500 characters). Sets status `deleted`
+(`400` if it already is), recomputes `isLatest`, keeps the artifact, its bytes
+and its tombstone; the version answers `404` unless `include_deleted=true`.
+`200` with the served entry (`status: "deleted"`). Audited
+`MCP_SERVER_DELETED` (`from`, `status_message`).
+
+### MCPB bundles
+
+An MCPB bundle (`.mcpb`, a ZIP with `manifest.json`) is uploaded beside a
+version **before** the version is published:
+
+```bash
+curl -X PUT -H "Authorization: Bearer $AK_TOKEN" --data-binary @echo.mcpb \
+  https://ak.example.com/mcp/mcp-local/v0.1/servers/com.acme/echo/versions/1.0.0/bundles/echo.mcpb
+```
+
+- File name: `<name>.mcpb`, letters, digits, `.`, `_`, `-`, at most 200
+  characters (`400 mcp_invalid_server_json`). The name must pass the
+  namespace rules (`403`). A version already recorded (published, even
+  deleted) is `409 mcp_version_exists`. Body at most 256 MiB
+  (`413 mcp_bundle_too_large`); streamed to staging, not buffered.
+- AK reads `manifest.json` (at most 1 MiB, an object with string `name` and
+  `version`; else `400 mcp_bundle_invalid`) and verifies the signature
+  block the `mcpb sign` tool appends (`MCPB_SIG_V1`, PKCS#7 detached
+  SignedData, `MCPB_SIG_END`; both the current layout, which grows the ZIP
+  comment length, and the earlier one are accepted). A signature is `valid`
+  when the SignedData's SHA-256 message digest matches the archive, its RSA
+  (PKCS#1 v1.5, SHA-256) signature over the signed attributes verifies with
+  the certificate it carries, and that certificate was valid at the signing
+  time. AK does not check the certificate against a trust store: the
+  result records `signer` (subject CN), `issuer`, `fingerprint` (SHA-256 of
+  the certificate) and `selfSigned`, for the UI and policy to judge.
+- A present but invalid signature (tampered bytes, broken block, an
+  algorithm other than RSA/SHA-256) is always refused:
+  `422 mcp_bundle_signature_invalid`. An unsigned bundle is refused with
+  `422 mcp_bundle_unsigned` when `mcp_require_bundle_signature` is on. Both
+  are audited `MCP_BUNDLE_SIGNATURE_REJECTED` (`file`, `file_sha256`,
+  `signature`, `require_signature`, `error`).
+- `201` (or `200` for a re-upload of identical bytes; other bytes under the
+  same file name are `409 mcp_bundle_exists`):
+  ```json
+  {"file": "echo.mcpb", "fileSha256": "<hex>", "size": 1234,
+   "signature": {"state": "valid" | "unsigned", "signer": "...", "issuer": "...",
+                 "fingerprint": "...", "selfSigned": true, "signedAt": "..."},
+   "manifest": {...}, "artifactId": "...",
+   "downloadUrl": "https://ak.example.com/mcp/mcp-local/v0.1/servers/com.acme/echo/versions/1.0.0/bundles/echo.mcpb",
+   "packageEntry": {"registryType": "mcpb", "identifier": "<downloadUrl>",
+                    "fileSha256": "<hex>", "transport": {"type": "stdio"}}}
+  ```
+  The bundle is an artifact at `servers/<name>/<version>/bundles/<file>`
+  (metadata format `mcpb`), scanned and quota-admitted like any upload.
+
+Publishing the version then resolves `mcpb` entries under `own-repos` by
+`fileSha256`: a bundle uploaded for this version, else one in the
+repository `mcp_package_repos.mcpb` maps (an MCP registry's bundles, or a
+`.mcpb` file in a Generic repository). `registryBaseUrl` on an `mcpb` entry
+is `422 mcp_external_registry`; no match is `422 mcp_package_not_found`. A
+document with no `mcpb` entry gets one `packages[]` entry per uploaded bundle
+(the `packageEntry` above), so `fileSha256` never has to be computed by hand.
+The served `identifier` is the bundle's Artifact Keeper URL; on an exact read
+by an authenticated caller it carries a single-use download ticket
+(`?ticket=...`, five minutes), so a client handed the document can fetch the
+bundle of a private registry without its own credential. Listings serve the
+plain URL.
+
+The version's metadata gains `bundles[]`, one per pinned bundle:
+
+```json
+{"index": 1, "artifactId": "...", "file": "echo.mcpb", "fileSha256": "<hex>", "size": 1234,
+ "signature": {"state": "valid" | "unsigned" | "invalid", "signer": "..."},
+ "manifest": {"name": "...", "version": "...", "tools": [{"name": "...", "description": "..."}],
+              "prompts": [...], "...": "..."}}
+```
+
+(A manifest over 64 KiB keeps only its identity, `tools` and `prompts`, with
+`"truncated": true`. A bundle from a Generic repository has no upload facts:
+`signature.state` is `unsigned`, `manifest` is `null`.)
+
+`GET .../bundles/{file}` serves a bundle of a published, not deleted,
+version: `200 application/zip` with `X-Checksum-Sha256` and
+`Cache-Control: private, no-store`, streamed. A bundle under quarantine or
+refused by scan policy, an unknown file, or a version that is not published
+answers the plain unknown-name `404` (`503 mcp_gate_unavailable` when the gate
+cannot be evaluated). The gate of a pinned bundle also holds its server
+version on every read, as any backing package does.
 
 ## Repository settings (Phase 2 and 3)
 
@@ -348,7 +579,7 @@ the repository type is refused with `400`; a response omits it.
 | `mcp_require_oci_label` | all | `false` \| `true` | Refuse an OCI package whose image lacks a matching `io.modelcontextprotocol.server.name` label (otherwise a lint warning). |
 | `mcp_require_namespace_grant` | Local, Staging, Remote | `false` \| `true` | Publishing needs a namespace-conditioned grant, not just repository write. |
 | `mcp_sandbox_introspection` | Local, Staging, Remote | `off` \| `on` | Queue sandboxed stdio introspection runs for the isolated worker. |
-| `mcp_require_bundle_signature` | Local, Staging, Remote | `false` \| `true` | Refuse unsigned MCPB bundles. A present but invalid signature is always refused. |
+| `mcp_require_bundle_signature` | Local, Staging, Remote | `false` \| `true` | Refuse unsigned MCPB bundles on upload (see [MCPB bundles](#mcpb-bundles)). A present but invalid signature is always refused. |
 
 Locks: only an instance administrator may set or clear a `*_locked` field
 (`403` otherwise), and while a lock is set only an instance administrator may
