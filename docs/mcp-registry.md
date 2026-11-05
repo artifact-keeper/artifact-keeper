@@ -36,6 +36,7 @@ URL-encoded (`com.acme%2Fweather`) or with a literal slash
 | `POST /v0.1/validate` | none on a public repository (read on a private one) | Dry run of a publish: `200` with `{valid, issues, packages}`; nothing is written. See [`POST /validate`](#post-validate). |
 | `PUT /v0.1/servers/{serverName}/versions/{version}` | repository admin | Replace a version's document (admin edit). |
 | `DELETE /v0.1/servers/{serverName}/versions/{version}` | write | Soft delete: status `deleted`, tombstoned. |
+| `POST /v0.1/servers/{serverName}/versions/{version}/purge` | instance administrator | Purge a soft-deleted version: its server.json and bundles go to the trash, releasing its pins; the tombstone stays. See [Purge](#post-versionsversionpurge-admin-purge). |
 | `PUT /v0.1/servers/{serverName}/versions/{version}/bundles/{file}.mcpb` | write | Upload an MCPB bundle for a version before publishing it. |
 | `GET /v0.1/servers/{serverName}/versions/{version}/bundles/{file}.mcpb` | read | Download a bundle of a published version. |
 | `PATCH /v0.1/servers/{serverName}/versions/{version}/status` | write | `{"status": "active" \| "deprecated" \| "deleted", "statusMessage": "..."}` |
@@ -443,14 +444,23 @@ are matched by `fileSha256`, not by name, and are not checked this way.
 Server versions enter an MCP repository only through `POST .../publish`. The
 generic artifact upload routes (`PUT`/`POST /api/v1/repositories/{key}/artifacts/...`
 and `/api/v1/uploads`) refuse an MCP repository with `400`, except for a
-trusted peer replication (an administrator or service account sending the
-replication header). Likewise a server version (or a bundle) leaves an MCP
+peer replication under an instance administrator's token (an administrator
+sending the replication header, which is how a peer link is set up). A
+service account does not qualify, unlike for the other formats: the header is
+client-set and nothing binds a credential to a registered peer, so "a service
+account plus the header" let any CI account with `write` claim a
+`name@version` in another team's namespace with an unvalidated, unpinned
+document (#5368). Likewise a server version (or a bundle) leaves an MCP
 repository only through `DELETE .../servers/{serverName}/versions/{version}`
-(the soft delete below): the generic
+(the soft delete below) and, after it, the administrator
+[purge](#post-versionsversionpurge-admin-purge): the generic
 `DELETE /api/v1/repositories/{key}/artifacts/...` refuses an MCP repository
 with `400`, administrators included, after its access checks, with the same
-replication exemption. The generic route knows nothing of namespaces, so it
-would let a writer of one namespace delete another's server.json.
+replication exemption (an administrator's token with the header; a service
+account is refused). The generic route knows nothing of namespaces, so it
+would let a writer of one namespace delete another's server.json. Lifecycle
+policies skip MCP repositories altogether (see
+[Lifecycle policy assignments](lifecycle-policy-assignments.md#execution)).
 
 To publish a server under `own-repos`, publish (or pull through a Remote) its
 package first, then publish the server.json. A publish answers `422` with one
@@ -532,21 +542,22 @@ Local or Staging repository with `405` and the OCI error body
 (the message names no MCP repository or server). Deleting the tag is still
 allowed (the retention row keeps the manifest).
 
-**A pinned digest stays pinned.** There is no override flag and no supported per-version
-way to release the pin. The pin holds while the server version's artifact row
-exists outside the trash (`services::mcp_write::digest_pinned_by_mcp`), and
-no supported route trashes that row: the MCP
+**A pinned digest stays pinned until the version is purged.** There is no
+override flag. The pin holds while the server version's artifact row exists
+outside the trash (`services::mcp_write::digest_pinned_by_mcp`). The MCP
 [`DELETE .../versions/{version}`](#delete-versionsversion-soft-delete) only
-sets the status to `deleted` and keeps the artifact, and the generic artifact
-`DELETE` refuses MCP repositories (`400`, see above). The only supported way
-to free the digest is to delete the whole MCP repository that holds the
-version (`DELETE /api/v1/repositories/{key}`): once the delete job has removed
-its rows, none of its versions pins anything, and their tombstones go with
-it. The peer-replication exemption of the generic `DELETE` and a lifecycle
-policy attached to the MCP repository can also trash a server.json row, but
-both skip the namespace gate, the `isLatest` recompute and the
-`MCP_SERVER_DELETED` audit, so they are not a way to release a pin. An admin
-path that releases one version's pins is proposed in #5368.
+sets the status to `deleted` and keeps the artifact, so it keeps the pin; the
+generic artifact `DELETE` refuses MCP repositories (`400`, see above) and
+lifecycle policies skip them. To free the digest, an instance administrator
+soft-deletes the version and then purges it with
+[`POST .../versions/{version}/purge`](#post-versionsversionpurge-admin-purge),
+which trashes its server.json and bundles, keeps its tombstone and audits
+`MCP_SERVER_PURGED` with the released digests. The digest is free once no
+other live version pins it (the purge answer says, per digest, whether one
+still does). Deleting the whole MCP repository that holds the version
+(`DELETE /api/v1/repositories/{key}`) also frees its digests: once the delete
+job has removed its rows, none of its versions pins anything, and their
+tombstones go with it.
 
 Switching a repository from `open` to `own-repos` does not resolve versions
 already published: they are `unresolvable` until republished as a new version.
@@ -631,7 +642,9 @@ bytes. Status changes of a server run in one transaction with the `isLatest`
 recompute. The
 pins, registry state and package policy live in the artifact's metadata.
 Published versions fire `artifact.uploaded` webhooks, are scanned on upload
-and replicate like any other artifact.
+and replicate like any other artifact, except that a peer link into an MCP
+repository must carry an instance administrator's token (a service account's
+replication write is refused, see [Package policy](#package-policy)).
 
 ## Not in this release
 
@@ -771,8 +784,8 @@ Every `name@version` a repository ever stored is recorded in
 `mcp_version_tombstones` (written by a database trigger on every server.json
 row insert, so publish, peer replication and promotion are all covered). A
 publish (or a bundle upload) of a recorded `name@version` answers
-`409 mcp_version_exists`, whether the version is live, soft-deleted, in the
-trash, or purged from it. The ledger has no link to the artifact row, so a
+`409 mcp_version_exists`, whether the version is live, soft-deleted, purged
+by an administrator (in the trash), or purged from the trash. The ledger has no link to the artifact row, so a
 trash purge does not touch it, and it binds every writer, not only publish: a
 database trigger (migration 328) refuses any insert of a server.json row for
 a recorded `name@version`, a promotion into an MCP repository is refused
@@ -887,7 +900,29 @@ and its tombstone; the version answers `404` unless `include_deleted=true`.
 `200` with the served entry (`status: "deleted"`). Audited
 `MCP_SERVER_DELETED` (`from`, `status_message`). This is the only delete
 route for a server version: the generic artifact `DELETE` answers `400` on an
-MCP repository (see [Package policy](#package-policy)).
+MCP repository (see [Package policy](#package-policy)). The version keeps its
+pins until it is [purged](#post-versionsversionpurge-admin-purge).
+
+### `POST .../versions/{version}/purge` (admin purge)
+
+The second, deliberate step after a soft delete (#5368). Needs an instance
+administrator (`403 mcp_forbidden` otherwise, repository administrators
+included); the version must be `deleted`
+(`409 mcp_version_not_deleted` otherwise, with its `status`); an unknown or
+already purged version is `404`. No body. Under the server's write lock the
+version's server.json artifact and every bundle under
+`servers/<name>/<version>/bundles/` go to the trash, as the generic artifact
+delete does (the usual `ARTIFACT_DELETED` audit rows, `artifact.deleted`
+webhooks and delete sync tasks to push peers follow), and `isLatest` is
+recomputed. The tombstone stays, so a publish or bundle upload of the version
+still answers `409 mcp_version_exists`. A trashed server.json no longer pins
+anything, so an OCI `DELETE /v2/<name>/manifests/sha256:<digest>` of a digest
+only this version pinned is allowed again. `200` with
+`{server, version, purged: true, trashed: [paths], releasedDigests: [{repository_id, image, digest, still_pinned}]}`.
+Audited `MCP_SERVER_PURGED` (`released_digests`, `pins`, `trashed`). Restoring
+the server.json from the trash brings its pins back (the version is
+`unresolvable` if a pinned manifest is gone by then); a trash purge or
+storage GC removes it for good, the tombstone outliving it.
 
 ### MCPB bundles
 

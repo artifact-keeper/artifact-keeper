@@ -11517,9 +11517,10 @@ pub(crate) async fn materialize_staged_for_repo<'a>(
 /// route, which validates the document, applies the namespace policy and
 /// pins its packages. A generic write of `servers/<name>/<version>/...` would
 /// skip all of that (and squat the version), so the generic upload entry
-/// points refuse an MCP repository. A trusted peer replication (admin or
-/// service account) still lands, so MCP repositories replicate like any
-/// other.
+/// points refuse an MCP repository. A peer replication under an instance
+/// administrator's token still lands ([`mcp_replication_trusted`]; a
+/// service account does not qualify, #5368), so MCP repositories replicate
+/// like any other.
 #[allow(clippy::result_large_err)]
 pub(crate) fn reject_generic_write_to_mcp(
     format: &RepositoryFormat,
@@ -11541,7 +11542,9 @@ const MCP_GENERIC_WRITE_REFUSED: &str =
 /// recomputes `isLatest` and audits `MCP_SERVER_DELETED`. The generic route
 /// knows none of that, so a plain repository writer could delete another
 /// namespace's server.json through it: it refuses MCP repositories, admins
-/// included, except a trusted peer replication (as for generic writes).
+/// included, except a peer replication under an administrator's token (as
+/// for generic writes). A version's pins are released through the admin
+/// purge (`POST .../versions/{version}/purge`, #5368).
 pub(crate) const MCP_GENERIC_DELETE_REFUSED: &str =
     "MCP registries delete server versions only through \
      DELETE /mcp/{repository}/v0.1/servers/{serverName}/versions/{version}";
@@ -11593,23 +11596,38 @@ fn generic_artifact_not_found(repo: &crate::models::repository::Repository) -> A
 }
 
 /// `400` for a generic write or delete into an MCP repository unless the/// `400` for a generic write or delete into an MCP repository unless the
-/// caller is a trusted peer replication (admin or service account with the
-/// replication header).
+/// caller is a peer replication under an instance administrator's
+/// credential ([`mcp_replication_trusted`]).
 pub(crate) fn mcp_generic_mutation_refusal(
     format: &RepositoryFormat,
     auth: &AuthExtension,
     headers: &HeaderMap,
     message: &str,
 ) -> Result<()> {
-    let trusted = replication_exemption_trusted(
-        super::is_replication_request(headers),
-        auth.is_admin,
-        auth.is_service_account,
-    );
+    let trusted = mcp_replication_trusted(super::is_replication_request(headers), auth.is_admin);
     if format == &RepositoryFormat::Mcp && !trusted {
         return Err(AppError::Validation(message.to_string()));
     }
     Ok(())
+}
+
+/// Whether a generic write or delete into an MCP repository is a peer
+/// replication that may skip the MCP routes (#5368).
+///
+/// Narrower than [`replication_exemption_trusted`]: a service account does
+/// not qualify. The replication header is client-set, and nothing binds an
+/// inbound credential to a registered peer (`peer_instances.api_key` is the
+/// key this instance presents to that peer, not the one the peer presents
+/// here), so "a service account plus the header" let any CI account with
+/// `write` store a `name@version` in another team's namespace with an
+/// unvalidated document, unpinned (the tombstone guard of migration 328
+/// still refused a recorded version), or trash another namespace's
+/// server.json. Peer links carry an instance administrator's token (the
+/// documented peer setup), and an administrator can already edit, delete
+/// and purge any version, so the exemption keeps replication of MCP
+/// repositories working without trusting any lesser identity.
+pub(crate) fn mcp_replication_trusted(is_replication: bool, is_admin: bool) -> bool {
+    is_replication && is_admin
 }
 
 pub(crate) async fn authorize_generic_upload(
@@ -23778,6 +23796,9 @@ mod tests {
         let user = tdh::make_auth(user_id, &username);
         let mut admin = user.clone();
         admin.is_admin = true;
+        // #5368: a service account is not a peer; the header is client-set.
+        let mut service_account = user.clone();
+        service_account.is_service_account = true;
         let mut replication = HeaderMap::new();
         replication.insert(
             "x-artifact-keeper-replication",
@@ -23786,6 +23807,7 @@ mod tests {
         for (who, headers) in [
             (user.clone(), HeaderMap::new()),
             (user.clone(), replication.clone()),
+            (service_account.clone(), replication.clone()),
             (admin.clone(), HeaderMap::new()),
         ] {
             let refused = delete_artifact(
@@ -23818,6 +23840,91 @@ mod tests {
         .await;
         assert!(replicated.is_ok(), "{replicated:?}");
         let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #5368: a generic `PUT` of a server.json into an MCP registry with the
+    /// replication header is refused for a service account holding `write`
+    /// (it would store an unvalidated, unpinned version in any namespace)
+    /// and stores nothing; a peer replication under an administrator's
+    /// token still lands.
+    #[tokio::test]
+    async fn generic_put_into_an_mcp_registry_needs_an_admin_peer_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let state = || {
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            ))
+        };
+        let mut service_account = tdh::make_auth(user_id, &username);
+        service_account.is_service_account = true;
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let mut replication = HeaderMap::new();
+        replication.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let doc = |name: &str| {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "name": name, "version": "1.0.0", "description": "squat",
+                }))
+                .unwrap(),
+            )
+        };
+        let squat = "servers/com.other/echo/1.0.0/server.json".to_string();
+        let refused = upload_artifact(
+            state(),
+            Extension(Some(service_account)),
+            Path((key.clone(), squat.clone())),
+            replication.clone(),
+            doc("com.other/echo"),
+        )
+        .await;
+        match refused {
+            Err(r) => assert_eq!(r.status(), StatusCode::BAD_REQUEST),
+            Ok(r) => panic!(
+                "a service account with the replication header must be refused, got {}",
+                r.status()
+            ),
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "the refused write stored nothing");
+        let replicated = upload_artifact(
+            state(),
+            Extension(Some(admin)),
+            Path((key.clone(), squat.clone())),
+            replication,
+            doc("com.other/echo"),
+        )
+        .await;
+        match replicated {
+            Ok(r) => assert!(r.status().is_success(), "{}", r.status()),
+            Err(r) => panic!("an admin peer replication must land, got {}", r.status()),
+        }
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM mcp_version_tombstones WHERE repository_id = $1")
             .bind(repo_id)
             .execute(&pool)
             .await;

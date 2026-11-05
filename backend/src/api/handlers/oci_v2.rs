@@ -14565,7 +14565,9 @@ async fn mcp_pin_blocks_delete(
             StatusCode::METHOD_NOT_ALLOWED,
             "UNSUPPORTED",
             "this manifest is pinned by a published MCP server version and cannot be deleted by \
-             digest; delete the tag instead, or remove the server version first",
+             digest; delete the tag instead, or have an administrator soft-delete the server \
+             version and then purge it with \
+             POST /mcp/{repository}/v0.1/servers/{serverName}/versions/{version}/purge",
         )),
         Err(e) => Some(oci_error(
             crate::api::handlers::db_status(&e),
