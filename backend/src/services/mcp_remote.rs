@@ -75,6 +75,11 @@ pub const WATERMARK_OVERLAP_SECS: i64 = 600;
 pub const DEFAULT_SYNC_INTERVAL_SECS: i64 = 3600;
 /// How often the scheduler looks for repositories that are due.
 pub const SCHEDULER_TICK_SECS: u64 = 300;
+/// A Remote never synced is not due until it is this old (#5402): its
+/// create stores the settings that govern upstream contact (upstream mode,
+/// egress proxy, `mcp_remote_sync_paused`) right after the row, and a
+/// scheduler tick between the two must not start a pass without them.
+pub const FIRST_SYNC_GRACE_SECS: i64 = 60;
 const SCHEDULER_LEASE: &str = "mcp_remote_sync";
 const SCHEDULER_LEASE_TTL_SECS: f64 = 330.0;
 
@@ -2071,21 +2076,27 @@ pub fn sync_interval_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS)
 }
 
-/// Remote MCP repositories due for a sync: never synced, past the
-/// interval, or with an unfinished pass to resume.
+/// Remote MCP repositories due for a sync: never synced (and older than
+/// [`FIRST_SYNC_GRACE_SECS`]), past the interval, or with an unfinished pass
+/// to resume. A Remote with `mcp_remote_sync_paused` is never due (#5402).
 pub async fn due_repositories(db: &PgPool, interval_secs: i64) -> Result<Vec<String>, String> {
     sqlx::query_scalar(
         "SELECT r.key FROM repositories r \
          LEFT JOIN mcp_remote_sync_state s ON s.repository_id = r.id \
          WHERE r.format = 'mcp' AND r.repo_type = 'remote' AND r.upstream_url IS NOT NULL \
            AND r.key NOT LIKE '~deleting~%' \
-           AND (s.last_started_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM repository_config c WHERE c.repository_id = r.id \
+                           AND c.key = $2 AND c.value = 'true') \
+           AND ((s.last_started_at IS NULL \
+                 AND r.created_at < now() - make_interval(secs => $3)) \
                 OR s.last_started_at < now() - make_interval(secs => $1) \
                 OR (s.resume_cursor IS NOT NULL \
                     AND s.last_started_at < now() - make_interval(secs => 300))) \
          ORDER BY s.last_started_at NULLS FIRST",
     )
     .bind(interval_secs as f64)
+    .bind(mcp_settings::REMOTE_SYNC_PAUSED_KEY)
+    .bind(FIRST_SYNC_GRACE_SECS as f64)
     .fetch_all(db)
     .await
     .map_err(db_err)
@@ -2162,25 +2173,38 @@ pub fn spawn(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
             }
-            if pause.skip_tick(&state.db).await {
-                continue;
-            }
-            let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
-                &state.db,
-                SCHEDULER_LEASE,
-                SCHEDULER_LEASE_TTL_SECS,
-            )
-            .await
-            else {
-                continue;
-            };
-            let (renewal, lost) =
-                lease.spawn_renewal_with_cancellation(state.db.clone(), SCHEDULER_LEASE_TTL_SECS);
-            run_due(&state, interval_secs, &lost).await;
-            drop(renewal);
-            lease.release(&state.db).await;
+            scheduler_tick(&state, interval_secs, &mut pause).await;
         }
     });
+}
+
+/// One tick of the scheduled sync: skipped, before the lease and any
+/// network work, while scheduled upstream jobs are paused; otherwise the due
+/// repositories are synced under the scheduler lease. `false` when the tick
+/// was skipped (paused, or another replica holds the lease).
+pub async fn scheduler_tick(
+    state: &SharedState,
+    interval_secs: i64,
+    pause: &mut UpstreamPauseGate,
+) -> bool {
+    if pause.skip_tick(&state.db).await {
+        return false;
+    }
+    let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+        &state.db,
+        SCHEDULER_LEASE,
+        SCHEDULER_LEASE_TTL_SECS,
+    )
+    .await
+    else {
+        return false;
+    };
+    let (renewal, lost) =
+        lease.spawn_renewal_with_cancellation(state.db.clone(), SCHEDULER_LEASE_TTL_SECS);
+    run_due(state, interval_secs, &lost).await;
+    drop(renewal);
+    lease.release(&state.db).await;
+    true
 }
 
 #[cfg(ak_test_shard = "services-1")]

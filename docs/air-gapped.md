@@ -213,6 +213,31 @@ for key in pypi-remote npm-remote ghcr-remote hf-remote; do
 done
 ```
 
+**Set upstream mode and egress proxy on create.** `POST /api/v1/repositories`
+takes `upstream_mode` and `egress_proxy` (the same bodies as the two `PUT`
+routes) for a Remote, and stores them before anything else, so the
+repository's first upstream request already obeys them (#5402). That
+matters for a Remote that contacts its upstream on its own, without a
+client: an MCP Remote's first sync used to start before a separate
+`PUT .../egress-proxy` or `PUT .../upstream-mode` could run, so its first
+pages bypassed the logging proxy. Create Remotes in their final state
+instead of pausing scheduled upstream jobs around the create:
+
+```bash
+curl -X POST "$AK/api/v1/repositories" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"key": "mcp-official", "name": "mcp-official", "format": "mcp", "repo_type": "remote",
+       "upstream_url": "https://registry.modelcontextprotocol.io",
+       "egress_proxy": {"mode": "explicit", "proxy_url": "http://egress-ledger:3128"},
+       "mcp_remote_sync_paused": true}'
+```
+
+`mcp_remote_sync_paused: true` (MCP Remotes only) also holds back the
+scheduled sync until you clear it with `PATCH`, for the settings that have
+no create field (cache TTL, upstream credentials set later). A Remote that
+was never synced is not due until it is a minute old in any case. Set the
+other settings in the table right after the create.
+
 Why each one matters:
 
 - **Cache TTL.** With the default 5 minutes, every index goes stale shortly
@@ -457,7 +482,7 @@ What each job contacts, and how to handle it individually:
 | Dependency scanner advisories | `api.osv.dev`, `api.github.com` | Runs on each scan, not on a timer. Leave `GITHUB_TOKEN` unset; see [section 4](#dependency-scanner-osv). |
 | Peer heartbeats and sync | The registered peers | Only peers you registered. The switch pauses replication transfers (queued tasks stay queued), not heartbeats; set `PEER_HEARTBEAT_ENABLED=false` to stop those. Unregister or disable subscriptions you no longer use. |
 | Webhooks, SMTP, LDAP, OIDC, tracing | Whatever you configured (`OTEL_EXPORTER_OTLP_ENDPOINT` for traces) | Point them at services inside the enclave, or leave them unset. |
-| MCP Remote sync | The upstream registry of each Remote MCP repository, hourly by default (`MCP_REMOTE_SYNC_INTERVAL_SECS`) | Paused by the switch (job `mcp_remote_sync`); the per-repository cursor survives, so it resumes from there. Cache-only mode does not cover it. See [MCP registry: Remote repositories](mcp-registry.md#remote-repositories). |
+| MCP Remote sync | The upstream registry of each Remote MCP repository, hourly by default (`MCP_REMOTE_SYNC_INTERVAL_SECS`) | Paused by the switch (job `mcp_remote_sync`); the per-repository cursor survives, so it resumes from there. `mcp_remote_sync_paused: true` pauses one Remote. A cache-only Remote's sync makes no upstream request (the shared upstream gate refuses each page that is not cached). Set any of these in the create body, not after it (#5402): see below and [MCP registry: Remote repositories](mcp-registry.md#remote-repositories). |
 
 Crash reporting is opt-in and off by default
 (`GET /api/v1/admin/telemetry/settings`). The backend has no update check.

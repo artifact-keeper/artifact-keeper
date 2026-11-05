@@ -1107,6 +1107,7 @@ the repository type is refused with `400`; a response omits it.
 | `mcp_require_oci_label` | all | `false` \| `true` | Refuse an OCI package whose image lacks a matching `io.modelcontextprotocol.server.name` label (otherwise a lint warning). |
 | `mcp_require_namespace_grant` | Local, Staging, Remote | `false` \| `true` | Publishing needs a namespace-conditioned grant, not just repository write. |
 | `mcp_sandbox_introspection` | Local, Staging, Remote | `off` \| `on` | Queue sandboxed stdio introspection runs for the isolated worker. |
+| `mcp_remote_sync_paused` | Remote | `false` \| `true` | The scheduled sync skips this repository (#5402). Set it on create to finish configuring a Remote before its first sync, then clear it with `PATCH`. A manual `POST .../mcp/sync` still runs a pass. Scheduled upstream jobs paused instance-wide (`upstream_jobs_paused`) stop every Remote's sync without it. |
 | `mcp_require_bundle_signature` | Local, Staging, Remote | `false` \| `true` | Refuse MCPB bundles that are not signed by a trusted signer (`MCP_TRUSTED_BUNDLE_SIGNERS`): on upload (unsigned or `self_signed`) and on publish, for every pinned bundle including those found through `mcp_package_repos.mcpb` (see [MCPB bundles](#mcpb-bundles)). A present but invalid signature is always refused. |
 
 Locks: only an instance administrator may set or clear a `*_locked` field
@@ -1144,6 +1145,42 @@ repository. Writes (`publish`, `status`) answer `405 mcp_read_only`.
 Pair it with the clients' own allowlists so developers cannot route around
 it: Copilot's "Registry only" policy, Claude Code `allowedMcpServers` with
 `allowManagedMcpServersOnly`, Cursor's team allowlist.
+
+**Create the Remote in its final state.** The settings that govern the
+first sync's upstream requests go in the create body, so the repository is
+born with them (#5402). Nothing has to be paused around the create.
+
+- `upstream_mode` (`online` or `cache_only`) and `egress_proxy` (the
+  `PUT .../egress-proxy` body: `mode`, `proxy_url`, `no_proxy`) are taken on
+  create for every Remote. They are validated before the repository exists
+  and stored before anything else, so a Remote created `cache_only` never
+  contacts its upstream, and the first request of one created with an
+  explicit proxy goes through the proxy.
+- The `mcp_*` settings above (`mcp_remote_mode`, `mcp_auto_approve_namespaces`,
+  `mcp_server_deny`, ...) are taken on create too. With
+  `mcp_remote_sync_paused: true` the scheduled sync leaves the Remote alone
+  until the flag is cleared, so the routes that only exist once the
+  repository does (`PUT .../cache-ttl`, `PUT .../upstream-auth`, ...) can be
+  set first.
+- A Remote that was never synced is not due until it is a minute old, so a
+  scheduler tick that lands during the create cannot start a pass before
+  its create-time settings are stored.
+- While scheduled upstream jobs are paused instance-wide, no Remote syncs
+  on its own; the switch is no longer needed to make a create safe.
+
+```json
+{
+  "key": "mcp-official", "format": "mcp", "repo_type": "remote",
+  "upstream_url": "https://registry.modelcontextprotocol.io",
+  "egress_proxy": {"mode": "explicit", "proxy_url": "http://egress-ledger:3128"},
+  "mcp_remote_sync_paused": true
+}
+```
+
+A cache-only Remote's sync runs on schedule but makes no upstream request:
+each page goes through the shared upstream gate, which refuses a miss
+before any request is built (`lastError` names the refusal) and serves a
+page that is still in the proxy cache.
 
 ### Sync
 

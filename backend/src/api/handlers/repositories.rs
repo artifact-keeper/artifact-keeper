@@ -1187,6 +1187,23 @@ pub struct CreateRepositoryRequest {
     /// `UpdateRepositoryRequest.virtual_metadata_partial`. Refused (400) on
     /// any other repository type.
     pub virtual_metadata_partial: Option<bool>,
+    /// Remote repositories only: the upstream mode the repository is born
+    /// with (#5402), `online` (the default) or `cache_only`. The same value
+    /// `PUT /api/v1/repositories/{key}/upstream-mode` sets, stored before any
+    /// scheduled job can pick the repository up, so a Remote created
+    /// `cache_only` never contacts its upstream, not even for an MCP
+    /// Remote's first sync. Refused (400) on any other repository type.
+    #[schema(nullable = false)]
+    pub upstream_mode: Option<UpstreamMode>,
+    /// Remote repositories only: the outbound egress proxy the repository is
+    /// born with (#5402), the body of
+    /// `PUT /api/v1/repositories/{key}/egress-proxy` (`mode`, `proxy_url`,
+    /// `no_proxy`), validated the same way. Stored before any scheduled job
+    /// can pick the repository up, so its first upstream request already
+    /// goes through the proxy. `proxy_url` is write-only; read the redacted
+    /// form back with `GET .../egress-proxy`. Refused (400) on any other
+    /// repository type.
+    pub egress_proxy: Option<EgressProxyRequest>,
     /// Not settable on create (#5324): link a staging repository to its
     /// release repository after creating it, with
     /// `PATCH /api/v1/repositories/{key}` or
@@ -4597,6 +4614,9 @@ pub async fn create_repository(
     refuse_update_only_fields_on_create(&payload)?;
     let shared_config = SharedRepoConfigSettings::from(&payload);
     shared_config.validate(&repo_type)?;
+    // #5402: the Remote's upstream mode and egress proxy, validated before
+    // the row exists and stored right after it, before anything else.
+    let born_remote = born_remote_settings(&payload, &repo_type)?;
 
     if let Some(ref ua) = payload.custom_user_agent {
         if repo_type != RepositoryType::Remote {
@@ -4893,6 +4913,10 @@ pub async fn create_repository(
         }
     }
 
+    // #5402: first, so no later write (and no scheduled job reading the new
+    // row) sees the Remote without them.
+    born_remote.persist(&state, repo.id).await?;
+
     // Quarantine period and `virtual_metadata_partial` (#5324), validated
     // above; the same writes as `update_repository`.
     shared_config.persist(&state.db, repo.id).await?;
@@ -5094,7 +5118,7 @@ pub async fn create_repository(
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
                 age_gate_change: None,
-                upstream_mode_change: None,
+                upstream_mode_change: born_remote.upstream_mode_audit(),
             }),
     )
     .await;
@@ -5826,6 +5850,70 @@ const CREATE_REFUSED_UPDATE_FIELDS: [&str; 3] = [
     "curation_enabled",
     "curation_default_action",
 ];
+
+/// The Remote settings a create may carry so the repository is born with
+/// them (#5402): its upstream mode and egress proxy.
+#[derive(Debug, Default)]
+struct BornRemoteSettings {
+    upstream_mode: Option<UpstreamMode>,
+    egress_proxy: Option<crate::services::egress_proxy::EgressProxyConfig>,
+}
+
+impl BornRemoteSettings {
+    /// Store them on the new repository, through the same writes as
+    /// `PUT .../upstream-mode` and `PUT .../egress-proxy`.
+    async fn persist(&self, state: &SharedState, repo_id: Uuid) -> Result<()> {
+        if let Some(mode) = self.upstream_mode {
+            upstream_mode::save_upstream_mode(&state.db, repo_id, mode).await?;
+        }
+        if let Some(config) = &self.egress_proxy {
+            crate::services::egress_proxy::save_egress_proxy(&state.db, repo_id, config).await?;
+            if let Some(proxy_service) = state.proxy_service.as_ref() {
+                proxy_service.invalidate_egress_client(repo_id).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// The `upstream_mode_change` of the creation audit row, when a mode
+    /// other than the default was chosen.
+    fn upstream_mode_audit(&self) -> Option<audit_details::UpstreamModeChangeAudit> {
+        self.upstream_mode
+            .filter(|mode| *mode != UpstreamMode::Online)
+            .map(|mode| audit_details::UpstreamModeChangeAudit {
+                previous_upstream_mode: UpstreamMode::Online.as_str().to_owned(),
+                upstream_mode: mode.as_str().to_owned(),
+            })
+    }
+}
+
+/// Validate a create's `upstream_mode` and `egress_proxy` (#5402): Remote
+/// repositories only, the same rules as their `PUT` routes. Pure.
+fn born_remote_settings(
+    payload: &CreateRepositoryRequest,
+    repo_type: &RepositoryType,
+) -> Result<BornRemoteSettings> {
+    if payload.upstream_mode.is_some() {
+        is_upstream_mode_configurable(repo_type)?;
+    }
+    let egress_proxy = match &payload.egress_proxy {
+        None => None,
+        Some(_) if repo_type != &RepositoryType::Remote => {
+            return Err(AppError::Validation(
+                "egress_proxy is only valid for remote repositories".to_string(),
+            ))
+        }
+        Some(request) => Some(build_egress_proxy_config(
+            &request.mode,
+            request.proxy_url.as_deref(),
+            request.no_proxy.as_deref(),
+        )?),
+    };
+    Ok(BornRemoteSettings {
+        upstream_mode: payload.upstream_mode,
+        egress_proxy,
+    })
+}
 
 /// Refuse the update-only fields `create_repository` does not apply (#5324).
 fn refuse_update_only_fields_on_create(payload: &CreateRepositoryRequest) -> Result<()> {
