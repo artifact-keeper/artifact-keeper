@@ -268,26 +268,50 @@ impl Members {
     }
 }
 
-/// The names among `names` some hosted member holds (any live row).
+/// The server names some hosted member holds, compared case-insensitively
+/// (#5394), as the deny lists and namespace allowlists compare them: a
+/// hosted `io.acme/tool` shadows a Remote's `io.Acme/tool`.
+#[derive(Debug, Default)]
+pub(crate) struct OwnedNames(HashSet<String>);
+
+impl OwnedNames {
+    /// The comparison key of a server name.
+    pub(crate) fn key(name: &str) -> String {
+        name.to_lowercase()
+    }
+
+    pub(crate) fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self(names.into_iter().map(Self::key).collect())
+    }
+
+    /// Whether a hosted member holds `name` in any letter case.
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        self.0.contains(&Self::key(name))
+    }
+}
+
+/// The names among `names` some hosted member holds (any live row, any
+/// letter case).
 async fn hosted_owned_names(
     state: &SharedState,
     members: &Members,
     names: &[String],
-) -> Result<HashSet<String>, Response> {
+) -> Result<OwnedNames, Response> {
     if members.hosted_all.is_empty() || names.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(OwnedNames::default());
     }
+    let keys: Vec<String> = names.iter().map(|n| OwnedNames::key(n)).collect();
     let owned: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.name FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
-         WHERE a.repository_id = ANY($1) AND a.name = ANY($2) AND a.is_deleted = false \
+         WHERE a.repository_id = ANY($1) AND lower(a.name) = ANY($2) AND a.is_deleted = false \
            AND m.format = 'mcp'",
     )
     .bind(&members.hosted_all)
-    .bind(names)
+    .bind(&keys)
     .fetch_all(&state.db)
     .await
     .map_err(mcp::internal)?;
-    Ok(owned.into_iter().collect())
+    Ok(OwnedNames::from_names(owned.iter().map(String::as_str)))
 }
 
 async fn owners_of(
@@ -296,7 +320,7 @@ async fn owners_of(
     name: &str,
 ) -> Result<Vec<usize>, Response> {
     let owned = hosted_owned_names(state, members, &[name.to_string()]).await?;
-    Ok(members.owners(owned.contains(name), name))
+    Ok(members.owners(owned.owns(name), name))
 }
 
 /// The member and row `latest` answers for `name` through the Virtual: the
@@ -578,7 +602,7 @@ async fn page_latest_ids(
     let owned = hosted_owned_names(state, members, &names).await?;
     let mut out = HashSet::new();
     for name in &names {
-        let owners = members.owners(owned.contains(name), name);
+        let owners = members.owners(owned.owns(name), name);
         if let (Some((_, row)), _) = virtual_latest(state, members, &owners, name).await? {
             out.insert(row.artifact_id);
         }
@@ -638,7 +662,7 @@ async fn drop_shadowed(
     if !hosted {
         let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
         let owned = hosted_owned_names(state, members, &names).await?;
-        rows.retain(|r| !owned.contains(&r.name));
+        rows.retain(|r| !owned.owns(&r.name));
     }
     let ctx = GateCtx::of(state, false);
     for earlier in (0..idx).filter(|&j| members.hosted[j] == hosted) {
@@ -778,7 +802,7 @@ async fn list_latest(
                     break 'members;
                 }
                 if !members.denies(&name) {
-                    let owners = members.owners(owned.contains(&name), &name);
+                    let owners = members.owners(owned.owns(&name), &name);
                     let (picked, walked) = virtual_latest(state, members, &owners, &name).await?;
                     budget = budget.saturating_sub(walked.max(1));
                     if let Some((owner, row)) = picked.filter(|(owner, r)| {
@@ -1492,5 +1516,55 @@ mod tests {
             false
         );
         env.teardown().await;
+    }
+
+    /// #5394: hosted shadows remote whatever the letter case. A hosted
+    /// `io.acme/tool` hides a Remote's `io.Acme/tool` from every read
+    /// through the Virtual, as the deny lists (case-insensitive) would.
+    #[tokio::test]
+    async fn hosted_shadows_remote_whatever_the_letter_case() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let r1 = env.member("remote", 1, true).await;
+        let l1 = env.member("local", 2, true).await;
+        env.store(r1, "io.Acme/tool", "9.0.0", "upstream").await;
+        env.store(r1, "io.public/y", "1.0.0", "upstream").await;
+        env.store(l1, "io.acme/tool", "1.0.0", "internal").await;
+        for tail in ["/servers", "/servers?version=latest"] {
+            let (s, b) = env.get(tail).await;
+            assert_eq!(s, StatusCode::OK, "{tail}");
+            assert_eq!(
+                descriptions(&b),
+                vec!["io.acme/tool@1.0.0=internal", "io.public/y@1.0.0=upstream"],
+                "{tail}"
+            );
+        }
+        for tail in [
+            "/servers/io.Acme%2Ftool/versions/9.0.0",
+            "/servers/io.Acme%2Ftool/versions/latest",
+            "/servers/io.Acme%2Ftool/versions",
+        ] {
+            assert_eq!(
+                env.get(tail).await,
+                (StatusCode::NOT_FOUND, fmt::not_found_value()),
+                "{tail}"
+            );
+        }
+        let (s, b) = env.get("/servers/io.acme%2Ftool/versions/latest").await;
+        assert_eq!(
+            (s, b["server"]["description"].as_str()),
+            (StatusCode::OK, Some("internal"))
+        );
+        env.teardown().await;
+    }
+
+    #[test]
+    fn owned_names_compare_case_insensitively() {
+        let owned = OwnedNames::from_names(["io.acme/tool"]);
+        assert!(owned.owns("io.Acme/tool"));
+        assert!(owned.owns("IO.ACME/TOOL"));
+        assert!(!owned.owns("io.acme/tools"));
+        assert!(!OwnedNames::default().owns("io.acme/tool"));
     }
 }

@@ -1631,6 +1631,10 @@ the shadowing rule below.
   Virtual while the Remote serves it directly). It reveals that a name exists
   internally, nothing about its versions or content; keep names that must not
   be inferable out of a Virtual that also merges a Remote carrying them.
+  Names compare case-insensitively here, as deny lists and namespace
+  allowlists do: a hosted `io.acme/tool` shadows a Remote's `io.Acme/tool`
+  (and every other spelling of it), so an upstream entry cannot pass for
+  the internal one by letter case.
 - **`/servers/{name}/versions`**: the union of the serving members' servable
   versions, each version once (from the first member that serves it), in
   version-text order; `isLatest` marks the version `latest` answers.
