@@ -20640,6 +20640,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// #5286 with #5282: a cache-only Remote refuses a miss at the upstream
+    /// gate, before anything is sent, so it writes no `UPSTREAM_FETCHED` row:
+    /// the event records upstream contact, and there was none.
+    #[tokio::test]
+    async fn upstream_fetched_audit_records_nothing_for_a_cache_only_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (proxy, repo, dir) =
+            audited_remote(&pool, &server.uri(), UpstreamFetchAuditMode::All).await;
+        crate::services::upstream_mode::save_upstream_mode(
+            &pool,
+            repo.id,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly,
+        )
+        .await
+        .expect("store cache_only");
+
+        let err = proxy
+            .fetch_artifact(&repo, "pkg/missing.json")
+            .await
+            .expect_err("a cache-only miss is refused");
+        assert!(
+            crate::services::upstream_mode::is_cache_only_refusal(&err),
+            "{err:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            tdh::audit_count(&pool, repo.id, "UPSTREAM_FETCHED").await,
+            0,
+            "no upstream contact, so no UPSTREAM_FETCHED row"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        drop_audited_remote(&pool, &repo, &dir).await;
+    }
+
     /// #5286: a cache miss writes exactly one `UPSTREAM_FETCHED` row with the
     /// request's host, path, status and size; the fresh cache hit after it
     /// contacts nothing and writes nothing.
