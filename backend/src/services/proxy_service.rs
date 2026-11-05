@@ -5433,9 +5433,13 @@ impl UpstreamClient {
         request = apply_custom_ua(request, custom_ua.as_deref());
 
         let shown = redact_url_for_diagnostics(url);
-        // Fully qualified so this compiles whether or not the module imports
-        // the plain sender (#5286 replaces that import with the audited one).
-        let response = match crate::services::upstream_tracing::send_upstream(request).await {
+        // #5347: through the audited sender like every other upstream request
+        // `ProxyService` makes, so a cold HEAD's probe is an `UPSTREAM_FETCHED`
+        // row (method `HEAD`, caller `proxy`) when the audit mode asks for one.
+        let response = match self
+            .send(request, Some(repo_id), UpstreamCaller::Proxy)
+            .await
+        {
             Ok(response) => response,
             Err(e) => {
                 tracing::debug!(
@@ -20932,9 +20936,20 @@ mod tests {
         upstream: &str,
         mode: UpstreamFetchAuditMode,
     ) -> (ProxyService, Repository, std::path::PathBuf) {
+        audited_remote_of(pool, upstream, mode, RepositoryFormat::Generic).await
+    }
+
+    /// [`audited_remote`] for a Remote of `format` (its `repositories` row
+    /// too).
+    async fn audited_remote_of(
+        pool: &PgPool,
+        upstream: &str,
+        mode: UpstreamFetchAuditMode,
+        format: RepositoryFormat,
+    ) -> (ProxyService, Repository, std::path::PathBuf) {
         use crate::api::handlers::test_db_helpers as tdh;
         use crate::services::storage_service::FilesystemBackend;
-        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "remote", "generic").await;
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "remote", format.as_key()).await;
         let backend = Arc::new(FilesystemBackend::new(dir.clone()));
         let proxy = ProxyService::new(
             pool.clone(),
@@ -20944,7 +20959,7 @@ mod tests {
         .with_upstream_fetch_audit(mode);
         let mut repo = remote_repo_for(&repo_key, upstream, dir.to_str().unwrap());
         repo.id = repo_id;
-        repo.format = RepositoryFormat::Generic;
+        repo.format = format;
         (proxy, repo, dir)
     }
 
@@ -21060,6 +21075,90 @@ mod tests {
             1,
             "a cache hit sends nothing upstream and must record nothing"
         );
+        server.verify().await;
+        drop_audited_remote(&pool, &repo, &dir).await;
+    }
+
+    /// #5347: the upstream `HEAD` that answers a cold client HEAD (#5322) is
+    /// upstream contact like any other, so with `AUDIT_UPSTREAM_FETCHES=all`
+    /// it records exactly one `UPSTREAM_FETCHED` row, method `HEAD`, caller
+    /// `proxy`. Before, the probe used the plain sender and recorded nothing.
+    /// A HEAD answered from the cache sends nothing and records nothing.
+    #[tokio::test]
+    async fn upstream_fetched_audit_records_a_cold_head_probe_once_5347() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use futures::StreamExt;
+        use wiremock::MockServer;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const FILE: &str = "gpt2/resolve/main/config.json";
+        let body = b"{\"model_type\":\"gpt2\"}".to_vec();
+        let server = MockServer::start().await;
+        tdh::mount_head_and_get_once(&server, &format!("/{FILE}"), &[("etag", "\"c1\"")], &body)
+            .await;
+        let (proxy, repo, dir) = audited_remote_of(
+            &pool,
+            &server.uri(),
+            UpstreamFetchAuditMode::All,
+            RepositoryFormat::Huggingface,
+        )
+        .await;
+        let head_rows = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 \
+                 AND action = 'UPSTREAM_FETCHED' AND details->>'method' = 'HEAD'",
+            )
+            .bind(repo.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count HEAD rows")
+        };
+
+        let cold = proxy
+            .head_artifact_streaming(&repo, FILE)
+            .await
+            .expect("the cold HEAD is answered from the upstream HEAD");
+        assert_eq!(cold.content_length, Some(body.len() as u64));
+        assert_eq!(
+            tdh::audit_count_eventually(&pool, repo.id, "UPSTREAM_FETCHED", 1).await,
+            1
+        );
+        let row = tdh::audit_row_eventually(&pool, repo.id, "UPSTREAM_FETCHED").await;
+        assert_eq!(row.details["method"], "HEAD");
+        assert_eq!(row.details["caller"], "proxy");
+        assert_eq!(row.details["path"], format!("/{FILE}"));
+        assert_eq!(row.details["status"], 200);
+        assert_eq!(row.details["result"], "ok");
+
+        // Fill the cache with the GET, then HEAD again: a cache hit.
+        let fill = proxy
+            .fetch_artifact_streaming(&repo, FILE)
+            .await
+            .expect("the GET fills from upstream");
+        let filled: Vec<u8> = fill
+            .body
+            .map(|chunk| chunk.expect("chunk").to_vec())
+            .concat()
+            .await;
+        assert_eq!(filled, body);
+        tdh::wait_for_cache_commit(&dir, body.len() as u64).await;
+        assert_eq!(
+            tdh::audit_count_eventually(&pool, repo.id, "UPSTREAM_FETCHED", 2).await,
+            2
+        );
+        proxy
+            .head_artifact_streaming(&repo, FILE)
+            .await
+            .expect("the warm HEAD is a cache hit");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            tdh::audit_count(&pool, repo.id, "UPSTREAM_FETCHED").await,
+            2,
+            "a HEAD cache hit sends nothing upstream and must record nothing"
+        );
+        assert_eq!(head_rows().await, 1, "exactly one HEAD probe is recorded");
         server.verify().await;
         drop_audited_remote(&pool, &repo, &dir).await;
     }
