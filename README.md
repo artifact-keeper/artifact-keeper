@@ -156,7 +156,7 @@ flowchart TD
 
 | Format | Ecosystem |
 |--------|-----------|
-| **HuggingFace** | Models, datasets |
+| **HuggingFace** | Hub models (proxy and hosted; not datasets or Spaces) |
 | **ML Model** | Generic ML artifacts |
 
 ### Editor Extensions

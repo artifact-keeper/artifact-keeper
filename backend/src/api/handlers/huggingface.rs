@@ -194,6 +194,116 @@ fn local_repo_commit_sha(model_id: &str, revision: &str) -> String {
     digest[..40].to_string()
 }
 
+/// `true` for a value `huggingface_hub` treats as an already-resolved commit:
+/// exactly 40 lowercase hex characters (its `REGEX_COMMIT_HASH`).
+fn is_commit_hash(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Pick which stored revision of a hosted model a request means (#5280).
+///
+/// `revisions` are the distinct `version`s the repository holds for the model,
+/// newest upload first. `requested` is the revision segment of the request, or
+/// `None` for the revision-less model-info route.
+///
+///   * A revision the repository holds by that literal name wins, so a branch
+///     or tag that happens to be spelled as 40 hex characters still means itself.
+///   * Otherwise a 40-hex value is matched against [`local_repo_commit_sha`] of
+///     each held revision. This is the round trip `snapshot_download` makes: it
+///     reads `sha` from model info and then lists the tree and requests every
+///     file at `/resolve/<sha>/<file>`, so the synthetic commit has to lead back
+///     to the revision it was derived from or every file 404s.
+///   * No revision means the default branch, `main`, as on the Hub; a model
+///     that was never published to `main` falls back to its newest revision so
+///     `model_info(repo_id)` still describes something real.
+///
+/// `None` means the revision does not exist for this model.
+fn pick_local_revision(
+    model_id: &str,
+    revisions: &[String],
+    requested: Option<&str>,
+) -> Option<String> {
+    match requested {
+        Some(requested) => {
+            if revisions.iter().any(|r| r == requested) {
+                return Some(requested.to_string());
+            }
+            if !is_commit_hash(requested) {
+                return None;
+            }
+            revisions
+                .iter()
+                .find(|r| local_repo_commit_sha(model_id, r) == requested)
+                .cloned()
+        }
+        None => revisions
+            .iter()
+            .find(|r| r.as_str() == "main")
+            .or_else(|| revisions.first())
+            .cloned(),
+    }
+}
+
+/// Distinct revisions held for `model_id` in a repository, newest upload first.
+async fn local_model_revisions(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    model_id: &str,
+) -> Result<Vec<String>, Response> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT version FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version IS NOT NULL \
+         GROUP BY version \
+         ORDER BY MAX(created_at) DESC, version",
+    )
+    .bind(repository_id)
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map_err(super::db_err)
+}
+
+/// Format a timestamp the way the Hub does and `huggingface_hub`'s
+/// `parse_datetime` requires: `%Y-%m-%dT%H:%M:%S.%fZ`.
+fn hub_timestamp(ts: chrono::DateTime<chrono::Utc>) -> String {
+    ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// The path of a stored file relative to its model revision, the shape the Hub
+/// reports as `siblings[].rfilename` and tree `path`.
+///
+/// Stored paths are `{model_id}/{revision}/{file}`. The prefix is stripped with
+/// the row's own `name` and `version` so a request that spells the model ID in
+/// another case (model info matches it case-insensitively) still gets the
+/// relative path.
+fn relative_model_path<'a>(path: &'a str, name: &str, version: &str) -> &'a str {
+    path.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.strip_prefix(version))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path)
+}
+
+/// 404 for a revision this repository does not hold, with the
+/// `X-Error-Code: RevisionNotFound` header the Hub sends, which
+/// `huggingface_hub` turns into `RevisionNotFoundError`.
+fn revision_not_found(model_id: &str, revision: &str) -> Response {
+    let mut resp = (
+        StatusCode::NOT_FOUND,
+        format!("Revision not found: {model_id}@{revision}"),
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert("x-error-code", HeaderValue::from_static("RevisionNotFound"));
+    resp
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -294,48 +404,62 @@ async fn list_models(
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
 
-    let artifacts = sqlx::query!(
-        r#"
-        SELECT DISTINCT ON (LOWER(name)) name, version,
-               am.metadata as "metadata?"
-        FROM artifacts a
-        LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
-        WHERE a.repository_id = $1
-          AND a.is_deleted = false
-        ORDER BY LOWER(name), a.created_at DESC
-        "#,
-        repo.id
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT DISTINCT ON (LOWER(a.name)) a.name, a.created_at, am.metadata \
+         FROM artifacts a \
+         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+         ORDER BY LOWER(a.name), a.created_at DESC",
     )
+    .bind(repo.id)
     .fetch_all(&state.db)
     .await
     .map_err(super::db_err)?;
 
-    let models: Vec<serde_json::Value> = artifacts
+    let models = rows
         .iter()
-        .map(|a| {
-            let model_id = a.name.clone();
-            let pipeline_tag = a
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("pipeline_tag"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            serde_json::json!({
-                "modelId": model_id,
-                "lastModified": a.version.clone().unwrap_or_default(),
-                "pipeline_tag": pipeline_tag,
-                "tags": [],
-            })
+        .map(|row| {
+            Ok(list_models_entry(
+                &row.try_get::<String, _>("name").map_err(super::db_err)?,
+                row.try_get("created_at").map_err(super::db_err)?,
+                row.try_get::<Option<serde_json::Value>, _>("metadata")
+                    .map_err(super::db_err)?
+                    .as_ref(),
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, Response>>()?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&models).unwrap()))
         .unwrap())
+}
+
+/// One `list_models` entry. `id` is required by `huggingface_hub`'s
+/// `ModelInfo`, which `HfApi.list_models` builds from every entry, and
+/// `lastModified` must be a Hub timestamp, not a revision name (#5280).
+fn list_models_entry(
+    model_id: &str,
+    last_modified: chrono::DateTime<chrono::Utc>,
+    metadata: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut json = serde_json::json!({
+        "id": model_id,
+        "modelId": model_id,
+        "lastModified": hub_timestamp(last_modified),
+        "tags": [],
+    });
+    if let Some(tag) = metadata
+        .and_then(|m| m.get("pipeline_tag"))
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())
+    {
+        json["pipeline_tag"] = tag.into();
+    }
+    json
 }
 
 // ---------------------------------------------------------------------------
@@ -406,63 +530,127 @@ async fn model_info_impl(
         }
     };
 
-    let siblings = sqlx::query!(
-        r#"
-        SELECT path, size_bytes
-        FROM artifacts
-        WHERE repository_id = $1
-          AND is_deleted = false
-          AND LOWER(name) = LOWER($2)
-        ORDER BY path
-        "#,
-        repo.id,
-        model_id
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(super::db_err)?;
+    // Which stored revision this request means: a branch/tag by name, the
+    // synthetic commit `sha` this route itself handed out, or (no revision)
+    // `main` (#5280). A revision the repository does not hold is the Hub's
+    // RevisionNotFound, except on a Remote repository holding promoted copies
+    // of some revisions, where upstream may still have it.
+    let revisions = local_model_revisions(&state.db, repo.id, &model_id).await?;
+    let Some(effective) = pick_local_revision(&model_id, &revisions, revision.as_deref()) else {
+        if let Some(resp) = proxy_model_info(&state, &repo, &model_id, revision.as_deref()).await? {
+            return Ok(resp);
+        }
+        return Err(revision_not_found(
+            &model_id,
+            revision.as_deref().unwrap_or("main"),
+        ));
+    };
 
-    let files: Vec<serde_json::Value> = siblings
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "rfilename": s.path,
-                "size": s.size_bytes,
-            })
-        })
-        .collect();
-
+    let files = hosted_revision_files(&state.db, repo.id, &model_id, &effective).await?;
     let pipeline_tag = artifact
         .metadata
         .as_ref()
         .and_then(|m| m.get("pipeline_tag"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|v| v.as_str());
 
-    // `sha` must be the SAME value the resolve route reports in
-    // `X-Repo-Commit` for this `(model_id, revision)`, or `snapshot_download`
-    // computes its snapshot directory from one value and files the downloaded
-    // blobs under the other (#2915 - see `local_repo_commit_sha`). It used to
-    // be this artifact's `checksum_sha256`, which is per-FILE and 64 hex
-    // characters: it disagreed with every sibling in the same revision and was
-    // never a commit identifier in the first place. Per-file content identity
-    // is still exposed - as the resolve ETag, where `huggingface_hub` looks for
-    // it.
-    let commit_revision = revision
-        .as_deref()
-        .or(artifact.version.as_deref())
-        .unwrap_or("main");
-    let json = serde_json::json!({
+    Ok(super::json_response(&hosted_model_info_json(
+        &model_id,
+        &effective,
+        &files,
+        pipeline_tag,
+    )))
+}
+
+/// One stored file of a hosted model revision.
+struct HostedFile {
+    /// Path relative to the model revision (`config.json`, `onnx/model.onnx`).
+    rfilename: String,
+    size_bytes: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Every live file of `model_id` at `revision` in a repository, by path.
+async fn hosted_revision_files(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    model_id: &str,
+    revision: &str,
+) -> Result<Vec<HostedFile>, Response> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT path, name, version, size_bytes, created_at \
+         FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND LOWER(name) = LOWER($2) \
+           AND version = $3 \
+         ORDER BY path",
+    )
+    .bind(repository_id)
+    .bind(model_id)
+    .bind(revision)
+    .fetch_all(db)
+    .await
+    .map_err(super::db_err)?;
+
+    rows.iter()
+        .map(|row| {
+            let path: String = row.try_get("path").map_err(super::db_err)?;
+            let name: String = row.try_get("name").map_err(super::db_err)?;
+            let version: String = row.try_get("version").map_err(super::db_err)?;
+            Ok(HostedFile {
+                rfilename: relative_model_path(&path, &name, &version).to_string(),
+                size_bytes: row.try_get("size_bytes").map_err(super::db_err)?,
+                created_at: row.try_get("created_at").map_err(super::db_err)?,
+            })
+        })
+        .collect()
+}
+
+/// The model-info document for a hosted model revision, in the shape the Hub
+/// serves and `huggingface_hub`'s `ModelInfo` parses (#5280).
+///
+///   * `id` is required: `ModelInfo.__init__` does `kwargs.pop("id")`, so a
+///     document without it fails `model_info()` and `snapshot_download` with a
+///     `KeyError`. `modelId` is the legacy alias the Hub still sends.
+///   * `siblings[].rfilename` is the path inside the repository
+///     (`config.json`), never the stored `{model}/{revision}/{file}` key: the
+///     client requests `/resolve/<sha>/<rfilename>` for each sibling.
+///   * `sha` is the same value the resolve route reports in `X-Repo-Commit` for
+///     this revision, or `snapshot_download` computes its snapshot directory
+///     from one value and files the downloaded blobs under the other (#2915,
+///     see [`local_repo_commit_sha`]).
+///   * `lastModified` / `createdAt` are timestamps in the Hub's
+///     `%Y-%m-%dT%H:%M:%S.%fZ` form, which `parse_datetime` insists on.
+fn hosted_model_info_json(
+    model_id: &str,
+    revision: &str,
+    files: &[HostedFile],
+    pipeline_tag: Option<&str>,
+) -> serde_json::Value {
+    let siblings: Vec<serde_json::Value> = files
+        .iter()
+        .map(|f| serde_json::json!({ "rfilename": f.rfilename, "size": f.size_bytes }))
+        .collect();
+    let mut json = serde_json::json!({
+        "id": model_id,
         "modelId": model_id,
-        "sha": local_repo_commit_sha(&model_id, commit_revision),
-        "lastModified": artifact.version.clone().unwrap_or_default(),
-        "pipeline_tag": pipeline_tag,
+        "sha": local_repo_commit_sha(model_id, revision),
+        "disabled": false,
+        "gated": false,
         "tags": [],
-        "siblings": files,
+        "siblings": siblings,
     });
-
-    Ok(super::json_response(&json))
+    if let Some(last) = files.iter().map(|f| f.created_at).max() {
+        json["lastModified"] = hub_timestamp(last).into();
+    }
+    if let Some(first) = files.iter().map(|f| f.created_at).min() {
+        json["createdAt"] = hub_timestamp(first).into();
+    }
+    if let Some(tag) = pipeline_tag.filter(|t| !t.is_empty()) {
+        json["pipeline_tag"] = tag.into();
+    }
+    json
 }
 
 /// Proxy the upstream Hugging Face model-info JSON for a Remote repo.
@@ -945,6 +1133,32 @@ async fn download_file_namespaced(
     .await
 }
 
+/// The stored file at `artifact_path`, with what the resolve route serves it by.
+///
+/// Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
+/// alongside the storage key in a single round trip; this is the same
+/// runtime-query + `try_get` shape
+/// `proxy_helpers::find_artifact_by_name_lowercase` uses. The checksum feeds
+/// the resolve ETag (#2915).
+async fn find_stored_file(
+    db: &PgPool,
+    repository_id: uuid::Uuid,
+    artifact_path: &str,
+) -> Result<Option<sqlx::postgres::PgRow>, Response> {
+    sqlx::query(
+        "SELECT id, storage_key, checksum_sha256 FROM artifacts \
+         WHERE repository_id = $1 \
+           AND is_deleted = false \
+           AND path = $2 \
+         LIMIT 1",
+    )
+    .bind(repository_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)
+}
+
 async fn download_file_impl(
     state: SharedState,
     auth: Option<crate::api::middleware::auth::AuthExtension>,
@@ -958,31 +1172,42 @@ async fn download_file_impl(
     validate_model_coordinates(&model_id, Some(&revision))?;
 
     let filename = filename.trim_start_matches('/');
-    let artifact_path = format!("{}/{}/{}", model_id, revision, filename);
+    let mut artifact_path = format!("{}/{}/{}", model_id, revision, filename);
 
     // GHSA-6wjw-gcvx-3q58: same reject-at-ingest rule as the upload path, so
     // read and write can never diverge on what they accept (#2915).
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
-    // Runtime query rather than `sqlx::query!` so `checksum_sha256` can be read
-    // alongside the storage key in a single round trip; this is the same
-    // runtime-query + `try_get` shape
-    // `proxy_helpers::find_artifact_by_name_lowercase` uses. The checksum feeds
-    // the resolve ETag below (#2915).
     use sqlx::Row;
-    let artifact = sqlx::query(
-        "SELECT id, storage_key, checksum_sha256 FROM artifacts \
-         WHERE repository_id = $1 \
-           AND is_deleted = false \
-           AND path = $2 \
-         LIMIT 1",
-    )
-    .bind(repo.id)
-    .bind(&artifact_path)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(super::db_err)?;
+    let mut artifact = find_stored_file(&state.db, repo.id, &artifact_path).await?;
+
+    // `snapshot_download` (and `hf_hub_download` once a ref is cached) asks for
+    // every file at the commit model info reported, `/resolve/<sha>/<file>`.
+    // For a hosted model that `sha` is synthetic, so map it back to the
+    // revision it was derived from (#5280). Only a 40-hex revision that no
+    // stored path matched takes this lookup, and only an exact synthetic match
+    // rewrites it, so a Remote repository's real upstream commits fall through
+    // to the proxy unchanged. A Virtual repository serves no model info, so it
+    // never hands out a synthetic commit to map.
+    let mut revision = revision;
+    if artifact.is_none()
+        && is_commit_hash(&revision)
+        && proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+            != proxy_helpers::RemoteOrVirtualAction::Virtual
+    {
+        let revisions = local_model_revisions(&state.db, repo.id, &model_id).await?;
+        if let Some(local) = pick_local_revision(&model_id, &revisions, Some(&revision))
+            .filter(|local| *local != revision)
+        {
+            let local_path = format!("{model_id}/{local}/{filename}");
+            artifact = find_stored_file(&state.db, repo.id, &local_path).await?;
+            if artifact.is_some() {
+                revision = local;
+                artifact_path = local_path;
+            }
+        }
+    }
 
     let Some(artifact) = artifact else {
         // The revision is re-encoded here: axum handed us the decoded value, and
@@ -1271,6 +1496,14 @@ async fn list_files_impl(
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     validate_model_coordinates(&model_id, Some(&revision))?;
 
+    // `snapshot_download` lists the tree at the commit model info reported, so
+    // a hosted model's synthetic `sha` must lead back to its revision here as
+    // it does on the resolve route (#5280). A revision the repository does
+    // not hold is looked up literally, as before.
+    let revisions = local_model_revisions(&state.db, repo.id, &model_id).await?;
+    let local_revision = pick_local_revision(&model_id, &revisions, Some(&revision))
+        .unwrap_or_else(|| revision.clone());
+
     // Two prefixes, deliberately: the LIKE pattern is escaped so `%`/`_`/`\` in
     // a model ID or revision cannot widen the match, while the prefix stripped
     // off each returned path must be the LITERAL one. Using the escaped form for
@@ -1279,8 +1512,8 @@ async fn list_files_impl(
     // `strip_prefix` could not match - so `unwrap_or` fell through and the
     // endpoint reported every entry under its full stored path instead of the
     // path relative to the revision.
-    let like_prefix = super::escape_path_prefix(&[&model_id, &revision]);
-    let path_prefix = format!("{}/{}/", model_id, revision);
+    let like_prefix = super::escape_path_prefix(&[&model_id, &local_revision]);
+    let path_prefix = format!("{}/{}/", model_id, local_revision);
 
     let artifacts = sqlx::query!(
         r#"
@@ -3377,6 +3610,323 @@ mod tests {
 
         assert_eq!(json[0]["type"], "file");
         assert_eq!(json[0]["path"], "config.json");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5280: `snapshot_download` against a hosted repository.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod hosted_snapshot_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    fn at(minute: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 4, 12, minute, 0)
+            .unwrap()
+    }
+
+    fn file(rfilename: &str, minute: u32) -> HostedFile {
+        HostedFile {
+            rfilename: rfilename.to_string(),
+            size_bytes: 7,
+            created_at: at(minute),
+        }
+    }
+
+    #[test]
+    fn commit_hash_is_exactly_40_lowercase_hex() {
+        assert!(is_commit_hash(&"a1".repeat(20)));
+        assert!(!is_commit_hash(&"A1".repeat(20)));
+        assert!(!is_commit_hash(&"a1".repeat(32)));
+        assert!(!is_commit_hash("main"));
+        assert!(!is_commit_hash(&"g1".repeat(20)));
+    }
+
+    #[test]
+    fn pick_local_revision_maps_names_commits_and_the_default_branch() {
+        let model = "acme/tiny";
+        let held = vec!["v1".to_string(), "main".to_string()];
+
+        // A held branch or tag means itself.
+        assert_eq!(
+            pick_local_revision(model, &held, Some("v1")).as_deref(),
+            Some("v1")
+        );
+        // The synthetic commit model info reported leads back to its revision.
+        let v1_sha = local_repo_commit_sha(model, "v1");
+        assert_eq!(
+            pick_local_revision(model, &held, Some(&v1_sha)).as_deref(),
+            Some("v1")
+        );
+        let main_sha = local_repo_commit_sha(model, "main");
+        assert_eq!(
+            pick_local_revision(model, &held, Some(&main_sha)).as_deref(),
+            Some("main")
+        );
+        // No revision means `main`, even when it is not the newest upload.
+        assert_eq!(
+            pick_local_revision(model, &held, None).as_deref(),
+            Some("main")
+        );
+        // Without a `main`, the newest revision.
+        assert_eq!(
+            pick_local_revision(model, &["v2".to_string(), "v1".to_string()], None).as_deref(),
+            Some("v2")
+        );
+        // Unknown names and commits are not found; another model's commit is
+        // not this model's.
+        assert_eq!(pick_local_revision(model, &held, Some("v9")), None);
+        assert_eq!(
+            pick_local_revision(model, &held, Some(&"0".repeat(40))),
+            None
+        );
+        let other = local_repo_commit_sha("acme/other", "v1");
+        assert_eq!(pick_local_revision(model, &held, Some(&other)), None);
+        assert_eq!(pick_local_revision(model, &[], None), None);
+        // A branch literally named like a commit still means itself.
+        let hexy = "c".repeat(40);
+        assert_eq!(
+            pick_local_revision(model, std::slice::from_ref(&hexy), Some(&hexy)).as_deref(),
+            Some(hexy.as_str())
+        );
+    }
+
+    #[test]
+    fn relative_model_path_strips_the_rows_own_prefix() {
+        assert_eq!(
+            relative_model_path("acme/tiny/v1/onnx/model.onnx", "acme/tiny", "v1"),
+            "onnx/model.onnx"
+        );
+        assert_eq!(
+            relative_model_path("gpt2/main/config.json", "gpt2", "main"),
+            "config.json"
+        );
+        // A path outside the expected layout is reported as stored.
+        assert_eq!(
+            relative_model_path("elsewhere/config.json", "gpt2", "main"),
+            "elsewhere/config.json"
+        );
+        assert_eq!(
+            relative_model_path("gpt2/mainx", "gpt2", "main"),
+            "gpt2/mainx"
+        );
+    }
+
+    /// The document `huggingface_hub.ModelInfo(**json)` parses: `id` present,
+    /// `rfilename` relative to the repo, `sha` the 40-hex commit the resolve
+    /// route reports, timestamps in `%Y-%m-%dT%H:%M:%S.%fZ`.
+    #[test]
+    fn hosted_model_info_matches_the_hub_shape() {
+        let files = [file("config.json", 1), file("onnx/model.onnx", 3)];
+        let json = hosted_model_info_json("acme/tiny", "v1", &files, Some("text-classification"));
+
+        assert_eq!(json["id"], "acme/tiny");
+        assert_eq!(json["modelId"], "acme/tiny");
+        assert_eq!(json["sha"], local_repo_commit_sha("acme/tiny", "v1"));
+        assert_eq!(json["siblings"][0]["rfilename"], "config.json");
+        assert_eq!(json["siblings"][1]["rfilename"], "onnx/model.onnx");
+        assert_eq!(json["siblings"][1]["size"], 7);
+        assert_eq!(json["lastModified"], "2026-11-04T12:03:00.000Z");
+        assert_eq!(json["createdAt"], "2026-11-04T12:01:00.000Z");
+        assert_eq!(json["pipeline_tag"], "text-classification");
+        assert_eq!(json["gated"], false);
+        for key in ["lastModified", "createdAt"] {
+            chrono::NaiveDateTime::parse_from_str(
+                json[key].as_str().unwrap(),
+                "%Y-%m-%dT%H:%M:%S%.fZ",
+            )
+            .unwrap_or_else(|e| panic!("{key} must parse as a Hub timestamp: {e}"));
+        }
+
+        let bare = hosted_model_info_json("gpt2", "main", &[], None);
+        assert!(bare.get("pipeline_tag").is_none());
+        assert!(bare.get("lastModified").is_none());
+        assert_eq!(bare["siblings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_models_entry_carries_id_and_a_timestamp() {
+        let meta = serde_json::json!({"pipeline_tag": "fill-mask"});
+        let json = list_models_entry("acme/tiny", at(5), Some(&meta));
+        assert_eq!(json["id"], "acme/tiny");
+        assert_eq!(json["modelId"], "acme/tiny");
+        assert_eq!(json["lastModified"], "2026-11-04T12:05:00.000Z");
+        assert_eq!(json["pipeline_tag"], "fill-mask");
+        assert!(list_models_entry("gpt2", at(0), None)
+            .get("pipeline_tag")
+            .is_none());
+    }
+
+    #[test]
+    fn revision_not_found_carries_the_hub_error_code() {
+        let resp = revision_not_found("acme/tiny", "v9");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.headers()["x-error-code"], "RevisionNotFound");
+    }
+
+    async fn upload(fx: &tdh::Fixture, model: &str, revision: &str, filename: &str, body: &str) {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/api/models/{model}/upload/{revision}",
+                fx.repo_key
+            ))
+            .header("x-filename", filename)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, resp) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        assert!(
+            status.is_success(),
+            "upload {filename} failed: {status} {}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    async fn get_json(fx: &tdh::Fixture, uri: String) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(fx.router_anon(super::router()), tdh::get(uri)).await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn sha256_hex(body: &str) -> String {
+        format!("{:x}", Sha256::digest(body.as_bytes()))
+    }
+
+    /// The request sequence `snapshot_download(repo_id, revision="v1")` makes,
+    /// against a model published with the hosted upload route: model info at
+    /// the revision, the tree at the `sha` it returned, then a HEAD and a GET
+    /// of every file at `/resolve/<sha>/<rfilename>`.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn snapshot_download_sequence_resolves_the_synthetic_commit() {
+        let Some(fx) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let model = "acme/tiny-model";
+        let files = [
+            ("config.json", "{\"hidden_size\": 8}"),
+            ("onnx/model.onnx", "onnx-bytes"),
+        ];
+        for (name, body) in files {
+            upload(&fx, model, "v1", name, body).await;
+        }
+        upload(&fx, model, "main", "README.md", "# tiny").await;
+
+        let (status, info) = get_json(
+            &fx,
+            format!("/{}/api/models/{model}/revision/v1", fx.repo_key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["id"], model);
+        let sha = info["sha"].as_str().expect("sha").to_string();
+        assert_eq!(sha, local_repo_commit_sha(model, "v1"));
+        let rfilenames: Vec<&str> = info["siblings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["rfilename"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rfilenames,
+            ["config.json", "onnx/model.onnx"],
+            "siblings must be this revision's files, relative to the repo"
+        );
+
+        let (status, tree) = get_json(
+            &fx,
+            format!(
+                "/{}/api/models/{model}/tree/{sha}?recursive=true",
+                fx.repo_key
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let paths: Vec<&str> = tree
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["config.json", "onnx/model.onnx"]);
+        assert_eq!(tree[0]["type"], "file");
+
+        for (name, body) in files {
+            let uri = format!("/{}/{model}/resolve/{sha}/{name}", fx.repo_key);
+            let head = axum::http::Request::builder()
+                .method("HEAD")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap();
+            let (status, _, headers) =
+                tdh::send_with_headers(fx.router_anon(super::router()), head).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {uri}");
+            assert_eq!(headers[UPSTREAM_COMMIT_HEADER], sha.as_str());
+            assert_eq!(
+                headers[ETAG].to_str().unwrap(),
+                format!("\"{}\"", sha256_hex(body))
+            );
+            assert_eq!(
+                headers[axum::http::header::CONTENT_LENGTH],
+                body.len().to_string().as_str()
+            );
+
+            let (status, got, headers) =
+                tdh::send_with_headers(fx.router_anon(super::router()), tdh::get(uri.clone()))
+                    .await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}");
+            assert_eq!(&got[..], body.as_bytes());
+            assert_eq!(headers[UPSTREAM_COMMIT_HEADER], sha.as_str());
+        }
+
+        // `main` gets its own commit and only its own files; a revision-less
+        // model info is `main`, as on the Hub.
+        let main_sha = local_repo_commit_sha(model, "main");
+        let (status, info) = get_json(&fx, format!("/{}/api/models/{model}", fx.repo_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(info["sha"], main_sha.as_str());
+        assert_eq!(
+            info["siblings"],
+            serde_json::json!([{"rfilename": "README.md", "size": 6}])
+        );
+        let (status, got) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!(
+                "/{}/{model}/resolve/{main_sha}/README.md",
+                fx.repo_key
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&got[..], b"# tiny");
+
+        // v1's commit does not serve main's file, and an unknown revision is
+        // the Hub's RevisionNotFound.
+        let (status, _) = tdh::send(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/{model}/resolve/{sha}/README.md", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, headers) = tdh::send_with_headers(
+            fx.router_anon(super::router()),
+            tdh::get(format!("/{}/api/models/{model}/revision/v9", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers["x-error-code"], "RevisionNotFound");
+
+        let (status, listed) = get_json(&fx, format!("/{}/api/models", fx.repo_key)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed[0]["id"], model);
+
+        fx.teardown().await;
     }
 }
 
