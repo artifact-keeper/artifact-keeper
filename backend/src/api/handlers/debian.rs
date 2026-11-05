@@ -62,7 +62,7 @@ use crate::services::signing_service::{
     signer_set_fingerprint, SigningService,
 };
 
-const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
+pub(crate) const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
 // ---------------------------------------------------------------------------
 // Router
@@ -6156,7 +6156,7 @@ mod tests {
 
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
-mod upload_db_tests {
+pub(crate) mod upload_db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
 
@@ -6199,7 +6199,7 @@ mod upload_db_tests {
         gzip_compress(&tar_bytes).expect("gzip data.tar")
     }
 
-    pub(super) fn minimal_deb(
+    pub(crate) fn minimal_deb(
         package: &str,
         version: &str,
         architecture: &str,

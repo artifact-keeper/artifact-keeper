@@ -6551,7 +6551,7 @@ async fn upload(
 /// [`Completeness::NotRead`] analysis carrying the reason, because "we could
 /// not read it" is a result the user is entitled to see, and because analysis
 /// must not be able to fail an otherwise-valid upload.
-async fn analyze_pypi_upload(
+pub(crate) async fn analyze_pypi_upload(
     staged_path: std::path::PathBuf,
     filename: String,
 ) -> crate::services::pypi_analysis::PypiAnalysis {
@@ -6580,7 +6580,7 @@ async fn analyze_pypi_upload(
 /// so a failure here must not fail the publish. But a distribution with
 /// nothing in it still records a row, because "we looked and there was
 /// nothing" and "we never looked" have to stay distinguishable (#4047).
-async fn record_pypi_package_analysis(
+pub(crate) async fn record_pypi_package_analysis(
     state: &SharedState,
     artifact_id: uuid::Uuid,
     analysis: crate::services::pypi_analysis::PypiAnalysis,
@@ -6709,7 +6709,7 @@ fn should_enqueue_pypi_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
 }
 
-fn build_pypi_package_catalog_metadata(
+pub(crate) fn build_pypi_package_catalog_metadata(
     filename: &str,
     requires_python: Option<&str>,
 ) -> serde_json::Value {
@@ -6724,7 +6724,7 @@ fn build_pypi_package_catalog_metadata(
 }
 
 /// Determine the Content-Type for a PyPI filename based on its extension.
-fn pypi_content_type(filename: &str) -> &'static str {
+pub(crate) fn pypi_content_type(filename: &str) -> &'static str {
     if filename.ends_with(".whl") || filename.ends_with(".zip") {
         "application/zip"
     } else if filename.ends_with(".tar.gz") {
@@ -6787,7 +6787,7 @@ fn html_escape(s: &str) -> String {
 /// Most trove classifiers kept per distribution (see [`build_upload_pkg_info`]).
 const PYPI_MAX_STORED_CLASSIFIERS: usize = 500;
 
-fn build_upload_pkg_info(
+pub(crate) fn build_upload_pkg_info(
     extracted: Option<PkgInfo>,
     requires_python: Option<&str>,
     summary: Option<&str>,
