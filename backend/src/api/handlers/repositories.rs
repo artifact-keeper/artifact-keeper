@@ -10465,7 +10465,9 @@ impl GenericStagedBody {
 /// Where a generic upload's body is staged (#3916): on the repository's own
 /// object-storage backend when it streams natively ([`stages_on_backend`]),
 /// unless a downstream consumer reads the body as a local file -- the RPM
-/// header parse (#3801) or a WASM format plugin (#2517 plugin-input decision).
+/// header parse (#3801), a format's native finalize that reads a file (a
+/// Debian, PyPI, Incus or RPM package, #5254) or a WASM format plugin (#2517
+/// plugin-input decision).
 struct GenericStagingPlan {
     format: crate::models::repository::RepositoryFormat,
     location: Option<crate::storage::StorageLocation>,
@@ -10493,16 +10495,13 @@ impl GenericStagingPlan {
 
     /// The backend to stage a body bound for `path` on, or `None` for local
     /// scratch. A `path` not yet known (a multipart form can name it after the
-    /// file) is treated as possibly an `.rpm`, so an RPM repository spools.
+    /// file) is treated as possibly a package the finalize reads as a file, so
+    /// an RPM, Debian, PyPI or Incus repository spools.
     fn backend_for(&self, path: Option<&str>) -> Option<&crate::storage::StorageLocation> {
-        let rpm_parse = match path {
-            Some(path) => super::upload::rpm_header_metadata_eligible(&self.format, path),
-            None => matches!(
-                self.format,
-                crate::models::repository::RepositoryFormat::Rpm
-            ),
-        };
-        self.location.as_ref().filter(|_| !rpm_parse)
+        let local_parse = path
+            .is_some_and(|path| super::upload::rpm_header_metadata_eligible(&self.format, path))
+            || super::upload::format_finalize::needs_local_file(&self.format, path);
+        self.location.as_ref().filter(|_| !local_parse)
     }
 
     fn on_backend(&self, path: Option<&str>) -> bool {
@@ -10730,6 +10729,17 @@ async fn persist_generic_staged_upload(
     // them with the target row locked in the publishing transaction.
     let precondition = parse_write_precondition(headers).map_err(|e| e.into_response())?;
 
+    // A TRUSTED replication push (admin or service account) is stored as the
+    // source sent it, with nothing derived from the bytes: a source row with
+    // format metadata replicates through the chunked flow, which carries it,
+    // so one arriving here had none. The replication header alone is
+    // client-set, so an untrusted caller gets the full parse.
+    let replication_trusted = replication_exemption_trusted(
+        is_replication_request(headers),
+        auth.is_admin,
+        auth.is_service_account,
+    );
+
     // #3801: an `.rpm` pushed into an RPM repository through this generic
     // endpoint gets the same header parse as the native and chunked paths —
     // on the blocking pool, BEFORE anything is stored — so a header over the
@@ -10739,11 +10749,8 @@ async fn persist_generic_staged_upload(
     // replication push (admin or service account, `replication_exemption_
     // trusted`) skips it: the replication header alone is client-set.
     let rpm_metadata = if super::upload::rpm_header_metadata_eligible(&repo.format, &path)
-        && !replication_exemption_trusted(
-            is_replication_request(headers),
-            auth.is_admin,
-            auth.is_service_account,
-        ) {
+        && !replication_trusted
+    {
         // The #3801 gate must not fail open: a `.rpm` that reached here staged
         // on the backend means `GenericStagingPlan` disagreed with this check,
         // which is a server bug, not a reason to skip the parse.
@@ -10780,9 +10787,11 @@ async fn persist_generic_staged_upload(
         .await
         .map_err(|e| e.into_response())?;
     let mut wasm_metadata = None;
+    let mut wasm_format = false;
 
     if let (Some(ref fk), Some(ref registry)) = (&format_key, &state.plugin_registry) {
         if registry.has_format(fk).await {
+            wasm_format = true;
             // WASM-PLUGIN-INPUT (#2517 product decision): format plugins receive
             // the whole artifact body by value across the WASM ABI. A repo with a
             // registered WASM format handler therefore still materialises the
@@ -10823,9 +10832,32 @@ async fn persist_generic_staged_upload(
         }
     }
 
-    // Use WASM-extracted metadata if available, otherwise try to derive
-    // name and version from the path segments (e.g. "pkg/v1/file.txt").
-    let (name, version) = if let Some(ref meta) = wasm_metadata {
+    // #5254: a package at its format's native layout path gets the native
+    // route's parse, BEFORE anything is stored, so a package that route
+    // refuses is refused here too and nothing is left behind. A WASM format
+    // plugin owns its repository's metadata, and a trusted replication push
+    // is stored as sent (above), so neither runs it.
+    let native = if wasm_format || replication_trusted {
+        None
+    } else {
+        match stage_generic_native_finalize(state, repo, &path, &staged).await {
+            Ok(native) => native,
+            Err(rejection) => {
+                staged.discard().await;
+                return Err(rejection);
+            }
+        }
+    };
+
+    // The native route's coordinates for a natively finalized package; else
+    // WASM-extracted metadata if available, otherwise try to derive name and
+    // version from the path segments (e.g. "pkg/v1/file.txt").
+    let (name, version) = if let Some(native) = &native {
+        (
+            native.target.name.clone(),
+            Some(native.target.version.clone()),
+        )
+    } else if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
         derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
@@ -10852,15 +10884,23 @@ async fn persist_generic_staged_upload(
 
     // Content-Type resolution priority:
     //   1. WASM plugin metadata (format-aware)
-    //   2. the request's declared Content-Type header (honour the client)
+    //   2. the request's declared Content-Type header (honour the client),
+    //      unless a natively finalized package declares none beyond the
+    //      generic `application/octet-stream`, when it takes the type its
+    //      native route stores (as a chunked completion does, #1846)
     //   3. mime_guess from the path extension
     let declared_content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
+    let native_content_type = native
+        .as_ref()
+        .and_then(|_| super::upload::format_finalize::native_content_type(&repo.format, &path));
     let content_type = wasm_metadata
         .as_ref()
         .map(|m| m.content_type.clone())
-        .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
+        .unwrap_or_else(|| {
+            resolve_native_upload_content_type(declared_content_type, &path, native_content_type)
+        });
 
     // No pre-cleanup here: this generic upload endpoint persists through
     // `artifact_service::upload_stream_with_sync_options`, whose
@@ -10895,7 +10935,24 @@ async fn persist_generic_staged_upload(
     // whether or not the upload succeeded.
     staged.discard().await;
     let artifact = artifact.map_err(|e| e.into_response())?;
-    if let Some(metadata) = &rpm_metadata {
+    let context = super::upload::format_finalize::FinalizeContext {
+        repository_id: repo.id,
+        repository_key: &key,
+        artifact_path: &artifact.path,
+        size_bytes: artifact.size_bytes,
+        checksum_sha256: &artifact.checksum_sha256,
+    };
+    if let Some(native) = native {
+        record_generic_native_finalize(
+            state,
+            &artifact_service,
+            &context,
+            artifact.id,
+            native,
+            rpm_metadata.as_ref(),
+        )
+        .await;
+    } else if let Some(metadata) = &rpm_metadata {
         if let Err(e) =
             super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
         {
@@ -10960,6 +11017,148 @@ async fn persist_generic_staged_upload(
         }),
     )
         .into_response())
+}
+
+/// A generic upload's native finalize (#5254): the coordinates the format's
+/// native route writes for the path, and what its parser read from the bytes.
+struct GenericNativeFinalize {
+    target: super::upload::format_finalize::NativeTarget,
+    staged: super::upload::format_finalize::StagedNativeFinalize,
+}
+
+/// Run the format-native finalize the chunked completion runs
+/// (`format_finalize`) over a single generic upload's staged body, before it
+/// is stored. `Ok(None)` when the path is not a package the format's native
+/// route indexes (the upload keeps the generic behaviour). A package that
+/// route refuses -- a control file, `package.json` or wheel `METADATA` that
+/// disagrees with the path -- is refused with 400, as the native route and the
+/// chunked completion refuse it; an unreadable package that route stores
+/// unindexed (an `.apk` with no control segment) is stored the same way.
+///
+/// The body is never buffered whole: a parser that reads a stream gets the
+/// staged file or staging object as a stream, one that seeks gets the staged
+/// file ([`GenericStagingPlan`] spools those uploads locally; a backend-staged
+/// body is downloaded to a temporary file only if it got there anyway).
+#[allow(clippy::result_large_err)]
+async fn stage_generic_native_finalize(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+    staged: &GenericStagedBody,
+) -> std::result::Result<Option<GenericNativeFinalize>, Response> {
+    use super::upload::format_finalize::{self, FinalizeInput, FinalizeSource};
+    let Some(target) = format_finalize::native_target(&repo.format, path) else {
+        return Ok(None);
+    };
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    let mut local = None;
+    let source = match (target.input, staged) {
+        (FinalizeInput::PathOnly, _) => FinalizeSource::None,
+        (FinalizeInput::Stream, GenericStagedBody::Local(staged)) => {
+            FinalizeSource::File(staged.path())
+        }
+        (FinalizeInput::Stream, GenericStagedBody::Backend(staged)) => FinalizeSource::Stream(
+            storage
+                .get_stream(staged.key())
+                .await
+                .map_err(|e| e.into_response())?,
+        ),
+        (FinalizeInput::LocalFile, _) => {
+            let dir = super::incus::staging_root(&state.config.storage_path);
+            if matches!(staged, GenericStagedBody::Backend(_)) {
+                tokio::fs::create_dir_all(&dir)
+                    .await
+                    .map_err(|e| proxy_helpers::spool_error("Staging directory", &e))?;
+            }
+            let file = local.insert(staged.materialize(storage.as_ref(), Some(&dir)).await?);
+            FinalizeSource::File(file.path())
+        }
+    };
+    let staged_native = format_finalize::stage(&repo.format, path, &target, source)
+        .await
+        .map_err(|reason| AppError::Validation(reason).into_response())?;
+    drop(local);
+    Ok(Some(GenericNativeFinalize {
+        target: format_finalize::resolved_target(target, &staged_native),
+        staged: staged_native,
+    }))
+}
+
+/// Record a natively finalized generic upload's format rows against its
+/// committed artifact (#5254): the `artifact_metadata` document, then the
+/// catalog entry, install-script analysis and index cache invalidation the
+/// native route performs. The artifact is already committed, so a failure is
+/// logged rather than failing the upload, as the RPM metadata write on this
+/// path always was.
+async fn record_generic_native_finalize(
+    state: &SharedState,
+    artifact_service: &ArtifactService,
+    context: &super::upload::format_finalize::FinalizeContext<'_>,
+    artifact_id: Uuid,
+    native: GenericNativeFinalize,
+    rpm_metadata: Option<&serde_json::Value>,
+) {
+    use super::upload::format_finalize;
+    let GenericNativeFinalize { target, staged } = native;
+    match format_finalize::metadata_document(&staged, &target, context, rpm_metadata) {
+        Ok(Some(document)) => {
+            let written = if document.format == "rpm" {
+                super::rpm::record_rpm_metadata(
+                    &state.db,
+                    artifact_id,
+                    context.repository_id,
+                    &document.metadata,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            } else {
+                artifact_service
+                    .set_metadata(
+                        artifact_id,
+                        document.format,
+                        document.metadata,
+                        document.properties,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
+            if let Err(e) = written {
+                tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be recorded");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(artifact_id = %artifact_id, error = %e, "format metadata could not be derived");
+        }
+    }
+    if let Err(e) =
+        format_finalize::record(state, context, artifact_id, &target, staged, rpm_metadata).await
+    {
+        tracing::warn!(artifact_id = %artifact_id, error = %e, "format records could not be written");
+    }
+}
+
+/// [`resolve_upload_content_type`] for a natively finalized package: a
+/// request that declares no type, or only the generic
+/// `application/octet-stream`, takes `native` (the type the format's native
+/// route stores) instead of a guess from the extension.
+fn resolve_native_upload_content_type(
+    declared: Option<&str>,
+    path: &str,
+    native: Option<&str>,
+) -> String {
+    let undeclared = declared.is_none_or(|raw| {
+        let base = raw.split(';').next().unwrap_or(raw).trim();
+        base.is_empty() || base.eq_ignore_ascii_case(upload_service::DEFAULT_CONTENT_TYPE)
+    });
+    match native {
+        Some(native) if undeclared => native.to_string(),
+        _ => resolve_upload_content_type(declared, path),
+    }
 }
 
 /// Resolve the Content-Type for a generic artifact upload.
@@ -21462,6 +21661,61 @@ mod tests {
         let filesystem = plan(RepositoryFormat::Generic, None);
         assert!(!filesystem.on_backend(Some("a/b.bin")));
         assert!(!filesystem.on_backend(None));
+    }
+
+    /// #5254: a package whose native finalize reads a file (a Debian pool
+    /// package) spools locally on an object-storage repository; one read as
+    /// a stream (an `.apk`, an npm tarball) and any other file stage on the
+    /// backend.
+    #[test]
+    fn generic_staging_plan_spools_file_read_packages_5254() {
+        use crate::models::repository::RepositoryFormat;
+        let location = || {
+            Some(crate::storage::StorageLocation {
+                backend: "s3".to_string(),
+                path: "repo".to_string(),
+            })
+        };
+        let debian = GenericStagingPlan {
+            format: RepositoryFormat::Debian,
+            location: location(),
+        };
+        assert!(!debian.on_backend(Some("pool/main/h/hello/hello_1.0_amd64.deb")));
+        assert!(debian.on_backend(Some("docs/readme.txt")));
+        assert!(!debian.on_backend(None));
+        let alpine = GenericStagingPlan {
+            format: RepositoryFormat::Alpine,
+            location: location(),
+        };
+        assert!(alpine.on_backend(Some("v3.24/main/x86_64/nginx-1.30.6-r0.apk")));
+        assert!(alpine.on_backend(None));
+    }
+
+    /// #5254: a natively finalized package takes its native route's content
+    /// type unless the client declared a specific one.
+    #[test]
+    fn native_upload_content_type_5254() {
+        let apk = Some("application/vnd.alpine.package");
+        assert_eq!(
+            resolve_native_upload_content_type(None, "a/b/c/x-1-r0.apk", apk),
+            "application/vnd.alpine.package"
+        );
+        assert_eq!(
+            resolve_native_upload_content_type(
+                Some("application/octet-stream"),
+                "a/b/c/x-1-r0.apk",
+                apk
+            ),
+            "application/vnd.alpine.package"
+        );
+        assert_eq!(
+            resolve_native_upload_content_type(Some("application/x-tar"), "a/b/c/x-1-r0.apk", apk),
+            "application/x-tar"
+        );
+        assert_eq!(
+            resolve_native_upload_content_type(None, "notes.txt", None),
+            "text/plain"
+        );
     }
 
     /// #3916: a generic staging object whose upload died before promoting or
@@ -34536,13 +34790,16 @@ mod tests {
         // `npm::store_npm_version` writes.
         let unscoped_stored = "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string();
         let scoped_stored = "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string();
-        for p in [&unscoped_stored, &scoped_stored] {
+        for (p, name, version) in [
+            (&unscoped_stored, "npm-test", "1.0.0"),
+            (&scoped_stored, "@scope/pkg", "2.1.0"),
+        ] {
             upload_artifact(
                 State(state.clone()),
                 Extension(auth.clone()),
                 Path((key.clone(), p.clone())),
                 HeaderMap::new(),
-                Body::from(Bytes::from_static(b"TARBALL-BYTES")),
+                Body::from(tdh::npm_tarball(name, version)),
             )
             .await
             .expect("publish must succeed");

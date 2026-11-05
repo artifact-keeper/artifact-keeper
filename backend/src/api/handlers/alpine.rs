@@ -2254,6 +2254,81 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Generic-upload finalize (#5254)
+// ---------------------------------------------------------------------------
+
+/// How much of an `.apk` the generic upload paths read to record its index
+/// metadata. The same window the index backfill reads: the control segment
+/// precedes the data segment, so the package's data is never read.
+pub(crate) const FINALIZE_HEAD_BYTES: usize = APK_BACKFILL_HEAD_BYTES;
+
+/// The `(name, version)` the native upload route writes for an `.apk` at
+/// `artifact_path`, the `{branch}/{repository}/{arch}/{name}-{version}.apk`
+/// layout `PUT /alpine/{repo}/...` stores a package under and `APKINDEX` is
+/// generated from. `None` for any other path (an index, a key, a file name the
+/// native route refuses).
+pub(crate) fn package_coordinates_from_path(artifact_path: &str) -> Option<(String, String)> {
+    let segments: Vec<&str> = artifact_path.split('/').collect();
+    let [branch, repository, arch, filename] = segments.as_slice() else {
+        return None;
+    };
+    if branch.is_empty() || repository.is_empty() || arch.is_empty() {
+        return None;
+    }
+    parse_apk_filename(filename)
+}
+
+/// What the native upload records for the package at `artifact_path`, built
+/// from the package's leading bytes (`head`, at most [`FINALIZE_HEAD_BYTES`]):
+/// the `(name, version)` the row and catalog are stored under, the
+/// `artifact_metadata` document (`format = 'alpine'`) and the `.PKGINFO`
+/// description for the catalog.
+///
+/// The identity is the package's own `.PKGINFO` `pkgname`/`pkgver`, as
+/// [`store_apk`] resolves it, with the file name's `name`/`version` as the
+/// fallback for a head without a readable control segment, which is stored
+/// unindexed as the native route stores it.
+pub(crate) fn finalize_document(
+    artifact_path: &str,
+    name: &str,
+    version: &str,
+    head: &[u8],
+) -> ((String, String), serde_json::Value, Option<String>) {
+    let mut segments = artifact_path.split('/');
+    let (branch, repository, arch) = (
+        segments.next().unwrap_or_default(),
+        segments.next().unwrap_or_default(),
+        segments.next().unwrap_or_default(),
+    );
+    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    let apk_info = parse_apk_package(head);
+    if apk_info.is_none() {
+        tracing::warn!(
+            "Alpine upload {}: no apk control segment found; package will not be indexed",
+            artifact_path
+        );
+    }
+    let identity = resolve_upload_identity(
+        filename,
+        (name.to_string(), version.to_string()),
+        apk_info.as_ref(),
+    );
+    let document = build_alpine_artifact_metadata(
+        &identity.0,
+        &identity.1,
+        arch,
+        branch,
+        repository,
+        filename,
+        apk_info.as_ref(),
+    );
+    let description = apk_info
+        .and_then(|info| info.pkginfo.description)
+        .filter(|d| !d.is_empty());
+    (identity, document, description)
+}
+
+// ---------------------------------------------------------------------------
 // Test fixtures
 // ---------------------------------------------------------------------------
 
