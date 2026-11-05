@@ -267,6 +267,13 @@ impl CapabilitySet {
     /// Parse the `{tools, resources, prompts, instructions}` members of
     /// `doc` (each optional). Items must be objects with a non-empty string
     /// key (`name`, or `uri` for resources), unique per kind.
+    ///
+    /// Identifiers (the key, a resource's `name`, a prompt argument's
+    /// `name`) with control, bidirectional, zero-width or tag characters
+    /// are refused, as the publish path refuses them in a declared block
+    /// (`formats::mcp::has_forbidden_chars`). Free text (titles,
+    /// descriptions, `instructions`) is not refused here: the lint flags it
+    /// (`mcp_lint::lint_capabilities`, `hidden_text`).
     pub fn from_doc(doc: &Value) -> Result<Self, CapError> {
         let Some(obj) = doc.as_object() else {
             return Err(CapError::new("", "must be a JSON object"));
@@ -345,11 +352,44 @@ fn validate_items(kind: Kind, items: &[Value]) -> Result<(), CapError> {
                 ))
             }
         };
+        check_identifiers(kind, obj, &path)?;
         if !seen.insert(key.clone()) {
             return Err(CapError::new(
                 format!("{path}.{field}"),
                 format!("duplicate {field} `{key}`"),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse hidden characters in an item's identifiers (#5388): its key, a
+/// resource's `name`, a prompt argument's `name`.
+fn check_identifiers(kind: Kind, obj: &Map<String, Value>, path: &str) -> Result<(), CapError> {
+    let refuse = |at: String| {
+        Err(CapError::new(
+            at,
+            "control, bidirectional or zero-width characters are not allowed",
+        ))
+    };
+    let hidden = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(crate::formats::mcp::has_forbidden_chars)
+    };
+    let field = kind.key_field();
+    if hidden(obj.get(field)) {
+        return refuse(format!("{path}.{field}"));
+    }
+    if kind == Kind::Resources && hidden(obj.get("name")) {
+        return refuse(format!("{path}.name"));
+    }
+    if kind == Kind::Prompts {
+        if let Some(args) = obj.get("arguments").and_then(Value::as_array) {
+            for (j, arg) in args.iter().enumerate() {
+                if hidden(arg.get("name")) {
+                    return refuse(format!("{path}.arguments[{j}].name"));
+                }
+            }
         }
     }
     Ok(())
@@ -1350,7 +1390,7 @@ pub async fn record_stored(
     if ins.created {
         audit_ingested(db, s.reported_by, &ins.snapshot, repo_key);
         if let Some(source) = lint_source(s) {
-            let findings = crate::services::mcp_lint::lint_tools(s.set.items(Kind::Tools));
+            let findings = crate::services::mcp_lint::lint_capabilities(&s.set);
             crate::services::mcp_lint::record_after_write(db, s.artifact_id, &findings, &source)
                 .await;
         }
@@ -1465,6 +1505,45 @@ mod tests {
         assert_eq!(Source::RemoteProbe.drift_severity(), Severity::High);
         assert_eq!(Source::CiReported.drift_severity(), Severity::Medium);
         assert_eq!(Source::PublisherDeclared.drift_severity(), Severity::Low);
+    }
+
+    /// #5388: hidden characters in identifiers are refused (as at publish);
+    /// in free text they are accepted here and left to the lint.
+    #[test]
+    fn from_doc_refuses_hidden_chars_in_identifiers_only() {
+        let bad = [
+            (
+                json!({"tools": [{"name": "read\u{200B}file"}]}),
+                "tools[0].name",
+            ),
+            (
+                json!({"prompts": [{"name": "p\u{202E}"}]}),
+                "prompts[0].name",
+            ),
+            (
+                json!({"resources": [{"uri": "file:///x\u{2066}"}]}),
+                "resources[0].uri",
+            ),
+            (
+                json!({"resources": [{"uri": "file:///x", "name": "doc\u{FEFF}"}]}),
+                "resources[0].name",
+            ),
+            (
+                json!({"prompts": [{"name": "p", "arguments": [{"name": "a"}, {"name": "b\u{E0041}"}]}]}),
+                "prompts[0].arguments[1].name",
+            ),
+        ];
+        for (doc, path) in bad {
+            let e = CapabilitySet::from_doc(&doc).unwrap_err();
+            assert_eq!(e.path, path, "{doc}");
+            assert!(e.message.contains("zero-width"), "{e}");
+        }
+        let text = CapabilitySet::from_doc(&json!({
+            "resources": [{"uri": "file:///x", "description": "a\u{202E}b"}],
+            "prompts": [{"name": "p", "arguments": [{"name": "a", "description": "z\u{200B}w"}]}],
+            "instructions": "hi\u{200D}",
+        }));
+        assert!(text.is_ok(), "{text:?}");
     }
 
     #[test]
