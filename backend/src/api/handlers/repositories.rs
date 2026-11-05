@@ -1127,6 +1127,28 @@ pub struct CreateRepositoryRequest {
     /// repositories; stored under `npm_virtual_isolate_hosted_names`. Omit or
     /// `false` for the default union semantics.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
+    /// must resolve to an artifact in a repository of this instance) or
+    /// `open` (packages stored and served verbatim, not gated). Stored in
+    /// `repository_config` under `mcp_package_policy`.
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): the backing repository key per `registryType`
+    /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
+    /// `{"npm": "npm-local", "oci": "docker-remote"}`. Stored under
+    /// `mcp_package_repos`.
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace prefixes a server name must start
+    /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
+    /// under `mcp_namespace_allow`.
+    pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
+    #[serde(flatten)]
+    #[schema(ignore)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591). Each entry is an exact
     /// `https://host[:port]` origin (no path, no wildcard), SSRF-validated
@@ -1415,6 +1437,28 @@ pub struct UpdateRepositoryRequest {
     /// Turn npm Virtual isolate mode (#3767) on or off. Only valid for npm
     /// Virtual repositories; omit to leave it unchanged.
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
+    /// must resolve to an artifact in a repository of this instance) or
+    /// `open` (packages stored and served verbatim, not gated). Stored in
+    /// `repository_config` under `mcp_package_policy`.
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): the backing repository key per `registryType`
+    /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
+    /// `{"npm": "npm-local", "oci": "docker-remote"}`. Stored under
+    /// `mcp_package_repos`.
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace prefixes a server name must start
+    /// with (`com.acme` admits `com.acme.sub`); `[]` admits any name. Stored
+    /// under `mcp_namespace_allow`.
+    pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
+    #[serde(flatten)]
+    #[schema(ignore)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
     /// Replace the trusted cross-origin OCI Bearer token realms for this
     /// Remote repository (#3591); same rules as on create. Omit to leave the
     /// list unchanged; send `[]` to clear it and restore the strict
@@ -1613,6 +1657,38 @@ pub struct RepositoryResponse {
     /// repositories; omitted for every other repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_virtual_isolate_hosted_names: Option<bool>,
+    /// MCP registries (#5253): the package policy (`own-repos` / `open`).
+    /// Omitted for every other repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_package_policy: Option<String>,
+    /// MCP registries (#5253): backing repository key per `registryType`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_package_repos: Option<std::collections::BTreeMap<String, String>>,
+    /// MCP registries (#5253): namespace allowlist (empty: any name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_namespace_allow: Option<Vec<String>>,
+    /// MCP registries (#5253): Phase 2/3 settings (`mcp_server_deny`,
+    /// `mcp_remote_posture`, ...), see `services::mcp_settings`.
+    /// Flattened on the wire; kept out of the generated schema because
+    /// utoipa renders a flattened field as `allOf`, which would hide every
+    /// other property (documented in `docs/mcp-registry.md`).
+    #[serde(flatten)]
+    #[schema(ignore)]
+    pub mcp_settings: crate::services::mcp_settings::McpRepoSettings,
+    /// MCP registries (#5253): whether the caller may set or clear the
+    /// instance locks (`mcp_remote_posture_locked`,
+    /// `mcp_probe_remotes_locked`) and change a locked setting: `true` only
+    /// for an instance administrator (repository administration is not
+    /// enough). Omitted for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_caller_can_lock: Option<bool>,
+    /// MCP registries (#5253): whether the caller administers this
+    /// repository (the repository `admin` action, or an instance
+    /// administrator): the check the MCP routes apply to admin edits and
+    /// deletes, catalog decisions, pins, bulk decisions, sync triggers and
+    /// introspection requests. Omitted for other formats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_caller_is_repo_admin: Option<bool>,
     /// Cross-origin OCI Bearer token realms trusted to receive this Remote
     /// repository's upstream credentials (#3591), canonical origins. Omitted
     /// when none are configured (the strict same-origin default applies).
@@ -2081,6 +2157,12 @@ fn repo_to_response(
         npm_allow_unscoped: None,
         npm_allowed_name_patterns: None,
         npm_virtual_isolate_hosted_names: None,
+        mcp_package_policy: None,
+        mcp_package_repos: None,
+        mcp_namespace_allow: None,
+        mcp_settings: Default::default(),
+        mcp_caller_can_lock: None,
+        mcp_caller_is_repo_admin: None,
         oci_trusted_bearer_realms: None,
         debian: None,
         curation_enabled: repo.curation_enabled,
@@ -3323,6 +3405,81 @@ async fn apply_npm_scope_policy_config(
     Ok(())
 }
 
+/// `RepositoryResponse.mcp_caller_can_lock` and `mcp_caller_is_repo_admin`
+/// (#5253): on an MCP registry, whether the caller is an instance
+/// administrator (only they may set the `*_locked` settings or change a
+/// locked one), and whether they administer the repository. Other formats:
+/// both absent.
+fn with_mcp_caller(
+    mut response: RepositoryResponse,
+    instance_admin: bool,
+    repo_admin: bool,
+) -> RepositoryResponse {
+    let mcp = response.format == "mcp";
+    response.mcp_caller_can_lock = mcp.then_some(instance_admin);
+    response.mcp_caller_is_repo_admin = mcp.then_some(instance_admin || repo_admin);
+    response
+}
+
+/// Whether `auth` administers repository `repo_id`: [`require_repo_admin`]
+/// as a predicate, the single check behind every MCP admin route, so the
+/// `mcp_caller_is_repo_admin` echo and the routes cannot disagree. Queried
+/// only for an MCP registry (`false` otherwise, and for anonymous callers).
+pub(crate) async fn mcp_caller_is_repo_admin(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_id: Uuid,
+    format: &str,
+) -> bool {
+    match auth {
+        Some(a) if format == "mcp" => require_repo_admin(a, repo_id, &state.permission_service)
+            .await
+            .is_ok(),
+        _ => false,
+    }
+}
+
+/// Populate `RepositoryResponse.mcp_*` from `repository_config` (#5253). A
+/// no-op for non-MCP repositories. The policy echo is the effective policy
+/// (`own-repos` when unset).
+async fn with_mcp_settings(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_type: &str,
+    format: &RepositoryFormat,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    use crate::services::mcp_packages as mp;
+    if format != &RepositoryFormat::Mcp {
+        return Ok(response);
+    }
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM repository_config WHERE repository_id = $1 AND key = ANY($2)",
+    )
+    .bind(repo_id)
+    .bind([mp::POLICY_KEY, mp::REPOS_KEY, mp::NAMESPACE_ALLOW_KEY])
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let get = |k: &str| {
+        rows.iter()
+            .find(|(key, _)| key == k)
+            .and_then(|(_, v)| v.as_deref())
+    };
+    response.mcp_package_policy = Some(
+        get(mp::POLICY_KEY)
+            .and_then(crate::formats::mcp::PackagePolicy::parse)
+            .unwrap_or(crate::formats::mcp::PackagePolicy::OwnRepos)
+            .as_str()
+            .to_string(),
+    );
+    response.mcp_package_repos = get(mp::REPOS_KEY).and_then(|v| mp::parse_package_repos(v).ok());
+    response.mcp_namespace_allow =
+        get(mp::NAMESPACE_ALLOW_KEY).and_then(|v| mp::parse_namespace_allow(v).ok());
+    response.mcp_settings = crate::services::mcp_settings::load(db, repo_id, repo_type).await?;
+    Ok(response)
+}
+
 /// Populate `RepositoryResponse` npm scope-policy fields from
 /// `repository_config` (#2424) so create/get/update echo the stored policy.
 /// A no-op for non-npm-Remote repositories and for repositories with no stored
@@ -3338,7 +3495,8 @@ async fn with_npm_scope_policy(
 ) -> Result<RepositoryResponse> {
     // The npm Virtual isolate toggle (#3767) rides the same echo, so every
     // handler that round-trips the scope policy round-trips it too.
-    let mut response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
+    let response = with_npm_virtual_isolate(db, repo_id, repo_type, format, response).await?;
+    let mut response = with_mcp_settings(db, repo_id, repo_type.as_str(), format, response).await?;
     if repo_type != &RepositoryType::Remote || format != &RepositoryFormat::Npm {
         return Ok(response);
     }
@@ -3932,6 +4090,7 @@ fn parse_format(s: &str) -> Result<RepositoryFormat> {
         "vagrant" => Ok(RepositoryFormat::Vagrant),
         "opkg" => Ok(RepositoryFormat::Opkg),
         "pacman" => Ok(RepositoryFormat::Pacman),
+        "mcp" => Ok(RepositoryFormat::Mcp),
         "p2" => Ok(RepositoryFormat::P2),
         "bazel" => Ok(RepositoryFormat::Bazel),
         "protobuf" => Ok(RepositoryFormat::Protobuf),
@@ -3978,7 +4137,7 @@ fn validate_format_supports_repo_type(
     if *format != RepositoryFormat::AgentPlugins {
         return Ok(());
     }
-    if !repo_type.is_hosted() {
+    if !crate::formats::supported_repo_types(format.handler_key()).contains(&repo_type.as_str()) {
         return Err(AppError::Validation(format!(
             "Agent Plugins repositories are hosted-only: repo_type {} is not supported \
              (use local)",
@@ -4200,7 +4359,7 @@ pub async fn list_repositories(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
     )
 )]
 pub async fn create_repository(
@@ -4328,6 +4487,27 @@ pub async fn create_repository(
         &repo_type,
         &format,
         payload.npm_virtual_isolate_hosted_names,
+    )?;
+    // MCP registries (#5253): hosted only in this release, settings validated
+    // up-front for the same reason; persisted once `repo.id` exists.
+    crate::services::mcp_packages::creatable(&format, repo_type.as_str())
+        .map_err(|m| AppError::Validation(m.to_string()))?;
+    let mcp_settings = crate::services::mcp_packages::settings_to_store(
+        &state.db,
+        &auth,
+        &format,
+        payload.mcp_package_policy.as_deref(),
+        payload.mcp_package_repos.as_ref(),
+        payload.mcp_namespace_allow.as_deref(),
+        true,
+    )
+    .await?;
+    let mcp_extra = crate::services::mcp_settings::to_store(
+        &payload.mcp_settings,
+        &format,
+        repo_type.as_str(),
+        auth.is_admin,
+        Default::default(),
     )?;
     // Trusted cross-origin OCI bearer realms (#3591): validated up-front for
     // the same reason; persisted once `repo.id` exists.
@@ -4576,6 +4756,9 @@ pub async fn create_repository(
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
     }
+    for (key, value) in mcp_settings.iter().chain(&mcp_extra) {
+        upsert_repo_config(&state.db, repo.id, key, value).await?;
+    }
     if let Some(ref realms) = oci_trusted_realms {
         crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
             .await?;
@@ -4795,6 +4978,8 @@ pub async fn create_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
+    let repo_admin = mcp_caller_is_repo_admin(&state, Some(&auth), repo_id, &response.format).await;
+    let response = with_mcp_caller(response, auth.is_admin, repo_admin);
     Ok(Json(response))
 }
 
@@ -4861,6 +5046,13 @@ pub async fn get_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
+    let repo_admin =
+        mcp_caller_is_repo_admin(&state, auth.as_ref(), repo_id, &response.format).await;
+    let response = with_mcp_caller(
+        response,
+        auth.as_ref().is_some_and(|a| a.is_admin),
+        repo_admin,
+    );
     Ok(Json(response))
 }
 
@@ -5403,7 +5595,7 @@ fn validate_update_config_fields(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository; a bare namespace in mcp_server_deny or mcp_auto_approve_namespaces (write `com.acme/*`)"),
     )
 )]
 pub async fn update_repository(
@@ -5563,6 +5755,29 @@ pub async fn update_repository(
         &existing.format,
         payload.npm_virtual_isolate_hosted_names,
     )?;
+    // MCP registry settings (#5253): validated before the update.
+    let mcp_settings = crate::services::mcp_packages::settings_to_store(
+        &state.db,
+        &auth,
+        &existing.format,
+        payload.mcp_package_policy.as_deref(),
+        payload.mcp_package_repos.as_ref(),
+        payload.mcp_namespace_allow.as_deref(),
+        false,
+    )
+    .await?;
+    let mcp_extra = if payload.mcp_settings.is_empty() {
+        Vec::new()
+    } else {
+        let rows = crate::services::mcp_settings::load_rows(&state.db, existing.id).await?;
+        crate::services::mcp_settings::to_store(
+            &payload.mcp_settings,
+            &existing.format,
+            existing.repo_type.as_str(),
+            auth.is_admin,
+            crate::services::mcp_settings::locks_of(&rows),
+        )?
+    };
     // Trusted cross-origin OCI bearer realms (#3591): validated before the
     // update for the same reason. Writing them is gated by the repository
     // `admin` check above, like every other credential-routing setting.
@@ -5715,6 +5930,9 @@ pub async fn update_repository(
     }
     if let Some(isolate) = npm_virtual_isolate {
         apply_npm_virtual_isolate(&state, repo.id, isolate).await?;
+    }
+    for (key, value) in mcp_settings.iter().chain(&mcp_extra) {
+        upsert_repo_config(&state.db, repo.id, key, value).await?;
     }
     if let Some(ref realms) = oci_trusted_realms {
         crate::services::oci_trusted_realms::save_trusted_realms(&state.db, repo.id, realms)
@@ -5905,6 +6123,8 @@ pub async fn update_repository(
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
+    let repo_admin = mcp_caller_is_repo_admin(&state, Some(&auth), repo_id, &response.format).await;
+    let response = with_mcp_caller(response, auth.is_admin, repo_admin);
     Ok(Json(response))
 }
 
@@ -7128,7 +7348,12 @@ pub async fn list_artifacts(
     // the listing is reconstructed from there. Without this, packages pulled
     // through a remote repo fill up storage but never appear in the UI, so they
     // can't be browsed or scanned (#1548, web #424).
-    if repo.repo_type == RepositoryType::Remote {
+    //
+    // An MCP Remote is the exception: its sync ingests every server version
+    // it serves as a real `artifacts` row (`servers/<name>/<version>/server.json`),
+    // and its proxy cache holds only upstream listing pages, which are not
+    // artifacts of the repository. It takes the flat listing below (#5253).
+    if repo.repo_type == RepositoryType::Remote && repo.format != RepositoryFormat::Mcp {
         return list_remote_cached_artifacts(
             &state,
             &repo,
@@ -7250,7 +7475,29 @@ pub async fn list_artifacts(
     } else {
         None
     };
+    // MCP registries (#5253): a version a reader is not served is left out,
+    // as on the registry surface. The cursor above is the last row read, so
+    // paging is unaffected; the total leaves out this page's hidden rows. A
+    // reader's total can still count versions hidden on other pages, so it
+    // is reported as not exact.
+    let mut hidden = 0i64;
+    let mut mcp_reader = false;
+    if repo.format == RepositoryFormat::Mcp {
+        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+        mcp_reader = !gate.holds_all(&[repo.id]).await;
+        let mut kept = Vec::with_capacity(artifacts.len());
+        for a in artifacts {
+            if gate.visible(a.repository_id, &a.path).await {
+                kept.push(a);
+            } else {
+                hidden += 1;
+            }
+        }
+        artifacts = kept;
+    }
     let (total, total_is_exact) = listing_total(exact_total, at);
+    let total = (total - hidden).max(0);
+    let total_is_exact = total_is_exact && !mcp_reader;
     let total_pages = grouped_total_pages(total, per_page);
 
     let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
@@ -9725,6 +9972,11 @@ pub async fn get_artifact_metadata(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
+    // An MCP version a reader is not served is a missing artifact here
+    // (#5253).
+    if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
+        return Err(generic_artifact_not_found(&repo));
+    }
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -10058,7 +10310,11 @@ pub async fn list_artifact_versions(
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
-    let versions = artifact_service.list_versions(repo.id, &path).await?;
+    let versions = if mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
+        artifact_service.list_versions(repo.id, &path).await?
+    } else {
+        Vec::new()
+    };
     if versions.is_empty() {
         return Err(AppError::NotFound(
             "No version history for this artifact".to_string(),
@@ -10142,6 +10398,7 @@ pub async fn upload_artifact(
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // #4186: refuse a conditional PUT whose precondition already fails
     // before reading its body. Not authoritative (the publishing transaction
@@ -10618,6 +10875,105 @@ pub(crate) async fn materialize_staged_for_repo<'a>(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
+/// MCP registries (#5253) accept a server version only through their publish
+/// route, which validates the document, applies the namespace policy and
+/// pins its packages. A generic write of `servers/<name>/<version>/...` would
+/// skip all of that (and squat the version), so the generic upload entry
+/// points refuse an MCP repository. A trusted peer replication (admin or
+/// service account) still lands, so MCP repositories replicate like any
+/// other.
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_generic_write_to_mcp(
+    format: &RepositoryFormat,
+    auth: &AuthExtension,
+    headers: &HeaderMap,
+) -> std::result::Result<(), Response> {
+    mcp_generic_mutation_refusal(format, auth, headers, MCP_GENERIC_WRITE_REFUSED)
+        .map_err(IntoResponse::into_response)
+}
+
+const MCP_GENERIC_WRITE_REFUSED: &str =
+    "MCP registries accept server versions only through POST /mcp/{repository}/v0.1/publish";
+
+/// The generic artifact `DELETE` on an MCP registry (#5253). A server version
+/// (and its bundles) is deleted only through
+/// `DELETE /mcp/{repository}/v0.1/servers/{name}/versions/{version}`, which
+/// runs the namespace write gate (`mcp_namespaces` rules,
+/// `mcp_require_namespace_grant`), records the version as `deleted`,
+/// recomputes `isLatest` and audits `MCP_SERVER_DELETED`. The generic route
+/// knows none of that, so a plain repository writer could delete another
+/// namespace's server.json through it: it refuses MCP repositories, admins
+/// included, except a trusted peer replication (as for generic writes).
+pub(crate) const MCP_GENERIC_DELETE_REFUSED: &str =
+    "MCP registries delete server versions only through \
+     DELETE /mcp/{repository}/v0.1/servers/{serverName}/versions/{version}";
+
+/// Whether `auth` may see the artifact at `path` of `repo` through a generic
+/// artifact route (metadata, revision history, download), under the MCP
+/// serve decision (#5253, [`super::mcp::GenericArtifactGate`]). Always
+/// `true` for other formats. For a Virtual MCP registry the member that
+/// holds the path first (by priority) decides; a path no member holds is
+/// left to the route's own `404`.
+pub(crate) async fn mcp_generic_path_visible(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<bool> {
+    if repo.format != RepositoryFormat::Mcp {
+        return Ok(true);
+    }
+    let owners: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT a.repository_id FROM artifacts a \
+         LEFT JOIN virtual_repo_members vm \
+           ON vm.member_repo_id = a.repository_id AND vm.virtual_repo_id = $1 \
+         WHERE a.path = $2 AND a.is_deleted = false \
+           AND (a.repository_id = $1 OR vm.virtual_repo_id IS NOT NULL) \
+         ORDER BY (a.repository_id = $1) DESC, vm.priority",
+    )
+    .bind(repo.id)
+    .bind(path)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some(owner) = owners.first() else {
+        return Ok(true);
+    };
+    Ok(super::mcp::GenericArtifactGate::new(state, auth)
+        .visible(*owner, path)
+        .await)
+}
+
+/// The plain `404` a generic artifact route answers for a missing artifact,
+/// also its answer for an MCP version the caller may not see.
+fn generic_artifact_not_found(repo: &crate::models::repository::Repository) -> AppError {
+    AppError::NotFound(if repo.repo_type == RepositoryType::Virtual {
+        "Artifact not found in any member repository".to_string()
+    } else {
+        "Artifact not found".to_string()
+    })
+}
+
+/// `400` for a generic write or delete into an MCP repository unless the/// `400` for a generic write or delete into an MCP repository unless the
+/// caller is a trusted peer replication (admin or service account with the
+/// replication header).
+pub(crate) fn mcp_generic_mutation_refusal(
+    format: &RepositoryFormat,
+    auth: &AuthExtension,
+    headers: &HeaderMap,
+    message: &str,
+) -> Result<()> {
+    let trusted = replication_exemption_trusted(
+        super::is_replication_request(headers),
+        auth.is_admin,
+        auth.is_service_account,
+    );
+    if format == &RepositoryFormat::Mcp && !trusted {
+        return Err(AppError::Validation(message.to_string()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
@@ -11201,6 +11557,7 @@ async fn upload_artifact_multipart_with_path(
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // The URL path is the artifact path unless empty, when the uploaded file
     // name is; either is known by the time the file field streams (#3916).
@@ -11250,6 +11607,7 @@ async fn upload_artifact_multipart(
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
     let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    reject_generic_write_to_mcp(&repo.format, &auth, &headers)?;
 
     // The artifact path may arrive in a `path` field after the file, so the
     // file stages before its path is known (#3916).
@@ -12003,6 +12361,11 @@ pub async fn download_artifact(
     // unchanged so the Remote/Virtual proxy fallback below still fires against
     // the original URL shape.
     let path = resolve_stored_path(&state, &repo, path).await?;
+    // An MCP version a reader is not served is a missing artifact here, as on
+    // the registry surface (#5253); also before any upstream fallback.
+    if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
+        return Err(generic_artifact_not_found(&repo));
+    }
 
     // Enforce quarantine AND the repository's scan policy before serving the
     // artifact: quarantined/rejected is a 409/403, a scan-policy violation
@@ -12542,6 +12905,10 @@ pub async fn delete_artifact(
     // (deny-by-default) so a write-only grantee cannot destroy artifacts and a
     // rules-less/public repo confers no delete. Mirrors the upload `write` gate.
     require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // After the access gates (nothing is said about a repository the caller
+    // cannot delete from): MCP versions are deleted through the namespace-
+    // gated MCP route only.
+    mcp_generic_mutation_refusal(&repo.format, &auth, &headers, MCP_GENERIC_DELETE_REFUSED)?;
     // Refused before the soft delete so a request never ends half done, and
     // after the access gates so it says nothing about a repository the caller
     // cannot write to.
@@ -17555,6 +17922,7 @@ mod tests {
             "protobuf",
             "pacman",
             "agentplugins",
+            "mcp",
         ];
         for f in formats {
             assert!(parse_format(f).is_ok(), "parse_format failed for: {}", f);
@@ -17780,6 +18148,12 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -17793,6 +18167,91 @@ mod tests {
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
         assert!(json.contains("\"promotion_only\":false"));
+    }
+
+    #[test]
+    fn test_mcp_caller_can_lock_only_on_mcp_and_only_for_instance_admins() {
+        let sample = || RepositoryResponse {
+            repodata_depth: 0,
+            repodata_depth_editable: false,
+            repodata_mode: None,
+            versioning_enabled: false,
+            has_trusted_gpg_key: false,
+            id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            key: "my-repo".to_string(),
+            name: "My Repo".to_string(),
+            description: Some("desc".to_string()),
+            format: "maven".to_string(),
+            format_key: None,
+            repo_type: "local".to_string(),
+            visibility: crate::models::repository::RepositoryVisibility::Public,
+            is_public: true,
+            allow_anonymous_access: true,
+            promotion_only: false,
+            storage_backend: "filesystem".to_string(),
+            storage_used_bytes: 1024,
+            member_storage_used_bytes: None,
+            quota_bytes: Some(1048576),
+            upstream_url: None,
+            upstream_url_has_credentials: false,
+            upstream_auth_type: None,
+            upstream_auth_configured: false,
+            public_with_upstream_credentials: false,
+            allow_public_with_upstream_credentials: false,
+            quarantine_enabled: None,
+            quarantine_duration_minutes: None,
+            custom_user_agent: None,
+            project_id: None,
+            apt_origin: None,
+            apt_label: None,
+            apt_release_version: None,
+            apt_description: None,
+            npm_allowed_scopes: None,
+            npm_allow_unscoped: None,
+            npm_allowed_name_patterns: None,
+            npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
+            oci_trusted_bearer_realms: None,
+            debian: None,
+            curation_enabled: false,
+            curation_default_action: "allow".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let resp = sample();
+        assert_ne!(resp.format, "mcp");
+        let other = with_mcp_caller(resp, true, true);
+        assert_eq!(
+            (other.mcp_caller_can_lock, other.mcp_caller_is_repo_admin),
+            (None, None)
+        );
+        let json = serde_json::to_value(&other).unwrap();
+        assert!(json.get("mcp_caller_is_repo_admin").is_none());
+        let mcp = || {
+            let mut m = sample();
+            m.format = "mcp".into();
+            m
+        };
+        let instance = with_mcp_caller(mcp(), true, false);
+        assert_eq!(
+            (
+                instance.mcp_caller_can_lock,
+                instance.mcp_caller_is_repo_admin
+            ),
+            (Some(true), Some(true)),
+            "an instance administrator administers every repository"
+        );
+        let repo_admin = with_mcp_caller(mcp(), false, true);
+        let json = serde_json::to_value(&repo_admin).unwrap();
+        assert_eq!(json["mcp_caller_can_lock"], false);
+        assert_eq!(json["mcp_caller_is_repo_admin"], true);
+        let reader = with_mcp_caller(mcp(), false, false);
+        assert_eq!(reader.mcp_caller_is_repo_admin, Some(false));
     }
 
     #[test]
@@ -19200,6 +19659,12 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,
@@ -22560,6 +23025,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #5253: the generic `DELETE /api/v1/repositories/{key}/artifacts/...` is
+    /// not namespace-aware, so on an MCP registry it is refused (`400`, naming
+    /// the MCP route) for a repository writer with the `delete` action and for
+    /// an admin alike; the server.json row stays live. A trusted peer
+    /// replication still deletes.
+    #[tokio::test]
+    async fn generic_delete_of_an_mcp_server_version_is_refused_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let path = "servers/com.other/echo/1.0.0/server.json".to_string();
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 'com.other/echo', '1.0.0', 2, $4, 'application/json', $5)",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(&path)
+        .bind("a".repeat(64))
+        .bind(format!("mcp/com.other/echo/1.0.0/{}.json", "a".repeat(64)))
+        .execute(&pool)
+        .await
+        .expect("seed server.json row");
+        let state = || {
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            ))
+        };
+        let user = tdh::make_auth(user_id, &username);
+        let mut admin = user.clone();
+        admin.is_admin = true;
+        let mut replication = HeaderMap::new();
+        replication.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        for (who, headers) in [
+            (user.clone(), HeaderMap::new()),
+            (user.clone(), replication.clone()),
+            (admin.clone(), HeaderMap::new()),
+        ] {
+            let refused = delete_artifact(
+                state(),
+                Extension(Some(who)),
+                Path((key.clone(), path.clone())),
+                Query(DeleteArtifactQuery::default()),
+                headers,
+            )
+            .await;
+            match refused {
+                Err(AppError::Validation(m)) => assert_eq!(m, MCP_GENERIC_DELETE_REFUSED),
+                other => panic!("generic delete on an MCP repository must be refused: {other:?}"),
+            }
+        }
+        let live: bool = sqlx::query_scalar("SELECT NOT is_deleted FROM artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(live, "the server.json row must stay live");
+        // Peer replication (an admin token with the replication header).
+        let replicated = delete_artifact(
+            state(),
+            Extension(Some(admin)),
+            Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
+            replication,
+        )
+        .await;
+        assert!(replicated.is_ok(), "{replicated:?}");
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #2321 G2 (delete): the generic REST `delete_artifact` handler enforces the
     /// fine-grained `delete` action AFTER the tenant gate, so a WRITE-only
     /// grantee cannot destroy artifacts. Granting `delete` lets them through.
@@ -23655,6 +24206,51 @@ mod tests {
         tdh::cleanup(&pool, other_id, dev_id).await;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    /// DB-backed (#5253): `mcp_caller_is_repo_admin` on an MCP repository is
+    /// `require_repo_admin` as a predicate: a `repository-owner` member and an
+    /// instance administrator see `true`, a developer member `false`.
+    #[tokio::test]
+    async fn mcp_caller_is_repo_admin_follows_require_repo_admin_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (dev_id, dev_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        tdh::grant_repo_role(&pool, repo_id, owner_id, "repository-owner").await;
+        tdh::grant_repo_role(&pool, repo_id, dev_id, "developer").await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let owner = tdh::make_auth(owner_id, &owner_name);
+        let dev = tdh::make_auth(dev_id, &dev_name);
+        let mut admin = tdh::make_auth(dev_id, &dev_name);
+        admin.is_admin = true;
+        for (auth, can_lock, is_admin) in [
+            (owner.clone(), false, true),
+            (dev.clone(), false, false),
+            (admin.clone(), true, true),
+        ] {
+            let agrees = require_repo_admin(&auth, repo_id, &state.permission_service)
+                .await
+                .is_ok();
+            assert_eq!(agrees, is_admin);
+            let Json(got) = get_repository(
+                State(state.clone()),
+                Extension(Some(auth)),
+                Path(key.clone()),
+            )
+            .await
+            .expect("get");
+            assert_eq!(
+                (got.mcp_caller_can_lock, got.mcp_caller_is_repo_admin),
+                (Some(can_lock), Some(is_admin))
+            );
+        }
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup_user(&pool, dev_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DB-backed (#4834): every repository-administration handler that still
@@ -33934,6 +34530,12 @@ mod tests {
             npm_allow_unscoped: None,
             npm_allowed_name_patterns: None,
             npm_virtual_isolate_hosted_names: None,
+            mcp_package_policy: None,
+            mcp_package_repos: None,
+            mcp_namespace_allow: None,
+            mcp_settings: Default::default(),
+            mcp_caller_can_lock: None,
+            mcp_caller_is_repo_admin: None,
             oci_trusted_bearer_realms: None,
             debian: None,
             curation_enabled: false,

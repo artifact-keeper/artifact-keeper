@@ -268,6 +268,8 @@ async fn create_session(
     // without ever having been fetched from it. Checked after the
     // authorization gates and before any session row exists.
     proxy_helpers::reject_write_if_not_hosted(repo_record.repo_type.as_str())?;
+    // #5253: an MCP registry publishes through its own route only.
+    super::repositories::reject_generic_write_to_mcp(&repo_record.format, &auth, &headers)?;
 
     let is_replication = super::is_replication_request(&headers);
     if req.skip_if_present && !is_replication {

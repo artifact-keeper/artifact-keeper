@@ -1,0 +1,30 @@
+# ak-mcp-introspector with the sandbox, as the dedicated rootless user
+# (#5253, docs/security/mcp-sandbox.md "Option A"). The worker drives that
+# user's rootless Podman directly: no engine socket, no root.
+[Unit]
+Description=Artifact Keeper MCP introspection worker (sandboxed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ak-sbx
+Group=ak-sbx
+EnvironmentFile=/etc/ak-mcp-introspector.env
+ExecStart=/usr/local/bin/ak-mcp-introspector run --sandbox --poll-secs 30
+Restart=on-failure
+RestartSec=30
+# The worker itself needs no privileges; Podman's rootless helpers
+# (newuidmap/newgidmap) are setuid and need the default NoNewPrivileges=no.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ak-sbx/.local/share/containers /run/user
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+RestrictSUIDSGID=false
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

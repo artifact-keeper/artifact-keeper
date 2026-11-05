@@ -702,6 +702,7 @@ have no core proxy path to gate.
 | `incus` | `incus`, `lxc` | accepted | |
 | `pacman` | `pacman` | accepted | |
 | `agentplugins` | `agentplugins` | accepted | Hosted only: there is no proxied download to gate. Uploads are scanned on publish. |
+| `mcp` | `mcp` | accepted | |
 <!-- coverage-table:end -->
 
 ## Known gaps

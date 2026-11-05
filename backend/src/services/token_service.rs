@@ -104,6 +104,10 @@ pub(crate) const ALLOWED_SCOPES: &[&str] = &[
     // publish packages must not thereby be able to write the verdicts the
     // download gate, the promotion gate and the repository score read.
     "write:findings",
+    // #5253: the MCP introspection worker's credential (claim jobs, post
+    // results). Dedicated so no other token can feed observed capability
+    // snapshots, and admin-only to mint.
+    "mcp:introspect",
     "admin",
     "*",
 ];
@@ -162,6 +166,7 @@ pub(crate) const ADMIN_ONLY_SCOPES: &[&str] = &[
     "trigger:sync",
     "write:users",
     "write:findings",
+    "mcp:introspect",
 ];
 
 /// Enforce that a non-admin caller may not grant any admin-class scope

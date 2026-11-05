@@ -102,6 +102,13 @@ impl AuditAction {
             AuditAction::LoginRateLimited => Outcome::Denied,
             // #4777: the scan-on-proxy gate refused the pull.
             AuditAction::ProxyScanBlocked => Outcome::Denied,
+            // #5253: the MCP surface refused a held server version.
+            AuditAction::McpServerDownloadRefused => Outcome::Denied,
+            // #5253: MCP refusals and gate/proof failures.
+            AuditAction::McpServerRejected => Outcome::Denied,
+            AuditAction::McpBundleSignatureRejected => Outcome::Denied,
+            AuditAction::McpGateUnavailable => Outcome::Failure,
+            AuditAction::McpNamespaceProofFailed => Outcome::Failure,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -194,7 +201,22 @@ impl AuditAction {
             | AuditAction::EnvironmentDeleted
             | AuditAction::ExternalFindingsIngested
             | AuditAction::DeviceCodeIssued
-            | AuditAction::DeviceAuthorizationApproved => Outcome::Success,
+            | AuditAction::DeviceAuthorizationApproved
+            | AuditAction::McpPackagePinned
+            | AuditAction::McpPinDriftDetected
+            | AuditAction::McpServerPublished
+            | AuditAction::McpServerStatusChanged
+            | AuditAction::McpServerApproved
+            | AuditAction::McpServerReopened
+            | AuditAction::McpServerContentDrift
+            | AuditAction::McpCapabilitiesIngested
+            | AuditAction::McpToolsDrift
+            | AuditAction::McpNamespaceGranted
+            | AuditAction::McpNamespaceRevoked
+            | AuditAction::McpNamespaceProofVerified
+            | AuditAction::McpServerEdited
+            | AuditAction::McpServerDeleted
+            | AuditAction::McpMirrorSynced => Outcome::Success,
         }
     }
 }

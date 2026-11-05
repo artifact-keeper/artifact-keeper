@@ -121,6 +121,7 @@ pub fn create_router(state: SharedState) -> Router {
         .nest("/cocoapods", handlers::cocoapods::router())
         .nest("/hex", handlers::hex::router())
         .nest("/huggingface", handlers::huggingface::router())
+        .nest(handlers::mcp::MOUNT_PREFIX, handlers::mcp::router())
         .nest("/jetbrains", handlers::jetbrains::router())
         .nest("/agentplugins", handlers::agent_plugins::router())
         .nest("/chef", handlers::chef::router())
@@ -253,6 +254,10 @@ pub fn create_router(state: SharedState) -> Router {
             "/v2",
             handlers::oci_v2::router(Some(token_exchange_rate_limit_state)),
         )
+        // #5253: the MCP registry's credential exchange (`/mcp/{repo}/v0/auth/*`);
+        // the OIDC assertion in the body is the credential, so it sits outside
+        // the repository visibility middleware.
+        .merge(handlers::mcp_edges::public_router())
         // All native-protocol format handler routes (repo visibility enforced)
         .merge(format_routes);
 
@@ -1112,6 +1117,13 @@ fn api_v1_routes(
                 // Precomputed RPM repodata (#4544):
                 // POST /repositories/{key}/rpm/repodata/rebuild.
                 .merge(handlers::rpm::repo_router())
+                // Remote MCP registries (#5253): upstream catalog, approval
+                // queue, pins, bulk approval, sync:
+                // /repositories/{key}/mcp/{catalog,sync}[/...].
+                .merge(handlers::mcp_remote::repo_router())
+                // MCP server health roll-up (#5253):
+                // GET /repositories/{key}/mcp/servers/{name}/versions/{v}/health.
+                .merge(handlers::mcp_health::repo_router())
                 // `GET /repositories/{key}/download/{path}` is NOT merged
                 // here: it is nested separately below with its own
                 // authentication layer (#4654).
@@ -1405,6 +1417,11 @@ fn api_v1_routes(
             .nest("/monitoring", handlers::monitoring::router())
             .nest("/sso", handlers::sso_admin::router())
             .nest("/ci-oidc", handlers::ci_auth_admin::router())
+            // #5253: MCP namespace proofs (admin-initiated DNS/HTTP checks).
+            .nest(
+                "/mcp/namespace-proofs",
+                handlers::mcp_namespace_proofs::router(),
+            )
             .nest("/smtp", handlers::smtp::router())
             // Maintenance banner CRUD (#2155); the public read is `/banners`.
             .nest("/banners", handlers::banners::admin_router())
@@ -1532,6 +1549,24 @@ fn api_v1_routes(
         .nest(
             "/quality",
             handlers::quality_gates::router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // MCP approval-queue count across the Remote MCP repositories the
+        // caller can read (#5253): GET /mcp/pending-summary.
+        .nest(
+            "/mcp",
+            handlers::mcp_remote::summary_router().layer(middleware::from_fn_with_state(
+                auth_service.clone(),
+                auth_middleware,
+            )),
+        )
+        // MCP introspection worker API (#5253): claim/complete jobs with an
+        // `mcp:introspect` token. The worker is a separate process.
+        .nest(
+            "/mcp/introspection",
+            handlers::mcp_capabilities::worker_router().layer(middleware::from_fn_with_state(
                 auth_service.clone(),
                 auth_middleware,
             )),

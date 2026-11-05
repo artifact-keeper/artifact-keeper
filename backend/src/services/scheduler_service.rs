@@ -399,6 +399,21 @@ pub fn spawn_all(
         });
     }
 
+    // MCP introspection queue (every 15 minutes, #5253): return expired worker
+    // claims and re-queue remote probes that are due. DB-only and idempotent
+    // (`IdempotentDbOnly`): one open job per target is a unique index.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let mut ticker = interval(Duration::from_secs(900));
+            loop {
+                ticker.tick().await;
+                crate::services::mcp_introspection::scheduler_tick(&db).await;
+            }
+        });
+    }
+
     // API-token cache invalidation map prune (every hour).
     //
     // The invalidation map records when each user's API-token cache entries

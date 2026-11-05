@@ -3387,7 +3387,7 @@ impl ScanResultService {
 /// [`ScanResultService::create_findings`], generic over the executor so
 /// [`ScanResultService::create_completed_scan_with_findings`] can run it
 /// inside the transaction that wrote the scan row (#4667).
-async fn insert_findings<'e, E>(
+pub(crate) async fn insert_findings<'e, E>(
     executor: E,
     scan_result_id: Uuid,
     artifact_id: Uuid,

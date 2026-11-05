@@ -1,0 +1,14 @@
+{
+  "jobId": "sandbox-check",
+  "akBaseUrl": "https://ak.example.com",
+  "target": {
+    "type": "package",
+    "index": 0,
+    "registryType": "oci",
+    "package": {
+      "registryType": "oci",
+      "identifier": "ak.example.com/docker-local/ak/sandbox-echo@sha256:<digest of the pushed sandbox-check image>",
+      "transport": {"type": "stdio"}
+    }
+  }
+}
