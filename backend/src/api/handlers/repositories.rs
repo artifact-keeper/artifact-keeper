@@ -5219,9 +5219,16 @@ pub async fn get_repository(
     // `require_visible` above proves nothing about token scope when `repo` is
     // public — it early-returns before `can_access_repo` — so the member
     // filter re-derives BOTH halves from the principal.
-    let storage_used = service
+    let mut storage_used = service
         .get_display_storage_usage(&repo, &member_read_visibility(auth.as_ref()))
         .await?;
+    // MCP registries (#5253): a caller who does not hold the registry is
+    // shown the bytes of the versions it is served only.
+    if repo.repo_type != RepositoryType::Virtual {
+        if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+            storage_used.own_bytes = reader_storage_figures(&served).0;
+        }
+    }
     let auth_type =
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
@@ -5446,6 +5453,34 @@ pub async fn get_repository_storage(
         None
     };
 
+    // MCP registries (#5253): a caller who does not hold the registry gets
+    // the figures of the versions it is served, with the rollup's formula
+    // (per repository, nothing shared: such a caller is never an admin, so
+    // the dedup breakdown is withheld on cloud scope anyway).
+    if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+        let (logical, physical, blobs) = reader_storage_figures(&served);
+        let dedup_scope = match &row {
+            Some(r) => r.dedup_scope.clone(),
+            None => crate::services::storage_stats_service::DedupScope::from_backend(
+                &state.config.storage_backend,
+            )
+            .as_str()
+            .to_string(),
+        };
+        return Ok(Json(RepositoryStorageStatsResponse::assemble(
+            repo.key,
+            logical,
+            physical,
+            physical,
+            0,
+            blobs,
+            dedup_scope,
+            is_admin,
+            instance_unique_bytes,
+            row.map(|r| r.computed_at),
+        )));
+    }
+
     let response = match row {
         Some(r) => RepositoryStorageStatsResponse::assemble(
             repo.key,
@@ -5611,44 +5646,26 @@ pub async fn get_repository_storage_tree(
     // MCP registries (#5253): the materialized rollups include every stored
     // version, so a caller who does not hold the registry gets the tree
     // rebuilt from the rows it is served, with the same per-node formula.
-    if repo.format == RepositoryFormat::Mcp {
-        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
-        if !gate.holds_all(&[repo.id]).await {
-            // The rows are live; `computed_at` keeps the rollup's own mark.
-            let computed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-                "SELECT computed_at FROM repository_path_storage_stats \
-                 WHERE repository_id = $1 AND prefix = ''",
-            )
-            .bind(repo.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            let rows: Vec<(String, String, i64)> = sqlx::query_as(
-                "SELECT path, storage_key, size_bytes FROM artifacts \
-                 WHERE repository_id = $1 AND is_deleted = false \
-                   AND storage_key NOT LIKE 'proxy-cache/%'",
-            )
-            .bind(repo.id)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            let mut served = Vec::with_capacity(rows.len());
-            for row in rows {
-                if gate.visible_listed(repo.id, &row.0).await {
-                    served.push(row);
-                }
-            }
-            let tree = reader_storage_tree(&served, &prefix, levels, limit);
-            return Ok(Json(RepositoryStorageTreeResponse {
-                repository_key: key,
-                node: tree.node,
-                unattributed_bytes: (root_depth == 0).then_some(0),
-                children: tree.children,
-                truncated: tree.truncated,
-                max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
-                computed_at,
-            }));
-        }
+    if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+        // The rows are live; `computed_at` keeps the rollup's own mark.
+        let computed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT computed_at FROM repository_path_storage_stats \
+             WHERE repository_id = $1 AND prefix = ''",
+        )
+        .bind(repo.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let tree = reader_storage_tree(&served, &prefix, levels, limit);
+        return Ok(Json(RepositoryStorageTreeResponse {
+            repository_key: key,
+            node: tree.node,
+            unattributed_bytes: (root_depth == 0).then_some(0),
+            children: tree.children,
+            truncated: tree.truncated,
+            max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at,
+        }));
     }
 
     // The rooted node's own rollup (with the root-only unattributed figure).
@@ -8009,6 +8026,55 @@ pub async fn list_artifacts(
         has_more: Some(has_more),
         total_is_exact: Some(total_is_exact),
     }))
+}
+
+/// For an MCP registry `repo` that `auth` does not hold (#5253), the
+/// `(path, storage_key, size_bytes)` of the stored rows the caller is served
+/// (the generic listing decision), which the storage figures it is shown are
+/// computed from. `None` for any other repository or caller (the
+/// materialized figures apply). Proxy-cache entries are not counted.
+async fn mcp_reader_storage_rows(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> Result<Option<Vec<(String, String, i64)>>> {
+    if repo.format != RepositoryFormat::Mcp {
+        return Ok(None);
+    }
+    let mut gate = super::mcp::GenericArtifactGate::new(state, auth);
+    if gate.holds_all(&[repo.id]).await {
+        return Ok(None);
+    }
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT path, storage_key, size_bytes FROM artifacts \
+         WHERE repository_id = $1 AND is_deleted = false \
+           AND storage_key NOT LIKE 'proxy-cache/%'",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut served = Vec::with_capacity(rows.len());
+    for row in rows {
+        if gate.visible_listed(repo.id, &row.0).await {
+            served.push(row);
+        }
+    }
+    Ok(Some(served))
+}
+
+/// `(logical_bytes, physical_bytes, blob_count)` of `rows` with the
+/// materialized rollup's formula: every row counts toward the logical total,
+/// each `storage_key` once toward the physical one.
+fn reader_storage_figures(rows: &[(String, String, i64)]) -> (i64, i64, i64) {
+    let mut blobs: std::collections::HashMap<&str, i64> = Default::default();
+    let mut logical = 0i64;
+    for (_, key, size) in rows {
+        logical += size;
+        let b = blobs.entry(key.as_str()).or_insert(0);
+        *b = (*b).max(*size);
+    }
+    (logical, blobs.values().sum(), blobs.len() as i64)
 }
 
 struct ReaderStorageTree {

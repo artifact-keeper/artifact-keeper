@@ -415,7 +415,14 @@ async fn get_artifact_health(
     // Cross-repo authorization: the caller must be allowed to see this
     // artifact's repository (token scope + admin bypass + private-repo
     // membership), else existence-hiding NotFound (#2437).
-    check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, artifact_id, &state.db, "read").await?;
+    // #5253: a held MCP server version answers as one with no health score.
+    if !super::artifacts::mcp_servable(&state, auth.as_ref(), artifact_id).await? {
+        return Err(AppError::NotFound(
+            "No health score found for artifact".to_string(),
+        ));
+    }
     let checks = qc_service.list_checks(artifact_id).await?;
 
     let check_summaries: Vec<CheckSummary> = checks
@@ -712,7 +719,10 @@ async fn list_checks(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
-    check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, artifact_id, &state.db, "read").await?;
+    // #5253: a held MCP server version answers as a missing artifact.
+    super::artifacts::require_mcp_servable(&state, &auth, artifact_id).await?;
     let qc_service = QualityCheckService::new(state.db.clone());
     let checks = qc_service.list_checks(artifact_id).await?;
     let response: Vec<CheckResponse> = checks.into_iter().map(CheckResponse::from).collect();
@@ -799,7 +809,9 @@ async fn get_check(
     let check = qc_service.get_check(id).await?;
     // Enforce cross-repo authorization on the check's artifact before
     // returning any check metadata (#2437).
-    check_artifact_visibility(&Some(auth), check.artifact_id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, check.artifact_id, &state.db, "read").await?;
+    require_check_artifact_servable(&state, &auth, check.artifact_id).await?;
     Ok(Json(CheckResponse::from(check)))
 }
 
@@ -826,10 +838,28 @@ async fn list_check_issues(
     // Resolve the check (404s if missing) so we can authorize its artifact
     // before returning any issue metadata (#2437).
     let check = qc_service.get_check(check_id).await?;
-    check_artifact_visibility(&Some(auth), check.artifact_id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, check.artifact_id, &state.db, "read").await?;
+    require_check_artifact_servable(&state, &auth, check.artifact_id).await?;
     let issues = qc_service.list_check_issues(check_id).await?;
     let response: Vec<IssueResponse> = issues.into_iter().map(IssueResponse::from).collect();
     Ok(Json(response))
+}
+
+/// #5253: a check of an MCP server version readers are not served answers
+/// as a missing check for a caller who does not hold the registry.
+async fn require_check_artifact_servable(
+    state: &SharedState,
+    auth: &Option<AuthExtension>,
+    artifact_id: Uuid,
+) -> Result<()> {
+    if super::artifacts::mcp_servable(state, auth.as_ref(), artifact_id).await? {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(
+            "Quality check result not found".to_string(),
+        ))
+    }
 }
 
 #[utoipa::path(
