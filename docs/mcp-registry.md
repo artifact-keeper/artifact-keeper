@@ -134,9 +134,17 @@ server.
 
 Behaviour pinned by the end-to-end suite (clients may rely on it):
 
-- A private repository answers the plain unknown-name `404` (the body of
-  [What a client sees](#what-a-client-sees)) to an anonymous caller **and** to
-  an authenticated user with no grant on it, on every read route.
+- A private repository answers an anonymous caller `401 mcp_unauthorized`
+  (problem+json, with the `WWW-Authenticate` challenge every format route
+  gives), and an authenticated user with no grant on it the plain
+  unknown-name `404` (the body of [What a client sees](#what-a-client-sees)),
+  on every read route. The `401` comes from the repository visibility
+  middleware (`repo_visibility_middleware` in
+  `backend/src/api/middleware/auth.rs`), which refuses the request before the
+  MCP handler runs; `mcp_surface_guard` in `backend/src/api/handlers/mcp.rs`
+  re-renders it as problem+json (test `visibility_middleware_gates_the_surface`).
+  A key that names no repository gets the same `401` anonymously, so the
+  status does not reveal which private registries exist.
 - A trailing slash (`/v0.1/servers/`) is not a route: plain `404`.
 - `/versions` is not paged: it returns every servable version (at most the
   newest 1000) with no `nextCursor`.
@@ -510,9 +518,23 @@ not in the trash) pins as its index or gated child digest is refused in a
 Local or Staging repository with `405` and the OCI error body
 `{"errors":[{"code":"UNSUPPORTED","message":"this manifest is pinned by a published MCP server version ..."}]}`
 (the message names no MCP repository or server). Deleting the tag is still
-allowed (the retention row keeps the manifest). There is no override flag: to
-free the digest, move the server version's artifact to the trash through the
-artifact API; a restored version is then `unresolvable`.
+allowed (the retention row keeps the manifest).
+
+**A pinned digest stays pinned.** There is no override flag and no supported per-version
+way to release the pin. The pin holds while the server version's artifact row
+exists outside the trash (`services::mcp_write::digest_pinned_by_mcp`), and
+no supported route trashes that row: the MCP
+[`DELETE .../versions/{version}`](#delete-versionsversion-soft-delete) only
+sets the status to `deleted` and keeps the artifact, and the generic artifact
+`DELETE` refuses MCP repositories (`400`, see above). The only supported way
+to free the digest is to delete the whole MCP repository that holds the
+version (`DELETE /api/v1/repositories/{key}`): once the delete job has removed
+its rows, none of its versions pins anything, and their tombstones go with
+it. The peer-replication exemption of the generic `DELETE` and a lifecycle
+policy attached to the MCP repository can also trash a server.json row, but
+both skip the namespace gate, the `isLatest` recompute and the
+`MCP_SERVER_DELETED` audit, so they are not a way to release a pin. An admin
+path that releases one version's pins is proposed in #5368.
 
 Switching a repository from `open` to `own-repos` does not resolve versions
 already published: they are `unresolvable` until republished as a new version.
