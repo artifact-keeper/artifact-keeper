@@ -1349,4 +1349,182 @@ mod tests {
             json_path
         );
     }
+
+    /// Env vars the air-gapped guide names that are read by clients, not by
+    /// anything in this repository (#5293). A new entry here must be a
+    /// variable of a client tool, never one of Artifact Keeper's own.
+    const AIR_GAPPED_CLIENT_ENV_VARS: &[&str] = &[
+        "HF_ENDPOINT",
+        "HF_TOKEN",
+        "HF_HUB_DISABLE_XET",
+        "HF_HUB_OFFLINE",
+        "GOPROXY",
+        "GOSUMDB",
+        "GONOSUMDB",
+        "GOPRIVATE",
+        "GOFLAGS",
+        "PIP_INDEX_URL",
+        "PIP_REQUIRE_HASHES",
+        "NPM_CONFIG_REGISTRY",
+        "AK_ADMIN_TOKEN",
+        "AK_TOKEN",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+    ];
+
+    /// Every `/api/v1/...` path in `doc` (prose, tables and code blocks), cut
+    /// at the query string.
+    fn doc_api_paths(doc: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = doc;
+        while let Some(at) = rest.find("/api/v1/") {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || "/{}_-.:%".contains(c)))
+                .unwrap_or(tail.len());
+            let path = tail[..end].trim_end_matches(['.', ':', '/']);
+            out.push(path.to_string());
+            rest = &tail[end..];
+        }
+        out
+    }
+
+    /// Whether a concrete or templated doc path matches a spec path template
+    /// (`{param}` matches any one segment, on either side).
+    fn path_matches_template(doc_path: &str, template: &str) -> bool {
+        let a: Vec<&str> = doc_path.split('/').collect();
+        let b: Vec<&str> = template.split('/').collect();
+        a.len() == b.len()
+            && a.iter().zip(&b).all(|(x, y)| {
+                x == y || y.starts_with('{') || (x.starts_with('{') && x.ends_with('}'))
+            })
+    }
+
+    /// Env-var-looking names in `doc` (`UPPER_SNAKE`, at least one `_`):
+    /// inline code spans outside fences (`NAME` or `NAME=value`), and
+    /// assignments (`NAME=...`, `NAME: ...`) inside fenced code blocks.
+    fn doc_env_vars(doc: &str) -> std::collections::BTreeSet<String> {
+        let inline = regex::Regex::new(r"`([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)(?:=[^`]*)?`").unwrap();
+        let assigned =
+            regex::Regex::new(r"(?:^|[\s\-'\x22])([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\s*[=:]").unwrap();
+        let mut out = std::collections::BTreeSet::new();
+        let mut in_fence = false;
+        for line in doc.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            let re = if in_fence { &assigned } else { &inline };
+            for cap in re.captures_iter(line) {
+                out.insert(cap[1].to_string());
+            }
+        }
+        out
+    }
+
+    fn collect_text(dir: &Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_text(&path, out);
+            } else if path.ends_with("api/openapi.rs") {
+                // This file's allowlist must not satisfy the check by itself.
+                continue;
+            } else if let Ok(text) = std::fs::read_to_string(&path) {
+                out.push_str(&text);
+            }
+        }
+    }
+
+    /// #5293: `docs/air-gapped.md` is read before the cable is cut, when
+    /// nobody can search for a misspelt knob. Every Artifact Keeper env var
+    /// it names must be read somewhere in the backend, the shipped images or
+    /// a compose file, and every `/api/v1/...` route it names must be in the
+    /// OpenAPI spec.
+    #[test]
+    fn air_gapped_guide_names_only_env_vars_and_routes_that_exist() {
+        const DOC: &str = include_str!("../../../docs/air-gapped.md");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+
+        let spec = build_openapi();
+        let templates: Vec<&String> = spec.paths.paths.keys().collect();
+        let paths = doc_api_paths(DOC);
+        assert!(!paths.is_empty(), "the guide names no /api/v1 route at all");
+        let unknown_routes: Vec<&String> = paths
+            .iter()
+            .filter(|p| !templates.iter().any(|t| path_matches_template(p, t)))
+            .collect();
+        assert!(
+            unknown_routes.is_empty(),
+            "docs/air-gapped.md names routes that are not in the OpenAPI spec: {unknown_routes:?}"
+        );
+
+        let mut source = String::new();
+        collect_text(&root.join("backend/src"), &mut source);
+        collect_text(&root.join("docker"), &mut source);
+        for entry in std::fs::read_dir(&root).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("docker-compose") && name.ends_with(".yml") {
+                source.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+            }
+        }
+        let vars = doc_env_vars(DOC);
+        assert!(!vars.is_empty(), "the guide names no env var at all");
+        let unknown_vars: Vec<&String> = vars
+            .iter()
+            .filter(|v| !AIR_GAPPED_CLIENT_ENV_VARS.contains(&v.as_str()))
+            .filter(|v| !source.contains(v.as_str()))
+            .collect();
+        assert!(
+            unknown_vars.is_empty(),
+            "docs/air-gapped.md names env vars nothing in backend/src, docker/ or a \
+             docker-compose*.yml reads (add client-side ones to \
+             AIR_GAPPED_CLIENT_ENV_VARS): {unknown_vars:?}"
+        );
+    }
+
+    #[test]
+    fn air_gapped_guide_lint_helpers() {
+        assert_eq!(
+            doc_api_paths("`PUT /api/v1/repositories/{key}/cache-ttl`, then\n curl https://x/api/v1/peers/abc/repositories?x=1."),
+            ["/api/v1/repositories/{key}/cache-ttl", "/api/v1/peers/abc/repositories"]
+        );
+        assert!(path_matches_template(
+            "/api/v1/peers/abc/repositories",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        assert!(path_matches_template(
+            "/api/v1/peers/{peer}/repositories",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        assert!(!path_matches_template(
+            "/api/v1/peers/abc",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        assert!(!path_matches_template(
+            "/api/v1/peerz/abc/repositories",
+            "/api/v1/peers/{id}/repositories"
+        ));
+        let vars = doc_env_vars(
+            "set `AK_SSRF_ALLOW_PRIVATE_CIDRS=10.0.0.0/8`, `HF_HUB_DISABLE_XET=1`, `cache-ttl`, `X`, `Mixed_Case`\n\
+             ```yaml\n      SCANNER_OFFLINE: \"true\"\n      - GRYPE_DB_AUTO_UPDATE=false\n```\n\
+             ```bash\nexport HF_ENDPOINT=https://x  # GET /api/v1/X_Y\n```\n\
+             `NOT_IN_FENCE_ONLY`",
+        );
+        assert_eq!(
+            vars.into_iter().collect::<Vec<_>>(),
+            [
+                "AK_SSRF_ALLOW_PRIVATE_CIDRS",
+                "GRYPE_DB_AUTO_UPDATE",
+                "HF_ENDPOINT",
+                "HF_HUB_DISABLE_XET",
+                "NOT_IN_FENCE_ONLY",
+                "SCANNER_OFFLINE"
+            ]
+        );
+    }
 }
