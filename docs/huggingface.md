@@ -113,7 +113,7 @@ All routes live under `/huggingface/{repo_key}`. Model IDs may be bare
 | `GET`, `HEAD` | `/{model_id}/resolve/{revision}/{filename}` | Download a file (`hf_hub_download`). Remote: pull-through from the Hub, then served from cache. |
 | `GET` | `/api/models/{model_id}` | Model info (`model_info`, with `siblings`). Remote: proxied from the Hub on a miss. |
 | `GET` | `/api/models/{model_id}/revision/{revision}` | Model info at a revision; what `snapshot_download` and `hf download` call first. |
-| `GET` | `/api/models/{model_id}/tree/{revision}` | File listing. Remote: proxied from the Hub when nothing is held locally. |
+| `GET` | `/api/models/{model_id}/tree/{revision}` | File listing (`list_repo_tree`; `snapshot_download` calls it with `recursive=true`). Honours `recursive`: without it, subdirectories are listed as `directory` entries. Remote: proxied from the Hub when nothing is held locally, forwarding `recursive`, `expand` and `cursor` (each distinct query is cached on its own), with the Hub's pages followed and returned as one list. |
 | `GET` | `/api/models` | Models held in the repository (see limitations). |
 | `POST` | `/api/models/{model_id}/upload/{revision}` | Upload one file to a Local repository (Artifact Keeper's own route, see below). |
 
