@@ -674,6 +674,107 @@ mod tests {
         assert_eq!(json["exclude_patterns"], serde_json::json!([]));
     }
 
+    /// The paths a Hugging Face Remote sends upstream for one model
+    /// (`api/handlers/huggingface.rs`: model info with and without a
+    /// revision, the tree, the resolve download, and a `refs/pr/N` revision,
+    /// which goes upstream as one encoded segment).
+    fn hf_upstream_paths(model: &str) -> Vec<String> {
+        vec![
+            format!("api/models/{model}"),
+            format!("api/models/{model}/revision/main"),
+            format!("api/models/{model}/revision/refs%2Fpr%2F1"),
+            format!("api/models/{model}/tree/main"),
+            format!("api/models/{model}/tree/main?recursive=true&expand=false"),
+            format!("{model}/resolve/main/config.json"),
+            format!("{model}/resolve/0123456789abcdef0123456789abcdef01234567/onnx/model.onnx"),
+        ]
+    }
+
+    /// The `-d '<json>'` request body of the first `upstream-filter` PUT
+    /// after `heading` in `doc`.
+    fn documented_filter(doc: &str, heading: &str) -> CompiledUpstreamFilter {
+        let section = &doc[doc.find(heading).expect("section heading")..];
+        let body = section
+            .lines()
+            .skip_while(|l| !l.contains("/upstream-filter"))
+            .find_map(|l| l.trim().strip_prefix("-d '"))
+            .and_then(|l| l.strip_suffix('\''))
+            .expect("a -d '<json>' body after the upstream-filter PUT");
+        serde_json::from_str::<UpstreamFilter>(body)
+            .expect("documented body is an UpstreamFilter")
+            .compile()
+            .expect("documented patterns compile")
+    }
+
+    /// #5290: the pattern `docs/huggingface.md` tells operators to use must
+    /// admit both path shapes of an allowed organisation (a filter on one
+    /// shape alone breaks `snapshot_download` on its first call) and refuse
+    /// unlisted and look-alike organisations.
+    #[test]
+    fn documented_huggingface_filter_admits_both_shapes_and_refuses_lookalikes() {
+        const DOC: &str = include_str!("../../../docs/huggingface.md");
+        let f = documented_filter(DOC, "### Restricting which models a Remote can fetch");
+        for model in [
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "Qwen/Qwen2.5-1.5B-Instruct",
+        ] {
+            for path in hf_upstream_paths(model) {
+                assert!(f.allows(&path), "allowed model refused: {path}");
+            }
+        }
+        for model in [
+            "evil-org/backdoor",
+            "sentence-transformer/all-MiniLM-L6-v2",
+            "sentence-transformers-x/all-MiniLM-L6-v2",
+            "qwen/Qwen2.5-1.5B-Instruct",
+            "evil-org/Qwen/x",
+        ] {
+            for path in hf_upstream_paths(model) {
+                assert!(!f.allows(&path), "refused model admitted: {path}");
+            }
+        }
+
+        // The single-model and organisation-less examples in the same section.
+        let one = compiled(&[r"^(api/models/)?Qwen/Qwen2\.5-1\.5B-Instruct(/|$)"], &[]);
+        let bare = compiled(&["^(api/models/)?gpt2(/|$)"], &[]);
+        assert!(DOC.contains(r"`^(api/models/)?Qwen/Qwen2\.5-1\.5B-Instruct(/|$)`"));
+        assert!(DOC.contains("`^(api/models/)?gpt2(/|$)`"));
+        for path in hf_upstream_paths("Qwen/Qwen2.5-1.5B-Instruct") {
+            assert!(one.allows(&path), "{path}");
+        }
+        for path in hf_upstream_paths("Qwen/Qwen2.5-1.5B-Instruct-evil")
+            .into_iter()
+            .chain(hf_upstream_paths("Qwen/Qwen2x5-1.5B-Instruct"))
+        {
+            assert!(!one.allows(&path), "{path}");
+        }
+        for path in hf_upstream_paths("gpt2") {
+            assert!(bare.allows(&path), "{path}");
+        }
+        for path in hf_upstream_paths("gpt2-xl") {
+            assert!(!bare.allows(&path), "{path}");
+        }
+    }
+
+    /// #5290: the general page's two-shape rows (npm and Hugging Face).
+    #[test]
+    fn documented_two_shape_patterns_in_the_general_page_hold() {
+        const DOC: &str = include_str!("../../../docs/upstream-filter.md");
+        assert!(DOC.contains("`^@acme(/|%2F)`"));
+        assert!(DOC.contains("`^(api/models/)?acme/[^/]+(/|$)`"));
+        let npm = compiled(&["^@acme(/|%2F)"], &[]);
+        assert!(npm.allows("@acme%2Fwidget"));
+        assert!(npm.allows("@acme/widget/-/widget-1.0.0.tgz"));
+        assert!(!npm.allows("@acme-evil%2Fwidget"));
+        let hf = compiled(&["^(api/models/)?acme/[^/]+(/|$)"], &[]);
+        for path in hf_upstream_paths("acme/model") {
+            assert!(hf.allows(&path), "{path}");
+        }
+        for path in hf_upstream_paths("acme-evil/model") {
+            assert!(!hf.allows(&path), "{path}");
+        }
+    }
+
     /// DB-backed: save / load / cache invalidation / delete round trip.
     #[tokio::test]
     async fn save_load_enforce_delete_round_trip_db() {
