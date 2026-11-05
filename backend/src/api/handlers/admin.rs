@@ -5414,6 +5414,10 @@ mod tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // The test compares `hidden_nav_items` across two reads, so a
+        // concurrent hidden-nav test writing that shared row between them
+        // made it flaky (#5431). Hold the same lock those tests take.
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
         let (user_id, username) = tdh::create_user(&pool).await;
         let state = tdh::build_state(pool.clone(), "/tmp/admin-upstream-pause");
         let auth = admin_auth(user_id, &username);

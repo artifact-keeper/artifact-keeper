@@ -296,7 +296,7 @@ pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
 const HIDDEN_NAV_ITEMS_TEST_LOCK_KEY: i64 = 0x4e56_4574; // "NV" + issue #4574
 
 /// Cross-process serialization guard for the DB-backed tests that write the
-/// `ui.hidden_nav_items` row (#4574). It is ONE row in `system_settings`
+/// `ui.hidden_nav_items` row (#4574), or that compare it across reads (#5431). It is ONE row in `system_settings`
 /// shared by the whole database, so two tests writing it under `cargo
 /// nextest` process-per-test parallelism would read each other's values.
 /// Mirrors [`token_policy_serial_lock`].
