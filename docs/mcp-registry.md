@@ -1810,7 +1810,9 @@ default 50, max 200).
 observable without credentials) | `caller_specific` (a page was
 `cacheScope: private`: the list may differ per user) | `unknown` (reports and
 declarations); `outcome` `ok` | `auth_required` | `rate_limited` | `timeout`
-| `start_failed` | `needs_config` (the sandboxed server would not start or
+| `start_failed` (the sandbox or the connection failed, not the server:
+the engine exited 125-127, the runtime, network or image was missing;
+retried) | `needs_config` (the sandboxed server would not start or
 answer without configuration) | `refused` (redirect, private address, over
 the size cap) | `unsupported` | `error`. Failed attempts are listed in
 `snapshots` (with empty lists and `details.error`) but are never `current`.
@@ -1928,7 +1930,7 @@ queues the same jobs automatically.
 | `remote_probe` | each `remotes[]` entry of type `streamable-http` with a concrete `http(s)` URL (no `{template}` variables, no userinfo). Legacy `sse` remotes are not probed. | `mcp_probe_remotes`: `all` (Local, Staging, Remote), `hosted_only` (Local and Staging only), `off` (never, the default). Re-queued every `max(ttlMs, 6 h)` after the last probe, because a remote can change its tools without a version bump. Handed out only while the version is servable (as a sandbox run), so a held, blocked or unapproved version's endpoints are never contacted. |
 | `sandbox_run` | each stdio `packages[]` entry of type `npm`, `pypi` or `oci` that the package policy pinned to an AK repository | `mcp_sandbox_introspection: on`. Never re-queued (the bytes are version pinned). Handed out only while the version is servable (its own and its backing packages' gates pass), so the bytes executed are the bytes AK scanned. |
 
-Attempts: 3. `timeout`, `rate_limited` and `error` results are retried after
+Attempts: 3. `timeout`, `rate_limited`, `start_failed` and `error` results are retried after
 `2^attempts` minutes (a `429`'s `Retry-After`, clamped to 1 minute .. 24 h);
 a claim not completed within 10 minutes returns to the queue. The scheduler
 pass (every 15 minutes, idempotent) reaps expired claims and re-queues due
@@ -2045,11 +2047,12 @@ code. Server-to-client requests over stdio are answered "method not found".
 **Sandbox runner** (`--sandbox`). A pluggable `SandboxRunner` renders a
 runner-neutral guest spec:
 
-- npm: image `AK_MCP_SANDBOX_NODE_IMAGE` (default `node:22-alpine`),
+- npm: image `AK_MCP_SANDBOX_NODE_IMAGE` (default
+  `docker.io/library/node:22-alpine` pinned by digest),
   `npx --yes --registry=<registryBaseUrl> <identifier>@<version> <args>` and
   `npm_config_registry=<registryBaseUrl>`;
 - pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
-  `ghcr.io/astral-sh/uv:python3.12-alpine`), `uvx --no-config
+  `ghcr.io/astral-sh/uv:python3.12-alpine` pinned by digest), `uvx --no-config
   --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
 - oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:...` itself, no
   network.
@@ -2060,29 +2063,70 @@ environment variables that steer a package manager or runtime (`NPM_CONFIG_*`,
 `UV_*`, `PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
 `HOME`, ...) are dropped. Every `isSecret` value, every required value
 without a default and every `{template}` value is the placeholder
-`AK_PLACEHOLDER_<NAME>`. The whole run, install included, is capped at 120 s,
-after which the guest is killed. A guest that exits before answering is
-reported `needs_config`.
+`AK_PLACEHOLDER_<NAME>`. The whole run, install included, is capped at 120 s.
+When the run ends, whatever the outcome, the engine client (or launcher)
+gets `SIGTERM`, then `SIGKILL` 5 s later, and the container is removed
+through the engine (`<engine> rm -f <name>`): killing the client alone
+leaves the container running. An OCI package's image is removed after its
+run (`<engine> rmi`); the runner images are kept. At startup the worker
+removes any container labelled `com.artifactkeeper.mcp-sandbox.owner=<worker
+id>` that a crashed or killed earlier run left behind, and warns about
+runner images that are not pinned by digest. A guest that exits before
+answering is reported `needs_config`, unless the engine exited `125`, `126`
+or `127` (the engine failed: runtime, network or image missing, pull failed,
+name in use), which is `start_failed` with the engine's message, and
+retried.
+
+Each stdio read is bounded: a line is read only up to what is left of the
+1 MiB budget, so a guest printing one endless line costs the worker 1 MiB,
+not its memory. A result the backend would refuse (a name over 256 bytes, a
+resource URI over 2048, `instructions` over 64 KiB, more than 1000 items of
+a kind, a request body over 1 MiB) is posted as `refused` with the reason
+instead: over-long names and URIs are dropped like unusable items, the rest
+refuse the result.
+
+The engine client or launcher starts with a cleared environment: only
+`PATH`, `HOME`, `USER`, `LOGNAME`, locale and `TZ`, `TMPDIR`, the `XDG_*`
+directories, `DBUS_SESSION_BUS_ADDRESS`, the Podman and Docker client
+variables (`CONTAINER_HOST`, `CONTAINERS_*`, `REGISTRY_AUTH_FILE`,
+`DOCKER_HOST`, `DOCKER_CONFIG`, `DOCKER_CONTEXT`, `DOCKER_CERT_PATH`,
+`DOCKER_TLS_VERIFY`), `KUBECONFIG` and `KUBERNETES_SERVICE_HOST`/`_PORT`,
+the proxy variables (for image pulls), every `AK_MCP_SANDBOX_*` variable and
+the names listed in `AK_MCP_SANDBOX_PASS_ENV` (comma separated) pass.
+`AK_MCP_INTROSPECTOR_TOKEN` and `AK_TOKEN` never do.
 
 Runners:
 
 - **OCI runner** (default): `AK_MCP_SANDBOX_ENGINE` (`podman` default, or
   `docker`), `AK_MCP_SANDBOX_RUNTIME` (`runsc`, gVisor, by default; `kata-fc`
-  or another microVM runtime works the same way; an empty runtime is refused
-  unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`, because a plain
-  container is not a boundary for attacker-chosen install scripts),
+  or another Kata runtime works the same way; an empty runtime, `runc`,
+  `crun` or any runtime that is not gVisor (`runsc*`) or Kata (`kata*`) is
+  refused unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`, because a
+  plain container is not a boundary for attacker-chosen install scripts),
   `AK_MCP_SANDBOX_NETWORK` (default `ak-mcp-sandbox`), `AK_MCP_SANDBOX_MEMORY`
   (`1g`), `AK_MCP_SANDBOX_CPUS` (`1`). Rendered as `<engine> run --rm -i
-  --name=ak-mcp-sbx-<job> --runtime=runsc --network=<net | none>
-  --read-only --tmpfs=/tmp:rw,exec,nosuid,nodev,size=512m
-  --user=65532:65532 --cap-drop=ALL --security-opt=no-new-privileges
-  --pids-limit=256 --memory=1g --cpus=1 --pull=missing --stop-timeout=1
-  --workdir=/tmp -e ... <image> <argv>`.
+  --name=ak-mcp-sbx-<job>-<random> --label=com.artifactkeeper.mcp-sandbox=<job>
+  --label=com.artifactkeeper.mcp-sandbox.owner=<worker id> --runtime=runsc
+  --network=<net | none> --read-only
+  --tmpfs=/tmp:rw,exec,nosuid,nodev,size=512m --user=65532:65532
+  --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256
+  --memory=1g --cpus=1 --pull=missing --stop-timeout=1 --log-driver=none
+  --workdir=/tmp -e ... <image> <argv>`; with Podman (an engine named
+  `podman*`) also `--timeout=130` (conmon kills the guest even if the
+  worker died) and `--http-proxy=false`. The name is fresh per attempt, so a
+  retry never collides with an earlier guest. `--log-driver=none`: the
+  guest's output is read over the attach stream, and Docker would otherwise
+  copy all of it into an uncapped JSON log on the host.
 - **External runner**: `AK_MCP_SANDBOX_COMMAND=/path/to/launcher` is started
   as `<launcher> '<guest spec JSON>'` and must connect the guest's stdio to
   its own (a Firecracker launcher, a Kubernetes job wrapper). The spec:
   `{jobId, image, argv, env: [[name, value]], network: "ak-only" | "none",
-  akBaseUrl, wallClockMs, notes}`.
+  akBaseUrl, wallClockMs, notes, pruneImage}`. When the run ends the
+  launcher gets `SIGTERM` (then `SIGKILL` after 5 s) and must remove its
+  guest; exit codes `125`-`127` mean the launcher itself failed
+  (`start_failed`). The Kubernetes launcher in `deploy/mcp-introspector/k8s`
+  names each pod afresh, deletes it on `SIGTERM` and deletes pods an earlier
+  attempt of the same job left behind.
 
 **Inventory adapters** (`convert` / `push`, posted as `gateway_reported`):
 `docker-gateway` (the array `docker mcp tools ls --format=json` prints),

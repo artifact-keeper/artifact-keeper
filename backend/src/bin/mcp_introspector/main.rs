@@ -104,6 +104,11 @@ fn env(k: &str) -> Option<String> {
     std::env::var(k).ok()
 }
 
+/// The worker id outside `run` (`render-sandbox`, `sandbox-probe`).
+fn default_owner() -> String {
+    env("AK_MCP_INTROSPECTOR_ID").unwrap_or_else(|| "ak-mcp-introspector".into())
+}
+
 /// Refuse to probe with an override that would admit private addresses.
 fn ensure_public_only() -> Result<(), String> {
     match http::private_override_set(env) {
@@ -128,7 +133,7 @@ fn convert_file(from: &str, file: &str) -> Result<Value, String> {
 
 /// The guest spec and runner command for a claimed job document.
 fn render_sandbox(job: &Value) -> Result<Value, String> {
-    let runner = sandbox::runner_from_env(env);
+    let runner = sandbox::runner_from_env(env, &default_owner());
     let ak = job["akBaseUrl"].as_str().ok_or("job has no akBaseUrl")?;
     let spec = sandbox::guest_spec(
         job["jobId"].as_str().unwrap_or("job"),
@@ -156,12 +161,25 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             ensure_public_only()?;
             let w = worker::Worker {
                 backend: worker::Backend::new(&ak_url, &token),
+                runner: sandbox.then(|| sandbox::runner_from_env(env, &worker_id)),
                 worker_id,
-                runner: sandbox.then(|| sandbox::runner_from_env(env)),
                 images: sandbox::images_from_env(env),
                 http: http::guarded_client(),
             };
             tracing::info!(kinds = ?w.kinds(), "ak-mcp-introspector started");
+            if let Some(runner) = &w.runner {
+                // Guests a crashed or killed earlier run left behind.
+                match sandbox::reap_leftovers(runner.as_ref()).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::warn!(removed = n, "removed leftover sandbox guests"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not check for leftover sandbox guests")
+                    }
+                }
+                for image in w.images.unpinned() {
+                    tracing::warn!(%image, "sandbox runner image is not pinned by digest");
+                }
+            }
             if once {
                 w.once().await.map(|_| ())
             } else {
@@ -211,8 +229,11 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::SandboxProbe { job } => {
-            let out = sandbox_probe_job(sandbox::runner_from_env(env).as_ref(), &read_json(&job)?)
-                .await?;
+            let out = sandbox_probe_job(
+                sandbox::runner_from_env(env, &default_owner()).as_ref(),
+                &read_json(&job)?,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
             if out["outcome"] == "ok" {
                 Ok(())

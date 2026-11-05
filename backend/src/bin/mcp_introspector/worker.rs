@@ -13,8 +13,13 @@ use crate::http::{check_url, HttpTransport};
 use crate::protocol::{probe, ProbeReport};
 use crate::sandbox::{guest_spec, run_and_probe, Images, SandboxRunner};
 
-pub const MAX_ITEMS: usize = 1000;
-pub const MAX_BYTES: usize = 1024 * 1024;
+use artifact_keeper_backend::services::mcp_capabilities as caps;
+
+/// The backend's limits, so a result the backend would refuse is refused
+/// here, with the reason, instead of being posted, rejected, and left to
+/// expire as "claim lease expired".
+pub const MAX_ITEMS: usize = caps::MAX_ITEMS;
+pub const MAX_BYTES: usize = caps::INGEST_MAX_BYTES;
 /// The whole remote probe (all requests together).
 pub const REMOTE_BUDGET: Duration = Duration::from_secs(30);
 
@@ -146,6 +151,46 @@ fn failed(outcome: &str, error: impl Into<String>) -> ProbeReport {
     }
 }
 
+/// `report` as the backend will accept it: an `ok` result whose lists or
+/// instructions break the backend's limits ([`caps::CapabilitySet::from_doc`],
+/// the same check the backend applies) becomes `refused` with the reason.
+pub fn within_backend_limits(report: ProbeReport) -> ProbeReport {
+    if report.outcome != "ok" {
+        return report;
+    }
+    let doc = json!({
+        "tools": report.tools, "resources": report.resources,
+        "prompts": report.prompts, "instructions": report.instructions,
+    });
+    match caps::CapabilitySet::from_doc(&doc) {
+        Ok(_) => report,
+        Err(e) => ProbeReport {
+            details: report.details,
+            ..failed("refused", format!("result over the backend's limits: {e}"))
+        },
+    }
+}
+
+/// A `complete` body the backend accepts: within its request body limit
+/// ([`MAX_BYTES`]), else the result is replaced by a `refused` one.
+pub fn within_body_limit(body: Value) -> Value {
+    let size = serde_json::to_vec(&body)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if size <= MAX_BYTES {
+        return body;
+    }
+    let mut r = failed(
+        "refused",
+        format!("result is {size} bytes, over the backend's {MAX_BYTES} byte limit"),
+    )
+    .to_result_json();
+    for k in ["claimToken", "workerVersion"] {
+        r[k] = body[k].clone();
+    }
+    r
+}
+
 /// Probe one remote URL with the guard, the cap and the overall budget.
 pub async fn probe_remote(client: reqwest::Client, url: &str) -> ProbeReport {
     if let Err(e) = check_url(url) {
@@ -153,7 +198,7 @@ pub async fn probe_remote(client: reqwest::Client, url: &str) -> ProbeReport {
     }
     let mut t = HttpTransport::new(client, url, MAX_BYTES);
     match tokio::time::timeout(REMOTE_BUDGET, probe(&mut t, MAX_ITEMS)).await {
-        Ok(r) => r,
+        Ok(r) => within_backend_limits(r),
         Err(_) => failed("timeout", "probe exceeded 30 s"),
     }
 }
@@ -176,7 +221,7 @@ pub async fn sandbox_probe(
             r.details.insert("runner".into(), json!(runner.name()));
             r.details.insert("image".into(), json!(spec.image));
             r.details.insert("notes".into(), json!(spec.notes));
-            r
+            within_backend_limits(r)
         }
         Err(e) => failed("unsupported", e.to_string()),
     }
@@ -209,13 +254,13 @@ impl Worker {
             },
             _ => failed("unsupported", "unknown job kind"),
         };
-        let mut body = report.to_result_json();
+        let mut body = within_backend_limits(report).to_result_json();
         body["claimToken"] = job["claimToken"].clone();
         body["workerVersion"] = json!(format!(
             "ak-mcp-introspector/{}",
             artifact_keeper_backend::build_info::VERSION
         ));
-        body
+        within_body_limit(body)
     }
 
     /// Claim and run at most one job. `Ok(true)` when one ran.
@@ -390,5 +435,46 @@ mod tests {
         assert!(b.complete("j", &json!({})).await.is_err());
         let r = probe_remote(crate::http::guarded_client(), "http://169.254.169.254/").await;
         assert_eq!(r.outcome, "refused");
+    }
+
+    /// A result the backend would refuse is refused here with the reason
+    /// (the backend would answer 400/413 and the job would hang until its
+    /// lease expired).
+    #[test]
+    fn results_over_the_backend_limits_are_refused() {
+        let ok = |tools: Vec<Value>, instructions: Option<String>| ProbeReport {
+            outcome: "ok".into(),
+            auth_state: "none".into(),
+            tools,
+            instructions,
+            ..Default::default()
+        };
+        let fine = within_backend_limits(ok(vec![json!({"name": "t"})], Some("use it".into())));
+        assert_eq!(fine.outcome, "ok");
+        let long_name = within_backend_limits(ok(
+            vec![json!({"name": "n".repeat(caps::MAX_NAME_LEN + 1)})],
+            None,
+        ));
+        assert_eq!(long_name.outcome, "refused");
+        assert!(long_name.error.unwrap().contains("backend's limits"));
+        let long_instructions =
+            within_backend_limits(ok(vec![], Some("x".repeat(caps::MAX_INSTRUCTIONS_LEN + 1))));
+        assert_eq!(long_instructions.outcome, "refused");
+        assert!(long_instructions.error.unwrap().contains("instructions"));
+        let failed_stays = within_backend_limits(failed("timeout", "t"));
+        assert_eq!(failed_stays.outcome, "timeout");
+
+        // Within every per-item limit, over the request body limit.
+        let big: Vec<Value> = (0..900)
+            .map(|i| json!({"name": format!("t{i}"), "description": "d".repeat(2000)}))
+            .collect();
+        let mut body = within_backend_limits(ok(big, None)).to_result_json();
+        assert_eq!(body["outcome"], "ok");
+        body["claimToken"] = json!("ct");
+        let body = within_body_limit(body);
+        assert_eq!(body["outcome"], "refused");
+        assert_eq!(body["claimToken"], "ct");
+        assert!(body["error"].as_str().unwrap().contains("byte limit"));
+        assert!(serde_json::to_vec(&body).unwrap().len() < MAX_BYTES);
     }
 }
