@@ -504,8 +504,29 @@ export GONOSUMDB=example.com/internal/*
 **npm.** `npm ci` from a lockfile installs cached tarballs without needing
 fresh metadata. `npm audit` and `npm audit signatures` call upstream endpoints
 (`/-/npm/v1/security/...`, `/-/npm/v1/attestations/...`) that Artifact Keeper
-passes through and does not cache positively. Offline they fail. Run them on
-the low side before content crosses.
+passes through and does not cache positively. Run them on the low side before
+content crosses. Offline, a Remote answers them as follows:
+
+| Request | Upstream unreachable | Refused by the upstream filter | Cache-only |
+| --- | --- | --- | --- |
+| `GET /-/npm/v1/attestations/...`, `/-/v1/search` and other `/-/` reads | `503 upstream unreachable: ...` | `404 path excluded by the upstream filter of repository '<key>'` | `404 not in cache; repository '<key>' is cache-only` |
+| `POST /-/npm/v1/security/advisories/bulk`, `/-/npm/v1/security/audits/quick` | `200` with an empty advisory set | `200` with an empty advisory set | `200` with an empty advisory set |
+| `GET /-/ping`, `/-/whoami` | answered locally | `404` (filter reason) | `404` (cache-only reason) |
+
+- An attestation answer still held in the attestation negative cache
+  (`NPM_ATTESTATION_NEGATIVE_CACHE_*`, a `404`/`410` for that version, held
+  for up to an hour by default) is served instead of the refusal or the `503`.
+  Positive attestation bundles are never cached, so `npm audit signatures`
+  cannot verify provenance offline.
+- The audit endpoints degrade to an empty advisory set (#1400), so offline
+  `npm audit` reports `found 0 vulnerabilities`. That is not a clean audit:
+  audit on the low side.
+- A Virtual repository tries each Remote member in turn. When none answers it
+  returns `503` if a member was unreachable, otherwise `404` listing each
+  member's refusal reason.
+- `501 ... is not implemented for local repositories` is the answer of a Local
+  repository only (and of a Virtual repository with no Remote member, which
+  says so).
 
 **PyPI.** Hash-checking installs work offline: the hashes come from your lock
 file and the wheels are immutable cache entries. Only the simple index is
