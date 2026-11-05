@@ -1327,6 +1327,8 @@ API's usual `{"code", "message"}` body.
 | `POST /catalog/bulk-decide` | admin | `{"ids": ["<uuid>", ...], "action": "approve" \| "block", "reason": "..."}` (1 to 500 ids, names or `name@version` rows) | `200 BulkDecideResult`; `400` no ids or more than 500; `422` another `action` |
 | `POST /catalog/{id}/request-approval` | read | `{"note": "..."}` (optional, 500 characters kept) | `200 CatalogItem` |
 | `GET /sync` | read | | `200 SyncStatus` |
+| `POST /seed` | admin, or an API token with `trigger:sync` and access to the repository | `{"servers": [{"name": "io.github.acme/x", "version": "1.2.0"}, ...], "reason": "..."}` (1 to 500, concrete versions) | `202 {"jobId", "repository", "status": "pending", "total", "statusUrl"}`; `400` bad list; `409` scheduled upstream jobs paused, or the Remote is cache-only; `502` no outbound fetch path. See [Seeding named servers](#seeding-named-servers) |
+| `GET /seed/{jobId}` | read | | `200 SeedJob` |
 | `POST /sync` | admin, or an API token with `trigger:sync` and access to the repository | | `202 {"repository": "<key>", "status": "running", "statusUrl": "/api/v1/repositories/<key>/mcp/sync"}`: the pass runs in the background; `409` a pass is already running, or scheduled upstream jobs are paused; `502` this instance has no outbound fetch path |
 
 `GET /api/v1/mcp/pending-summary` (authenticated; token scope
@@ -1382,6 +1384,54 @@ curl -s "$AK/api/v1/repositories/mcp-official/mcp/sync" -H "Authorization: Beare
 A pass stops after 200 pages; the next one resumes at its cursor, so a
 large registry needs several passes (`lastSummary.complete` is `false`
 until one reaches the last page).
+
+### Seeding named servers
+
+`POST /seed` pins exact server versions without waiting for the sync to
+reach their names (#5408). A first sync pages the upstream in name order, so
+on the official registry (over 2,000 pages) a name late in the alphabet is
+not in the catalog for hours, and `POST /catalog/pins` answers `404` for it
+until then. "Seed exactly these servers" is also the air-gap workflow: see
+[Air-gapped deployment](air-gapped.md).
+
+```bash
+curl -s -X POST "$AK/api/v1/repositories/mcp-official/mcp/seed" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"servers": [{"name": "io.github.daedalus/mcp-sqlite3", "version": "1.2.0"}], "reason": "lab seed"}'
+# 202 {"jobId":"...","repository":"mcp-official","status":"pending","total":1,"statusUrl":"/api/v1/repositories/mcp-official/mcp/seed/<jobId>"}
+```
+
+The job runs in the background, one item after the other, and takes three steps per item:
+
+1. A version that is already pinned and ingested is `already_pinned`. The
+   upstream is not contacted.
+2. The name's version list, `GET {upstream}/v0.1/servers/{name}/versions`,
+   is fetched through the sync's outbound path: the SSRF guard, the
+   upstream credentials, the egress proxy, the upstream gate and its
+   cache-only refusal, and `UPSTREAM_FETCHED`. The list is recorded in the
+   catalog exactly as a sync page carrying those versions would record it:
+   the name row with its summary, `mcp_server_deny`, the lookalike check and
+   `mcp_auto_approve_namespaces`. A later sync finds the name already known.
+3. The version is pinned as `POST /catalog/pins` pins it: approved with the
+   request's `reason`, audited `MCP_SERVER_APPROVED`, and ingested with its
+   packages pinned through the Remote's `mcp_package_repos`.
+
+Poll `statusUrl` until `status` is `completed`. Each item ends `pinned`,
+`already_pinned`, `refused` or `failed`. `refused` covers a denied name, a
+name that is blocked or flagged for review (lookalike), and a version the
+upstream does not list (`reason` names the listed versions). In each case
+nothing is approved. `failed` covers an upstream or ingest error. The whole
+request is refused with `409`, before a job exists, while scheduled
+upstream jobs are paused (`upstream_jobs_paused`) or the Remote is
+cache-only, because a seed contacts the upstream. A job interrupted by a
+restart stays `running`. Submit the list again: items already done answer
+`already_pinned`.
+
+```text
+SeedJob  { jobId, repository, status: "pending" | "running" | "completed" | "failed",
+           error, createdAt, startedAt, finishedAt,
+           items: [{ name, version, state, reason, catalogId }] }
+```
 
 Approving a name (or pinning a version) ingests it right away; when upstream
 cannot be reached the approval stands, `ingestError` says why, and the next
