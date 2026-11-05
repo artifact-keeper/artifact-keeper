@@ -737,6 +737,18 @@ impl<'a> GenericArtifactGate<'a> {
         }
     }
 
+    /// Whether the caller sees every stored version of each of `repo_ids`
+    /// (none is an MCP registry, or the caller holds each one that is).
+    pub(crate) async fn holds_all(&mut self, repo_ids: &[Uuid]) -> bool {
+        for id in repo_ids {
+            match self.repo(*id).await {
+                GateRepo::NotMcp | GateRepo::Mcp(_, true) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     async fn repo(&mut self, repo_id: Uuid) -> GateRepo {
         if let Some(r) = self.repos.get(&repo_id) {
             return r.clone();
