@@ -37,6 +37,8 @@ pub const ENVIRONMENT_REEVAL_JOB: &str = "environment_reeval";
 pub const NPM_UPSTREAM_FEED_JOB: &str = "npm_upstream_feed";
 /// Peer replication transfers (push / mirror sync tasks).
 pub const PEER_SYNC_JOB: &str = "peer_sync";
+/// Remote MCP registry sync (`mcp_remote::spawn`, #5253).
+pub const MCP_REMOTE_SYNC_JOB: &str = "mcp_remote_sync";
 
 /// Every scheduled job that honours the switch.
 pub const PAUSABLE_JOBS: &[&str] = &[
@@ -44,6 +46,7 @@ pub const PAUSABLE_JOBS: &[&str] = &[
     ENVIRONMENT_REEVAL_JOB,
     NPM_UPSTREAM_FEED_JOB,
     PEER_SYNC_JOB,
+    MCP_REMOTE_SYNC_JOB,
 ];
 
 /// `UPSTREAM_JOBS_PAUSED`, installed once at startup by [`set_env_default`].
@@ -362,6 +365,13 @@ mod tests {
                 "PEER_SYNC_JOB",
                 ".skip_tick(",
                 "process_pending_tasks(&db",
+            ),
+            (
+                MCP_REMOTE_SYNC_JOB,
+                include_str!("mcp_remote.rs"),
+                "MCP_REMOTE_SYNC_JOB",
+                ".skip_tick(",
+                "run_due(&state",
             ),
         ];
         let gate_ctor = format!("{}::new(", "UpstreamPauseGate");

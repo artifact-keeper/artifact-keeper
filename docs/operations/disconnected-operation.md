@@ -41,7 +41,7 @@ starts outbound work that an operator turned off.
 | `environment_reeval` | OSV (`query_osv_detailed`), when advisory deltas are pending. Runs every 60 s. | `backend/src/services/scheduler_service.rs`, "Environment advisory re-evaluation" |
 | `npm_upstream_feed` | npm's replication feed (`NPM_UPSTREAM_FEED_URL`), when `NPM_UPSTREAM_FEED_ENABLED=true`. While the switch is on, the consumer also releases its leadership. | `backend/src/services/upstream_feed.rs`, `FeedConsumer::run` |
 | `peer_sync` | Peer instances: push and mirror replication transfers. Queued tasks stay queued. Runs every 10 s. | `backend/src/services/sync_worker.rs`, `spawn_sync_worker` |
-| Remote MCP registry sync | The upstream MCP registry of each Remote MCP repository. | Will honour the switch when it lands (#5257). |
+| `mcp_remote_sync` | The upstream MCP registry of each Remote MCP repository. The per-repository cursor survives a paused tick, so the sync resumes from it. | `backend/src/services/mcp_remote.rs`, `spawn` |
 
 ## Popularity lookups: an internal mirror, or off
 
