@@ -1105,6 +1105,36 @@ pub struct CreateRepositoryRequest {
     /// paths are refused. Stored as JSON under `debian_config`. Omit or set
     /// empty allowlists to proxy the whole upstream (default behaviour).
     pub debian: Option<DebianRepositoryConfig>,
+    /// Enable the upload-time quarantine period (Package Age Policy) from the
+    /// first upload (#5324). Same rules as on update: enabling is refused
+    /// (400) on a Virtual repository, which has no cache of its own. Stored
+    /// in `repository_config` under `quarantine_enabled`.
+    pub quarantine_enabled: Option<bool>,
+    /// Quarantine hold duration in minutes (#5324). Must be non-negative.
+    /// Stored in `repository_config` under `quarantine_duration_minutes`.
+    pub quarantine_duration_minutes: Option<i64>,
+    /// Virtual repositories only: serve a partial metadata merge instead of
+    /// a 502 when a member fails (#4192); see
+    /// `UpdateRepositoryRequest.virtual_metadata_partial`. Refused (400) on
+    /// any other repository type.
+    pub virtual_metadata_partial: Option<bool>,
+    /// Not settable on create (#5324): link a staging repository to its
+    /// release repository after creating it, with
+    /// `PATCH /api/v1/repositories/{key}` or
+    /// `PUT /api/v1/repositories/{key}/release-target`. A non-empty value is
+    /// refused with 400 rather than ignored.
+    pub release_repository_key: Option<String>,
+    /// Not settable on create (#5324): enable curation with
+    /// `PATCH /api/v1/repositories/{key}` after creating the repository.
+    /// `true` is refused with 400 rather than ignored; `false` (the default)
+    /// is accepted.
+    pub curation_enabled: Option<bool>,
+    /// Not settable on create (#5324): set it with
+    /// `PATCH /api/v1/repositories/{key}` after creating the repository.
+    /// Anything other than `allow` (the default) is refused with 400 rather
+    /// than ignored.
+    #[schema(value_type = Option<String>, example = "allow")]
+    pub curation_default_action: Option<String>,
 }
 
 /// What an update request asks to change about a repository's audience.
@@ -3793,6 +3823,15 @@ pub async fn create_repository(
     // See `validate_virtual_repo_member_count` for the rationale (#1279, #1444).
     validate_virtual_repo_member_count(&payload.key, &repo_type, payload.member_repos.as_deref())?;
 
+    // #5324: the quarantine period and `virtual_metadata_partial` are applied
+    // on create through the same validation and persistence as on update, and
+    // the update-only fields create cannot apply are refused (400) rather
+    // than silently dropped. Validated before the row exists so a refusal
+    // leaves no orphaned repository behind.
+    refuse_update_only_fields_on_create(&payload)?;
+    let shared_config = SharedRepoConfigSettings::from(&payload);
+    shared_config.validate(&repo_type)?;
+
     if let Some(ref ua) = payload.custom_user_agent {
         if repo_type != RepositoryType::Remote {
             return Err(AppError::Validation(
@@ -4040,6 +4079,10 @@ pub async fn create_repository(
         }
     }
 
+    // Quarantine period and `virtual_metadata_partial` (#5324), validated
+    // above; the same writes as `update_repository`.
+    shared_config.persist(&state.db, repo.id).await?;
+
     if let Some(ref index_url) = payload.index_upstream_url {
         upsert_index_upstream_url(&state.db, repo.id, index_url).await?;
     }
@@ -4261,7 +4304,10 @@ pub async fn create_repository(
     } else {
         new_repository_storage(&repo_type_out)
     };
-    let mut response = repo_to_display_response(repo, storage);
+    let response = repo_to_display_response(repo, storage);
+    // Echo the stored quarantine settings (#5324), read back exactly as GET
+    // and PATCH do.
+    let mut response = with_quarantine_settings(&state.db, repo_id, response).await;
     if let Some(ref at) = payload.upstream_auth_type {
         response.upstream_auth_type = Some(at.clone());
         response.upstream_auth_configured = true;
@@ -4817,6 +4863,133 @@ pub async fn get_repository_storage_tree(
     }))
 }
 
+/// The `repository_config` settings that create and update accept with the
+/// same rules (#5324): the quarantine period and `virtual_metadata_partial`.
+///
+/// They used to exist only on `UpdateRepositoryRequest`, so a create that
+/// carried them answered 200 and stored nothing: a repository created with
+/// `quarantine_enabled: true` had no upload hold until a `PATCH`. Both
+/// handlers now validate and persist them through this one type, so the two
+/// paths cannot drift apart again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SharedRepoConfigSettings {
+    quarantine_enabled: Option<bool>,
+    quarantine_duration_minutes: Option<i64>,
+    virtual_metadata_partial: Option<bool>,
+}
+
+impl SharedRepoConfigSettings {
+    /// Reject a value that does not apply to `repo_type` (400). Runs before
+    /// any write.
+    fn validate(&self, repo_type: &RepositoryType) -> Result<()> {
+        // #3647: enabling is refused on the proxying types; disabling stays
+        // allowed on every type so an existing enabled row can be turned off.
+        if self.quarantine_enabled == Some(true) {
+            is_quarantine_enableable(repo_type)?;
+        }
+        if self.virtual_metadata_partial.is_some() && *repo_type != RepositoryType::Virtual {
+            return Err(AppError::Validation(
+                "virtual_metadata_partial is only valid for virtual repositories".to_string(),
+            ));
+        }
+        if self.quarantine_duration_minutes.is_some_and(|d| d < 0) {
+            return Err(AppError::Validation(
+                "quarantine_duration_minutes must be non-negative".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write the supplied settings to `repository_config`. Validated already,
+    /// so this answers no 4xx.
+    async fn persist(&self, db: &sqlx::PgPool, repo_id: Uuid) -> Result<()> {
+        let bool_str = |b: bool| if b { "true" } else { "false" };
+        if let Some(enabled) = self.quarantine_enabled {
+            upsert_repo_config(db, repo_id, "quarantine_enabled", bool_str(enabled)).await?;
+        }
+        if let Some(allow) = self.virtual_metadata_partial {
+            upsert_repo_config(db, repo_id, "virtual_metadata_partial", bool_str(allow)).await?;
+        }
+        if let Some(duration) = self.quarantine_duration_minutes {
+            upsert_repo_config(
+                db,
+                repo_id,
+                "quarantine_duration_minutes",
+                &duration.to_string(),
+            )
+            .await?;
+        }
+        // Any quarantine change must flush the resolve_config cache so it
+        // takes effect immediately rather than after the short TTL.
+        if self.quarantine_enabled.is_some() || self.quarantine_duration_minutes.is_some() {
+            quarantine_service::invalidate_config_cache(repo_id);
+        }
+        Ok(())
+    }
+}
+
+impl From<&UpdateRepositoryRequest> for SharedRepoConfigSettings {
+    fn from(payload: &UpdateRepositoryRequest) -> Self {
+        Self {
+            quarantine_enabled: payload.quarantine_enabled,
+            quarantine_duration_minutes: payload.quarantine_duration_minutes,
+            virtual_metadata_partial: payload.virtual_metadata_partial,
+        }
+    }
+}
+
+impl From<&CreateRepositoryRequest> for SharedRepoConfigSettings {
+    fn from(payload: &CreateRepositoryRequest) -> Self {
+        Self {
+            quarantine_enabled: payload.quarantine_enabled,
+            quarantine_duration_minutes: payload.quarantine_duration_minutes,
+            virtual_metadata_partial: payload.virtual_metadata_partial,
+        }
+    }
+}
+
+/// The `UpdateRepositoryRequest` fields that `POST /repositories` does not
+/// apply (#5324). Each is refused with a 400 naming it when it asks for
+/// anything but the default, instead of being accepted and dropped; the
+/// default value is accepted because it is exactly what the new repository
+/// stores (a form that sends every field untouched must keep working).
+/// `test_update_only_fields_are_supported_or_refused_on_create` fails when a
+/// new update-only field is added without being handled here or on create.
+const CREATE_REFUSED_UPDATE_FIELDS: [&str; 3] = [
+    "release_repository_key",
+    "curation_enabled",
+    "curation_default_action",
+];
+
+/// Refuse the update-only fields `create_repository` does not apply (#5324).
+fn refuse_update_only_fields_on_create(payload: &CreateRepositoryRequest) -> Result<()> {
+    let requested = [
+        payload
+            .release_repository_key
+            .as_deref()
+            .is_some_and(|k| !k.is_empty()),
+        payload.curation_enabled == Some(true),
+        payload
+            .curation_default_action
+            .as_deref()
+            .is_some_and(|a| a != "allow"),
+    ];
+    let refused: Vec<&str> = CREATE_REFUSED_UPDATE_FIELDS
+        .iter()
+        .zip(requested)
+        .filter_map(|(field, set)| set.then_some(*field))
+        .collect();
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Validation(format!(
+        "{} cannot be set when creating a repository; create it first, then set \
+         {} with PATCH /api/v1/repositories/{{key}}",
+        refused.join(", "),
+        if refused.len() == 1 { "it" } else { "them" },
+    )))
+}
+
 /// Reject the `PATCH /repositories/{key}` fields that do not apply to this
 /// repository, or carry a bad value, before anything is written (#5201).
 /// The update handler used to check them one by one after the repository row
@@ -4834,21 +5007,9 @@ fn validate_update_config_fields(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     )?;
-    // #3647: enabling is refused on the proxying types; disabling stays
-    // allowed on every type so an existing enabled row can be turned off.
-    if payload.quarantine_enabled == Some(true) {
-        is_quarantine_enableable(repo_type)?;
-    }
-    if payload.virtual_metadata_partial.is_some() && *repo_type != RepositoryType::Virtual {
-        return Err(AppError::Validation(
-            "virtual_metadata_partial is only valid for virtual repositories".to_string(),
-        ));
-    }
-    if payload.quarantine_duration_minutes.is_some_and(|d| d < 0) {
-        return Err(AppError::Validation(
-            "quarantine_duration_minutes must be non-negative".to_string(),
-        ));
-    }
+    // Quarantine and `virtual_metadata_partial`: the same rules as on create
+    // (#3647, #5324).
+    SharedRepoConfigSettings::from(payload).validate(repo_type)?;
     if payload
         .release_repository_key
         .as_deref()
@@ -5084,6 +5245,8 @@ pub async fn update_repository(
     // check. Repository type and format are immutable here, so `existing`
     // decides, as for the npm and OCI fields above.
     validate_update_config_fields(&existing.repo_type, &existing.format, &payload)?;
+    // Captured before `payload` is partly moved into the service request.
+    let shared_config = SharedRepoConfigSettings::from(&payload);
     let release_link = match payload.release_repository_key.as_deref() {
         None => None,
         Some("") => Some(None),
@@ -5225,42 +5388,8 @@ pub async fn update_repository(
     }
 
     // Every field below was validated before the first write (#5201), so
-    // nothing past this point answers 4xx.
-    if let Some(enabled) = payload.quarantine_enabled {
-        upsert_repo_config(
-            &state.db,
-            repo.id,
-            "quarantine_enabled",
-            if enabled { "true" } else { "false" },
-        )
-        .await?;
-    }
-
-    if let Some(allow) = payload.virtual_metadata_partial {
-        upsert_repo_config(
-            &state.db,
-            repo.id,
-            "virtual_metadata_partial",
-            if allow { "true" } else { "false" },
-        )
-        .await?;
-    }
-
-    if let Some(duration) = payload.quarantine_duration_minutes {
-        upsert_repo_config(
-            &state.db,
-            repo.id,
-            "quarantine_duration_minutes",
-            &duration.to_string(),
-        )
-        .await?;
-    }
-
-    // Any quarantine change must flush the resolve_config cache so it takes
-    // effect immediately rather than after the short TTL.
-    if payload.quarantine_enabled.is_some() || payload.quarantine_duration_minutes.is_some() {
-        crate::services::quarantine_service::invalidate_config_cache(repo.id);
-    }
+    // nothing past this point answers 4xx. Shared with create (#5324).
+    shared_config.persist(&state.db, repo.id).await?;
 
     // Release repository linking for staging repos (resolved above).
     match release_link {
@@ -30999,6 +31128,390 @@ mod tests {
         tdh::cleanup(&pool, local_id, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
         let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #5324: update-only settings are applied or refused on create, never
+    // silently dropped.
+    // -----------------------------------------------------------------------
+
+    /// The `pub` field names of a request struct, read from this file's
+    /// source so the tests below follow the structs as they change.
+    fn request_struct_fields(struct_name: &str) -> Vec<String> {
+        let src = include_str!("repositories.rs");
+        let start = src
+            .find(&format!("pub struct {struct_name} {{"))
+            .unwrap_or_else(|| panic!("struct {struct_name} not found"));
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("struct end")];
+        body.lines()
+            .filter_map(|line| line.trim().strip_prefix("pub "))
+            .filter_map(|rest| {
+                rest.split_once(':')
+                    .map(|(name, _)| name.trim().to_string())
+            })
+            .collect()
+    }
+
+    /// The `UpdateRepositoryRequest` fields that `CreateRepositoryRequest`
+    /// does not have.
+    /// Structural: every `UpdateRepositoryRequest` field is either a
+    /// `CreateRepositoryRequest` field too, or one of the fields create
+    /// explicitly refuses. Adding an update-only field without deciding how
+    /// create handles it fails here.
+    #[test]
+    fn test_update_only_fields_are_supported_or_refused_on_create() {
+        let create = request_struct_fields("CreateRepositoryRequest");
+        for supported in [
+            "quarantine_enabled",
+            "quarantine_duration_minutes",
+            "virtual_metadata_partial",
+        ] {
+            assert!(
+                create.iter().any(|f| f == supported),
+                "{supported} must be accepted on create (#5324)"
+            );
+        }
+        // Every update field is also a create field, so serde never drops it
+        // silently on create: create either applies it or refuses it.
+        let update = request_struct_fields("UpdateRepositoryRequest");
+        let missing: Vec<&String> = update.iter().filter(|f| !create.contains(f)).collect();
+        assert!(
+            missing.is_empty(),
+            "update fields create would silently drop: {missing:?}. Accept each on create and \
+             either apply it or list it in CREATE_REFUSED_UPDATE_FIELDS and refuse it in \
+             refuse_update_only_fields_on_create (#5324)"
+        );
+        for refused in CREATE_REFUSED_UPDATE_FIELDS {
+            assert!(
+                update.iter().any(|f| f == refused) && create.iter().any(|f| f == refused),
+                "{refused} must be an update field that create accepts in order to refuse it"
+            );
+        }
+    }
+
+    /// Structural: both handlers route the shared settings through the same
+    /// validation (#3647, #5324). Searches only the non-test code.
+    #[test]
+    fn test_create_and_update_share_quarantine_validation() {
+        let src = include_str!("repositories.rs");
+        let code = src.split("#[cfg(test)]").next().expect("non-test code");
+        assert!(
+            code.contains("SharedRepoConfigSettings::from(payload).validate(repo_type)"),
+            "update_repository must validate quarantine through SharedRepoConfigSettings"
+        );
+        assert!(
+            code.contains("shared_config.validate(&repo_type)"),
+            "create_repository must validate quarantine through SharedRepoConfigSettings"
+        );
+        assert_eq!(
+            code.matches("shared_config.persist(&state.db, repo.id)")
+                .count(),
+            2,
+            "create and update must persist through SharedRepoConfigSettings::persist"
+        );
+    }
+
+    #[test]
+    fn test_refuse_update_only_fields_on_create_accepts_defaults() {
+        let req = |extra: serde_json::Value| -> CreateRepositoryRequest {
+            let mut base = serde_json::json!({
+                "key": "k", "name": "n", "format": "generic", "repo_type": "local"
+            });
+            if let (serde_json::Value::Object(b), serde_json::Value::Object(o)) = (&mut base, extra)
+            {
+                b.extend(o);
+            }
+            serde_json::from_value(base).expect("deserialize create payload")
+        };
+        // Omitted or default values configure nothing beyond what create stores.
+        for ok in [
+            serde_json::json!({}),
+            serde_json::json!({"release_repository_key": ""}),
+            serde_json::json!({"curation_enabled": false}),
+            serde_json::json!({"curation_default_action": "allow"}),
+        ] {
+            assert!(
+                refuse_update_only_fields_on_create(&req(ok.clone())).is_ok(),
+                "{ok} must be accepted"
+            );
+        }
+        let err = refuse_update_only_fields_on_create(&req(serde_json::json!({
+            "curation_enabled": true,
+            "curation_default_action": "review"
+        })))
+        .expect_err("non-default values must be refused");
+        assert!(
+            matches!(&err, AppError::Validation(msg)
+                if msg.contains("curation_enabled") && msg.contains("curation_default_action")),
+            "the refusal must name every refused field, got {err:?}"
+        );
+    }
+
+    /// DB-backed (#5324): `POST` with `quarantine_enabled: true` returns it
+    /// enabled, stores it, reads back the same on GET, and the first upload is
+    /// held. Fails on `main`: the fields were dropped on create.
+    #[tokio::test]
+    async fn test_create_with_quarantine_holds_first_upload_5324_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("q5324-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let repo_key = format!("q5324-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            make_create_request(
+                &repo_key,
+                "quarantine on create",
+                "generic",
+                serde_json::json!({
+                    "quarantine_enabled": true,
+                    "quarantine_duration_minutes": 120
+                }),
+            ),
+        )
+        .await
+        .expect("create with quarantine must succeed on a local repository");
+        assert_eq!(created.quarantine_enabled, Some(true));
+        assert_eq!(created.quarantine_duration_minutes, Some(120));
+
+        let Json(fetched) = get_repository(
+            State(state.clone()),
+            Extension(Some(admin_auth(user_id, &username))),
+            Path(repo_key.clone()),
+        )
+        .await
+        .expect("GET must succeed");
+        assert_eq!(fetched.quarantine_enabled, created.quarantine_enabled);
+        assert_eq!(
+            fetched.quarantine_duration_minutes,
+            created.quarantine_duration_minutes
+        );
+
+        // The first upload goes through the `insert_artifact` chokepoint,
+        // which applies the hosted upload hold (as in quarantine_service's
+        // `test_insert_artifact_holds_hosted_when_enabled`).
+        let repo_info = tdh::make_repo_info(created.id, &repo_key, &storage_dir, "local", None);
+        let before = chrono::Utc::now();
+        let artifact_id = tdh::seed_artifact(
+            &state,
+            &pool,
+            &repo_info,
+            "pkg/1.0.0/pkg.bin",
+            "pkg/1.0.0/pkg.bin",
+            "pkg",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"payload"),
+            user_id,
+        )
+        .await;
+        let (status, until) = crate::services::quarantine_service::get_status(&pool, artifact_id)
+            .await
+            .expect("quarantine status");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            status.as_deref(),
+            Some("quarantined"),
+            "the first upload to a repository created with quarantine must be held"
+        );
+        assert!(
+            until.expect("a timed upload hold has an expiry") > before,
+            "the hold must expire in the future"
+        );
+    }
+
+    /// DB-backed (#5324): every formerly update-only field sent on `POST` is
+    /// either applied (stored in `repository_config`) or refused with a 400
+    /// naming it and no repository left behind, exactly as the update path
+    /// would gate it. The case list is checked against the update-only fields
+    /// read from the source, so it cannot fall behind.
+    #[tokio::test]
+    async fn test_create_applies_or_refuses_every_update_only_field_5324_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        enum Expect {
+            /// Applied: stored under this `repository_config` key and value.
+            Stored(&'static str, &'static str),
+            /// Refused with a 400 whose message contains this text.
+            Refused(&'static str),
+        }
+        use Expect::{Refused, Stored};
+
+        // (field, repo_type, format, value, expectation)
+        let cases: Vec<(&str, &str, &str, serde_json::Value, Expect)> = vec![
+            (
+                "quarantine_enabled",
+                "local",
+                "helm",
+                serde_json::json!(true),
+                Stored("quarantine_enabled", "true"),
+            ),
+            (
+                "quarantine_enabled",
+                "remote",
+                "pypi",
+                serde_json::json!(true),
+                Stored("quarantine_enabled", "true"),
+            ),
+            // Refused on a Virtual exactly as PATCH refuses it (#3647, #3912).
+            (
+                "quarantine_enabled",
+                "virtual",
+                "helm",
+                serde_json::json!(true),
+                Refused("member remote"),
+            ),
+            (
+                "quarantine_enabled",
+                "virtual",
+                "helm",
+                serde_json::json!(false),
+                Stored("quarantine_enabled", "false"),
+            ),
+            (
+                "quarantine_duration_minutes",
+                "local",
+                "helm",
+                serde_json::json!(90),
+                Stored("quarantine_duration_minutes", "90"),
+            ),
+            (
+                "quarantine_duration_minutes",
+                "local",
+                "helm",
+                serde_json::json!(-1),
+                Refused("quarantine_duration_minutes"),
+            ),
+            (
+                "virtual_metadata_partial",
+                "virtual",
+                "helm",
+                serde_json::json!(true),
+                Stored("virtual_metadata_partial", "true"),
+            ),
+            (
+                "virtual_metadata_partial",
+                "local",
+                "helm",
+                serde_json::json!(true),
+                Refused("virtual_metadata_partial"),
+            ),
+            (
+                "release_repository_key",
+                "staging",
+                "helm",
+                serde_json::json!("some-release"),
+                Refused("release_repository_key"),
+            ),
+            (
+                "curation_enabled",
+                "local",
+                "helm",
+                serde_json::json!(true),
+                Refused("curation_enabled"),
+            ),
+            (
+                "curation_default_action",
+                "local",
+                "helm",
+                serde_json::json!("review"),
+                Refused("curation_default_action"),
+            ),
+        ];
+        // Every field that is (or was, before #5324) update-only has a case.
+        for field in CREATE_REFUSED_UPDATE_FIELDS.iter().copied().chain([
+            "quarantine_enabled",
+            "quarantine_duration_minutes",
+            "virtual_metadata_partial",
+        ]) {
+            assert!(
+                cases.iter().any(|(f, ..)| *f == field),
+                "no create case for update-only field {field}"
+            );
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("q5324-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let mut failures = Vec::new();
+        let mut created_ids = Vec::new();
+        for (field, repo_type, format, value, expect) in cases {
+            let repo_key = format!("u5324-{}", Uuid::new_v4().simple());
+            let mut overrides = serde_json::json!({ "repo_type": repo_type });
+            overrides[field] = value.clone();
+            if repo_type == "remote" {
+                overrides["upstream_url"] = serde_json::json!("https://pypi.org/simple");
+            }
+            let result = create_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                make_create_request(&repo_key, "update-only field", format, overrides),
+            )
+            .await;
+            let case = format!("{field}={value} on {repo_type}");
+            match (expect, result) {
+                (Stored(key, want), Ok(Json(created))) => {
+                    created_ids.push(created.id);
+                    let stored: Option<String> = sqlx::query_scalar(
+                        "SELECT value FROM repository_config \
+                         WHERE repository_id = $1 AND key = $2",
+                    )
+                    .bind(created.id)
+                    .bind(key)
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("query repository_config");
+                    if stored.as_deref() != Some(want) {
+                        failures.push(format!("{case}: stored {stored:?}, want {want}"));
+                    }
+                }
+                (Stored(..), Err(err)) => failures.push(format!("{case}: refused: {err:?}")),
+                (Refused(text), Err(err)) => {
+                    let named = matches!(&err, AppError::Validation(msg) if msg.contains(text));
+                    let status = err.into_response().status();
+                    let orphan: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM repositories WHERE key = $1)",
+                    )
+                    .bind(&repo_key)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("query repositories");
+                    if !named || status != StatusCode::BAD_REQUEST || orphan {
+                        failures.push(format!(
+                            "{case}: named={named} status={status} orphan={orphan}"
+                        ));
+                    }
+                }
+                (Refused(_), Ok(Json(created))) => {
+                    created_ids.push(created.id);
+                    failures.push(format!("{case}: accepted, must be refused"));
+                }
+            }
+        }
+
+        for id in created_ids {
+            tdh::cleanup(&pool, id, user_id).await;
+        }
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert!(failures.is_empty(), "create mishandled: {failures:#?}");
     }
 
     // -----------------------------------------------------------------------
