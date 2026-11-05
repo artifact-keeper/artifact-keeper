@@ -374,6 +374,95 @@ async fn resolve_huggingface_repo(db: &PgPool, repo_key: &str) -> Result<RepoInf
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["huggingface"], "a Hugging Face").await
 }
 
+// ---------------------------------------------------------------------------
+// Upstream refusals (#5323)
+// ---------------------------------------------------------------------------
+
+/// The response headers `huggingface_hub` reads to pick its exception
+/// (`hf_raise_for_status`): the code first, then the message.
+const HUB_ERROR_CODE_HEADER: &str = "x-error-code";
+const HUB_ERROR_MESSAGE_HEADER: &str = "x-error-message";
+
+/// The `X-Error-Code` and message a Hugging Face client gets for an upstream
+/// `status` (`401`/`403`) that named `upstream_code` (#5323).
+///
+/// The shared proxy mapping turns every upstream refusal into an opaque 502,
+/// which `huggingface_hub` retries five times as a server error. The Hub's own
+/// answer is a client error it raises at once, so this mirrors it: the status
+/// stays the upstream's, and the code is the upstream's when it gave one. A
+/// `401` without a code is how the Hub answers a missing or private repository
+/// to an unauthenticated request (and how `huggingface_hub` reads it), so it is
+/// named `RepoNotFound`; a `403` without one keeps no code.
+///
+/// The message is written here and names the Remote's upstream credential,
+/// never the credential itself or anything the upstream said.
+fn hub_refusal_reply(
+    status: StatusCode,
+    upstream_code: Option<&'static str>,
+    repo_key: &str,
+) -> (Option<&'static str>, String) {
+    let fix = format!(
+        "An administrator can set the Remote's upstream credential with \
+         PUT /api/v1/repositories/{repo_key}/upstream-auth."
+    );
+    let code = upstream_code.or((status == StatusCode::UNAUTHORIZED).then_some("RepoNotFound"));
+    let message = match code {
+        Some("GatedRepo") => format!(
+            "This model is gated on the upstream Hub, and the upstream credential of Remote \
+             '{repo_key}' is missing or has not been granted access to it. {fix}"
+        ),
+        Some("RepoNotFound") => format!(
+            "The upstream Hub has no such repository, or it is private and the upstream \
+             credential of Remote '{repo_key}' is missing or lacks access to it. {fix}"
+        ),
+        Some("RevisionNotFound") => "The upstream Hub has no such revision.".to_string(),
+        Some("EntryNotFound") => "The upstream Hub has no such file.".to_string(),
+        _ => format!(
+            "The upstream Hub refused the upstream credential of Remote '{repo_key}' for \
+             this model. {fix}"
+        ),
+    };
+    (code, message)
+}
+
+/// Turn a Remote's proxy error `response` that came from an upstream
+/// `401`/`403` into the Hub-shaped refusal [`hub_refusal_reply`] describes
+/// (#5323). Any other response (a 404, a 5xx folded to 503, a policy refusal,
+/// a Virtual's answer) is returned as is.
+///
+/// A pure mapping on purpose: the proxy fetch futures sit at the compiler's
+/// layout query-depth limit, so this is applied with `map_err` rather than as
+/// another async layer.
+fn hub_upstream_refusal(repo: &RepoInfo, response: Response) -> Response {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return response;
+    }
+    let Some(status) = proxy_helpers::upstream_refusal_status(&response) else {
+        return response;
+    };
+    let upstream_code = proxy_helpers::upstream_hub_error_code(&response);
+    let (code, message) = hub_refusal_reply(status, upstream_code, &repo.key);
+    let mut reply = (
+        status,
+        axum::Json(serde_json::json!({ "error": message.as_str() })),
+    )
+        .into_response();
+    if let Some(code) = code {
+        reply
+            .headers_mut()
+            .insert(HUB_ERROR_CODE_HEADER, HeaderValue::from_static(code));
+    }
+    if let Ok(value) = HeaderValue::from_str(&message) {
+        reply.headers_mut().insert(HUB_ERROR_MESSAGE_HEADER, value);
+    }
+    reply
+        .extensions_mut()
+        .extend(response.into_parts().0.extensions);
+    reply
+}
+
 /// Extract a filename from request headers.
 ///
 /// Prefers the `X-Filename` header; falls back to `Content-Disposition`
@@ -1145,7 +1234,8 @@ async fn proxy_hf_metadata_json(
         upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
     )
-    .await?;
+    .await
+    .map_err(|resp| hub_upstream_refusal(repo, resp))?;
 
     Ok(Some(
         Response::builder()
@@ -1636,7 +1726,8 @@ async fn download_file_impl(
                 suppress_upstream_proxy: false,
             },
         )
-        .await?
+        .await
+        .map_err(|resp| hub_upstream_refusal(&repo, resp))?
         {
             // Remote serves normally arrive with upstream's own ETag and
             // `X-Repo-Commit` already forwarded by the streaming response
@@ -3134,6 +3225,243 @@ mod tests {
             "Artifact not found upstream",
             "the 404 must be the proxy's mapped upstream error, not axum's \
              bodyless router fallback"
+        );
+    }
+
+    /// #5323: what a Hugging Face client is told for each upstream refusal.
+    /// `huggingface_hub` raises `GatedRepoError` for `X-Error-Code: GatedRepo`
+    /// with 401 or 403 and `RepositoryNotFoundError` for `RepoNotFound`.
+    #[test]
+    fn test_hub_refusal_reply_mirrors_the_hub_5323() {
+        let reply = |status, code| hub_refusal_reply(status, code, "hf-remote");
+
+        let (code, message) = reply(StatusCode::UNAUTHORIZED, Some("GatedRepo"));
+        assert_eq!(code, Some("GatedRepo"));
+        assert!(message.contains("gated"), "{message}");
+        assert!(
+            message.contains("PUT /api/v1/repositories/hf-remote/upstream-auth"),
+            "{message}"
+        );
+        assert_eq!(
+            reply(StatusCode::FORBIDDEN, Some("GatedRepo")).0,
+            Some("GatedRepo")
+        );
+
+        // A 401 without a code is the Hub's answer for a missing or private
+        // repository; a 403 without one keeps no code.
+        assert_eq!(
+            reply(StatusCode::UNAUTHORIZED, None).0,
+            Some("RepoNotFound")
+        );
+        assert_eq!(
+            reply(StatusCode::UNAUTHORIZED, Some("RepoNotFound")).0,
+            Some("RepoNotFound")
+        );
+        let (code, message) = reply(StatusCode::FORBIDDEN, None);
+        assert_eq!(code, None);
+        assert!(message.contains("upstream-auth"), "{message}");
+        assert_eq!(
+            reply(StatusCode::FORBIDDEN, Some("EntryNotFound")).0,
+            Some("EntryNotFound")
+        );
+    }
+
+    /// Mount the Hub's refusal of `model` on both resolve and model-info: the
+    /// status, the Hub's `X-Error-Message`, its `X-Error-Code` when `code` is
+    /// set, and (when `challenge`) the `WWW-Authenticate: Bearer
+    /// realm="Authentication required"` huggingface.co sends with a 401.
+    async fn mount_hub_refusal(
+        server: &wiremock::MockServer,
+        model: &str,
+        status: u16,
+        code: Option<&str>,
+        challenge: bool,
+    ) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for upstream_path in [
+            format!("/{model}/resolve/main/config.json"),
+            format!("/api/models/{model}/revision/main"),
+        ] {
+            let mut template = ResponseTemplate::new(status)
+                .insert_header("x-error-message", "upstream-said-this")
+                .set_body_string("upstream-said-this");
+            if let Some(code) = code {
+                template = template.insert_header("x-error-code", code);
+            }
+            if challenge {
+                template = template.insert_header(
+                    "www-authenticate",
+                    "Bearer realm=\"Authentication required\", charset=\"UTF-8\"",
+                );
+            }
+            Mock::given(method("GET"))
+                .and(wm_path(upstream_path))
+                .respond_with(template)
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// #5323: an upstream 401/403 from the Hub reaches the client as the same
+    /// 401/403 with an `X-Error-Code` huggingface_hub recognises, on resolve and
+    /// on model-info, never as a 5xx it would retry (nor the 400 the Hub's
+    /// non-URL Bearer realm used to produce). The Hub's own message is not
+    /// echoed.
+    #[tokio::test]
+    async fn test_huggingface_upstream_refusal_is_a_hub_client_error_5323() {
+        use wiremock::MockServer;
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // (model, upstream status, upstream code, challenge, client code)
+        let cases: [(&str, u16, Option<&str>, bool, &str); 4] = [
+            ("org/gated-401", 401, Some("GatedRepo"), true, "GatedRepo"),
+            ("org/gated-403", 403, Some("GatedRepo"), false, "GatedRepo"),
+            (
+                "org/missing-401",
+                401,
+                Some("RepoNotFound"),
+                false,
+                "RepoNotFound",
+            ),
+            ("org/private-401", 401, None, true, "RepoNotFound"),
+        ];
+        for (model, status, code, challenge, _) in cases {
+            mount_hub_refusal(&server, model, status, code, challenge).await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let mut seen = Vec::new();
+        for (model, status, _, _, client_code) in cases {
+            for uri in [
+                format!("/{}/{model}/resolve/main/config.json", f.repo_key),
+                format!("/{}/api/models/{model}/revision/main", f.repo_key),
+            ] {
+                let (got, body, headers) =
+                    tdh::send_with_headers(app.clone(), tdh::get(uri.clone())).await;
+                seen.push((uri, status, got, body, headers, client_code));
+            }
+        }
+
+        f.teardown().await;
+
+        for (uri, status, got, body, headers, client_code) in seen {
+            assert_eq!(got.as_u16(), status, "{uri}: the upstream refusal's status");
+            assert_eq!(
+                headers.get("x-error-code").and_then(|v| v.to_str().ok()),
+                Some(client_code),
+                "{uri}"
+            );
+            let message = headers
+                .get("x-error-message")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(message.contains("upstream-auth"), "{uri}: {message}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("upstream-said-this"), "{uri}: {body}");
+            assert!(!message.contains("upstream-said-this"), "{uri}: {message}");
+        }
+    }
+
+    /// #5323: a gated model refused without an upstream credential downloads
+    /// once one is set (the refusal was not cached), and a credential the Hub
+    /// has not granted access gets the Hub's 403 `GatedRepo`, without the
+    /// credential appearing anywhere in the response.
+    #[tokio::test]
+    async fn test_huggingface_gated_model_with_upstream_auth_5323() {
+        use wiremock::matchers::{header, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // `save_upstream_auth` encrypts via `encryption_key()`.
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let token = "hf_upstream_secret_5323";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/org/gated/resolve/main/config.json"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{\"gated\": true}".to_vec()))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_hub_refusal(&server, "org/gated", 401, Some("GatedRepo"), true).await;
+        Mock::given(method("GET"))
+            .and(wm_path("/org/not-granted/resolve/main/config.json"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-error-code", "GatedRepo")
+                    .insert_header("x-error-message", "upstream-said-this"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let gated = format!("/{}/org/gated/resolve/main/config.json", f.repo_key);
+
+        let (before, _, before_headers) =
+            tdh::send_with_headers(app.clone(), tdh::get(gated.clone())).await;
+
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: token.to_string(),
+            },
+        );
+        crate::services::upstream_auth::save_upstream_auth(&f.pool, f.repo_id, "bearer", &creds)
+            .await
+            .expect("save upstream auth");
+
+        let (after, after_body, _) = tdh::send_with_headers(app.clone(), tdh::get(gated)).await;
+        let (refused, refused_body, refused_headers) = tdh::send_with_headers(
+            app,
+            tdh::get(format!(
+                "/{}/org/not-granted/resolve/main/config.json",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(before, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            before_headers
+                .get("x-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("GatedRepo")
+        );
+        assert_eq!(
+            after,
+            StatusCode::OK,
+            "with upstream-auth set the gated model must download, so the earlier \
+             401 must not have been cached"
+        );
+        assert_eq!(&after_body[..], b"{\"gated\": true}");
+        assert_eq!(refused, StatusCode::FORBIDDEN);
+        assert_eq!(
+            refused_headers
+                .get("x-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("GatedRepo")
+        );
+        let leaked = refused_headers
+            .values()
+            .any(|v| v.to_str().is_ok_and(|v| v.contains(token)))
+            || String::from_utf8_lossy(&refused_body).contains(token);
+        assert!(
+            !leaked,
+            "the upstream credential must never reach the client"
         );
     }
 

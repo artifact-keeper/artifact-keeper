@@ -133,6 +133,29 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HF_TOKEN" \
   "$HF_ENDPOINT/api/models/sentence-transformer/all-MiniLM-L6-v2/revision/main"    # 404
 ```
 
+What a client sees for a gated model:
+
+- **No upstream credential on the Remote.** The Hub refuses the Remote with
+  `401` and `X-Error-Code: GatedRepo`, and the client gets the same: `401`,
+  `X-Error-Code: GatedRepo`, and an `X-Error-Message` naming the Remote and
+  `PUT /api/v1/repositories/{key}/upstream-auth`. `huggingface_hub` raises
+  `GatedRepoError` straight away, without retrying. A Hub token that has not
+  been granted the model gives `403` with `GatedRepo`, which raises the same
+  error. Neither the Hub's message nor the Remote's token is passed on.
+- **An upstream credential with access.** The model downloads like any other
+  and is cached as usual. A refusal is never cached, so setting the credential
+  takes effect on the next request.
+- **An Artifact Keeper user who cannot read the Remote** (for example, outside
+  the group the repository is restricted to) gets `404`, as for a repository
+  that does not exist, whether or not the model is gated. `huggingface_hub`
+  raises `RepositoryNotFoundError`. Artifact Keeper does not reveal that the
+  repository exists, and the Hub is never asked.
+
+Other refusals follow the Hub's lead. A `401` for a model that does not
+exist, or for a private one the Remote's credential cannot see, reaches the
+client as `401` with `X-Error-Code: RepoNotFound` (`RepositoryNotFoundError`).
+A `403` without a code stays a `403`. Only a real upstream failure is a `5xx`.
+
 ## Pointing `huggingface_hub` at it
 
 `huggingface_hub` takes its server from `HF_ENDPOINT` and its credential from
