@@ -846,9 +846,6 @@ async fn copy_storage_object_to_file(
     })
 }
 
-/// Where `docker/Dockerfile.backend` seeds the Grype vulnerability DB, and the
-/// value its `GRYPE_DB_CACHE_DIR` ENV points at. Kept in sync by
-/// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
 /// Paths excluded from every `dir:` workspace scan (#5262).
 ///
 /// A Maven-built JAR embeds its own build POM at
@@ -867,10 +864,20 @@ async fn copy_storage_object_to_file(
 /// extracted build POMs, which describe what the project was BUILT against,
 /// are skipped.
 ///
+/// The one bundled component this gives up is a shaded dependency whose
+/// `pom.properties` was stripped while its `pom.xml` was kept: the
+/// java-archive cataloger names components from `pom.properties` only, so
+/// such a component was cataloged solely from the extracted POM. Shading
+/// tools copy both files or neither, and `grype file:` on the same JAR never
+/// saw it either.
+///
 /// Patterns are relative to the scan root; syft requires each to start with
 /// `./`, `*/` or `**/`.
 pub(crate) const GRYPE_DIR_EXCLUDES: &[&str] = &["**/META-INF/maven/**/pom.xml"];
 
+/// Where `docker/Dockerfile.backend` seeds the Grype vulnerability DB, and the
+/// value its `GRYPE_DB_CACHE_DIR` ENV points at. Kept in sync by
+/// `test_seeded_grype_db_cache_dir_matches_the_dockerfile`.
 const SEEDED_GRYPE_DB_CACHE_DIR: &str = "/home/artifact/.cache/grype";
 
 /// The DB-related env every grype child gets, scan or probe alike.
@@ -4197,8 +4204,8 @@ mod tests {
     }
 
     /// A Maven-plugin-shaped JAR (#5262): its own `pom.properties`, a build
-    /// POM declaring `provided` and `test` dependencies, and one shaded
-    /// component carrying its own `pom.properties`.
+    /// POM declaring `provided` and `test` dependencies, one shaded
+    /// component carrying its own `pom.properties`, and one nested JAR.
     fn maven_plugin_jar_with_embedded_pom() -> Bytes {
         use std::io::Write;
         let mut buf = Vec::new();
@@ -4244,9 +4251,35 @@ mod tests {
                 "groupId=com.google.code.gson\nartifactId=gson\nversion=2.8.0\n",
             );
             put("com/acme/plugin/Mojo.class", "not real bytecode");
+            zip.start_file("lib/commons-text-1.9.jar", opts).unwrap();
+            zip.write_all(&nested_jar_with_pom_properties()).unwrap();
             zip.finish().unwrap();
         }
         Bytes::from(buf)
+    }
+
+    /// A JAR nested inside the plugin JAR, identified by its own
+    /// `pom.properties` only. The exclusion must leave it to the
+    /// java-archive cataloger.
+    fn nested_jar_with_pom_properties() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            // syft skips a nested archive without a manifest.
+            zip.start_file("META-INF/MANIFEST.MF", opts).unwrap();
+            zip.write_all(b"Manifest-Version: 1.0\n").unwrap();
+            zip.start_file(
+                "META-INF/maven/org.apache.commons/commons-text/pom.properties",
+                opts,
+            )
+            .unwrap();
+            zip.write_all(b"groupId=org.apache.commons\nartifactId=commons-text\nversion=1.9\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        buf
     }
 
     /// END-TO-END against the REAL grype binary (#5262): the fix is a grype
@@ -4295,8 +4328,8 @@ mod tests {
             );
         }
         // Positive controls: excluding the POM must not cost the archive's
-        // own identity or its bundled (shaded) component.
-        for shipped in ["acme-maven-plugin", "gson"] {
+        // own identity, its bundled (shaded) component or a nested JAR.
+        for shipped in ["acme-maven-plugin", "gson", "commons-text"] {
             assert!(
                 names.contains(&shipped),
                 "{shipped} is in the archive and must stay cataloged; \
