@@ -1203,6 +1203,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )
     .await;
 
+    // #5288: install UPSTREAM_JOBS_PAUSED before the first scheduled upstream
+    // job can tick, and say once which jobs the switch holds off.
+    {
+        use artifact_keeper_backend::services::upstream_pause;
+        upstream_pause::set_env_default(config.upstream_jobs_paused);
+        let pause_state = upstream_pause::state(&db_pool).await;
+        if let Some(message) = upstream_pause::startup_message(&pause_state) {
+            tracing::warn!(event = "upstream_jobs_paused", "{message}");
+        }
+    }
+
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
     // via an advisory lock. Detached deliberately: lifecycle is governed by

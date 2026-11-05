@@ -22,6 +22,9 @@ use crate::services::scan_result_service::ScanResultService;
 use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
+/// The one helper every scheduled upstream job consults (#5288).
+pub use crate::services::upstream_pause::upstream_jobs_paused;
+use crate::services::upstream_pause::{self, UpstreamPauseGate};
 
 /// TTL for the lifecycle-cycle singleton lease. Bounds a crashed holder; a
 /// live holder heartbeats it for as long as the cycle runs.
@@ -967,9 +970,16 @@ pub fn spawn_all(
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(45)).await;
             let mut ticker = interval(Duration::from_secs(300));
+            let mut pause = UpstreamPauseGate::new(upstream_pause::CURATION_SYNC_JOB);
 
             loop {
                 ticker.tick().await;
+                // #5288: no upstream fetch (nor popularity lookup) while the
+                // instance is disconnected; due repos sync on the first tick
+                // after the switch is turned off.
+                if pause.skip_tick(&db).await {
+                    continue;
+                }
                 tracing::debug!("Checking for curation repos due for upstream sync");
 
                 // Cluster-lease the sweep (#2357 S11): only one replica runs the
@@ -1397,9 +1407,14 @@ pub fn spawn_all(
             );
             let mut ticker = interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut pause = UpstreamPauseGate::new(upstream_pause::ENVIRONMENT_REEVAL_JOB);
 
             loop {
                 ticker.tick().await;
+                // #5288: re-evaluation queries OSV; pending deltas wait.
+                if pause.skip_tick(&db).await {
+                    continue;
+                }
                 let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                     &db,
                     "environment_reeval",
@@ -2126,7 +2141,7 @@ async fn run_curation_sync_cycle_for(
     // rules (#2949) evaluated across many packages / staging repos share
     // lookups instead of hammering the public stats APIs.
     let popularity_source =
-        crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
+        crate::services::curation::popularity_source::HttpPopularitySource::from_env().cached();
     // Repo-level ingest failures that must surface as a failed sync (#4427)
     // without aborting the rest of the sweep.
     let mut failures: Vec<String> = Vec::new();

@@ -54,6 +54,7 @@ use crate::services::mcp_curation::{
 };
 use crate::services::mcp_packages::{self, BackingRepo, McpSettings};
 use crate::services::mcp_settings::{self, McpRepoSettings};
+use crate::services::upstream_pause::{self, UpstreamPauseGate};
 
 /// Advisory-lock class of the per-repository sync lock (`ClusterLock`).
 pub const SYNC_LOCK_CLASS: i32 = 0x5253;
@@ -2059,10 +2060,17 @@ pub fn spawn(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
         }
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_TICK_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // #5288: the instance-wide switch for scheduled upstream jobs. A paused
+        // tick is skipped before the lease; the per-repository cursor is kept,
+        // so the sync resumes from it when the switch goes off.
+        let mut pause = UpstreamPauseGate::new(upstream_pause::MCP_REMOTE_SYNC_JOB);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
+            }
+            if pause.skip_tick(&state.db).await {
+                continue;
             }
             let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                 &state.db,
