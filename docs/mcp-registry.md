@@ -1814,7 +1814,25 @@ a `notice` member.
 
 The **current** snapshot is the newest successful (`outcome: ok`) one of the
 best source in this order: `sandbox_run`, `remote_probe`, `gateway_reported`,
-`ci_reported`, `publisher_declared`. History is kept.
+`ci_reported`, `publisher_declared`.
+
+History is kept, deduplicated and bounded (#5386):
+
+- **Repeats are not stored again.** A reported or observed snapshot whose
+  `contentHash`, `outcome` and `authState` equal the newest snapshot of the
+  same (version, `source`, `origin`) adds no row: that snapshot's
+  `lastSeenAt` (and `ttlMs`, the latest re-probe hint) is updated and it is
+  returned instead. A repeat is not audited, linted or compared for drift.
+  `observedAt` stays the first time the content was seen, `lastSeenAt` is
+  the latest (equal to `observedAt` until the content is seen again). A
+  declaration is recorded once per (version, origin, content), as before.
+- **Retention.** The scheduler pass keeps the newest 20 snapshots of each
+  (version, `source`, `origin`) and deletes older ones, at most 1000 per pass.
+  It never deletes the newest successful snapshot of a (version, `source`,
+  `origin`) (the current view and the drift baseline), a snapshot a
+  `tool_drift` finding names, or the snapshot an open job or the newest job of
+  a target points at. An older job's `snapshotId` becomes `null` when its
+  snapshot is pruned; the job itself is kept.
 
 ### Declaring capabilities at publish
 
@@ -1911,6 +1929,7 @@ default 50, max 200).
     "outcome": "ok",
     "protocolVersion": "2026-07-28",
     "observedAt": "2026-11-03T10:00:00Z",
+    "lastSeenAt": "2026-11-03T16:00:00Z",
     "ttlMs": 3600000,
     "cacheScope": "public",
     "counts": {"tools": 3, "resources": 0, "prompts": 1},
@@ -1987,12 +2006,15 @@ by the caller: `reported by CI (<username>[, <generatedBy>])` /
 `201`:
 
 ```json
-{"snapshot": { /* as `current` above */ }, "previousSnapshotId": "uuid|null",
- "drift": {"scanId": "uuid"} }
+{"snapshot": { /* as `current` above */ }, "created": true,
+ "previousSnapshotId": "uuid|null", "drift": {"scanId": "uuid"} }
 ```
 
 `drift` is `null` unless this report differs from the previous one of the
-same source. Errors: `400 mcp_invalid_capabilities` (`detail` names the
+same source. `created` is `false` when the report repeats the newest one of
+the same source and `generatedBy` (same content, outcome and auth state):
+nothing new is stored, the existing snapshot's `lastSeenAt` is bumped and it
+is returned, without audit or drift. Errors: `400 mcp_invalid_capabilities` (`detail` names the
 field), `401 mcp_unauthorized`, `403 mcp_forbidden`, `404` (unknown or
 invisible version), `413 mcp_too_large`. Audited `MCP_CAPABILITIES_INGESTED`.
 
@@ -2053,14 +2075,23 @@ queues the same jobs automatically.
 
 | Kind | Queued for | When |
 | --- | --- | --- |
-| `remote_probe` | each `remotes[]` entry of type `streamable-http` with a concrete `http(s)` URL (no `{template}` variables, no userinfo). Legacy `sse` remotes are not probed. | `mcp_probe_remotes`: `all` (Local, Staging, Remote), `hosted_only` (Local and Staging only), `off` (never, the default). Re-queued every `max(ttlMs, 6 h)` after the last probe, because a remote can change its tools without a version bump. Handed out only while the version is servable (as a sandbox run), so a held, blocked or unapproved version's endpoints are never contacted. |
+| `remote_probe` | each `remotes[]` entry of type `streamable-http` with a concrete `http(s)` URL (no `{template}` variables, no userinfo). Legacy `sse` remotes are not probed. | `mcp_probe_remotes`: `all` (Local, Staging, Remote), `hosted_only` (Local and Staging only), `off` (never, the default). Re-queued every `max(ttlMs, 6 h)` after the last probe, because a remote can change its tools without a version bump, for the server's latest version (`isLatest`) and for versions published in the last 30 days (`publishedAt`) only; an older version keeps its last snapshot and can still be probed on demand (`POST .../capabilities/probe`). Handed out only while the version is servable (as a sandbox run), so a held, blocked or unapproved version's endpoints are never contacted. |
 | `sandbox_run` | each stdio `packages[]` entry of type `npm`, `pypi` or `oci` that the package policy pinned to an AK repository | `mcp_sandbox_introspection: on`. Never re-queued (the bytes are version pinned). Handed out only while the version is servable (its own and its backing packages' gates pass), so the bytes executed are the bytes AK scanned. |
 
 Attempts: 3. `timeout`, `rate_limited`, `start_failed` and `error` results are retried after
 `2^attempts` minutes (a `429`'s `Retry-After`, clamped to 1 minute .. 24 h);
 a claim not completed within 10 minutes returns to the queue. The scheduler
-pass (every 15 minutes, idempotent) reaps expired claims and re-queues due
-probes.
+pass (every 15 minutes, idempotent) reaps expired claims, re-queues due
+probes and prunes snapshot history (see [Capabilities and
+introspection](#capabilities-and-introspection)).
+
+Completing a job is atomic (#5389): the claim (job id, token hash, `claimed`
+status) is checked and ended and the snapshot stored in one transaction, and
+the audit, lint and drift side effects run only after it commits. Of two
+completions of one claim, or a completion racing the reaper or a re-claim,
+exactly one stores a snapshot; the other stores nothing and is answered
+`409 mcp_claim_invalid`. A retry (`status: "retry"`) likewise only counts
+when it ended the current claim.
 
 ### Worker API (`/api/v1/mcp/introspection`)
 
@@ -2115,7 +2146,8 @@ OCI identifier rewritten to akBaseUrl */ }}` with limits `{"wallClockMs":
 ```
 
 A failed outcome carries no lists. `200 {"status": "stored", "snapshotId",
-"contentHash", "drift": {"scanId"} | null}` or `200 {"status": "retry",
+"contentHash", "drift": {"scanId"} | null}` (`snapshotId` is the existing
+snapshot when the result repeats it) or `200 {"status": "retry",
 "notBefore"}`; `409 mcp_claim_invalid` when the token does not match the
 current claim (expired, re-claimed or already completed); `400` for a
 malformed result.

@@ -481,6 +481,9 @@ async fn post_capabilities(
         StatusCode::CREATED,
         &json!({
             "snapshot": ins.snapshot.to_json(),
+            // `false`: the report repeats the newest one of the same source
+            // and origin, whose `lastSeenAt` was bumped instead (#5386).
+            "created": ins.created,
             "previousSnapshotId": ins.previous.as_ref().map(|s| s.id),
             "drift": drift.map(|scan_id| json!({"scanId": scan_id})),
         }),
@@ -882,18 +885,19 @@ async fn complete_job(
     }
     let result: jobs::WorkerResult = serde_json::from_slice(&body)
         .map_err(|e| bad_request("", &format!("unreadable result: {e}")))?;
+    let claim_invalid = || {
+        problem(
+            409,
+            "mcp_claim_invalid",
+            "This job is not claimed with that token (lease expired or already completed)",
+            json!({}),
+        )
+    };
     let job = jobs::get_job(&state.db, id)
         .await
         .map_err(app_error)?
         .filter(|j| jobs::token_matches(j, &result.claim_token))
-        .ok_or_else(|| {
-            problem(
-                409,
-                "mcp_claim_invalid",
-                "This job is not claimed with that token (lease expired or already completed)",
-                json!({}),
-            )
-        })?;
+        .ok_or_else(claim_invalid)?;
     let parsed = jobs::parse_result(&result).map_err(|e| bad_request(&e.path, &e.message))?;
     let out = match jobs::complete(&state.db, &job, &result, parsed)
         .await
@@ -912,6 +916,9 @@ async fn complete_job(
             "status": "retry",
             "notBefore": not_before,
         }),
+        // The claim ended between the token check and the store (a duplicate
+        // or concurrent completion, the reaper): nothing was stored (#5389).
+        jobs::Completed::ClaimLost => return Err(claim_invalid()),
     };
     Ok(json_resp(StatusCode::OK, &out))
 }
@@ -1102,6 +1109,11 @@ mod db_tests {
         fx: tdh::Fixture,
     }
 
+    /// The job queue and the snapshot retention pass are global: the tests
+    /// that claim, re-queue or prune take this lock so they do not hand each
+    /// other's jobs out or count each other's re-queues.
+    static QUEUE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     impl Env {
         fn admin(&self) -> Router {
             tdh::router_with_auth(
@@ -1124,6 +1136,69 @@ mod db_tests {
                 "/{}/v0.1/servers/com.acme%2Fweather/versions/1.0.0/capabilities{tail}",
                 self.fx.repo_key
             )
+        }
+        async fn publish(&self, version: &str) {
+            let publish = format!("/{}/v0.1/publish", self.fx.repo_key);
+            let (s, b) = call(
+                self.admin(),
+                "POST",
+                &publish,
+                Some(doc(version, json!({"tools": [{"name": "get_weather"}]}))),
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        async fn artifact(&self, version: &str) -> Uuid {
+            sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 \
+                   AND name = 'com.acme/weather' AND version = $2",
+            )
+            .bind(self.fx.repo_id)
+            .bind(version)
+            .fetch_one(&self.fx.pool)
+            .await
+            .unwrap()
+        }
+        /// Claim the open probe of `artifact_id` with `token`, without the
+        /// global claim query (which could hand out another test's job).
+        async fn claim_probe(&self, artifact_id: Uuid, token: &str) -> jobs::JobRow {
+            let id: Uuid = sqlx::query_scalar(
+                "UPDATE mcp_introspection_jobs SET status = 'claimed', \
+                   attempts = attempts + 1, claimed_by = 'test', claimed_at = NOW(), \
+                   lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $2 \
+                 WHERE artifact_id = $1 AND kind = 'remote_probe' AND status = 'pending' \
+                 RETURNING id",
+            )
+            .bind(artifact_id)
+            .bind(caps::sha256_hex(token.as_bytes()))
+            .fetch_one(&self.fx.pool)
+            .await
+            .unwrap();
+            jobs::get_job(&self.fx.pool, id).await.unwrap().unwrap()
+        }
+        async fn snapshots(&self, artifact_id: Uuid, source: Source) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM mcp_capability_snapshots \
+                 WHERE artifact_id = $1 AND source = $2",
+            )
+            .bind(artifact_id)
+            .bind(source.as_str())
+            .fetch_one(&self.fx.pool)
+            .await
+            .unwrap()
+        }
+        async fn cleanup(self) {
+            for sql in [
+                "DELETE FROM mcp_introspection_jobs WHERE repository_id = $1",
+                "DELETE FROM repository_config WHERE repository_id = $1",
+                "DELETE FROM packages WHERE repository_id = $1",
+            ] {
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(self.fx.repo_id)
+                    .execute(&self.fx.pool)
+                    .await;
+            }
+            self.fx.teardown().await;
         }
         async fn config(&self, key: &str, value: &str) {
             sqlx::query(
@@ -1150,6 +1225,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn capabilities_lifecycle_end_to_end() {
+        let _queue = QUEUE_LOCK.lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
             return;
         };
@@ -1481,6 +1557,7 @@ mod db_tests {
     /// to the worker (the same servability gate as a sandbox run).
     #[tokio::test]
     async fn probes_of_held_versions_are_not_handed_out() {
+        let _queue = QUEUE_LOCK.lock().await;
         let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
             return;
         };
@@ -1546,5 +1623,436 @@ mod db_tests {
                 .await;
         }
         env.fx.teardown().await;
+    }
+
+    fn probe_snapshot(
+        env: &Env,
+        artifact_id: Uuid,
+        origin: &str,
+        tools: Value,
+        outcome: Outcome,
+        observed_at: DateTime<Utc>,
+    ) -> NewSnapshot {
+        NewSnapshot {
+            repository_id: env.fx.repo_id,
+            artifact_id,
+            server_name: "com.acme/weather".into(),
+            server_version: "1.0.0".into(),
+            source: Source::RemoteProbe,
+            provenance: Source::RemoteProbe.default_provenance().into(),
+            origin: Some(origin.into()),
+            reported_by: None,
+            auth_state: AuthState::None,
+            outcome,
+            protocol_version: None,
+            observed_at,
+            ttl_ms: None,
+            cache_scope: None,
+            set: CapabilitySet {
+                tools: tools.as_array().cloned().unwrap_or_default(),
+                ..Default::default()
+            },
+            worker_version: None,
+            details: json!({}),
+        }
+    }
+
+    /// #5389: two completions of one claim (both past the handler's token
+    /// check) store exactly one snapshot; the second ends nothing and is
+    /// answered as an invalid claim. The retry path likewise.
+    #[tokio::test]
+    async fn a_duplicate_completion_stores_nothing() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let job = env.claim_probe(artifact_id, "tok-1").await;
+        let ok = |tools: Value| jobs::WorkerResult {
+            claim_token: "tok-1".into(),
+            outcome: "ok".into(),
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let r1 = ok(json!([{"name": "get_weather"}]));
+        let first = jobs::complete(&env.fx.pool, &job, &r1, jobs::parse_result(&r1).unwrap())
+            .await
+            .unwrap();
+        let jobs::Completed::Stored { snapshot, .. } = &first else {
+            panic!("the first completion stores: {first:?}");
+        };
+        // A different list, so a deduplicated repeat cannot hide a second
+        // store.
+        let r2 = ok(json!([{"name": "get_weather"}, {"name": "delete_city"}]));
+        let second = jobs::complete(&env.fx.pool, &job, &r2, jobs::parse_result(&r2).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(second, jobs::Completed::ClaimLost),
+            "a duplicate completion stores nothing: {second:?}"
+        );
+        assert_eq!(env.snapshots(artifact_id, Source::RemoteProbe).await, 1);
+        let done = jobs::get_job(&env.fx.pool, job.id).await.unwrap().unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(done.snapshot_id, Some(snapshot.id));
+        let drift_scans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1 AND scan_type = 'external'",
+        )
+        .bind(artifact_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(drift_scans, 0, "no drift from a lost claim");
+
+        // The retry path respects the claim too.
+        let queued = jobs::enqueue_for_artifact(&env.fx.pool, artifact_id, None)
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        let job = env.claim_probe(artifact_id, "tok-2").await;
+        let timeout = jobs::WorkerResult {
+            claim_token: "tok-2".into(),
+            outcome: "timeout".into(),
+            ..Default::default()
+        };
+        let parsed = jobs::parse_result(&timeout).unwrap();
+        let first = jobs::complete(&env.fx.pool, &job, &timeout, parsed.clone())
+            .await
+            .unwrap();
+        assert!(matches!(first, jobs::Completed::Retry { .. }), "{first:?}");
+        let second = jobs::complete(&env.fx.pool, &job, &timeout, parsed)
+            .await
+            .unwrap();
+        assert!(
+            matches!(second, jobs::Completed::ClaimLost),
+            "a duplicate retry ends nothing: {second:?}"
+        );
+        env.cleanup().await;
+    }
+
+    /// #5386: a snapshot repeating the newest one of its (version, source,
+    /// origin) bumps `last_seen_at` instead of adding a row, with no drift; a
+    /// different one is a new row.
+    #[tokio::test]
+    async fn repeated_snapshots_are_deduplicated() {
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let key = env.fx.repo_key.clone();
+        let t0 = DateTime::from_timestamp(Utc::now().timestamp() - 7200, 0).unwrap();
+        let hour = chrono::Duration::hours(1);
+        let a = json!([{"name": "get_weather"}]);
+        let b = json!([{"name": "get_weather"}, {"name": "delete_city"}]);
+        let snap = |tools: &Value, outcome, at| {
+            probe_snapshot(&env, artifact_id, "remote:0", tools.clone(), outcome, at)
+        };
+
+        let (first, drift) = caps::store(&env.fx.pool, &snap(&a, Outcome::Ok, t0), &key)
+            .await
+            .unwrap();
+        assert!(first.created && drift.is_none());
+        let (again, drift) = caps::store(&env.fx.pool, &snap(&a, Outcome::Ok, t0 + hour), &key)
+            .await
+            .unwrap();
+        assert!(!again.created, "the same content is not stored twice");
+        assert!(drift.is_none());
+        assert_eq!(again.snapshot.id, first.snapshot.id);
+        assert_eq!(again.snapshot.observed_at, t0);
+        assert_eq!(again.snapshot.last_seen_at, Some(t0 + hour));
+        assert_eq!(
+            again.snapshot.summary_json()["lastSeenAt"],
+            json!(t0 + hour)
+        );
+        assert_eq!(env.snapshots(artifact_id, Source::RemoteProbe).await, 1);
+
+        let (changed, drift) =
+            caps::store(&env.fx.pool, &snap(&b, Outcome::Ok, t0 + hour * 2), &key)
+                .await
+                .unwrap();
+        assert!(changed.created);
+        assert_ne!(changed.snapshot.id, first.snapshot.id);
+        assert!(drift.is_some(), "a changed list still drifts");
+        assert_eq!(env.snapshots(artifact_id, Source::RemoteProbe).await, 2);
+
+        // A failed attempt repeats too; another origin is its own history.
+        let empty = json!([]);
+        let (t1, _) = caps::store(
+            &env.fx.pool,
+            &snap(&empty, Outcome::Timeout, t0 + hour * 3),
+            &key,
+        )
+        .await
+        .unwrap();
+        let (t2, _) = caps::store(
+            &env.fx.pool,
+            &snap(&empty, Outcome::Timeout, t0 + hour * 4),
+            &key,
+        )
+        .await
+        .unwrap();
+        assert!(t1.created && !t2.created);
+        let other = probe_snapshot(&env, artifact_id, "remote:1", b.clone(), Outcome::Ok, t0);
+        let (o, _) = caps::store(&env.fx.pool, &other, &key).await.unwrap();
+        assert!(o.created, "dedupe is per origin");
+        assert_eq!(env.snapshots(artifact_id, Source::RemoteProbe).await, 4);
+
+        // A CI report that repeats the previous one answers `created: false`.
+        let report = json!({"source": "ci_reported", "generatedBy": "gha",
+                            "tools": [{"name": "get_weather"}]});
+        let (s, r1) = call(env.admin(), "POST", &env.url(""), Some(report.clone())).await;
+        assert_eq!(s, StatusCode::CREATED, "{r1}");
+        assert_eq!(r1["created"], true);
+        let (s, r2) = call(env.admin(), "POST", &env.url(""), Some(report)).await;
+        assert_eq!(s, StatusCode::CREATED, "{r2}");
+        assert_eq!(r2["created"], false);
+        assert_eq!(r2["snapshot"]["id"], r1["snapshot"]["id"]);
+        assert!(r2["drift"].is_null());
+        assert_eq!(env.snapshots(artifact_id, Source::CiReported).await, 1);
+        env.cleanup().await;
+    }
+
+    /// #5386: the scheduler pass keeps the newest `SNAPSHOT_KEEP` snapshots
+    /// per (version, source, origin) plus every one still referenced: the
+    /// newest successful one, one a drift finding names, one the newest job
+    /// of the target points at.
+    #[tokio::test]
+    async fn snapshot_history_is_pruned_to_the_retention_limit() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let key = env.fx.repo_key.clone();
+        let pool = env.fx.pool.clone();
+        let now = Utc::now();
+        // A then B: a drift finding naming both; B is the newest ok one.
+        let (a, _) = caps::store(
+            &pool,
+            &probe_snapshot(
+                &env,
+                artifact_id,
+                "remote:0",
+                json!([{"name": "a"}]),
+                Outcome::Ok,
+                now,
+            ),
+            &key,
+        )
+        .await
+        .unwrap();
+        let (b, drift) = caps::store(
+            &pool,
+            &probe_snapshot(
+                &env,
+                artifact_id,
+                "remote:0",
+                json!([{"name": "b"}]),
+                Outcome::Ok,
+                now,
+            ),
+            &key,
+        )
+        .await
+        .unwrap();
+        assert!(drift.is_some());
+        let insert_failed = |days_ago: i64| {
+            let pool = pool.clone();
+            let repo = env.fx.repo_id;
+            async move {
+                let id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO mcp_capability_snapshots (repository_id, artifact_id, \
+                       server_name, server_version, source, provenance, origin, outcome, \
+                       observed_at, tools_hash, content_hash, created_at) \
+                     VALUES ($1, $2, 'com.acme/weather', '1.0.0', 'remote_probe', 'p', \
+                       'remote:0', 'timeout', NOW(), 'x', 'x', \
+                       NOW() - make_interval(secs => $3)) RETURNING id",
+                )
+                .bind(repo)
+                .bind(artifact_id)
+                .bind(days_ago as f64 * 86400.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                id
+            }
+        };
+        for (id, days) in [(a.snapshot.id, 10.0), (b.snapshot.id, 9.0)] {
+            sqlx::query(
+                "UPDATE mcp_capability_snapshots SET \
+                   created_at = NOW() - make_interval(secs => $2) WHERE id = $1",
+            )
+            .bind(id)
+            .bind(days * 86400.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let by_newest_job = insert_failed(8).await;
+        let by_older_job = insert_failed(7).await;
+        for i in 0..25 {
+            sqlx::query(
+                "INSERT INTO mcp_capability_snapshots (repository_id, artifact_id, \
+                   server_name, server_version, source, provenance, origin, outcome, \
+                   observed_at, tools_hash, content_hash, created_at) \
+                 VALUES ($1, $2, 'com.acme/weather', '1.0.0', 'remote_probe', 'p', \
+                   'remote:0', 'timeout', NOW(), 'x', 'x', \
+                   NOW() - INTERVAL '1 day' + make_interval(secs => $3))",
+            )
+            .bind(env.fx.repo_id)
+            .bind(artifact_id)
+            .bind(i as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut job_ids = Vec::new();
+        for (snapshot, days) in [(by_older_job, 3.0), (by_newest_job, 2.0)] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO mcp_introspection_jobs (repository_id, artifact_id, kind, \
+                   target_key, status, snapshot_id, completed_at, created_at) \
+                 VALUES ($1, $2, 'remote_probe', 'remote:0', 'completed', $3, NOW(), \
+                   NOW() - make_interval(secs => $4)) RETURNING id",
+            )
+            .bind(env.fx.repo_id)
+            .bind(artifact_id)
+            .bind(snapshot)
+            .bind(days * 86400.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            job_ids.push(id);
+        }
+        assert_eq!(env.snapshots(artifact_id, Source::RemoteProbe).await, 29);
+
+        jobs::scheduler_tick(&pool).await;
+        let keep = caps::SNAPSHOT_KEEP;
+        assert_eq!(
+            env.snapshots(artifact_id, Source::RemoteProbe).await,
+            keep + 3,
+            "the newest {keep} plus the three referenced rows"
+        );
+        for (id, why) in [
+            (a.snapshot.id, "named by the drift finding"),
+            (b.snapshot.id, "the newest successful snapshot"),
+            (by_newest_job, "the newest job's snapshot"),
+        ] {
+            assert!(
+                caps::get_snapshot(&pool, id).await.unwrap().is_some(),
+                "{why} is kept"
+            );
+        }
+        assert!(caps::get_snapshot(&pool, by_older_job)
+            .await
+            .unwrap()
+            .is_none());
+        let older = jobs::get_job(&pool, job_ids[0]).await.unwrap().unwrap();
+        assert_eq!(
+            older.snapshot_id, None,
+            "the foreign key clears the reference"
+        );
+        assert_eq!(older.status, "completed");
+        // The declared history is its own group, untouched.
+        assert_eq!(
+            env.snapshots(artifact_id, Source::PublisherDeclared).await,
+            1
+        );
+        // Idempotent.
+        jobs::scheduler_tick(&pool).await;
+        assert_eq!(
+            env.snapshots(artifact_id, Source::RemoteProbe).await,
+            keep + 3
+        );
+        env.cleanup().await;
+    }
+
+    /// #5386: due re-probes are queued for each server's latest version and
+    /// recently published versions only.
+    #[tokio::test]
+    async fn reprobes_skip_old_versions() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        env.publish("2.0.0").await;
+        let (v1, v2) = (env.artifact("1.0.0").await, env.artifact("2.0.0").await);
+        // Every probe done 7 h ago; both versions published 60 days ago, so
+        // only 2.0.0 (the latest) is due.
+        sqlx::query(
+            "UPDATE mcp_introspection_jobs SET status = 'completed', \
+               completed_at = NOW() - INTERVAL '7 hours', claim_token_hash = NULL \
+             WHERE repository_id = $1",
+        )
+        .bind(env.fx.repo_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let published = |id: Uuid, days: i32| {
+            let pool = env.fx.pool.clone();
+            async move {
+                sqlx::query(
+                    "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, \
+                       '{registry,publishedAt}', to_jsonb(to_char((NOW() - make_interval(days => $2)) \
+                       AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))) \
+                     WHERE artifact_id = $1",
+                )
+                .bind(id)
+                .bind(days)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        published(v1, 60).await;
+        published(v2, 60).await;
+        let pending = |id: Uuid| {
+            let pool = env.fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM mcp_introspection_jobs \
+                     WHERE artifact_id = $1 AND status = 'pending'",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let latest: Vec<(String, Option<bool>)> = sqlx::query_as(
+            "SELECT a.version, (m.metadata->'registry'->>'isLatest')::boolean FROM artifacts a \
+             JOIN artifact_metadata m ON m.artifact_id = a.id WHERE a.repository_id = $1 \
+             ORDER BY a.version",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_all(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            latest,
+            vec![
+                (String::from("1.0.0"), Some(false)),
+                (String::from("2.0.0"), Some(true))
+            ]
+        );
+        jobs::requeue_due_probes(&env.fx.pool).await.unwrap();
+        assert_eq!(pending(v2).await, 1, "the latest version is re-probed");
+        assert_eq!(pending(v1).await, 0, "an old version is not");
+        // A version published in the window is re-probed.
+        published(v1, jobs::REPROBE_RECENT_DAYS - 25).await;
+        jobs::requeue_due_probes(&env.fx.pool).await.unwrap();
+        assert_eq!(pending(v1).await, 1, "a recent version is re-probed");
+        env.cleanup().await;
     }
 }
