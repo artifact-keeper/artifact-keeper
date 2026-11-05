@@ -43,8 +43,11 @@ no background decay.
 
 jemalloc (`tikv-jemallocator`) uses its own arenas and *decays*: dirty pages
 are returned with `madvise` after `dirty_decay_ms` (10 s by default), and
-muzzy pages after `muzzy_decay_ms`. The resident set therefore follows the
-working set instead of the historical high-water mark.
+`muzzy_decay_ms` is 0, so they are released outright rather than parked as
+muzzy pages. Background threads are off by default, so the purge runs on the
+backend's own allocation activity; an idle backend still allocates often
+enough for it to run. The resident set therefore follows the working set
+instead of the historical high-water mark.
 
 ## What the shipped image does
 
@@ -65,21 +68,31 @@ Other images and builds:
   ```
   `--features profiling` implies `jemalloc` and adds heap profiling; see
   `backend/src/main.rs`.
+* **arm64.** jemalloc fixes its page size when it is compiled, and refuses to
+  start on a kernel with larger pages (`<jemalloc>: Unsupported system page
+  size`). The Dockerfile builds it for 64 KiB pages on aarch64, which also
+  runs on 4 KiB-page kernels. An aarch64 source build that must run on a
+  64 KiB-page kernel (RHEL's `kernel-64k`, NVIDIA Grace) needs the same:
+  `JEMALLOC_SYS_WITH_LG_PAGE=16 cargo build --release --features jemalloc`.
 * **The Alpine/musl image** (`docker/Dockerfile.backend.alpine`) does not use
   glibc and keeps its current allocator.
 
 ## Verifying which allocator a process is using
 
-jemalloc reads `MALLOC_CONF` itself, so a process without it produces no
-jemalloc output. Set `stats_print:true` and restart the container; on a clean
-shutdown jemalloc writes its statistics to stderr, beginning with
-`___ Begin jemalloc statistics ___`, a `Version:` line and the configured
-decay values. If the log has no such block, the binary was built with the
-system allocator.
+The backend logs its allocator at startup: `Global allocator: jemalloc`, or
+`Global allocator: system` for a build without the feature.
 
-`MALLOC_CONF=abort_conf:true` makes an invalid configuration abort at startup
-instead of being ignored, which is useful when you are also setting decay
-options.
+For jemalloc's own view, set `_RJEM_MALLOC_CONF=stats_print:true` and restart
+the container; on exit jemalloc writes its statistics to stderr, beginning with
+`___ Begin jemalloc statistics ___`, a `Version:` line, the page size and the
+configured decay values. The variable has the `_RJEM_` prefix because
+`tikv-jemallocator` builds jemalloc with prefixed symbols. Plain `MALLOC_CONF`
+is ignored.
+
+`_RJEM_MALLOC_CONF=abort_conf:true` makes an invalid configuration abort at
+startup instead of being ignored, which is useful when you are also setting
+decay options, for example
+`_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:5000`.
 
 ## If you cannot switch allocators
 

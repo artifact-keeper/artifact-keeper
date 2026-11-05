@@ -3651,6 +3651,18 @@ mod tests {
              passes it to both cargo invocations; the jemalloc feature would \
              not reach the binary (#5130)"
         );
+        // jemalloc takes its page size from the build host and refuses to
+        // start on a kernel with larger pages, so the arm64 image, built on
+        // 4 KiB-page runners, must build it for 64 KiB pages in both stages.
+        assert_eq!(
+            dockerfile
+                .matches(r#"if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi"#)
+                .count(),
+            2,
+            "docker/Dockerfile.backend must build jemalloc for 64 KiB pages on \
+             aarch64 in both the deps and builder stages, or the arm64 image \
+             aborts at startup on a 64 KiB-page kernel (#5130)"
+        );
 
         let workflow = include_str!("../../.github/workflows/docker-publish.yml");
         let backend_job = workflow

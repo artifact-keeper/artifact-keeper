@@ -82,7 +82,14 @@ ARG CARGO_FEATURES="jemalloc"
 # Must name a profile whose output directory is its own name (`release` or a
 # custom one), not `dev`/`test`, which write to `target/debug/`.
 ARG CARGO_PROFILE=release
-RUN if [ -n "$CARGO_FEATURES" ]; then \
+# jemalloc fixes its page size when it is compiled, from the build host, and
+# refuses to start on a kernel with larger pages ("<jemalloc>: Unsupported
+# system page size"). The arm64 image is built on 4 KiB-page runners but must
+# also run on 64 KiB-page arm64 kernels (RHEL's kernel-64k, NVIDIA Grace), so
+# aarch64 builds jemalloc for 64 KiB pages, which also works on 4 KiB kernels.
+# The builder stage sets the same value; a mismatch rebuilds jemalloc there.
+RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
+    if [ -n "$CARGO_FEATURES" ]; then \
       cargo chef cook --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
     else \
       cargo chef cook --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
@@ -108,7 +115,9 @@ ARG CARGO_PROFILE=release
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-RUN if [ -n "${APP_VERSION}" ]; then \
+# Same jemalloc page size as the deps stage above.
+RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
+    if [ -n "${APP_VERSION}" ]; then \
       CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
       sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
     fi && \
