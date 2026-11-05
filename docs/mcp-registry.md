@@ -1124,6 +1124,16 @@ response. Each is a `repository_config` key of the same name. `null`/absent on
 a request leaves the stored value unchanged. A setting that does not apply to
 the repository type is refused with `400`; a response omits it.
 
+The echo is for administrators: `POST`, `GET` and `PATCH
+/api/v1/repositories/{key}` carry these settings, and `mcp_package_repos` and
+`mcp_namespace_allow`, only when the caller administers the repository
+(`mcp_caller_is_repo_admin` is `true`). Any other caller, an anonymous reader
+of a public registry or a grantee without the repository `admin` action, gets
+them omitted (#5398): the backing repository keys can name repositories the
+caller cannot see, and the globs are policy a reader does not need. The
+package policy (`mcp_package_policy`) is echoed to every reader. The
+repository list carries none of them.
+
 | Field | Types | Values (default first) | Meaning |
 | --- | --- | --- | --- |
 | `mcp_server_deny` | all | glob list (`[]`) | Full server names refused on publish, edit and bundle upload, and hidden on serve. `*` matches any run of characters including `/`; matching is ASCII case-insensitive. Deny always wins, even over an approval. An entry with neither `/` nor `*` (a bare namespace) is refused with `422` (it would match no name; write `com.acme/*`); other bad syntax is `400`. |
