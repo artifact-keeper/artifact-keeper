@@ -618,6 +618,7 @@ pub async fn quick_search(
         accessible_repo_ids,
         sort_by: None,
         sort_order: None,
+        ..Default::default()
     };
 
     let service = SearchService::new(state.db.clone());
@@ -676,6 +677,8 @@ pub async fn advanced_search(
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<AdvancedSearchQuery>,
 ) -> Result<Json<AdvancedSearchResponse>> {
+    let filters = advanced_field_filters(&params)?;
+
     // per_page=0 is an explicit request for zero results: return an empty
     // page with the right total so paginated UIs still render counts.
     if matches!(params.per_page, Some(0)) {
@@ -691,6 +694,7 @@ pub async fn advanced_search(
             accessible_repo_ids: accessible_repo_ids.clone(),
             sort_by: None,
             sort_order: None,
+            ..filters
         };
         let service = SearchService::new(state.db.clone());
         let response = service.search(count_query).await?;
@@ -725,6 +729,7 @@ pub async fn advanced_search(
         accessible_repo_ids,
         sort_by: params.sort_by.clone(),
         sort_order: params.sort_order.clone(),
+        ..filters
     };
 
     let service = SearchService::new(state.db.clone());
@@ -751,6 +756,39 @@ pub async fn advanced_search(
         },
         facets,
     }))
+}
+
+/// The field filters of `GET /search/advanced` (#5200) as the base of its
+/// [`SearchQuery`], so the items and the total both honour them.
+fn advanced_field_filters(params: &AdvancedSearchQuery) -> Result<SearchQuery> {
+    Ok(SearchQuery {
+        repository_key: params.repository_key.clone(),
+        path: params.path.clone(),
+        version: params.version.clone(),
+        min_size: params.min_size,
+        max_size: params.max_size,
+        created_after: parse_search_instant("created_after", params.created_after.as_deref())?,
+        created_before: parse_search_instant("created_before", params.created_before.as_deref())?,
+        ..Default::default()
+    })
+}
+
+/// Parse a `created_after` / `created_before` value: an RFC 3339 timestamp,
+/// or a `YYYY-MM-DD` date meaning midnight UTC. Anything else is a 400 rather
+/// than a silently ignored filter.
+fn parse_search_instant(field: &str, value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if let Ok(instant) = DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(instant.with_timezone(&Utc)));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Ok(Some(date.and_time(chrono::NaiveTime::MIN).and_utc()));
+    }
+    Err(AppError::Validation(format!(
+        "{field} must be an RFC 3339 timestamp or a YYYY-MM-DD date"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -3448,5 +3486,267 @@ mod opensearch_quick_search_db_tests {
                 "{backend}: the reason must never be exposed on search"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5200: /search/advanced applies every documented field filter
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod advanced_field_filter_db_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Two repositories the non-admin caller can read, `sa` and `sb`, and a
+    /// third, `sc`, it holds no grant on. Every artifact's name is
+    /// `<needle>-<label>`, so `name=<needle>-*` alone selects exactly this
+    /// fixture and each test only adds the filter under test.
+    ///
+    /// | label | repo | path                | version | size | created_at |
+    /// |-------|------|---------------------|---------|------|------------|
+    /// | a1    | sa   | `<needle>/lib/a1`   | 1.0.0   | 5    | 2024-01-10 |
+    /// | a2    | sa   | `<needle>/docs/a2`  | 2.0.0   | 50   | 2024-06-10 |
+    /// | b1    | sb   | `<needle>/lib/b1`   | 1.0.0   | 5    | 2025-01-10 |
+    /// | c1    | sc   | `<needle>/lib/c1`   | 2.0.0   | 50   | 2024-06-10 |
+    struct Fixture {
+        pool: PgPool,
+        state: SharedState,
+        user_id: Uuid,
+        username: String,
+        needle: String,
+        repos: Vec<(Uuid, String, std::path::PathBuf)>,
+    }
+
+    impl Fixture {
+        async fn setup() -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let mut repos = Vec::new();
+            for _ in 0..3 {
+                repos.push(tdh::create_repo(&pool, "local", "generic").await);
+            }
+            tdh::grant_repo_access(&pool, repos[0].0, user_id).await;
+            tdh::grant_repo_access(&pool, repos[1].0, user_id).await;
+            let needle = format!("adv5200{}", Uuid::new_v4().simple());
+            let rows = [
+                ("a1", 0, "lib", "1.0.0", 5_i64, "2024-01-10T12:00:00Z"),
+                ("a2", 0, "docs", "2.0.0", 50, "2024-06-10T12:00:00Z"),
+                ("b1", 1, "lib", "1.0.0", 5, "2025-01-10T12:00:00Z"),
+                ("c1", 2, "lib", "2.0.0", 50, "2024-06-10T12:00:00Z"),
+            ];
+            for (label, repo, dir, version, size, created) in rows {
+                sqlx::query(
+                    "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'application/octet-stream', $7, \
+                     $8::timestamptz)",
+                )
+                .bind(repos[repo].0)
+                .bind(format!("{needle}/{dir}/{label}"))
+                .bind(format!("{needle}-{label}"))
+                .bind(version)
+                .bind(size)
+                .bind("0".repeat(64))
+                .bind(format!("generic/{}", Uuid::new_v4()))
+                .bind(created)
+                .execute(&pool)
+                .await
+                .expect("seed artifact");
+            }
+            let state = tdh::build_state(pool.clone(), repos[0].2.to_string_lossy().as_ref());
+            Some(Self {
+                pool,
+                state,
+                user_id,
+                username,
+                needle,
+                repos,
+            })
+        }
+
+        fn key(&self, repo: usize) -> &str {
+            &self.repos[repo].1
+        }
+
+        /// `GET /advanced?name=<needle>-*&<extra>` as the non-admin caller:
+        /// the status, the sorted labels of the items, and `pagination.total`.
+        async fn search(&self, extra: &str) -> (axum::http::StatusCode, Vec<String>, i64) {
+            let auth = tdh::make_auth(self.user_id, &self.username);
+            let app = tdh::router_with_auth(router(), self.state.clone(), auth);
+            let page = if extra.contains("per_page=") {
+                ""
+            } else {
+                "per_page=50&"
+            };
+            let uri = format!("/advanced?name={}-*&{page}{extra}", self.needle);
+            let (status, body) = tdh::send(app, tdh::get(uri)).await;
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+            let prefix = format!("{}-", self.needle);
+            let mut labels: Vec<String> = json["items"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|i| i["name"].as_str())
+                        .map(|n| n.trim_start_matches(&prefix).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            labels.sort();
+            let total = json["pagination"]["total"].as_i64().unwrap_or(-1);
+            (status, labels, total)
+        }
+
+        /// Run `extra` and tear the fixture down before returning, so a failed
+        /// assertion never leaks it.
+        async fn search_once(self, extra: &str) -> (axum::http::StatusCode, Vec<String>, i64) {
+            let out = self.search(extra).await;
+            self.teardown().await;
+            out
+        }
+
+        async fn teardown(self) {
+            for (id, _, dir) in &self.repos {
+                tdh::cleanup_member_repo(&self.pool, *id, dir).await;
+            }
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(self.user_id)
+                .execute(&self.pool)
+                .await;
+        }
+    }
+
+    fn assert_hits(got: (axum::http::StatusCode, Vec<String>, i64), want: &[&str], what: &str) {
+        let (status, labels, total) = got;
+        assert_eq!(status, axum::http::StatusCode::OK, "{what}: status");
+        assert_eq!(labels, want, "{what}: items");
+        assert_eq!(total, want.len() as i64, "{what}: pagination.total");
+    }
+
+    /// Control: with no field filter the caller sees everything it can read,
+    /// and never `sc`. Every other test narrows this set.
+    #[tokio::test]
+    async fn advanced_search_without_field_filters_returns_all_readable_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        assert_hits(fx.search_once("").await, &["a1", "a2", "b1"], "no filter");
+    }
+
+    /// The #5200 reproduction: `repository_key=sa` returned `sb`'s artifact
+    /// too.
+    #[tokio::test]
+    async fn advanced_search_filters_by_repository_key_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let extra = format!("repository_key={}", fx.key(0));
+        assert_hits(
+            fx.search_once(&extra).await,
+            &["a1", "a2"],
+            "repository_key",
+        );
+    }
+
+    /// Naming a repository the caller cannot read must not widen its scope.
+    #[tokio::test]
+    async fn advanced_search_repository_key_respects_permissions_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let extra = format!("repository_key={}", fx.key(2));
+        assert_hits(
+            fx.search_once(&extra).await,
+            &[],
+            "unreadable repository_key",
+        );
+    }
+
+    /// `path` is a literal prefix: a leading `/` is ignored and `_` is not a
+    /// wildcard.
+    #[tokio::test]
+    async fn advanced_search_filters_by_path_prefix_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let lib = fx.search(&format!("path={}/lib/", fx.needle)).await;
+        let slash = fx.search(&format!("path=/{}/docs", fx.needle)).await;
+        let literal = fx.search(&format!("path={}/l_b", fx.needle)).await;
+        fx.teardown().await;
+        assert_hits(lib, &["a1", "b1"], "path prefix");
+        assert_hits(slash, &["a2"], "path with a leading slash");
+        assert_hits(literal, &[], "path `_` is literal");
+    }
+
+    #[tokio::test]
+    async fn advanced_search_filters_by_version_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        assert_hits(fx.search_once("version=2.0.0").await, &["a2"], "version");
+    }
+
+    /// Both bounds are inclusive.
+    #[tokio::test]
+    async fn advanced_search_filters_by_size_bounds_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let min = fx.search("min_size=50").await;
+        let max = fx.search("max_size=5").await;
+        let between = fx.search("min_size=6&max_size=49").await;
+        fx.teardown().await;
+        assert_hits(min, &["a2"], "min_size");
+        assert_hits(max, &["a1", "b1"], "max_size");
+        assert_hits(between, &[], "min_size and max_size");
+    }
+
+    /// A bare date means midnight UTC; an RFC 3339 timestamp is exact.
+    #[tokio::test]
+    async fn advanced_search_filters_by_created_dates_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let after = fx.search("created_after=2024-03-01").await;
+        let before = fx.search("created_before=2024-03-01T00:00:00Z").await;
+        let range = fx
+            .search("created_after=2024-06-10T11:59:59Z&created_before=2024-12-31")
+            .await;
+        fx.teardown().await;
+        assert_hits(after, &["a2", "b1"], "created_after");
+        assert_hits(before, &["a1"], "created_before");
+        assert_hits(range, &["a2"], "created_after and created_before");
+    }
+
+    /// An unparseable date is refused, not silently dropped.
+    #[tokio::test]
+    async fn advanced_search_rejects_an_invalid_date_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let (status, _, _) = fx.search_once("created_after=yesterday").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// The `per_page=0` count-only path honours the filters too, and they
+    /// combine with each other.
+    #[tokio::test]
+    async fn advanced_search_count_only_and_combined_filters_db() {
+        let Some(fx) = Fixture::setup().await else {
+            return;
+        };
+        let count_only = fx
+            .search(&format!("repository_key={}&per_page=0", fx.key(0)))
+            .await;
+        let combined = fx
+            .search(&format!("repository_key={}&version=1.0.0", fx.key(0)))
+            .await;
+        fx.teardown().await;
+        assert_eq!(count_only.0, axum::http::StatusCode::OK);
+        assert_eq!(count_only.2, 2, "per_page=0 total must honour the filter");
+        assert_hits(combined, &["a1"], "repository_key and version");
     }
 }
