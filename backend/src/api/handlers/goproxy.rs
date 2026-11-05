@@ -4795,8 +4795,9 @@ mod duplicate_entry_tests {
 /// database (standing in for `https://sum.golang.org`) and counts the
 /// requests it receives. The Remote's mutable-path TTL is `0` throughout, so
 /// a path cached as mutable is revalidated on every request: a path that is
-/// requested twice but reaches the mock once is immutable. "Down" is a
-/// sumdb answering `503` to everything (`take_down`).
+/// requested twice but reaches the mock once is immutable. Each outage is
+/// tested twice: a sumdb answering `503` to everything (`take_down`), and an
+/// unreachable one, a closed port (`unreachable_sumdb`).
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod sumdb_cache_5344_tests {
@@ -4856,6 +4857,15 @@ mod sumdb_cache_5344_tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(server)
             .await;
+    }
+
+    /// A base URL nothing listens on (a port bound and released), so a fetch
+    /// from it fails with a connection error: the sumdb unreachable.
+    fn unreachable_sumdb() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
     }
 
     /// Requests `server` has received for `path`.
@@ -4954,6 +4964,14 @@ mod sumdb_cache_5344_tests {
             );
             assert_eq!(hits(&server, path).await, 0, "{path}: no upstream contact");
         }
+        // And unreachable: a connection error, not an upstream answer.
+        let gone = unreachable_sumdb();
+        for (path, body) in &expected {
+            let (status, served, headers) = get_sumdb(&app, &gone, &fx.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path} unreachable");
+            assert_eq!(&served[..], &body[..], "{path} unreachable");
+            assert!(headers.get(axum::http::header::WARNING).is_none(), "{path}");
+        }
         fx.teardown().await;
     }
 
@@ -5003,6 +5021,22 @@ mod sumdb_cache_5344_tests {
             Some(proxy_helpers::STALE_WARNING)
         );
         assert!(headers.get(proxy_helpers::STALE_SINCE_HEADER).is_some());
+
+        // Unreachable (connection refused): served stale the same way.
+        let (status, served, headers) =
+            get_sumdb(&app, &unreachable_sumdb(), &fx.repo_key, LATEST).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "stale-if-error on a connection error"
+        );
+        assert_eq!(served, latest_body(200).as_bytes());
+        assert_eq!(
+            headers
+                .get(axum::http::header::WARNING)
+                .and_then(|v| v.to_str().ok()),
+            Some(proxy_helpers::STALE_WARNING)
+        );
         fx.teardown().await;
     }
 
@@ -5118,6 +5152,9 @@ mod sumdb_cache_5344_tests {
         take_down(&server).await;
         let offline = get_sumdb(&app, &sumdb, &fx.repo_key, TILE).await.0;
         let offline_hits = hits(&server, TILE).await;
+        let unreachable = get_sumdb(&app, &unreachable_sumdb(), &fx.repo_key, TILE)
+            .await
+            .0;
 
         tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
         fx.teardown().await;
@@ -5125,6 +5162,11 @@ mod sumdb_cache_5344_tests {
         assert_eq!(tile_hits, 1, "cached in the Remote member");
         assert_eq!(offline, StatusCode::OK, "served from the member's cache");
         assert_eq!(offline_hits, 0);
+        assert_eq!(
+            unreachable,
+            StatusCode::OK,
+            "served with the sumdb unreachable"
+        );
     }
 
     #[test]
