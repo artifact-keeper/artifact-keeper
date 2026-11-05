@@ -860,13 +860,16 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let backup_registry = storage_registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(45)).await;
             let mut ticker = interval(Duration::from_secs(300)); // 5 minutes
 
             loop {
                 ticker.tick().await;
-                if let Err(e) = execute_due_backup_schedules(&db, &config_clone).await {
+                if let Err(e) =
+                    execute_due_backup_schedules(&db, &config_clone, &backup_registry).await
+                {
                     tracing::warn!("Backup schedule check failed: {}", e);
                 }
             }
@@ -1656,7 +1659,11 @@ async fn finalize_backup_schedule_run(
 }
 
 /// Check for due backup schedules and execute them.
-async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::error::Result<()> {
+async fn execute_due_backup_schedules(
+    db: &PgPool,
+    config: &Config,
+    storage_registry: &Arc<crate::storage::StorageRegistry>,
+) -> crate::error::Result<()> {
     // Find schedules where next_run_at <= now
     let due_schedules = sqlx::query_as::<_, DueBackupSchedule>(
         r#"
@@ -1760,7 +1767,8 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             db.clone(),
             storage.clone(),
             archive_storage.clone(),
-        );
+        )
+        .with_storage_registry(storage_registry.clone());
         // The renewal loop heartbeats the claim; its cancellation token fires
         // if ownership is lost (DB partition, expired TTL reclaimed by another
         // replica) so the in-flight archive is aborted instead of producing a
