@@ -680,6 +680,7 @@ fn cfg(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         device_auth: Default::default(),
+        proxy_upstream: Default::default(),
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
