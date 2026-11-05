@@ -141,6 +141,8 @@ tar = "0.4"
 xz2 = "0.1"
 mime_guess = "2.0"
 zip = "9.0"
+# Strict SemVer 2.0 precedence for Puppet Forge release ordering (#5229).
+semver = "1"
 toml = "1.1"
 serde_yaml = "0.9"
 regex = "1.11"
