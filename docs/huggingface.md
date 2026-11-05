@@ -87,7 +87,7 @@ the same model, and **a pattern has to match both**:
 | Request | Path sent upstream |
 |---------|--------------------|
 | Model info (`model_info`, the first call of `snapshot_download` and `hf download`) | `api/models/<org>/<name>`, `api/models/<org>/<name>/revision/<rev>` |
-| File listing (`list_repo_tree`) | `api/models/<org>/<name>/tree/<rev>` |
+| File listing (`list_repo_tree`, and `snapshot_download` in `huggingface_hub` 2.x) | `api/models/<org>/<name>/tree/<rev>`, with the query string once #5321 forwards it (`?recursive=true`, `&cursor=...`) |
 | File download (`hf_hub_download`) | `<org>/<name>/resolve/<rev>/<file>` |
 
 A filter written as `^acme/` admits the files but refuses model info, so
@@ -104,6 +104,7 @@ curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/upstream-
 
 - **Anchor with `^`.** Patterns match anywhere in the path unless anchored, so
   an unanchored `Qwen/` also admits `evil-org/Qwen/...` paths.
+- **Do not anchor the end with `$` after the model name.** Tree listings carry a query string (`?recursive=true`), which is part of the subject.
 - **Keep the `/` after the organisation.** It stops look-alikes: the pattern
   above refuses `sentence-transformer/...` and `sentence-transformers-x/...`.
 - **One model rather than a whole organisation:**

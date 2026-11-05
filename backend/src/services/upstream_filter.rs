@@ -684,6 +684,7 @@ mod tests {
             format!("api/models/{model}/revision/main"),
             format!("api/models/{model}/revision/refs%2Fpr%2F1"),
             format!("api/models/{model}/tree/main"),
+            format!("api/models/{model}/tree/main?recursive=true&expand=false"),
             format!("{model}/resolve/main/config.json"),
             format!("{model}/resolve/0123456789abcdef0123456789abcdef01234567/onnx/model.onnx"),
         ]
