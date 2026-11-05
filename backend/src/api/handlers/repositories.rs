@@ -55,6 +55,7 @@ use crate::services::rpm_repodata_builder::{self, RepodataMode};
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 use crate::services::upstream_filter::{self, UpstreamFilter};
+use crate::services::upstream_mode::{self, UpstreamMode};
 use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
 
 /// Require that the request is authenticated, returning an error if not.
@@ -870,6 +871,11 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/:key/on-upstream-not-found",
             put(set_on_upstream_not_found).get(get_on_upstream_not_found),
+        )
+        // Declared cache-only (offline) mode for proxy/remote repositories (#5282)
+        .route(
+            "/:key/upstream-mode",
+            put(set_upstream_mode).get(get_upstream_mode),
         )
         // stale-if-error grace window for proxy/remote repositories (#4581)
         .route(
@@ -3032,6 +3038,132 @@ pub async fn get_on_upstream_not_found(
     }))
 }
 
+/// Reject `upstream_mode` writes against non-Remote repositories (#5282): only
+/// the proxy reads the row, so on any other type it would be dead state.
+fn is_upstream_mode_configurable(repo_type: &RepositoryType) -> Result<()> {
+    if repo_type != &RepositoryType::Remote {
+        return Err(AppError::Validation(
+            "upstream_mode is only configurable on remote (proxy) repositories".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetUpstreamModeRequest {
+    /// Whether this remote (proxy) repository may contact its upstream.
+    /// `online` (the default) proxies as usual. `cache_only` serves only what
+    /// is already cached, fresh or stale, without revalidating, and answers a
+    /// miss with 404 `not in cache; repository '<key>' is cache-only`; the
+    /// upstream is never contacted (#5282).
+    pub upstream_mode: UpstreamMode,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UpstreamModeResponse {
+    pub repository_key: String,
+    /// The mode stored for this repository.
+    pub upstream_mode: UpstreamMode,
+    /// The mode the proxy enforces: `cache_only` whenever the instance-wide
+    /// `PROXY_UPSTREAM_MODE=cache_only` override is set, else `upstream_mode`.
+    pub effective_upstream_mode: UpstreamMode,
+}
+
+impl UpstreamModeResponse {
+    fn new(repository_key: String, stored: UpstreamMode) -> Self {
+        let effective_upstream_mode = if upstream_mode::instance_forces_cache_only() {
+            UpstreamMode::CacheOnly
+        } else {
+            stored
+        };
+        Self {
+            repository_key,
+            upstream_mode: stored,
+            effective_upstream_mode,
+        }
+    }
+}
+
+/// Set the upstream mode (online / cache-only) of a remote (proxy) repository
+#[utoipa::path(
+    put,
+    path = "/{key}/upstream-mode",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    request_body = SetUpstreamModeRequest,
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Upstream mode updated", body = UpstreamModeResponse),
+        (status = 400, description = "Invalid mode value, or not a remote repository"),
+        (status = 401, description = "Authentication required"),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+pub async fn set_upstream_mode(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(payload): Json<SetUpstreamModeRequest>,
+) -> Result<Json<UpstreamModeResponse>> {
+    let auth = require_auth(auth)?;
+    auth.require_scope("write:repositories")?;
+
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    require_repo_write_access(&auth, &repo, &service).await?;
+    // Same administrative tier as `on_upstream_not_found`: turning upstream
+    // contact off (or back on) is a pull-through proxy control.
+    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    is_upstream_mode_configurable(&repo.repo_type)?;
+
+    let previous = upstream_mode::stored_upstream_mode(&state.db, repo.id).await?;
+    // Stores the row and invalidates the cached mode here and, through the
+    // upstream-gate invalidation event, on the other replicas.
+    upstream_mode::save_upstream_mode(&state.db, repo.id, payload.upstream_mode).await?;
+
+    audit_remote_setting_change(&state, &auth, &repo, |details| {
+        details.upstream_mode_change = Some(audit_details::UpstreamModeChangeAudit {
+            previous_upstream_mode: previous.as_str().to_owned(),
+            upstream_mode: payload.upstream_mode.as_str().to_owned(),
+        });
+    })
+    .await;
+
+    Ok(Json(UpstreamModeResponse::new(key, payload.upstream_mode)))
+}
+
+/// Get the upstream mode (online / cache-only) of a repository
+#[utoipa::path(
+    get,
+    path = "/{key}/upstream-mode",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+    ),
+    responses(
+        (status = 200, description = "Current upstream mode", body = UpstreamModeResponse),
+        (status = 404, description = "Repository not found"),
+    )
+)]
+// GET stays permissive for any repo_type (mirrors `get_on_upstream_not_found`):
+// a non-Remote repository reports the default `online`.
+pub async fn get_upstream_mode(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+) -> Result<Json<UpstreamModeResponse>> {
+    let service = RepositoryService::new(state.db.clone());
+    let repo = service.get_by_key(&key).await?;
+    // #4815: a repository the caller may not read answers like a missing key.
+    require_visible(&repo, &auth, &service).await?;
+    let mode = upstream_mode::stored_upstream_mode(&state.db, repo.id).await?;
+    Ok(Json(UpstreamModeResponse::new(key, mode)))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetStaleIfErrorGraceRequest {
     /// RFC 5861 `stale-if-error` grace window, in seconds, for this remote:
@@ -4958,6 +5090,7 @@ pub async fn create_repository(
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
                 age_gate_change: None,
+                upstream_mode_change: None,
             }),
     )
     .await;
@@ -6216,6 +6349,7 @@ pub async fn update_repository(
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
                 age_gate_change: None,
+                upstream_mode_change: None,
             }),
     )
     .await;
@@ -6969,6 +7103,7 @@ pub async fn delete_repository(
                     allow_public_with_upstream_credentials: None,
                     upstream_auth_change: None,
                     age_gate_change: None,
+                    upstream_mode_change: None,
                 }),
         )
         .await;
@@ -13810,6 +13945,46 @@ async fn audit_upstream_auth_change(
     credentials_changed: bool,
     allow_public_with_upstream_credentials: Option<bool>,
 ) {
+    audit_remote_setting_change(state, auth, repo, |details| {
+        details.allow_public_with_upstream_credentials = allow_public_with_upstream_credentials;
+        details.upstream_auth_change = Some(upstream_auth_change_audit(
+            previous_auth_type,
+            auth_type,
+            credentials_changed,
+        ));
+    })
+    .await;
+}
+
+/// Emit a `REPOSITORY_UPDATED` audit row for a per-Remote setting endpoint
+/// (`PUT .../upstream-auth`, `PUT .../upstream-mode`): the actor, the
+/// repository, and whatever change record `fill` sets on the details.
+async fn audit_remote_setting_change(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    fill: impl FnOnce(&mut audit_details::RepositoryDetails),
+) {
+    let mut details = audit_details::RepositoryDetails {
+        actor_id: auth.user_id,
+        key: repo.key.clone(),
+        is_public: repo.is_public,
+        format: Some(derive_format_key(&repo.format)),
+        visibility: Some(repo.visibility.as_str().to_owned()),
+        age_gate_enabled: None,
+        age_gate_min_age_days: None,
+        age_gate_mode: None,
+        scan_config: None,
+        previous_scan_config: None,
+        scan_config_changed: None,
+        upstream_change: None,
+        project_change: None,
+        allow_public_with_upstream_credentials: None,
+        upstream_auth_change: None,
+        age_gate_change: None,
+        upstream_mode_change: None,
+    };
+    fill(&mut details);
     audit_fire_and_forget(
         state.db.clone(),
         AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
@@ -13817,28 +13992,7 @@ async fn audit_upstream_auth_change(
             .resource(repo.id)
             .actor_name(auth.username.clone())
             .resource_name(repo.key.clone())
-            .details_typed(audit_details::RepositoryDetails {
-                actor_id: auth.user_id,
-                key: repo.key.clone(),
-                is_public: repo.is_public,
-                format: Some(derive_format_key(&repo.format)),
-                visibility: Some(repo.visibility.as_str().to_owned()),
-                age_gate_enabled: None,
-                age_gate_min_age_days: None,
-                age_gate_mode: None,
-                scan_config: None,
-                previous_scan_config: None,
-                scan_config_changed: None,
-                upstream_change: None,
-                project_change: None,
-                allow_public_with_upstream_credentials,
-                upstream_auth_change: Some(upstream_auth_change_audit(
-                    previous_auth_type,
-                    auth_type,
-                    credentials_changed,
-                )),
-                age_gate_change: None,
-            }),
+            .details_typed(details),
     )
     .await;
 }
@@ -14965,6 +15119,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         get_cache_ttl,
         set_on_upstream_not_found,
         get_on_upstream_not_found,
+        set_upstream_mode,
+        get_upstream_mode,
         set_stale_if_error_grace,
         get_stale_if_error_grace,
         invalidate_cache,
@@ -15014,6 +15170,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         SetOnUpstreamNotFoundRequest,
         OnUpstreamNotFoundResponse,
         OnUpstreamNotFound,
+        SetUpstreamModeRequest,
+        UpstreamModeResponse,
+        UpstreamMode,
         SetStaleIfErrorGraceRequest,
         StaleIfErrorGraceResponse,
         SetNpmScopePolicyRequest,
@@ -21490,6 +21649,7 @@ mod tests {
         let reads = [
             "cache-ttl",
             "on-upstream-not-found",
+            "upstream-mode",
             "stale-if-error-grace",
             "routing-rules",
             "pypi-tracks",
@@ -25446,6 +25606,135 @@ mod tests {
         );
 
         fx.teardown().await;
+    }
+
+    /// #5282, through the HTTP surface: a Remote defaults to `online`, `PUT`
+    /// stores `cache_only` under the documented key and writes the audit row,
+    /// `GET` reads it back; an unknown value and a non-Remote repository are
+    /// both 400.
+    #[tokio::test]
+    async fn upstream_mode_round_trips_through_the_api_5282() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let Some(local) = tdh::Fixture::setup("local", "generic").await else {
+            fx.teardown().await;
+            return;
+        };
+        let admin_app = |fx: &tdh::Fixture| {
+            tdh::router_with_auth_ext(
+                super::router(),
+                fx.state.clone(),
+                tdh::admin_auth(fx.user_id, &fx.username),
+            )
+        };
+        let put = |fx: &tdh::Fixture, body: &'static [u8]| {
+            let req = tdh::put_json(
+                format!("/{}/upstream-mode", fx.repo_key),
+                axum::body::Bytes::from_static(body),
+            );
+            tdh::send(admin_app(fx), req)
+        };
+        let get = |fx: &tdh::Fixture| {
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::get(format!("/{}/upstream-mode", fx.repo_key)),
+            )
+        };
+        let mode = |body: &[u8]| -> String {
+            let json: serde_json::Value = serde_json::from_slice(body).expect("JSON body");
+            json["upstream_mode"]
+                .as_str()
+                .expect("upstream_mode")
+                .to_string()
+        };
+
+        let (default_status, default_body) = get(&fx).await;
+        let (put_status, put_body) = put(&fx, br#"{"upstream_mode":"cache_only"}"#).await;
+        let (read_status, read_body) = get(&fx).await;
+        let (bad_status, _) = put(&fx, br#"{"upstream_mode":"offline"}"#).await;
+        let (local_status, _) = put(&local, br#"{"upstream_mode":"cache_only"}"#).await;
+        let stored: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'upstream_mode'",
+        )
+        .bind(fx.repo_id)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read the stored mode");
+        // The audit write is fire-and-forget; give it a moment to land.
+        let mut audited = 0i64;
+        for _ in 0..50 {
+            audited = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 \
+                 AND action = 'REPOSITORY_UPDATED' \
+                 AND details->'upstream_mode_change'->>'upstream_mode' = 'cache_only'",
+            )
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap_or(0);
+            if audited > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        local.teardown().await;
+        fx.teardown().await;
+
+        assert_eq!(default_status, StatusCode::OK);
+        assert_eq!(mode(&default_body), "online", "a Remote defaults to online");
+        assert_eq!(
+            put_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&put_body)
+        );
+        assert_eq!(mode(&put_body), "cache_only");
+        assert_eq!(read_status, StatusCode::OK);
+        assert_eq!(
+            mode(&read_body),
+            "cache_only",
+            "GET reads back what PUT stored"
+        );
+        assert_eq!(stored.map(|(v,)| v).as_deref(), Some("cache_only"));
+        assert_eq!(
+            bad_status,
+            StatusCode::BAD_REQUEST,
+            "an unknown mode is a 400"
+        );
+        assert_eq!(
+            local_status,
+            StatusCode::BAD_REQUEST,
+            "upstream_mode is Remote-only"
+        );
+        assert_eq!(audited, 1, "the change is recorded as REPOSITORY_UPDATED");
+    }
+
+    #[test]
+    fn upstream_mode_is_configurable_only_on_remote_repositories() {
+        assert!(is_upstream_mode_configurable(&RepositoryType::Remote).is_ok());
+        for repo_type in [
+            RepositoryType::Local,
+            RepositoryType::Virtual,
+            RepositoryType::Staging,
+        ] {
+            assert!(
+                matches!(
+                    is_upstream_mode_configurable(&repo_type),
+                    Err(AppError::Validation(_))
+                ),
+                "{repo_type:?}"
+            );
+        }
     }
 
     /// Runtime regression (#1539): on a Remote repo with the proxy service

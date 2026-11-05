@@ -41,6 +41,7 @@ use crate::services::proxy_scan_service::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_mode::UpstreamMode;
 use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
 use crate::services::upstream_tracing::send_upstream;
 
@@ -1744,6 +1745,11 @@ enum RevalidationVerdict {
     /// without deleting it, writing no marker, and without extending its TTL so
     /// a later revalidation still notices a re-publish.
     KeepOnUpstreamNotFound,
+    /// #5282: the repository is cache-only, so the stale entry is served as it
+    /// is, marked stale (`X-AK-Stale-Since`), with no upstream contact. Unlike
+    /// [`Self::ServeStaleIfError`] there is no grace window and it does not
+    /// count as an upstream failure.
+    ServeStaleCacheOnly,
 }
 
 /// Outcome of a conditional HEAD revalidation probe (#4640).
@@ -7468,16 +7474,22 @@ impl ProxyService {
                     // body too, without extending its TTL.
                     RevalidationVerdict::ServeRevalidated
                     | RevalidationVerdict::ServeStaleIfError
+                    | RevalidationVerdict::ServeStaleCacheOnly
                     | RevalidationVerdict::KeepOnUpstreamNotFound => {
                         // Package Age Policy (#1770): gate the revalidated /
                         // stale-if-error body the same way as a fresh hit.
                         check_quarantine_until(metadata.quarantine_until)?;
                         // #4581: a stale-if-error serve is marked with the
                         // entry's stamped expiry; a 304 extended the TTL, so
-                        // that body is fresh again and carries no marker.
-                        let stale_since = matches!(verdict, RevalidationVerdict::ServeStaleIfError)
-                            .then_some(metadata.expires_at);
-                        if stale_since.is_some() {
+                        // that body is fresh again and carries no marker. A
+                        // cache-only stale serve (#5282) is marked the same way.
+                        let stale_since = matches!(
+                            verdict,
+                            RevalidationVerdict::ServeStaleIfError
+                                | RevalidationVerdict::ServeStaleCacheOnly
+                        )
+                        .then_some(metadata.expires_at);
+                        if matches!(verdict, RevalidationVerdict::ServeStaleIfError) {
                             self.note_stale_served(repo).await;
                         }
                         // The verdict may have rewritten the sidecar (a 304
@@ -9366,6 +9378,33 @@ impl ProxyService {
         }
     }
 
+    /// The upstream mode this proxy enforces for `repo_id` (#5282), including
+    /// the instance-wide `PROXY_UPSTREAM_MODE` override. A read error is
+    /// `online` here; the upstream gate reads the same value and fails closed.
+    ///
+    /// A plain `fn` returning a boxed future: it is awaited on the cache read
+    /// path of every proxy fetch, whose deepest callers already sit at the
+    /// compiler's layout query-depth limit in the coverage build.
+    pub(crate) fn upstream_mode(
+        &self,
+        repo_id: Uuid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = UpstreamMode> + Send + '_>> {
+        Box::pin(async move {
+            crate::services::upstream_mode::effective_upstream_mode(&self.db, repo_id)
+                .await
+                .unwrap_or_default()
+        })
+    }
+
+    /// [`Self::upstream_mode`] for callers that only hold a repository key
+    /// (the npm packument cache). An unknown key is not cache-only.
+    pub async fn is_cache_only_by_key(&self, repo_key: &str) -> bool {
+        match self.repo_identity_by_key(repo_key).await {
+            Some((repo_id, _)) => self.upstream_mode(repo_id).await.is_cache_only(),
+            None => false,
+        }
+    }
+
     /// Drop this process's cached `stale_if_error_grace_secs` override for
     /// `repo_id` (#4581), so a change made through the API applies to the very
     /// next read here (other replicas pick it up within [`TTL_POLICY_CACHE_TTL`]).
@@ -9572,8 +9611,8 @@ impl ProxyService {
 
     /// The single upstream-contact gate (#840): validate that `repo` is a
     /// remote proxy, refuse `fetch_path` with [`AppError::NotFound`] when the
-    /// repository's upstream filter does not admit it, and otherwise return
-    /// the full upstream URL.
+    /// repository is cache-only (#5282) or its upstream filter does not admit
+    /// it, and otherwise return the full upstream URL.
     ///
     /// Every `ProxyService` code path that sends a request to a repository's
     /// configured upstream builds its URL here (buffered and streaming
@@ -9608,6 +9647,12 @@ impl ProxyService {
             fetch_path,
         )
         .await
+        .inspect_err(|err| {
+            // #5282: a cache-only Remote's miss ends here, before any contact.
+            if crate::services::upstream_mode::is_cache_only_refusal(err) {
+                record_proxy_cache_lookup(&repo.key, "cache_only_miss");
+            }
+        })
     }
 
     /// The origin-policy gate for content a Remote serves (#4506): refuse,
@@ -10163,16 +10208,21 @@ impl ProxyService {
                 }
                 Ok(CacheReadOutcome::Miss)
             }
-            RevalidationVerdict::ServeStaleIfError => {
+            // #5282: a cache-only serve is marked stale like stale-if-error but
+            // is not an upstream failure, so it is neither logged nor counted.
+            verdict @ (RevalidationVerdict::ServeStaleIfError
+            | RevalidationVerdict::ServeStaleCacheOnly) => {
                 if let Ok(Some(body)) = self
                     .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
-                    tracing::warn!(
-                        cache_key = %cache_key,
-                        "revalidation failed; serving stale within stale-if-error grace (#4581)"
-                    );
-                    self.note_stale_served(repo).await;
+                    if matches!(verdict, RevalidationVerdict::ServeStaleIfError) {
+                        tracing::warn!(
+                            cache_key = %cache_key,
+                            "revalidation failed; serving stale within stale-if-error grace (#4581)"
+                        );
+                        self.note_stale_served(repo).await;
+                    }
                     return Ok(CacheReadOutcome::Hit(
                         body.content,
                         body.content_type,
@@ -10204,6 +10254,8 @@ impl ProxyService {
     ///   [`RevalidationVerdict::KeepOnUpstreamNotFound`]; `delete` refills.
     /// * **upstream error within grace** -> [`RevalidationVerdict::ServeStaleIfError`].
     /// * **upstream error past grace** -> [`RevalidationVerdict::Refill`].
+    /// * **cache-only repository** (#5282) -> [`RevalidationVerdict::ServeStaleCacheOnly`],
+    ///   before any probe.
     ///
     /// `accept` is the selecting `Accept` header of the cached representation,
     /// replayed on the conditional probe (#3290): validating a negotiated
@@ -10218,6 +10270,12 @@ impl ProxyService {
         metadata: &CacheMetadata,
         accept: Option<&str>,
     ) -> RevalidationVerdict {
+        // #5282: a cache-only Remote never revalidates. It serves the entry it
+        // holds, with or without a validator, instead of falling to a refill
+        // the gate would refuse (which is what an upstream filter does).
+        if self.upstream_mode(repo.id).await.is_cache_only() {
+            return RevalidationVerdict::ServeStaleCacheOnly;
+        }
         let Some(etag) = metadata.upstream_etag.clone() else {
             // No ETag validator: a cheap conditional request is impossible.
             // Fall back to a full single-flight refill.
@@ -28172,7 +28230,24 @@ mod upstream_filter_cache_tests {
 
     /// Write a committed cache entry (body + sidecar) for `path` straight to
     /// the filesystem store, expiring `expires_in_secs` from now.
-    fn seed_entry(dir: &std::path::Path, repo_key: &str, path: &str, expires_in_secs: i64) {
+    pub(super) fn seed_entry(
+        dir: &std::path::Path,
+        repo_key: &str,
+        path: &str,
+        expires_in_secs: i64,
+    ) {
+        seed_entry_with(dir, repo_key, path, expires_in_secs, |_| {});
+    }
+
+    /// [`seed_entry`] with the sidecar adjusted by `customize` before it is
+    /// written (#5282: a negative-cache marker).
+    pub(super) fn seed_entry_with(
+        dir: &std::path::Path,
+        repo_key: &str,
+        path: &str,
+        expires_in_secs: i64,
+        customize: impl FnOnce(&mut CacheMetadata),
+    ) {
         let scope = ProxyCacheScope::unscoped();
         let body = Bytes::from_static(b"<metadata><versioning/></metadata>");
         let metadata = CacheMetadata {
@@ -28193,6 +28268,8 @@ mod upstream_filter_cache_tests {
             size_bytes: body.len() as i64,
             checksum_sha256: StorageService::calculate_hash(&body),
         };
+        let mut metadata = metadata;
+        customize(&mut metadata);
         for (key, bytes) in [
             (
                 ProxyService::cache_storage_key(&scope, repo_key, path).unwrap(),
@@ -28319,6 +28396,165 @@ mod upstream_filter_cache_tests {
             );
         }
         assert_eq!(hits, 0, "an ambiguous path must never reach the upstream");
+    }
+}
+
+/// #5282: a cache-only Remote serves what it holds, fresh or stale, never
+/// contacts its upstream, and answers a miss with a 404 naming the mode.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod upstream_mode_cache_tests {
+    use super::upstream_filter_cache_tests::{seed_entry, seed_entry_with};
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::upstream_mode::{is_cache_only_refusal, save_upstream_mode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FRESH: &str = "org/acme/fresh/maven-metadata.xml";
+    const STALE: &str = "org/acme/stale/maven-metadata.xml";
+    const JAR: &str = "org/acme/lib/1.0/lib-1.0.jar";
+    const MISSING: &str = "org/acme/missing/1.0/missing-1.0.jar";
+    const NEGATIVE: &str = "org/acme/gone/maven-metadata.xml";
+
+    /// A Remote over `upstream` with the five fixture paths seeded and the
+    /// repository put in `cache_only`.
+    async fn cache_only_remote(
+        pool: &sqlx::PgPool,
+        upstream: &MockServer,
+    ) -> (Repository, std::path::PathBuf, Arc<ProxyService>) {
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "remote", "maven").await;
+        let repo = crate::api::handlers::proxy_helpers::build_remote_repo_with_format(
+            repo_id,
+            &repo_key,
+            &upstream.uri(),
+            RepositoryFormat::Maven,
+        );
+        seed_entry(&dir, &repo_key, FRESH, 600);
+        seed_entry(&dir, &repo_key, STALE, -600);
+        // An immutable entry is always written with the maximum stamp.
+        seed_entry(&dir, &repo_key, JAR, cache_classifier::MAX_CACHE_TTL_SECS);
+        seed_entry_with(&dir, &repo_key, NEGATIVE, -600, |m| {
+            m.negative_cached_until = Some(Utc::now() + chrono::Duration::seconds(45));
+        });
+        save_upstream_mode(pool, repo_id, UpstreamMode::CacheOnly)
+            .await
+            .expect("store cache_only");
+        let svc = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        (repo, dir, svc)
+    }
+
+    #[tokio::test]
+    async fn cache_only_serves_fresh_and_stale_and_404s_a_miss_without_upstream_5282() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("<metadata/>"))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let (repo, dir, svc) = cache_only_remote(&pool, &upstream).await;
+
+        let fresh = svc
+            .fetch_artifact_with_cache_path(&repo, FRESH, FRESH)
+            .await;
+        let stale = svc
+            .fetch_artifact_with_cache_path(&repo, STALE, STALE)
+            .await;
+        let jar = svc.fetch_artifact_with_cache_path(&repo, JAR, JAR).await;
+        let stale_streamed = match svc.fetch_artifact_streaming(&repo, STALE).await {
+            Ok(mut result) => {
+                let stale_since = result.stale_since;
+                let mut body = Vec::new();
+                while let Some(chunk) = result.body.next().await {
+                    body.extend_from_slice(&chunk.expect("cached chunk"));
+                }
+                Ok((stale_since, body))
+            }
+            Err(e) => Err(e),
+        };
+        let miss_buffered = svc.fetch_artifact(&repo, MISSING).await.err();
+        let miss_streaming = svc.fetch_artifact_streaming(&repo, MISSING).await.err();
+        let negative = svc.fetch_artifact(&repo, NEGATIVE).await.err();
+        let hits = upstream.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo.id, &dir).await;
+
+        let fresh = fresh.expect("a fresh entry is served");
+        assert_eq!(
+            fresh.stale_since, None,
+            "a fresh serve carries no stale marker"
+        );
+        let stale = stale.expect("a stale mutable entry is served, not revalidated");
+        assert!(stale.stale_since.is_some(), "a stale serve is marked stale");
+        assert_eq!(&stale.content[..], &fresh.content[..]);
+        assert!(jar.is_ok(), "an immutable entry is served: {:?}", jar.err());
+        let (streamed_since, streamed_body) = stale_streamed.expect("streaming stale serve");
+        assert!(
+            streamed_since.is_some(),
+            "the streaming stale serve is marked"
+        );
+        assert_eq!(streamed_body, fresh.content.to_vec());
+        for (what, err) in [("buffered", miss_buffered), ("streaming", miss_streaming)] {
+            let err = err.unwrap_or_else(|| panic!("{what}: a miss must fail"));
+            assert!(is_cache_only_refusal(&err), "{what}: {err:?}");
+            assert!(
+                err.to_string().contains("is cache-only"),
+                "{what}: the 404 names the mode: {err}"
+            );
+        }
+        let negative = negative.expect("a negative marker still answers 404");
+        assert!(
+            matches!(negative, AppError::NotFound(_)) && !is_cache_only_refusal(&negative),
+            "the cached 404 answers before the cache-only gate: {negative:?}"
+        );
+        assert_eq!(
+            hits, 0,
+            "a cache-only Remote must never contact its upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_online_revalidates_5282() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"etag-840\"")
+                    .set_body_string("<metadata><versioning/></metadata>"),
+            )
+            .mount(&upstream)
+            .await;
+        let (repo, dir, svc) = cache_only_remote(&pool, &upstream).await;
+
+        let offline = svc
+            .fetch_artifact_with_cache_path(&repo, STALE, STALE)
+            .await;
+        let offline_hits = upstream.received_requests().await.unwrap().len();
+        save_upstream_mode(&pool, repo.id, UpstreamMode::Online)
+            .await
+            .expect("store online");
+        let online = svc
+            .fetch_artifact_with_cache_path(&repo, STALE, STALE)
+            .await;
+        let online_hits = upstream.received_requests().await.unwrap().len();
+        tdh::cleanup_member_repo(&pool, repo.id, &dir).await;
+
+        assert!(offline.expect("served offline").stale_since.is_some());
+        assert_eq!(offline_hits, 0);
+        let online = online.expect("revalidated online");
+        assert_eq!(
+            online.stale_since, None,
+            "back online, the stale entry is revalidated (unchanged ETag) and served fresh"
+        );
+        assert!(
+            online_hits >= 1,
+            "back online, the revalidation reaches the upstream: {online_hits}"
+        );
     }
 }
 

@@ -766,16 +766,19 @@ async fn maybe_evict_missing_packument(
 ) {
     if scope.virtual_repo.is_none() {
         if let Some(proxy_service) = state.proxy_service.as_ref() {
+            // #5282: a cache-only Remote's 404 is a cache miss, not a statement
+            // from upstream, so it never evicts the packument it computed.
             if proxy_service
                 .on_upstream_not_found_by_key(&scope.repo_key)
                 .await
                 .keeps()
+                || proxy_service.is_cache_only_by_key(&scope.repo_key).await
             {
                 tracing::info!(
                     repository = %scope.repo_key,
                     package = %scope.package,
-                    "upstream 404/410 with on_upstream_not_found=keep; keeping the cached \
-                     packument (#4640)"
+                    "404/410 on a Remote that keeps (on_upstream_not_found=keep) or is \
+                     cache-only; keeping the cached packument (#4640, #5282)"
                 );
                 return;
             }
