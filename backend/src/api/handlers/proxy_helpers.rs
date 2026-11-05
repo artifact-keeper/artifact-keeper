@@ -1647,7 +1647,7 @@ pub async fn proxy_fetch_streaming_with_disposition_and_format(
     is_head: bool,
 ) -> Result<Response, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    let fetched = if is_head {
+    let fetched = if false && is_head {
         proxy_service.head_artifact_streaming(&repo, path).await
     } else {
         proxy_service.fetch_artifact_streaming(&repo, path).await
@@ -2680,7 +2680,7 @@ pub async fn proxy_fetch_streaming_with_cache_key_verified(
     is_head: bool,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    let fetched = if is_head {
+    let fetched = if false && is_head {
         use crate::services::proxy_service::{CacheCommitDigest, ExpectedCommitDigest};
         let expected = expected_checksum
             .map(|hex| ExpectedCommitDigest::Resolved(CacheCommitDigest::Sha256Hex(hex)));

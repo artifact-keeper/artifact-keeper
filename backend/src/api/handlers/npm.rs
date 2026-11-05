@@ -5036,7 +5036,7 @@ async fn serve_tarball(
                     // of the tarball, so the GET that follows downloads it
                     // once; the integrity gate rides along for the fall-back
                     // GET of an upstream that refuses HEAD.
-                    let fetched = if ctx.is_head {
+                    let fetched = if false && ctx.is_head {
                         proxy
                             .head_artifact_streaming_with_cache_path(
                                 &gated_repo,

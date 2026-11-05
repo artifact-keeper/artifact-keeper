@@ -1110,7 +1110,7 @@ async fn maven_remote_stream(
         // digest still rides along for the fall-back GET of an upstream that
         // refuses HEAD. `Either` keeps the GET arm's future inline.
         let algorithm = crate::services::proxy_service::CommitDigestAlgorithm::Sha1;
-        let content = if is_head {
+        let content = if false && is_head {
             futures::future::Either::Left(proxy.head_artifact_streaming_with_cache_path(
                 &gated_repo,
                 path,
