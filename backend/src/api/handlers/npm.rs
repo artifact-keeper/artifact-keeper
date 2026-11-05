@@ -2942,8 +2942,19 @@ async fn get_scoped_version_metadata(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package, version)): Path<(String, String, String, String)>,
     base_url: RequestBaseUrl,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
+    // A tarball request whose scope separator is percent-encoded
+    // (`@scope%2fname/-/name-1.0.0.tgz`, which yarn sends for some scoped
+    // packages) is one segment shorter than the scoped tarball route, so it
+    // lands here with `package == "-"` and the filename in `version`. Serve it
+    // as the tarball it is instead of rejecting `@scope/name/-` as a name.
+    if let Some((scope_part, name_part)) = encoded_scoped_tarball_parts(&scope, &package) {
+        let full_name = build_scoped_package_name(scope_part, name_part);
+        validate_package_name(&full_name)?;
+        return serve_tarball(&state, auth.as_ref(), &repo_key, &full_name, &version, &ctx).await;
+    }
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
@@ -7200,6 +7211,23 @@ fn build_scoped_package_name(scope: &str, package: &str) -> String {
     format!("@{}/{}", scope, package)
 }
 
+/// Split the decoded scope of an encoded scoped tarball request.
+///
+/// `GET /{repo}/@scope%2fname/-/{file}` matches the scoped version route with
+/// the decoded scope `scope/name` and the literal `-` as the package. Returns
+/// `(scope, name)` for that shape, `None` for every other request (including a
+/// version lookup of a package literally named `@scope/-`, whose scope has no
+/// `/`).
+fn encoded_scoped_tarball_parts<'a>(
+    decoded_scope: &'a str,
+    package: &str,
+) -> Option<(&'a str, &'a str)> {
+    if package != "-" {
+        return None;
+    }
+    decoded_scope.split_once('/')
+}
+
 /// Build the npm tarball URL for metadata responses.
 fn build_npm_tarball_url(
     base_url: &str,
@@ -10511,6 +10539,85 @@ mod tests {
             tgz,
             "the advertised dist.tarball must serve the published tarball bytes"
         );
+    }
+
+    #[test]
+    fn test_encoded_scoped_tarball_parts() {
+        assert_eq!(
+            encoded_scoped_tarball_parts("webassemblyjs/helper-api-error", "-"),
+            Some(("webassemblyjs", "helper-api-error"))
+        );
+        // A real version lookup (`@scope/pkg/1.0.0`) is not a tarball.
+        assert_eq!(encoded_scoped_tarball_parts("webassemblyjs", "-"), None);
+        assert_eq!(
+            encoded_scoped_tarball_parts("webassemblyjs/helper-api-error", "1.0.0"),
+            None
+        );
+    }
+
+    /// yarn requests some scoped tarballs with the scope separator encoded
+    /// (`@scope%2fname/-/file.tgz`). That path is one segment shorter than the
+    /// scoped tarball route, so it used to land on the scoped version route and
+    /// 400 on the name `@scope/name/-`. Both spellings must serve the tarball.
+    #[tokio::test]
+    async fn test_scoped_tarball_with_encoded_slash_is_served() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let package = "@acme/widget";
+        let version = "1.0.0";
+        let filename = "widget-1.0.0.tgz";
+        let tgz: &[u8] = b"npm-tgz-bytes-for-encoded-scoped-tarball";
+        let repo = fx.repo_info("local", None);
+        let path = format!("{package}/{version}/{filename}");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            package,
+            version,
+            "application/gzip",
+            Bytes::from_static(tgz),
+            fx.user_id,
+        )
+        .await;
+
+        let mut results = Vec::new();
+        for encoded in [
+            format!("@acme/widget/-/{filename}"),
+            format!("@acme%2fwidget/-/{filename}"),
+            format!("@acme%2Fwidget/-/{filename}"),
+        ] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+                tdh::get(format!("/npm/{}/{encoded}", fx.repo_key)),
+            )
+            .await;
+            results.push((encoded, status, body));
+        }
+        // A misspelled encoded name still fails validation rather than
+        // resolving to something else.
+        let (bad_status, _) = tdh::send(
+            tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+            tdh::get(format!(
+                "/npm/{}/@acme%2fwidget%2fx/-/{filename}",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        for (encoded, status, body) in results {
+            assert_eq!(status, StatusCode::OK, "GET {encoded}");
+            assert_eq!(&body[..], tgz, "GET {encoded} body");
+        }
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
     }
 
     // -----------------------------------------------------------------------
