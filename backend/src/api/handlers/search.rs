@@ -196,6 +196,7 @@ async fn retain_live_visible_hits(
         JOIN repositories r ON r.id = a.repository_id
         WHERE a.id = ANY($1)
           AND a.is_deleted = false
+          AND r.key NOT LIKE '~deleting~%'
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
         "#,
     )
@@ -420,6 +421,7 @@ async fn resolve_visible_repos(
                 SELECT r.id
                 FROM repositories r
                 WHERE r.visibility <> 'private'
+                  AND r.key NOT LIKE '~deleting~%'
                 UNION
                 SELECT COALESCE(ra.repository_id, r2.id)
                 FROM role_assignments ra
@@ -429,6 +431,7 @@ async fn resolve_visible_repos(
                 UNION
                 SELECT r3.id
                 {read_grants}
+                  AND r3.key NOT LIKE '~deleting~%'
                 "#
             );
             let rows: Vec<(Uuid,)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
@@ -443,6 +446,7 @@ async fn resolve_visible_repos(
             let rows: Vec<(Uuid,)> = sqlx::query_as(
                 r#"
                 SELECT r.id FROM repositories r WHERE r.visibility = 'public'
+                  AND r.key NOT LIKE '~deleting~%'
                 "#,
             )
             .fetch_all(db)
@@ -833,6 +837,7 @@ pub async fn checksum_search(
         FROM artifacts a
         JOIN repositories r ON r.id = a.repository_id
         WHERE a.is_deleted = false
+          AND r.key NOT LIKE '~deleting~%'
           AND {col} = $1
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
         ORDER BY a.created_at DESC

@@ -28,7 +28,7 @@ use crate::services::package_service::PackageService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::upload_service::{self, UploadError, UploadService};
 
-mod format_finalize;
+pub(crate) mod format_finalize;
 use format_finalize::{FinalizeInput, FinalizeSource};
 
 // ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ async fn create_session(
     // `AND is_deleted = false` predicate was a copy-paste from artifact
     // queries that crashed every session create (issue #1168).
     let repo = sqlx::query_as::<_, (Uuid, bool)>(
-        "SELECT id, promotion_only FROM repositories WHERE key = $1",
+        "SELECT id, promotion_only FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
     )
     .bind(&req.repository_key)
     .fetch_optional(&state.db)
@@ -268,6 +268,8 @@ async fn create_session(
     // without ever having been fetched from it. Checked after the
     // authorization gates and before any session row exists.
     proxy_helpers::reject_write_if_not_hosted(repo_record.repo_type.as_str())?;
+    // #5253: an MCP registry publishes through its own route only.
+    super::repositories::reject_generic_write_to_mcp(&repo_record.format, &auth, &headers)?;
 
     let is_replication = super::is_replication_request(&headers);
     if req.skip_if_present && !is_replication {
@@ -579,7 +581,7 @@ async fn session_status_response(
         ("Prefer" = Option<String>, Header, description = "`respond-async` (RFC 7240): answer 202 once the completion lease is held and commit in the background; poll `GET /api/v1/uploads/{session_id}` until `status` is `completed` (with `artifact_id`), `failed` (with `error`), or back to `in_progress` (a retryable failure: repeat this request)"),
     ),
     responses(
-        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
+        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian, Alpine) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
         (status = 202, description = "`Prefer: respond-async` was sent: the completion lease is held and the commit runs in the background. `Location` is the session status to poll", body = SessionStatusResponse),
         (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed), or the format's own upload route would refuse the package: a `package.json`, wheel `METADATA` or Debian control file that names another package or version than the path (the session is failed, nothing is stored)", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
@@ -610,16 +612,13 @@ async fn complete(
 
     // C3: Verify user owns this session.
     //
-    // complete_session takes the completion lease (pending/in_progress ->
-    // 'committing' with a state token) before verifying chunks/size/checksum,
-    // so a duplicate complete request, even one routed to another replica,
-    // gets a conflict here instead of a second storage copy + artifact
-    // upsert. Everything after runs under that lease and the terminal
+    // `complete_session_with_lease` takes the completion lease
+    // (pending/in_progress -> 'committing' with a state token) before verifying
+    // chunks/size/checksum, so a duplicate complete request, even one routed to
+    // another replica, gets a conflict here instead of a second storage copy +
+    // artifact upsert. Everything after runs under that lease and the terminal
     // transition is token-guarded.
-    let session = UploadService::complete_session(&state.db, session_id, auth.user_id)
-        .await
-        .map_err(map_upload_err)?;
-
+    //
     // #1846: a client that sends `Prefer: respond-async` (RFC 7240) gets 202
     // as soon as the lease is held, and polls the session (`GET
     // /api/v1/uploads/{id}`) for the outcome. A format finalize can read a
@@ -627,11 +626,28 @@ async fn complete(
     // than a proxy in front of the server waits for a response. The commit
     // runs exactly as it would in the request; the session's `status` is the
     // poll state.
-    if prefers_respond_async(&headers) {
+    //
+    // The detached commit is not guarded by a live request any more, so it
+    // takes the shorter async lease (#5002): a replica restart costs the
+    // client minutes, not six hours. The renewal loop extends it with the same
+    // TTL while the task runs.
+    let respond_async = prefers_respond_async(&headers);
+    let lease_ttl = if respond_async {
+        upload_service::ASYNC_COMMIT_LEASE_TTL_SECS
+    } else {
+        upload_service::COMMIT_LEASE_TTL_SECS
+    };
+    let session =
+        UploadService::complete_session_with_lease(&state.db, session_id, auth.user_id, lease_ttl)
+            .await
+            .map_err(map_upload_err)?;
+
+    if respond_async {
         let status = session_status_response(&state.db, &session, "committing").await;
         let location = format!("/api/v1/uploads/{session_id}");
         tokio::spawn(async move {
-            let outcome = complete_session_commit(&state, &auth, &headers, session).await;
+            let outcome =
+                complete_session_commit(&state, &auth, &headers, session, lease_ttl).await;
             if let Err(response) = &outcome {
                 tracing::warn!(
                     session = %session_id,
@@ -654,7 +670,7 @@ async fn complete(
         return Ok(response);
     }
 
-    let outcome = complete_session_commit(&state, &auth, &headers, session).await;
+    let outcome = complete_session_commit(&state, &auth, &headers, session, lease_ttl).await;
     if outcome.is_err() {
         // #3922: a completion that failed terminally (checksum mismatch,
         // quota, a post-copy database failure) can never be retried, so its
@@ -690,13 +706,15 @@ async fn complete_session_commit(
     auth: &AuthExtension,
     headers: &HeaderMap,
     session: upload_service::UploadSession,
+    lease_ttl: f64,
 ) -> Result<Response, Response> {
     // The `write:artifacts` scope ceiling is enforced by `complete` before
     // this runs.
     let user_id = auth.user_id;
     let session_id = session.id;
     let is_replication_request = super::is_replication_request(headers);
-    let commit_renewal = UploadService::spawn_commit_lease_renewal(state.db.clone(), &session);
+    let commit_renewal =
+        UploadService::spawn_commit_lease_renewal_for(state.db.clone(), &session, lease_ttl);
 
     // #2603 G1: re-check repository write authorization before committing the
     // artifact. Finalizing a session is the actual write, so access revoked
@@ -793,7 +811,7 @@ async fn complete_session_commit(
     );
     let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
     // #1846: a format with a native upload route (Maven, npm, PyPI, RPM,
-    // Incus, Debian) gets the coordinates that route writes, derived from the
+    // Incus, Debian, Alpine) gets the coordinates that route writes, derived from the
     // path before the bytes are read so the immutability gate below checks
     // the very `version` the row is written with. A trusted replication
     // session brings the source row's own metadata instead.
@@ -1068,6 +1086,14 @@ async fn complete_session_commit(
     // Clean up the local scratch copy now that the bytes are in final storage.
     drop(assembled);
 
+    // #5254: a format whose native route stores a package under the identity
+    // its bytes declare (an Alpine `.PKGINFO`) is stored under that identity
+    // here too: row, catalog entry and response.
+    let native_target = match (native_target, staged_native.as_ref()) {
+        (Some(target), Some(staged)) => Some(format_finalize::resolved_target(target, staged)),
+        (target, _) => target,
+    };
+
     // Create artifact record. A natively finalized format is named the way
     // its native route names it (Maven artifactId, npm package, normalized
     // PyPI project, RPM name, incus product, debian package), which is what
@@ -1094,8 +1120,14 @@ async fn complete_session_commit(
     // path so the artifact remains retrievable with correct coordinates. Generic
     // repositories keep their existing behaviour (version may be NULL).
     // `derived_version` was computed above, before the immutability gate, so
-    // the value checked there is exactly the value written here.
-    let artifact_version = derived_version.as_deref();
+    // the value checked there is the value written here, except for a package
+    // whose own declared version differs from its file name's (#5254): the
+    // atomic upsert below still refuses a live row at that version, and the
+    // gate's release backstop already refused any change of bytes at the path.
+    let artifact_version = match &native_target {
+        Some(target) => Some(target.version.as_str()),
+        None => derived_version.as_deref(),
+    };
 
     // #2516 S2: atomic quota admission for the chunked path, in the same
     // transaction as the artifact INSERT. The session-create quota check is
@@ -1250,6 +1282,142 @@ async fn complete_session_commit(
             return Err(release_after_precommit_failure(&state.db, &session, e).await);
         }
     };
+    // #5002: write the format metadata in the same transaction as the
+    // artifact row. The native finalize's document (or the client's, for a
+    // non-native format) used to be written after the commit; a crash in
+    // between left an indexed row without metadata. Native Maven and npm
+    // already take this shape.
+    let native_metadata = match (staged_native.as_ref(), native_target.as_ref()) {
+        (Some(staged), Some(target)) => {
+            match format_finalize::metadata_document(
+                staged,
+                target,
+                &(&session).into(),
+                rpm_upload_metadata.as_ref(),
+            ) {
+                Ok(document) => document,
+                Err(reason) => {
+                    drop(tx);
+                    UploadService::fail_committing(&state.db, &session, &reason).await;
+                    return Err(map_err(StatusCode::BAD_REQUEST, reason));
+                }
+            }
+        }
+        _ => None,
+    };
+    // A natively finalized format records the document derived from the bytes;
+    // a client-supplied one is not written first, so none of its
+    // `format`/`properties` can outlive it (#1846).
+    let mut pacman_files = None;
+    let session_metadata = if native_metadata.is_some() {
+        None
+    } else if let Some((format, mut metadata)) = session
+        .artifact_metadata_format
+        .as_deref()
+        .zip(session.artifact_metadata.clone())
+    {
+        // #3801: a repodata block renders verbatim and bypasses every header
+        // budget, so one supplied by an UNTRUSTED client is dropped; the
+        // block parsed from the uploaded bytes above (if any) replaces it,
+        // and otherwise the repodata heal derives it from the stored object.
+        if !replication_trusted
+            && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
+        {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.remove(super::rpm::RPM_REPODATA_KEY);
+                if let Some(block) = rpm_upload_metadata
+                    .as_ref()
+                    .and_then(|m| m.get(super::rpm::RPM_REPODATA_KEY))
+                {
+                    obj.insert(super::rpm::RPM_REPODATA_KEY.to_string(), block.clone());
+                }
+            }
+        }
+        // #4424: a pacman file list lives in `pacman_file_lists`, never in
+        // the document. A trusted peer's list is re-attached by its sync
+        // worker or moved here; an untrusted client's is dropped.
+        if format == "pacman" {
+            pacman_files =
+                super::pacman::take_file_list(&mut metadata).filter(|_| replication_trusted);
+        }
+        let properties = session
+            .artifact_metadata_properties
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        Some((format.to_string(), metadata, properties))
+    } else if staged_native.is_none() {
+        // #2588: the RPM header parse produced a document even though this
+        // path has no native target to dispatch (an RPM repository holding a
+        // file the native route would not index as a package).
+        if let Some(metadata) = rpm_upload_metadata.clone() {
+            Some(("rpm".to_string(), metadata, serde_json::json!({})))
+        } else if !replication_trusted {
+            // #5002: formats without a native finalize still get a format
+            // dispatch on chunked completion. The handler derives the document
+            // from the path alone (an empty body), and the document is written
+            // in the artifact transaction below. A trusted peer replication
+            // without a document keeps the source row's behaviour instead of
+            // inventing metadata the source did not have.
+            format_finalize::generic_metadata_document(&repo.format, &session.artifact_path)
+                .await
+                .map(|document| {
+                    (
+                        document.format.to_string(),
+                        document.metadata,
+                        document.properties,
+                    )
+                })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let metadata_document = native_metadata
+        .map(|document| {
+            (
+                document.format.to_string(),
+                document.metadata,
+                document.properties,
+            )
+        })
+        .or(session_metadata);
+    if let Some((format, metadata, properties)) = metadata_document {
+        let written = if format == "rpm" {
+            // The RPM document keeps the native route's size-limit fallback,
+            // behind a savepoint so a retry does not abort the artifact
+            // transaction.
+            crate::api::handlers::rpm::record_rpm_metadata_in_tx(
+                &mut tx,
+                artifact_id,
+                session.repository_id,
+                &metadata,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| crate::error::AppError::Database(e.to_string()))
+        } else {
+            crate::services::artifact_service::ArtifactService::set_metadata_in_tx(
+                &mut tx,
+                artifact_id,
+                &format,
+                metadata,
+                properties,
+            )
+            .await
+            .map(|_| ())
+        };
+        if let Err(e) = written {
+            drop(tx);
+            UploadService::fail_committing(
+                &state.db,
+                &session,
+                &format!("artifact metadata write failed: {e}"),
+            )
+            .await;
+            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    }
     if let Err(e) = tx.commit().await {
         UploadService::fail_committing(
             &state.db,
@@ -1271,79 +1439,16 @@ async fn complete_session_commit(
     )
     .await;
 
-    // A natively finalized format records the document derived from the
-    // bytes below; a client-supplied one is not written first, so none of its
-    // `format`/`properties` can outlive it (#1846).
-    let session_metadata = match &staged_native {
-        Some(_) => None,
-        None => session
-            .artifact_metadata_format
-            .as_deref()
-            .zip(session.artifact_metadata.clone()),
-    };
-    if let Some((format, mut metadata)) = session_metadata {
-        // #3801: a repodata block renders verbatim and bypasses every header
-        // budget, so one supplied by an UNTRUSTED client is dropped; the
-        // block parsed from the uploaded bytes above (if any) replaces it,
-        // and otherwise the repodata heal derives it from the stored object.
-        if !replication_trusted
-            && rpm_header_metadata_eligible(&repo.format, &session.artifact_path)
-        {
-            if let Some(obj) = metadata.as_object_mut() {
-                obj.remove(super::rpm::RPM_REPODATA_KEY);
-                if let Some(block) = rpm_upload_metadata
-                    .as_ref()
-                    .and_then(|m| m.get(super::rpm::RPM_REPODATA_KEY))
-                {
-                    obj.insert(super::rpm::RPM_REPODATA_KEY.to_string(), block.clone());
-                }
-            }
-        }
-        // #4424: a pacman file list lives in `pacman_file_lists`, never in
-        // the document. A trusted peer's list (re-attached by its sync
-        // worker, or left in place by a peer older than #4424) is moved
-        // there; an untrusted client's is dropped.
-        let pacman_files = if format == "pacman" {
-            super::pacman::take_file_list(&mut metadata).filter(|_| replication_trusted)
-        } else {
-            None
-        };
-        let properties = session
-            .artifact_metadata_properties
-            .clone()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let artifact_service = state.create_artifact_service(storage.clone());
-        let written = match artifact_service
-            .set_metadata(artifact_id, format, metadata, properties)
-            .await
-        {
-            Ok(_) => match &pacman_files {
-                Some(files) => super::pacman::store_file_list(&state.db, artifact_id, files)
-                    .await
-                    .map_err(crate::error::AppError::from),
-                None => Ok(()),
-            },
-            Err(e) => Err(e),
-        };
-        if let Err(e) = written {
-            UploadService::fail_committing(
-                &state.db,
-                &session,
-                &format!("artifact metadata write failed: {e}"),
-            )
-            .await;
-            return Err(map_err(StatusCode::INTERNAL_SERVER_ERROR, e));
-        }
-    } else if let Some(metadata) = &rpm_upload_metadata {
-        // #2588: record the RPM header metadata parsed above, mirroring what
-        // the native RPM upload route records. Unparseable or non-package
-        // objects simply record no metadata; they never fail the upload. A
-        // value too large to store is recorded with an unparseable marker.
-        if let Err(e) =
-            super::rpm::record_rpm_metadata(&state.db, artifact_id, session.repository_id, metadata)
-                .await
-        {
-            tracing::warn!(artifact_id = %artifact_id, error = %e, "RPM metadata could not be recorded");
+    // #4424: the pacman file list is an auxiliary table, written after the
+    // artifact transaction that stored the document without it. A failure is
+    // logged, not fatal: the artifact is already committed and indexed.
+    if let Some(files) = &pacman_files {
+        if let Err(e) = super::pacman::store_file_list(&state.db, artifact_id, files).await {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "pacman file list could not be recorded"
+            );
         }
     }
 
@@ -1372,11 +1477,9 @@ async fn complete_session_commit(
     }
 
     if let (Some(staged), Some(target)) = (staged_native, &native_target) {
-        let artifact_service = state.create_artifact_service(storage.clone());
         let recorded = format_finalize::record(
             state,
-            &artifact_service,
-            &session,
+            &(&session).into(),
             artifact_id,
             target,
             staged,

@@ -339,6 +339,75 @@ pub(crate) fn proxy_gate_refuses(
         .blocks(max_severity.and_then(Severity::from_str_loose))
 }
 
+/// Whether a repository's proxy scan gate would refuse a stored `vulnerable`
+/// verdict if it enforced (#5232), whatever its current action:
+/// [`proxy_gate_refuses`] itself, asked with an enforcing action, so a preview
+/// and the gate cannot grade a verdict differently. `fail_open` and
+/// `fail_closed` grade a stored `vulnerable` verdict alike; they differ only
+/// where there is no verdict to grade ([`ProxyNoVerdictCounts`]).
+pub(crate) fn proxy_gate_would_refuse(
+    format: &str,
+    block_on_policy_violation: bool,
+    severity_threshold: &str,
+    max_severity: Option<&str>,
+) -> bool {
+    proxy_gate_refuses(
+        format,
+        block_on_policy_violation,
+        severity_threshold,
+        crate::services::proxy_scan_service::ProxyScanAction::FailClosed.as_db_str(),
+        max_severity,
+    )
+}
+
+/// Count the distinct digests at least one repository's proxy scan gate would
+/// refuse if it enforced (#5232): [`count_blocked_proxy_digests`] plus what
+/// `record_only` repositories record and serve.
+pub(crate) fn count_would_block_proxy_digests(rows: &[ProxyBlockCandidate]) -> i64 {
+    let would_block: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            proxy_gate_would_refuse(
+                &r.format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                r.max_severity.as_deref(),
+            )
+        })
+        .map(|r| r.checksum_sha256.as_str())
+        .collect();
+    would_block.len() as i64
+}
+
+/// Cached digests of gate-running repositories that a `would_block` preview
+/// does not list, because the gate has no verdict it would act on (#5232):
+/// `fail_closed` scans them inline on the next pull, then serves, refuses, or
+/// answers `423` if the scan is inconclusive; `fail_open` and `record_only`
+/// serve them. Same catalog as the `proxy-scans` summary, so cached metadata
+/// is left out, and a cached file the format serves without gating it (a
+/// Maven POM, a Debian `Release`) is counted there and here.
+#[derive(Debug, Default, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ProxyNoVerdictCounts {
+    /// No verdict row, or an `error` row, which no current code writes: the
+    /// same reading as the `proxy-scans` summary's `not_scanned`.
+    pub no_verdict: i64,
+    /// A `clean` or `vulnerable` verdict older than the scan TTL.
+    pub stale_verdict: i64,
+    /// A current `clean` verdict for which
+    /// [`clean_verdict_graded_nothing`](crate::services::proxy_scan_service::clean_verdict_graded_nothing)
+    /// holds: `fail_closed` does not reuse it.
+    pub clean_graded_nothing: i64,
+}
+
+/// The `repository_format` labels of the formats that run the proxy gate.
+fn proxy_gated_format_labels() -> Vec<&'static str> {
+    crate::models::repository::RepositoryFormat::ALL
+        .iter()
+        .filter(|f| crate::formats::format_enforces_scan_on_proxy(f))
+        .map(|f| f.as_key())
+        .collect()
+}
+
 /// One proxied path whose stored verdict its repository's proxy scan gate
 /// currently refuses (#4510, #4777): a `proxy_cache_artifacts` row (or, for
 /// OCI, an image manifest the repository references) whose digest has a
@@ -389,6 +458,7 @@ pub(crate) fn build_dashboard_summary(
         high_findings,
         policy_violations_blocked: 0,
         proxy_blocked: 0,
+        proxy_would_block: 0,
         repos_grade_a,
         repos_grade_f,
         repos_rated: 0,
@@ -641,12 +711,25 @@ macro_rules! reusable_scan_filters {
 
 /// [`ScanResultService::find_reusable_scan`]: the newest ORIGINAL scan
 /// (`source_scan_id IS NULL`, #4425). Served by `idx_scan_results_dedup_local`.
+/// `NOT is_reused` as well, because `source_scan_id` is cleared when the source is
+/// deleted (#5153) and a copy must not then pass as an original: its `completed_at`
+/// can be the time it was copied, which would restart the age limit.
 pub(crate) const FIND_REUSABLE_SCAN_SQL: &str = concat!(
     "SELECT ",
     scan_result_columns!(),
     " FROM scan_results WHERE ",
     reusable_scan_filters!(),
-    " AND source_scan_id IS NULL ORDER BY completed_at DESC LIMIT 1"
+    " AND source_scan_id IS NULL AND NOT is_reused ORDER BY completed_at DESC LIMIT 1"
+);
+
+/// Whether one row of an artifact's own scans is a complete verdict a dedup could
+/// reuse: the same filters, so a promotion cannot accept what a byte-identical
+/// upload would refuse. `partial` is excluded on top of them, because a promoted
+/// copy has no rescan coming and a partial verdict would read as a scanned artifact.
+pub(crate) const FIND_CARRYABLE_SCAN_SQL: &str = concat!(
+    "SELECT EXISTS (SELECT 1 FROM scan_results WHERE ",
+    reusable_scan_filters!(),
+    " AND scan_completeness = 'complete' AND artifact_id = $6 AND id = $7)"
 );
 
 /// [`ScanResultService::find_own_reusable_scan`]: the same filters on one
@@ -658,6 +741,14 @@ pub(crate) const FIND_OWN_REUSABLE_SCAN_SQL: &str = concat!(
     reusable_scan_filters!(),
     " AND artifact_id = $6 ORDER BY completed_at DESC LIMIT 1"
 );
+
+/// The columns of [`ScanFinding`] as `scan_findings_effective` (migration 312)
+/// projects them.
+const SCAN_FINDING_COLUMNS: &str =
+    "id, scan_result_id, artifact_id, severity, title, description, \
+     cve_id, affected_component, affected_version, fixed_version, source, source_url, \
+     is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at, \
+     acknowledgement_id, acknowledgement_expires_at, created_at, finding_class";
 
 impl ScanResultService {
     pub fn new(db: PgPool) -> Self {
@@ -1466,7 +1557,34 @@ impl ScanResultService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        let new_scan = Self::copy_scan_results_in_tx(
+            &mut tx,
+            source_scan_id,
+            artifact_id,
+            repository_id,
+            scan_type,
+            checksum_sha256,
+            pin_identity,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok(new_scan)
+    }
+
+    /// [`Self::copy_scan_results`] inside a caller's transaction, for a caller
+    /// copying several scans that must land together.
+    pub(crate) async fn copy_scan_results_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        source_scan_id: Uuid,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        scan_type: &str,
+        checksum_sha256: &str,
+        pin_identity: Option<&str>,
+    ) -> Result<ScanResult> {
         let source = sqlx::query_as!(
             ScanResult,
             r#"
@@ -1481,7 +1599,7 @@ impl ScanResultService {
             "#,
             source_scan_id,
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Source scan result not found".to_string()))?;
@@ -1542,7 +1660,7 @@ impl ScanResultService {
             source.vuln_db_version,
             source.vuln_db_published_at,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -1564,15 +1682,47 @@ impl ScanResultService {
             artifact_id,
             source_scan_id,
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-
         Ok(new_scan)
+    }
+
+    /// The reused rows pointing at `scan_id`, for a caller who can see a copy of
+    /// a scan and not its source: the scan listing reports a copy under its
+    /// source's id. Bounded: a caller who sees none of these gets a 404.
+    pub async fn copies_of_scan(&self, scan_id: Uuid) -> Result<Vec<ScanResult>> {
+        let sql = concat!(
+            "SELECT ",
+            scan_result_columns!(),
+            " FROM scan_results WHERE source_scan_id = $1 ORDER BY created_at LIMIT 200"
+        );
+        sqlx::query_as::<_, ScanResult>(sql)
+            .bind(scan_id)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// The one artifact's copy of `scan_id`, or `scan_id` itself if it is theirs.
+    pub async fn scan_for_artifact(
+        &self,
+        scan_id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<Option<ScanResult>> {
+        let sql = concat!(
+            "SELECT ",
+            scan_result_columns!(),
+            " FROM scan_results WHERE artifact_id = $2 AND (id = $1 OR source_scan_id = $1) \
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        sqlx::query_as::<_, ScanResult>(sql)
+            .bind(scan_id)
+            .bind(artifact_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// Convert a pre-allocated `running` scan_result row into a reused row
@@ -2293,14 +2443,11 @@ impl ScanResultService {
             cve_id,
             finding_class,
         } = *filter;
-        let findings = sqlx::query_as!(
-            ScanFinding,
+        // #5153: acknowledged state comes from the decisions, through the view.
+        let sql = format!(
             r#"
-            SELECT id, scan_result_id, artifact_id, severity, title, description,
-                   cve_id, affected_component, affected_version, fixed_version,
-                   source, source_url, is_acknowledged, acknowledged_by,
-                   acknowledged_reason, acknowledged_at, created_at, finding_class
-            FROM scan_findings
+            SELECT {SCAN_FINDING_COLUMNS}
+            FROM scan_findings_effective
             WHERE scan_result_id = $1
               AND ($2::text IS NULL OR severity = $2)
               AND ($3::text IS NULL OR source = $3)
@@ -2316,18 +2463,19 @@ impl ScanResultService {
                 END,
                 created_at DESC
             LIMIT $5 OFFSET $6
-            "#,
-            scan_result_id,
-            severity,
-            source,
-            cve_id,
-            limit,
-            offset,
-            finding_class,
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+            "#
+        );
+        let findings = sqlx::query_as::<_, ScanFinding>(sqlx::AssertSqlSafe(sql))
+            .bind(scan_result_id)
+            .bind(severity)
+            .bind(source)
+            .bind(cve_id)
+            .bind(limit)
+            .bind(offset)
+            .bind(finding_class)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
         let total = sqlx::query_scalar!(
             r#"
@@ -2352,36 +2500,61 @@ impl ScanResultService {
         Ok((findings, total))
     }
 
-    /// Acknowledge a finding (accept risk).
+    /// Acknowledge a finding (accept risk): record a decision about its identity
+    /// (#5153, [`crate::services::finding_acknowledgements`]) and return the row
+    /// with the state of the repository decided, which need not be the row's own.
     pub async fn acknowledge_finding(
         &self,
         finding_id: Uuid,
-        user_id: Uuid,
+        actor: &crate::services::finding_acknowledgements::AckActor,
         reason: &str,
+        options: crate::services::finding_acknowledgements::AcknowledgeOptions,
     ) -> Result<ScanFinding> {
-        let finding = sqlx::query_as!(
-            ScanFinding,
-            r#"
-            UPDATE scan_findings
-            SET is_acknowledged = true, acknowledged_by = $2,
-                acknowledged_reason = $3, acknowledged_at = NOW()
-            WHERE id = $1
-            RETURNING id, scan_result_id, artifact_id, severity, title, description,
-                      cve_id, affected_component, affected_version, fixed_version,
-                      source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at, finding_class
-            "#,
-            finding_id,
-            user_id,
-            reason,
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
+        let decision =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            )
+            .acknowledge_finding(finding_id, actor, Some(reason), options)
+            .await?;
+        self.get_finding_as_decided(finding_id, decision.repository_id)
+            .await
+    }
 
-        self.refresh_score_for_artifact(finding.artifact_id).await;
+    /// The row, with its acknowledged fields as they stand in `repository_id`.
+    /// `None`, an every-repository decision, is the row's own state.
+    async fn get_finding_as_decided(
+        &self,
+        finding_id: Uuid,
+        repository_id: Option<Uuid>,
+    ) -> Result<ScanFinding> {
+        let mut finding = self.get_finding(finding_id).await?;
+        if let Some(repository_id) = repository_id {
+            let decision =
+                crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                    self.db.clone(),
+                )
+                .decision_in_repository(finding_id, repository_id)
+                .await?;
+            finding.is_acknowledged = decision.is_some();
+            finding.acknowledgement_id = decision.as_ref().map(|d| d.id);
+            finding.acknowledged_by = decision.as_ref().and_then(|d| d.acknowledged_by);
+            finding.acknowledged_reason = decision.as_ref().and_then(|d| d.reason.clone());
+            finding.acknowledged_at = decision.as_ref().map(|d| d.acknowledged_at);
+            finding.acknowledgement_expires_at = decision.as_ref().and_then(|d| d.expires_at);
+        }
         Ok(finding)
+    }
+
+    /// One finding with its effective acknowledged state.
+    async fn get_finding(&self, finding_id: Uuid) -> Result<ScanFinding> {
+        let sql =
+            format!("SELECT {SCAN_FINDING_COLUMNS} FROM scan_findings_effective WHERE id = $1");
+        sqlx::query_as::<_, ScanFinding>(sqlx::AssertSqlSafe(sql))
+            .bind(finding_id)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))
     }
 
     /// Recompute the security score of the repository holding `artifact_id`
@@ -2411,28 +2584,25 @@ impl ScanResultService {
         }
     }
 
-    /// Revoke acknowledgment of a finding.
-    pub async fn revoke_acknowledgment(&self, finding_id: Uuid) -> Result<ScanFinding> {
-        let finding = sqlx::query_as!(
-            ScanFinding,
-            r#"
-            UPDATE scan_findings
-            SET is_acknowledged = false, acknowledged_by = NULL,
-                acknowledged_reason = NULL, acknowledged_at = NULL
-            WHERE id = $1
-            RETURNING id, scan_result_id, artifact_id, severity, title, description,
-                      cve_id, affected_component, affected_version, fixed_version,
-                      source, source_url, is_acknowledged, acknowledged_by,
-                      acknowledged_reason, acknowledged_at, created_at, finding_class
-            "#,
-            finding_id,
-        )
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Finding not found".to_string()))?;
-
-        self.refresh_score_for_artifact(finding.artifact_id).await;
+    /// Revoke the decision covering a finding, as far as the actor has authority
+    /// (#5153), and return the row with the state of the repository asked about.
+    /// `acknowledgements_left_effective` counts what stayed.
+    pub async fn revoke_acknowledgment(
+        &self,
+        finding_id: Uuid,
+        repository_id: Option<Uuid>,
+        actor: &crate::services::finding_acknowledgements::AckActor,
+    ) -> Result<ScanFinding> {
+        let outcome =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            )
+            .revoke_finding(finding_id, repository_id, actor)
+            .await?;
+        let mut finding = self
+            .get_finding_as_decided(finding_id, repository_id)
+            .await?;
+        finding.acknowledgements_left_effective = Some(outcome.left_effective);
         Ok(finding)
     }
 
@@ -2924,9 +3094,12 @@ impl ScanResultService {
             repos_grade_f,
         );
         let hosted = self.count_hosted_rejected().await?;
-        let proxy = self.count_proxy_blocked().await?;
+        // One read: `proxy_would_block` grades the same candidates.
+        let candidates = self.proxy_block_candidates().await?;
+        let proxy = count_blocked_proxy_digests(&candidates);
         out.policy_violations_blocked = hosted + proxy;
         out.proxy_blocked = proxy;
+        out.proxy_would_block = count_would_block_proxy_digests(&candidates);
         out.repos_rated = tally.rated;
         out.repos_incomplete = tally.incomplete;
         out.repos_unrated = tally.unrated;
@@ -2970,7 +3143,16 @@ impl ScanResultService {
     /// least one repository's proxy scan gate refuses right now, the same
     /// set the cross-repository blocked listing pages through.
     pub async fn count_proxy_blocked(&self) -> Result<i64> {
-        let rows: Vec<ProxyBlockCandidate> = sqlx::query_as(
+        Ok(count_blocked_proxy_digests(
+            &self.proxy_block_candidates().await?,
+        ))
+    }
+
+    /// Every fresh `vulnerable` verdict on a digest a scanning repository
+    /// caches, paired with that repository's settings and whatever its action:
+    /// the gate's predicates decide from here.
+    async fn proxy_block_candidates(&self) -> Result<Vec<ProxyBlockCandidate>> {
+        sqlx::query_as(
             r#"
             SELECT DISTINCT psr.checksum_sha256, r.format::text AS format,
                    psr.max_severity,
@@ -3001,9 +3183,7 @@ impl ScanResultService {
         .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
         .fetch_all(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(count_blocked_proxy_digests(&rows))
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// The CVE ids recorded for each of `digests` (#4777), most severe
@@ -3045,6 +3225,110 @@ impl ScanResultService {
     /// [`Self::count_policy_violations_blocked`], filtered with
     /// [`proxy_gate_refuses`], so a listed row is one the gate would refuse.
     pub async fn list_blocked_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        rows.retain(|r| {
+            proxy_gate_refuses(
+                &r.repository_format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                &r.proxy_scan_action,
+                r.max_severity.as_deref(),
+            )
+        });
+        Ok(rows)
+    }
+
+    /// Every proxied path a repository's proxy scan gate would refuse if it
+    /// enforced (#5232): [`Self::list_blocked_proxy_entries`] over the same
+    /// candidates, filtered with [`proxy_gate_would_refuse`].
+    pub async fn list_would_block_proxy_entries(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<Vec<ProxyBlockedEntry>> {
+        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        rows.retain(|r| {
+            proxy_gate_would_refuse(
+                &r.repository_format,
+                r.block_on_policy_violation,
+                &r.severity_threshold,
+                r.max_severity.as_deref(),
+            )
+        });
+        Ok(rows)
+    }
+
+    /// See [`ProxyNoVerdictCounts`]. One statement; the catalog is read once
+    /// per repository, and each distinct digest is looked up once.
+    pub async fn count_proxy_no_verdict(
+        &self,
+        repository_key: Option<&str>,
+    ) -> Result<ProxyNoVerdictCounts> {
+        let packument_formats: Vec<&str> =
+            crate::services::proxy_catalog::packument_format_labels();
+        let not_metadata = crate::services::proxy_catalog::not_cached_metadata_sql_by_format(
+            "pca.path",
+            "r.format::text",
+            "$5",
+        );
+        sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+            r#"
+            WITH scanning AS (
+                SELECT r.id, r.format
+                  FROM scan_configs sc
+                  JOIN repositories r ON r.id = sc.repository_id
+                 WHERE sc.scan_on_proxy
+                   AND r.repo_type IN ('remote', 'virtual')
+                   AND r.format::text = ANY($3)
+                   AND ($4::text IS NULL OR r.key = $4)
+            ), cached AS (
+                SELECT pca.checksum_sha256 AS digest
+                  FROM scanning r
+                  JOIN proxy_cache_artifacts pca ON pca.repository_id = r.id
+                 WHERE pca.checksum_sha256 IS NOT NULL
+                   AND {not_metadata}
+                UNION
+                SELECT REPLACE(mbr.manifest_digest, 'sha256:', '')
+                  FROM scanning r
+                  JOIN manifest_blob_refs mbr ON mbr.repository_id = r.id
+            )
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE psr.verdict IS NULL
+                       OR psr.verdict NOT IN ('clean', 'vulnerable')
+                ) AS no_verdict,
+                COUNT(*) FILTER (
+                    WHERE psr.verdict IN ('clean', 'vulnerable')
+                      AND psr.scanned_at <= NOW() - make_interval(days => $2)
+                ) AS stale_verdict,
+                COUNT(*) FILTER (
+                    WHERE psr.verdict = 'clean'
+                      AND psr.scanned_at > NOW() - make_interval(days => $2)
+                      AND psr.findings_count = 0
+                      AND COALESCE(psr.components_cataloged, 0) <= 0
+                      AND psr.pin_identity IS NULL
+                ) AS clean_graded_nothing
+              FROM cached
+              LEFT JOIN proxy_scan_results psr
+                     ON psr.checksum_sha256 = cached.digest
+                    AND psr.scan_type = $1
+            "#
+        )))
+        .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+        .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
+        .bind(proxy_gated_format_labels())
+        .bind(repository_key)
+        .bind(packument_formats)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Fresh `vulnerable` verdicts on cached paths of scanning repositories,
+    /// ordered by repository key then path, before any gate decides.
+    async fn cached_vulnerable_proxy_entries(
         &self,
         repository_key: Option<&str>,
     ) -> Result<Vec<ProxyBlockedEntry>> {
@@ -3095,18 +3379,7 @@ impl ScanResultService {
                 "blocked proxy listing reached its candidate cap; later repositories are not listed"
             );
         }
-        Ok(rows
-            .into_iter()
-            .filter(|r| {
-                proxy_gate_refuses(
-                    &r.repository_format,
-                    r.block_on_policy_violation,
-                    &r.severity_threshold,
-                    &r.proxy_scan_action,
-                    r.max_severity.as_deref(),
-                )
-            })
-            .collect())
+        Ok(rows)
     }
 }
 
@@ -3114,7 +3387,7 @@ impl ScanResultService {
 /// [`ScanResultService::create_findings`], generic over the executor so
 /// [`ScanResultService::create_completed_scan_with_findings`] can run it
 /// inside the transaction that wrote the scan row (#4667).
-async fn insert_findings<'e, E>(
+pub(crate) async fn insert_findings<'e, E>(
     executor: E,
     scan_result_id: Uuid,
     artifact_id: Uuid,
@@ -3419,6 +3692,121 @@ mod tests {
         assert_eq!(count_blocked_proxy_digests(&[]), 0);
     }
 
+    /// #5232: the preview is the gate's own predicate asked with an enforcing
+    /// action, and agrees with every decision the serve paths take on a stored
+    /// `vulnerable` verdict, for every format, opt-in, threshold and severity.
+    #[test]
+    fn test_would_refuse_is_the_gate_under_enforcement_5232() {
+        use crate::api::handlers::proxy_helpers::stored_verdict_blocks_under_gate;
+        use crate::services::proxy_scan_service::{
+            decide_cache_scan_gate, decide_serve, CacheScanGate, ProxyScanAction, ProxyScanRow,
+            ServeDecision, StoredProxyVerdict,
+        };
+        use crate::services::scan_config_service::proxy_severity_gate_for_row;
+        let now = chrono::Utc::now();
+        for format in [
+            "npm", "pypi", "conda", "helm_oci", "helm", "generic", "no-such",
+        ] {
+            for block in [false, true] {
+                for threshold in ["critical", "high", "medium", "low", "info", "garbage"] {
+                    for severity in [
+                        Some("critical"),
+                        Some("high"),
+                        Some("medium"),
+                        Some("low"),
+                        Some("info"),
+                        Some("junk"),
+                        None,
+                    ] {
+                        let ctx = format!("{format} {block} {threshold} {severity:?}");
+                        let would = proxy_gate_would_refuse(format, block, threshold, severity);
+                        for action in ["fail_open", "fail_closed"] {
+                            assert_eq!(
+                                would,
+                                proxy_gate_refuses(format, block, threshold, action, severity),
+                                "{ctx}: an enforcing repository lists exactly the preview"
+                            );
+                        }
+                        assert!(
+                            !proxy_gate_refuses(format, block, threshold, "record_only", severity),
+                            "{ctx}: record-only itself keeps refusing nothing"
+                        );
+
+                        // The decisions the real serve paths take.
+                        let row = ProxyScanRow {
+                            checksum_sha256: "d".repeat(64),
+                            scan_type: "grype".to_string(),
+                            verdict: "vulnerable".to_string(),
+                            findings_count: 1,
+                            critical_count: 0,
+                            high_count: 0,
+                            medium_count: 0,
+                            low_count: 0,
+                            max_severity: severity.map(str::to_string),
+                            scanner_version: Some("v".to_string()),
+                            scanned_at: now,
+                        };
+                        let gate = proxy_severity_gate_for_row(block, threshold, "fail_closed");
+                        let enforced = crate::formats::format_key_enforces_scan_on_proxy(format);
+                        for action in [ProxyScanAction::FailOpen, ProxyScanAction::FailClosed] {
+                            assert_eq!(
+                                decide_serve(Some(&row), Some("v"), action, 30, now),
+                                ServeDecision::BlockCached,
+                                "{ctx}"
+                            );
+                            assert_eq!(
+                                would,
+                                enforced && stored_verdict_blocks_under_gate(Some(&row), gate),
+                                "{ctx}: the buffered gate"
+                            );
+                            let stored = StoredProxyVerdict {
+                                row: row.clone(),
+                                pin_identity: None,
+                                components_cataloged: Some(1),
+                            };
+                            let fast = decide_cache_scan_gate(
+                                Some(&stored),
+                                Some("v"),
+                                action,
+                                gate,
+                                30,
+                                now,
+                            );
+                            assert_eq!(
+                                would,
+                                enforced && fast == CacheScanGate::Block,
+                                "{ctx}: the redirect gate"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// #5232: the counter is `proxy_blocked` plus what `record_only` serves,
+    /// once per digest, and a digest refused anywhere is not counted twice.
+    #[test]
+    fn test_count_would_block_proxy_digests_5232() {
+        let rows = vec![
+            // Enforcing: both counters.
+            block_candidate("a", Some("critical"), "fail_open", true, "high"),
+            // The same digest record-only elsewhere: still one.
+            block_candidate("a", Some("critical"), "record_only", true, "high"),
+            // Record-only at or above its threshold: the preview only.
+            block_candidate("b", Some("high"), "record_only", true, "high"),
+            // Record-only below its threshold: neither.
+            block_candidate("c", Some("medium"), "record_only", true, "high"),
+            // Record-only with no threshold opted in: any finding would block.
+            block_candidate("d", Some("low"), "record_only", false, "critical"),
+            // Record-only and ungraded: fails closed.
+            block_candidate("e", None, "record_only", true, "critical"),
+        ];
+        assert_eq!(count_blocked_proxy_digests(&rows), 1);
+        assert_eq!(count_would_block_proxy_digests(&rows), 4);
+        assert_eq!(count_would_block_proxy_digests(&[]), 0);
+    }
+
     /// #4582: a blocking verdict counts only where the format's proxy path
     /// runs the gate. The same high verdict under the same policy is counted
     /// on a conda remote (gated since #4585) and an OCI alias, and not on a
@@ -3666,6 +4054,9 @@ mod tests {
             acknowledged_by: None,
             acknowledged_reason: None,
             acknowledged_at: None,
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
             finding_class: "vulnerability".to_string(),
         };
@@ -3693,6 +4084,9 @@ mod tests {
             acknowledged_by: Some(user_id),
             acknowledged_reason: Some("Accepted risk for legacy code".to_string()),
             acknowledged_at: Some(chrono::Utc::now()),
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
             finding_class: "vulnerability".to_string(),
         };
@@ -4646,9 +5040,18 @@ mod tests {
             let admin = crate::api::handlers::test_db_helpers::create_user(&pool)
                 .await
                 .0;
-            svc.acknowledge_finding(finding_id, admin, "not reachable")
-                .await
-                .expect("acknowledge");
+            crate::api::handlers::test_db_helpers::grant_repo_access(&pool, repo_id, admin).await;
+            svc.acknowledge_finding(
+                finding_id,
+                &crate::services::finding_acknowledgements::AckActor::new(
+                    admin,
+                    crate::models::access_scope::AccessScope::Admin,
+                ),
+                "not reachable",
+                Default::default(),
+            )
+            .await
+            .expect("acknowledge");
             assert_agree(
                 "after acknowledging CVE-2026-0002",
                 &views().await,
@@ -4658,9 +5061,9 @@ mod tests {
                 1,
             );
 
-            // grype rescans and now reports only CVE-2026-0002 (a new,
-            // unacknowledged row). CVE-2026-0001 is still reported by the
-            // image scanner, at high.
+            // grype rescans and now reports only CVE-2026-0002. The new row is
+            // covered by the decision (#5153), so it stays acknowledged.
+            // CVE-2026-0001 is still reported by the image scanner, at high.
             seed_scan_4338(
                 &svc,
                 artifact_id,
@@ -4677,7 +5080,7 @@ mod tests {
             svc.recalculate_score(repo_id)
                 .await
                 .expect("score after rescan");
-            assert_agree("after the rescan", &views().await, 1, 1, 2, 0);
+            assert_agree("after the rescan", &views().await, 0, 1, 1, 1);
         }
 
         /// Build a completed source scan with one High finding.

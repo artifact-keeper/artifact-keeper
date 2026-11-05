@@ -24,7 +24,7 @@ use regex::Regex;
 use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -99,6 +99,9 @@ pub const PROXY_SCAN_MAX_BYTES: usize = 200 * 1024 * 1024;
 /// of a fresh wheel is seconds; this bounds the added `pip install` latency so a
 /// slow or contended scan cannot stall the pull indefinitely. Budget exceeded
 /// is treated as inconclusive (fail-open serves-with-pending, fail-closed 423).
+/// It starts when the scan holds a permit: the wait for one is bounded on its
+/// own by `AK_PROXY_SCAN_QUEUE_WAIT_SECS`, and the scan goes on without the request
+/// up to [`PROXY_SCAN_BACKGROUND_BUDGET`] (#5231).
 pub const PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Wall-clock budget for a single inline OCI image proxy scan (#3003 PR-2).
@@ -127,6 +130,12 @@ pub const OCI_PROXY_SCAN_INLINE_BUDGET: Duration = Duration::from_secs(120);
 /// precedent for a context that can legitimately take longer than the file
 /// gate's 30s.
 pub const PROXY_RESCAN_BUDGET_CEILING: Duration = Duration::from_secs(120);
+
+/// How long a proxy file scan may run once it holds a permit, after the
+/// requests waiting on it have had their [`PROXY_SCAN_INLINE_BUDGET`] (#5231).
+/// Nobody is waiting by then: what this bounds is how long one permit can be
+/// held. The scan is killed at this point and the file has no verdict.
+pub const PROXY_SCAN_BACKGROUND_BUDGET: Duration = PROXY_RESCAN_BUDGET_CEILING;
 
 /// The scan budget an individual rescan request actually runs under (#3455
 /// review, F2).
@@ -851,7 +860,7 @@ impl ScanReferenceResolution {
 ///     marker `docker buildx` stamps onto attestation children),
 ///   * `annotations["vnd.docker.reference.type"]` is `attestation-manifest`,
 ///   * `artifactType` contains `in-toto` (SLSA/provenance attestations).
-fn is_excluded_index_child(child: &serde_json::Value) -> bool {
+pub(crate) fn is_excluded_index_child(child: &serde_json::Value) -> bool {
     let platform = child.get("platform");
     let os = platform
         .and_then(|p| p.get("os"))
@@ -1865,7 +1874,10 @@ impl ScanWorkspace {
             // [`SCAN_PIN_SUBDIR`] where no shipped file can displace it. Unlike
             // npm there is no merge concern: a lockfile the archive happens to
             // ship stays exactly where it is and is graded on its own, and the
-            // pin-scoped `dedupe_findings` collapses the overlap.
+            // pin-scoped `dedupe_findings` collapses the overlap. Cargo is the
+            // exception: a crate's own `Cargo.lock` is removed first, because
+            // no consumer ever resolves against it (#5143, see
+            // [`Self::drop_bundled_cargo_locks`]).
             ComponentEcosystem::RubyGems => {
                 Self::write_pin_file(
                     workspace,
@@ -1875,6 +1887,7 @@ impl ScanWorkspace {
                 .await
             }
             ComponentEcosystem::Cargo => {
+                Self::drop_bundled_cargo_locks(extract_root).await;
                 Self::write_pin_file(
                     workspace,
                     &PathBuf::from(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME),
@@ -2086,6 +2099,57 @@ impl ScanWorkspace {
             })?;
         }
         Ok(())
+    }
+
+    /// Remove every `Cargo.lock` the crate itself ships, so a pinned `.crate`
+    /// is graded on its own coordinate and nothing else (#5143).
+    ///
+    /// Many published crates (every binary crate, and libraries whose authors
+    /// commit one) ship a `Cargo.lock`. Both engines catalog it, so the crate
+    /// used to be graded on every package in its author's build: a proxied
+    /// `async-ctrlc@1.2.0` was blocked for `crossbeam-deque@0.7.3`. Cargo
+    /// never reads a dependency's lockfile; a dependent resolves its whole
+    /// graph from its own. The one consumer that does read it,
+    /// `cargo install --locked`, downloads every locked crate through the
+    /// same registry, where each is graded on its own coordinate. Removing
+    /// the bundled lockfile therefore loses no coverage for what a consumer
+    /// installs. The crate's identity was already checked against its own
+    /// `Cargo.toml` ([`pin_agrees_with_content`]) before a pin exists, and
+    /// the pin is written right after this.
+    ///
+    /// Only the archive namespace ([`SCAN_ARCHIVE_SUBDIR`]) is walked, so the
+    /// pin under [`SCAN_PIN_SUBDIR`] is out of reach. Extraction never
+    /// materialises symlinks, and the walk does not follow them.
+    ///
+    /// A failure is logged and the scan goes on: a lockfile left behind is
+    /// graded as before this change, which can over-block but never under-
+    /// grade, while a hard error would turn into an inconclusive scan that a
+    /// `fail_open` remote serves ungraded.
+    async fn drop_bundled_cargo_locks(extract_root: &Path) {
+        let root = extract_root.to_path_buf();
+        let removed =
+            tokio::task::spawn_blocking(move || remove_files_named(&root, CARGO_LOCK_NAME)).await;
+        match removed {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => debug!(
+                "Removed {} bundled {} from {} before pinning (#5143)",
+                n,
+                CARGO_LOCK_NAME,
+                extract_root.display()
+            ),
+            Ok(Err(e)) => warn!(
+                "Failed to remove bundled {} from {}: {}; it will be graded",
+                CARGO_LOCK_NAME,
+                extract_root.display(),
+                e
+            ),
+            Err(e) => warn!(
+                "Bundled {} removal task failed for {}: {}; it will be graded",
+                CARGO_LOCK_NAME,
+                extract_root.display(),
+                e
+            ),
+        }
     }
 
     /// Write one pin file (creating parents), mapping IO failure onto the
@@ -2545,6 +2609,21 @@ fn widen_owner_modes(root: &Path) {
     }
 }
 
+/// Remove every regular file under `root` whose name is exactly `name`, at any
+/// depth, and return how many were removed. Symlinks are neither followed nor
+/// removed. Blocking; run it off the async workers.
+fn remove_files_named(root: &Path, name: &str) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.map_err(std::io::Error::from)?;
+        if entry.file_type().is_file() && entry.file_name() == name {
+            std::fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// The lockfile name the npm component pin is written under. syft catalogs
 /// this name at any depth, which is what makes both the merged root pin and
 /// the preserve-fallback subdirectory pin gradeable.
@@ -2572,7 +2651,8 @@ pub(crate) const SCAN_PIN_SUBDIR: &str = ".ak-scan-pin";
 pub(crate) const GEMFILE_LOCK_NAME: &str = "Gemfile.lock";
 
 /// The Rust lockfile the CVE engine catalogs from a directory. A published
-/// library `.crate` ships `Cargo.toml` but no `Cargo.lock` (#3603).
+/// library `.crate` usually ships `Cargo.toml` but no `Cargo.lock` (#3603);
+/// one that does ship it has it removed before the pin is written (#5143).
 pub(crate) const CARGO_LOCK_NAME: &str = "Cargo.lock";
 
 /// The .NET dependency manifest the CVE engine catalogs from a directory. The
@@ -2752,6 +2832,11 @@ pub(crate) fn gemfile_lock_pin(name: &str, version: &str) -> String {
 /// engine, so a hosted `smallvec@1.6.0` graded as nothing. `Cargo.lock` is
 /// what both read (syft's `rust-cargo-lock-cataloger`, Trivy's `cargo`
 /// analyzer).
+///
+/// Many crates do ship a `Cargo.lock` (every binary crate does). That file
+/// describes the author's build, which no consumer resolves against, so it is
+/// removed from the workspace and this pin is the crate's only gradeable
+/// component (#5143, [`ScanWorkspace::drop_bundled_cargo_locks`]).
 ///
 /// `checksum` is deliberately omitted: it is absent in real lockfiles for
 /// path/git sources and neither parser requires it, so inventing one would add
@@ -3963,6 +4048,13 @@ async fn acquire_scan_extraction_permit(repository_id: Uuid) -> ScanExtractionPe
         scan_extraction_per_tenant_fair_share(),
     )
     .await
+}
+
+/// A held scan-extraction permit, for a caller that has to wait for one outside
+/// the clock it scans under (#5231). The scan methods taking one do not acquire
+/// another.
+pub struct InlineScanSlot {
+    _permit: ScanExtractionPermit,
 }
 
 /// The cumulative-budget breach error, shared by the reader-level budget under
@@ -5890,6 +5982,10 @@ async fn run_inline_proxy_scanners_target(
     // What the CVE-authoritative scanner actually cataloged (#3003). `None`
     // until a CVE engine that reports a catalog completes.
     let mut cve_cataloged: Option<Vec<CatalogedComponent>> = None;
+    // Read before the scan, so a verdict says what it was graded against: a
+    // vulnerability-database update during the scan must make the next pull scan
+    // again, not reuse this verdict as if it had seen the new data (#5231).
+    let version_at_start = cve_authoritative_scanner_version(scanners).await;
 
     for scanner in scanners {
         // Applicability gates on the target artifact's path/content-type
@@ -6113,7 +6209,7 @@ async fn run_inline_proxy_scanners_target(
     // Cheap: `Scanner::version` is `VersionCache`-backed, so this is a memory
     // read, not a second `--version` subprocess.
     let scanner_version = if cve_scanner_ran {
-        cve_authoritative_scanner_version(scanners).await
+        version_at_start
     } else {
         None
     };
@@ -9317,10 +9413,29 @@ impl ScannerService {
         content: &Bytes,
         expected: Option<&ExpectedComponent>,
     ) -> Result<ProxyScanVerdict> {
-        // Fair-share + global cap: inline scans queue behind the same semaphore
-        // as upload scans instead of contending for unbounded extraction slots.
-        let _extraction_permit = acquire_scan_extraction_permit(synthetic.repository_id).await;
+        let slot = self.acquire_inline_scan_slot(synthetic.repository_id).await;
+        self.scan_content_expecting_in_slot(&slot, synthetic, content, expected)
+            .await
+    }
 
+    /// Wait for a scan-extraction permit. Fair-share + global cap: inline scans
+    /// queue behind the same semaphore as upload scans instead of contending
+    /// for unbounded extraction slots.
+    pub async fn acquire_inline_scan_slot(&self, repository_id: Uuid) -> InlineScanSlot {
+        InlineScanSlot {
+            _permit: acquire_scan_extraction_permit(repository_id).await,
+        }
+    }
+
+    /// [`ScannerService::scan_content_expecting`] under a permit the caller
+    /// already holds, so that the wait for it is not part of the scan (#5231).
+    pub async fn scan_content_expecting_in_slot(
+        &self,
+        _slot: &InlineScanSlot,
+        synthetic: &Artifact,
+        content: &Bytes,
+        expected: Option<&ExpectedComponent>,
+    ) -> Result<ProxyScanVerdict> {
         let target = ScanTarget {
             artifact: synthetic,
             repository_key: "",
@@ -11094,7 +11209,10 @@ impl ScannerService {
         );
         if let Err(e) = sqlx::query(
             "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
-             quarantine_reason = $2 \
+             quarantine_reason = $2, \
+             quarantine_source = CASE WHEN quarantine_status = 'quarantined' \
+                                           AND quarantine_until IS NULL \
+                                      THEN quarantine_source ELSE 'scan_policy' END \
              WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
         )
         .bind(artifact_id)
@@ -11168,6 +11286,25 @@ impl ScannerService {
             }
         };
 
+        // #5153: the scanner now records the origin of its holds, so a rescan that
+        // leaves the policy with nothing to refuse (the findings are gone, or are
+        // acknowledged) ends that hold rather than leaving it answering for a policy
+        // that passes. Any other hold stays; see the guard in the release.
+        let mut current_status = current_status;
+        if matches!(current_status.as_deref(), Some("quarantined"))
+            && !has_timed_hold
+            && policy_result.as_ref().is_some_and(|p| p.allowed)
+            && crate::services::quarantine_service::release_cleared_scan_policy_hold(
+                &self.db,
+                artifact_id,
+                None,
+                "scan",
+            )
+            .await?
+        {
+            current_status = Some("released".to_string());
+        }
+
         let decision = post_scan_status_decision(
             current_status.as_deref(),
             findings_count,
@@ -11194,7 +11331,9 @@ impl ScannerService {
             let result = sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
                        quarantine_reason = CASE WHEN $2 = 'released' THEN NULL \
-                                                ELSE COALESCE($3, quarantine_reason) END \
+                                                ELSE COALESCE($3, quarantine_reason) END, \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                                                ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status = 'quarantined' \
                        AND quarantine_until IS NOT NULL",
             )
@@ -11219,7 +11358,9 @@ impl ScannerService {
             sqlx::query(
                 "UPDATE artifacts SET quarantine_status = $2, \
                        quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
-                       quarantine_reason = $3 \
+                       quarantine_reason = $3, \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                                                ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined' \
                        AND quarantine_status IS DISTINCT FROM 'rejected'",
             )
@@ -11415,6 +11556,20 @@ pub(crate) mod test_helpers {
         /// under test) before completing. Proves the BudgetExceeded arm
         /// end-to-end (#3455) without a real grype subprocess.
         Hang(std::time::Duration),
+        /// [`Self::Hang`], then the given outcome: a verdict that lands after
+        /// the request that started the scan gave up (#5231).
+        HangThen(std::time::Duration, &'static MockCveRescan),
+    }
+
+    /// Hold every scan-extraction permit, so that a scan queues until the guard
+    /// drops (#5231). The semaphore is process-wide, which nextest's one process
+    /// per test keeps to the test that calls this.
+    pub async fn hold_all_scan_permits() -> tokio::sync::OwnedSemaphorePermit {
+        super::scan_extraction_semaphore()
+            .clone()
+            .acquire_many_owned(super::max_concurrent_scan_extractions() as u32)
+            .await
+            .expect("the semaphore is never closed")
     }
 
     /// CVE-authoritative mock scanner reporting a fixed live version string.
@@ -11511,7 +11666,15 @@ pub(crate) mod test_helpers {
             _: &bytes::Bytes,
         ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match self.rescan {
+            let rescan = match self.rescan {
+                MockCveRescan::HangThen(d, then) => {
+                    tokio::time::sleep(d).await;
+                    *then
+                }
+                rescan => rescan,
+            };
+            match rescan {
+                MockCveRescan::HangThen(..) => unreachable!("replaced above"),
                 MockCveRescan::Clean => Ok(crate::services::scanner_service::ScanOutput::default()),
                 MockCveRescan::Error => Err(crate::error::AppError::Internal(
                     "simulated grype failure on re-scan".to_string(),
@@ -13028,6 +13191,12 @@ mod tests {
             .expect("update_quarantine_status must not error");
 
         let (status, reason, has_until) = quarantine_row(&fx.pool, artifact_id).await;
+        let source: Option<String> =
+            sqlx::query_scalar("SELECT quarantine_source FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("fetch quarantine source");
         fx.teardown().await;
 
         assert_eq!(
@@ -13046,6 +13215,64 @@ mod tests {
             !has_until,
             "a policy quarantine must be permanent (quarantine_until NULL) so it cannot lapse"
         );
+        assert_eq!(
+            source.as_deref(),
+            Some("scan_policy"),
+            "#5153: the scanner records the origin of its hold, so an acknowledgement \
+             that clears the policy can release it and only it"
+        );
+    }
+
+    /// #5153: a rescan the policy no longer objects to ends a hold the policy
+    /// wrote, and only that kind of hold.
+    #[tokio::test]
+    async fn test_update_quarantine_status_releases_only_a_cleared_scan_policy_hold() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let scanner = scanner_for_fixture(&fx);
+        seed_enabled_policy(&fx.pool, fx.repo_id, "test-cve-gate-5153").await;
+
+        for (source, expected) in [
+            (Some("scan_policy"), "clean"),
+            (Some("admin"), "quarantined"),
+            (None, "quarantined"),
+        ] {
+            let artifact_id = Uuid::new_v4();
+            insert_test_artifact(&fx, artifact_id, "hold-5153", Some("quarantined"), None).await;
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_source = $2, is_deleted = false WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .bind(source)
+            .execute(&fx.pool)
+            .await
+            .expect("stamp source");
+            // A completed scan with nothing to refuse.
+            sqlx::query(
+                "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+                 VALUES ($1, $2, 'dependency', 'completed', NOW())",
+            )
+            .bind(artifact_id)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("clean scan");
+
+            scanner
+                .update_quarantine_status(artifact_id, 0)
+                .await
+                .expect("update_quarantine_status");
+            let (status, _, _) = quarantine_row(&fx.pool, artifact_id).await;
+            assert_eq!(status.as_deref(), Some(expected), "source {source:?}");
+            sqlx::query("DELETE FROM artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .execute(&fx.pool)
+                .await
+                .expect("remove artifact");
+        }
+        fx.teardown().await;
     }
 
     /// Negative twin of the above: a *disabled* policy must not quarantine, so the
@@ -16522,6 +16749,146 @@ mod tests {
             .exists());
     }
 
+    /// The `Cargo.lock` that `cargo package` puts into a crate that commits
+    /// one: the author's resolved build, here listing a crate with a critical
+    /// advisory (CVE-2021-32810), as `async-ctrlc@1.2.0`'s does.
+    const BUNDLED_CARGO_LOCK: &str = "version = 3\n\n\
+        [[package]]\nname = \"async-ctrlc\"\nversion = \"1.2.0\"\n\n\
+        [[package]]\nname = \"crossbeam-deque\"\nversion = \"0.7.3\"\n";
+
+    /// Every path under `root` named `Cargo.lock`, relative to `root`.
+    fn cargo_locks_under(root: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_name() == CARGO_LOCK_NAME)
+            .map(|e| e.path().strip_prefix(root).unwrap().to_path_buf())
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// #5143: a pinned `.crate` that ships its own `Cargo.lock` is graded on
+    /// its own coordinate only. Cargo never resolves a dependent against a
+    /// dependency's lockfile, so the bundled one (and any nested one) must not
+    /// reach either engine; the pin is the only `Cargo.lock` left. Everything
+    /// else the crate ships is untouched.
+    #[tokio::test]
+    async fn test_prepare_pinned_drops_bundled_cargo_lock_5143() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = "[package]\nname = \"async-ctrlc\"\nversion = \"1.2.0\"\n";
+        let content = Bytes::from(build_tar_gz(&[
+            ("async-ctrlc-1.2.0/Cargo.toml", manifest.as_bytes().to_vec()),
+            (
+                "async-ctrlc-1.2.0/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+            (
+                "async-ctrlc-1.2.0/fuzz/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+            (
+                "async-ctrlc-1.2.0/Cargo.lock.orig",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+            ("async-ctrlc-1.2.0/src/lib.rs", b"// lib\n".to_vec()),
+        ]));
+        let pin = ExpectedComponent::new(ComponentEcosystem::Cargo, "async-ctrlc", "1.2.0");
+        assert!(
+            pin_agrees_with_content(&content, &pin, "async-ctrlc-1.2.0.crate"),
+            "the fixture must be a crate the serve path would pin"
+        );
+
+        let workspace = pinned_workspace(
+            &tmp.path().join("ws"),
+            "async-ctrlc-1.2.0.crate",
+            &content,
+            &pin,
+        )
+        .await;
+
+        assert_eq!(
+            cargo_locks_under(&workspace),
+            vec![PathBuf::from(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME)],
+            "the pin must be the only Cargo.lock either engine can catalog"
+        );
+        let body = tokio::fs::read_to_string(workspace.join(SCAN_PIN_SUBDIR).join(CARGO_LOCK_NAME))
+            .await
+            .expect("Cargo.lock pin");
+        let parsed: toml::Value = toml::from_str(&body).expect("valid TOML");
+        let packages = parsed["package"].as_array().expect("package array");
+        assert_eq!(packages.len(), 1, "{body}");
+        assert_eq!(packages[0]["name"].as_str(), Some("async-ctrlc"));
+        assert_eq!(packages[0]["version"].as_str(), Some("1.2.0"));
+        assert!(!body.contains("crossbeam-deque"), "{body}");
+
+        let crate_root = workspace
+            .join(SCAN_ARCHIVE_SUBDIR)
+            .join("async-ctrlc-1.2.0");
+        assert!(crate_root.join("Cargo.toml").exists());
+        assert!(crate_root.join("src").join("lib.rs").exists());
+        assert!(
+            crate_root.join("Cargo.lock.orig").exists(),
+            "only files named exactly Cargo.lock are removed"
+        );
+    }
+
+    /// #5143 scope: the bundled `Cargo.lock` is dropped ONLY for a Cargo pin.
+    /// An unpinned scan (no pin, or one the serve path dropped because the
+    /// crate disagreed with it) and an archive pinned as another ecosystem
+    /// keep grading whatever `Cargo.lock` they ship, exactly as before.
+    #[tokio::test]
+    async fn test_bundled_cargo_lock_kept_without_a_cargo_pin_5143() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = Bytes::from(build_tar_gz(&[
+            (
+                "async-ctrlc-1.2.0/Cargo.toml",
+                b"[package]\nname = \"async-ctrlc\"\nversion = \"1.2.0\"\n".to_vec(),
+            ),
+            (
+                "async-ctrlc-1.2.0/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+        ]));
+        let artifact = test_helpers::make_test_artifact(
+            "async-ctrlc-1.2.0.crate",
+            "application/octet-stream",
+            "async-ctrlc-1.2.0.crate",
+        );
+        let unpinned = ScanWorkspace::prepare_pinned(
+            tmp.path().join("unpinned").to_str().unwrap(),
+            None,
+            &artifact,
+            &content,
+            None,
+        )
+        .await
+        .expect("prepare");
+        assert_eq!(
+            cargo_locks_under(&unpinned),
+            vec![PathBuf::from("async-ctrlc-1.2.0").join(CARGO_LOCK_NAME)]
+        );
+
+        let zip = Bytes::from(build_zip(&[
+            (
+                "example.com/m@v1.0.0/go.mod",
+                b"module example.com/m\n".to_vec(),
+            ),
+            (
+                "example.com/m@v1.0.0/rust/Cargo.lock",
+                BUNDLED_CARGO_LOCK.as_bytes().to_vec(),
+            ),
+        ]));
+        let go =
+            ExpectedComponent::coordinate_pin(ComponentEcosystem::Go, "example.com/m", "v1.0.0")
+                .expect("a module path is pinnable");
+        let ws = pinned_workspace(&tmp.path().join("go"), "v1.0.0.zip", &zip, &go).await;
+        assert_eq!(
+            cargo_locks_under(&ws),
+            vec![PathBuf::from(SCAN_ARCHIVE_SUBDIR).join("example.com/m@v1.0.0/rust/Cargo.lock")]
+        );
+    }
+
     /// #3603: a hosted `.nupkg` must leave a `*.deps.json`. The filename is
     /// fixed, so a package id can never choose a path component.
     #[tokio::test]
@@ -16999,6 +17366,21 @@ mod tests {
             let junk = Bytes::from_static(b"just some notes, not a package at all");
             assert!(!pin_agrees_with_content(&junk, &pin, filename), "{eco:?}");
         }
+
+        // #5140: a crate published without a README carries `readme = false`
+        // in its normalized manifest; it still declares its own identity.
+        let no_readme = Bytes::from(build_tar_gz(&[(
+            "parking_lot_core-0.9.12/Cargo.toml",
+            b"[package]\nedition = \"2021\"\nname = \"parking_lot_core\"\n\
+              version = \"0.9.12\"\nbuild = \"build.rs\"\nautobins = false\n\
+              readme = false\n"
+                .to_vec(),
+        )]));
+        assert!(pin_agrees_with_content(
+            &no_readme,
+            &ExpectedComponent::new(ComponentEcosystem::Cargo, "parking_lot_core", "0.9.12"),
+            "parking_lot_core-0.9.12.crate"
+        ));
 
         // Case folding follows each ecosystem's own rule, so a publisher's
         // spelling of their own id does not cost them the pin.
@@ -34090,6 +34472,7 @@ tonic-build = "0.12"
 
 /// Vulnerability-database provenance parsing (#3014). Fixtures are verbatim
 /// output of grype 0.118.0 and trivy 0.71.2.
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod vuln_db_provenance_tests {
     use super::*;

@@ -21,6 +21,10 @@ use crate::error::{AppError, Result};
 use crate::models::security::ScanResult;
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+use crate::services::finding_acknowledgements::{
+    severity_for_rank, AckActor, AcknowledgeOptions, AcknowledgementFilter, AcknowledgementScope,
+    FindingAcknowledgement, FindingAcknowledgementService,
+};
 use crate::services::policy_service::PolicyService;
 use crate::services::proxy_catalog;
 use crate::services::proxy_scan_service::ProxyScanService;
@@ -68,6 +72,12 @@ pub fn router() -> Router<SharedState> {
         // Finding acknowledgment
         .route("/findings/:id/acknowledge", post(acknowledge_finding))
         .route("/findings/:id/acknowledge", delete(revoke_acknowledgment))
+        // Acknowledgement decisions (#5153)
+        .route("/acknowledgements", get(list_acknowledgements))
+        .route(
+            "/acknowledgements/:id",
+            delete(revoke_acknowledgement_by_id),
+        )
         // Policy CRUD
         .route("/policies", get(list_policies).post(create_policy))
         .route(
@@ -108,6 +118,12 @@ pub struct DashboardResponse {
     /// keeps its meaning (hosted rejections plus these). The rows behind it
     /// are `GET /api/v1/security/proxy-blocked`.
     pub proxy_blocked: i64,
+    /// Distinct proxied digests whose recorded verdict a repository's proxy
+    /// scan gate would refuse if it enforced (#5232): `proxy_blocked` plus
+    /// what a `record_only` repository records and serves. Counts nothing
+    /// toward `proxy_blocked` or `policy_violations_blocked`. The rows behind
+    /// it are `GET /api/v1/security/proxy-blocked?would_block=true`.
+    pub proxy_would_block: i64,
     /// Repositories whose grade letter, over what was assessed, is A (#4336:
     /// an `unrated` repository has no letter and is not counted).
     pub repos_grade_a: i64,
@@ -267,7 +283,7 @@ pub struct ListScansQuery {
 ///
 /// Kept in sync with the constraint by hand — the constraint is the authority
 /// and is re-stated in whichever migration last touched it (`022`, `032`,
-/// `034`, `060`, and `220` for `external`). Used only to reject a typo'd
+/// `034`, `060`, `220` for `external`, and `326` for `mcp_lint`). Used only to reject a typo'd
 /// filter: an unknown value must be a `400`, because an unfiltered response to
 /// a misspelled engine name reads as "no scans from that engine", which is the
 /// wrong direction for a security view (#3410).
@@ -281,6 +297,7 @@ pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
     "openscap",
     "incus",
     EXTERNAL_SCAN_TYPE,
+    crate::services::mcp_lint::MCP_LINT_SCAN_TYPE,
 ];
 
 /// Canonical severity vocabulary for the findings filter, matching
@@ -452,8 +469,10 @@ impl ScanResponse {
         // second artifact must resolve to the same scan_id as the first. The
         // row's own (placeholder) id is internal bookkeeping; clients that need
         // the findings hit `GET /security/scans/{id}` which works against the
-        // source id because the findings live there. `source_scan_id` is still
-        // exposed verbatim below for provenance.
+        // source id because the findings live there too. A caller acting on what
+        // they read has to say which repository they mean: see
+        // `AcknowledgeRequest::repository_id` and `ListFindingsQuery::artifact_id`
+        // (#5153). `source_scan_id` is still exposed verbatim below for provenance.
         let reported_id = match (s.is_reused, s.source_scan_id) {
             (true, Some(source_id)) => source_id,
             _ => s.id,
@@ -589,6 +608,9 @@ impl From<crate::models::security::ScanFinding> for FindingResponse {
             acknowledged_by: f.acknowledged_by,
             acknowledged_reason: f.acknowledged_reason,
             acknowledged_at: f.acknowledged_at,
+            acknowledgement_id: f.acknowledgement_id,
+            acknowledgement_expires_at: f.acknowledgement_expires_at,
+            acknowledgements_left_effective: f.acknowledgements_left_effective,
             created_at: f.created_at,
             finding_class: f.finding_class,
         }
@@ -697,6 +719,10 @@ async fn enrich_scans(db: &PgPool, scans: Vec<ScanResult>) -> Result<Vec<ScanRes
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct ListFindingsQuery {
+    /// The artifact whose copy of this scan to list. A scan listing reports a
+    /// reused row under its source's id, so this names which copy is meant, and
+    /// the rows returned are that artifact's, in that artifact's repository.
+    pub artifact_id: Option<Uuid>,
     /// Restrict the listing to one severity (#3410).
     ///
     /// Validated against [`KNOWN_SEVERITIES`]; an unrecognized token is a
@@ -766,6 +792,15 @@ pub struct FindingResponse {
     pub acknowledged_by: Option<Uuid>,
     pub acknowledged_reason: Option<String>,
     pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The decision covering this finding, when one does. A decision is about
+    /// the advisory, component and bytes, so it covers this row and the same
+    /// finding in any other scan of those bytes in its scope.
+    pub acknowledgement_id: Option<Uuid>,
+    /// When that decision stops applying; null means until revoked.
+    pub acknowledgement_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// After a revoke: how many copies of the decision stay effective in
+    /// repositories this caller has no authority over. Null on any other read.
+    pub acknowledgements_left_effective: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// What kind of finding this is (#3013): `vulnerability` (a known
     /// weakness), `malicious` (the package itself is known to be hostile,
@@ -777,6 +812,145 @@ pub struct FindingResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AcknowledgeRequest {
     pub reason: String,
+    /// When the acknowledgement stops applying. Must be in the future. Omitted:
+    /// until revoked.
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Where it applies. Omitted: `repository`, the finding's own repository.
+    /// `all_repositories` accepts the finding for these bytes in every repository
+    /// that holds them or later receives them.
+    #[serde(default)]
+    pub scope: AcknowledgementScopeParam,
+    /// The repository this decision applies in. It must hold these bytes.
+    /// Omitted: the finding's own repository, unless the finding's scan has copies
+    /// in other repositories, which answers 409 and asks for this field: a scan
+    /// listing reports a copy under its source's id, so the finding may not belong
+    /// to the repository the caller is looking at.
+    #[serde(default)]
+    pub repository_id: Option<Uuid>,
+}
+
+/// Which repository's decision a revoke by finding is about.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct RevokeAcknowledgementQuery {
+    /// The repository whose decision is meant. Omitted: the finding's own, unless
+    /// its scan has copies in other repositories, which answers 409.
+    pub repository_id: Option<Uuid>,
+}
+
+/// Where an acknowledgement applies (#5153).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AcknowledgementScopeParam {
+    #[default]
+    Repository,
+    AllRepositories,
+}
+
+impl From<&AcknowledgeRequest> for AcknowledgeOptions {
+    fn from(body: &AcknowledgeRequest) -> Self {
+        Self {
+            expires_at: body.expires_at,
+            repository_id: body.repository_id,
+            scope: match body.scope {
+                AcknowledgementScopeParam::Repository => AcknowledgementScope::Repository,
+                AcknowledgementScopeParam::AllRepositories => AcknowledgementScope::AllRepositories,
+            },
+        }
+    }
+}
+
+/// One acknowledgement decision (#5153).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AcknowledgementResponse {
+    pub id: Uuid,
+    /// Shared with the copies promotion made and the decisions that superseded
+    /// it. A revoke applies to the whole lineage.
+    pub lineage_id: Uuid,
+    /// Null: every repository holding these bytes.
+    pub repository_id: Option<Uuid>,
+    pub checksum_sha256: String,
+    pub finding_class: String,
+    /// The CVE id, or the finding title when the scanner reported none.
+    pub advisory: String,
+    /// Empty when the finding named no component.
+    pub component: String,
+    /// Empty when the finding named no version.
+    pub component_version: String,
+    /// The highest severity accepted. A finding graded above it stays open.
+    pub max_severity: String,
+    pub reason: Option<String>,
+    pub acknowledged_by: Option<Uuid>,
+    pub acknowledged_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `api`, `promotion` or `migration`.
+    pub created_via: String,
+    /// For `created_via = promotion`, who promoted the artifact.
+    pub carried_by: Option<Uuid>,
+    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_by: Option<Uuid>,
+    /// `revoked`, or `superseded` when a newer decision replaced it.
+    pub revoked_reason: Option<String>,
+    /// `active`, `expired` or `revoked`.
+    pub state: String,
+}
+
+impl From<FindingAcknowledgement> for AcknowledgementResponse {
+    fn from(d: FindingAcknowledgement) -> Self {
+        Self {
+            max_severity: severity_for_rank(d.max_severity_rank).to_string(),
+            id: d.id,
+            lineage_id: d.lineage_id,
+            repository_id: d.repository_id,
+            checksum_sha256: d.checksum_sha256,
+            finding_class: d.finding_class,
+            advisory: d.advisory_key,
+            component: d.component_key,
+            component_version: d.component_version_key,
+            reason: d.reason,
+            acknowledged_by: d.acknowledged_by,
+            acknowledged_at: d.acknowledged_at,
+            expires_at: d.expires_at,
+            created_via: d.created_via,
+            carried_by: d.carried_by,
+            revoked_at: d.revoked_at,
+            revoked_by: d.revoked_by,
+            revoked_reason: d.revoked_reason,
+            state: d.state,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ListAcknowledgementsQuery {
+    /// Decisions that apply in this repository, including every-repository ones.
+    pub repository_id: Option<Uuid>,
+    /// Decisions about these bytes.
+    pub checksum_sha256: Option<String>,
+    /// Decisions about this advisory: a CVE id, in any case, or a finding title.
+    pub advisory: Option<String>,
+    /// Include expired and revoked decisions. Default false.
+    #[serde(default)]
+    pub include_inactive: bool,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// What a revoke did (#5153).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RevokeResponse {
+    /// Decisions revoked.
+    pub revoked: usize,
+    /// Decisions still in force on this finding that the revoke did not undo: copies
+    /// in repositories this credential does not cover and separate decisions for every
+    /// repository. Lapsed decisions are not counted.
+    pub left_effective: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AcknowledgementListResponse {
+    pub items: Vec<AcknowledgementResponse>,
+    pub total: i64,
 }
 
 /// Secure default for `block_unscanned` on policy creation (#1643). When a
@@ -958,6 +1132,7 @@ async fn get_dashboard(
         high_findings: summary.high_findings,
         policy_violations_blocked: summary.policy_violations_blocked,
         proxy_blocked: summary.proxy_blocked,
+        proxy_would_block: summary.proxy_would_block,
         repos_grade_a: summary.repos_grade_a,
         repos_grade_f: summary.repos_grade_f,
         repos_rated: summary.repos_rated,
@@ -981,6 +1156,12 @@ pub struct ProxyBlockedQuery {
     /// (`critical`, `high`, `medium`, `low`, `info`). An item whose verdict
     /// recorded no severity is kept: the gate blocks it under every policy.
     pub min_severity: Option<String>,
+    /// Preview what enforcement would refuse (#5232): apply each repository's
+    /// severity gate to its recorded verdicts whatever its current
+    /// `proxy_scan_action`, so a `record_only` repository lists what it would
+    /// refuse. Adds `would_block_summary` to the response and
+    /// `proxy_scan_action` to each item. Off by default.
+    pub would_block: Option<bool>,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
 }
@@ -1005,12 +1186,41 @@ pub struct ProxyBlockedItem {
     /// verdict recorded before per-CVE detail existed.
     pub cve_ids: Vec<String>,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
+    /// The repository's current action, so a preview tells what is refused
+    /// today from what `record_only` still serves. Only with `would_block`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_scan_action: Option<String>,
+}
+
+/// What a `would_block` preview adds to the list (#5232). Distinct digests,
+/// like the dashboard and the `proxy-scans` summary; `pagination.total` counts
+/// paths.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ProxyWouldBlockSummary {
+    /// Digests behind the listed items.
+    pub would_block_digests: i64,
+    /// Cached digests with no verdict recorded (a failed scan records none).
+    /// Not listed and not in `would_block_digests`: there is nothing to grade.
+    /// `fail_closed` would not serve them from a verdict: it scans them inline
+    /// on the next pull, refuses them if the result is blocking, and answers
+    /// `423` if the scan is inconclusive.
+    pub no_verdict: i64,
+    /// Cached digests whose verdict is older than the scan window. Handled as
+    /// `no_verdict` by the gate: the next pull scans the bytes again.
+    pub stale_verdict: i64,
+    /// Cached digests with a `clean` verdict that graded nothing. `fail_open`
+    /// and `record_only` accept it, `fail_closed` does not: it scans them
+    /// inline as `no_verdict`.
+    pub clean_graded_nothing: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProxyBlockedResponse {
     pub items: Vec<ProxyBlockedItem>,
     pub pagination: crate::api::dto::Pagination,
+    /// Set only with `would_block`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub would_block_summary: Option<ProxyWouldBlockSummary>,
 }
 
 /// Whether an item with this stored severity passes a `min_severity` filter.
@@ -1052,6 +1262,7 @@ async fn list_proxy_blocked(
     // Every repository's blocked content: an instance administrator with an
     // unrestricted credential, like the admin hold queues.
     auth.require_unscoped_admin("the cross-repository proxy-blocked list")?;
+    let would_block = query.would_block.unwrap_or(false);
     let min = match query.min_severity.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => Some(
@@ -1065,13 +1276,35 @@ async fn list_proxy_blocked(
     let (page, per_page, offset) =
         crate::api::dto::Pagination::clamp_offset(query.page, query.per_page);
     let svc = ScanResultService::new(state.db.clone());
-    let entries: Vec<_> = svc
-        .list_blocked_proxy_entries(query.repository.as_deref())
-        .await?
+    let entries = if would_block {
+        svc.list_would_block_proxy_entries(query.repository.as_deref())
+            .await?
+    } else {
+        svc.list_blocked_proxy_entries(query.repository.as_deref())
+            .await?
+    };
+    let entries: Vec<_> = entries
         .into_iter()
         .filter(|e| meets_min_severity(e.max_severity.as_deref(), min))
         .collect();
     let total = entries.len() as i64;
+    let would_block_summary = if would_block {
+        let counts = svc
+            .count_proxy_no_verdict(query.repository.as_deref())
+            .await?;
+        Some(ProxyWouldBlockSummary {
+            would_block_digests: entries
+                .iter()
+                .map(|e| e.checksum_sha256.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len() as i64,
+            no_verdict: counts.no_verdict,
+            stale_verdict: counts.stale_verdict,
+            clean_graded_nothing: counts.clean_graded_nothing,
+        })
+    } else {
+        None
+    };
     let page_entries: Vec<_> = entries
         .into_iter()
         .skip(offset.max(0) as usize)
@@ -1104,11 +1337,13 @@ async fn list_proxy_blocked(
             medium_count: e.medium_count,
             low_count: e.low_count,
             scanned_at: e.scanned_at,
+            proxy_scan_action: would_block.then_some(e.proxy_scan_action),
         })
         .collect();
     Ok(Json(ProxyBlockedResponse {
         items,
         pagination: crate::api::dto::Pagination::for_page(page, per_page, total),
+        would_block_summary,
     }))
 }
 
@@ -1406,13 +1641,8 @@ async fn get_scan(
     let svc = ScanResultService::new(state.db.clone());
     let s = svc.get_scan(id).await?;
 
-    // Cross-repo authorization (#2439): resolve the scan's owning artifact,
-    // then apply the canonical visibility gate (existence-hiding 404) before
-    // returning any scan detail. Normalize the no-access 404 body to the same
-    // message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), s.artifact_id, &state.db, "read")
-        .await
-        .map_err(unify_scan_not_found)?;
+    // Cross-repo authorization (#2439): see `scan_visible_to`.
+    let s = scan_visible_to(&state.db, &auth, s, None).await?;
 
     let mut items = enrich_scans(&state.db, vec![s]).await?;
     Ok(Json(items.remove(0)))
@@ -1421,6 +1651,47 @@ async fn get_scan(
 // ---------------------------------------------------------------------------
 // Findings
 // ---------------------------------------------------------------------------
+
+/// The row of `scan` this caller may read: the canonical visibility gate
+/// (existence-hiding 404) on the scan's owning artifact, unless `artifact_id` names
+/// another artifact's copy of it.
+///
+/// `ScanResponse.id` reports a reused row under its source's id (#1373), so a caller
+/// who can see only the copy is handed an id whose owner they cannot see. That
+/// caller gets their copy (#5153). The no-access 404 body is normalized to the one
+/// an absent id produces, so this is not an existence oracle.
+async fn scan_visible_to(
+    db: &PgPool,
+    auth: &AuthExtension,
+    scan: ScanResult,
+    artifact_id: Option<Uuid>,
+) -> Result<ScanResult> {
+    let caller = Some(auth.clone());
+    let svc = ScanResultService::new(db.clone());
+    if let Some(artifact_id) = artifact_id {
+        let row = svc
+            .scan_for_artifact(scan.id, artifact_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(SCAN_NOT_FOUND_MSG.to_string()))?;
+        check_artifact_visibility(&caller, row.artifact_id, db, "read")
+            .await
+            .map_err(unify_scan_not_found)?;
+        return Ok(row);
+    }
+    let refusal = match check_artifact_visibility(&caller, scan.artifact_id, db, "read").await {
+        Ok(_) => return Ok(scan),
+        Err(refusal) => refusal,
+    };
+    for copy in svc.copies_of_scan(scan.id).await? {
+        if check_artifact_visibility(&caller, copy.artifact_id, db, "read")
+            .await
+            .is_ok()
+        {
+            return Ok(copy);
+        }
+    }
+    Err(unify_scan_not_found(refusal))
+}
 
 #[utoipa::path(
     get,
@@ -1452,13 +1723,8 @@ async fn list_findings(
     // scan with zero findings" without this pre-check.
     let scan = svc.get_scan(scan_id).await?;
 
-    // Cross-repo authorization (#2439): resolve the scan's owning artifact and
-    // apply the canonical visibility gate (existence-hiding 404) before
-    // returning any CVE finding for it. Normalize the no-access 404 body to the
-    // same message an absent id produces so it is not an existence oracle.
-    check_artifact_visibility(&Some(auth), scan.artifact_id, &state.db, "read")
-        .await
-        .map_err(unify_scan_not_found)?;
+    // Cross-repo authorization (#2439): see `scan_visible_to`.
+    let scan = scan_visible_to(&state.db, &auth, scan, query.artifact_id).await?;
 
     let filters = query.validated_filters()?;
     let page = query.page.unwrap_or(1);
@@ -1466,7 +1732,7 @@ async fn list_findings(
     let offset = (page - 1) * per_page;
 
     let (findings, total) = svc
-        .list_findings(scan_id, &filters, offset, per_page)
+        .list_findings(scan.id, &filters, offset, per_page)
         .await?;
 
     let items: Vec<FindingResponse> = findings.into_iter().map(FindingResponse::from).collect();
@@ -1873,7 +2139,9 @@ async fn ingest_external_findings(
     ),
     request_body = AcknowledgeRequest,
     responses(
-        (status = 200, description = "Finding acknowledged", body = FindingResponse),
+        (status = 200, description = "Finding acknowledged. The decision covers this advisory, component and version on these bytes, in every scan, until it is revoked or expires. A scan-policy hold with no other open finding is released.", body = FindingResponse),
+        (status = 400, description = "expires_at is not in the future", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "The finding's scan has copies in other repositories and repository_id was not given", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
@@ -1890,12 +2158,11 @@ async fn acknowledge_finding(
     // counts. No per-user repo-membership model exists; admin gate
     // matches the dashboard gate in #1034. See #1032.
     auth.require_admin()?;
-
     let svc = ScanResultService::new(state.db.clone());
-    let user_id = auth.user_id;
+    let actor = AckActor::new(auth.user_id, auth.access_scope());
 
     let f = svc
-        .acknowledge_finding(finding_id, user_id, &body.reason)
+        .acknowledge_finding(finding_id, &actor, &body.reason, (&body).into())
         .await?;
 
     Ok(Json(FindingResponse::from(f)))
@@ -1907,10 +2174,12 @@ async fn acknowledge_finding(
     context_path = "/api/v1/security",
     tag = "security",
     params(
-        ("id" = Uuid, Path, description = "Finding ID")
+        ("id" = Uuid, Path, description = "Finding ID"),
+        RevokeAcknowledgementQuery,
     ),
     responses(
-        (status = 200, description = "Acknowledgment revoked", body = FindingResponse),
+        (status = 200, description = "The decisions covering this finding are revoked, with the copies promotion made of them that this credential has authority over. acknowledgements_left_effective counts the rest", body = FindingResponse),
+        (status = 409, description = "The finding's scan has copies in other repositories and repository_id was not given", body = crate::api::openapi::ErrorResponse),
         (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Finding not found", body = crate::api::openapi::ErrorResponse),
     ),
@@ -1920,6 +2189,7 @@ async fn revoke_acknowledgment(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(finding_id): Path<Uuid>,
+    Query(query): Query<RevokeAcknowledgementQuery>,
 ) -> Result<Json<FindingResponse>> {
     // Symmetric gate with acknowledge_finding (#1032): both write to the
     // same row. Allowing un-privileged un-acknowledge would let an attacker
@@ -1928,9 +2198,84 @@ async fn revoke_acknowledgment(
     auth.require_admin()?;
 
     let svc = ScanResultService::new(state.db.clone());
-    let f = svc.revoke_acknowledgment(finding_id).await?;
+    let actor = AckActor::new(auth.user_id, auth.access_scope());
+    let f = svc
+        .revoke_acknowledgment(finding_id, query.repository_id, &actor)
+        .await?;
 
     Ok(Json(FindingResponse::from(f)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/acknowledgements",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(ListAcknowledgementsQuery),
+    responses(
+        (status = 200, description = "Acknowledgement decisions, newest first", body = AcknowledgementListResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_acknowledgements(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ListAcknowledgementsQuery>,
+) -> Result<Json<AcknowledgementListResponse>> {
+    auth.require_unscoped_admin("the acknowledgement list")?;
+    // Every repository's decisions: for a caller who may act everywhere.
+    FindingAcknowledgementService::new(state.db.clone())
+        .authorize_every_repository(&AckActor::new(auth.user_id, auth.access_scope()))
+        .await?;
+    let page = i64::from(query.page.unwrap_or(1).max(1));
+    let per_page = i64::from(query.per_page.unwrap_or(50).clamp(1, 200));
+    let (rows, total) = FindingAcknowledgementService::new(state.db.clone())
+        .list(
+            AcknowledgementFilter {
+                repository_id: query.repository_id,
+                checksum_sha256: query.checksum_sha256.as_deref(),
+                advisory: query.advisory.as_deref(),
+                include_inactive: query.include_inactive,
+            },
+            (page - 1) * per_page,
+            per_page,
+        )
+        .await?;
+    Ok(Json(AcknowledgementListResponse {
+        items: rows.into_iter().map(Into::into).collect(),
+        total,
+    }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/acknowledgements/{id}",
+    context_path = "/api/v1/security",
+    tag = "security",
+    params(
+        ("id" = Uuid, Path, description = "Acknowledgement ID")
+    ),
+    responses(
+        (status = 200, description = "The decision is revoked, with the copies promotion made of it that this credential has authority over. left_effective counts the rest", body = RevokeResponse),
+        (status = 403, description = "Admin privileges required", body = crate::api::openapi::ErrorResponse),
+        (status = 404, description = "Acknowledgement not found", body = crate::api::openapi::ErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn revoke_acknowledgement_by_id(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RevokeResponse>> {
+    auth.require_admin()?;
+    let outcome = FindingAcknowledgementService::new(state.db.clone())
+        .revoke(id, &AckActor::new(auth.user_id, auth.access_scope()))
+        .await?;
+    Ok(Json(RevokeResponse {
+        revoked: outcome.revoked,
+        left_effective: outcome.left_effective,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3438,6 +3783,8 @@ async fn rescan_proxy_cached_path(
         ingest_external_findings,
         acknowledge_finding,
         revoke_acknowledgment,
+        list_acknowledgements,
+        revoke_acknowledgement_by_id,
         list_policies,
         create_policy,
         get_policy,
@@ -3456,6 +3803,7 @@ async fn rescan_proxy_cached_path(
         ProxyBlockedQuery,
         ProxyBlockedItem,
         ProxyBlockedResponse,
+        ProxyWouldBlockSummary,
         ScoreResponse,
         ScoreCoverageResponse,
         TriggerScanRequest,
@@ -3465,6 +3813,10 @@ async fn rescan_proxy_cached_path(
         FindingListResponse,
         FindingResponse,
         AcknowledgeRequest,
+        AcknowledgementScopeParam,
+        AcknowledgementResponse,
+        AcknowledgementListResponse,
+        RevokeResponse,
         ExternalFindingInput,
         IngestExternalFindingsRequest,
         IngestExternalFindingsResponse,
@@ -4863,6 +5215,815 @@ mod tests {
             ProxyScanServeOutcome::Serve(served) => served.header_value().to_string(),
             ProxyScanServeOutcome::Deny(resp) => resp.status().as_u16().to_string(),
         }
+    }
+
+    /// #5231: the verdict row for `digest`, polled for up to `within` while a
+    /// scan with no request waiting on it finishes.
+    async fn verdict_lands_5231(
+        pool: &PgPool,
+        digest: &str,
+        within: std::time::Duration,
+    ) -> Option<String> {
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone());
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let row = pss
+                .lookup_verdict(digest, crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
+                .await
+                .expect("read the verdict");
+            if let Some(row) = row {
+                return Some(row.verdict);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// #5231: a state whose scanner behaves as `rescan`, the fixture repository,
+    /// and bytes of their own, so the verdict row is this test's alone.
+    async fn scan_state_5231(
+        pool: &PgPool,
+        rescan: crate::services::scanner_service::test_helpers::MockCveRescan,
+        mutate: impl FnOnce(&mut crate::config::Config),
+    ) -> (
+        SharedState,
+        ProxyScanFixture,
+        bytes::Bytes,
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use crate::services::scanner_service::test_helpers::VersionedCveScanner;
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let content = bytes::Bytes::from(format!("npm tarball {}", Uuid::new_v4()));
+        let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+        let (scanner, scans) = VersionedCveScanner::counting(Some("grype-test"), rescan);
+        let state = scanner_state_with(
+            &fx,
+            vec![std::sync::Arc::new(scanner)],
+            "pkg/-/pkg-1.0.0.tgz",
+            content.clone(),
+            mutate,
+        )
+        .await;
+        (state, fx, content, digest, scans)
+    }
+
+    /// #5231: a scan that waits in the queue for longer than the budget, and
+    /// then runs quickly, serves. The budget used to be spent in the queue, so
+    /// this answered `423` with the scan never having started. Every scan
+    /// permit is held for 32 real seconds: no paused clock next to a database
+    /// pool (see `http_client.rs:884`).
+    #[tokio::test]
+    async fn a_scan_queued_past_the_budget_still_serves_under_fail_closed_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+
+        let permits = hold_all_scan_permits().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+            drop(permits);
+        });
+
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::FailClosed,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "clean", "time in the queue must not spend the budget");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(&[digest]).await;
+    }
+
+    /// #5231: a scan that runs over the budget is still refused, with no bytes
+    /// served, and is not killed: it records its verdict and the retry gets that
+    /// verdict, without scanning again.
+    #[tokio::test]
+    async fn an_over_budget_scan_is_refused_and_a_retry_finds_its_verdict_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            // Cataloged: a clean verdict that graded nothing is not reused
+            // under fail_closed, and this one has to be.
+            MockCveRescan::HangThen(
+                std::time::Duration::from_secs(32),
+                &MockCveRescan::Cataloged("pkg", "1.0.0"),
+            ),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        assert_eq!(pull().await, "423", "over budget stays refused");
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("clean"),
+            "the scan must finish after its request gave up"
+        );
+        assert_eq!(pull().await, "clean");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: the verdict a late scan lands is enforced. A file found vulnerable
+    /// after its first request gave up is `423` and then `403`, never served.
+    #[tokio::test]
+    async fn a_late_vulnerable_verdict_blocks_the_retry_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::HangThen(
+                std::time::Duration::from_secs(32),
+                &MockCveRescan::Vulnerable,
+            ),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        assert_eq!(pull().await, "423");
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("vulnerable"),
+        );
+        assert_eq!(pull().await, "403");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: under `record_only` the pull is answered at once and a scan queued
+    /// past the budget still records a verdict. It used to be dropped from the
+    /// queue, which left most of a first install with no verdict.
+    #[tokio::test]
+    async fn a_record_only_scan_queued_past_the_budget_records_a_verdict_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+
+        let permits = hold_all_scan_permits().await;
+        let started = std::time::Instant::now();
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::RecordOnly,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "pending");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "record_only must not hold the response for the scan"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        drop(permits);
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("clean"),
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: two requests for one file share one scan, which is what keeps
+    /// client retries from stacking scans of the same bytes.
+    #[tokio::test]
+    async fn concurrent_pulls_of_one_file_share_one_scan_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(2)),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        let (first, second) = tokio::join!(pull(), pull());
+        assert_eq!((first.as_str(), second.as_str()), ("clean", "clean"));
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231: the queue wait has a bound of its own (`AK_PROXY_SCAN_QUEUE_WAIT_SECS`).
+    /// Past it the request is refused, and the scan keeps its place in the queue
+    /// for the retry.
+    #[tokio::test]
+    async fn a_request_stops_waiting_for_the_queue_and_the_scan_keeps_its_place_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |config| {
+                config.proxy_scan_queue_wait_secs = 1;
+            })
+            .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+
+        let permits = hold_all_scan_permits().await;
+        let started = std::time::Instant::now();
+        assert_eq!(pull().await, "423");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the queue wait is bounded by its setting, took {:?}",
+            started.elapsed()
+        );
+        drop(permits);
+
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(15))
+                .await
+                .as_deref(),
+            Some("clean"),
+        );
+        assert_eq!(pull().await, "clean");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: a client that aborts leaves nothing queued for long. A
+    /// `fail_closed` scan nobody waits on leaves the queue after the grace
+    /// period, and never runs.
+    #[tokio::test]
+    async fn an_aborted_request_does_not_leave_its_scan_queued_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+        let permits = hold_all_scan_permits().await;
+
+        let aborted = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            ),
+        )
+        .await;
+        assert!(
+            aborted.is_err(),
+            "the request is still waiting when dropped"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        drop(permits);
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest, std::time::Duration::from_secs(3)).await,
+            None,
+            "the abandoned scan must have left the queue"
+        );
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: one repository filling its share of the table does not
+    /// refuse another repository's scans.
+    #[tokio::test]
+    async fn one_repository_cannot_exhaust_the_scan_table_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state_a, fx_a, _, _, _) = scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+        let (state_b, fx_b, content_b, digest_b, _) =
+            scan_state_5231(&pool, MockCveRescan::Clean, |_| {}).await;
+        let permits = hold_all_scan_permits().await;
+
+        let mut filler = Vec::new();
+        for n in 0..1100 {
+            let content = bytes::Bytes::from(format!("filler {n} {}", Uuid::new_v4()));
+            let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+            let served = gate_pull_3396(
+                &state_a,
+                &fx_a,
+                &format!("filler-{n}.tgz"),
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::RecordOnly,
+                ProxyScanIdentity::NotApplicable,
+            )
+            .await;
+            assert_eq!(served, "pending");
+            filler.push(digest);
+        }
+
+        let served = gate_pull_3396(
+            &state_b,
+            &fx_b,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest_b,
+            &content_b,
+            ProxyScanAction::RecordOnly,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(served, "pending");
+        drop(permits);
+        assert_eq!(
+            verdict_lands_5231(&pool, &digest_b, std::time::Duration::from_secs(60))
+                .await
+                .as_deref(),
+            Some("clean"),
+            "the other repository's scan must have got a place in the table"
+        );
+        fx_a.cleanup(&filler).await;
+        fx_b.cleanup(std::slice::from_ref(&digest_b)).await;
+    }
+
+    /// #5231 review: a request is answered inside three quarters of the router's
+    /// timeout however short it is, so the client gets the `423` and not the
+    /// router's undifferentiated 503.
+    #[tokio::test]
+    async fn a_short_request_timeout_still_gets_a_423_in_time_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(40)),
+            |config| config.global_request_timeout_secs = 20,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::FailClosed,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "423");
+        assert!(
+            started.elapsed() <= std::time::Duration::from_secs(16),
+            "took {:?}",
+            started.elapsed()
+        );
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: time the request already spent (the upstream fetch) counts.
+    /// The router's clock has been running since the request arrived.
+    #[tokio::test]
+    async fn the_wait_uses_what_is_left_of_the_request_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(10)),
+            |_| {},
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let answer_by = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let pull = REQUEST_ANSWER_BY
+            .scope(
+                answer_by,
+                gate_pull_3396(
+                    &state,
+                    &fx,
+                    "pkg-1.0.0.tgz",
+                    None,
+                    &digest,
+                    &content,
+                    ProxyScanAction::FailClosed,
+                    ProxyScanIdentity::NotApplicable,
+                ),
+            )
+            .await;
+        assert_eq!(pull, "423");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: requests for one file do not pile up behind its scan. Each
+    /// holds a router slot and a buffer of its own, so past the bound they are
+    /// answered `423` at once.
+    #[tokio::test]
+    async fn requests_joining_one_scan_are_bounded_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(3)),
+            |_| {},
+        )
+        .await;
+        let pulls = (0..20).map(|_| {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        });
+        let answers = futures::future::join_all(pulls).await;
+        let served = answers.iter().filter(|a| a.as_str() == "clean").count();
+        let refused = answers.iter().filter(|a| a.as_str() == "423").count();
+        assert_eq!((served, refused), (16, 4), "{answers:?}");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: a verdict recorded while a background scan ran is not
+    /// overwritten by it, so a clean scan cannot undo a vulnerable verdict. The
+    /// request refused meanwhile finds the newer verdict on its retry.
+    #[tokio::test]
+    async fn a_background_scan_does_not_overwrite_a_newer_verdict_5231() {
+        use crate::api::handlers::proxy_helpers::{ProxyScanIdentity, PROXY_SCAN_TYPE};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxyScanService};
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) = scan_state_5231(
+            &pool,
+            MockCveRescan::HangThen(
+                std::time::Duration::from_secs(3),
+                &MockCveRescan::Cataloged("pkg", "1.0.0"),
+            ),
+            |_| {},
+        )
+        .await;
+        let pull = || {
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+        let pss = ProxyScanService::new(pool.clone());
+        let newer = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            pss.record_verdict_with_catalog(
+                &digest,
+                PROXY_SCAN_TYPE,
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-test"),
+                Some(fx.repo_id),
+                Some(3),
+                None,
+            )
+            .await
+            .expect("record the newer verdict");
+        };
+        let (first, ()) = tokio::join!(pull(), newer);
+        assert_eq!(first, "423", "the scan's verdict was not recorded");
+        let row = pss
+            .lookup_verdict(&digest, PROXY_SCAN_TYPE)
+            .await
+            .expect("read")
+            .expect("a verdict");
+        assert_eq!(row.verdict, "vulnerable");
+        assert_eq!(pull().await, "403");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// Reports one version until its scan has run, then another: the vulnerability
+    /// database changing under a running scan (#5231 review).
+    struct VersionChangesDuringScan(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl crate::services::scanner_service::Scanner for VersionChangesDuringScan {
+        fn name(&self) -> &str {
+            "version-changes-during-scan"
+        }
+        fn scan_type(&self) -> &str {
+            "grype"
+        }
+        fn is_cve_authoritative(&self) -> bool {
+            true
+        }
+        async fn version(&self) -> Option<String> {
+            Some(if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                "grype-new".to_string()
+            } else {
+                "grype-old".to_string()
+            })
+        }
+        async fn scan(
+            &self,
+            _: &crate::models::artifact::Artifact,
+            _: Option<&crate::models::artifact::ArtifactMetadata>,
+            _: &bytes::Bytes,
+        ) -> crate::error::Result<crate::services::scanner_service::ScanOutput> {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::services::scanner_service::ScanOutput::default())
+        }
+    }
+
+    /// #5231 review: a verdict records the version the scan ran with, so a
+    /// database update during the scan makes the next pull scan again.
+    #[tokio::test]
+    async fn a_verdict_records_the_version_its_scan_ran_with_5231() {
+        use crate::api::handlers::proxy_helpers::{ProxyScanIdentity, PROXY_SCAN_TYPE};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxyScanService};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "npm").await;
+        let content = bytes::Bytes::from(format!("npm tarball {}", Uuid::new_v4()));
+        let digest = crate::api::handlers::proxy_helpers::sha256_hex(&content);
+        let state = scanner_state_with(
+            &fx,
+            vec![std::sync::Arc::new(VersionChangesDuringScan(
+                std::sync::atomic::AtomicBool::new(false),
+            ))],
+            "pkg/-/pkg-1.0.0.tgz",
+            content.clone(),
+            |_| {},
+        )
+        .await;
+        let pull = gate_pull_3396(
+            &state,
+            &fx,
+            "pkg-1.0.0.tgz",
+            None,
+            &digest,
+            &content,
+            ProxyScanAction::FailClosed,
+            ProxyScanIdentity::NotApplicable,
+        )
+        .await;
+        assert_eq!(pull, "clean");
+        let row = ProxyScanService::new(pool.clone())
+            .lookup_verdict(&digest, PROXY_SCAN_TYPE)
+            .await
+            .expect("read")
+            .expect("a verdict");
+        assert_eq!(row.scanner_version.as_deref(), Some("grype-old"));
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: a request is answered once the verdict is durable, and the
+    /// scan's permit is free by then, even if the CVE detail is slow to write.
+    #[tokio::test]
+    async fn a_slow_detail_write_holds_neither_the_answer_nor_the_permit_5231() {
+        use crate::api::handlers::proxy_helpers::{ProxyScanIdentity, PROXY_SCAN_TYPE};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{ProxyScanAction, ProxyScanService};
+        use crate::services::scanner_service::test_helpers::{
+            hold_all_scan_permits, MockCveRescan,
+        };
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, _) =
+            scan_state_5231(&pool, MockCveRescan::Vulnerable, |_| {}).await;
+
+        let mut blocker = pool.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE proxy_scan_findings IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("lock");
+
+        let pull = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            gate_pull_3396(
+                &state,
+                &fx,
+                "pkg-1.0.0.tgz",
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            ),
+        )
+        .await;
+        let permits =
+            tokio::time::timeout(std::time::Duration::from_secs(2), hold_all_scan_permits()).await;
+        blocker.rollback().await.expect("rollback");
+        assert_eq!(
+            pull.ok().as_deref(),
+            Some("403"),
+            "answered from the verdict"
+        );
+        assert!(permits.is_ok(), "the permit is released before the writes");
+        drop(permits);
+
+        let pss = ProxyScanService::new(pool.clone());
+        let mut findings = 0;
+        for _ in 0..50 {
+            findings = pss
+                .fetch_findings(&digest, PROXY_SCAN_TYPE, 50)
+                .await
+                .expect("read findings")
+                .len();
+            if findings > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(findings, 1, "the detail still lands");
+        fx.cleanup(std::slice::from_ref(&digest)).await;
+    }
+
+    /// #5231 review: one digest served under two names is two scans, so bytes
+    /// cannot join a scan that grades them as something else.
+    #[tokio::test]
+    async fn one_digest_under_two_file_names_is_two_scans_5231() {
+        use crate::api::handlers::proxy_helpers::ProxyScanIdentity;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::ProxyScanAction;
+        use crate::services::scanner_service::test_helpers::MockCveRescan;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (state, fx, content, digest, scans) = scan_state_5231(
+            &pool,
+            MockCveRescan::Hang(std::time::Duration::from_secs(2)),
+            |_| {},
+        )
+        .await;
+        let pull = |name: &'static str| {
+            gate_pull_3396(
+                &state,
+                &fx,
+                name,
+                None,
+                &digest,
+                &content,
+                ProxyScanAction::FailClosed,
+                ProxyScanIdentity::NotApplicable,
+            )
+        };
+        let _ = tokio::join!(pull("pkg-1.0.0.tgz"), pull("pkg-1.0.0.whl"));
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+        fx.cleanup(std::slice::from_ref(&digest)).await;
     }
 
     /// #3396: a fail_closed npm remote holds a `vulnerable` verdict for a
@@ -6530,6 +7691,7 @@ mod tests {
                     Query(ProxyBlockedQuery {
                         repository: Some(key),
                         min_severity: min,
+                        would_block: None,
                         page: None,
                         per_page: None,
                     }),
@@ -6573,6 +7735,531 @@ mod tests {
         assert!(matches!(non_admin, Err(AppError::Authorization(_))));
         assert!(dashboard.proxy_blocked >= 1);
         assert!(dashboard.policy_violations_blocked >= dashboard.proxy_blocked);
+    }
+
+    /// The items of a #5232 list as `(path, digest)`, sorted.
+    fn listed_5232(resp: &ProxyBlockedResponse, key: &str) -> Vec<(String, String)> {
+        let mut v: Vec<_> = resp
+            .items
+            .iter()
+            .filter(|i| i.repository_key == key)
+            .map(|i| (i.path.clone(), i.checksum_sha256.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// One cached path and, when `verdict` is set, the verdict of its digest:
+    /// `(verdict, max_severity, findings_count, components_cataloged, pin, age_days)`.
+    #[allow(clippy::type_complexity)]
+    async fn seed_file_5232(
+        pool: &PgPool,
+        repo_id: Uuid,
+        path: &str,
+        digest: &str,
+        verdict: Option<(&str, Option<&str>, i32, Option<i32>, Option<&str>, i32)>,
+    ) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+                                                size_bytes, checksum_sha256) \
+             VALUES ($1, $2, $3, 'm', 8, $4)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(format!("{repo_id}/{path}"))
+        .bind(digest)
+        .execute(pool)
+        .await
+        .expect("cache row");
+        let Some((verdict, severity, findings, cataloged, pin, age_days)) = verdict else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO proxy_scan_results (checksum_sha256, scan_type, verdict, findings_count, \
+                                             max_severity, components_cataloged, pin_identity, \
+                                             scanned_at) \
+             VALUES ($1, 'grype', $2, $3, $4, $5, $6, NOW() - make_interval(days => $7)) \
+             ON CONFLICT (checksum_sha256, scan_type) DO NOTHING",
+        )
+        .bind(digest)
+        .bind(verdict)
+        .bind(findings)
+        .bind(severity)
+        .bind(cataloged)
+        .bind(pin)
+        .bind(age_days)
+        .execute(pool)
+        .await
+        .expect("verdict");
+    }
+
+    /// What the real gate answers one pull of `digest` under the repository's
+    /// stored policy, read the way a Remote arm reads it.
+    async fn real_gate_5232(state: &SharedState, repo_id: Uuid, digest: &str) -> String {
+        use crate::api::handlers::proxy_helpers::{
+            gate_proxy_scan_serve, proxy_rescan_synthetic_artifact, remote_scan_policy,
+            ProxyScanIdentity, ProxyScanMode, ProxyScanServeOutcome,
+        };
+        let (action, gate) = remote_scan_policy(&state.db, repo_id)
+            .await
+            .map_err(|_| "unreadable policy")
+            .unwrap()
+            .expect("scan-on-proxy is on");
+        let bytes = bytes::Bytes::from_static(b"stub content");
+        let synthetic = proxy_rescan_synthetic_artifact(
+            repo_id,
+            "p/-/p-1.tgz",
+            digest,
+            bytes.len() as i64,
+            None,
+        );
+        match gate_proxy_scan_serve(
+            state,
+            repo_id,
+            "p-1.tgz",
+            digest,
+            synthetic,
+            &bytes,
+            action,
+            gate,
+            ProxyScanIdentity::NotApplicable,
+            ProxyScanMode::File,
+        )
+        .await
+        {
+            ProxyScanServeOutcome::Serve(served) => format!("serve:{served:?}"),
+            ProxyScanServeOutcome::Deny(resp) => format!("deny:{}", resp.status().as_u16()),
+        }
+    }
+
+    /// #5232: `would_block` previews enforcement. The list a `record_only`
+    /// repository shows is the list `proxy-blocked` shows once it enforces,
+    /// and every entry is what the real gate answers 403 to; no-verdict files
+    /// are never listed but are counted, and are what the gate answers 423 to
+    /// when it cannot scan. Existing `proxy_blocked` semantics do not move.
+    #[tokio::test]
+    async fn would_block_previews_what_the_gate_refuses_5232_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (a, a_key, a_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (b, b_key, b_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (helm, helm_key, helm_dir) = tdh::create_repo(&pool, "remote", "helm").await;
+        let (off, off_key, off_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (enf, enf_key, enf_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (mvn, mvn_key, mvn_dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        // (repository, scan_on_proxy, block_on_policy_violation, action)
+        for (repo, on, block, action) in [
+            (a, true, true, "record_only"),
+            // No threshold opted in: the gate refuses any finding, so a low
+            // verdict is in the preview although it is below "high".
+            (b, true, false, "record_only"),
+            // helm stores the settings, but its proxy path runs no gate.
+            (helm, true, true, "record_only"),
+            (off, false, true, "record_only"),
+            (enf, true, true, "fail_closed"),
+            (mvn, true, true, "record_only"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, \
+                                           scan_on_proxy, block_on_policy_violation, \
+                                           severity_threshold, proxy_scan_action) \
+                 VALUES ($1, true, false, $2, $3, 'high', $4)",
+            )
+            .bind(repo)
+            .bind(on)
+            .bind(block)
+            .bind(action)
+            .execute(&pool)
+            .await
+            .expect("scan config");
+        }
+        let d = |_: &str| format!("{:064x}", Uuid::new_v4().as_u128());
+        let (crit, high, med, ungraded, clean) = (d(""), d(""), d(""), d(""), d(""));
+        let (none, errored, stale, nothing, pinned) = (d(""), d(""), d(""), d(""), d(""));
+        let (packument, index, low, helm_d, off_d, enf_d) =
+            (d(""), d(""), d(""), d(""), d(""), d(""));
+        let (mvn_jar, mvn_index) = (d(""), d(""));
+        let vuln = |sev| Some(("vulnerable", sev, 1, Some(5), None, 0));
+        let f = |repo, path: &'static str, digest: String, v| (repo, path, digest, v);
+        let files = vec![
+            f(a, "crit/-/crit-1.tgz", crit.clone(), vuln(Some("critical"))),
+            f(a, "high/-/high-1.tgz", high.clone(), vuln(Some("high"))),
+            // The same digest at a second path: two items, one digest.
+            f(a, "high/-/high-copy.tgz", high.clone(), vuln(Some("high"))),
+            f(a, "med/-/med-1.tgz", med.clone(), vuln(Some("medium"))),
+            f(a, "ungraded/-/u-1.tgz", ungraded.clone(), vuln(None)),
+            f(
+                a,
+                "clean/-/c-1.tgz",
+                clean.clone(),
+                Some(("clean", None, 0, Some(5), None, 0)),
+            ),
+            f(a, "none/-/n-1.tgz", none.clone(), None),
+            f(
+                a,
+                "errored/-/e-1.tgz",
+                errored.clone(),
+                Some(("error", None, 0, None, None, 0)),
+            ),
+            f(
+                a,
+                "stale/-/s-1.tgz",
+                stale.clone(),
+                Some(("vulnerable", Some("critical"), 1, Some(5), None, 40)),
+            ),
+            f(
+                a,
+                "nothing/-/n-1.tgz",
+                nothing.clone(),
+                Some(("clean", None, 0, Some(0), None, 0)),
+            ),
+            f(
+                a,
+                "pinned/-/p-1.tgz",
+                pinned.clone(),
+                Some(("clean", None, 0, Some(0), Some("npm|p|1"), 0)),
+            ),
+            // Cached metadata the gate never grades is not "no verdict".
+            f(a, "packument", packument.clone(), None),
+            f(a, "x/-/index.v1+json", index.clone(), None),
+            f(b, "low/-/low-1.tgz", low.clone(), vuln(Some("low"))),
+            f(helm, "h/-/h-1.tgz", helm_d.clone(), vuln(Some("critical"))),
+            f(off, "o/-/o-1.tgz", off_d.clone(), vuln(Some("critical"))),
+            f(enf, "e/-/e-1.tgz", enf_d.clone(), vuln(Some("critical"))),
+            // Only the npm family keeps its packages under `/-/`.
+            f(mvn, "org/x/1/x-1.jar", mvn_jar.clone(), None),
+            f(mvn, "org/x/index.v1+json", mvn_index.clone(), None),
+        ];
+        for (repo, path, digest, verdict) in &files {
+            seed_file_5232(&pool, *repo, path, digest, *verdict).await;
+        }
+        let state = tdh::build_state(pool.clone(), a_dir.to_string_lossy().as_ref());
+        let admin = tdh::admin_auth(user_id, &username);
+        let list =
+            |auth: AuthExtension, repo: Option<String>, wb: Option<bool>, min: Option<&str>| {
+                let state = state.clone();
+                let min = min.map(str::to_string);
+                async move {
+                    list_proxy_blocked(
+                        State(state),
+                        Extension(auth),
+                        Query(ProxyBlockedQuery {
+                            repository: repo,
+                            min_severity: min,
+                            would_block: wb,
+                            page: None,
+                            per_page: Some(200),
+                        }),
+                    )
+                    .await
+                    .map(|j| j.0)
+                }
+            };
+        let some = |k: &String| Some(k.clone());
+
+        // Under record_only: today's view and the preview.
+        let today_a = list(admin.clone(), some(&a_key), None, None)
+            .await
+            .expect("today");
+        let today_false = list(admin.clone(), some(&a_key), Some(false), None)
+            .await
+            .expect("off");
+        let preview_a = list(admin.clone(), some(&a_key), Some(true), None)
+            .await
+            .expect("preview");
+        let preview_b = list(admin.clone(), some(&b_key), Some(true), None)
+            .await
+            .expect("b");
+        let preview_helm = list(admin.clone(), some(&helm_key), Some(true), None)
+            .await
+            .expect("helm");
+        let preview_off = list(admin.clone(), some(&off_key), Some(true), None)
+            .await
+            .expect("off");
+        let preview_enf = list(admin.clone(), some(&enf_key), Some(true), None)
+            .await
+            .expect("enf");
+        let today_enf = list(admin.clone(), some(&enf_key), None, None)
+            .await
+            .expect("enf today");
+        let preview_mvn = list(admin.clone(), some(&mvn_key), Some(true), None)
+            .await
+            .expect("mvn");
+        let crit_only = list(admin.clone(), some(&a_key), Some(true), Some("critical"))
+            .await
+            .expect("min");
+        let unknown = list(
+            admin.clone(),
+            Some("no-such-repo-5232".into()),
+            Some(true),
+            None,
+        )
+        .await
+        .expect("unknown");
+        let across = list(admin.clone(), None, Some(true), None)
+            .await
+            .expect("across");
+        let non_admin = list(
+            tdh::make_auth(user_id, &username),
+            some(&a_key),
+            Some(true),
+            None,
+        )
+        .await;
+        let mut scoped_admin = tdh::admin_auth(user_id, &username);
+        scoped_admin.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![a]);
+        let scoped = list(scoped_admin, some(&a_key), Some(true), None).await;
+        let dashboard = get_dashboard(State(state.clone()), Extension(admin.clone()))
+            .await
+            .expect("dashboard")
+            .0;
+        let default_json = serde_json::to_value(&today_enf).expect("json");
+        let preview_json = serde_json::to_value(&preview_enf).expect("json");
+        let served_crit = real_gate_5232(&state, a, &crit).await;
+        // A digest of its own: serving it pending queues a scan that records
+        // a verdict, and `none` has to reach the flip with no verdict.
+        let pending_probe = d("");
+        let served_none = real_gate_5232(&state, a, &pending_probe).await;
+
+        // Flip to enforcement: what the preview said is what is now refused.
+        sqlx::query("UPDATE scan_configs SET proxy_scan_action = 'fail_closed' WHERE repository_id = ANY($1)")
+            .bind([a, b].as_slice())
+            .execute(&pool)
+            .await
+            .expect("flip");
+        let enforced_a = list(admin.clone(), some(&a_key), None, None)
+            .await
+            .expect("enforced a");
+        let enforced_b = list(admin.clone(), some(&b_key), None, None)
+            .await
+            .expect("enforced b");
+        let preview_after = list(admin.clone(), some(&a_key), Some(true), None)
+            .await
+            .expect("after");
+        let mut gate_a = std::collections::HashMap::new();
+        for digest in [
+            &crit, &high, &ungraded, &med, &none, &errored, &stale, &nothing,
+        ] {
+            gate_a.insert(digest.clone(), real_gate_5232(&state, a, digest).await);
+        }
+        let gate_low = real_gate_5232(&state, b, &low).await;
+
+        for digest in files.iter().map(|f| &f.2).chain([&pending_probe]) {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&pool)
+                .await;
+        }
+        for (repo, dir) in [
+            (b, &b_dir),
+            (helm, &helm_dir),
+            (off, &off_dir),
+            (enf, &enf_dir),
+            (mvn, &mvn_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, repo, dir).await;
+        }
+        tdh::cleanup(&pool, a, user_id).await;
+        let _ = std::fs::remove_dir_all(&a_dir);
+
+        // proxy_blocked keeps its meaning: record-only refuses nothing, and
+        // an explicit `would_block=false` is the default.
+        assert!(
+            today_a.items.is_empty(),
+            "record-only refuses nothing today"
+        );
+        assert!(today_a.would_block_summary.is_none());
+        assert!(today_false.items.is_empty());
+        assert!(today_false.would_block_summary.is_none());
+        // The default response is byte-compatible: the new keys are absent.
+        assert!(default_json.get("would_block_summary").is_none());
+        assert!(default_json["items"][0].get("proxy_scan_action").is_none());
+        assert_eq!(preview_json["items"][0]["proxy_scan_action"], "fail_closed");
+
+        // The preview applies the gate, not the action.
+        let want_a = {
+            let mut v = vec![
+                ("crit/-/crit-1.tgz".to_string(), crit.clone()),
+                ("high/-/high-1.tgz".to_string(), high.clone()),
+                ("high/-/high-copy.tgz".to_string(), high.clone()),
+                ("ungraded/-/u-1.tgz".to_string(), ungraded.clone()),
+            ];
+            v.sort();
+            v
+        };
+        assert_eq!(listed_5232(&preview_a, &a_key), want_a);
+        assert_eq!(preview_a.pagination.total, 4, "items are paths");
+        assert!(preview_a
+            .items
+            .iter()
+            .all(|i| i.proxy_scan_action.as_deref() == Some("record_only")));
+        assert_eq!(
+            preview_a.would_block_summary,
+            Some(ProxyWouldBlockSummary {
+                would_block_digests: 3,
+                no_verdict: 2,
+                stale_verdict: 1,
+                clean_graded_nothing: 1,
+            }),
+            "no-verdict files are counted apart and never listed"
+        );
+        assert_eq!(
+            listed_5232(&preview_b, &b_key),
+            vec![("low/-/low-1.tgz".to_string(), low.clone())],
+            "no threshold opted in: any finding would be refused"
+        );
+        assert!(preview_helm.items.is_empty(), "helm runs no gate");
+        assert_eq!(
+            preview_helm.would_block_summary,
+            Some(ProxyWouldBlockSummary::default())
+        );
+        assert!(
+            preview_off.items.is_empty(),
+            "scanning off has no gate to preview"
+        );
+        assert_eq!(
+            preview_off.would_block_summary,
+            Some(ProxyWouldBlockSummary::default())
+        );
+        assert_eq!(
+            preview_mvn.would_block_summary.as_ref().unwrap().no_verdict,
+            1
+        );
+        // An enforcing repository is in both views, the same way.
+        assert_eq!(
+            listed_5232(&preview_enf, &enf_key),
+            listed_5232(&today_enf, &enf_key)
+        );
+        assert_eq!(listed_5232(&today_enf, &enf_key).len(), 1);
+        // Filters and scoping apply to the preview as to the list.
+        let crit_paths: Vec<_> = crit_only.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(crit_paths, vec!["crit/-/crit-1.tgz", "ungraded/-/u-1.tgz"]);
+        assert_eq!(
+            crit_only
+                .would_block_summary
+                .as_ref()
+                .unwrap()
+                .would_block_digests,
+            2
+        );
+        assert!(unknown.items.is_empty());
+        assert_eq!(
+            unknown.would_block_summary,
+            Some(ProxyWouldBlockSummary::default())
+        );
+        assert_eq!(listed_5232(&across, &a_key), want_a);
+        assert_eq!(listed_5232(&across, &b_key).len(), 1);
+        assert_eq!(listed_5232(&across, &enf_key).len(), 1);
+        assert!(matches!(non_admin, Err(AppError::Authorization(_))));
+        assert!(matches!(scoped, Err(AppError::Authorization(_))));
+        // crit, high, ungraded and low are recorded, not refused.
+        assert!(dashboard.proxy_would_block >= dashboard.proxy_blocked + 4);
+
+        // Record-only serves them.
+        assert_eq!(served_crit, "serve:Recorded");
+        assert_eq!(served_none, "serve:Pending");
+
+        // Preview and enforcement agree: the list, then the gate itself.
+        assert_eq!(listed_5232(&enforced_a, &a_key), want_a);
+        assert_eq!(listed_5232(&preview_after, &a_key), want_a);
+        assert_eq!(
+            listed_5232(&enforced_b, &b_key),
+            vec![("low/-/low-1.tgz".to_string(), low.clone())]
+        );
+        for digest in [&crit, &high, &ungraded] {
+            assert_eq!(gate_a[digest], "deny:403", "a listed digest is refused");
+        }
+        assert_eq!(gate_low, "deny:403");
+        assert_eq!(
+            gate_a[&med], "serve:Clean",
+            "below the threshold: not listed, served"
+        );
+        // Counted apart: no scanner here, so the inline scan is inconclusive.
+        for digest in [&none, &stale, &nothing] {
+            assert_eq!(
+                gate_a[digest], "deny:423",
+                "no usable verdict is scanned inline"
+            );
+        }
+    }
+
+    /// #5232: `clean_graded_nothing` is counted in SQL over the whole catalog;
+    /// it must hold for exactly the rows the gate's own
+    /// `clean_verdict_graded_nothing` declines to reuse.
+    #[tokio::test]
+    async fn clean_graded_nothing_count_agrees_with_the_gate_5232_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{clean_verdict_graded_nothing, ProxyScanRow};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        sqlx::query(
+            "INSERT INTO scan_configs (repository_id, scan_enabled, scan_on_upload, scan_on_proxy, \
+                                       block_on_policy_violation, severity_threshold, \
+                                       proxy_scan_action) \
+             VALUES ($1, true, false, true, true, 'high', 'record_only')",
+        )
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .expect("scan config");
+        let mut digests = Vec::new();
+        let mut want = 0;
+        for verdict in ["clean", "vulnerable"] {
+            for findings in [0, 1] {
+                for cataloged in [None, Some(0), Some(5)] {
+                    for pin in [None, Some("npm|p|1")] {
+                        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+                        seed_file_5232(
+                            &pool,
+                            repo,
+                            &format!("p{}/-/p.tgz", digests.len()),
+                            &digest,
+                            Some((verdict, None, findings, cataloged, pin, 0)),
+                        )
+                        .await;
+                        let row = ProxyScanRow {
+                            checksum_sha256: digest.clone(),
+                            scan_type: "grype".to_string(),
+                            verdict: verdict.to_string(),
+                            findings_count: findings,
+                            critical_count: 0,
+                            high_count: 0,
+                            medium_count: 0,
+                            low_count: 0,
+                            max_severity: None,
+                            scanner_version: None,
+                            scanned_at: chrono::Utc::now(),
+                        };
+                        if clean_verdict_graded_nothing(&row, pin, cataloged) {
+                            want += 1;
+                        }
+                        digests.push(digest);
+                    }
+                }
+            }
+        }
+        let counts = ScanResultService::new(pool.clone())
+            .count_proxy_no_verdict(Some(&key))
+            .await
+            .expect("counts");
+        for digest in &digests {
+            let _ = sqlx::query("DELETE FROM proxy_scan_results WHERE checksum_sha256 = $1")
+                .bind(digest)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_member_repo(&pool, repo, &dir).await;
+
+        assert!(want > 0);
+        assert_eq!(counts.clean_graded_nothing, want);
+        assert_eq!(counts.no_verdict, 0);
+        assert_eq!(counts.stale_verdict, 0);
     }
 
     /// #4363: an instance administrator's write locks the repository's proxy
@@ -7177,6 +8864,9 @@ mod tests {
             acknowledged_by: None,
             acknowledged_reason: None,
             acknowledged_at: None,
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: chrono::Utc::now(),
             finding_class: "malicious".to_string(),
         };
@@ -7565,6 +9255,7 @@ mod tests {
             high_findings: 15,
             policy_violations_blocked: 3,
             proxy_blocked: 0,
+            proxy_would_block: 0,
             repos_grade_a: 6,
             repos_grade_f: 1,
             repos_rated: 0,
@@ -7591,6 +9282,7 @@ mod tests {
             high_findings: 0,
             policy_violations_blocked: 0,
             proxy_blocked: 0,
+            proxy_would_block: 0,
             repos_grade_a: 0,
             repos_grade_f: 0,
             repos_rated: 0,
@@ -8156,6 +9848,589 @@ mod tests {
         assert_eq!(req.reason, "False positive");
     }
 
+    /// #5153: the HTTP surface of a decision, end to end against the database.
+    #[tokio::test]
+    async fn test_acknowledgement_endpoints_5153() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = Uuid::new_v4();
+        let path = format!("ack-5153/{artifact_id}");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .bind(&path)
+        .bind(format!("{:064x}", artifact_id.as_u128()))
+        .execute(&fx.pool)
+        .await
+        .expect("artifact");
+        let scan_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("scan");
+        let finding_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                        affected_component, affected_version) \
+             VALUES ($1, $2, 'high', 't', 'CVE-2031-5153', 'lodash', '4') RETURNING id",
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("finding");
+
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, fx.user_id).await;
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id) \
+             SELECT $1, r.id FROM roles r WHERE r.name = 'admin'",
+        )
+        .bind(fx.user_id)
+        .execute(&fx.pool)
+        .await
+        .expect("global admin role");
+        let mut admin = tdh::make_auth(fx.user_id, &fx.username);
+        admin.is_admin = true;
+        let plain = tdh::make_auth(fx.user_id, &fx.username);
+        let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
+        let body = || AcknowledgeRequest {
+            reason: "accepted".to_string(),
+            expires_at: Some(expires_at),
+            scope: AcknowledgementScopeParam::Repository,
+            repository_id: None,
+        };
+
+        assert!(matches!(
+            acknowledge_finding(
+                State(fx.state.clone()),
+                Extension(plain.clone()),
+                Path(finding_id),
+                Json(body()),
+            )
+            .await,
+            Err(AppError::Authorization(_))
+        ));
+
+        let Json(acked) = acknowledge_finding(
+            State(fx.state.clone()),
+            Extension(admin.clone()),
+            Path(finding_id),
+            Json(body()),
+        )
+        .await
+        .expect("acknowledge");
+        assert!(acked.is_acknowledged);
+        assert_eq!(acked.acknowledged_reason.as_deref(), Some("accepted"));
+        assert!(acked.acknowledgement_expires_at.is_some());
+        let decision = acked.acknowledgement_id.expect("decision id");
+
+        let query = || ListAcknowledgementsQuery {
+            repository_id: Some(fx.repo_id),
+            checksum_sha256: None,
+            advisory: Some("cve-2031-5153".to_string()),
+            include_inactive: true,
+            page: None,
+            per_page: None,
+        };
+        let mut scoped = admin.clone();
+        scoped.allowed_repo_ids =
+            crate::models::access_scope::AccessScope::Restricted(vec![Uuid::new_v4()]);
+        assert!(matches!(
+            acknowledge_finding(
+                State(fx.state.clone()),
+                Extension(scoped.clone()),
+                Path(finding_id),
+                Json(AcknowledgeRequest {
+                    scope: AcknowledgementScopeParam::AllRepositories,
+                    ..body()
+                }),
+            )
+            .await,
+            Err(AppError::NotFound(_))
+        ));
+        assert!(matches!(
+            revoke_acknowledgement_by_id(
+                State(fx.state.clone()),
+                Extension(scoped),
+                Path(decision),
+            )
+            .await,
+            Err(AppError::Authorization(_))
+        ));
+
+        assert!(matches!(
+            list_acknowledgements(
+                State(fx.state.clone()),
+                Extension(plain.clone()),
+                Query(query()),
+            )
+            .await,
+            Err(AppError::Authorization(_))
+        ));
+        let Json(listed) = list_acknowledgements(
+            State(fx.state.clone()),
+            Extension(admin.clone()),
+            Query(query()),
+        )
+        .await
+        .expect("list");
+        assert_eq!(listed.total, 1);
+        assert_eq!(listed.items[0].id, decision);
+        assert_eq!(listed.items[0].max_severity, "high");
+        assert_eq!(listed.items[0].state, "active");
+
+        let status = revoke_acknowledgement_by_id(
+            State(fx.state.clone()),
+            Extension(admin.clone()),
+            Path(decision),
+        )
+        .await
+        .expect("revoke");
+        assert_eq!(status.0.revoked, 1);
+        assert_eq!(status.0.left_effective, 0);
+        let Json(listed) = list_acknowledgements(
+            State(fx.state.clone()),
+            Extension(admin.clone()),
+            Query(query()),
+        )
+        .await
+        .expect("list after revoke");
+        assert_eq!(listed.items[0].state, "revoked");
+
+        // The finding route answers for the same decision. A second revoke is a no-op.
+        let Json(row) = revoke_acknowledgment(
+            State(fx.state.clone()),
+            Extension(admin.clone()),
+            Path(finding_id),
+            Query(RevokeAcknowledgementQuery::default()),
+        )
+        .await
+        .expect("idempotent revoke");
+        assert!(!row.is_acknowledged);
+        fx.teardown().await;
+    }
+
+    /// One request through the real router, as `auth`. Status and JSON body.
+    async fn security_call(
+        state: &SharedState,
+        auth: &AuthExtension,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let app = crate::api::handlers::test_db_helpers::router_with_auth_ext(
+            router(),
+            state.clone(),
+            auth.clone(),
+        );
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let (status, bytes) = crate::api::handlers::test_db_helpers::send(app, request).await;
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// #5153: the scan listing reports a copy under its source's id, so a caller
+    /// looking at `dev` is shown `prod`'s rows. Acting on one must not decide for
+    /// `prod`, open its gate and release its hold while `dev` stays blocked.
+    #[tokio::test]
+    async fn test_acknowledging_through_a_copys_view_decides_for_the_viewed_repository_5153() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+        use axum::http::StatusCode;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let (reader_id, reader_name) = tdh::create_user(&pool).await;
+        let (prod, _, prod_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (dev, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), prod_dir.to_str().unwrap());
+        let svc = ScanResultService::new(pool.clone());
+        let digest = format!("{:064x}", Uuid::new_v4().as_u128());
+        let mut artifacts = Vec::new();
+        for repo in [prod, dev] {
+            sqlx::query(
+                "UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1",
+            )
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("private");
+            sqlx::query(
+                "INSERT INTO scan_policies (name, repository_id, max_severity, is_enabled) \
+                 VALUES ($1, $2, 'high', true)",
+            )
+            .bind(format!("view-{repo}"))
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .expect("policy");
+            tdh::grant_repo_access(&pool, repo, admin_id).await;
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                        content_type, storage_key) \
+                 VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+            )
+            .bind(id)
+            .bind(repo)
+            .bind(format!("view/{id}"))
+            .bind(&digest)
+            .execute(&pool)
+            .await
+            .expect("artifact");
+            artifacts.push(id);
+        }
+        let (prod_artifact, dev_artifact) = (artifacts[0], artifacts[1]);
+        tdh::grant_repo_role(&pool, dev, reader_id, "reader").await;
+
+        let source = svc
+            .create_scan_result_with_checksum(prod_artifact, prod, "dependency", Some(&digest))
+            .await
+            .expect("scan");
+        let raw = crate::models::security::RawFinding {
+            severity: crate::models::security::Severity::High,
+            title: "t".to_string(),
+            description: None,
+            cve_id: Some("CVE-2031-5153".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4".to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        };
+        svc.create_findings(source.id, prod_artifact, &[raw])
+            .await
+            .expect("findings");
+        svc.complete_scan(
+            source.id,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            Some("t"),
+            chrono::Utc::now(),
+            "complete",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("complete");
+        svc.copy_scan_results(source.id, dev_artifact, dev, "dependency", &digest, None)
+            .await
+            .expect("copy");
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_source = 'scan_policy' \
+             WHERE id = $1",
+        )
+        .bind(prod_artifact)
+        .execute(&pool)
+        .await
+        .expect("hold");
+
+        let allowed = |artifact: Uuid, repo: Uuid| {
+            let pool = pool.clone();
+            async move {
+                PolicyService::new(pool)
+                    .evaluate_artifact(artifact, repo)
+                    .await
+                    .expect("evaluate")
+                    .allowed
+            }
+        };
+        let mut admin = tdh::make_auth(admin_id, &admin_name);
+        admin.is_admin = true;
+        let reader = tdh::make_auth(reader_id, &reader_name);
+        let scan_findings = format!("/scans/{}/findings", source.id);
+
+        // A viewer who can see only the copy gets the copy, under the id the
+        // listing gave them.
+        let (status, body) = security_call(
+            &state,
+            &reader,
+            "GET",
+            &format!("/scans/{}", source.id),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["artifact_id"], dev_artifact.to_string());
+        let (status, body) = security_call(&state, &reader, "GET", &scan_findings, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"][0]["artifact_id"], dev_artifact.to_string());
+
+        // An administrator who sees both can ask for the copy's rows.
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "GET",
+            &format!("{scan_findings}?artifact_id={dev_artifact}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"][0]["artifact_id"], dev_artifact.to_string());
+        let dev_finding: Uuid =
+            serde_json::from_value(body["items"][0]["id"].clone()).expect("copy's finding");
+
+        // The source's row is ambiguous without saying where the caller is.
+        let (_, body) = security_call(&state, &admin, "GET", &scan_findings, None).await;
+        assert_eq!(body["items"][0]["artifact_id"], prod_artifact.to_string());
+        let prod_finding: Uuid =
+            serde_json::from_value(body["items"][0]["id"].clone()).expect("source's finding");
+        let acknowledge = format!("/findings/{prod_finding}/acknowledge");
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "POST",
+            &acknowledge,
+            Some(serde_json::json!({ "reason": "accepted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(!allowed(prod_artifact, prod).await);
+
+        // Naming the repository decides for that one, and only that one.
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "POST",
+            &acknowledge,
+            Some(serde_json::json!({ "reason": "accepted", "repository_id": dev })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["is_acknowledged"], true,
+            "the answer is the state of the repository that was decided"
+        );
+        assert!(allowed(dev_artifact, dev).await, "dev is what was decided");
+        assert!(!allowed(prod_artifact, prod).await, "prod was not");
+        let (hold,): (Option<String>,) =
+            sqlx::query_as("SELECT quarantine_status FROM artifacts WHERE id = $1")
+                .bind(prod_artifact)
+                .fetch_one(&pool)
+                .await
+                .expect("hold");
+        assert_eq!(hold.as_deref(), Some("quarantined"), "prod's hold stands");
+
+        // The row's id says nothing about which repository is meant.
+        let (status, body) = security_call(&state, &admin, "DELETE", &acknowledge, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(allowed(dev_artifact, dev).await, "nothing was revoked");
+
+        let (status, body) = security_call(
+            &state,
+            &admin,
+            "DELETE",
+            &format!("{acknowledge}?repository_id={dev}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!allowed(dev_artifact, dev).await);
+
+        // A credential scoped to the copy acts on the copy's row, and cannot
+        // reach the source's.
+        let mut scoped = admin.clone();
+        scoped.allowed_repo_ids = AccessScope::Restricted(vec![dev]);
+        let (status, _) = security_call(
+            &state,
+            &scoped,
+            "POST",
+            &acknowledge,
+            Some(serde_json::json!({ "reason": "out of scope" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = security_call(
+            &state,
+            &scoped,
+            "POST",
+            &format!("/findings/{dev_finding}/acknowledge"),
+            Some(serde_json::json!({ "reason": "accepted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(allowed(dev_artifact, dev).await);
+        assert!(!allowed(prod_artifact, prod).await);
+
+        for repo in [prod, dev] {
+            tdh::cleanup_member_repo(&pool, repo, &std::env::temp_dir().join("none")).await;
+        }
+    }
+
+    /// #5250: the built-in admin holds roles on the repositories it created and no
+    /// instance-wide role. That does not narrow what it may do here, a credential
+    /// restricted to some repositories stays there, and a non-admin stays refused.
+    #[tokio::test]
+    async fn test_an_admin_holding_repository_roles_over_http_5250() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::access_scope::AccessScope;
+        use axum::http::StatusCode;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let pool = fx.pool.clone();
+        let (created, _, _) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_role(&pool, created, fx.user_id, "developer").await;
+        sqlx::query(
+            "UPDATE repositories SET visibility = 'private', is_public = false WHERE id = $1",
+        )
+        .bind(fx.repo_id)
+        .execute(&pool)
+        .await
+        .expect("private");
+        let artifact = Uuid::new_v4();
+        let path = format!("r5250/{artifact}");
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, 'a', $3, 1, $4, 'application/octet-stream', $3)",
+        )
+        .bind(artifact)
+        .bind(fx.repo_id)
+        .bind(&path)
+        .bind(format!("{:064x}", artifact.as_u128()))
+        .execute(&pool)
+        .await
+        .expect("artifact");
+        let scan: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+             VALUES ($1, $2, 'dependency', 'completed', NOW()) RETURNING id",
+        )
+        .bind(artifact)
+        .bind(fx.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("scan");
+        let finding: Uuid = sqlx::query_scalar(
+            "INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title, cve_id, \
+                                        affected_component, affected_version) \
+             VALUES ($1, $2, 'high', 't', 'CVE-2031-5250', 'lodash', '4') RETURNING id",
+        )
+        .bind(scan)
+        .bind(artifact)
+        .fetch_one(&pool)
+        .await
+        .expect("finding");
+
+        let mut admin = tdh::make_auth(fx.user_id, &fx.username);
+        admin.is_admin = true;
+        let mut restricted = admin.clone();
+        restricted.allowed_repo_ids = AccessScope::Restricted(vec![created]);
+        let plain = tdh::make_auth(fx.user_id, &fx.username);
+        let acknowledge = format!("/findings/{finding}/acknowledge");
+        let every = serde_json::json!({ "reason": "accepted", "scope": "all_repositories" });
+
+        let (status, body) =
+            security_call(&fx.state, &admin, "GET", "/acknowledgements", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for refused in [&restricted, &plain] {
+            let (status, _) =
+                security_call(&fx.state, refused, "GET", "/acknowledgements", None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        // Not in a repository this user created, and for every repository.
+        let (status, _) =
+            security_call(&fx.state, &plain, "POST", &acknowledge, Some(every.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = security_call(
+            &fx.state,
+            &restricted,
+            "POST",
+            &acknowledge,
+            Some(every.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) =
+            security_call(&fx.state, &admin, "POST", &acknowledge, Some(every)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let decision = body["acknowledgement_id"]
+            .as_str()
+            .expect("decision")
+            .to_string();
+
+        let by_id = format!("/acknowledgements/{decision}");
+        for refused in [&restricted, &plain] {
+            let (status, _) = security_call(&fx.state, refused, "DELETE", &by_id, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        let (status, body) = security_call(&fx.state, &admin, "DELETE", &by_id, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revoked"], 1);
+        assert_eq!(body["left_effective"], 0);
+
+        tdh::cleanup_member_repo(&pool, created, &std::env::temp_dir().join("none")).await;
+        fx.teardown().await;
+    }
+
+    #[test]
+    fn test_acknowledge_request_defaults_to_the_narrow_scope_with_no_expiry() {
+        let req: AcknowledgeRequest =
+            serde_json::from_value(serde_json::json!({ "reason": "r" })).unwrap();
+        let options = AcknowledgeOptions::from(&req);
+        assert_eq!(options.scope, AcknowledgementScope::Repository);
+        assert!(options.expires_at.is_none());
+    }
+
+    #[test]
+    fn test_acknowledge_request_widening_is_explicit_and_unknown_scopes_are_refused() {
+        let req: AcknowledgeRequest = serde_json::from_value(serde_json::json!({
+            "reason": "r",
+            "scope": "all_repositories",
+            "expires_at": "2031-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        let options = AcknowledgeOptions::from(&req);
+        assert_eq!(options.scope, AcknowledgementScope::AllRepositories);
+        assert!(options.expires_at.is_some());
+        assert!(
+            serde_json::from_value::<AcknowledgeRequest>(serde_json::json!({
+                "reason": "r",
+                "scope": "everywhere",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_severity_for_rank_inverts_finding_severity_rank() {
+        for (rank, name) in [
+            (4, "critical"),
+            (3, "high"),
+            (2, "medium"),
+            (1, "low"),
+            (0, "info"),
+        ] {
+            assert_eq!(severity_for_rank(rank), name);
+        }
+    }
+
     #[test]
     fn test_acknowledge_request_long_reason() {
         let reason = "This CVE does not apply to our usage because we never pass user input to the affected function. Verified by security team on 2024-03-15.";
@@ -8362,6 +10637,7 @@ mod tests {
             high_findings: 3,
             policy_violations_blocked: 0,
             proxy_blocked: 0,
+            proxy_would_block: 0,
             repos_grade_a: 4,
             repos_grade_f: 0,
             repos_rated: 0,
@@ -8525,6 +10801,9 @@ mod tests {
             acknowledged_by: None,
             acknowledged_reason: None,
             acknowledged_at: None,
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: now,
             finding_class: "vulnerability".to_string(),
         };
@@ -8557,6 +10836,9 @@ mod tests {
             acknowledged_by: Some(user_id),
             acknowledged_reason: Some("False positive".to_string()),
             acknowledged_at: Some(now),
+            acknowledgement_id: None,
+            acknowledgement_expires_at: None,
+            acknowledgements_left_effective: None,
             created_at: now,
             finding_class: "vulnerability".to_string(),
         };

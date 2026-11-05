@@ -1138,6 +1138,9 @@ pub struct Config {
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+    /// How long a request waits for its proxy file scan to get a permit (#5231).
+    /// Env var: `AK_PROXY_SCAN_QUEUE_WAIT_SECS`. Default 60, least 1.
+    pub proxy_scan_queue_wait_secs: u64,
 
     /// How long, in seconds, an HTTP/1 connection may take to deliver a
     /// complete request head (request line plus headers) on the API and
@@ -1605,6 +1608,12 @@ pub struct Config {
     /// Endpoint of the npm replication feed. Env `NPM_UPSTREAM_FEED_URL`,
     /// default `https://replicate.npmjs.com/_changes`.
     pub npm_upstream_feed_url: String,
+
+    /// Pause every scheduled job that contacts an upstream on its own
+    /// (#5288; see `services::upstream_pause`). Env `UPSTREAM_JOBS_PAUSED`,
+    /// default `false`. `true` pins the switch on; otherwise the
+    /// `upstream_jobs_paused` runtime setting decides.
+    pub upstream_jobs_paused: bool,
 }
 
 redacted_debug!(Config {
@@ -1693,6 +1702,7 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show proxy_scan_queue_wait_secs,
     show http_header_read_timeout_secs,
     show http_listen_backlog,
     show upload_progress_window_secs,
@@ -1757,6 +1767,7 @@ redacted_debug!(Config {
     show npm_attestation_negative_cache_ttl_secs,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
+    show upstream_jobs_paused,
 });
 
 impl Default for Config {
@@ -1853,6 +1864,7 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            proxy_scan_queue_wait_secs: 60,
             http_header_read_timeout_secs: DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
             http_listen_backlog: 0,
             upload_progress_window_secs: 60,
@@ -1927,6 +1939,7 @@ impl Default for Config {
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
+            upstream_jobs_paused: false,
         }
     }
 }
@@ -2240,6 +2253,7 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            proxy_scan_queue_wait_secs: env_parse("AK_PROXY_SCAN_QUEUE_WAIT_SECS", 60_u64),
             http_header_read_timeout_secs: env_parse(
                 "HTTP_HEADER_READ_TIMEOUT_SECS",
                 DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
@@ -2483,6 +2497,10 @@ impl Config {
                 .unwrap_or_else(|| {
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into()
                 }),
+            // Off by default; only an explicit `true`/`1` pauses (#5288).
+            upstream_jobs_paused: parse_opt_in_flag(
+                env::var("UPSTREAM_JOBS_PAUSED").ok().as_deref(),
+            ),
         };
 
         config.validate_jwt_secret()?;
@@ -2952,6 +2970,33 @@ mod tests {
             !disabled_config.incus_scanner_enabled,
             "INCUS_SCANNER_ENABLED=false must disable Incus scanner construction"
         );
+    }
+
+    /// #5288: `UPSTREAM_JOBS_PAUSED` is opt-in; only `true`/`1` pauses the
+    /// scheduled upstream jobs, so defaults are unchanged.
+    #[test]
+    fn test_config_upstream_jobs_paused_is_opt_in() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> =
+            ["DATABASE_URL", "JWT_SECRET", "UPSTREAM_JOBS_PAUSED"]
+                .into_iter()
+                .map(|k| (k, env::var(k).ok()))
+                .collect();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let mut observed = Vec::new();
+        for value in [None, Some("false"), Some("yes"), Some("TRUE"), Some("1")] {
+            match value {
+                Some(v) => env::set_var("UPSTREAM_JOBS_PAUSED", v),
+                None => env::remove_var("UPSTREAM_JOBS_PAUSED"),
+            }
+            observed.push(Config::from_env().expect("config").upstream_jobs_paused);
+        }
+        for (key, value) in saved {
+            restore_env(key, value);
+        }
+        assert_eq!(observed, vec![false, false, false, true, true]);
+        assert!(!Config::default().upstream_jobs_paused);
     }
 
     #[test]

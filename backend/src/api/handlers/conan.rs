@@ -5390,6 +5390,7 @@ mod tests {
                 auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
                 global_max_concurrency: 512,
                 global_request_timeout_secs: 120,
+                proxy_scan_queue_wait_secs: 60,
                 http_header_read_timeout_secs: 10,
                 http_listen_backlog: 0,
                 upload_progress_window_secs: 60,
@@ -5464,6 +5465,7 @@ mod tests {
                 npm_attestation_negative_cache_enabled: true,
                 npm_attestation_negative_cache_ttl_secs: 86_400,
                 npm_upstream_feed_enabled: false,
+                upstream_jobs_paused: false,
                 npm_upstream_feed_url:
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into(),
                 scan_token_ttl_seconds: 300,

@@ -148,8 +148,8 @@ pub enum HoldAnswer {
     /// 403: the repository's scan policy refuses the artifact.
     ScanPolicy,
     /// The recorded source does not settle it (no source: a hold written by
-    /// the scanner, by a 1.11 replica during a rolling upgrade, or before
-    /// migration 299; or a source that contradicts the row): ask the scan
+    /// a scanner before #5153, by a 1.11 replica during a rolling upgrade, or
+    /// before migration 299; or a source that contradicts the row): ask the scan
     /// policy, the same evaluation the gate's policy half runs.
     AskPolicy,
 }
@@ -592,6 +592,52 @@ pub async fn transition(
     Ok(())
 }
 
+/// Release a scan-policy hold whose policy no longer refuses the artifact (#5153).
+///
+/// A hold with `quarantine_source = 'scan_policy'` exists only because of the
+/// policy. The caller has evaluated the policy and found it allows the artifact.
+/// The guard is on the whole predicate, so an administrator's hold, an upload
+/// hold, a rejection and a hold with no recorded origin (which may be an
+/// administrator's) are never released here, including one set since that
+/// evaluation. Returns whether a hold was released, and audits it.
+pub async fn release_cleared_scan_policy_hold(
+    db: &PgPool,
+    artifact_id: Uuid,
+    actor: Option<Uuid>,
+    released_by: &str,
+) -> Result<bool> {
+    let released = sqlx::query(
+        "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL, \
+             quarantine_reason = NULL, quarantine_source = NULL \
+         WHERE id = $1 AND quarantine_status = 'quarantined' \
+           AND quarantine_until IS NULL AND quarantine_source = 'scan_policy'",
+    )
+    .bind(artifact_id)
+    .execute(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .rows_affected()
+        == 1;
+    if released {
+        let mut entry = crate::services::audit_service::AuditEntry::new(
+            crate::services::audit_service::AuditAction::QuarantineReleased,
+            crate::services::audit_service::ResourceType::Artifact,
+        )
+        .resource(artifact_id)
+        .details(serde_json::json!({
+            "artifact_id": artifact_id,
+            "previous_status": "quarantined",
+            "released_by": released_by,
+        }));
+        if let Some(actor) = actor {
+            entry = entry.user(actor);
+        }
+        crate::services::audit_service::audit_fire_and_forget(db.clone(), entry).await;
+        tracing::info!(%artifact_id, released_by, "Scan-policy hold released: the policy no longer refuses the artifact");
+    }
+    Ok(released)
+}
+
 /// Pure legality check for the admin quarantine-now action (#2912).
 pub fn admin_quarantine_allowed(current: Option<&str>) -> bool {
     !matches!(current, Some("rejected"))
@@ -1021,6 +1067,28 @@ pub async fn listing_refusals(
     repository_id: Uuid,
     candidates: &[ListingCandidate<'_>],
 ) -> Result<std::collections::HashSet<Uuid>> {
+    listing_refusals_with(db, repository_id, candidates, true).await
+}
+
+/// [`listing_refusals`] without its caches: every candidate's scan-policy
+/// decision is evaluated now. For a listing that is itself the serve surface
+/// (the MCP registry lists whole server.json documents, #5253), where a
+/// decision a minute behind a scan that just completed would hand out a
+/// refused recipe.
+pub async fn listing_refusals_fresh(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+) -> Result<std::collections::HashSet<Uuid>> {
+    listing_refusals_with(db, repository_id, candidates, false).await
+}
+
+async fn listing_refusals_with(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+    cached: bool,
+) -> Result<std::collections::HashSet<Uuid>> {
     use futures::StreamExt;
     let now = Utc::now();
     let mut refused = std::collections::HashSet::new();
@@ -1037,7 +1105,12 @@ pub async fn listing_refusals(
     }
 
     let presence = listing_policy_presence_cache();
-    let policy_applies = match presence.get(&repository_id).await {
+    let known = if cached {
+        presence.get(&repository_id).await
+    } else {
+        None
+    };
+    let policy_applies = match known {
         Some(v) => v,
         None => {
             let v: bool = sqlx::query_scalar(
@@ -1062,8 +1135,10 @@ pub async fn listing_refusals(
         .map(|artifact_id| {
             let policy = &policy;
             async move {
-                if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
-                    return (artifact_id, blocked);
+                if cached {
+                    if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
+                        return (artifact_id, blocked);
+                    }
                 }
                 let blocked = match policy.evaluate_artifact(artifact_id, repository_id).await {
                     Ok(result) => !result.allowed,
@@ -2288,6 +2363,10 @@ mod listing_refusals_4288_tests {
         let cached = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
             .await
             .expect("cached");
+        // The uncached variant (#5253) sees the change at once.
+        let fresh = listing_refusals_fresh(&fx.pool, fx.repo_id, &candidates(None))
+            .await
+            .expect("fresh");
         invalidate_listing_decisions();
         let after = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
             .await
@@ -2305,6 +2384,10 @@ mod listing_refusals_4288_tests {
             "block_unscanned refuses the unscanned and the (unscanned) held package"
         );
         assert_eq!(cached, with_policy);
+        assert!(
+            fresh.is_empty(),
+            "the fresh variant ignores the cached decisions"
+        );
         assert!(after.is_empty(), "no policy, no hold: everything listed");
     }
 }

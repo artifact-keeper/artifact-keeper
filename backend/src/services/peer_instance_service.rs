@@ -137,6 +137,117 @@ pub enum ReplicationMode {
     None,
 }
 
+/// Message of the 400 a `pull` subscription or sync policy is refused with
+/// (#5293).
+pub const PULL_REPLICATION_NOT_IMPLEMENTED: &str =
+    "pull replication is not implemented: no sync task is ever created for a `pull` \
+     subscription. Subscribe this repository to the receiving peer on the instance that \
+     holds it, with `push` or `mirror` (each new artifact is sent as it is uploaded; \
+     POST /api/v1/peers/{id}/repositories/{repo_id}/sync sends the whole repository)";
+
+impl ReplicationMode {
+    /// The mode a subscription gets when the caller names none (#5293). It was
+    /// `pull`, which no task producer ever selects, so an omitted mode created a
+    /// subscription that silently never moved a byte; sync policies already
+    /// defaulted to `push`.
+    pub const DEFAULT: ReplicationMode = ReplicationMode::Push;
+
+    /// The mode as stored in the `replication_mode` enum.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplicationMode::Push => "push",
+            ReplicationMode::Pull => "pull",
+            ReplicationMode::Mirror => "mirror",
+            ReplicationMode::None => "none",
+        }
+    }
+
+    /// Whether anything ever creates sync tasks for a subscription in this
+    /// mode: `push` and `mirror` both get one per new artifact from the upload
+    /// hook (`PUSH_MIRROR_SUBSCRIPTIONS_SQL`). `none` is the explicit
+    /// "subscribed, do not replicate" mode, and `pull` has no producer at all.
+    pub fn produces_sync_tasks(self) -> bool {
+        matches!(self, ReplicationMode::Push | ReplicationMode::Mirror)
+    }
+
+    /// The mode to store for a subscription request: an omitted mode is
+    /// [`Self::DEFAULT`], and `pull` is refused with
+    /// [`PULL_REPLICATION_NOT_IMPLEMENTED`] instead of being stored as a
+    /// subscription that never replicates (#5293).
+    pub fn for_new_subscription(mode: Option<ReplicationMode>) -> Result<ReplicationMode> {
+        match mode.unwrap_or(Self::DEFAULT) {
+            ReplicationMode::Pull => Err(AppError::Validation(
+                PULL_REPLICATION_NOT_IMPLEMENTED.to_string(),
+            )),
+            other => Ok(other),
+        }
+    }
+}
+
+/// Whether a stored subscription is actually replicated, as reported in the
+/// subscription API's `effective` field (#5293): `active` when it is enabled
+/// and its mode has a task producer, `inactive` otherwise. A `pull` row
+/// written before `pull` was refused reports `inactive`.
+pub fn subscription_effective_state(
+    sync_enabled: bool,
+    replication_mode: Option<&str>,
+) -> &'static str {
+    let replicates = matches!(replication_mode, Some("push") | Some("mirror"));
+    if sync_enabled && replicates {
+        "active"
+    } else {
+        "inactive"
+    }
+}
+
+/// Name, once per boot, every peer subscription and sync policy that still
+/// uses `pull` (#5293). Those rows were accepted before `pull` was refused and
+/// have never replicated anything; they are left unchanged so the operator
+/// can pick `push` or `mirror` deliberately. Returns the
+/// `(kind, description)` pairs it warned about.
+pub async fn warn_inactive_pull_replication(db: &PgPool) -> Vec<(String, String)> {
+    let subscriptions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT p.name, r.key \
+         FROM peer_repo_subscriptions s \
+         JOIN peer_instances p ON p.id = s.peer_instance_id \
+         JOIN repositories r ON r.id = s.repository_id \
+         WHERE s.replication_mode::text = 'pull' \
+         ORDER BY p.name, r.key",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let policies: Vec<(String,)> = sqlx::query_as(
+        "SELECT name FROM sync_policies WHERE replication_mode = 'pull' ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut warned = Vec::new();
+    for (peer, repo) in subscriptions {
+        tracing::warn!(
+            peer = %peer,
+            repository = %repo,
+            "peer subscription uses replication_mode 'pull', which is not implemented: it has \
+             never replicated anything (#5293). Re-subscribe with `push` or `mirror` \
+             (POST /api/v1/peers/{{id}}/repositories); the stored row has been left unchanged."
+        );
+        warned.push(("subscription".to_string(), format!("{peer}/{repo}")));
+    }
+    for (policy,) in policies {
+        tracing::warn!(
+            policy = %policy,
+            "sync policy uses replication_mode 'pull', which is not implemented: the \
+             subscriptions it creates never replicate anything (#5293). Change it to `push` \
+             or `mirror` (PUT /api/v1/sync-policies/{{id}}); the stored policy has been left \
+             unchanged."
+        );
+        warned.push(("policy".to_string(), policy));
+    }
+    warned
+}
+
 /// A repository with a mirror replication policy.
 #[derive(Debug)]
 pub struct MirrorRepo {
@@ -589,8 +700,9 @@ impl PeerInstanceService {
         // `peer_repo_subscriptions.replication_mode` is NOT NULL. A caller that
         // omits the mode must not produce a constraint violation surfaced as an
         // opaque 500 -- fall back to the same default the column declares
-        // (`'pull'`).
-        let replication_mode = replication_mode.unwrap_or(ReplicationMode::Pull);
+        // (`'push'` since #5293). `pull` is refused here, at the one writer of
+        // a hand-made subscription, rather than stored and never acted on.
+        let replication_mode = ReplicationMode::for_new_subscription(replication_mode)?;
         sqlx::query!(
             r#"
             INSERT INTO peer_repo_subscriptions
@@ -1380,7 +1492,7 @@ mod tests {
         for (mode, enabled) in [
             (ReplicationMode::Push, true),
             (ReplicationMode::Mirror, true),
-            (ReplicationMode::Pull, true),
+            (ReplicationMode::None, true),
             (ReplicationMode::Push, false),
         ] {
             let peer_id = register_test_peer(&svc, &Uuid::new_v4()).await;
@@ -1389,6 +1501,10 @@ mod tests {
                 .unwrap();
             peers.push(peer_id);
         }
+        // A `pull` row stored before `pull` was refused (#5293) gets no task.
+        let legacy_pull_peer = register_test_peer(&svc, &Uuid::new_v4()).await;
+        insert_legacy_pull_subscription(&pool, legacy_pull_peer, repo_id).await;
+        peers.push(legacy_pull_peer);
 
         let path = "pkg/1.0.0/pkg-1.0.0.tgz";
         let artifact_id = insert_test_artifact(&pool, repo_id, path).await;
@@ -1473,6 +1589,166 @@ mod tests {
             .ok();
     }
 
+    /// Store a `pull` subscription directly, as one written before `pull`
+    /// was refused at the API (#5293) would be.
+    async fn insert_legacy_pull_subscription(pool: &sqlx::PgPool, peer_id: Uuid, repo_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, 'pull')",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// #5293: every mode a new subscription can be created with has a task
+    /// producer, except `none`, the explicit "do not replicate" mode. `pull`
+    /// had none and is refused; an omitted mode is `push`.
+    #[test]
+    fn every_accepted_subscription_mode_replicates_or_is_none() {
+        for mode in [
+            ReplicationMode::Push,
+            ReplicationMode::Pull,
+            ReplicationMode::Mirror,
+            ReplicationMode::None,
+        ] {
+            match ReplicationMode::for_new_subscription(Some(mode)) {
+                Ok(stored) => {
+                    assert_eq!(stored, mode);
+                    assert!(
+                        mode.produces_sync_tasks() || mode == ReplicationMode::None,
+                        "{mode:?} is accepted but nothing creates sync tasks for it"
+                    );
+                }
+                Err(AppError::Validation(msg)) => {
+                    assert_eq!(mode, ReplicationMode::Pull);
+                    assert_eq!(msg, PULL_REPLICATION_NOT_IMPLEMENTED);
+                }
+                Err(other) => panic!("{mode:?}: unexpected error {other:?}"),
+            }
+        }
+        assert_eq!(
+            ReplicationMode::for_new_subscription(None).unwrap(),
+            ReplicationMode::Push
+        );
+        assert_eq!(ReplicationMode::DEFAULT, ReplicationMode::Push);
+        // The producers' SQL selects exactly the modes `produces_sync_tasks`
+        // names, so the two cannot drift apart unnoticed.
+        let produced: Vec<&str> = [
+            ReplicationMode::Push,
+            ReplicationMode::Pull,
+            ReplicationMode::Mirror,
+            ReplicationMode::None,
+        ]
+        .into_iter()
+        .filter(|m| m.produces_sync_tasks())
+        .map(ReplicationMode::as_str)
+        .collect();
+        assert_eq!(produced, ["push", "mirror"]);
+        assert!(PUSH_MIRROR_SUBSCRIPTIONS_SQL.contains("IN ('push', 'mirror')"));
+    }
+
+    #[test]
+    fn subscription_effective_state_reports_rows_that_never_replicate() {
+        assert_eq!(subscription_effective_state(true, Some("push")), "active");
+        assert_eq!(subscription_effective_state(true, Some("mirror")), "active");
+        assert_eq!(subscription_effective_state(true, Some("pull")), "inactive");
+        assert_eq!(subscription_effective_state(true, Some("none")), "inactive");
+        assert_eq!(
+            subscription_effective_state(false, Some("push")),
+            "inactive"
+        );
+        assert_eq!(subscription_effective_state(true, None), "inactive");
+    }
+
+    /// DB-backed (#5293): `pull` is refused before anything is written, the
+    /// column default is `push`, and a legacy `pull` row gets no task from
+    /// either producer and is named by the boot-time warning.
+    #[tokio::test]
+    async fn pull_subscriptions_are_refused_and_legacy_rows_are_reported() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let svc = PeerInstanceService::new(pool.clone());
+        let peer_id = register_test_peer(&svc, &suffix).await;
+        let repo_id = insert_test_repo(&pool, &suffix).await;
+
+        let err = svc
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Pull),
+                None,
+                None,
+            )
+            .await
+            .expect_err("pull must be refused");
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        assert!(matches!(
+            svc.get_subscription(peer_id, repo_id).await,
+            Err(AppError::NotFound(_))
+        ));
+
+        // The column default agrees with the API default (migration 330).
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions (peer_instance_id, repository_id) VALUES ($1, $2)",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
+        assert_eq!(sub.replication_mode.as_deref(), Some("push"));
+        sqlx::query("DELETE FROM peer_repo_subscriptions WHERE peer_instance_id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_legacy_pull_subscription(&pool, peer_id, repo_id).await;
+        assert!(svc
+            .get_repos_for_push_sync(peer_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(svc
+            .get_repos_for_mirror_sync(peer_id)
+            .await
+            .unwrap()
+            .is_empty());
+        let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
+        assert_eq!(
+            subscription_effective_state(sub.sync_enabled, sub.replication_mode.as_deref()),
+            "inactive"
+        );
+        let peer_name: String = sqlx::query_scalar("SELECT name FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let repo_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let warned = warn_inactive_pull_replication(&pool).await;
+        assert!(
+            warned.contains(&(
+                "subscription".to_string(),
+                format!("{peer_name}/{repo_key}")
+            )),
+            "{warned:?}"
+        );
+
+        cleanup_assign(&pool, peer_id, repo_id).await;
+    }
+
     async fn cleanup_assign(pool: &sqlx::PgPool, peer_id: Uuid, repo_id: Uuid) {
         // peer_repo_subscriptions cascades from both peer and repo deletes.
         sqlx::query("DELETE FROM peer_instances WHERE id = $1")
@@ -1489,11 +1765,12 @@ mod tests {
 
     /// DB-backed regression for the 1.2.2 federation fix: assigning a valid
     /// repository to a peer with NO `replication_mode` supplied must succeed
-    /// (defaulting to `pull`) and persist a subscription. Previously this wrote
-    /// a NULL into the NOT NULL `replication_mode` column and surfaced as an
-    /// opaque 500 DATABASE_ERROR for every such call.
+    /// and persist a subscription. Previously this wrote a NULL into the NOT
+    /// NULL `replication_mode` column and surfaced as an opaque 500
+    /// DATABASE_ERROR for every such call. The default is `push` since #5293:
+    /// it was `pull`, which never replicated anything.
     #[tokio::test]
-    async fn assign_repository_without_mode_defaults_to_pull_and_persists() {
+    async fn assign_repository_without_mode_defaults_to_push_and_persists() {
         let Some(pool) = test_pool().await else {
             return;
         };
@@ -1507,10 +1784,14 @@ mod tests {
             .await
             .expect("assignment without replication_mode must succeed");
 
-        // Persisted with the column default.
+        // Persisted with the default, a mode that replicates.
         let sub = svc.get_subscription(peer_id, repo_id).await.unwrap();
         assert_eq!(sub.repository_id, repo_id);
-        assert_eq!(sub.replication_mode.as_deref(), Some("pull"));
+        assert_eq!(sub.replication_mode.as_deref(), Some("push"));
+        assert_eq!(
+            subscription_effective_state(sub.sync_enabled, sub.replication_mode.as_deref()),
+            "active"
+        );
         assert!(sub.sync_enabled);
 
         // Idempotent upsert: a second assign with an explicit mode updates,
@@ -1588,7 +1869,7 @@ mod tests {
                 peer_id,
                 bogus_repo,
                 true,
-                Some(ReplicationMode::Pull),
+                Some(ReplicationMode::Push),
                 None,
                 None,
             )
@@ -1626,7 +1907,7 @@ mod tests {
             peer_id,
             enabled_repo,
             true,
-            Some(ReplicationMode::Pull),
+            Some(ReplicationMode::Push),
             None,
             None,
         )
@@ -1636,7 +1917,7 @@ mod tests {
             peer_id,
             disabled_repo,
             false,
-            Some(ReplicationMode::Pull),
+            Some(ReplicationMode::Push),
             None,
             None,
         )

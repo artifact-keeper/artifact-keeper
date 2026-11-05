@@ -1,0 +1,15 @@
+# ak-mcp-introspector on Kubernetes (#5253, docs/security/mcp-sandbox.md
+# "Option B"): the worker and its guests live in separate namespaces.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ak-mcp-introspector
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ak-mcp-sandbox
+  labels:
+    pod-security.kubernetes.io/enforce: restricted

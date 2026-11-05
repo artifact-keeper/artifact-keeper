@@ -1642,6 +1642,10 @@ impl GcsBackend {
 
 #[async_trait]
 impl StorageBackend for GcsBackend {
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        GcsBackend::size(self, key).await.map(Some)
+    }
+
     /// `exists` also probes the Artifactory fallback key in migration mode.
     fn exists_may_match_fallback_key(&self) -> bool {
         self.path_format.has_fallback()

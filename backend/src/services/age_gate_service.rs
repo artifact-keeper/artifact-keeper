@@ -403,6 +403,63 @@ pub(crate) fn decide_age_gate_check(
     }
 }
 
+/// What a gated Remote's upstream says about one version on the download path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamVersionEvidence {
+    /// The upstream lists the version, with its publish time when it gives one.
+    Listed(Option<DateTime<Utc>>),
+    /// The upstream answered and does not have the version: a 404 or 410, or a
+    /// readable package document that does not list it.
+    NotHosted,
+    /// No answer about the version: an outage, a refusal, a document that is
+    /// not package metadata, or no read attempted. Never a reason to skip the
+    /// gate, because a member that cannot be read may host the version.
+    Unknown,
+}
+
+impl UpstreamVersionEvidence {
+    pub(crate) fn published_at(self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Listed(published_at) => published_at,
+            Self::NotHosted | Self::Unknown => None,
+        }
+    }
+
+    /// Positive evidence that may start a `first_seen` clock.
+    pub(crate) fn is_listed(self) -> bool {
+        matches!(self, Self::Listed(_))
+    }
+}
+
+/// Read one version's evidence out of an npm packument body.
+///
+/// `versions` is what the registry serves and `time` what it dates. A version
+/// in either is hosted (a `time` entry without a manifest keeps the gate
+/// deciding rather than reading as a miss), and a body with neither map is not
+/// a packument at all, so it says nothing.
+pub(crate) fn npm_packument_version_evidence(
+    body: &[u8],
+    version: &str,
+) -> UpstreamVersionEvidence {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return UpstreamVersionEvidence::Unknown;
+    };
+    let versions = doc.get("versions").and_then(|v| v.as_object());
+    let time = doc.get("time").and_then(|t| t.as_object());
+    if versions.is_none() && time.is_none() {
+        return UpstreamVersionEvidence::Unknown;
+    }
+    if versions.is_some_and(|v| v.contains_key(version))
+        || time.is_some_and(|t| t.contains_key(version))
+    {
+        let published_at = UpstreamMetadataCache::parse_npm_publish_times(&doc)
+            .get(version)
+            .copied();
+        return UpstreamVersionEvidence::Listed(published_at);
+    }
+    UpstreamVersionEvidence::NotHosted
+}
+
 /// Per-version classification output for metadata listing (npm packument / PyPI simple index).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MetadataListingClassification {
@@ -760,11 +817,19 @@ impl AgeGateService {
     }
 
     /// Whether a version meets the minimum age threshold.
+    ///
+    /// A threshold of 0 asks for no age, so it is met whatever is known about
+    /// the version (#5151). Above 0 an unknown time does not meet it: the gate
+    /// cannot show the version is old enough, so it fails closed, and an
+    /// upstream that publishes no times is what `first_seen` mode is for.
     pub fn meets_age_threshold(
         published_at: Option<DateTime<Utc>>,
         min_age_days: i32,
         now: DateTime<Utc>,
     ) -> bool {
+        if min_age_days <= 0 {
+            return true;
+        }
         match published_at {
             Some(ts) => Self::package_age_days(ts, now) >= i64::from(min_age_days),
             None => false,
@@ -1002,6 +1067,35 @@ impl AgeGateService {
                 }
             }
         }
+    }
+
+    /// Whether a Virtual member whose upstream does not host this version may
+    /// stay out of the request (#5150).
+    ///
+    /// The upstream's answer covers what it serves now, not what this server
+    /// has on record. A rejection is an administrator's decision about the
+    /// version on this member, and a `first_seen` observation shows the member
+    /// did carry it, so either keeps the ordinary decision in charge.
+    pub async fn member_may_step_aside(
+        &self,
+        repo: &AgeGateRepoParams,
+        package_name: &str,
+        version: &str,
+    ) -> Result<bool> {
+        if let Some(review) = self.get_review(repo.id, package_name, version).await? {
+            if review.status == AgeGateReviewStatus::Rejected.as_str() {
+                return Ok(false);
+            }
+        }
+        if repo.age_gate_mode == AgeGateMode::FirstSeen
+            && self
+                .lookup_first_seen(repo, package_name, version)
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Resolve the age basis of every version in a metadata listing according
@@ -1671,7 +1765,7 @@ impl AgeGateService {
         ))
     }
 
-    async fn get_review(
+    pub(crate) async fn get_review(
         &self,
         repository_id: Uuid,
         package_name: &str,
@@ -2041,8 +2135,9 @@ impl AgeGateService {
                     review_reason = $2
                 WHERE repository_id = $1
                   AND status = 'pending'
-                  AND upstream_published_at IS NOT NULL
-                  AND NOW() - upstream_published_at >= make_interval(days => $3)
+                  AND ($3 = 0
+                       OR (upstream_published_at IS NOT NULL
+                           AND NOW() - upstream_published_at >= make_interval(days => $3)))
                   AND ((basis_mode = $4 AND basis_upstream_fingerprint = $5)
                        OR (basis_mode IS NULL AND basis_upstream_fingerprint IS NULL
                            AND $4 = 'upstream_publish_time'))
@@ -2129,8 +2224,36 @@ type PypiSimpleIndexParseResult = (Vec<PypiAnchorSpan>, Vec<(String, Option<Date
 
 /// First pass over PyPI simple-index HTML: locate anchors and dedupe versions.
 pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexParseResult {
+    parse_pypi_index_anchors_where(html, |_| true)
+}
+
+/// The versions in a simple index that come from files named for `project`
+/// (its PEP 503 form). A link to anything else on the page says nothing about
+/// this project's releases.
+pub(crate) fn parse_pypi_project_index_anchors(
+    html: &str,
+    project: &str,
+) -> Vec<(String, Option<DateTime<Utc>>)> {
+    parse_pypi_index_anchors_where(html, |anchor| {
+        extract_href_filename(anchor).is_some_and(|f| pypi_filename_names_project(&f, project))
+    })
+    .1
+}
+
+/// Whether a distribution filename names `project` (its PEP 503 form).
+pub(crate) fn pypi_filename_names_project(filename: &str, project: &str) -> bool {
+    crate::formats::pypi::PypiHandler::parse_filename(filename)
+        .ok()
+        .and_then(|info| info.name)
+        .is_some_and(|name| crate::formats::pypi::PypiHandler::normalize_name(&name) == project)
+}
+
+fn parse_pypi_index_anchors_where(
+    html: &str,
+    keep_version: impl Fn(&str) -> bool,
+) -> PypiSimpleIndexParseResult {
     let mut spans: Vec<PypiAnchorSpan> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut versions: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let mut cursor = 0usize;
     while let Some(rel) = html[cursor..].find("<a ") {
@@ -2139,10 +2262,19 @@ pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexPars
             break;
         };
         let end = start + end_rel + 4;
-        let version = pypi_anchor_version(&html[start..end]);
-        if let Some(ref ver) = version {
-            if seen.insert(ver.clone()) {
+        let anchor = &html[start..end];
+        let version = pypi_anchor_version(anchor);
+        if let Some(ver) = version.as_ref().filter(|_| keep_version(anchor)) {
+            // A version is as old as its earliest file, as in the PEP 691 walk.
+            let index = *seen.entry(ver.clone()).or_insert_with(|| {
                 versions.push((ver.clone(), None));
+                versions.len() - 1
+            });
+            if let Some(uploaded) = pypi_anchor_upload_time(anchor) {
+                let earliest = &mut versions[index].1;
+                if earliest.is_none_or(|existing| uploaded < existing) {
+                    *earliest = Some(uploaded);
+                }
             }
         }
         spans.push(PypiAnchorSpan {
@@ -2153,6 +2285,27 @@ pub(crate) fn parse_pypi_simple_index_anchors(html: &str) -> PypiSimpleIndexPars
         cursor = end;
     }
     (spans, versions)
+}
+
+/// Find a version in a parsed simple index, matching PEP 440-equal spellings.
+/// `Some(time)` when it is listed, where a spelling with no time makes the
+/// answer `Some(None)`: the fallback must never be more permissive than an
+/// exact hit, the same rule as [`pypi_publish_time`].
+pub(crate) fn pypi_listed_version(
+    versions: &[(String, Option<DateTime<Utc>>)],
+    version: &str,
+) -> Option<Option<DateTime<Utc>>> {
+    if let Some((_, time)) = versions.iter().find(|(listed, _)| listed == version) {
+        return Some(*time);
+    }
+    let wanted = crate::formats::pypi::PypiHandler::pep440_sort_key(version)?;
+    versions
+        .iter()
+        .filter(|(listed, _)| {
+            crate::formats::pypi::PypiHandler::pep440_sort_key(listed).as_ref() == Some(&wanted)
+        })
+        .map(|(_, time)| *time)
+        .reduce(|a, b| a.zip(b).map(|(a, b)| a.max(b)))
 }
 
 /// Look up a PyPI version's publish time, matching PEP 440-equal spellings.
@@ -2181,13 +2334,17 @@ pub(crate) fn pypi_publish_time(
         .max()
 }
 
-/// Attach publish times to parsed simple-index versions.
+/// Attach publish times to the versions of an HTML simple index. In this
+/// listing the upstream's JSON API wins, the same order the download path reads
+/// them in, and an anchor's own time stays where the API has nothing. The PEP
+/// 691 listing is the other way round: [`AgeGateService::filter_pypi_simple_json`]
+/// keeps the document's `upload-time` and only falls back to the API.
 pub(crate) fn attach_pypi_publish_times(
     versions: &mut [(String, Option<DateTime<Utc>>)],
     publish_times: &std::collections::HashMap<String, DateTime<Utc>>,
 ) {
     for (ver, ts) in versions {
-        *ts = pypi_publish_time(publish_times, ver);
+        *ts = pypi_publish_time(publish_times, ver).or(*ts);
     }
 }
 
@@ -2242,8 +2399,21 @@ fn extract_href_filename(anchor: &str) -> Option<String> {
     if filename.is_empty() {
         None
     } else {
-        Some(filename.to_string())
+        // A local version's `+` arrives as `%2B` on some indexes (#5151).
+        Some(
+            urlencoding::decode(filename)
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or_else(|_| filename.to_string()),
+        )
     }
+}
+
+/// An anchor's `data-upload-time`, the HTML form of PEP 700 `upload-time`.
+fn pypi_anchor_upload_time(anchor: &str) -> Option<DateTime<Utc>> {
+    let start_tag = &anchor[..anchor.find('>').unwrap_or(anchor.len())];
+    let rest = &start_tag[start_tag.find("data-upload-time=\"")? + 18..];
+    let value = &rest[..rest.find('"')?];
+    crate::services::upstream_metadata::parse_iso_timestamp(&serde_json::Value::from(value))
 }
 
 /// Extract the package version a PyPI simple-index anchor links to, if any.
@@ -2837,6 +3007,180 @@ mod tests {
     fn missing_timestamp_does_not_meet_threshold() {
         let now = Utc::now();
         assert!(!AgeGateService::meets_age_threshold(None, 7, now));
+    }
+
+    /// #5151: no age is required at 0, so an unknown one cannot fall short.
+    #[test]
+    fn zero_days_is_met_without_a_timestamp_5151() {
+        let now = Utc::now();
+        assert!(AgeGateService::meets_age_threshold(None, 0, now));
+        assert!(AgeGateService::meets_age_threshold(Some(now), 0, now));
+        assert!(!AgeGateService::meets_age_threshold(None, 1, now));
+    }
+
+    /// #5151: a listing makes the same decision as a download at 0 days, and
+    /// a rejection is still honoured there.
+    #[test]
+    fn listing_at_zero_days_withholds_only_a_rejection_5151() {
+        let now = Utc::now();
+        let versions = vec![("1.0.0".to_string(), None), ("2.0.0".to_string(), None)];
+        let existing = std::collections::HashMap::from([(
+            "2.0.0".to_string(),
+            PackageReviewRow {
+                status: AgeGateReviewStatus::Rejected.as_str().to_string(),
+                is_automatic: false,
+                basis_mode: None,
+                basis_upstream_fingerprint: None,
+            },
+        )]);
+        let out = classify_versions_for_metadata_listing(
+            &versions,
+            &existing,
+            0,
+            AgeGateMode::UpstreamPublishTime,
+            "fp",
+            now,
+        );
+        assert_eq!(
+            out.blocked,
+            std::collections::HashSet::from(["2.0.0".to_string()])
+        );
+        assert!(out.request_versions.is_empty());
+    }
+
+    /// #5151: an anchor's upload time is the version's, as old as its earliest
+    /// file, and a percent-encoded local version parses to its real spelling.
+    #[test]
+    fn simple_index_anchors_carry_their_upload_time_5151() {
+        let html = "<a href=\"/f/a-1.0.0-py3-none-any.whl\" \
+                    data-upload-time=\"2023-10-06T00:25:26Z\">x</a>\
+                    <a href=\"/f/a-1.0.0.tar.gz\" \
+                    data-upload-time=\"2022-01-02T03:04:05Z\">x</a>\
+                    <a href=\"/f/a-2.0.0%2Bcpu-py3-none-any.whl#sha256=ab\">x</a>\
+                    <a href=\"/f/a-3.0.0-py3-none-any.whl\" \
+                    data-upload-time=\"not a date\">x</a>";
+        let (spans, versions) = parse_pypi_simple_index_anchors(html);
+        assert_eq!(spans.len(), 4);
+        let expected = "2022-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            versions,
+            vec![
+                ("1.0.0".to_string(), Some(expected)),
+                ("2.0.0+cpu".to_string(), None),
+                ("3.0.0".to_string(), None),
+            ]
+        );
+    }
+
+    /// #5151: a time from the upstream's JSON API wins over an anchor's, and
+    /// an anchor's survives where the API has nothing.
+    #[test]
+    fn attach_publish_times_keeps_an_anchor_time_the_api_lacks_5151() {
+        let anchor = "2022-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        let api = "2020-01-02T03:04:05Z".parse::<DateTime<Utc>>().unwrap();
+        let mut versions = vec![
+            ("1.0.0".to_string(), Some(anchor)),
+            ("2.0.0".to_string(), Some(anchor)),
+            ("3.0.0".to_string(), None),
+        ];
+        let times = std::collections::HashMap::from([("1.0.0".to_string(), api)]);
+        attach_pypi_publish_times(&mut versions, &times);
+        assert_eq!(versions[0].1, Some(api));
+        assert_eq!(versions[1].1, Some(anchor));
+        assert_eq!(versions[2].1, None);
+    }
+
+    /// #5150: what counts as "not hosted" in a packument, and what does not.
+    #[test]
+    fn npm_packument_evidence_separates_a_miss_from_no_answer_5150() {
+        use UpstreamVersionEvidence::{Listed, NotHosted, Unknown};
+        let at = "2024-06-01T12:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
+        let check = |doc: serde_json::Value| {
+            npm_packument_version_evidence(doc.to_string().as_bytes(), "1.0.0")
+        };
+        assert_eq!(
+            check(serde_json::json!({
+                "versions": {"1.0.0": {}}, "time": {"1.0.0": "2024-06-01T12:00:00.000Z"}
+            })),
+            Listed(Some(at))
+        );
+        assert_eq!(
+            check(serde_json::json!({"versions": {"1.0.0": {}}})),
+            Listed(None)
+        );
+        assert_eq!(
+            check(serde_json::json!({"time": {"1.0.0": "2024-06-01T12:00:00.000Z"}})),
+            Listed(Some(at))
+        );
+        assert_eq!(
+            check(serde_json::json!({"versions": {"2.0.0": {}}})),
+            NotHosted
+        );
+        // Fully unpublished: npm keeps `time` and drops `versions`.
+        assert_eq!(
+            check(serde_json::json!({"time": {"unpublished": {"time": "x"}}})),
+            NotHosted
+        );
+        assert_eq!(check(serde_json::json!({"error": "not_found"})), Unknown);
+        assert_eq!(check(serde_json::json!(["1.0.0"])), Unknown);
+        assert_eq!(npm_packument_version_evidence(b"<html>", "1.0.0"), Unknown);
+    }
+
+    /// PEP 440-equal spellings match, and any spelling without a time leaves
+    /// the answer undated, so the fallback never admits more than an exact hit.
+    #[test]
+    fn pypi_listed_version_matches_spellings_conservatively_5151() {
+        let old = "2020-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let new = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let versions = vec![
+            ("1.0".to_string(), Some(old)),
+            ("2.0".to_string(), Some(old)),
+            ("2.0.0".to_string(), Some(new)),
+            ("3.0".to_string(), Some(old)),
+            ("3.0.0".to_string(), None),
+        ];
+        assert_eq!(pypi_listed_version(&versions, "1.0"), Some(Some(old)));
+        assert_eq!(pypi_listed_version(&versions, "1.0.0"), Some(Some(old)));
+        assert_eq!(pypi_listed_version(&versions, "2.0.0.0"), Some(Some(new)));
+        assert_eq!(pypi_listed_version(&versions, "3.0.0.0"), Some(None));
+        assert_eq!(pypi_listed_version(&versions, "9.0"), None);
+    }
+
+    /// #5151: the sweep mirrors the threshold at 0 too, so a row with no time
+    /// does not sit pending in the queue after the read path would allow it.
+    #[tokio::test]
+    async fn sweep_releases_an_undated_pending_row_only_at_zero_days_5151() {
+        let Some(pool) = try_db_pool().await else {
+            return;
+        };
+        let svc = AgeGateService::new(pool.clone(), Arc::new(EventBus::new(4)));
+        let (zero, _) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 0).await;
+        let (seven, _) = create_age_gate_repo(&pool, RepositoryFormat::Npm, 7).await;
+        let zero_row = insert_review_row(&pool, zero, "pkg", "1.0.0", "pending", None).await;
+        let seven_row = insert_review_row(&pool, seven, "pkg", "1.0.0", "pending", None).await;
+
+        svc.auto_approve_aged_reviews().await.expect("sweep");
+        let status = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT status FROM age_gate_reviews WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("row")
+            }
+        };
+        let zero_status = status(zero_row).await;
+        let seven_status = status(seven_row).await;
+        for repo in [zero, seven] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(repo)
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(zero_status, "approved");
+        assert_eq!(seven_status, "pending");
     }
 
     #[tokio::test]

@@ -77,10 +77,33 @@ pub fn ecosystem_for_format(format: &str) -> Option<&'static str> {
 /// [`CachedPopularitySource`] (see [`HttpPopularitySource::cached`]) for
 /// production use so repeated evaluations of the same package do not hammer
 /// the public APIs.
+const DEFAULT_PYPISTATS_BASE: &str = "https://pypistats.org";
+const DEFAULT_NPM_BASE: &str = "https://api.npmjs.org";
+
 pub struct HttpPopularitySource {
     client: crate::services::http_client::Client,
-    pypistats_base: String,
-    npm_base: String,
+    /// `None`: lookups for this ecosystem are switched off and answer
+    /// [`PopularityResult::Unknown`] without a request (#5288).
+    pypistats_base: Option<String>,
+    npm_base: Option<String>,
+}
+
+/// Env var naming the PyPI download-statistics base URL (#5288). Unset or
+/// empty: `https://pypistats.org`; `off`: no lookups.
+pub const PYPI_URL_ENV: &str = "CURATION_POPULARITY_PYPI_URL";
+/// Env var naming the npm download-statistics base URL (#5288). Unset or
+/// empty: `https://api.npmjs.org`; `off`: no lookups.
+pub const NPM_URL_ENV: &str = "CURATION_POPULARITY_NPM_URL";
+
+/// Resolve one configured base URL: unset or blank is `default`, `off`
+/// (any case) disables the ecosystem, anything else is used as given,
+/// without a trailing `/`.
+pub fn configured_base(raw: Option<&str>, default: &str) -> Option<String> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(default.to_string()),
+        Some(v) if v.eq_ignore_ascii_case("off") => None,
+        Some(v) => Some(v.trim_end_matches('/').to_string()),
+    }
 }
 
 impl HttpPopularitySource {
@@ -94,15 +117,30 @@ impl HttpPopularitySource {
             .expect("failed to build popularity HTTP client");
         Self {
             client,
-            pypistats_base: "https://pypistats.org".to_string(),
-            npm_base: "https://api.npmjs.org".to_string(),
+            pypistats_base: Some(DEFAULT_PYPISTATS_BASE.to_string()),
+            npm_base: Some(DEFAULT_NPM_BASE.to_string()),
         }
+    }
+
+    /// [`Self::new`] with the base URLs taken from [`PYPI_URL_ENV`] and
+    /// [`NPM_URL_ENV`] (#5288), so an air-gapped site can point lookups at an
+    /// internal mirror or turn them `off` instead of waiting out a connect
+    /// timeout on every lookup.
+    pub fn from_env() -> Self {
+        let mut source = Self::new();
+        source.pypistats_base = configured_base(
+            std::env::var(PYPI_URL_ENV).ok().as_deref(),
+            DEFAULT_PYPISTATS_BASE,
+        );
+        source.npm_base =
+            configured_base(std::env::var(NPM_URL_ENV).ok().as_deref(), DEFAULT_NPM_BASE);
+        source
     }
 
     /// Override the upstream base URLs (tests / air-gapped mirrors).
     pub fn with_base_urls(mut self, pypistats_base: &str, npm_base: &str) -> Self {
-        self.pypistats_base = pypistats_base.trim_end_matches('/').to_string();
-        self.npm_base = npm_base.trim_end_matches('/').to_string();
+        self.pypistats_base = Some(pypistats_base.trim_end_matches('/').to_string());
+        self.npm_base = Some(npm_base.trim_end_matches('/').to_string());
         self
     }
 
@@ -188,11 +226,13 @@ impl PopularitySource for HttpPopularitySource {
         };
         match ecosystem {
             "pypi" => {
+                let Some(base) = &self.pypistats_base else {
+                    return PopularityResult::Unknown;
+                };
                 // PEP 503 normalization: lowercase, runs of -_. become -.
                 let normalized = normalize_pypi_name(name);
                 let url = format!(
-                    "{}/api/packages/{}/recent",
-                    self.pypistats_base,
+                    "{base}/api/packages/{}/recent",
                     encode_path_segment(&normalized)
                 );
                 match self.fetch_json(&url).await {
@@ -201,9 +241,11 @@ impl PopularitySource for HttpPopularitySource {
                 }
             }
             "npm" => {
+                let Some(base) = &self.npm_base else {
+                    return PopularityResult::Unknown;
+                };
                 let url = format!(
-                    "{}/downloads/point/last-month/{}",
-                    self.npm_base,
+                    "{base}/downloads/point/last-month/{}",
                     encode_path_segment(name)
                 );
                 match self.fetch_json(&url).await {
@@ -457,6 +499,43 @@ mod tests {
             PopularityResult::Unknown
         );
         assert_eq!(cached.inner.call_count(), 1);
+    }
+
+    #[test]
+    fn configured_base_defaults_overrides_and_switches_off_5288() {
+        let d = "https://pypistats.org";
+        assert_eq!(configured_base(None, d).as_deref(), Some(d));
+        assert_eq!(configured_base(Some("  "), d).as_deref(), Some(d));
+        assert_eq!(configured_base(Some("off"), d), None);
+        assert_eq!(configured_base(Some(" OFF "), d), None);
+        assert_eq!(
+            configured_base(Some("https://stats.internal/"), d).as_deref(),
+            Some("https://stats.internal")
+        );
+    }
+
+    /// #5288: an ecosystem switched `off` answers Unknown without a request.
+    #[tokio::test]
+    async fn http_source_switched_off_makes_no_request_5288() {
+        use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut source = HttpPopularitySource::new().with_base_urls(&server.uri(), &server.uri());
+        source.pypistats_base = None;
+        source.npm_base = None;
+        assert_eq!(
+            source.downloads("pypi", "requests").await,
+            PopularityResult::Unknown
+        );
+        assert_eq!(
+            source.downloads("npm", "left-pad").await,
+            PopularityResult::Unknown
+        );
+        server.verify().await;
     }
 
     #[tokio::test]

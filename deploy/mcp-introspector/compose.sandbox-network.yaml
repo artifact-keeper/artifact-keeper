@@ -1,0 +1,43 @@
+# Reference sandbox network for ak-mcp-introspector (#5253).
+# docs/security/mcp-sandbox.md, "Option A". Run as the worker's rootless user
+# (`podman-compose -f compose.sandbox-network.yaml up -d`, or
+# `docker compose` on a host dedicated to the worker).
+#
+# `ak-mcp-sandbox` is internal: no route out. npm and PyPI guests join it,
+# and their only peer is `ak-gateway`. That container answers on the AK
+# hostname (a network alias, so the guest's DNS lookup of the AK host
+# resolves to it) and forwards raw TCP to the real AK, so TLS and the
+# certificate stay end to end. OCI guests run with `--network=none` and
+# never join it.
+#
+# Replace ak.example.com (here and in nginx-ak-gateway.conf) with the host
+# of AK_URL.
+name: ak-mcp-sandbox
+
+services:
+  ak-gateway:
+    # Pin by digest in production (mirror it through an AK OCI repository).
+    image: docker.io/library/nginx:1.27-alpine
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID, CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./nginx-ak-gateway.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      sandbox:
+        aliases: [ak.example.com]
+      egress: {}
+    restart: unless-stopped
+
+networks:
+  # The network AK_MCP_SANDBOX_NETWORK names (default `ak-mcp-sandbox`).
+  sandbox:
+    name: ak-mcp-sandbox
+    internal: true
+  # The gateway's way out, to AK only (restrict it at the host firewall).
+  egress:
+    name: ak-mcp-sandbox-egress

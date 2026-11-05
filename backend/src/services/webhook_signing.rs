@@ -42,6 +42,17 @@ pub fn compute_v1_signature(secret: &str, unix_secs: i64, body: &[u8]) -> String
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// Value of the legacy `X-Webhook-Signature: sha256=<hex>` header: HMAC-SHA256
+/// over `body` alone. That header carries no timestamp, so signing
+/// `"<t>.<body>"` (as `v1=` does) would leave a receiver of it unable to
+/// verify (#5234). Removed with the legacy header set.
+pub fn compute_legacy_signature(secret: &str, body: &[u8]) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// Render the full `X-ArtifactKeeper-Signature` header value. `secrets`
 /// is ordered current-first so receivers that pin to the leftmost token
 /// stay on the freshest secret. An empty `secrets` slice returns an
@@ -206,6 +217,19 @@ pub fn within_replay_window(now: i64, signed_at: i64, window_secs: i64) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_signature_is_hmac_over_body_alone() {
+        // printf '%s' 'hello' | openssl dgst -sha256 -hmac whsec_x
+        assert_eq!(
+            compute_legacy_signature("whsec_x", b"hello"),
+            "1c7d3692ce8ced7295d06f7a6e02cddd5b50a8dcc894aca414d32e35cc3d6921"
+        );
+        assert_ne!(
+            compute_legacy_signature("whsec_x", b"hello"),
+            compute_v1_signature("whsec_x", 1_700_000_000, b"hello")
+        );
+    }
 
     #[test]
     fn signature_is_deterministic_and_hex_64() {

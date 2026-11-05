@@ -30,7 +30,7 @@ use crate::api::{
 };
 use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
-use crate::models::repository::RepositoryVisibility;
+use crate::models::repository::{is_deleting_key, RepositoryVisibility};
 use crate::models::user::User;
 use crate::services::auth_service::{AuthService, Claims};
 use crate::services::metrics_service::{
@@ -2177,6 +2177,14 @@ pub(crate) fn extract_repo_key(path: &str) -> Cow<'_, str> {
             segments.next(); // "<TOKEN>"
         }
     }
+    // Agent Plugins token-in-path routes (#5251, D8) put the credential in
+    // front of the repository key: `/agentplugins/t/<TOKEN>/<repo_key>/...`.
+    // The format refuses `t` as a repository key, so the pair is skipped only
+    // when a repository key and a document follow the token.
+    if format == "agentplugins" && agentplugins_url_token(trimmed).is_some() {
+        segments.next(); // "t"
+        segments.next(); // "<TOKEN>"
+    }
     // WASM plugin proxy routes are nested as
     //   /ext/<format_key>/<repo_key>/...
     // so the repository key is the THIRD path segment, not the second
@@ -2248,6 +2256,22 @@ pub(crate) fn extract_conda_url_token(path: &str) -> Option<&str> {
     // a repository fail with 401 for an *invalid credential* it never sent.
     // Same shape test `extract_repo_key` applies to the matching skip.
     segments.next()?;
+    Some(token)
+}
+
+/// Extract the credential from an Agent Plugins token-in-path URL,
+/// `agentplugins/t/<TOKEN>/<repo_key>/<document...>` (leading `/` already
+/// trimmed, #5251). Claude Code cannot attach a header to a marketplace it
+/// adds from a URL, so a private repository is read with a repository-scoped
+/// token in the path, the pattern conda's token channels use. `None` unless
+/// the token, the repository key and at least one more segment are present.
+pub(crate) fn agentplugins_url_token(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("agentplugins/t/")?;
+    let (token, rest) = rest.split_once('/')?;
+    let (repo_key, document) = rest.split_once('/')?;
+    if token.is_empty() || repo_key.is_empty() || document.is_empty() {
+        return None;
+    }
     Some(token)
 }
 
@@ -2335,6 +2359,9 @@ pub(crate) fn extract_visibility_token(request: &Request) -> ExtractedToken<'_> 
         return extracted;
     }
     if let Some(token) = extract_conda_url_token(request.uri().path()) {
+        return ExtractedToken::ApiKey(token);
+    }
+    if let Some(token) = agentplugins_url_token(request.uri().path().trim_start_matches('/')) {
         return ExtractedToken::ApiKey(token);
     }
     if let Some(token) = extract_nuget_push_api_key(request) {
@@ -2446,8 +2473,22 @@ fn is_non_mutating_format_post(path: &str) -> bool {
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
         // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
         Some("npm") => is_npm_audit_tail(segments),
+        // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
+        Some("mcp") => is_mcp_validate_tail(segments),
         _ => false,
     }
+}
+
+/// `<repo_key>/v0/validate` or `<repo_key>/v0.1/validate` — the remaining
+/// segments of the MCP registry's dry-run validation path after the leading
+/// `mcp` (#5253). `mcp-publisher validate` posts a server.json there with no
+/// credential; the handler writes nothing and scopes what it checks to what
+/// the caller may read. Exact match only.
+fn is_mcp_validate_tail<'a>(mut segments: impl Iterator<Item = &'a str>) -> bool {
+    matches!(segments.next(), Some(k) if !k.is_empty())
+        && matches!(segments.next(), Some("v0" | "v0.1"))
+        && segments.next() == Some("validate")
+        && segments.next().is_none()
 }
 
 /// The strict subset of [`is_non_mutating_format_post`] that a **public**
@@ -2472,6 +2513,13 @@ fn is_non_mutating_format_post(path: &str) -> bool {
 ///   `GET`s, so a public npm registry answered every audit with 401. The
 ///   handlers only look up advisories and never change AK state. Publish,
 ///   dist-tag and unpublish stay writes (they are `PUT`/`DELETE`).
+///
+/// * **MCP validate** — `POST /mcp/<repo_key>/{v0,v0.1}/validate` (#5253), the
+///   registry's dry run. `mcp-publisher validate` sends no credential; the
+///   handler writes nothing, and checks that depend on what the caller may
+///   read (version taken, package resolution) are skipped for an anonymous
+///   caller. A private registry still answers an anonymous caller 401, as
+///   every read does.
 ///
 /// git-lfs `objects/batch` and conan `users/authenticate` are deliberately NOT
 /// here. `batch` is an upload *and* download negotiation whose upload arm mints
@@ -2524,6 +2572,8 @@ fn is_anonymous_readable_format_post(path: &str) -> bool {
         Some("pypi") => is_pypi_xmlrpc_tail(segments),
         // /npm/<repo_key>/-/npm/v1/security/{advisories/bulk,audits/quick} (#4317)
         Some("npm") => is_npm_audit_tail(segments),
+        // /mcp/<repo_key>/{v0,v0.1}/validate (#5253)
+        Some("mcp") => is_mcp_validate_tail(segments),
         _ => false,
     }
 }
@@ -2799,6 +2849,15 @@ pub async fn repo_visibility_middleware(
         return not_found_response();
     }
 
+    // A repository whose delete job renamed it to `~deleting~<job id>` is
+    // being torn down. Answer the same existence-hiding 404 as a key that
+    // names no repository, without a DB query, so the temporary key is
+    // unreachable on every format route during the job. The lookup below also
+    // excludes the prefix as defense in depth (#5002).
+    if is_deleting_key(&repo_key) {
+        return not_found_response();
+    }
+
     // Check the shared repo cache first to avoid a DB round-trip on every
     // request.  The cache is populated with full repo metadata so that
     // format-handler resolvers (e.g. resolve_cargo_repo) can reuse it
@@ -2846,7 +2905,7 @@ pub async fn repo_visibility_middleware(
                  (SELECT value FROM repository_config \
                   WHERE repository_id = repositories.id \
                   AND key = 'index_upstream_url') AS index_upstream_url \
-                 FROM repositories WHERE key = $1",
+                 FROM repositories WHERE key = $1 AND key NOT LIKE '~deleting~%'",
             )
             .bind(&*repo_key)
             .fetch_optional(&vis_state.db)
@@ -3215,11 +3274,23 @@ pub async fn repo_visibility_middleware(
                 // public-repo write hole (any authed caller could PUT/DELETE)
                 // and the rules-less private-repo case (a read-only `viewer`
                 // member could write/delete). DB error fails closed (503).
-                match vis_state
-                    .permission_service
-                    .check_repository_action(ext.user_id, repo.id, action, false)
-                    .await
-                {
+                // #5253: on the MCP registry surface a namespace-conditioned
+                // rule counts here; the MCP write handler then decides the
+                // server name (`services::mcp_namespaces`). Anywhere else
+                // such a rule grants nothing.
+                let mcp_surface = repo.format == "mcp" && path.starts_with("/mcp/");
+                let decision = if mcp_surface {
+                    vis_state
+                        .permission_service
+                        .check_mcp_surface_action(ext.user_id, repo.id, action, false)
+                        .await
+                } else {
+                    vis_state
+                        .permission_service
+                        .check_repository_action(ext.user_id, repo.id, action, false)
+                        .await
+                };
+                match decision {
                     Ok(true) => {}
                     Ok(false) => return forbidden_permission_response(),
                     Err(_) => {
@@ -3561,6 +3632,43 @@ mod tests {
             .unwrap();
         let result = extract_token(&request);
         assert!(matches!(result, ExtractedToken::ApiKey("token-xyz")));
+    }
+
+    #[test]
+    fn agentplugins_token_path_resolves_repo_and_token_5251() {
+        let p = "/agentplugins/t/ak_tok/plugins/claude-marketplace.json";
+        assert_eq!(extract_repo_key(p), "plugins");
+        assert_eq!(
+            agentplugins_url_token(p.trim_start_matches('/')),
+            Some("ak_tok")
+        );
+        assert_eq!(
+            extract_repo_key("/agentplugins/t/tok/plugins/p/1.0.0/p-1.0.0.zip"),
+            "plugins"
+        );
+        // The plain routes keep the second segment.
+        assert_eq!(
+            extract_repo_key("/agentplugins/plugins/marketplace.json"),
+            "plugins"
+        );
+        for not_token in [
+            "agentplugins/t/tok/plugins",
+            "agentplugins/t/tok/plugins/",
+            "agentplugins/t//plugins/x",
+            "agentplugins/t/tok//x",
+            "agentplugins/plugins/x/y",
+            "conda/t/tok/plugins/x",
+        ] {
+            assert_eq!(agentplugins_url_token(not_token), None, "{not_token}");
+        }
+        let request = Request::builder()
+            .uri("/agentplugins/t/url-token-9/plugins/marketplace.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(matches!(
+            extract_visibility_token(&request),
+            ExtractedToken::ApiKey("url-token-9")
+        ));
     }
 
     #[test]
@@ -8997,6 +9105,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_5253_mcp_validate_post_is_anonymous_readable_and_non_mutating() {
+        for path in ["/mcp/reg/v0/validate", "/mcp/reg/v0.1/validate"] {
+            assert!(is_anonymous_readable_format_post(path), "{path}");
+            assert!(is_non_mutating_format_post(path), "{path}");
+        }
+        for path in [
+            "/mcp/reg/v0.1/publish",
+            "/mcp/reg/v0.1/validate/",
+            "/mcp/reg/v0.2/validate",
+            "/mcp//v0.1/validate",
+            "/mcp/reg/validate",
+            "/mcp/reg/v0.1/servers/a/validate",
+            "/npm/reg/v0.1/validate",
+        ] {
+            assert!(!is_anonymous_readable_format_post(path), "{path}");
+            assert!(!is_non_mutating_format_post(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_5253_mcp_validate_post_no_auth_passes_public_and_401s_private() {
+        let mcp = |is_public| CachedRepo {
+            format: "mcp".to_string(),
+            ..make_cached_repo(is_public)
+        };
+        for (key, public, want) in [
+            ("pubmcp", true, StatusCode::OK),
+            ("privmcp", false, StatusCode::UNAUTHORIZED),
+        ] {
+            let state = make_vis_state(Some((key.to_string(), mcp(public)))).await;
+            for v in ["v0", "v0.1"] {
+                let req = axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/mcp/{key}/{v}/validate"))
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap();
+                let resp = run_through_visibility(state.clone(), req).await;
+                assert_eq!(resp.status(), want, "{key} {v}");
+            }
+            // Publish stays an anonymous-write 401 on either.
+            let req = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/mcp/{key}/v0.1/publish"))
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            let resp = run_through_visibility(state.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{key} publish");
+        }
+    }
+
     #[tokio::test]
     async fn test_4317_npm_audit_post_no_auth_passes_on_public_repo() {
         let state = make_vis_state(Some(("pubnpm".to_string(), npm_cached_repo(true)))).await;
@@ -9645,6 +9804,7 @@ mod tests {
             "/huggingface//api/models/m/upload/main",
             StatusCode::NOT_FOUND,
         ),
+        (Method::POST, "/mcp//v0.1/publish", StatusCode::NOT_FOUND),
         (
             Method::POST,
             "/jetbrains//plugin/uploadPlugin",

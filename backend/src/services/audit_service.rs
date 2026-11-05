@@ -260,6 +260,62 @@ pub enum AuditAction {
     /// per minute so a CI loop retrying a blocked pull writes at most two
     /// rows a minute per replica; see [`record_proxy_scan_blocked`].
     ProxyScanBlocked,
+    /// An administrator accepted a finding: a decision about an advisory in a
+    /// component of specific bytes (#5153).
+    FindingAcknowledged,
+    /// An acknowledgement was revoked. One row per decision the revoke reached.
+    FindingAcknowledgementRevoked,
+    /// A promotion copied an acknowledgement into the target repository. The
+    /// actor is the promoter; the decision stays that of its original author.
+    FindingAcknowledgementCarried,
+    /// A promotion left an acknowledgement behind, because the promoter could not
+    /// acknowledge in the target. The finding is open there.
+    FindingAcknowledgementNotCarried,
+    /// An acknowledgement reached its expiry and stopped applying.
+    FindingAcknowledgementExpired,
+    /// An MCP server publish pinned one `packages[]` entry to an artifact or
+    /// image digest in a backing repository (#5253). One row per entry.
+    McpPackagePinned,
+    /// An OCI tag an MCP server version pinned moved to another digest. The
+    /// version keeps serving the pinned digest (#5253).
+    McpPinDriftDetected,
+    /// The MCP registry API refused to hand a held server version to a
+    /// client (#5253). Sampled per (version, caller) per minute.
+    McpServerDownloadRefused,
+    /// A server version was published to a hosted MCP registry, or ingested from upstream into a Remote one. (#5253).
+    McpServerPublished,
+    /// A server version's registry status (active, deprecated, deleted) changed. (#5253).
+    McpServerStatusChanged,
+    /// A Remote MCP registry approved a server name (or a name@version pin) for serving. (#5253).
+    McpServerApproved,
+    /// A Remote MCP registry blocked a server name (or a name@version pin). (#5253).
+    McpServerRejected,
+    /// An MCP approval was revoked back to review (an admin reopened it, or content drift re-queued it). (#5253).
+    McpServerReopened,
+    /// An upstream entry changed content under an already ingested name@version. (#5253).
+    McpServerContentDrift,
+    /// An MCP serve gate could not be evaluated and the surface answered 503 (fail closed). (#5253).
+    McpGateUnavailable,
+    /// A capability snapshot (tools/resources/prompts) was recorded for a server version. (#5253).
+    McpCapabilitiesIngested,
+    /// A new capability snapshot differs from the previous one for the same server version. (#5253).
+    McpToolsDrift,
+    /// A namespace-conditioned MCP publish grant was created or widened. (#5253).
+    McpNamespaceGranted,
+    /// A namespace-conditioned MCP publish grant was removed or narrowed. (#5253).
+    McpNamespaceRevoked,
+    /// An admin-initiated DNS/HTTP namespace proof verified. (#5253).
+    McpNamespaceProofVerified,
+    /// An admin-initiated DNS/HTTP namespace proof did not verify. (#5253).
+    McpNamespaceProofFailed,
+    /// An administrator replaced a server version's document (PUT admin edit). (#5253).
+    McpServerEdited,
+    /// A server version was soft-deleted (DELETE), leaving a tombstone. (#5253).
+    McpServerDeleted,
+    /// A Remote MCP registry finished an upstream sync run. (#5253).
+    McpMirrorSynced,
+    /// An MCPB bundle's signature did not verify and the upload was refused. (#5253).
+    McpBundleSignatureRejected,
 }
 
 impl AuditAction {
@@ -328,6 +384,11 @@ impl AuditAction {
             AuditAction::StorageScrubRun => "STORAGE_SCRUB_RUN",
             AuditAction::StorageReindexRun => "STORAGE_REINDEX_RUN",
             AuditAction::RepositoryAllowlistChanged => "REPOSITORY_ALLOWLIST_CHANGED",
+            AuditAction::FindingAcknowledged => "FINDING_ACKNOWLEDGED",
+            AuditAction::FindingAcknowledgementRevoked => "FINDING_ACKNOWLEDGEMENT_REVOKED",
+            AuditAction::FindingAcknowledgementCarried => "FINDING_ACKNOWLEDGEMENT_CARRIED",
+            AuditAction::FindingAcknowledgementNotCarried => "FINDING_ACKNOWLEDGEMENT_NOT_CARRIED",
+            AuditAction::FindingAcknowledgementExpired => "FINDING_ACKNOWLEDGEMENT_EXPIRED",
             AuditAction::QuarantineReleased => "QUARANTINE_RELEASED",
             AuditAction::QuarantineRejected => "QUARANTINE_REJECTED",
             AuditAction::PromotionApprovalGranted => "PROMOTION_APPROVAL_GRANTED",
@@ -368,6 +429,26 @@ impl AuditAction {
             AuditAction::DeviceAuthorizationExpired => "DEVICE_AUTHORIZATION_EXPIRED",
             AuditAction::DebianBackfillRun => "DEBIAN_BACKFILL_RUN",
             AuditAction::ProxyScanBlocked => "PROXY_SCAN_BLOCKED",
+            AuditAction::McpPackagePinned => "MCP_PACKAGE_PINNED",
+            AuditAction::McpPinDriftDetected => "MCP_PIN_DRIFT_DETECTED",
+            AuditAction::McpServerDownloadRefused => "MCP_SERVER_DOWNLOAD_REFUSED",
+            AuditAction::McpServerPublished => "MCP_SERVER_PUBLISHED",
+            AuditAction::McpServerStatusChanged => "MCP_SERVER_STATUS_CHANGED",
+            AuditAction::McpServerApproved => "MCP_SERVER_APPROVED",
+            AuditAction::McpServerRejected => "MCP_SERVER_REJECTED",
+            AuditAction::McpServerReopened => "MCP_SERVER_REOPENED",
+            AuditAction::McpServerContentDrift => "MCP_SERVER_CONTENT_DRIFT",
+            AuditAction::McpGateUnavailable => "MCP_GATE_UNAVAILABLE",
+            AuditAction::McpCapabilitiesIngested => "MCP_CAPABILITIES_INGESTED",
+            AuditAction::McpToolsDrift => "MCP_TOOLS_DRIFT",
+            AuditAction::McpNamespaceGranted => "MCP_NAMESPACE_GRANTED",
+            AuditAction::McpNamespaceRevoked => "MCP_NAMESPACE_REVOKED",
+            AuditAction::McpNamespaceProofVerified => "MCP_NAMESPACE_PROOF_VERIFIED",
+            AuditAction::McpNamespaceProofFailed => "MCP_NAMESPACE_PROOF_FAILED",
+            AuditAction::McpServerEdited => "MCP_SERVER_EDITED",
+            AuditAction::McpServerDeleted => "MCP_SERVER_DELETED",
+            AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
+            AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
         }
     }
 }
@@ -1821,6 +1902,118 @@ mod proxy_scan_blocked_4777_tests {
         assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
     }
+
+    /// #5253: the MCP registry vocabulary is a published contract
+    /// (`docs/audit-events.md`).
+    #[test]
+    fn mcp_action_names_and_outcomes() {
+        use crate::services::audit_export::Outcome;
+        for (action, name, outcome) in [
+            (
+                AuditAction::McpPackagePinned,
+                "MCP_PACKAGE_PINNED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpPinDriftDetected,
+                "MCP_PIN_DRIFT_DETECTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDownloadRefused,
+                "MCP_SERVER_DOWNLOAD_REFUSED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::McpServerPublished,
+                "MCP_SERVER_PUBLISHED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerStatusChanged,
+                "MCP_SERVER_STATUS_CHANGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerApproved,
+                "MCP_SERVER_APPROVED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerRejected,
+                "MCP_SERVER_REJECTED",
+                Outcome::Denied,
+            ),
+            (
+                AuditAction::McpServerReopened,
+                "MCP_SERVER_REOPENED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerContentDrift,
+                "MCP_SERVER_CONTENT_DRIFT",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpGateUnavailable,
+                "MCP_GATE_UNAVAILABLE",
+                Outcome::Failure,
+            ),
+            (
+                AuditAction::McpCapabilitiesIngested,
+                "MCP_CAPABILITIES_INGESTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpToolsDrift,
+                "MCP_TOOLS_DRIFT",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceGranted,
+                "MCP_NAMESPACE_GRANTED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceRevoked,
+                "MCP_NAMESPACE_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceProofVerified,
+                "MCP_NAMESPACE_PROOF_VERIFIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpNamespaceProofFailed,
+                "MCP_NAMESPACE_PROOF_FAILED",
+                Outcome::Failure,
+            ),
+            (
+                AuditAction::McpServerEdited,
+                "MCP_SERVER_EDITED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerDeleted,
+                "MCP_SERVER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpMirrorSynced,
+                "MCP_MIRROR_SYNCED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpBundleSignatureRejected,
+                "MCP_BUNDLE_SIGNATURE_REJECTED",
+                Outcome::Denied,
+            ),
+        ] {
+            assert_eq!(action.as_str(), name);
+            assert_eq!(action.outcome(), outcome);
+        }
+    }
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -2013,6 +2206,31 @@ mod tests {
     fn test_core_privileged_action_names_and_outcomes() {
         use crate::services::audit_export::Outcome;
         let cases = [
+            (
+                AuditAction::FindingAcknowledged,
+                "FINDING_ACKNOWLEDGED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementRevoked,
+                "FINDING_ACKNOWLEDGEMENT_REVOKED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementCarried,
+                "FINDING_ACKNOWLEDGEMENT_CARRIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementNotCarried,
+                "FINDING_ACKNOWLEDGEMENT_NOT_CARRIED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::FindingAcknowledgementExpired,
+                "FINDING_ACKNOWLEDGEMENT_EXPIRED",
+                Outcome::Success,
+            ),
             (
                 AuditAction::QuarantineReleased,
                 "QUARANTINE_RELEASED",

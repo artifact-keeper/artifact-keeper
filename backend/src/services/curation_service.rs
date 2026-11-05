@@ -991,7 +991,7 @@ impl CurationService {
         // One cached source for the whole batch: repeated evaluations of the
         // same package hit the in-memory TTL cache, not the public APIs.
         let popularity_source =
-            crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
+            crate::services::curation::popularity_source::HttpPopularitySource::from_env().cached();
 
         // #3230: re-evaluation must not lose a verification the scheduler
         // already computed and persisted. Without this the marker is per-tick

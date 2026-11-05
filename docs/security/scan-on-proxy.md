@@ -163,10 +163,16 @@ and so is Alpine's `libcrypto3` through its `origin`).
   are inconclusive and not scanned.
 - *Release, Debian.* The release the remote's own cached `Release` /
   `InRelease` names (`Origin` Debian or Ubuntu, then `Version` or
-  `Codename`), for the suite whose cached `Packages` index lists the file, or
-  else the one release every cached suite of the remote agrees on; failing
-  both, a stable-update or backport version (`+deb12u1`, `~bpo12+1`). The
-  remote's `Release` is cached by any `apt update` through it.
+  `Codename`), for the suite whose `Packages` index lists the file. The
+  remote's `Release` and index are cached by any `apt update` through it, and
+  an index a cached `Release` names is fetched and verified against it when no
+  client has fetched it. A file no such index lists, or whose suite's `Release`
+  is not cached, is graded on the release its version names (`+deb12u1`,
+  `~bpo12+1`, the rightmost marker when there are several), and is otherwise
+  inconclusive: another suite's release is never used. When a Debian suite and
+  the version's marker name different releases (`+deb11u1` in a Debian 12
+  suite), the package is inconclusive; a marker on an Ubuntu or derivative
+  package is not compared.
 - *Release, RPM.* The dist tag in the package's release: `el9` / `el9_2` is
   RHEL 9 (RHEL rebuilds such as Rocky, AlmaLinux and Oracle Linux are graded
   against the RHEL feed, as the scanner itself grades them), `fc40` Fedora 40,
@@ -276,6 +282,65 @@ Refusals answered outside the shared gate are not audited yet: a conda
 attestation sidecar of a blocked package, the NuGet digest-pinned row repair
 path, and OCI image pulls.
 
+## Previewing enforcement
+
+`record_only` refuses nothing, so the three views above are empty under it.
+To see what enforcement would refuse (#5232):
+
+- `GET /api/v1/security/proxy-blocked?would_block=true` applies each
+  repository's severity gate to its recorded verdicts whatever its current
+  action, using the same check the gate uses. The access rule and the
+  `repository`, `min_severity`, `page` and `per_page` parameters are those of
+  the list above. Each item also carries the repository's `proxy_scan_action`,
+  so what is refused today can be told from what `record_only` still serves.
+- `GET /api/v1/security/dashboard` returns `proxy_would_block`: the distinct
+  digests behind that list across repositories. It includes `proxy_blocked`,
+  and it is not added to `proxy_blocked` or `policy_violations_blocked`.
+
+Without `would_block` the list and its response are unchanged, and
+`policy-blocks` is not affected.
+
+The gate applied is the one enforcement would apply, which is not always the
+threshold on the settings page: with `block_on_policy_violation` off, any
+finding refuses, so a `low` verdict is listed under a `high` threshold. A
+`vulnerable` verdict with no recorded severity is always listed. A format whose
+proxy path runs no gate, and a repository with `scan_on_proxy` off, list
+nothing.
+
+### Files with no usable verdict
+
+These are never listed, because there is nothing to grade, but they are where
+`fail_closed` differs from the list. The response counts them in
+`would_block_summary`, in distinct digests:
+
+| Field | Which cached digests | Under `fail_closed`, on the next pull |
+| --- | --- | --- |
+| `would_block_digests` | Those behind the listed items | `403` |
+| `no_verdict` | No verdict recorded: not pulled since scanning was enabled, or the scan did not finish | Scanned inline |
+| `stale_verdict` | Verdict older than the 30-day window | Scanned inline |
+| `clean_graded_nothing` | `clean`, no findings, no component cataloged, no pin | Scanned inline |
+
+An inline scan decides there and then: served if clean or below the threshold,
+`403` if the gate refuses the result, and `423` if the scan is inconclusive (no
+scanner, over the 200 MiB cap, over the time budget) or what the bytes are
+served as cannot be established. `record_only` and `fail_open` serve all three
+kinds. So these counts are the pulls that will wait on a scan after the switch
+and may be refused, not a count of refusals. A large `no_verdict` is a reason to
+pull or rescan before enforcing.
+
+The counts cover the catalog the `proxy-scans` summary reads, where the same
+files show as `not_scanned`: cached index documents and npm packuments are left
+out, but a file the format serves without gating it, such as a Maven POM or a
+Debian `Release`, is counted although `fail_closed` serves it anyway. Read them
+as an upper bound. They ignore `min_severity`.
+
+The preview reads stored verdicts only, as `proxy_blocked` does. A pull can
+still come out differently when the CVE database has advanced since the verdict
+(the bytes are scanned again), when a format reuses a verdict only for the
+coordinate it was graded as (Go, Composer, Conan, Debian, RPM, Alpine), and on
+a Virtual route, where the stricter of the two repositories' policies applies
+and each repository here is judged on its own settings.
+
 ## Actions
 
 | `proxy_scan_action` | First pull of unknown bytes | Vulnerable | Inconclusive (over the byte cap, scan error, timeout, identity mismatch) |
@@ -288,6 +353,93 @@ path, and OCI image pulls.
 pull is scanned and recorded, and no pull is withheld. An object over the
 200 MiB cap is never buffered. Under `fail_closed` it is `423`. Otherwise it
 streams unscanned with `X-AK-Scan: pending`.
+
+### When scans queue
+
+A first install asks for many never-seen files at once, and only
+`MAX_CONCURRENT_SCAN_EXTRACTIONS` scans (default 4, shared with upload scans)
+run at a time, so most of them queue. A file scan runs in a task of its own and
+requests wait on it:
+
+| Limit | Value | What happens at the limit |
+| --- | --- | --- |
+| A `fail_closed` request waiting for its scan to start | 60 seconds, `AK_PROXY_SCAN_QUEUE_WAIT_SECS` | `423 scan_pending`. The scan keeps its place in the queue. |
+| A `fail_closed` request waiting for a running scan | 30 seconds from when the scan started, or from when the request arrived if that is later | `423 scan_pending`. The scan keeps running. |
+| Any `fail_closed` wait | Three quarters of `GLOBAL_REQUEST_TIMEOUT_SECS` after the request arrived, including the time spent fetching the file (90 seconds at the default of 120) | `423 scan_pending`, in place of the router's `503`. The scan carries on as above. |
+| A queued `fail_closed` scan with no request waiting on it | 30 seconds after the last request went, whether it was refused or hung up | The scan leaves the queue without running. The next pull starts it again. |
+| A running scan, with or without a request waiting | 120 seconds | The scan is killed and the file has no verdict. The next pull scans it again. |
+| Writing a scan's verdict, and then its inventory and CVE detail | 30 seconds each | A verdict not written in time is inconclusive. Detail not written in time is left out, and the verdict stands. |
+
+A scan's permit is free once it has run, before any of those writes, and waiting
+requests are answered once the verdict row is written.
+
+The scans waiting and the requests waiting on them are limited too, because each
+holds memory or a router slot:
+
+| Limit | Overall | Per repository |
+| --- | --- | --- |
+| Scans in flight, queued and running | 4,096 | 1,024 |
+| Bytes held in memory | 1 GiB, `AK_PROXY_SCAN_QUEUE_BUDGET_BYTES` (never below 400 MiB) | Half of the overall value |
+| Requests waiting | | 256, and 16 on any one scan |
+
+The bytes count each file being scanned and the separate copy held by a request
+that joined a scan. A file or request past one of these limits gets no scan for
+now: `423` under `fail_closed`, served `pending` otherwise, with no verdict until
+a later pull finds room. Each one counts in
+[`ak_proxy_scan_queue_refused_total`](../operations/detection-metrics.md#proxy-scans),
+labelled with the limit, and one dropped from the queue counts in
+`ak_proxy_scan_abandoned_total`.
+
+A `423 scan_pending` therefore means what its body says: retry shortly. A retry
+to the same backend while the scan runs joins it, and one after the scan ends gets
+its verdict: the file is served, or `403` if the verdict blocks it. A
+`fail_closed` repository still serves no byte without a verdict. If another verdict
+is recorded for the same bytes while a scan runs, that one stands, and requests
+waiting on the scan get `423`, then that verdict on their retry.
+
+The table of scans belongs to one backend process:
+
+- A retry that reaches another replica starts a second scan there. Both record a
+  verdict for the digest, and whichever finishes second gets `423` and reads the
+  first one's verdict on retry.
+- A restart loses whatever was queued or running, and the next pull starts it
+  again. Scans do not hold up a shutdown; a request still waiting on one does, for
+  as long as its wait lasts, as any in-flight request does.
+
+Under `fail_open` and `record_only` the response does not wait for any of this, so
+an install can finish well before its verdicts do. Those scans are not dropped from
+the queue. A file past the limits has no verdict until a later pull, so check
+`ak_proxy_scan_queue_refused_total` after a first install of more than 1,024 unique
+files, which is the likely way to reach them.
+
+One repository cannot take the whole table, but this is not fair sharing. Two
+repositories at their byte limit fill the overall limit, and a repository's backlog
+makes that repository's own new files wait: a large `record_only` install can make a
+`fail_closed` pull from the same repository wait, and get `423` past the limits
+above. How fast a backlog drains depends on the scan permits, which are shared
+with upload scans.
+
+Image manifests are not part of this: a manifest scan runs on its request with a
+budget of 120 seconds, and its wait for a permit counts against that budget.
+
+### Timeouts in front of the gate
+
+A `fail_closed` request can wait up to 90 seconds with no bytes on the wire, so
+what sits in front of the backend needs to allow for it:
+
+| In front of the backend | Default | What happens past it |
+| --- | --- | --- |
+| nginx, ingress-nginx `proxy_read_timeout` | 60 s | The client gets `504`. The scan carries on for the retry. |
+| npm `fetch-timeout` | 300 s | No effect at these limits. npm retries a `504` but not a `423`. |
+| pip `--timeout` | 15 s | pip retries, joining the scan. |
+| cargo `http.timeout` | 30 s | cargo retries, joining the scan. |
+| apt `Acquire::http::Timeout` | 120 s | No effect at these limits. |
+
+To keep the `423`, set the proxy's read timeout above 90 seconds on the package
+routes, or lower `AK_PROXY_SCAN_QUEUE_WAIT_SECS` so that the wait plus the 30-second
+budget fits inside it. A lower wait refuses more of a first install on a small host;
+see [the OCI timeouts page](../operations/oci-reverse-proxy-timeouts.md) for how to
+set the timeout on each proxy.
 
 ## Verdicts and freshness
 
@@ -549,6 +701,8 @@ have no core proxy path to gate.
 | `protobuf` | `protobuf` | accepted | |
 | `incus` | `incus`, `lxc` | accepted | |
 | `pacman` | `pacman` | accepted | |
+| `agentplugins` | `agentplugins` | accepted | Hosted only: there is no proxied download to gate. Uploads are scanned on publish. |
+| `mcp` | `mcp` | accepted | |
 <!-- coverage-table:end -->
 
 ## Known gaps

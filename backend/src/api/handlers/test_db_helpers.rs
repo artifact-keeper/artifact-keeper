@@ -695,6 +695,7 @@ fn cfg(storage_path: &str) -> Config {
         auth_max_concurrency: crate::services::auth_service::TEST_AUTH_MAX_CONCURRENCY,
         global_max_concurrency: 512,
         global_request_timeout_secs: 120,
+        proxy_scan_queue_wait_secs: 60,
         http_header_read_timeout_secs: 10,
         http_listen_backlog: 0,
         upload_progress_window_secs: 60,
@@ -767,6 +768,7 @@ fn cfg(storage_path: &str) -> Config {
         npm_attestation_negative_cache_enabled: true,
         npm_attestation_negative_cache_ttl_secs: 86_400,
         npm_upstream_feed_enabled: false,
+        upstream_jobs_paused: false,
         npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
             .into(),
         scan_token_ttl_seconds: 300,
@@ -1538,6 +1540,82 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
         "proxy cache never committed (content + __cache_meta__.json sidecar) under {}",
         dir.display()
     );
+}
+
+/// Drop a wiremock [`MockServer`](wiremock::MockServer) from a task that may
+/// have just spent its whole Tokio coop budget.
+///
+/// `MockServer`'s `Drop` runs `futures::executor::block_on(self.verify())`,
+/// which takes a Tokio `RwLock`, on the test's own runtime thread. That lock
+/// charges the coop budget. A test whose last poll spent all 128 units gets
+/// `Pending` from it even though the lock is free, and the wake-up is deferred
+/// to the runtime, which cannot run because `block_on` has parked its thread.
+/// The test then hangs forever at 0% CPU: no timer can fire and no panic is
+/// raised.
+///
+/// Reading a body from the warm proxy cache spends one unit per 64 KiB when
+/// each `spawn_blocking` read has finished by the time it is polled, which a
+/// CPU-saturated machine makes possible, so a body of about 8 MiB or more can
+/// land the budget on exactly zero. Yielding first ends the poll, and the next
+/// one starts with a fresh budget. Use this instead of `drop(server)` after
+/// reading such a body.
+pub async fn drop_mock_server(server: wiremock::MockServer) {
+    tokio::task::yield_now().await;
+    drop(server);
+}
+
+/// #5322: mount a counting upstream for `path` on `server`. A `HEAD` is
+/// answered with `headers` and a `Content-Length` of `body` (no body), a `GET`
+/// with `headers` and `body`. Each mock expects exactly ONE request, verified
+/// when `server` is dropped, so a test that sends a HEAD and two GETs proves
+/// the body left the upstream once and the HEAD was answered by a HEAD.
+pub async fn mount_head_and_get_once(
+    server: &wiremock::MockServer,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) {
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mut head =
+        ResponseTemplate::new(200).insert_header("content-length", body.len().to_string().as_str());
+    let mut get = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    for (name, value) in headers {
+        head = head.insert_header(*name, *value);
+        get = get.insert_header(*name, *value);
+    }
+    Mock::given(method("HEAD"))
+        .and(wm_path(path))
+        .respond_with(head)
+        .expect(1)
+        .named("upstream HEAD")
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path(path))
+        .respond_with(get)
+        .expect(1)
+        .named("upstream GET of the body")
+        .mount(server)
+        .await;
+}
+
+/// #5322: the `hf_hub_download` request shape against a cold Remote: `HEAD
+/// uri`, then `GET uri`, then (once the proxy cache has committed the body)
+/// `GET uri` again. Returns the three `(status, body, headers)` answers.
+/// `app` builds a fresh router per request, as `oneshot` consumes it.
+pub async fn cold_head_then_two_gets(
+    app: impl Fn() -> Router,
+    uri: &str,
+    cache_dir: &std::path::Path,
+    body_len: u64,
+) -> [(StatusCode, Bytes, axum::http::HeaderMap); 3] {
+    let head_answer = send_with_headers(app(), head(uri.to_string())).await;
+    let cold_get = send_with_headers(app(), get(uri.to_string())).await;
+    wait_for_cache_commit(cache_dir, body_len).await;
+    let warm_get = send_with_headers(app(), get(uri.to_string())).await;
+    [head_answer, cold_get, warm_get]
 }
 
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".
@@ -3719,6 +3797,28 @@ pub fn captured_metric<'a>(
                 .all(|(k, val)| l.iter().any(|(lk, lv)| lk == k && lv == val));
         (n == name && same).then_some(v)
     })
+}
+
+/// A minimal npm tarball (`package/package.json` naming `name`@`version`), as
+/// `npm pack` lays it out. The generic upload finalizes a `.tgz` at an npm
+/// layout path from it (#5254), so a fixture standing in for a published
+/// tarball must be a real one.
+pub fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let package_json = serde_json::json!({ "name": name, "version": version }).to_string();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(package_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, package_json.as_bytes()).unwrap();
+        builder.finish().unwrap();
+    }
+    gz.flush().unwrap();
+    gz.finish().unwrap()
 }
 
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the

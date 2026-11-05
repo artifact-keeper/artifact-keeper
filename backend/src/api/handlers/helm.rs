@@ -968,34 +968,50 @@ async fn upload_chart(
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
-    // Spool the .tgz straight to a bounded scratch file instead of buffering
-    // the whole archive in memory. See proxy_helpers::stage_upload_field.
+    // Stage the .tgz on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole archive in
+    // memory. See repositories::stage_upload_field_for_repo.
     //
     // #2635: the `prov` part is staged too rather than being dropped on the
     // floor. The loop no longer breaks on `chart` because ChartMuseum clients
     // may send the parts in either order, and a part that is never read is a
     // part that gets silently discarded.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
-    let mut staged_prov: Option<proxy_helpers::StagedUpload> = None;
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
+    let mut staged_prov: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         (StatusCode::BAD_REQUEST, format!("Invalid multipart: {}", e)).into_response()
     })? {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
-            "chart" => staged = Some(proxy_helpers::stage_upload_field(&state, field).await?),
-            "prov" => staged_prov = Some(proxy_helpers::stage_upload_field(&state, field).await?),
+            "chart" => {
+                staged = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                )
+            }
+            "prov" => {
+                staged_prov = Some(
+                    super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?,
+                )
+            }
             _ => {}
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing 'chart' field").into_response())?;
 
     // Validate the provenance before the chart is committed, so a bad prov
     // fails the whole upload instead of leaving a chart that advertises
     // provenance it cannot serve.
-    if let Some(prov) = staged_prov.as_ref() {
-        let head = read_prov_head(prov.path()).await?;
+    if let Some((prov, _prov_digests)) = staged_prov.as_ref() {
+        let local = super::repositories::materialize_staged_for_repo(&state, &repo, prov).await?;
+        let head = read_prov_head(local.path()).await?;
         validate_prov_bytes(&head).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -1005,21 +1021,25 @@ async fn upload_chart(
         })?;
     }
 
-    // Extract and validate Chart.yaml from the staged archive on disk, reading
-    // only the Chart.yaml entry (bounded memory) rather than the whole package.
+    // Extract and validate Chart.yaml from the staged archive, reading only the
+    // Chart.yaml entry (bounded memory) rather than the whole package.
     // #2561: permit held across the blocking decode, fast-fail 503 on saturation.
-    let chart_yaml = crate::util::bounded_archive::with_ingest_extraction_async(|| {
-        extract_chart_yaml_from_staged(staged.path())
-    })
-    .await
-    .map_err(|e| e.into_response())?
-    .map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("Invalid chart package: {}", e),
-        )
-            .into_response()
-    })?;
+    let chart_yaml = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        crate::util::bounded_archive::with_ingest_extraction_async(|| {
+            extract_chart_yaml_from_staged(local.path())
+        })
+        .await
+        .map_err(|e| e.into_response())?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chart package: {}", e),
+            )
+                .into_response()
+        })?
+    };
 
     let chart_name = &chart_yaml.name;
     let chart_version = &chart_yaml.version;
@@ -1071,10 +1091,18 @@ async fn upload_chart(
     // by that retry -- the storage key is fully determined by chart name and
     // version.
 
-    // Stream the staged archive into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash pass).
+    // Stream the staged archive into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     let size_bytes = put.bytes_written as i64;
@@ -1086,9 +1114,17 @@ async fn upload_chart(
     // serve.
     let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
     let prov_put = match staged_prov {
-        Some(prov) => {
-            Some(proxy_helpers::put_artifact_stream(&state, &repo, &prov_storage_key, prov).await?)
-        }
+        Some((prov, prov_digests)) => Some(
+            proxy_helpers::put_staged_body(
+                &state,
+                &repo,
+                super::publish_quota::PublishAt::StorageKey(&prov_storage_key),
+                &prov_storage_key,
+                prov,
+                &prov_digests,
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -3182,6 +3218,88 @@ entries:
         assert!(index.entries.contains_key("trust-manager"));
     }
 
+    /// #5277: charts.rancher.io lists local subcharts (`repository: file://...`)
+    /// with no dependency `version`, which Helm accepts. The whole Remote index
+    /// answered 502 because of them, so every chart in the repository was
+    /// unreachable, including charts with no such dependency.
+    #[tokio::test]
+    async fn test_remote_index_yaml_with_versionless_dependency_5277() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = r#"apiVersion: v1
+generated: "2025-06-01T00:00:00Z"
+entries:
+  epinio:
+    - apiVersion: v2
+      appVersion: v1.10.0
+      created: "2024-06-01T00:00:00Z"
+      dependencies:
+        - condition: global.dex.enabled
+          name: dex
+          repository: file://./charts/dex
+          tags:
+            - dex
+      digest: bbbb2222
+      name: epinio
+      urls:
+        - assets/epinio/epinio-103.0.2+up1.10.0.tgz
+      version: 103.0.2+up1.10.0
+    - name: epinio
+      digest: broken-entry-without-version
+  rancher-backup:
+    - apiVersion: v2
+      created: "2024-06-01T00:00:00Z"
+      digest: cccc3333
+      name: rancher-backup
+      urls:
+        - assets/rancher-backup/rancher-backup-105.0.0+up6.0.0.tgz
+      version: 105.0.0+up6.0.0
+"#;
+
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream.as_bytes()))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a dependency without `version` is valid Helm and must not 502 the index: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let index = parse_index(&body);
+        assert_eq!(index.entries["rancher-backup"].len(), 1);
+        let epinio = &index.entries["epinio"];
+        assert_eq!(
+            epinio.len(),
+            1,
+            "the unreadable entry is skipped, the valid one is served"
+        );
+        let dep = &epinio[0].chart.dependencies.as_ref().unwrap()[0];
+        assert_eq!(dep.name, "dex");
+        assert_eq!(dep.version, None);
+
+        let served: serde_yaml::Value = serde_yaml::from_slice(&body).unwrap();
+        assert!(
+            served["entries"]["epinio"][0]["dependencies"][0]
+                .get("version")
+                .is_none(),
+            "the proxied index must not invent a dependency version"
+        );
+    }
+
     /// The two upstream failures an operator actually hits: the upstream is
     /// down (5xx), and the upstream URL is wrong so `index.yaml` 404s — the
     /// more common misconfiguration of the two. Neither may answer 200 with an
@@ -3337,9 +3455,9 @@ entries:
 
     /// #3448: an upstream index is parsed as ONE document, so a single
     /// non-conforming entry must not take the whole repository's discovery with
-    /// it. `urls`, `created`, `digest` and `generated` default; `name` and
-    /// `version` remain required because there is nothing to advertise without
-    /// them.
+    /// it. `urls`, `created`, `digest` and `generated` default; an entry
+    /// without `name` or `version` has nothing to advertise and is skipped
+    /// (see `test_upstream_index_entry_without_a_name_is_skipped`).
     #[test]
     fn test_upstream_index_entry_missing_optional_fields_still_parses() {
         let yaml = r#"apiVersion: v1
@@ -3364,18 +3482,31 @@ entries:
         );
     }
 
+    /// An entry with no chart name cannot be advertised, so it is dropped;
+    /// like Helm's index loader, the rest of the index is still served
+    /// (#5277) instead of the whole document failing.
     #[test]
-    fn test_upstream_index_entry_without_a_name_is_still_rejected() {
+    fn test_upstream_index_entry_without_a_name_is_skipped() {
         let yaml = r#"apiVersion: v1
 entries:
   nameless:
     - apiVersion: v2
       version: 1.0.0
+  named:
+    - apiVersion: v2
+      name: named
+      version: 1.0.0
 "#;
-        assert!(
-            serde_yaml::from_str::<HelmIndex>(yaml).is_err(),
-            "an entry with no chart name cannot be advertised and must stay a parse error"
+        let index: HelmIndex =
+            serde_yaml::from_str(yaml).expect("one unusable entry must not fail the index");
+        let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the named entry is advertised, got {out:?}"
         );
+        assert_eq!(out[0].1, "charts/named-1.0.0.tgz");
     }
 
     /// #3448: the proxied index rebuilds every URL from a third party's
@@ -3931,7 +4062,7 @@ entries:
         }
 
         // `.expect(1)` on the chart mock is verified on server drop.
-        drop(server);
+        tdh::drop_mock_server(server).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

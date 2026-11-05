@@ -1649,10 +1649,14 @@ async fn upload_collection(
     // older clients still send a `collection` or `metadata` JSON field, so
     // accept either source for the namespace/name/version. The filename
     // takes precedence because it is what the CLI ships with.
-    // Spool the tarball straight to a bounded scratch file instead of buffering
-    // the whole body in memory; the small text/JSON fields are still read
-    // in-hand. See proxy_helpers::stage_upload_field / put_artifact_stream.
-    let mut staged: Option<proxy_helpers::StagedUpload> = None;
+    // Stage the tarball on the repository's backend when it streams natively,
+    // else in bounded local scratch, instead of buffering the whole body in
+    // memory; the small text/JSON fields are still read in-hand. See
+    // repositories::stage_upload_field_for_repo.
+    let mut staged: Option<(
+        super::repositories::GenericStagedBody,
+        crate::services::artifact_service::ContentDigests,
+    )> = None;
     let mut file_name: Option<String> = None;
     let mut declared_sha256: Option<String> = None;
     let mut collection_json: Option<serde_json::Value> = None;
@@ -1665,7 +1669,8 @@ async fn upload_collection(
         let field_name = field.name().unwrap_or("").to_string();
         if field_name == "file" {
             file_name = field.file_name().map(|s| s.to_string());
-            staged = Some(proxy_helpers::stage_upload_field(&state, field).await?);
+            staged =
+                Some(super::repositories::stage_upload_field_for_repo(&state, &repo, field).await?);
         } else if field_name == "sha256" {
             declared_sha256 = Some(field.text().await.map_err(|e| {
                 (
@@ -1694,7 +1699,7 @@ async fn upload_collection(
         }
     }
 
-    let staged =
+    let (staged, digests) =
         staged.ok_or_else(|| (StatusCode::BAD_REQUEST, "Missing file field").into_response())?;
     if staged.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Empty tarball").into_response());
@@ -1790,21 +1795,33 @@ async fn upload_collection(
     // the staged file before the tarball is streamed away, and let an optional
     // client-sent `collection`/`metadata` part overlay the keys it actually
     // carries so those clients keep the behaviour they had.
-    let collection_json = match (
-        extract_collection_info_from_staged(staged.path()).await,
-        collection_json,
-    ) {
-        (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(sent))) => {
-            base.extend(sent);
-            Some(serde_json::Value::Object(base))
+    let collection_json = {
+        let local =
+            super::repositories::materialize_staged_for_repo(&state, &repo, &staged).await?;
+        match (
+            extract_collection_info_from_staged(local.path()).await,
+            collection_json,
+        ) {
+            (Some(serde_json::Value::Object(mut base)), Some(serde_json::Value::Object(sent))) => {
+                base.extend(sent);
+                Some(serde_json::Value::Object(base))
+            }
+            (manifest, sent) => sent.or(manifest),
         }
-        (manifest, sent) => sent.or(manifest),
     };
 
-    // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
-    // which computes the SHA-256 incrementally as it copies (no re-hash).
+    // Stream the staged tarball into the repo's StorageBackend, from local
+    // scratch or by copying the object the backend already staged (#4990).
     let storage_key = format!("ansible/{}/{}/{}", full_name, collection_version, filename);
-    let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
+    let put = proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
     let computed_sha256 = put.checksum_sha256;
 
     // If the client supplied a digest, verify the upload was not corrupted in

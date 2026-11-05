@@ -16,7 +16,7 @@ catalog use) and the version is the path's version directory.
 
 | Request | With the gate on |
 |---|---|
-| Any file in a version directory: `.pom`, `.jar`, `.war`, `.module`, `-sources.jar`, classifier archives | Served when the version is old enough or its review is approved; otherwise `451` with the shared `age_gate_blocked` body (`review_id`, `package`, `version`, `min_age_days`, `requested_age_days`) and a pending review. A refused file is neither fetched nor cached; the gate only reads the version's POM, uncached, to date it. |
+| Any file in a version directory: `.pom`, `.jar`, `.war`, `.module`, `-sources.jar`, classifier archives | Served when the version is old enough or its review is approved; otherwise `451` with the shared `age_gate_blocked` body (`review_id`, `package`, `version`, `min_age_days`, `requested_age_days`) and a pending review. The `451` carries `Cache-Control: no-store` (RFC 7725 makes a `451` cacheable by default; this hold is lifted by a review or by time). A refused file is neither fetched nor cached; the gate only reads the version's POM, uncached, to date it. |
 | That file's `.sha1`, `.md5`, `.sha256`, `.sha512`, `.asc` | Answers exactly as the file does (the same `451`). |
 | GA-level `g/a/maven-metadata.xml` | Withheld versions are removed from `<versions>`; `<latest>` and `<release>` are re-pointed to the newest remaining version (release: newest non-SNAPSHOT). When nothing is withheld the upstream bytes are served unchanged. |
 | `g/a/maven-metadata.xml.sha1` (and the other digests) | Computed from the served (filtered) metadata, so it always matches. |
@@ -48,6 +48,9 @@ memory per repository and upstream for a day. A version whose POM carries
 no parseable `Last-Modified` has no publish time and is withheld with the
 `451` (the same rule every format follows). If your upstream sends no
 `Last-Modified`, use `first_seen`.
+
+A minimum age of 0 needs no date: nothing above is consulted for it, so an
+unreadable POM does not refuse the download. A rejected review still blocks.
 
 A version whose POM the upstream does not have (`404` or `410`) answers a
 plain `404` and records no review, as an ungated Remote would: nothing is

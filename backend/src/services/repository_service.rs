@@ -11,7 +11,8 @@ use crate::api::validation::validate_outbound_url;
 use crate::error::{AppError, Result};
 #[allow(unused_imports)] // Used by sqlx query macros
 use crate::models::repository::{
-    ReplicationPriority, Repository, RepositoryFormat, RepositoryType, RepositoryVisibility,
+    is_deleting_key, ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    RepositoryVisibility,
 };
 use crate::services::opensearch_service::{OpenSearchService, RepositoryDocument};
 
@@ -1007,12 +1008,14 @@ pub(crate) fn parse_format_str(s: &str) -> Option<RepositoryFormat> {
         "gitlfs" => Some(RepositoryFormat::Gitlfs),
         "vscode" => Some(RepositoryFormat::Vscode),
         "jetbrains" => Some(RepositoryFormat::Jetbrains),
+        "agentplugins" => Some(RepositoryFormat::AgentPlugins),
         "huggingface" => Some(RepositoryFormat::Huggingface),
         "mlmodel" => Some(RepositoryFormat::Mlmodel),
         "cran" => Some(RepositoryFormat::Cran),
         "vagrant" => Some(RepositoryFormat::Vagrant),
         "opkg" => Some(RepositoryFormat::Opkg),
         "pacman" => Some(RepositoryFormat::Pacman),
+        "mcp" => Some(RepositoryFormat::Mcp),
         "p2" => Some(RepositoryFormat::P2),
         "bazel" => Some(RepositoryFormat::Bazel),
         "protobuf" => Some(RepositoryFormat::Protobuf),
@@ -1669,7 +1672,15 @@ impl RepositoryService {
     }
 
     /// Get a repository by key
+    ///
+    /// A repository whose delete job renamed it to `~deleting~<job id>` is
+    /// treated as absent: its key is free for re-creation and its rows are
+    /// about to disappear, so no by-key surface may keep addressing it. The
+    /// delete worker resolves the repository by id instead.
     pub async fn get_by_key(&self, key: &str) -> Result<Repository> {
+        if is_deleting_key(key) {
+            return Err(AppError::NotFound("Repository not found".to_string()));
+        }
         let repo = sqlx::query_as!(
             Repository,
             r#"
@@ -1752,6 +1763,7 @@ impl RepositoryService {
               AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($7::uuid IS NULL OR project_id = $7)
+              AND key NOT LIKE '~deleting~%'
               AND NOT EXISTS (SELECT 1 FROM repository_delete_jobs j
                                WHERE j.repository_id = repositories.id
                                  AND j.status IN ('pending', 'running'))
@@ -1788,6 +1800,7 @@ impl RepositoryService {
               AND ({visibility_clause})
               AND ($4::text IS NULL OR LOWER(key) LIKE $4 ESCAPE '\' OR LOWER(name) LIKE $4 ESCAPE '\' OR LOWER(COALESCE(description, '')) LIKE $4 ESCAPE '\')
               AND ($5::uuid IS NULL OR project_id = $5)
+              AND key NOT LIKE '~deleting~%'
               AND NOT EXISTS (SELECT 1 FROM repository_delete_jobs j
                                WHERE j.repository_id = repositories.id
                                  AND j.status IN ('pending', 'running'))

@@ -51,6 +51,7 @@ use crate::error::{AppError, Result};
 use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
 use crate::services::cluster_work::WorkerIdentity;
 use crate::services::npm_packument_cache::{self, NpmPackumentCache};
+use crate::services::upstream_pause::{self, DbPauseProbe, PauseProbe, UpstreamPauseGate};
 use crate::services::upstream_tracing::send_upstream;
 
 /// Advisory-lock class for upstream-feed consumers. Distinct from
@@ -735,6 +736,10 @@ pub struct NpmUpstreamFeedStatus {
     /// the replica steps down. Only the leader polls, so a non-leader replica
     /// reports `null` here unless it failed to start the consumer.
     pub last_error: Option<String>,
+    /// Whether scheduled upstream jobs are paused (#5288): while `true` the
+    /// consumer takes no leadership and makes no feed request; it resumes
+    /// from `cursor` once the switch is off.
+    pub upstream_jobs_paused: bool,
 }
 
 /// Shown as `feed_url` when the configured value is not a usable URL: it may
@@ -818,6 +823,7 @@ pub async fn npm_feed_status(
         cluster_leader_active,
         leader_term_secs: LEADER_TERM.as_secs(),
         last_error: live.last_error(),
+        upstream_jobs_paused: upstream_pause::upstream_jobs_paused(pool).await,
     })
 }
 
@@ -839,6 +845,8 @@ pub struct FeedConsumer {
     backoff_initial: Duration,
     backoff_max: Duration,
     status: Arc<FeedStatus>,
+    /// The #5288 switch; `None` never pauses.
+    pause: Option<Arc<dyn PauseProbe>>,
 }
 
 impl FeedConsumer {
@@ -860,6 +868,22 @@ impl FeedConsumer {
             backoff_initial: FEED_BACKOFF_INITIAL,
             backoff_max: FEED_BACKOFF_MAX,
             status: Arc::new(FeedStatus::default()),
+            pause: None,
+        }
+    }
+
+    /// Skip leadership and every feed request while `probe` reports scheduled
+    /// upstream jobs paused (#5288).
+    pub fn with_pause_probe(mut self, probe: Arc<dyn PauseProbe>) -> Self {
+        self.pause = Some(probe);
+        self
+    }
+
+    /// Whether the #5288 switch holds this consumer off right now.
+    async fn paused(&self, gate: &mut UpstreamPauseGate) -> bool {
+        match &self.pause {
+            Some(probe) => gate.skip_tick_with(probe.as_ref()).await,
+            None => false,
         }
     }
 
@@ -899,9 +923,18 @@ impl FeedConsumer {
         // across leadership terms so a permanently-broken feed escalates to
         // warn even though each bootstrap failure ends its term.
         let mut failures: u32 = 0;
+        let mut pause = UpstreamPauseGate::new(upstream_pause::NPM_UPSTREAM_FEED_JOB);
         loop {
             if self.cancel.is_cancelled() {
                 return;
+            }
+            // #5288: a paused consumer neither leads nor polls; the stored
+            // cursor is where it resumes.
+            if self.paused(&mut pause).await {
+                if cancelled_within(&self.cancel, self.leader_retry).await {
+                    return;
+                }
+                continue;
             }
             let lease = match self
                 .lock
@@ -936,7 +969,8 @@ impl FeedConsumer {
                 "upstream feed consumer: leadership acquired"
             );
             self.status.set_leader(true);
-            self.consume_for_one_term(&feed_key, &mut failures).await;
+            self.consume_for_one_term(&feed_key, &mut failures, &mut pause)
+                .await;
             // Step down at term end (or cancellation) and re-contend, so a
             // lock silently lost to a dead connection converges back to a
             // single consumer within one term instead of persisting until
@@ -956,7 +990,12 @@ impl FeedConsumer {
     /// One leadership term: poll, apply actions, persist the cursor; back
     /// off on feed errors. Returns at term end or on cancellation. `failures`
     /// is the run-wide consecutive-failure counter driving log escalation.
-    async fn consume_for_one_term(&self, feed_key: &str, failures: &mut u32) {
+    async fn consume_for_one_term(
+        &self,
+        feed_key: &str,
+        failures: &mut u32,
+        pause: &mut UpstreamPauseGate,
+    ) {
         let mut since = match self.state.load(feed_key).await {
             Ok(Some(seq)) => Some(seq),
             // First enablement: bootstrap the head cursor from the adapter.
@@ -1025,6 +1064,11 @@ impl FeedConsumer {
         let term_ends = tokio::time::sleep(self.leader_term);
         tokio::pin!(term_ends);
         loop {
+            // #5288: the switch turned on mid-term ends the term (run() then
+            // waits it out without the lock).
+            if self.paused(pause).await {
+                return;
+            }
             let polled = tokio::select! {
                 _ = self.cancel.cancelled() => return,
                 _ = &mut term_ends => return,
@@ -1186,10 +1230,11 @@ pub fn spawn_npm_feed_consumer(
         adapter,
         Arc::new(PackumentInvalidationAction::new(db.clone(), cache)),
         Arc::new(PgFeedStateStore::new(db.clone())),
-        Arc::new(PgAdvisoryLock::new(db)),
+        Arc::new(PgAdvisoryLock::new(db.clone())),
         cancel,
     )
-    .with_status(status);
+    .with_status(status)
+    .with_pause_probe(Arc::new(DbPauseProbe(db)));
     Some(tokio::spawn(consumer.run()))
 }
 
@@ -1993,6 +2038,55 @@ mod tests {
 
         cancel.cancel();
         handle.await.expect("consumer task joins after cancel");
+    }
+
+    /// The #5288 switch, flipped by the test.
+    struct TogglePause(AtomicBool);
+
+    #[async_trait]
+    impl PauseProbe for TogglePause {
+        async fn paused(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// #5288: while scheduled upstream jobs are paused the consumer makes no
+    /// feed request (no bootstrap, no poll) and never takes leadership; once
+    /// the switch is off it resumes from the persisted cursor.
+    #[tokio::test]
+    async fn consumer_makes_no_feed_request_while_upstream_jobs_paused() {
+        let adapter = ScriptedAdapter::with_bootstrap_failure(vec![batch(&["after"], "8")]);
+        let action = Arc::new(RecordingAction::default());
+        let state = Arc::new(MemoryStateStore::default());
+        state.put("test-feed", "7");
+        let pause = Arc::new(TogglePause(AtomicBool::new(true)));
+        let cancel = CancellationToken::new();
+        let status = Arc::new(FeedStatus::default());
+        let consumer = test_consumer(
+            adapter.clone(),
+            action.clone(),
+            state.clone(),
+            Arc::new(InMemoryClusterLock::default()),
+            cancel.clone(),
+        )
+        .with_status(status.clone())
+        .with_pause_probe(pause.clone());
+        let handle = tokio::spawn(consumer.run());
+
+        // Several leader-retry intervals (20 ms each) pass while paused.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(adapter.sinces().is_empty(), "no poll while paused");
+        assert!(!status.is_leader(), "a paused consumer must not lead");
+        assert!(action.applied().is_empty());
+
+        pause.0.store(false, Ordering::SeqCst);
+        assert!(
+            wait_until(|| action.applied() == vec!["after"]).await,
+            "the consumer must resume once the switch is off"
+        );
+        assert_eq!(adapter.sinces()[0], Some("7".to_string()));
+        cancel.cancel();
+        handle.await.expect("join");
     }
 
     #[tokio::test]
