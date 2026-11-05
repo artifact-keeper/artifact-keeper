@@ -50,6 +50,8 @@ pub const REPROBE_BATCH: i64 = 100;
 /// versions keep their last snapshot and can still be probed on demand
 /// (`POST .../capabilities/probe`) (#5386).
 pub const REPROBE_RECENT_DAYS: i32 = 30;
+/// Attempts of a `sandbox_run` job whose runs time out: one retry.
+pub const SANDBOX_TIMEOUT_ATTEMPTS: i32 = 2;
 /// Package types the reference sandbox runner can install from AK.
 pub const SANDBOX_REGISTRY_TYPES: &[&str] = &["npm", "pypi", "oci"];
 
@@ -231,6 +233,17 @@ pub fn is_transient(outcome: Outcome) -> bool {
         outcome,
         Outcome::RateLimited | Outcome::Timeout | Outcome::Error | Outcome::StartFailed
     )
+}
+
+/// How many attempts a job of `kind` gets when an attempt ends in `outcome`.
+/// A `sandbox_run` timeout already held a worker for the sandbox's whole wall
+/// clock (120 s), so it is retried once at most instead of up to
+/// `max_attempts` times (#5387).
+pub fn attempts_allowed(kind: JobKind, outcome: Outcome, max_attempts: i32) -> i32 {
+    match (kind, outcome) {
+        (JobKind::SandboxRun, Outcome::Timeout) => max_attempts.min(SANDBOX_TIMEOUT_ATTEMPTS),
+        _ => max_attempts,
+    }
 }
 
 /// The delay before the next attempt: the server's `Retry-After`/`ttlMs`
@@ -482,7 +495,12 @@ fn new_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-/// Claim the oldest due job of `kinds`.
+/// Claim a due job of `kinds`, fairly across repositories (#5387): the job
+/// comes from the repository with the fewest jobs claimed right now, and is
+/// that repository's oldest due job. One publisher queueing many versions
+/// therefore cannot hold every worker while other repositories' jobs wait.
+/// A single statement: `FOR UPDATE SKIP LOCKED` keeps concurrent claims from
+/// handing out one job twice.
 pub async fn claim(
     db: &PgPool,
     kinds: &[JobKind],
@@ -491,10 +509,15 @@ pub async fn claim(
     let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
     let token = new_token();
     let sql = format!(
-        "WITH next AS ( \
-           SELECT id FROM mcp_introspection_jobs \
-           WHERE status = 'pending' AND not_before <= NOW() AND kind = ANY($1) \
-           ORDER BY not_before, created_at LIMIT 1 FOR UPDATE SKIP LOCKED) \
+        "WITH busy AS ( \
+           SELECT repository_id, COUNT(*) AS claimed FROM mcp_introspection_jobs \
+           WHERE status = 'claimed' GROUP BY repository_id), \
+         next AS ( \
+           SELECT p.id FROM mcp_introspection_jobs p \
+           LEFT JOIN busy b ON b.repository_id = p.repository_id \
+           WHERE p.status = 'pending' AND p.not_before <= NOW() AND p.kind = ANY($1) \
+           ORDER BY COALESCE(b.claimed, 0), p.not_before, p.created_at \
+           LIMIT 1 FOR UPDATE OF p SKIP LOCKED) \
          UPDATE mcp_introspection_jobs j SET status = 'claimed', attempts = j.attempts + 1, \
            claimed_by = $2, claimed_at = NOW(), \
            lease_expires_at = NOW() + make_interval(secs => $3), claim_token_hash = $4, \
@@ -636,7 +659,9 @@ pub async fn complete(
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
-    if is_transient(parsed.outcome) && job.attempts < job.max_attempts {
+    if is_transient(parsed.outcome)
+        && job.attempts < attempts_allowed(kind, parsed.outcome, job.max_attempts)
+    {
         let delay = retry_delay_secs(parsed.outcome, job.attempts, result.retry_after_ms);
         let not_before = Utc::now() + chrono::Duration::seconds(delay);
         let ended = finish(
@@ -970,6 +995,23 @@ mod tests {
         assert_eq!(
             job_target(JobKind::SandboxRun, "package:2", &s, &served),
             Err(Unrunnable::TargetGone)
+        );
+    }
+
+    #[test]
+    fn sandbox_timeout_is_retried_once() {
+        assert_eq!(
+            attempts_allowed(JobKind::SandboxRun, Outcome::Timeout, 3),
+            2
+        );
+        assert_eq!(
+            attempts_allowed(JobKind::SandboxRun, Outcome::Timeout, 1),
+            1
+        );
+        assert_eq!(attempts_allowed(JobKind::SandboxRun, Outcome::Error, 3), 3);
+        assert_eq!(
+            attempts_allowed(JobKind::RemoteProbe, Outcome::Timeout, 3),
+            3
         );
     }
 
