@@ -168,15 +168,17 @@ pub fn webhook_within_token_scope(token_scope: &AccessScope, repository_id: Opti
 /// # What this gate fronts (#3715, #3901)
 ///
 /// The `TENANT-GATE-ONLY` justification this gate used to carry argued in
-/// MANAGEMENT terms, but no management verb reaches here any more:
-/// `create_webhook` goes through `enforce_admin_audited`, and delete /
+/// MANAGEMENT terms, but no management verb relies on it for its decision any
+/// more: `create_webhook` goes through `enforce_admin_audited`, and delete /
 /// enable / disable / test / rotate-secret / redeliver each call
-/// `auth.require_admin()` first. The only two callers left are pure READS --
-/// [`get_webhook`] and [`list_deliveries`] -- which return a private
+/// `auth.require_admin()` first. The two READ callers are
+/// [`get_webhook`] and [`list_deliveries`], which return a private
 /// repository's webhook `url`, `headers`, `secret_digest` and delivery
 /// history. (The raw secret is not among them: it is returned once at create
-/// and is unrecoverable afterwards, so what a bad decision here leaks is
-/// secret METADATA, not the signing key.)
+/// or rotation and is unrecoverable afterwards, so what a bad decision here
+/// leaks is secret METADATA, not the signing key.) `rotate_webhook_secret` also
+/// passes through here after its admin check, for the token-scope term alone,
+/// because it hands back the raw secret (#5235).
 ///
 /// #3901 settled the policy question #3708 left open: the by-id read must
 /// require the same READ-carrying access as [`list_webhooks`], so this gate
@@ -454,18 +456,37 @@ pub struct WebhookSecretCreatedResponse {
 
 /// Response returned by the rotate-secret endpoint.
 ///
-/// GHSA-qcmj: the raw signing secret is intentionally NOT returned here. A
-/// rotation only reports success and non-reversible metadata (the display
-/// `secret_digest` and the previous-secret expiry); the new raw secret is
-/// retained only in encrypted form and delivered/consumed out-of-band, so it
-/// cannot be disclosed via this response body or logs.
-#[derive(Debug, Serialize, ToSchema)]
+/// #5235: this is the one place the new secret is ever returned, because a
+/// receiver cannot verify after the overlap ends without it. GHSA-qcmj's threat
+/// was a NON-ADMIN obtaining a key to forge deliveries, so what keeps this safe
+/// is the gate in [`rotate_webhook_secret`], not the absence of the field. The
+/// value is never stored in the clear, and no read route returns it.
+///
+/// `Debug` is written by hand so that logging this struct cannot print it.
+#[derive(Serialize, ToSchema)]
 pub struct RotateWebhookSecretResponse {
     pub id: Uuid,
+    /// Raw signing secret produced by this rotation. Shown exactly once: record
+    /// it now, because the server retains only the encrypted form and a digest.
+    pub secret: String,
     /// Short, non-reversible identifier for the newly active signing secret.
     pub secret_digest: String,
     /// When the previously active secret stops being accepted.
     pub previous_secret_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for RotateWebhookSecretResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotateWebhookSecretResponse")
+            .field("id", &self.id)
+            .field("secret", &"<redacted>")
+            .field("secret_digest", &self.secret_digest)
+            .field(
+                "previous_secret_expires_at",
+                &self.previous_secret_expires_at,
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1630,13 +1651,16 @@ fn rotation_guard_allows(
 ///
 /// Generates a new raw secret, encrypts it, moves the existing
 /// `secret_encrypted` into `secret_previous_encrypted`, and stamps an
-/// expiry 24 hours in the future. GHSA-qcmj: the new raw secret is NOT
-/// returned in the response body — only success and non-reversible
-/// metadata (`secret_digest`, previous-secret expiry). The new secret is
-/// retained encrypted at rest and consumed out-of-band. The HMAC signing
-/// path (added in a later ticket)
-/// signs deliveries with both secrets while the previous one is within
-/// its expiry window so consumers can rotate without dropped events.
+/// expiry 24 hours in the future. The new raw secret is returned in this
+/// response, once, with `Cache-Control: no-store` (#5235); it is the same
+/// contract `create_webhook` has, and no later call can return it. The HMAC
+/// signing path signs deliveries with both secrets while the previous one is
+/// within its expiry window so consumers can rotate without dropped events.
+///
+/// Authorization (GHSA-qcmj, #5235): the caller must be an effective admin,
+/// which an admin-owned token without the `admin` scope is not (GHSA-vvc3), and
+/// the webhook must be within the presenting token's repository scope, so a
+/// credential gets a secret only for a webhook it can read.
 ///
 /// If a previous-secret window is still active when the rotate request
 /// arrives, the request is REJECTED with HTTP 409 Conflict. This prevents
@@ -1653,8 +1677,9 @@ fn rotation_guard_allows(
         ("id" = Uuid, Path, description = "Webhook ID")
     ),
     responses(
-        (status = 200, description = "Secret rotated. Body reports success and metadata only; the raw secret is not returned.", body = RotateWebhookSecretResponse),
-        (status = 404, description = "Webhook not found"),
+        (status = 200, description = "Secret rotated. Body includes the new raw secret exactly once, with `Cache-Control: no-store`; no later call returns it.", body = RotateWebhookSecretResponse),
+        (status = 403, description = "Caller is not an admin, or its token lacks the `admin` scope"),
+        (status = 404, description = "Webhook not found, or outside the token's repository scope"),
         (status = 409, description = "A previous rotation overlap window is still active"),
         (status = 500, description = "Encryption key not configured")
     ),
@@ -1670,6 +1695,10 @@ pub async fn rotate_webhook_secret(
     // GHSA-qcmj: rotating the signing secret is a management action -> admin
     // only (scope-aware via GHSA-vvc3), matching `create_webhook`.
     auth.require_admin()?;
+    // #5235: the response holds the new secret, so the token's repository scope
+    // binds too. An out-of-scope webhook takes the read gate's 404 and is not
+    // rotated.
+    authorize_webhook_access(&state, &auth, id).await?;
 
     let new_secret = webhook_secret_crypto::generate_secret();
     let new_encrypted = webhook_secret_crypto::encrypt_secret(&new_secret).map_err(|e| {
@@ -1761,15 +1790,18 @@ pub async fn rotate_webhook_secret(
     )
     .await;
 
-    // GHSA-qcmj: return success + non-reversible metadata only. The raw
-    // `new_secret` is never echoed in the response body; it is stored
-    // encrypted and delivered out-of-band.
-    Ok(Json(RotateWebhookSecretResponse {
-        id,
-        secret_digest: new_digest,
-        previous_secret_expires_at: previous_expires_at,
-    })
-    .into_response())
+    // #5235: the only time the new secret leaves the server. Never cached, and
+    // never passed to the audit entry above or to a log line.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(RotateWebhookSecretResponse {
+            id,
+            secret: new_secret,
+            secret_digest: new_digest,
+            previous_secret_expires_at: previous_expires_at,
+        }),
+    )
+        .into_response())
 }
 
 /// Background-task entry point: clear expired previous-secret material so
@@ -2023,12 +2055,11 @@ fn build_delivery_request_headers(inputs: &DeliveryHeaderInputs<'_>) -> Vec<(Str
         );
         out.push(("X-ArtifactKeeper-Signature".into(), sig_header));
     }
+    // The legacy header carries no timestamp, so it signs the body alone
+    // (#5234); the timestamped form lives only in the `v1=` token above.
     if let Some(current) = inputs.secrets.first() {
-        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
-            current,
-            inputs.unix_secs,
-            inputs.body_bytes,
-        );
+        let legacy_sig =
+            crate::services::webhook_signing::compute_legacy_signature(current, inputs.body_bytes);
         out.push((
             "X-Webhook-Signature".into(),
             format!("sha256={}", legacy_sig),
@@ -3689,16 +3720,21 @@ mod tests {
         let mut inputs = sample_inputs(&secret_refs, body);
         inputs.unix_secs = unix_secs;
         let h = build_delivery_request_headers(&inputs);
-        // The legacy header is HMAC over body alone (no timestamp prefix).
+        // The legacy header is HMAC over body alone (no timestamp prefix),
+        // so a receiver holding only this header can verify it (#5234).
+        // Literal computed out-of-band:
+        // printf '%s' 'hello world' | openssl dgst -sha256 -hmac whsec_test
         let legacy = header(&h, "X-Webhook-Signature").unwrap();
-        let expected_legacy = format!(
-            "sha256={}",
-            crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body)
+        assert_eq!(
+            legacy,
+            "sha256=a3ea78f3992b9c14cb5f03dfc734e3ac8846b716e277bb2b1826079fdceec34a"
         );
-        assert_eq!(legacy, expected_legacy);
-        // The v2 header includes the same hex token.
+        // The v1= token is still over "<t>.<body>", so it differs from the
+        // legacy value.
         let v2 = header(&h, "X-ArtifactKeeper-Signature").unwrap();
-        assert!(v2.contains(&legacy[7..]));
+        let v1 = crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body);
+        assert_eq!(v2, format!("t={unix_secs},v1={v1}"));
+        assert!(!v2.contains(&legacy[7..]));
     }
 
     #[test]
@@ -3732,8 +3768,10 @@ mod tests {
     /// #921 regression pin: the complete header set a `signing_mode = hmac`
     /// webhook sends, byte for byte, as it was before asymmetric signing
     /// existed. The expected values are literals (HMAC-SHA256 computed
-    /// out-of-band over `"1700000000.<body>"`), not re-derived through the
-    /// code under test, so any drift in names, order, or token layout fails.
+    /// out-of-band: `v1=` over `"1700000000.<body>"`, the legacy
+    /// `X-Webhook-Signature` over `<body>` alone since #5234), not
+    /// re-derived through the code under test, so any drift in names,
+    /// order, or token layout fails.
     #[test]
     fn delivery_headers_hmac_mode_are_byte_identical_to_pre_v2_wire() {
         let secret_refs = ["whsec_current", "whsec_previous"];
@@ -3744,6 +3782,7 @@ mod tests {
         let h = build_delivery_request_headers(&inputs);
         let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
         let prev = "725598b0de63a47dc2a201da3fa6ac232f9d56ffa4ee9f9fb86ad5a1df0d6926";
+        let legacy = "4586d3971c966d41554b224a7fe762e2638266efe34320caebe19967f969c776";
         let nil = "00000000-0000-0000-0000-000000000000";
         let expected: Vec<(String, String)> = [
             ("Content-Type", "application/json".to_string()),
@@ -3759,7 +3798,7 @@ mod tests {
                 "X-ArtifactKeeper-Signature",
                 format!("t=1700000000,v1={cur},v1={prev}"),
             ),
-            ("X-Webhook-Signature", format!("sha256={cur}")),
+            ("X-Webhook-Signature", format!("sha256={legacy}")),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -5059,32 +5098,284 @@ mod tests {
         }
 
         // ===================================================================
-        // rotate_webhook_secret — secret non-disclosure (GHSA-qcmj)
+        // rotate_webhook_secret — one-time secret disclosure (#5235)
         // ===================================================================
 
-        /// The rotate-secret response body must not carry the raw signing
-        /// secret. This is a pure serialization guard (no DB): before the fix
-        /// the response embedded the raw `secret`; after it, only the
-        /// non-reversible `secret_digest` and expiry metadata are present.
+        /// A webhook that already has a signing secret, so a rotation opens
+        /// the overlap window and a second rotation answers 409.
+        async fn insert_signed_webhook(pool: &PgPool, repository_id: Option<Uuid>) -> Uuid {
+            super::set_test_secret_key();
+            let id = insert_webhook(pool, None, repository_id).await;
+            sqlx::query(
+                "UPDATE webhooks SET secret_encrypted = $2, secret_digest = 'whsec_...init' \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(super::encrypt_test_secret("whsec_initial"))
+            .execute(pool)
+            .await
+            .expect("set initial secret");
+            id
+        }
+
+        async fn stored_digest(pool: &PgPool, id: Uuid) -> String {
+            sqlx::query_scalar("SELECT secret_digest FROM webhooks WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read digest")
+        }
+
+        /// POST rotate-secret through the real route and the layers that wrap
+        /// every response in production that could touch this one: the security
+        /// headers and the request trace.
+        #[allow(clippy::disallowed_methods)]
+        // streaming-invariant: test exempt — a small JSON body is not an
+        // artifact path (#1608).
+        async fn rotate_via_router(
+            state: crate::api::SharedState,
+            auth: AuthExtension,
+            id: Uuid,
+        ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+            use tower::ServiceExt;
+            let app = router()
+                .layer(axum::middleware::from_fn(
+                    crate::api::middleware::security_headers::security_headers_middleware,
+                ))
+                .layer(tower_http::trace::TraceLayer::new_for_http().on_response(
+                    crate::api::middleware::request_span::RecordResponseOnSpan::default(),
+                ))
+                .layer(axum::Extension(auth))
+                .with_state(state);
+            let response = app
+                .oneshot(
+                    axum::http::Request::post(format!("/{id}/rotate-secret"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (parts, body) = response.into_parts();
+            let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap();
+            (
+                parts.status,
+                parts.headers,
+                String::from_utf8(bytes.to_vec()).unwrap(),
+            )
+        }
+
+        #[derive(Clone, Default)]
+        struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+            type Writer = LogCapture;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// #5235: a rotation hands the admin the new secret, once. The value
+        /// must be the one deliveries now sign with, must not be cacheable, and
+        /// must not reach a later read, the 409 of a repeat rotation, the audit
+        /// row or any log line, at the most verbose log level.
+        #[tokio::test]
+        async fn rotate_secret_returns_the_new_secret_once_and_nowhere_else() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let admin = create_user(&pool, true).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let wh = insert_signed_webhook(&pool, None).await;
+
+            let logs = LogCapture::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(logs.clone())
+                .finish();
+            let log_guard = tracing::subscriber::set_default(subscriber);
+            let (status, headers, body) =
+                rotate_via_router(state.clone(), auth_for(admin, true), wh).await;
+            let row = tdh::audit_row_eventually(&pool, wh, "WEBHOOK_SECRET_ROTATED").await;
+            drop(log_guard);
+
+            assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+            assert_eq!(
+                headers
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                Some("no-store"),
+                "a response holding a signing secret must not be cached"
+            );
+
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let secret = json["secret"]
+                .as_str()
+                .expect("rotate response must carry the new secret")
+                .to_string();
+            assert!(secret.starts_with(webhook_secret_crypto::SECRET_PREFIX));
+
+            // It is the secret deliveries now sign with, not merely a string
+            // that looks like one, and the digest identifies it.
+            let stored: Vec<u8> =
+                sqlx::query_scalar("SELECT secret_encrypted FROM webhooks WHERE id = $1")
+                    .bind(wh)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                webhook_secret_crypto::decrypt_secret(&stored).unwrap(),
+                secret
+            );
+            assert_eq!(
+                json["secret_digest"].as_str(),
+                Some(webhook_secret_crypto::digest_for_display(&secret).as_str())
+            );
+
+            // No later read returns it.
+            let read = get_webhook(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Path(wh),
+            )
+            .await
+            .expect("get webhook")
+            .0;
+            let read = serde_json::to_string(&read).unwrap();
+            assert!(read.contains("secret_digest"), "read: {read}");
+            assert!(!read.contains(&secret), "GET returned the secret");
+
+            let list = list_webhooks(
+                axum::extract::State(state.clone()),
+                axum::Extension(auth_for(admin, true)),
+                axum::extract::Query(ListWebhooksQuery {
+                    repository_id: None,
+                    enabled: None,
+                    page: None,
+                    per_page: Some(1000),
+                }),
+            )
+            .await
+            .expect("list webhooks")
+            .0;
+            assert!(!serde_json::to_string(&list).unwrap().contains(&secret));
+
+            // Rotating again inside the window neither replays the secret nor
+            // changes the one just handed out.
+            let (again, _, again_body) =
+                rotate_via_router(state.clone(), auth_for(admin, true), wh).await;
+            assert_eq!(again, axum::http::StatusCode::CONFLICT);
+            assert!(!again_body.contains(&secret), "409 replayed the secret");
+            let stored: Vec<u8> =
+                sqlx::query_scalar("SELECT secret_encrypted FROM webhooks WHERE id = $1")
+                    .bind(wh)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                webhook_secret_crypto::decrypt_secret(&stored).unwrap(),
+                secret
+            );
+
+            // The audit row records the fact, not the value.
+            assert_eq!(row.details["secret_rotated"], true);
+            let details = row.details.to_string();
+            assert!(!details.contains(&secret), "audit recorded: {details}");
+            assert!(!details.contains("secret_digest"), "audit: {details}");
+
+            // Prove the capture saw the request, then that it never saw the
+            // secret: not in a span, an event, or a logged SQL statement.
+            let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logged.contains("UPDATE webhooks"),
+                "capture saw nothing, so its silence proves nothing"
+            );
+            assert!(!logged.contains(&secret), "the secret reached a log line");
+
+            sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                .bind(wh)
+                .execute(&pool)
+                .await
+                .ok();
+            cleanup(&pool, &[], &[admin]).await;
+        }
+
+        /// #5235: rotation takes the read gate's token-scope check. A webhook
+        /// outside the token's repository scope answers 404 and is not rotated;
+        /// inside it, the token behaves as an admin.
+        #[tokio::test]
+        async fn rotate_secret_is_confined_to_the_token_repository_scope() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let admin = create_user(&pool, true).await;
+            let in_scope_repo = create_repo(&pool).await;
+            let other_repo = create_repo(&pool).await;
+            let state = tdh::build_state(pool.clone(), "/tmp");
+            let global_wh = insert_signed_webhook(&pool, None).await;
+            let other_wh = insert_signed_webhook(&pool, Some(other_repo)).await;
+            let in_scope_wh = insert_signed_webhook(&pool, Some(in_scope_repo)).await;
+            let restricted = || AuthExtension {
+                is_api_token: true,
+                allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                    in_scope_repo,
+                ]),
+                ..auth_for(admin, true)
+            };
+
+            for wh in [global_wh, other_wh] {
+                let before = stored_digest(&pool, wh).await;
+                let (status, _, body) = rotate_via_router(state.clone(), restricted(), wh).await;
+                assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "body: {body}");
+                assert!(!body.contains("whsec_"), "body: {body}");
+                assert_eq!(
+                    stored_digest(&pool, wh).await,
+                    before,
+                    "an out-of-scope rotation must not change the secret"
+                );
+            }
+
+            let (status, _, body) =
+                rotate_via_router(state.clone(), restricted(), in_scope_wh).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "body: {body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(json["secret"].is_string(), "body: {body}");
+
+            for wh in [global_wh, other_wh, in_scope_wh] {
+                sqlx::query("DELETE FROM webhooks WHERE id = $1")
+                    .bind(wh)
+                    .execute(&pool)
+                    .await
+                    .ok();
+            }
+            cleanup(&pool, &[in_scope_repo, other_repo], &[admin]).await;
+        }
+
+        /// The derived `Debug` would print the raw secret into any log line
+        /// that formats this response.
         #[test]
-        fn rotate_response_omits_raw_secret() {
+        fn rotate_response_debug_redacts_the_secret() {
             let resp = RotateWebhookSecretResponse {
                 id: Uuid::new_v4(),
-                secret_digest: "whsec_pub_abcdef".to_string(),
+                secret: "whsec_must_not_be_logged".to_string(),
+                secret_digest: "whsec_...gged".to_string(),
                 previous_secret_expires_at: chrono::Utc::now(),
             };
-            let v = serde_json::to_value(&resp).expect("serialize rotate response");
-            let obj = v.as_object().expect("rotate response is a JSON object");
-            assert!(
-                !obj.contains_key("secret"),
-                "rotate response must not carry the raw signing secret, got: {v}"
-            );
-            // The non-reversible digest is still surfaced so callers can
-            // identify the newly active secret.
-            assert!(
-                obj.contains_key("secret_digest"),
-                "rotate response should still expose the display digest"
-            );
+            let printed = format!("{resp:?}");
+            assert!(!printed.contains("must_not_be_logged"), "{printed}");
+            assert!(printed.contains("whsec_...gged"), "{printed}");
+            // The field is still on the wire: it is the point of the response.
+            let v = serde_json::to_value(&resp).unwrap();
+            assert_eq!(v["secret"], "whsec_must_not_be_logged");
         }
 
         // ===================================================================
@@ -6239,13 +6530,14 @@ mod tests {
             let inputs = super::sample_inputs(&refs, body);
             let h = build_delivery_request_headers(&inputs);
             let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
+            let legacy = "4586d3971c966d41554b224a7fe762e2638266efe34320caebe19967f969c776";
             assert_eq!(
                 super::header(&h, "X-ArtifactKeeper-Signature"),
                 Some(format!("t=1700000000,v1={cur}").as_str())
             );
             assert_eq!(
                 super::header(&h, "X-Webhook-Signature"),
-                Some(format!("sha256={cur}").as_str())
+                Some(format!("sha256={legacy}").as_str())
             );
         }
 

@@ -283,7 +283,7 @@ pub struct ListScansQuery {
 ///
 /// Kept in sync with the constraint by hand — the constraint is the authority
 /// and is re-stated in whichever migration last touched it (`022`, `032`,
-/// `034`, `060`, and `220` for `external`). Used only to reject a typo'd
+/// `034`, `060`, `220` for `external`, and `326` for `mcp_lint`). Used only to reject a typo'd
 /// filter: an unknown value must be a `400`, because an unfiltered response to
 /// a misspelled engine name reads as "no scans from that engine", which is the
 /// wrong direction for a security view (#3410).
@@ -297,6 +297,7 @@ pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
     "openscap",
     "incus",
     EXTERNAL_SCAN_TYPE,
+    crate::services::mcp_lint::MCP_LINT_SCAN_TYPE,
 ];
 
 /// Canonical severity vocabulary for the findings filter, matching

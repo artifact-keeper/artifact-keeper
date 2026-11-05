@@ -1067,6 +1067,28 @@ pub async fn listing_refusals(
     repository_id: Uuid,
     candidates: &[ListingCandidate<'_>],
 ) -> Result<std::collections::HashSet<Uuid>> {
+    listing_refusals_with(db, repository_id, candidates, true).await
+}
+
+/// [`listing_refusals`] without its caches: every candidate's scan-policy
+/// decision is evaluated now. For a listing that is itself the serve surface
+/// (the MCP registry lists whole server.json documents, #5253), where a
+/// decision a minute behind a scan that just completed would hand out a
+/// refused recipe.
+pub async fn listing_refusals_fresh(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+) -> Result<std::collections::HashSet<Uuid>> {
+    listing_refusals_with(db, repository_id, candidates, false).await
+}
+
+async fn listing_refusals_with(
+    db: &PgPool,
+    repository_id: Uuid,
+    candidates: &[ListingCandidate<'_>],
+    cached: bool,
+) -> Result<std::collections::HashSet<Uuid>> {
     use futures::StreamExt;
     let now = Utc::now();
     let mut refused = std::collections::HashSet::new();
@@ -1083,7 +1105,12 @@ pub async fn listing_refusals(
     }
 
     let presence = listing_policy_presence_cache();
-    let policy_applies = match presence.get(&repository_id).await {
+    let known = if cached {
+        presence.get(&repository_id).await
+    } else {
+        None
+    };
+    let policy_applies = match known {
         Some(v) => v,
         None => {
             let v: bool = sqlx::query_scalar(
@@ -1108,8 +1135,10 @@ pub async fn listing_refusals(
         .map(|artifact_id| {
             let policy = &policy;
             async move {
-                if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
-                    return (artifact_id, blocked);
+                if cached {
+                    if let Some(blocked) = decisions.get(&(repository_id, artifact_id)).await {
+                        return (artifact_id, blocked);
+                    }
                 }
                 let blocked = match policy.evaluate_artifact(artifact_id, repository_id).await {
                     Ok(result) => !result.allowed,
@@ -2334,6 +2363,10 @@ mod listing_refusals_4288_tests {
         let cached = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
             .await
             .expect("cached");
+        // The uncached variant (#5253) sees the change at once.
+        let fresh = listing_refusals_fresh(&fx.pool, fx.repo_id, &candidates(None))
+            .await
+            .expect("fresh");
         invalidate_listing_decisions();
         let after = listing_refusals(&fx.pool, fx.repo_id, &candidates(None))
             .await
@@ -2351,6 +2384,10 @@ mod listing_refusals_4288_tests {
             "block_unscanned refuses the unscanned and the (unscanned) held package"
         );
         assert_eq!(cached, with_policy);
+        assert!(
+            fresh.is_empty(),
+            "the fresh variant ignores the cached decisions"
+        );
         assert!(after.is_empty(), "no policy, no hold: everything listed");
     }
 }

@@ -63,7 +63,7 @@ use crate::services::signing_service::{
 };
 use crate::storage::StorageBackend;
 
-const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
+pub(crate) const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
 // ---------------------------------------------------------------------------
 // Router

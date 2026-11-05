@@ -2774,7 +2774,7 @@ pub(crate) async fn persist_tag_and_refs(
     manifest_body: &[u8],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    persist_tag_and_refs_in_tx(
+    let moved_from = persist_tag_and_refs_in_tx(
         &mut tx,
         repo_id,
         name,
@@ -2786,6 +2786,17 @@ pub(crate) async fn persist_tag_and_refs(
     )
     .await?;
     tx.commit().await?;
+    if let Some(previous) = moved_from {
+        crate::services::mcp_packages::record_pin_drift(
+            pool,
+            repo_id,
+            name,
+            tag,
+            &previous,
+            manifest_digest,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -2807,22 +2818,19 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
     manifest_content_type: &str,
     class: &ManifestClass,
     manifest_body: &[u8],
-) -> Result<(), sqlx::Error> {
-    // 1. Tag upsert (identical SQL/semantics to the previous standalone form).
-    sqlx::query(
-        r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-           VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
-             manifest_digest = EXCLUDED.manifest_digest,
-             manifest_content_type = EXCLUDED.manifest_content_type,
-             updated_at = NOW()"#,
+) -> Result<Option<String>, sqlx::Error> {
+    // 1. Tag upsert (identical SQL/semantics to the previous standalone form),
+    //    returning the digest the tag named before when it moved (#5253: an
+    //    MCP server version may have pinned the old digest; the caller audits
+    //    the drift after its commit).
+    let moved_from = upsert_tag_returning_moved_from(
+        tx,
+        repo_id,
+        name,
+        tag,
+        manifest_digest,
+        manifest_content_type,
     )
-    .bind(repo_id)
-    .bind(name)
-    .bind(tag)
-    .bind(manifest_digest)
-    .bind(manifest_content_type)
-    .execute(&mut **tx)
     .await?;
 
     // 2. Reference recording, in the SAME transaction. A failure here rolls
@@ -2960,7 +2968,48 @@ pub(crate) async fn persist_tag_and_refs_in_tx(
     )
     .await?;
 
-    Ok(())
+    Ok(moved_from)
+}
+
+/// The `oci_tags` upsert every tag write shares, returning the digest the tag
+/// named before when this write changed what it names: `Some("")` for a tag
+/// that did not exist, `None` for a re-push of the same digest. One
+/// statement: the CTE reads the pre-upsert row.
+pub(crate) async fn upsert_tag_returning_moved_from(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    name: &str,
+    tag: &str,
+    manifest_digest: &str,
+    manifest_content_type: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let previous: Option<String> = sqlx::query_scalar(
+        r#"WITH prev AS (
+               SELECT manifest_digest FROM oci_tags
+               WHERE repository_id = $1 AND name = $2 AND tag = $3
+           )
+           INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (repository_id, name, tag) DO UPDATE SET
+             manifest_digest = EXCLUDED.manifest_digest,
+             manifest_content_type = EXCLUDED.manifest_content_type,
+             updated_at = NOW()
+           RETURNING (SELECT manifest_digest FROM prev)"#,
+    )
+    .bind(repo_id)
+    .bind(name)
+    .bind(tag)
+    .bind(manifest_digest)
+    .bind(manifest_content_type)
+    .fetch_one(conn)
+    .await?;
+    Ok(match previous {
+        Some(p) if p == manifest_digest => None,
+        Some(p) => Some(p),
+        // A new tag (or one re-pushed after a delete): a pin may still name
+        // it, so the caller checks; the empty string marks "no previous".
+        None => Some(String::new()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4174,26 +4223,39 @@ async fn cache_manifest_reference_locally(
     // digest (e.g. `docker pull redis@sha256:...`), there is no human-readable
     // tag to record, so we skip the second insert.
     if repo.repo_type == RepositoryType::Remote && !is_digest_reference(reference) {
-        if let Err(e) = sqlx::query(
-            r#"INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (repository_id, name, tag) DO UPDATE SET
-                 manifest_digest = EXCLUDED.manifest_digest,
-                 manifest_content_type = EXCLUDED.manifest_content_type,
-                 updated_at = NOW()"#,
-        )
-        .bind(repo.id)
-        .bind(&repo.image)
-        .bind(reference)
-        .bind(&digest)
-        .bind(&manifest_content_type)
-        .execute(&state.db)
-        .await
-        {
-            // Best-effort: the digest-keyed oci_tags row above is already
-            // persisted, so the manifest still resolves by digest. Only the
-            // human-readable tag in the UI listing is degraded.
-            tracing::warn!(
+        let upserted = match state.db.acquire().await {
+            Ok(mut conn) => {
+                upsert_tag_returning_moved_from(
+                    &mut conn,
+                    repo.id,
+                    &repo.image,
+                    reference,
+                    &digest,
+                    &manifest_content_type,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        match upserted {
+            // #5253: the upstream moved a tag an MCP server version pinned.
+            Ok(Some(previous)) => {
+                crate::services::mcp_packages::record_pin_drift(
+                    &state.db,
+                    repo.id,
+                    &repo.image,
+                    reference,
+                    &previous,
+                    &digest,
+                )
+                .await
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Best-effort: the digest-keyed oci_tags row above is already
+                // persisted, so the manifest still resolves by digest. Only the
+                // human-readable tag in the UI listing is degraded.
+                tracing::warn!(
                 repo = %repo.key,
                 image = %repo.image,
                 reference = %reference,
@@ -4201,7 +4263,8 @@ async fn cache_manifest_reference_locally(
                 "Failed to upsert tag-keyed oci_tags row for proxied manifest; \
                  the digest-keyed row is still persisted but the Docker tag UI \
                  listing will not include this tag until the next proxy refresh"
-            );
+                );
+            }
         }
     }
 
@@ -12384,7 +12447,7 @@ async fn commit_pushed_manifest(
         )
     };
     let mut tx = state.db.begin().await.map_err(|e| internal(&e))?;
-    persist_tag_and_refs_in_tx(
+    let moved_from = persist_tag_and_refs_in_tx(
         &mut tx,
         m.repo_id,
         m.image,
@@ -12417,6 +12480,20 @@ async fn commit_pushed_manifest(
     .await
     .map_err(|e| internal(&e))?;
     tx.commit().await.map_err(|e| internal(&e))?;
+
+    // #5253: a tag an MCP server version pinned moved; the version keeps its
+    // pinned digest, the drift is recorded and audited.
+    if let Some(previous) = moved_from {
+        crate::services::mcp_packages::record_pin_drift(
+            &state.db,
+            m.repo_id,
+            m.image,
+            m.reference,
+            &previous,
+            m.digest,
+        )
+        .await;
+    }
 
     // Post-commit: the hold and the scan read the committed row.
     crate::services::quarantine_service::apply_upload_hold_hosted(
@@ -14408,6 +14485,14 @@ async fn handle_delete_manifest(
     } else {
         OciIndexDeleteScope::NamedReference
     };
+    // #5253: a digest an MCP server version pins stays deletable by tag (the
+    // pin's digest-keyed retention row keeps the manifest), but not by
+    // digest: that would leave the published server version unresolvable.
+    if scope == OciIndexDeleteScope::ContentAddressed {
+        if let Some(resp) = mcp_pin_blocks_delete(state, &repo, &digest).await {
+            return resp;
+        }
+    }
     if let Err(e) = delete_oci_manifest_and_artifacts(
         &state.db,
         repo.id,
@@ -14436,6 +14521,37 @@ async fn handle_delete_manifest(
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap()
+}
+
+/// The refusal of a by-digest manifest delete whose digest a live MCP server
+/// version pins (#5253), or `None` when the delete may proceed. `405
+/// UNSUPPORTED`: the distribution spec's answer for a delete the registry
+/// does not allow. The message names no MCP repository or server (the caller
+/// may not be able to read them). A lookup failure refuses (fail closed).
+async fn mcp_pin_blocks_delete(
+    state: &SharedState,
+    repo: &OciRepoInfo,
+    digest: &str,
+) -> Option<Response> {
+    if !matches!(repo.repo_type.as_str(), "local" | "staging") {
+        return None;
+    }
+    match crate::services::mcp_write::digest_pinned_by_mcp(&state.db, repo.id, &repo.image, digest)
+        .await
+    {
+        Ok(false) => None,
+        Ok(true) => Some(oci_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "UNSUPPORTED",
+            "this manifest is pinned by a published MCP server version and cannot be deleted by \
+             digest; delete the tag instead, or remove the server version first",
+        )),
+        Err(e) => Some(oci_error(
+            crate::api::handlers::db_status(&e),
+            "INTERNAL_ERROR",
+            crate::api::handlers::db_err_message(&e),
+        )),
+    }
 }
 
 /// Which OCI index rows a manifest delete is allowed to remove.

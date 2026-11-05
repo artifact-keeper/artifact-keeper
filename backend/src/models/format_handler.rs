@@ -124,6 +124,9 @@ pub struct FormatHandlerResponse {
     /// WASM plugin handler, which has no core proxy serve path the setting
     /// could apply to.
     pub scan_on_proxy: ScanOnProxySupport,
+    /// The repository types a repository of this format can be created as
+    /// (`local`, `staging`, `remote`, `virtual`), e.g. all four for `mcp`.
+    pub repository_types: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -132,6 +135,10 @@ impl From<FormatHandlerRecord> for FormatHandlerResponse {
     fn from(record: FormatHandlerRecord) -> Self {
         let scan_on_proxy =
             ScanOnProxySupport::for_handler(&record.handler_type, &record.format_key);
+        let repository_types = crate::formats::supported_repo_types(&record.format_key)
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
         Self {
             id: record.id,
             format_key: record.format_key,
@@ -145,6 +152,7 @@ impl From<FormatHandlerRecord> for FormatHandlerResponse {
             repository_count: None,
             capabilities: None,
             scan_on_proxy,
+            repository_types,
             created_at: record.created_at,
             updated_at: record.updated_at,
         }
@@ -197,6 +205,10 @@ mod tests {
         assert_eq!(response.extensions.len(), 2);
         assert!(response.is_enabled);
         assert_eq!(response.priority, 10);
+        assert_eq!(
+            response.repository_types,
+            ["local", "staging", "remote", "virtual"]
+        );
         // Computed fields should be None
         assert!(response.repository_count.is_none());
         assert!(response.capabilities.is_none());
