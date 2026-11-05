@@ -247,6 +247,27 @@ pub(crate) async fn mcp_served_only(
     auth: Option<&AuthExtension>,
     scope: Option<&[Uuid]>,
 ) -> Result<Option<McpServedOnly>> {
+    served_only(state, auth, scope, true).await
+}
+
+/// [`mcp_served_only`] with each registry's reader served set computed for
+/// this request ([`compute_reader_served`]) instead of shared for
+/// [`MCP_SEARCH_SERVED_TTL`]: for the generic routes that evaluate the
+/// listing decision afresh on every request (the security scan listings).
+pub(crate) async fn mcp_served_only_fresh(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    scope: Option<&[Uuid]>,
+) -> Result<Option<McpServedOnly>> {
+    served_only(state, auth, scope, false).await
+}
+
+async fn served_only(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    scope: Option<&[Uuid]>,
+    shared: bool,
+) -> Result<Option<McpServedOnly>> {
     let repos: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM repositories WHERE format = 'mcp' \
          AND ($1::uuid[] IS NULL OR id = ANY($1))",
@@ -264,8 +285,13 @@ pub(crate) async fn mcp_served_only(
         if gate.holds_all(&[repo_id]).await {
             continue;
         }
-        out.served
-            .extend(reader_served(state, repo_id).await.iter().copied());
+        if shared {
+            out.served
+                .extend(reader_served(state, repo_id).await.iter().copied());
+        } else {
+            out.served
+                .extend(compute_reader_served(state, repo_id, MCP_SEARCH_SERVED_ROW_CAP).await);
+        }
         out.repos.push(repo_id);
     }
     Ok((!out.repos.is_empty()).then_some(out))

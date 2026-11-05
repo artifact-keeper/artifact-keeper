@@ -1131,7 +1131,10 @@ resolving, unresolvable, or soft-deleted) is treated as missing:
   `GET /api/v1/security/scans?repository_id=`, and, as for a missing
   artifact (an empty page), `GET /api/v1/security/artifacts/{id}/scans` and
   `GET /api/v1/security/scans?artifact_id=`. `GET /api/v1/security/scans/{id}`
-  and `/findings` answer the missing scan's `404`.
+  and `/findings` answer the missing scan's `404`. The listings compute
+  the set of a registry's scans a reader is served on every request (not
+  shared like search's), with the same cap of 20,000 artifact rows per
+  registry; a scan past the cap is left out.
 - `GET /api/v1/packages` decides its MCP rows over the whole filtered set
   before paging (at most 10,000 MCP rows per request; rows past that are
   hidden), so `pagination.total` and every page count only the rows the
