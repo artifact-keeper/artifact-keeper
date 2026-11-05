@@ -2092,6 +2092,27 @@ Runners:
 `set_during_runtime` is skipped), `static` (`{tools, resources, prompts,
 instructions}`, e.g. Cisco MCP Scanner static JSON).
 
+### What a probe cannot catch
+
+A server can tell that it is being probed, and answer differently. Every
+probe looks the same from the server's side:
+
+- every probe names its client `ak-mcp-introspector` (`clientInfo.name`)
+  and carries no credentials;
+- remote probes send `User-Agent: ak-mcp-introspector/<version> (...;
+  capability probe; never calls tools)`;
+- sandbox runs set `CI=1`, pass `AK_PLACEHOLDER_<NAME>` for every secret,
+  required or templated value, run on the sandbox network, which reaches
+  only AK, and end at the 120 s wall clock.
+
+A server that checks any of these can show AK one tool list and its clients
+another, or behave only after the probe has gone. `remote_probe` and
+`sandbox_run` snapshots, and the `tool_drift` findings computed from them,
+cannot catch such a server. A snapshot is evidence of what the server
+showed AK, not of what it shows clients. Approving a remote server is
+trusting its operator, and approving a package is trusting the code AK
+scanned, not the tool list the probe saw.
+
 ### Deploying the worker
 
 1. Mint the credential: create a service account, then an API token for it
