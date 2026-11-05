@@ -312,10 +312,33 @@ pub(crate) fn reproblem(resp: Response) -> Response {
     out
 }
 
+/// A JSON answer that no cache may keep: a version detail (which can carry
+/// a per-caller bundle ticket), a write's result, a token. Listings use
+/// [`json_listing`].
 pub(crate) fn json_ok(status: StatusCode, value: &serde_json::Value) -> Response {
     (
         status,
-        [(header::CONTENT_TYPE, "application/json")],
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        serde_json::to_vec(value).unwrap_or_default(),
+    )
+        .into_response()
+}
+
+/// A listing (`/servers`, `/servers/{name}/versions`): what it holds is
+/// decided per caller and can change on the next read (a hold, a deny-list
+/// entry), so only the caller's own cache may keep it, revalidated on every
+/// use and keyed on the credential.
+pub(crate) fn json_listing(value: &serde_json::Value) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "private, no-cache"),
+            (header::VARY, "Authorization, Cookie"),
+        ],
         serde_json::to_vec(value).unwrap_or_default(),
     )
         .into_response()
@@ -1273,7 +1296,7 @@ async fn list_servers(
     } else {
         list_versions_page(ctx, &repo, &q, policy_now, base.as_str()).await?
     };
-    Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, next)))
+    Ok(json_listing(&fmt::list_envelope(entries, next)))
 }
 
 /// Upper bound on the rows one listing request reads and gates, so a
@@ -1481,7 +1504,7 @@ async fn list_versions_impl(
         .iter()
         .map(|r| served_entry(r, &repo, base, Some(r.artifact_id) == latest))
         .collect();
-    Ok(json_ok(StatusCode::OK, &fmt::list_envelope(entries, None)))
+    Ok(json_listing(&fmt::list_envelope(entries, None)))
 }
 
 /// Every servable version of `name` in `repo` (the reader-only listing
@@ -3841,6 +3864,123 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(listed(anon(repos())).await.len(), 2);
+        env.teardown().await;
+    }
+
+    /// The tree browser (`/api/v1/tree`, `/api/v1/tree/content`) applies
+    /// the serve decision: a reader gets no node for a held version (and no
+    /// folder that only held versions fill) and the plain 404 for its
+    /// server.json, while a holder browses and reads it. MCP content is
+    /// never cached, and a non-public repository's bytes only privately.
+    #[tokio::test]
+    async fn tree_browser_follows_the_serve_decision() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let (npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for v in ["1.0.0", "2.0.0"] {
+            let d = doc(
+                "com.acme/tree",
+                v,
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+        let key = env.fx.repo_key.clone();
+        let tree = || crate::api::handlers::tree::router();
+        let names = |app: Router, path: &str| {
+            let uri = format!("/?repository_key={key}&path={path}");
+            async move {
+                let (s, b, _) = call(app, "GET", &uri, None).await;
+                assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+                json(&b)["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n["name"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let anon = || env.fx.router_anon(tree());
+        let member = || env.fx.router_with_auth(tree());
+        assert_eq!(names(anon(), "servers/com.acme/tree").await, ["1.0.0"]);
+        assert_eq!(
+            names(member(), "servers/com.acme/tree").await,
+            ["1.0.0", "2.0.0"]
+        );
+        assert_eq!(names(anon(), "servers/com.acme/tree/2.0.0").await.len(), 0);
+
+        let content = |app: Router, path: &str| {
+            let uri = format!("/content?repository_key={key}&path={path}");
+            async move { call(app, "GET", &uri, None).await }
+        };
+        let held = "servers/com.acme/tree/2.0.0/server.json";
+        let served = "servers/com.acme/tree/1.0.0/server.json";
+        let missing = "servers/com.acme/tree/9.0.0/server.json";
+        let (s, held_body, _) = content(anon(), held).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, missing_body, _) = content(anon(), missing).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(
+            json(&held_body)["message"]
+                .as_str()
+                .map(|m| m.replace("2.0.0", "9.0.0")),
+            json(&missing_body)["message"].as_str().map(str::to_string),
+            "a held version answers as a missing one"
+        );
+        let (s, b, h) = content(anon(), served).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(json(&b)["version"], "1.0.0");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        let (s, b, h) = content(member(), held).await;
+        assert_eq!(s, StatusCode::OK, "a holder reads the held version");
+        assert_eq!(json(&b)["version"], "2.0.0");
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+
+        // Another format: a public repository may be cached publicly, a
+        // private one only by the caller.
+        let npm_path = "@acme/echo/-/echo-1.0.0.tgz";
+        let npm_content = |app: Router| {
+            let uri = format!("/content?repository_key={}&path={npm_path}", npm.key);
+            async move { call(app, "GET", &uri, None).await }
+        };
+        let (s, _, h) = npm_content(member()).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::CACHE_CONTROL], "private, max-age=3600");
+        tdh::publish_repo(&env.fx.pool, npm.id).await;
+        let (s, _, h) = npm_content(anon()).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::CACHE_CONTROL], "public, max-age=3600");
+        env.teardown().await;
+    }
+
+    /// Successful `/v0.1` reads say how they may be cached: a detail (which
+    /// can carry a per-caller bundle ticket) never is, a listing only by the
+    /// caller and only after revalidation, keyed on the credential.
+    #[tokio::test]
+    async fn registry_reads_are_not_shared_cached() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let d = doc("com.acme/cache", "1.0.0", serde_json::json!({}));
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        for tail in [
+            "/servers/com.acme%2Fcache/versions/1.0.0",
+            "/servers/com.acme%2Fcache/versions/latest",
+        ] {
+            let (s, _, h) = env.get(env.anon(), tail).await;
+            assert_eq!(s, StatusCode::OK, "{tail}");
+            assert_eq!(h[header::CACHE_CONTROL], "no-store", "{tail}");
+        }
+        for tail in ["/servers", "/servers/com.acme%2Fcache/versions"] {
+            let (s, _, h) = env.get(env.anon(), tail).await;
+            assert_eq!(s, StatusCode::OK, "{tail}");
+            assert_eq!(h[header::CACHE_CONTROL], "private, no-cache", "{tail}");
+            assert_eq!(h[header::VARY], "Authorization, Cookie", "{tail}");
+        }
         env.teardown().await;
     }
 

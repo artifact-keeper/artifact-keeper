@@ -411,10 +411,7 @@ pub(crate) async fn list_versions(
             mark_virtual(entry, &virtual_repo.key)
         })
         .collect();
-    Ok(mcp::json_ok(
-        StatusCode::OK,
-        &fmt::list_envelope(entries, None),
-    ))
+    Ok(mcp::json_listing(&fmt::list_envelope(entries, None)))
 }
 
 // ---------------------------------------------------------------------------
@@ -459,10 +456,7 @@ pub(crate) async fn list_servers(
             mark_virtual(entry, &virtual_repo.key)
         })
         .collect();
-    Ok(mcp::json_ok(
-        StatusCode::OK,
-        &fmt::list_envelope(entries, page.next),
-    ))
+    Ok(mcp::json_listing(&fmt::list_envelope(entries, page.next)))
 }
 
 /// One listing page: rows with the index of the member each came from.
