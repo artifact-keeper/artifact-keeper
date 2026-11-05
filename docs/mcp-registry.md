@@ -712,7 +712,8 @@ member by priority of a mapped Virtual) is **filled** instead of refused:
    another repository, or a Virtual's first Remote member changed;
    `mcp_package_not_found`, publish again), the publishing account gone or
    disabled. A
-   transient one (`429`, `5xx`, timeout after 300 s) is retried with backoff
+   transient one (`429`, `5xx`, a fill not finished, response body
+   included, within 300 s) is retried with backoff
    (30 s doubling, at most 1 h) up to 8 attempts (`mcp_resolve_exhausted`).
    A failed version stays stored and hidden (`404 mcp_unresolvable` for a
    holder) so its `resolution.error` can be read, but it does **not** take
