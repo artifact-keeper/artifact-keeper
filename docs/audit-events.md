@@ -291,8 +291,9 @@ of the client request that caused the upstream request, when there was one.
 
 Not yet recorded: upstream requests made outside the proxy service (the
 `test-upstream` probe, curation sync, the popularity source, the npm change
-feed and the npm `/-/` and audit passthroughs, the Go sumdb proxy, the AWS
-token exchange).
+feed and the npm `/-/` and audit passthroughs, the Go sumdb pass-through of
+a Hosted repository, the AWS token exchange). A Go Remote's checksum database
+fetches go through the proxy service and are recorded (#5344).
 
 ## Compatibility policy
 

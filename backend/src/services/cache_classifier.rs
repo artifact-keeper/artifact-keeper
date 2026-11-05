@@ -651,14 +651,30 @@ fn classify_oci(lower: &str) -> Mutability {
 /// for a canonical `vMAJOR.MINOR.PATCH[-pre][+build]` version (pseudo-versions
 /// and `+incompatible` included). `@v/list`, `@latest` and a query such as
 /// `@v/master.info` or `@v/v1.2.info` stay mutable.
+///
+/// The checksum database the Go handler caches under `sumdb/<host>/...`
+/// (#5344): see [`classify_go_sumdb`].
 fn classify_go(lower: &str) -> Mutability {
+    if let Some(rest) = lower.strip_prefix("sumdb/") {
+        return classify_go_sumdb(rest);
+    }
     let version = lower.rsplit_once("/@v/").and_then(|(_, leaf)| {
         [".info", ".mod", ".zip"]
             .iter()
             .find_map(|ext| leaf.strip_suffix(ext))
     });
-    let canonical = version
-        .and_then(|v| v.strip_prefix('v'))
+    if version.is_some_and(is_canonical_go_version) {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
+}
+
+/// A canonical Go version, `vMAJOR.MINOR.PATCH[-pre][+build]` with no leading
+/// zeros (pseudo-versions and `+incompatible` included).
+fn is_canonical_go_version(version: &str) -> bool {
+    version
+        .strip_prefix('v')
         .and_then(|v| v.split(['-', '+']).next())
         .is_some_and(|core| {
             let parts: Vec<&str> = core.split('.').collect();
@@ -668,8 +684,23 @@ fn classify_go(lower: &str) -> Mutability {
                         && p.bytes().all(|b| b.is_ascii_digit())
                         && (p.len() == 1 || !p.starts_with('0'))
                 })
-        });
-    if canonical {
+        })
+}
+
+/// The Go checksum database (`<host>/<path>` after `sumdb/`, #5344). A tile
+/// (`tile/H/L/NNN`, and a partial `tile/H/L/NNN.p/W`, which names exactly
+/// `W` hashes) is fixed by its coordinates, and the record a lookup of a
+/// canonical `module@version` returns never changes: only the signed tree
+/// head it carries ages, and the toolchain accepts an older head that is
+/// consistent with the one it knows. The signed tree head `latest` moves
+/// with every append and stays mutable, as does anything unrecognised.
+fn classify_go_sumdb(rest: &str) -> Mutability {
+    let path = rest.split_once('/').map_or("", |(_, path)| path);
+    let pinned_lookup = path
+        .strip_prefix("lookup/")
+        .and_then(|lookup| lookup.rsplit_once('@'))
+        .is_some_and(|(module, version)| !module.is_empty() && is_canonical_go_version(version));
+    if path.starts_with("tile/") || pinned_lookup {
         Mutability::Immutable
     } else {
         Mutability::mutable_default()
@@ -1472,6 +1503,19 @@ mod tests {
             (Go, "github.com/foo/bar/@v/v2.0.0+incompatible.zip", true),
             (Go, "github.com/!burnt!sushi/toml/@v/v1.3.2.zip", true),
             (Go, "github.com/foo/bar/@v/list", false),
+            // Go checksum database under the Go repository (#5344): tiles and
+            // a lookup of a canonical version are pinned, the signed tree head
+            // moves.
+            (Go, "sumdb/sum.golang.org/tile/8/0/000", true),
+            (Go, "sumdb/sum.golang.org/tile/8/1/x001/234.p/17", true),
+            (Go, "sumdb/sum.golang.org/tile/8/data/x123/456", true),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text@v0.14.0", true),
+            (Go, "sumdb/sum.golang.org/lookup/github.com/!azure/sdk@v1.2.3-!r!c1", true),
+            (Go, "sumdb/sum.golang.org/latest", false),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text@master", false),
+            (Go, "sumdb/sum.golang.org/lookup/golang.org/x/text", false),
+            (Go, "sumdb/sum.golang.org/supported", false),
+            (Go, "sumdb/sum.golang.org", false),
             (Go, "github.com/foo/bar/@latest", false),
             (Go, "github.com/foo/bar/@v/master.info", false),
             (Go, "github.com/foo/bar/@v/v1.2.info", false),
