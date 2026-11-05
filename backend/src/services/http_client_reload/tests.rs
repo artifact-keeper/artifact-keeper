@@ -290,11 +290,20 @@ async fn an_in_flight_response_finishes_after_its_root_is_removed() {
     assert!(!succeeds(&client, &server_a).await);
     assert!(succeeds(&client, &server_b).await);
     server_a.stream_release.notify_one();
-    let remaining = tokio::time::timeout(Duration::from_secs(3), response.bytes())
-        .await
-        .expect("rotation must not cancel an active response")
-        .unwrap();
-    assert_eq!(remaining.as_ref(), b"cd");
+    let remaining = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut remaining = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            assert!(
+                remaining.len() + chunk.len() <= 2,
+                "unexpected response body"
+            );
+            remaining.extend_from_slice(&chunk);
+        }
+        remaining
+    })
+    .await
+    .expect("rotation must not cancel an active response");
+    assert_eq!(remaining, b"cd");
     assert!(!succeeds(&client, &server_a).await);
 }
 
