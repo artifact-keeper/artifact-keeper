@@ -1721,11 +1721,12 @@ Every server version is linted (`McpLintScanner`, offline and
 deterministic: no network, no model). The lint reads the stored server.json
 (`title`, `description`, every package's `runtimeArguments`,
 `packageArguments`, `environmentVariables` and transport `headers`, every
-remote's `url`, `headers` and `variables`), the tools the publisher declares
-in `_meta` (`com.artifactkeeper/capabilities.tools`, directly or inside
-`io.modelcontextprotocol.registry/publisher-provided`), the tools of stored
-MCPB bundles (`metadata.bundles[*].manifest.tools`), the OCI pins and image
-labels, and the `statusMessage`.
+remote's `url`, `headers` and `variables`), the tools, resources, prompts and
+`instructions` the publisher declares in `_meta`
+(`com.artifactkeeper/capabilities`, directly or inside
+`io.modelcontextprotocol.registry/publisher-provided`), the tools and prompts
+of stored MCPB bundles (`metadata.bundles[*].manifest.tools`, `.prompts`),
+the OCI pins and image labels, and the `statusMessage`.
 
 It runs (independent of the repository's scan settings):
 
@@ -1735,9 +1736,28 @@ It runs (independent of the repository's scan settings):
 | admin edit (`PUT .../versions/{v}`) | the same as a publish | `server_json`, `status_message` |
 | status change, soft delete | the `statusMessage` (refusing on `block`) | `status_message` |
 | Remote ingest of a new version; a mirrored upstream status change; a re-resolution that pinned packages | the stored version (`services::mcp_lint::lint_stored_version`; never refuses: a `block` finding holds the version through the scan-policy gate) | `server_json`, `status_message` |
-| every stored capability snapshot that is reported or observed (`ci_reported`, `gateway_reported`, `remote_probe`, `sandbox_run`) with `outcome: ok` | its tools (`mcp_lint::lint_tools`) | `capabilities:<source>` |
+| every stored capability snapshot that is reported or observed (`ci_reported`, `gateway_reported`, `remote_probe`, `sandbox_run`) with `outcome: ok` | its tools, resources, prompts and `instructions` (`mcp_lint::lint_capabilities`) | `capabilities:<source>` |
 
-Publisher-declared tools (`_meta` and MCPB manifests) are part of the
+What each part of a capability list gets (#5388):
+
+| Part | Rules |
+| --- | --- |
+| tools | every string of the tool (`name`, `title`, `description`, `inputSchema`, `outputSchema`, `annotations`, object keys): `hidden_text`, `injection_phrase`, `secret_literal`; the name: `destructive_tool`, `shell_like_tool_name`, `confusable_name` |
+| resources | every string (`uri`, `name`, `title`, `description`, `mimeType`, ...): `hidden_text`, `injection_phrase`, `secret_literal`; `name`: `confusable_name` (not `uri`: a path in a non-Latin script mixes scripts with its scheme legitimately) |
+| prompts | every string (`name`, `title`, `description`, argument `name`s and `description`s; an MCPB prompt's `text`): `hidden_text`, `injection_phrase`, `secret_literal`; `name`: `confusable_name` |
+| `instructions` | `hidden_text`, `injection_phrase` (URLs count, as in a description), `secret_literal` |
+
+Identifiers are refused rather than linted: a capability document
+(`POST .../capabilities`, a worker result, a declared block) whose tool or
+prompt `name`, resource `uri` or `name`, or prompt argument `name` contains a
+control, bidirectional, zero-width or tag character answers `400` (the introspector applies the same `from_doc` check before
+posting, so its attempt is recorded as `refused` with the reason), the same characters the publish path
+refuses anywhere in a declared block. Free text with them is accepted and
+flagged `hidden_text`. These are checks on what reaches an agent, not output
+encoding: the web UI renders every capability string as text, so markup in a
+description is not an XSS vector.
+
+Publisher-declared capabilities (`_meta` and MCPB manifests) are part of the
 document and are linted under `server_json`, so a `publisher_declared`
 snapshot is not linted again. A new snapshot of a source replaces that
 source's findings (a snapshot with no flagged tool clears them); a failed
@@ -1758,6 +1778,7 @@ snapshot (`outcome` other than `ok`) leaves them.
 | `mcpb_missing_sha` | `block`, `review` | `block`: an `mcpb` package without `fileSha256`. `review`: an `mcpb` `fileSha256` that matches no bundle stored with the version (when bundles are stored). |
 | `destructive_tool` | `review`, `warn` | `warn`: a tool whose name reads as destructive (`delete`, `drop`, `rm`, `purge`, `wipe`, `truncate`, `kill`, `reset`, `overwrite`, ...) or that declares `destructiveHint: true`. `review`: a destructive name whose annotations claim `readOnlyHint: true` or `destructiveHint: false`. |
 | `shell_like_tool_name` | `review` | A tool whose name reads as running arbitrary commands (`shell`, `bash`, `sh`, `cmd`, `powershell`, `terminal`, `exec`, `eval`, `subprocess`, or `run`/`execute` with `command`/`script`/`code`/`process`). |
+| `confusable_name` | `review` | A tool, prompt or resource name that carries a character which reads as ASCII (its UTS #39 confusable skeleton after NFKC is ASCII, for example Cyrillic `е` or fullwidth `ｒ`) and either mixes scripts (`rеad_file`) or reads as plain ASCII as a whole (all-Cyrillic `реа`, fullwidth `ｒｅａｄ`). The message gives the name it reads as. A name that only mixes scripts (`get_天気`) or is written in one non-Latin script (`файл`) is not flagged. Same `unicode-security` skeleton as the curation typo-squat rules. |
 
 | Action | `scan_findings.severity` | Hosted publish / status change | Every other path (scan-policy gate) |
 | --- | --- | --- | --- |
@@ -1774,7 +1795,7 @@ the rule and the field: re-linting the same version keeps it acknowledged.
 ### Where findings are stored
 
 One completed `scan_results` row with `scan_type = "mcp_lint"` and
-`scanner_version = "ak-mcp-lint/1"` per lint run of the server.json artifact,
+`scanner_version = "ak-mcp-lint/2"` per lint run of the server.json artifact,
 listed by `GET /api/v1/security/artifacts/{artifact_id}/scans` like any scan.
 Each finding:
 
