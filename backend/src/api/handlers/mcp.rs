@@ -681,6 +681,117 @@ pub(crate) async fn catalog_visible_versions(
 }
 
 // ---------------------------------------------------------------------------
+// The generic artifact routes (`/api/v1/repositories/{key}/artifacts`, ...)
+// ---------------------------------------------------------------------------
+
+/// The `name@version` an artifact path of an MCP repository belongs to: its
+/// `servers/<name>/<version>/server.json`, or a bundle stored beside it
+/// (`servers/<name>/<version>/bundles/<file>`). `None` for any other path.
+pub(crate) fn owning_version(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("servers/")?;
+    let nv = match rest.strip_suffix("/server.json") {
+        Some(nv) => nv,
+        None => &rest[..rest.find("/bundles/")?],
+    };
+    let (name, version) = nv.rsplit_once('/')?;
+    (!name.is_empty() && !version.is_empty()).then_some((name, version))
+}
+
+/// The MCP serve decision for the generic artifact routes (#5253): a
+/// listing, a metadata read, a revision history or a download of an MCP
+/// repository's artifact answers a reader exactly as the `/v0.1` surface
+/// does. A holder (instance administrator, or `read` through a grant or role:
+/// the reason gate) sees every stored version; any other caller sees an
+/// artifact only while its owning version is served to readers now
+/// ([`decide_row`] with the reader audience and no deleted versions), so a
+/// held, refused, resolving, unresolvable or soft-deleted version is left out
+/// of listings and is the route's plain `404` elsewhere. A path that belongs
+/// to no server version, and a gate that cannot be evaluated, are hidden from
+/// readers (fail closed). Decisions are cached per repository and version
+/// for one request.
+pub(crate) struct GenericArtifactGate<'a> {
+    state: &'a SharedState,
+    auth: Option<&'a AuthExtension>,
+    repos: HashMap<Uuid, GateRepo>,
+    decided: HashMap<(Uuid, String, String), bool>,
+}
+
+/// What [`GenericArtifactGate`] knows of one repository.
+#[derive(Clone)]
+enum GateRepo {
+    /// Not an MCP registry: this gate does not apply.
+    NotMcp,
+    /// An MCP registry, and whether the caller holds it.
+    Mcp(Box<RepoInfo>, bool),
+    /// An MCP registry that could not be resolved: hidden (fail closed).
+    Unavailable,
+}
+
+impl<'a> GenericArtifactGate<'a> {
+    pub(crate) fn new(state: &'a SharedState, auth: Option<&'a AuthExtension>) -> Self {
+        Self {
+            state,
+            auth,
+            repos: HashMap::new(),
+            decided: HashMap::new(),
+        }
+    }
+
+    async fn repo(&mut self, repo_id: Uuid) -> GateRepo {
+        if let Some(r) = self.repos.get(&repo_id) {
+            return r.clone();
+        }
+        let key: Result<Option<String>, sqlx::Error> =
+            sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1 AND format = 'mcp'")
+                .bind(repo_id)
+                .fetch_optional(&self.state.db)
+                .await;
+        let found = match key {
+            Ok(None) => GateRepo::NotMcp,
+            Ok(Some(key)) => match resolve_mcp_repo(&self.state.db, &key).await {
+                Ok(info) => {
+                    let holder = audience(&self.state.db, self.auth, repo_id).await
+                        == GateAudience::ReasonGated;
+                    GateRepo::Mcp(Box::new(info), holder)
+                }
+                Err(_) => GateRepo::Unavailable,
+            },
+            Err(_) => GateRepo::Unavailable,
+        };
+        self.repos.insert(repo_id, found.clone());
+        found
+    }
+
+    /// Whether the caller may see the artifact at `path` of `repo_id`.
+    /// Always `true` for a repository that is not an MCP registry.
+    pub(crate) async fn visible(&mut self, repo_id: Uuid, path: &str) -> bool {
+        let repo = match self.repo(repo_id).await {
+            GateRepo::NotMcp => return true,
+            GateRepo::Unavailable => return false,
+            GateRepo::Mcp(_, true) => return true,
+            GateRepo::Mcp(repo, false) => repo,
+        };
+        let Some((name, version)) = owning_version(path) else {
+            return false;
+        };
+        let key = (repo_id, name.to_string(), version.to_string());
+        if let Some(v) = self.decided.get(&key) {
+            return *v;
+        }
+        let row = match versions_of(&self.state.db, repo_id, name).await {
+            Ok(rows) => rows.into_iter().find(|r| r.version == version),
+            Err(_) => None,
+        };
+        let ok = match row {
+            Some(row) => servable_row(self.state, repo.as_ref(), &row, "").await,
+            None => false,
+        };
+        self.decided.insert(key, ok);
+        ok
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Refusal audit (sampled)
 // ---------------------------------------------------------------------------
 
@@ -3434,6 +3545,102 @@ mod tests {
     // -----------------------------------------------------------------------
     // Held versions
     // -----------------------------------------------------------------------
+
+    /// #5253: the generic artifact routes apply the MCP serve decision. With
+    /// 2.0.0 held through its backing npm package (the server.json row itself
+    /// is not quarantined), an anonymous reader of the public registry gets
+    /// no 2.0.0 row from the artifact listing and the routes' plain `404`
+    /// from the metadata, revision-history, download and by-id routes, while
+    /// 1.0.0 is served. A holder keeps access. Releasing the hold serves
+    /// 2.0.0 again.
+    #[tokio::test]
+    async fn generic_artifact_routes_follow_the_serve_decision() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let (_npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for v in ["1.0.0", "2.0.0"] {
+            let d = doc(
+                "com.acme/gen",
+                v,
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+        let key = env.fx.repo_key.clone();
+        let held = "servers/com.acme/gen/2.0.0/server.json";
+        let served = "servers/com.acme/gen/1.0.0/server.json";
+        let held_id = env.server_artifact("com.acme/gen", "2.0.0").await;
+        let repos = || crate::api::handlers::repositories::router();
+        let downloads = || crate::api::handlers::repositories::download_router();
+        let by_id = || crate::api::handlers::artifacts::router();
+        let anon = |r: Router<SharedState>| env.fx.router_anon(r);
+        let member = |r: Router<SharedState>| env.fx.router_with_auth(r);
+        let listed = |app: Router| {
+            let uri = format!("/{key}/artifacts?per_page=100");
+            async move {
+                let (s, b, _) = call(app, "GET", &uri, None).await;
+                assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+                let mut paths: Vec<String> = json(&b)["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["path"].as_str().unwrap().to_string())
+                    .collect();
+                paths.sort();
+                paths
+            }
+        };
+        assert_eq!(listed(anon(repos())).await, [served.to_string()]);
+        assert_eq!(
+            listed(member(repos())).await,
+            [served.to_string(), held.to_string()]
+        );
+        let status = |app: Router, uri: String| async move { call(app, "GET", &uri, None).await.0 };
+        for (path, want) in [(held, StatusCode::NOT_FOUND), (served, StatusCode::OK)] {
+            assert_eq!(
+                status(anon(repos()), format!("/{key}/artifacts/{path}")).await,
+                want,
+                "metadata {path}"
+            );
+            assert_eq!(
+                status(anon(downloads()), format!("/{key}/download/{path}")).await,
+                want,
+                "download {path}"
+            );
+        }
+        assert_eq!(
+            status(anon(repos()), format!("/{key}/versions/{held}")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(anon(by_id()), format!("/{held_id}")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(anon(by_id()), format!("/{held_id}/metadata")).await,
+            StatusCode::NOT_FOUND
+        );
+        // A holder reads the held version's metadata and record.
+        assert_eq!(
+            status(member(repos()), format!("/{key}/artifacts/{held}")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status(member(by_id()), format!("/{held_id}")).await,
+            StatusCode::OK
+        );
+        // Released: served to readers again.
+        env.hold(ids[1], None).await;
+        assert_eq!(
+            status(anon(repos()), format!("/{key}/artifacts/{held}")).await,
+            StatusCode::OK
+        );
+        assert_eq!(listed(anon(repos())).await.len(), 2);
+        env.teardown().await;
+    }
 
     #[tokio::test]
     async fn held_backing_package_hides_the_version() {

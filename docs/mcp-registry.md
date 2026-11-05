@@ -987,6 +987,25 @@ row at all when no version of the server is served: `GET
 `GET /api/v1/packages/{id}/versions` lists only servable versions for such a
 reader. A gate that cannot be evaluated hides the row (fail closed).
 
+**The generic artifact routes** apply the same decision to an MCP
+registry's stored documents and bundles (`servers/<name>/<version>/server.json`,
+`servers/<name>/<version>/bundles/<file>`). For a caller who does not hold the
+repository, a version that readers are not served now (held through its
+server.json or a pinned package, refused by scan policy or curation,
+resolving, unresolvable, or soft-deleted) is treated as missing:
+
+- `GET /api/v1/repositories/{key}/artifacts` leaves its rows out. The cursor
+  is unaffected, and `total` leaves out only that page's hidden rows.
+- `GET /api/v1/repositories/{key}/artifacts/{path}`,
+  `GET /api/v1/repositories/{key}/versions/{path}`,
+  `GET /api/v1/repositories/{key}/download/{path}`, and
+  `GET /api/v1/artifacts/{id}` (with `/metadata` and `/stats`) answer the
+  route's plain `404`. For a Virtual registry, the member that holds the
+  path first (by priority) decides.
+
+A holder sees every stored version there, and still gets the server.json's
+own quarantine refusals (`409`/`403`) on download.
+
 **`GET /api/v1/formats`** (and `/api/v1/formats/{key}`): every format handler
 carries `repository_types`, the repository types it can be created as, in
 the order `local`, `staging`, `remote`, `virtual`; `["local", "staging",

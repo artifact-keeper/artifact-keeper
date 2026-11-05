@@ -7442,6 +7442,23 @@ pub async fn list_artifacts(
     } else {
         None
     };
+    // MCP registries (#5253): a version a reader is not served is left out,
+    // as on the registry surface. The cursor above is the last row read, so
+    // paging is unaffected; the total leaves out this page's hidden rows.
+    let mut hidden = 0i64;
+    if repo.format == RepositoryFormat::Mcp {
+        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+        let mut kept = Vec::with_capacity(artifacts.len());
+        for a in artifacts {
+            if gate.visible(a.repository_id, &a.path).await {
+                kept.push(a);
+            } else {
+                hidden += 1;
+            }
+        }
+        artifacts = kept;
+    }
+    let exact_total = exact_total.map(|t| (t - hidden).max(0));
     let total = grouped_listing_total(exact_total, offset, artifacts.len(), has_more);
     let total_pages = grouped_total_pages(total, per_page);
 
@@ -9800,6 +9817,11 @@ pub async fn get_artifact_metadata(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_visible(&repo, &auth, &repo_service).await?;
+    // An MCP version a reader is not served is a missing artifact here
+    // (#5253).
+    if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
+        return Err(generic_artifact_not_found(&repo));
+    }
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
@@ -10133,7 +10155,11 @@ pub async fn list_artifact_versions(
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
-    let versions = artifact_service.list_versions(repo.id, &path).await?;
+    let versions = if mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
+        artifact_service.list_versions(repo.id, &path).await?
+    } else {
+        Vec::new()
+    };
     if versions.is_empty() {
         return Err(AppError::NotFound(
             "No version history for this artifact".to_string(),
@@ -10728,7 +10754,53 @@ pub(crate) const MCP_GENERIC_DELETE_REFUSED: &str =
     "MCP registries delete server versions only through \
      DELETE /mcp/{repository}/v0.1/servers/{serverName}/versions/{version}";
 
-/// `400` for a generic write or delete into an MCP repository unless the
+/// Whether `auth` may see the artifact at `path` of `repo` through a generic
+/// artifact route (metadata, revision history, download), under the MCP
+/// serve decision (#5253, [`super::mcp::GenericArtifactGate`]). Always
+/// `true` for other formats. For a Virtual MCP registry the member that
+/// holds the path first (by priority) decides; a path no member holds is
+/// left to the route's own `404`.
+pub(crate) async fn mcp_generic_path_visible(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<bool> {
+    if repo.format != RepositoryFormat::Mcp {
+        return Ok(true);
+    }
+    let owners: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT a.repository_id FROM artifacts a \
+         LEFT JOIN virtual_repo_members vm \
+           ON vm.member_repo_id = a.repository_id AND vm.virtual_repo_id = $1 \
+         WHERE a.path = $2 AND a.is_deleted = false \
+           AND (a.repository_id = $1 OR vm.virtual_repo_id IS NOT NULL) \
+         ORDER BY (a.repository_id = $1) DESC, vm.priority",
+    )
+    .bind(repo.id)
+    .bind(path)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let Some(owner) = owners.first() else {
+        return Ok(true);
+    };
+    Ok(super::mcp::GenericArtifactGate::new(state, auth)
+        .visible(*owner, path)
+        .await)
+}
+
+/// The plain `404` a generic artifact route answers for a missing artifact,
+/// also its answer for an MCP version the caller may not see.
+fn generic_artifact_not_found(repo: &crate::models::repository::Repository) -> AppError {
+    AppError::NotFound(if repo.repo_type == RepositoryType::Virtual {
+        "Artifact not found in any member repository".to_string()
+    } else {
+        "Artifact not found".to_string()
+    })
+}
+
+/// `400` for a generic write or delete into an MCP repository unless the/// `400` for a generic write or delete into an MCP repository unless the
 /// caller is a trusted peer replication (admin or service account with the
 /// replication header).
 pub(crate) fn mcp_generic_mutation_refusal(
@@ -11935,6 +12007,11 @@ pub async fn download_artifact(
     // unchanged so the Remote/Virtual proxy fallback below still fires against
     // the original URL shape.
     let path = resolve_stored_path(&state, &repo, path).await?;
+    // An MCP version a reader is not served is a missing artifact here, as on
+    // the registry surface (#5253); also before any upstream fallback.
+    if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
+        return Err(generic_artifact_not_found(&repo));
+    }
 
     // Enforce quarantine AND the repository's scan policy before serving the
     // artifact: quarantined/rejected is a 409/403, a scan-policy violation
