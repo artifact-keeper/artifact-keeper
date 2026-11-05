@@ -1119,7 +1119,8 @@ pub struct RuntimeSettingsResponse {
     pub hidden_nav_items: Vec<String>,
     /// Whether every scheduled job that contacts an upstream on its own is
     /// paused (#5288): curation sync, environment re-evaluation, the npm
-    /// replication feed and peer replication transfers.
+    /// replication feed, peer replication transfers and scheduled `mirror`
+    /// passes (#5342).
     pub upstream_jobs_paused: bool,
     /// Where that value comes from: `environment` (`UPSTREAM_JOBS_PAUSED=true`
     /// pins it on), `database` (set through this API), `default` (neither) or
