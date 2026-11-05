@@ -18,6 +18,12 @@ import (
 func main() {
 	cfg := LoadConfig()
 	srv := NewServer(cfg)
+	if cfg.Offline {
+		log.Printf("offline mode (SCANNER_OFFLINE): no vulnerability-DB or Java-DB download, scans run with --skip-db-update --skip-java-db-update --offline-scan; import a DB with PUT /api/v1/vulndb")
+	}
+	if cfg.AdapterToken == "" {
+		log.Printf("SCANNER_ADAPTER_TOKEN unset: GET/PUT /api/v1/vulndb are disabled")
+	}
 
 	if cfg.TrivyServer != "" {
 		// Client mode: the vulnerability DB and the matching live on the trivy
@@ -61,6 +67,7 @@ func startStandalone(srv *Server, cfg *Config) {
 	// Probe the trivy version at startup (unless pinned via env). A failed probe
 	// leaves the adapter not-ready so the backend does not dispatch scans to an
 	// adapter whose trivy binary is missing/broken.
+	cleanStaleImports(cfg.CacheDir)
 	versionOK := true
 	if cfg.ScannerVersion == "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -83,6 +90,7 @@ func startStandalone(srv *Server, cfg *Config) {
 	// instead. When DB updates are enabled, download it now so it is present
 	// before the readiness flag flips (rather than racing the first scan).
 	if versionOK {
+		srv.versionProbed.Store(true)
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.ScanTimeout)
 		if !cfg.SkipDBUpdate {
 			if err := DownloadDB(ctx, cfg); err != nil {
@@ -93,7 +101,7 @@ func startStandalone(srv *Server, cfg *Config) {
 		if srv.markReadyIfDBPresent(func() bool { return DBReady(cfg) }) {
 			log.Printf("trivy vuln DB present; adapter ready (trivy=%s)", cfg.ScannerVersion)
 		} else {
-			log.Printf("trivy vuln DB not present in %s (staying not-ready)", cfg.CacheDir)
+			log.Printf("trivy vuln DB not present in %s (staying not-ready until one is downloaded or imported via PUT /api/v1/vulndb)", cfg.CacheDir)
 		}
 	}
 }

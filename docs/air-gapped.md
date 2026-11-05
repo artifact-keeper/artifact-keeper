@@ -23,15 +23,22 @@ disconnected side.
 
 ### Seed, then disconnect
 
-1. Bring the stack up on a connected network.
+1. Bring the stack up on a connected network. Set
+   `AUDIT_UPSTREAM_FETCHES=all` if you want the audit log to list every
+   upstream request of the seed window ([section 7](#7-verification-checklist)).
 2. Create the Remote repositories you need and apply the offline settings in
    [section 3](#3-remote-repositories) **before** you seed. A raised cache TTL
    only applies to an entry from its next revalidation, so set it first.
-3. Pull everything the site will need through Artifact Keeper: run the
-   builds, `pip install -r`, `npm ci`, `docker pull`, `hf download` and so on
-   against it. Every path that is fetched once is cached.
+3. Fill the caches. Either pull everything the site will need through
+   Artifact Keeper (run the builds, `pip install -r`, `npm ci`, `docker pull`,
+   `hf download` and so on against it; every path that is fetched once is
+   cached), or, where you have the list of paths, seed a Remote on the server
+   side with a cache seed job ([Seeding the cache](#seeding-the-cache)).
 4. Refresh the scanner databases ([section 4](#4-scanners)).
-5. Disconnect, then run the [verification checklist](#7-verification-checklist).
+5. Put every Remote in cache-only mode
+   ([Cache-only mode](#cache-only-mode)) and pause the scheduled upstream jobs
+   ([section 5](#5-background-jobs-that-reach-out)).
+6. Disconnect, then run the [verification checklist](#7-verification-checklist).
 
 Anything you did not fetch in step 3 is not there afterwards. Fetch the exact
 versions the site will use, not only the latest ones.
@@ -75,6 +82,13 @@ Notes:
   matching repositories on the high side first. The usual pattern is to
   promote vetted content into a Local repository on the low side and
   subscribe that repository.
+- To create those repositories with the low side's settings, export the low
+  side's repository configuration with `GET /api/v1/admin/config/export`
+  (optionally `?repositories=a,b`), then on the high side review it with
+  `POST /api/v1/admin/config/import?mode=plan` and write it with
+  `mode=apply`. Credentials are not exported; supply them in the import's
+  `secrets` map. The document covers repositories and their per-repository
+  settings only. See [Config as code](config-as-code.md).
 - The peer endpoint URL goes through the same SSRF check as Remote upstream
   URLs. If the high side is on a private address, list it in
   `AK_SSRF_ALLOW_PRIVATE_CIDRS` on the low side.
@@ -181,7 +195,8 @@ the `write:repositories` scope and `admin` on the repository.
 | Cache TTL | `PUT /api/v1/repositories/{key}/cache-ttl` | Lifetime of mutable paths. Immutable artifacts are cached forever regardless. | `{"cache_ttl_seconds": 315360000}` (the maximum: never revalidate). Set it before seeding. |
 | Upstream 404/410 | `PUT /api/v1/repositories/{key}/on-upstream-not-found` | Whether a definitive upstream 404/410 deletes the cached copy. | `{"on_upstream_not_found": "keep"}` |
 | Stale-if-error grace | `PUT /api/v1/repositories/{key}/stale-if-error-grace` | How long past expiry a cached body is still served when upstream is unreachable. Instance default `PROXY_STALE_IF_ERROR_GRACE_SECS` (3600). | `{"stale_if_error_grace_seconds": 2592000}` (the maximum, 30 days) |
-| Upstream filter | `PUT /api/v1/repositories/{key}/upstream-filter` | Which paths may be requested from upstream at all. | `{"include_patterns": [], "exclude_patterns": [".*"]}` for cache-only (see below) |
+| Upstream mode | `PUT /api/v1/repositories/{key}/upstream-mode` | Whether the Remote contacts its upstream at all. | `{"upstream_mode": "cache_only"}` once seeded (see [below](#cache-only-mode)) |
+| Upstream filter | `PUT /api/v1/repositories/{key}/upstream-filter` | Which paths may be requested from upstream at all. | Not needed for offline use; a security control (see [below](#cache-only-mode)) |
 | Egress proxy | `PUT /api/v1/repositories/{key}/egress-proxy` | Which forward proxy this Remote uses. | `{"mode": "explicit", "proxy_url": "http://egress-ledger:3128"}` to log, or leave at `inherit` |
 
 ```bash
@@ -216,33 +231,67 @@ Why each one matters:
   `ak_proxy_stale_if_error_responses_total`. With the TTL at the maximum it is
   a safety net, not the main mechanism.
 
-### Cache-only today: exclude everything
+### Seeding the cache
 
-There is no declared cache-only mode yet (#5282). Today an upstream filter
-that refuses every path gives the same effect:
+A cache seed job fetches a list of paths into a Remote's cache on the server,
+instead of replaying client installs, and reports per path what happened:
 
 ```bash
-curl -X PUT "$AK/api/v1/repositories/pypi-remote/upstream-filter" \
+curl -X POST "$AK/api/v1/repositories/maven-remote/cache/seed" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"include_patterns": [], "exclude_patterns": [".*"]}'
+  -d '{"kind": "paths", "content": ["org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar"]}'
 ```
 
-With it:
+The answer is `202` with a job id; `GET
+/api/v1/repositories/{key}/cache/seed/{job_id}` returns the inventory, one
+row per path (`cached`, `already_cached`, `refused` or `failed`) with size and
+SHA-256. A job takes at most 10,000 paths. Each path goes through the same
+proxy entry as a client download, so the upstream filter, the Package Age
+Policy, quotas and the scan-on-proxy refusal apply to it. Only the `paths`
+manifest exists in this release: the typed manifests (`pypi-requirements`,
+`npm-lockfile`, `oci-images`, `hf-models`) and seeding a Virtual repository
+answer `400`. See [Seeding a Remote's proxy cache](cache-seed.md).
 
-- A path that is not cached answers 404 at once. No connection is attempted,
-  so a client fails fast instead of waiting for a connect timeout.
-- A Virtual repository skips this member for the path without contacting it.
-- The filter also gates the npm `/-/` passthroughs and audit, the curation
-  upstream sync and the `test-upstream` probe.
-- **Expired entries stop serving.** A cached entry for a refused path is
-  served only while it is fresh. Once it expires it is not revalidated and
-  stale-if-error does not apply: it answers 404 like a miss. So pair the
-  filter with the maximum cache TTL, set before seeding. Immutable artifacts
-  never expire and are not affected.
+### Cache-only mode
 
-Remove the filter with `DELETE /api/v1/repositories/{key}/upstream-filter` to
-let a Remote fetch again. Pattern syntax, the subject each format matches and
-the npm and Hugging Face path shapes are in
+Once a Remote is seeded, declare it cache-only. It then serves what it holds
+and never contacts its upstream:
+
+```bash
+for key in pypi-remote npm-remote ghcr-remote hf-remote; do
+  curl -X PUT "$AK/api/v1/repositories/$key/upstream-mode" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d '{"upstream_mode": "cache_only"}'
+done
+```
+
+Or set `PROXY_UPSTREAM_MODE=cache_only` in the backend environment, which
+puts every Remote in cache-only mode at once (read at startup).
+`GET /api/v1/repositories/{key}/upstream-mode` reports the stored and the
+effective mode. With it:
+
+- **Every cached entry is served, fresh or stale**, with no revalidation. A
+  stale entry carries `Warning: 110` and `X-AK-Stale-Since`, so the cache TTL
+  no longer decides whether seeded indexes keep serving.
+- **A miss answers 404 at once**, with the reason
+  `not in cache; repository '<key>' is cache-only`, and counts as
+  `ak_proxy_cache_lookups_total{result="cache_only_miss"}`. No connection is
+  attempted, so a client fails fast instead of waiting for a connect timeout.
+- The mode is checked by the same gate as the upstream filter, so the npm
+  `/-/` passthroughs and `npm audit`, the curation upstream sync and the
+  `test-upstream` probe honour it too.
+- A Virtual repository skips a cache-only member that does not hold the path.
+
+The setting is Remote-only and needs `write:repositories` and `admin` on the
+repository. Set `{"upstream_mode": "online"}` to let a Remote fetch again.
+
+An upstream filter that excludes everything (`"exclude_patterns": [".*"]`)
+also stops upstream contact, but it is a security control, not an offline
+mode: an expired entry for a refused path answers 404 instead of being served,
+so a seeded index file disappears once its TTL passes. Use `upstream_mode` for
+"disconnected now" and the filter for "never fetch this". The details are in
+[Proxy cache freshness](proxy-cache-freshness.md#cache-only-offline-mode-upstream_mode-5282);
+pattern syntax and the per-format subjects are in
 [Upstream filters](upstream-filter.md).
 
 ### Internal upstreams
@@ -295,7 +344,10 @@ To refresh it:
 
 The `trivy` service runs `trivy server`, which downloads its database into the
 `trivy_cache` volume. Offline, seed the volume while connected and add
-`--skip-db-update` so the server uses it as is:
+`--skip-db-update` so the server uses it as is (`docker-compose.yml` carries
+this line commented out). trivy refuses `--skip-db-update` on a first run, so
+the volume must already hold `db/trivy.db` and `db/metadata.json`, for example
+the `db.tar.gz` from `oras pull ghcr.io/aquasecurity/trivy-db:2`, unpacked:
 
 ```yaml
 trivy:
@@ -313,7 +365,9 @@ The adapter (`docker/scanner-adapter`) has its own settings:
 
 | Variable | What it does | Offline value |
 | --- | --- | --- |
-| `SCANNER_TRIVY_SKIP_DB_UPDATE` | Skip the startup download and pass `--skip-db-update` to image scans. | `true` |
+| `SCANNER_OFFLINE` | The single air-gap switch (adapter 1.7.0 and later). Implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true`, skips the startup database download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update --offline-scan`, so trivy contacts no database registry, no Java DB registry and no other network API. | `true` |
+| `SCANNER_ADAPTER_TOKEN` | Shared bearer token for the adapter's own `vulndb` route (`PUT` imports a database, `GET` reports it). Unset, both answer 403. | A secret you generate |
+| `SCANNER_TRIVY_SKIP_DB_UPDATE` | Skip the startup download and pass `--skip-db-update` to image and filesystem scans. | `true` (implied by `SCANNER_OFFLINE`) |
 | `SCANNER_TRIVY_DB_REPOSITORY` | OCI repository the database is pulled from (`--db-repository`). Default is trivy's public mirror. | An OCI repository in your Artifact Keeper that holds a copy of the trivy DB artifact |
 | `SCANNER_TRIVY_SERVER` | Run every scan as a client of a `trivy server`, which owns the database. | `http://trivy:8090` (the compose server started with `--skip-db-update`) |
 | `SCANNER_TRIVY_CACHE_DIR` | Local cache and database directory. | A volume seeded while connected |
@@ -321,12 +375,23 @@ The adapter (`docker/scanner-adapter`) has its own settings:
 The adapter stays not-ready until a database is present, so a missing
 database fails scans closed instead of reporting them clean.
 
-Prefer client/server mode (`SCANNER_TRIVY_SERVER`) offline. In standalone mode
-`SCANNER_TRIVY_SKIP_DB_UPDATE` is only passed to image scans; filesystem scans
-are not given the flag, so they can still try to download a database. In
-either mode trivy fetches its separate Java DB on the client the first time it
-analyzes a JAR, so seed `SCANNER_TRIVY_CACHE_DIR` with it while connected if
-you scan Java.
+**Importing a database without shell access.** In standalone mode the adapter
+takes a trivy database over HTTP and swaps it in with no restart. On a
+connected machine, `oras pull ghcr.io/aquasecurity/trivy-db:2` writes
+`db.tar.gz`. Carry it across and `PUT` it to the adapter's `vulndb` route with
+the `SCANNER_ADAPTER_TOKEN` bearer token; a `GET` of the same route reports the
+installed database's build date and age (`age_seconds`, `stale`). The import
+checks that the archive holds exactly `trivy.db` and `metadata.json` with the
+expected schema version, refuses a database older than the installed one with
+409 unless `?force=true` is given, and makes an adapter that had no database
+ready. In client mode the trivy server owns the database and the import
+answers 409. The route belongs to the scanner-adapter service (port 8080 in
+the compose example), not to the backend; the exact `curl` commands are under
+"Offline use and vulnerability-DB import" in `docker/scanner-adapter/README.md`.
+
+With `SCANNER_OFFLINE=true` the Java DB is never downloaded, so JAR files are
+matched only if a Java DB is already in `SCANNER_TRIVY_CACHE_DIR`. Seed it
+while connected if you scan Java.
 
 ### Dependency scanner (OSV)
 
@@ -346,28 +411,48 @@ off unless you plan that. OpenSCAP uses the content baked into its image.
 ### Database age (#5177)
 
 Scan results record the database version and publish date
-(`vuln_db_version`, `vuln_db_published_at`), but nothing warns when the
-database is old, and grype is told not to check. An air-gapped scan against a
-six-month-old database looks the same as one against today's. Track the age
-yourself until #5177 adds a view and a threshold. An admin route to import a
-database and report its age, and offline defaults for the trivy services, are
-#5287.
+(`vuln_db_version`, `vuln_db_published_at`), but the backend does not warn
+when the database is old, and grype is told not to check. An air-gapped scan
+against a six-month-old database looks the same as one against today's. The
+scanner-adapter's `vulndb` route reports its own database's age
+(`age_seconds`, `stale`); for the rest, track the age yourself until #5177
+adds a view and a threshold.
 
 ## 5. Background jobs that reach out
 
 These run on a timer or as a standing subscription and contact the internet
-without a client request. There is no single switch yet; #5288 proposes one.
-Until then, handle each:
+without a client request. **One switch pauses the scheduled ones**: set
+`UPSTREAM_JOBS_PAUSED=true` in the backend environment (pins it on), or turn
+it on at run time with no restart:
+
+```bash
+curl -X PATCH "$AK/api/v1/admin/settings/system" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"upstream_jobs_paused": true}'
+```
+
+It pauses the curation upstream sync and its popularity lookups, the
+environment advisory re-evaluation (OSV), the npm change feed consumer, peer
+replication transfers and the Remote MCP registry sync. Each skips its tick
+before any network work and resumes where it stopped when the switch is
+turned off. `GET /api/v1/admin/settings/system` reports the state
+(`upstream_jobs_paused`, `upstream_jobs_paused_source`). Local jobs and
+request-time proxy fetches are not affected; the latter are what
+[cache-only mode](#cache-only-mode) covers. See
+[Disconnected operation](operations/disconnected-operation.md) for the full
+list, including the scheduled jobs it does not pause.
+
+What each job contacts, and how to handle it individually:
 
 | Job | Contacts | How to turn it off |
 | --- | --- | --- |
-| npm change feed | `replicate.npmjs.com` | Off by default. Leave `NPM_UPSTREAM_FEED_ENABLED` unset (and `NPM_UPSTREAM_FEED_URL` unused). The upstream filter does not gate it. |
-| Curation upstream sync | The source Remote's upstream (RPM and Debian index walks, PyPI attestation enrichment), every 5 minutes for each staging repository with curation enabled | Exclude everything in the source Remote's upstream filter. Turning curation off on the staging repository also stops it, but that also stops rule enforcement. |
-| Popularity lookups | `pypistats.org`, `api.npmjs.org`, during curation evaluation, only for `popularity` rules | Disable or delete the rule: `PUT /api/v1/curation/rules/{id}` with `"enabled": false`, or `DELETE /api/v1/curation/rules/{id}`. Offline, an unknown count flags the package for review, so a live rule sends every new package to review. |
+| npm change feed | `replicate.npmjs.com` | Off by default. Leave `NPM_UPSTREAM_FEED_ENABLED` unset (and `NPM_UPSTREAM_FEED_URL` unused). Paused by the switch; the upstream filter does not gate it. |
+| Curation upstream sync | The source Remote's upstream (RPM and Debian index walks, PyPI attestation enrichment), every 5 minutes for each staging repository with curation enabled | Paused by the switch. A cache-only source Remote also refuses it. Turning curation off on the staging repository also stops it, but that also stops rule enforcement. |
+| Popularity lookups | `pypistats.org`, `api.npmjs.org`, during curation evaluation, only for `popularity` rules | The switch pauses the lookups of the scheduled sync, not those made when a rule evaluates a package at request time. Set `CURATION_POPULARITY_PYPI_URL` and `CURATION_POPULARITY_NPM_URL` to an internal mirror, or to `off` so each lookup answers unknown at once. Or disable or delete the rule: `PUT /api/v1/curation/rules/{id}` with `"enabled": false`, or `DELETE /api/v1/curation/rules/{id}`. Offline, an unknown count flags the package for review, so a live rule sends every new package to review. |
 | Dependency scanner advisories | `api.osv.dev`, `api.github.com` | Runs on each scan, not on a timer. Leave `GITHUB_TOKEN` unset; see [section 4](#dependency-scanner-osv). |
-| Peer heartbeats and sync | The registered peers | Only peers you registered. Unregister or disable subscriptions you no longer use. |
+| Peer heartbeats and sync | The registered peers | Only peers you registered. The switch pauses replication transfers (queued tasks stay queued), not heartbeats; set `PEER_HEARTBEAT_ENABLED=false` to stop those. Unregister or disable subscriptions you no longer use. |
 | Webhooks, SMTP, LDAP, OIDC, tracing | Whatever you configured (`OTEL_EXPORTER_OTLP_ENDPOINT` for traces) | Point them at services inside the enclave, or leave them unset. |
-| MCP Remote sync | The MCP registry a Remote proxies | Forthcoming with the MCP registry repository type (#5257); its switch will be documented there. |
+| MCP Remote sync | The upstream registry of each Remote MCP repository, hourly by default (`MCP_REMOTE_SYNC_INTERVAL_SECS`) | Paused by the switch (job `mcp_remote_sync`); the per-repository cursor survives, so it resumes from there. Cache-only mode does not cover it. See [MCP registry: Remote repositories](mcp-registry.md#remote-repositories). |
 
 Crash reporting is opt-in and off by default
 (`GET /api/v1/admin/telemetry/settings`). The backend has no update check.
@@ -377,8 +462,11 @@ Crash reporting is opt-in and off by default
 **Hugging Face.** Set `HF_ENDPOINT` to the Remote and `HF_HUB_DISABLE_XET=1`
 on clients, so `huggingface_hub` never tries the Hub's Xet storage directly.
 `snapshot_download` with a branch revision such as `main` calls model info
-first, which is a mutable path, so the cache TTL above matters. See
-[Hugging Face](huggingface.md).
+first, which is a mutable path, so the cache TTL above matters on a Remote
+that is not cache-only. The files it then fetches by commit sha are immutable
+cache entries (#5283). A Remote forwards the tree listing's `recursive`,
+`expand` and `cursor` (#5321), so a snapshot seeded through it includes the
+files in subdirectories. See [Hugging Face](huggingface.md).
 
 **Go.** Point `GOPROXY` at the Go Remote. Artifact Keeper also answers the
 checksum database under the same prefix (`sumdb/sum.golang.org/...`), but
@@ -430,6 +518,23 @@ Run these after you disconnect, and again after any change.
    same installs. The proxy log should gain no new lines for content that is
    already cached.
 
+   **The audit log agrees.** With `AUDIT_UPSTREAM_FETCHES=all`, every request
+   the proxy sends upstream (a cache-miss fetch, a revalidation, an OCI token
+   exchange) writes an `UPSTREAM_FETCHED` audit entry with the repository,
+   host, path, status and result; a cache hit writes nothing. List what came
+   in during the seed window, and check that nothing was fetched after the
+   cut:
+
+   ```bash
+   curl "$AK/api/v1/admin/audit?action=UPSTREAM_FETCHED&from=<cut time, RFC 3339>" \
+     -H "Authorization: Bearer $ADMIN_TOKEN"
+   ```
+
+   Requests made outside the proxy service (the `test-upstream` probe,
+   curation sync, the popularity source, the npm change feed and `/-/`
+   passthroughs, the Go sumdb proxy) are not recorded. See
+   [Upstream contact](audit-events.md#upstream-contact).
+
 3. **Hits, not misses.** Scrape `GET /api/v1/admin/metrics` (or `/metrics` on
    `METRICS_PORT`) and chart `ak_proxy_cache_lookups_total` by `result` and
    `repository`. A sealed instance serving seeded content should show `hit`
@@ -440,13 +545,19 @@ Run these after you disconnect, and again after any change.
    responses carry no `X-AK-Stale-Since`. If it rises, a mutable entry has
    expired: raise the cache TTL.
 
-5. **Unseeded paths fail fast.** Request a package you did not seed. With the
-   exclude-everything filter it answers 404 at once, without a timeout.
+5. **Unseeded paths fail fast.** Request a package you did not seed. A
+   cache-only Remote answers 404 at once, without a timeout, with the reason
+   `not in cache; repository '<key>' is cache-only`, and
+   `ak_proxy_cache_lookups_total{result="cache_only_miss"}` rises.
 
-6. **Scanners are ready.** The scanner-adapter reports ready, and recent scan
+6. **Scheduled upstream jobs are paused.**
+   `GET /api/v1/admin/settings/system` shows `"upstream_jobs_paused": true`.
+
+7. **Scanners are ready.** The scanner-adapter reports ready, its
+   `vulndb` route shows the database you imported, and recent scan
    results show the database version you expect.
 
-7. **Replication is active.** On the low side,
+8. **Replication is active.** On the low side,
    `GET /api/v1/peers/{id}/repositories/{repo_id}` shows `push` or `mirror`
    and `"effective": "active"` for each subscription, and
    `GET /api/v1/peers/{id}/sync/tasks` drains.
@@ -455,8 +566,14 @@ Run these after you disconnect, and again after any change.
 
 - [Proxy cache freshness](proxy-cache-freshness.md): TTLs, stale-if-error and `on_upstream_not_found`.
 - [Upstream filters](upstream-filter.md): pattern syntax and per-format subjects.
+- [Seeding a Remote's proxy cache](cache-seed.md): the cache seed job and its inventory.
+- [Disconnected operation](operations/disconnected-operation.md): the switch that pauses scheduled upstream jobs.
+- [Config as code](config-as-code.md): export, plan and apply repository configuration.
+- [Audit events](audit-events.md#upstream-contact): `UPSTREAM_FETCHED` and `AUDIT_UPSTREAM_FETCHES`.
 - [Hugging Face](huggingface.md): `HF_ENDPOINT`, gated models and Xet.
 - `backend/src/services/egress_proxy.rs`: egress proxy modes and precedence.
 - `docker/scanner-adapter/README.md`: scanner-adapter client/server mode.
-- #2463, #2464 (bundles), #5177 (scanner DB age), #5282 (cache-only mode),
-  #5287 (scanner offline DB), #5288 (pause scheduled upstream jobs).
+- #2463, #2464 (bundles, planned), #5177 (scanner DB age, open). New in
+  1.12.0: #5282 (cache-only mode), #5284 (cache seed), #5286
+  (`UPSTREAM_FETCHED`), #5287 (scanner offline mode and DB import), #5288
+  (pause scheduled upstream jobs), #5292 (config export and plan/apply).

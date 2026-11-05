@@ -991,7 +991,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Ok(storage_svc) => {
             let proxy_service = Arc::new(
                 ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
-                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs),
+                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs)
+                    .with_upstream_fetch_audit(config.audit_upstream_fetches),
             );
             app_state.set_proxy_service(proxy_service);
             tracing::info!(
@@ -1239,6 +1240,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // #4311: resume repository delete jobs that are pending or whose replica
     // died mid-delete (their claim lapsed).
     artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5284: resume proxy-cache seed jobs that are pending or whose replica
+    // died or restarted mid-seed (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_cache_seed_resumer(
         state.clone(),
         runtime_shutdown_token.clone(),
     );

@@ -374,6 +374,95 @@ async fn resolve_huggingface_repo(db: &PgPool, repo_key: &str) -> Result<RepoInf
     proxy_helpers::resolve_repo_by_key(db, repo_key, &["huggingface"], "a Hugging Face").await
 }
 
+// ---------------------------------------------------------------------------
+// Upstream refusals (#5323)
+// ---------------------------------------------------------------------------
+
+/// The response headers `huggingface_hub` reads to pick its exception
+/// (`hf_raise_for_status`): the code first, then the message.
+const HUB_ERROR_CODE_HEADER: &str = "x-error-code";
+const HUB_ERROR_MESSAGE_HEADER: &str = "x-error-message";
+
+/// The `X-Error-Code` and message a Hugging Face client gets for an upstream
+/// `status` (`401`/`403`) that named `upstream_code` (#5323).
+///
+/// The shared proxy mapping turns every upstream refusal into an opaque 502,
+/// which `huggingface_hub` retries five times as a server error. The Hub's own
+/// answer is a client error it raises at once, so this mirrors it: the status
+/// stays the upstream's, and the code is the upstream's when it gave one. A
+/// `401` without a code is how the Hub answers a missing or private repository
+/// to an unauthenticated request (and how `huggingface_hub` reads it), so it is
+/// named `RepoNotFound`; a `403` without one keeps no code.
+///
+/// The message is written here and names the Remote's upstream credential,
+/// never the credential itself or anything the upstream said.
+fn hub_refusal_reply(
+    status: StatusCode,
+    upstream_code: Option<&'static str>,
+    repo_key: &str,
+) -> (Option<&'static str>, String) {
+    let fix = format!(
+        "An administrator can set the Remote's upstream credential with \
+         PUT /api/v1/repositories/{repo_key}/upstream-auth."
+    );
+    let code = upstream_code.or((status == StatusCode::UNAUTHORIZED).then_some("RepoNotFound"));
+    let message = match code {
+        Some("GatedRepo") => format!(
+            "This model is gated on the upstream Hub, and the upstream credential of Remote \
+             '{repo_key}' is missing or has not been granted access to it. {fix}"
+        ),
+        Some("RepoNotFound") => format!(
+            "The upstream Hub has no such repository, or it is private and the upstream \
+             credential of Remote '{repo_key}' is missing or lacks access to it. {fix}"
+        ),
+        Some("RevisionNotFound") => "The upstream Hub has no such revision.".to_string(),
+        Some("EntryNotFound") => "The upstream Hub has no such file.".to_string(),
+        _ => format!(
+            "The upstream Hub refused the upstream credential of Remote '{repo_key}' for \
+             this model. {fix}"
+        ),
+    };
+    (code, message)
+}
+
+/// Turn a Remote's proxy error `response` that came from an upstream
+/// `401`/`403` into the Hub-shaped refusal [`hub_refusal_reply`] describes
+/// (#5323). Any other response (a 404, a 5xx folded to 503, a policy refusal,
+/// a Virtual's answer) is returned as is.
+///
+/// A pure mapping on purpose: the proxy fetch futures sit at the compiler's
+/// layout query-depth limit, so this is applied with `map_err` rather than as
+/// another async layer.
+fn hub_upstream_refusal(repo: &RepoInfo, response: Response) -> Response {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return response;
+    }
+    let Some(status) = proxy_helpers::upstream_refusal_status(&response) else {
+        return response;
+    };
+    let upstream_code = proxy_helpers::upstream_hub_error_code(&response);
+    let (code, message) = hub_refusal_reply(status, upstream_code, &repo.key);
+    let mut reply = (
+        status,
+        axum::Json(serde_json::json!({ "error": message.as_str() })),
+    )
+        .into_response();
+    if let Some(code) = code {
+        reply
+            .headers_mut()
+            .insert(HUB_ERROR_CODE_HEADER, HeaderValue::from_static(code));
+    }
+    if let Ok(value) = HeaderValue::from_str(&message) {
+        reply.headers_mut().insert(HUB_ERROR_MESSAGE_HEADER, value);
+    }
+    reply
+        .extensions_mut()
+        .extend(response.into_parts().0.extensions);
+    reply
+}
+
 /// Extract a filename from request headers.
 ///
 /// Prefers the `X-Filename` header; falls back to `Content-Disposition`
@@ -1137,15 +1226,19 @@ async fn proxy_hf_metadata_json(
         return Ok(None);
     };
 
-    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped(
+    // The real format reaches the cache classifier (#5283): model info and
+    // a tree at a commit sha are immutable, branch and tag forms are not.
+    let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        crate::models::repository::RepositoryFormat::Huggingface,
     )
-    .await?;
+    .await
+    .map_err(|resp| hub_upstream_refusal(repo, resp))?;
 
     Ok(Some(
         Response::builder()
@@ -1205,13 +1298,14 @@ async fn fetch_upstream_commit_sha(
         "api/models/{model_id}/revision/{}",
         encode_upstream_revision(revision)
     );
-    let fetch = proxy_helpers::proxy_fetch_capped(
+    let fetch = proxy_helpers::proxy_fetch_capped_with_format(
         proxy,
         repo.id,
         &repo.key,
         upstream_url,
         &upstream_path,
         proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+        crate::models::repository::RepositoryFormat::Huggingface,
     );
 
     // Own deadline, not the shared client's: see `COMMIT_SHA_FALLBACK_TIMEOUT`.
@@ -1636,7 +1730,8 @@ async fn download_file_impl(
                 suppress_upstream_proxy: false,
             },
         )
-        .await?
+        .await
+        .map_err(|resp| hub_upstream_refusal(&repo, resp))?
         {
             // Remote serves normally arrive with upstream's own ETag and
             // `X-Repo-Commit` already forwarded by the streaming response
@@ -1730,7 +1825,7 @@ async fn upload_file(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     upload_file_impl(state, auth, repo_key, model_id, revision, headers, body).await
 }
@@ -1740,7 +1835,7 @@ async fn upload_file_namespaced(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     upload_file_impl(
         state,
@@ -1761,17 +1856,13 @@ async fn upload_file_impl(
     model_id: String,
     revision: String,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "huggingface", "write:artifacts")?.user_id;
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
-
-    if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
-    }
 
     // Length ceilings (`name` is VARCHAR(512), `version` is VARCHAR(255)) plus
     // the traversal/NUL rejections, from the one helper the read paths also use
@@ -1802,10 +1893,45 @@ async fn upload_file_impl(
             .into_response());
     }
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // #5291: a declared body over `MAX_UPLOAD_SIZE` is refused before any of
+    // it is read. The stager below enforces the same cap on the bytes actually
+    // received, which covers a chunked body or a wrong header.
+    let max = state.config.max_upload_size_bytes;
+    if max != 0 && super::upload_body::declared_content_length(&headers).is_some_and(|n| n > max) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Upload exceeds the maximum allowed size of {max} bytes"),
+        )
+            .into_response());
+    }
+
+    // A published file is immutable, so a re-publish to a taken path is
+    // refused before its body is received rather than after (#5291). The
+    // authoritative check (which also sweeps a soft-deleted row) still runs
+    // below, after staging, where it always ran. A request that declares an
+    // empty body skips this probe so it keeps answering 400.
+    if super::upload_body::declared_content_length(&headers) != Some(0) {
+        reject_if_artifact_path_taken(&state.db, repo.id, &artifact_path).await?;
+    }
+
+    // #5291: stream the body to a bounded staging area (local scratch, or the
+    // repository's own backend when it streams natively), computing SHA-256
+    // as it arrives, instead of holding the whole file in memory. The stager
+    // refuses with 413 once `MAX_UPLOAD_SIZE` is crossed, and the staged copy
+    // is removed when `staged` drops, on every early return below.
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
+
+    if staged.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
+    }
+
+    let computed_sha256 = digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -1815,10 +1941,19 @@ async fn upload_file_impl(
     )
     .await?;
 
+    // Same quota preflight and cross-repository write guard as the buffered
+    // `put_artifact_bytes` this replaces, then the staged bytes are streamed
+    // (or copied server-side) to the final key and the staging copy released.
     let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
-    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
-
-    let size_bytes = body.len() as i64;
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     let metadata = serde_json::json!({
         "model_id": model_id,
@@ -1905,6 +2040,30 @@ async fn upload_file_impl(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&response).unwrap()))
         .unwrap())
+}
+
+/// Refuse with the upload route's 409 when a live artifact already sits at
+/// `artifact_path`. Read-only: unlike
+/// [`proxy_helpers::ensure_unique_artifact_path`] it never sweeps a
+/// soft-deleted row, so it can run before the body has been received (#5291).
+#[allow(clippy::result_large_err)]
+async fn reject_if_artifact_path_taken(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> Result<(), Response> {
+    let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    match existing {
+        Some(_) => Err((StatusCode::CONFLICT, "File already exists at this path").into_response()),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,6 +2565,278 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5291: hosted uploads stream to storage instead of being buffered.
+    // -----------------------------------------------------------------------
+
+    /// Small `MAX_UPLOAD_SIZE` the #5291 size tests run against.
+    const TEST_MAX_UPLOAD: u64 = 64;
+
+    /// A fixture whose state carries `TEST_MAX_UPLOAD` as its upload cap.
+    async fn small_limit_fixture() -> Option<tdh::Fixture> {
+        let mut f = tdh::Fixture::setup("local", "huggingface").await?;
+        f.state = tdh::build_state_with(f.pool.clone(), f.storage_dir.to_str().unwrap(), |cfg| {
+            cfg.max_upload_size_bytes = TEST_MAX_UPLOAD
+        });
+        Some(f)
+    }
+
+    fn upload_request(
+        repo_key: &str,
+        model: &str,
+        filename: &str,
+        body: Body,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{repo_key}/api/models/{model}/upload/main"))
+            .header("x-filename", filename)
+            .body(body)
+            .unwrap()
+    }
+
+    async fn artifact_count(f: &tdh::Fixture) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("count artifacts")
+    }
+
+    /// The fixture repository's storage backend, resolved from its stored
+    /// row as the upload handler resolves it.
+    async fn fixture_storage(
+        f: &tdh::Fixture,
+    ) -> std::sync::Arc<dyn crate::storage::StorageBackend> {
+        let repo = resolve_huggingface_repo(&f.state.db, &f.repo_key)
+            .await
+            .expect("repo");
+        f.state
+            .storage_for_repo(&repo.storage_location())
+            .expect("storage")
+    }
+
+    /// Upload staging files left under the fixture's staging root. Skipped
+    /// (empty) when the staging root is overridden by the environment, since
+    /// that directory is shared with every other test.
+    fn leftover_staging_files(f: &tdh::Fixture) -> Vec<String> {
+        if std::env::var_os("AK_UPLOAD_STAGING_DIR").is_some()
+            || std::env::var_os("AK_INCUS_UPLOAD_TMP_DIR").is_some()
+        {
+            return Vec::new();
+        }
+        let root = crate::api::handlers::incus::staging_root(f.storage_dir.to_str().unwrap());
+        std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| crate::api::handlers::incus::is_staging_file(n))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A body over `MAX_UPLOAD_SIZE`, sent with no `Content-Length` and in
+    /// several chunks, is cut off while streaming with 413: no artifact row,
+    /// no stored object and no staging file is left behind.
+    #[tokio::test]
+    async fn upload_over_max_upload_size_streamed_is_413_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..5)
+            .map(|_| Ok(Bytes::from(vec![b'a'; TEST_MAX_UPLOAD as usize / 4])))
+            .collect();
+        let req = upload_request(
+            &f.repo_key,
+            "big-model",
+            "weights.bin",
+            Body::from_stream(futures::stream::iter(chunks)),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        let stored = fixture_storage(&f)
+            .await
+            .exists("huggingface/big-model/main/weights.bin")
+            .await
+            .unwrap_or(false);
+        let leftovers = leftover_staging_files(&f);
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains(&TEST_MAX_UPLOAD.to_string()),
+            "the 413 names the configured limit"
+        );
+        assert_eq!(count, 0, "a refused upload records no artifact row");
+        assert!(!stored, "a refused upload stores no object");
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
+    /// A declared `Content-Length` over `MAX_UPLOAD_SIZE` is refused up front.
+    #[tokio::test]
+    async fn upload_declared_length_over_max_upload_size_is_413_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+        let mut req = upload_request(
+            &f.repo_key,
+            "big-model",
+            "weights.bin",
+            Body::from(content.clone()),
+        );
+        req.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&content.len().to_string()).unwrap(),
+        );
+        let (status, _) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(count, 0);
+    }
+
+    /// A body of exactly `MAX_UPLOAD_SIZE` is accepted, and an empty body is
+    /// still a 400.
+    #[tokio::test]
+    async fn upload_at_max_upload_size_is_stored_and_empty_is_400_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let req = upload_request(
+            &f.repo_key,
+            "edge-model",
+            "exact.bin",
+            Body::from(vec![b'z'; TEST_MAX_UPLOAD as usize]),
+        );
+        let (exact, _) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let req = upload_request(&f.repo_key, "edge-model", "empty.bin", Body::empty());
+        let (empty, empty_body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(exact, StatusCode::OK);
+        assert_eq!(empty, StatusCode::BAD_REQUEST);
+        assert_eq!(&empty_body[..], b"Empty file body");
+        assert_eq!(count, 1);
+    }
+
+    /// A multi-chunk upload is stored byte for byte, and the sha256 and size
+    /// in the response and on the artifact row are those of the bytes sent.
+    #[tokio::test]
+    async fn upload_streams_body_and_records_its_sha256_5291() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        // ~1.5 MiB in uneven chunks, so the staging and storage copies both
+        // span several reads.
+        let content: Vec<u8> = (0..(3 * 512 * 1024 + 17))
+            .map(|i: u32| (i % 251) as u8)
+            .collect();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = content
+            .chunks(100_003)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let req = upload_request(
+            &f.repo_key,
+            "acme/streamed",
+            "model.gguf",
+            Body::from_stream(futures::stream::iter(chunks)),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let stored = fixture_storage(&f)
+            .await
+            .get("huggingface/acme/streamed/main/model.gguf")
+            .await;
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind("acme/streamed/main/model.gguf")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("artifact row");
+        let leftovers = leftover_staging_files(&f);
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upload failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let want_sha = format!("{:x}", Sha256::digest(&content));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(json["message"], "File uploaded successfully");
+        assert_eq!(json["path"], "acme/streamed/main/model.gguf");
+        assert_eq!(json["sha256"], want_sha.as_str());
+        assert_eq!(json["size"], content.len() as i64);
+        let stored = stored.expect("stored object");
+        assert!(stored.as_ref() == content.as_slice(), "stored bytes differ");
+        assert_eq!(row, Some((content.len() as i64, want_sha)));
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
+    /// A published file is immutable: a second upload to the same path is a
+    /// 409, whether or not the bytes differ, and the first file's bytes stay.
+    #[tokio::test]
+    async fn upload_republish_to_taken_path_is_409_5291() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let send = |body: &'static [u8]| {
+            let req = upload_request(&f.repo_key, "frozen", "config.json", Body::from(body));
+            tdh::send(f.router_with_auth(super::router()), req)
+        };
+        let (first, _) = send(b"{\"v\":1}").await;
+        let (different, different_body) = send(b"{\"v\":2}").await;
+        let (same, _) = send(b"{\"v\":1}").await;
+        let stored = fixture_storage(&f)
+            .await
+            .get("huggingface/frozen/main/config.json")
+            .await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(different, StatusCode::CONFLICT);
+        assert_eq!(&different_body[..], b"File already exists at this path");
+        assert_eq!(same, StatusCode::CONFLICT);
+        assert_eq!(stored.expect("stored").as_ref(), b"{\"v\":1}");
+        assert_eq!(count, 1);
+    }
+
+    /// #5291 ratchet: the upload handlers take the request body as a stream,
+    /// never as a buffered `Bytes` extractor.
+    #[test]
+    fn upload_handlers_take_a_streamed_body_5291() {
+        let source = include_str!("huggingface.rs");
+        for name in ["upload_file", "upload_file_namespaced", "upload_file_impl"] {
+            let start = source
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let signature = &source[start..];
+            let signature = &signature[..signature.find(") -> Result").expect("signature end")];
+            assert!(
+                signature.contains("body: Body,"),
+                "{name} must take the body as axum::body::Body"
+            );
+            assert!(
+                !signature.contains("Bytes"),
+                "{name} must not buffer the upload body as Bytes"
+            );
+        }
     }
 
     /// #4725: a HuggingFace file upload to a hosted repository must queue a
@@ -3137,6 +3568,243 @@ mod tests {
         );
     }
 
+    /// #5323: what a Hugging Face client is told for each upstream refusal.
+    /// `huggingface_hub` raises `GatedRepoError` for `X-Error-Code: GatedRepo`
+    /// with 401 or 403 and `RepositoryNotFoundError` for `RepoNotFound`.
+    #[test]
+    fn test_hub_refusal_reply_mirrors_the_hub_5323() {
+        let reply = |status, code| hub_refusal_reply(status, code, "hf-remote");
+
+        let (code, message) = reply(StatusCode::UNAUTHORIZED, Some("GatedRepo"));
+        assert_eq!(code, Some("GatedRepo"));
+        assert!(message.contains("gated"), "{message}");
+        assert!(
+            message.contains("PUT /api/v1/repositories/hf-remote/upstream-auth"),
+            "{message}"
+        );
+        assert_eq!(
+            reply(StatusCode::FORBIDDEN, Some("GatedRepo")).0,
+            Some("GatedRepo")
+        );
+
+        // A 401 without a code is the Hub's answer for a missing or private
+        // repository; a 403 without one keeps no code.
+        assert_eq!(
+            reply(StatusCode::UNAUTHORIZED, None).0,
+            Some("RepoNotFound")
+        );
+        assert_eq!(
+            reply(StatusCode::UNAUTHORIZED, Some("RepoNotFound")).0,
+            Some("RepoNotFound")
+        );
+        let (code, message) = reply(StatusCode::FORBIDDEN, None);
+        assert_eq!(code, None);
+        assert!(message.contains("upstream-auth"), "{message}");
+        assert_eq!(
+            reply(StatusCode::FORBIDDEN, Some("EntryNotFound")).0,
+            Some("EntryNotFound")
+        );
+    }
+
+    /// Mount the Hub's refusal of `model` on both resolve and model-info: the
+    /// status, the Hub's `X-Error-Message`, its `X-Error-Code` when `code` is
+    /// set, and (when `challenge`) the `WWW-Authenticate: Bearer
+    /// realm="Authentication required"` huggingface.co sends with a 401.
+    async fn mount_hub_refusal(
+        server: &wiremock::MockServer,
+        model: &str,
+        status: u16,
+        code: Option<&str>,
+        challenge: bool,
+    ) {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        for upstream_path in [
+            format!("/{model}/resolve/main/config.json"),
+            format!("/api/models/{model}/revision/main"),
+        ] {
+            let mut template = ResponseTemplate::new(status)
+                .insert_header("x-error-message", "upstream-said-this")
+                .set_body_string("upstream-said-this");
+            if let Some(code) = code {
+                template = template.insert_header("x-error-code", code);
+            }
+            if challenge {
+                template = template.insert_header(
+                    "www-authenticate",
+                    "Bearer realm=\"Authentication required\", charset=\"UTF-8\"",
+                );
+            }
+            Mock::given(method("GET"))
+                .and(wm_path(upstream_path))
+                .respond_with(template)
+                .mount(server)
+                .await;
+        }
+    }
+
+    /// #5323: an upstream 401/403 from the Hub reaches the client as the same
+    /// 401/403 with an `X-Error-Code` huggingface_hub recognises, on resolve and
+    /// on model-info, never as a 5xx it would retry (nor the 400 the Hub's
+    /// non-URL Bearer realm used to produce). The Hub's own message is not
+    /// echoed.
+    #[tokio::test]
+    async fn test_huggingface_upstream_refusal_is_a_hub_client_error_5323() {
+        use wiremock::MockServer;
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        // (model, upstream status, upstream code, challenge, client code)
+        let cases: [(&str, u16, Option<&str>, bool, &str); 4] = [
+            ("org/gated-401", 401, Some("GatedRepo"), true, "GatedRepo"),
+            ("org/gated-403", 403, Some("GatedRepo"), false, "GatedRepo"),
+            (
+                "org/missing-401",
+                401,
+                Some("RepoNotFound"),
+                false,
+                "RepoNotFound",
+            ),
+            ("org/private-401", 401, None, true, "RepoNotFound"),
+        ];
+        for (model, status, code, challenge, _) in cases {
+            mount_hub_refusal(&server, model, status, code, challenge).await;
+        }
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let mut seen = Vec::new();
+        for (model, status, _, _, client_code) in cases {
+            for uri in [
+                format!("/{}/{model}/resolve/main/config.json", f.repo_key),
+                format!("/{}/api/models/{model}/revision/main", f.repo_key),
+            ] {
+                let (got, body, headers) =
+                    tdh::send_with_headers(app.clone(), tdh::get(uri.clone())).await;
+                seen.push((uri, status, got, body, headers, client_code));
+            }
+        }
+
+        f.teardown().await;
+
+        for (uri, status, got, body, headers, client_code) in seen {
+            assert_eq!(got.as_u16(), status, "{uri}: the upstream refusal's status");
+            assert_eq!(
+                headers.get("x-error-code").and_then(|v| v.to_str().ok()),
+                Some(client_code),
+                "{uri}"
+            );
+            let message = headers
+                .get("x-error-message")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(message.contains("upstream-auth"), "{uri}: {message}");
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("upstream-said-this"), "{uri}: {body}");
+            assert!(!message.contains("upstream-said-this"), "{uri}: {message}");
+        }
+    }
+
+    /// #5323: a gated model refused without an upstream credential downloads
+    /// once one is set (the refusal was not cached), and a credential the Hub
+    /// has not granted access gets the Hub's 403 `GatedRepo`, without the
+    /// credential appearing anywhere in the response.
+    #[tokio::test]
+    async fn test_huggingface_gated_model_with_upstream_auth_5323() {
+        use wiremock::matchers::{header, method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // `save_upstream_auth` encrypts via `encryption_key()`.
+        if std::env::var("JWT_SECRET").is_err() && std::env::var("SSO_ENCRYPTION_KEY").is_err() {
+            return;
+        }
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let token = "hf_upstream_secret_5323";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/org/gated/resolve/main/config.json"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{\"gated\": true}".to_vec()))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_hub_refusal(&server, "org/gated", 401, Some("GatedRepo"), true).await;
+        Mock::given(method("GET"))
+            .and(wm_path("/org/not-granted/resolve/main/config.json"))
+            .and(header("authorization", format!("Bearer {token}").as_str()))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-error-code", "GatedRepo")
+                    .insert_header("x-error-message", "upstream-said-this"),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let gated = format!("/{}/org/gated/resolve/main/config.json", f.repo_key);
+
+        let (before, _, before_headers) =
+            tdh::send_with_headers(app.clone(), tdh::get(gated.clone())).await;
+
+        let creds = crate::services::upstream_auth::build_credentials_json(
+            &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                token: token.to_string(),
+            },
+        );
+        crate::services::upstream_auth::save_upstream_auth(&f.pool, f.repo_id, "bearer", &creds)
+            .await
+            .expect("save upstream auth");
+
+        let (after, after_body, _) = tdh::send_with_headers(app.clone(), tdh::get(gated)).await;
+        let (refused, refused_body, refused_headers) = tdh::send_with_headers(
+            app,
+            tdh::get(format!(
+                "/{}/org/not-granted/resolve/main/config.json",
+                f.repo_key
+            )),
+        )
+        .await;
+
+        f.teardown().await;
+
+        assert_eq!(before, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            before_headers
+                .get("x-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("GatedRepo")
+        );
+        assert_eq!(
+            after,
+            StatusCode::OK,
+            "with upstream-auth set the gated model must download, so the earlier \
+             401 must not have been cached"
+        );
+        assert_eq!(&after_body[..], b"{\"gated\": true}");
+        assert_eq!(refused, StatusCode::FORBIDDEN);
+        assert_eq!(
+            refused_headers
+                .get("x-error-code")
+                .and_then(|v| v.to_str().ok()),
+            Some("GatedRepo")
+        );
+        let leaked = refused_headers
+            .values()
+            .any(|v| v.to_str().is_ok_and(|v| v.contains(token)))
+            || String::from_utf8_lossy(&refused_body).contains(token);
+        assert!(
+            !leaked,
+            "the upstream credential must never reach the client"
+        );
+    }
+
     #[tokio::test]
     async fn test_huggingface_model_info_cached_model_skips_upstream_proxy() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3370,6 +4038,78 @@ mod tests {
             "a HEAD probe must transfer no bytes, got {}",
             collected.len()
         );
+    }
+
+    /// #5283: a file fetched by commit sha is immutable and is served from the
+    /// cache without contacting the Hub again, even with the repository's
+    /// mutable-path TTL set to expire at once; the same file fetched by
+    /// branch is revalidated. Before, every Remote download reached the cache
+    /// classifier as `Generic`, which has no arm, so both were revalidated.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test-only body buffering for assertions (#1608).
+    async fn test_huggingface_commit_pinned_resolve_is_never_revalidated() {
+        use tower::ServiceExt;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let sha = "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf";
+        let model = "sentence-transformers/all-MiniLM-L6-v2";
+        let server = MockServer::start().await;
+        for (rev, hits) in [(sha, 1), ("main", 2)] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/{model}/resolve/{rev}/model.safetensors")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"weights\"")
+                        .insert_header("x-repo-commit", sha)
+                        .set_body_bytes(b"weights".to_vec()),
+                )
+                .expect(hits)
+                .mount(&server)
+                .await;
+        }
+        // Every mutable path expires the moment it is cached.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '0')",
+        )
+        .bind(f.repo_id)
+        .execute(&f.pool)
+        .await
+        .expect("set cache_ttl_secs");
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        for rev in [sha, "main"] {
+            for _ in 0..2 {
+                let req = axum::http::Request::builder()
+                    .uri(format!(
+                        "/{}/{model}/resolve/{rev}/model.safetensors",
+                        f.repo_key
+                    ))
+                    .body(Body::empty())
+                    .expect("build request");
+                let resp = app
+                    .clone()
+                    .oneshot(req)
+                    .await
+                    .expect("resolve must respond");
+                assert_eq!(resp.status(), StatusCode::OK, "{rev}");
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .expect("collect body");
+                assert_eq!(&body[..], b"weights", "{rev}");
+            }
+        }
+
+        f.teardown().await;
+        // `expect(..)` is checked when the server drops: one upstream request
+        // for the sha path, two for the branch path.
+        server.verify().await;
     }
 
     /// `X-Repo-Commit` comes from the resolve response's OWN header when upstream

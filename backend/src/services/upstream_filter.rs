@@ -46,6 +46,11 @@
 //! refuses the path is skipped without being contacted (#840: one dead fringe
 //! remote no longer stalls every `maven-metadata.xml` merge).
 //!
+//! A cache-only Remote (#5282, [`crate::services::upstream_mode`]) is refused
+//! by the same gate, before the filter is consulted, with a reason that names
+//! the mode. Unlike a filter refusal, it does not hide expired cache entries:
+//! the proxy serves them stale instead of revalidating.
+//!
 //! # Already-cached objects
 //!
 //! A proxy-cache entry for a now-refused path is served **only while it is
@@ -370,9 +375,13 @@ static FILTER_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Drop this process's cached compiled filter for `repo_id`. Called locally by
 /// the writer and, through the `upstream_filter_changed` cache-invalidation
 /// event, on every other replica.
+///
+/// The same event carries a change of the repository's upstream mode (#5282),
+/// the other half of the upstream gate, so that cached value is dropped too.
 pub async fn invalidate_cached_filter(repo_id: Uuid) {
     FILTER_GENERATION.fetch_add(1, Ordering::SeqCst);
     FILTER_CACHE.invalidate(&repo_id).await;
+    crate::services::upstream_mode::invalidate_cached_mode(repo_id).await;
 }
 
 /// Invalidate locally and tell the other replicas to do the same.
@@ -429,7 +438,9 @@ fn check_filter(
 }
 
 /// Refuse (with `NotFound`) a fetch of `fetch_path` from the upstream of the
-/// Remote repository `repo_id` when its upstream filter does not admit it.
+/// Remote repository `repo_id` when the repository is cache-only (#5282) or
+/// its upstream filter does not admit it. The two refusals carry different
+/// reasons (see [`crate::services::upstream_mode::is_cache_only_refusal`]).
 pub async fn ensure_upstream_allowed(
     db: &PgPool,
     repo_id: Uuid,
@@ -437,6 +448,11 @@ pub async fn ensure_upstream_allowed(
     upstream_url: &str,
     fetch_path: &str,
 ) -> Result<()> {
+    // Boxed for the same layout-depth reason as `ProxyService::upstream_mode`.
+    Box::pin(
+        crate::services::upstream_mode::ensure_upstream_contact_allowed(db, repo_id, repo_key),
+    )
+    .await?;
     let filter = compiled_filter(db, repo_id).await?;
     let decision = check_filter(filter.as_deref(), repo_key, upstream_url, fetch_path);
     if decision.is_err() {
@@ -451,7 +467,8 @@ pub async fn ensure_upstream_allowed(
 
 /// [`ensure_upstream_allowed`] as a yes/no for callers that contact the
 /// upstream outside `ProxyService` (#840: the npm `/-/` passthroughs and npm
-/// audit, and the curation upstream sync). A refused path is `Ok(false)`; a
+/// audit, and the curation upstream sync). A refused path, including every
+/// path of a cache-only repository (#5282), is `Ok(false)`; a
 /// failure to read the filter is an error, never an admission, as on the proxy
 /// path.
 pub async fn upstream_allows(

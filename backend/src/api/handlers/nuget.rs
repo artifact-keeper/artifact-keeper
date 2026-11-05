@@ -3938,9 +3938,13 @@ impl NugetMemberWalk<'_> {
         scan: Option<proxy_helpers::MemberScanPolicy>,
     ) -> Result<Response, Response> {
         let upstream_url = member.upstream_url.as_deref().unwrap_or_default();
+        // Both legs are boxed: this walk is the deepest future that reaches
+        // the proxy fetch, and inlining the fetch's state machine here took
+        // the walk's layout past the compiler's query-depth limit once the
+        // upstream gate grew (#5282, #5286).
         match self.surface {
             DownloadSurface::V3 => {
-                proxy_v3_flatcontainer(
+                Box::pin(proxy_v3_flatcontainer(
                     self.state,
                     proxy,
                     member.id,
@@ -3950,11 +3954,11 @@ impl NugetMemberWalk<'_> {
                     true,
                     Some(self.ctx),
                     scan,
-                )
+                ))
                 .await
             }
             DownloadSurface::V2 { id } => {
-                proxy_v2_download(
+                Box::pin(proxy_v2_download(
                     self.state,
                     proxy,
                     member.id,
@@ -3964,7 +3968,7 @@ impl NugetMemberWalk<'_> {
                     ProbeFallback::IfAnsweredQuickly,
                     scan,
                     self.ctx,
-                )
+                ))
                 .await
             }
         }

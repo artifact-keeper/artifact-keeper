@@ -44,7 +44,10 @@ outlive the upstream, for example on an instance that will be disconnected.
 Model info at a branch (`main`) and other mutable paths are revalidated after
 the TTL (5 minutes by default), and a raised TTL only applies to an entry
 from its next revalidation, so raising it after seeding leaves the entries
-already cached on the old lifetime:
+already cached on the old lifetime. Paths at a 40-character commit sha
+(`<model>/resolve/<sha>/...`, which is how `snapshot_download` fetches its
+files, and model info and tree listings at a sha) are immutable cache entries
+and are never revalidated, whatever the TTL (#5283):
 
 ```bash
 curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/cache-ttl \
@@ -87,7 +90,7 @@ the same model, and **a pattern has to match both**:
 | Request | Path sent upstream |
 |---------|--------------------|
 | Model info (`model_info`, the first call of `snapshot_download` and `hf download`) | `api/models/<org>/<name>`, `api/models/<org>/<name>/revision/<rev>` |
-| File listing (`list_repo_tree`, and `snapshot_download` in `huggingface_hub` 2.x) | `api/models/<org>/<name>/tree/<rev>`, with the query string once #5321 forwards it (`?recursive=true`, `&cursor=...`) |
+| File listing (`list_repo_tree`, and `snapshot_download` in `huggingface_hub` 2.x) | `api/models/<org>/<name>/tree/<rev>`, followed by its query in one canonical spelling: `recursive=true`, `expand=true` and `cursor=...` in that order, a `false` flag left out (`?recursive=true`, `?recursive=true&cursor=...`) |
 | File download (`hf_hub_download`) | `<org>/<name>/resolve/<rev>/<file>` |
 
 A filter written as `^acme/` admits the files but refuses model info, so
@@ -132,6 +135,29 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HF_TOKEN" \
 curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $HF_TOKEN" \
   "$HF_ENDPOINT/api/models/sentence-transformer/all-MiniLM-L6-v2/revision/main"    # 404
 ```
+
+What a client sees for a gated model:
+
+- **No upstream credential on the Remote.** The Hub refuses the Remote with
+  `401` and `X-Error-Code: GatedRepo`, and the client gets the same: `401`,
+  `X-Error-Code: GatedRepo`, and an `X-Error-Message` naming the Remote and
+  `PUT /api/v1/repositories/{key}/upstream-auth`. `huggingface_hub` raises
+  `GatedRepoError` straight away, without retrying. A Hub token that has not
+  been granted the model gives `403` with `GatedRepo`, which raises the same
+  error. Neither the Hub's message nor the Remote's token is passed on.
+- **An upstream credential with access.** The model downloads like any other
+  and is cached as usual. A refusal is never cached, so setting the credential
+  takes effect on the next request.
+- **An Artifact Keeper user who cannot read the Remote** (for example, outside
+  the group the repository is restricted to) gets `404`, as for a repository
+  that does not exist, whether or not the model is gated. `huggingface_hub`
+  raises `RepositoryNotFoundError`. Artifact Keeper does not reveal that the
+  repository exists, and the Hub is never asked.
+
+Other refusals follow the Hub's lead. A `401` for a model that does not
+exist, or for a private one the Remote's credential cannot see, reaches the
+client as `401` with `X-Error-Code: RepoNotFound` (`RepositoryNotFoundError`).
+A `403` without a code stays a `403`. Only a real upstream failure is a `5xx`.
 
 ## Pointing `huggingface_hub` at it
 
@@ -228,6 +254,17 @@ curl -X POST \
 The token needs `write:artifacts` and write permission on the repository.
 Uploads to Remote (405) and Virtual (400) repositories are refused.
 
+The body is streamed to storage while its SHA-256 is computed, so a
+multi-gigabyte GGUF or safetensors file does not have to fit in the server's
+memory. It is staged first (local upload scratch, or the repository's own
+object store when that backend streams natively) and written to its final
+key once it is complete. A file larger than `MAX_UPLOAD_SIZE` (default
+10 GiB) is refused with `413`, up front when `Content-Length` declares it and
+otherwise as soon as the limit is crossed, and leaves nothing behind. A
+published file is immutable: uploading to a path that already holds a file
+answers `409`, whatever the bytes. An empty body answers `400`. The response
+carries the stored file's `path`, `sha256` and `size`.
+
 Each revision is its own set of files: upload every file of a revision to
 that revision. The model can then be downloaded with the usual calls, with
 `HF_ENDPOINT` pointed at the Local repository:
@@ -240,6 +277,17 @@ snapshot_download("my-org/my-model")                 # main
 snapshot_download("my-org/my-model", revision="v1")  # a revision uploaded as upload/v1
 hf_hub_download("my-org/my-model", "config.json")
 ```
+
+## Model-file scanning
+
+Files uploaded to a Local repository are judged by the model-file scanner
+(scan type `model`): pickle-bearing files (`pytorch_model.bin`, `.pt`,
+`.ckpt`, `.pkl`, ...) are walked for imports that would run code on
+`torch.load`, and safetensors and GGUF headers are checked for malformed or
+inconsistent structure. A pickle importing a primitive such as `os.system` is
+a critical `malicious` finding. Files proxied by a Remote repository are not
+judged yet (Hugging Face has no scan-on-proxy). See [Model-file scanning](security/model-file-scanning.md) for
+what is checked, the limits, and what it does not catch.
 
 ## Limitations
 
@@ -257,15 +305,6 @@ Anything not listed under Endpoints answers 404. In particular:
   repository keeps no model rows for proxied files, so it returns `[]` rather
   than searching the Hub. `whoami`, `paths-info`, repository creation and the
   commit/upload API are not implemented.
-- **Tree listings for Remote repositories drop the query string** (#5321).
-  The Hub's `recursive`, `expand` and pagination `cursor` parameters are not
-  forwarded, so a Remote answers `list_repo_tree` with the top level and its
-  first page only. `snapshot_download` in `huggingface_hub` 2.x takes its file
-  list from `api/models/{model_id}/tree/{commit}?recursive=true`, not from the
-  model-info `siblings`, so through a Remote it currently misses every file
-  in a subdirectory (for example `1_Pooling/config.json`) while reporting
-  success. Until #5321 is fixed, fetch such files with `hf_hub_download`, or
-  check a snapshot against the model-info `siblings` list.
 - **Xet storage is hidden from clients.** Xet fields are stripped from
   proxied metadata so clients download through the ordinary `/resolve/` path
   (and through the cache) rather than fetching Xet chunks directly from the

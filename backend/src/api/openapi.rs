@@ -184,6 +184,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         ),
         ("rpm_repodata", handlers::rpm::RpmRepodataApiDoc::openapi()),
         ("admin", handlers::admin::AdminApiDoc::openapi()),
+        (
+            "admin_config",
+            handlers::admin_config::AdminConfigApiDoc::openapi(),
+        ),
         ("banners", handlers::banners::BannersApiDoc::openapi()),
         (
             "admin_security",

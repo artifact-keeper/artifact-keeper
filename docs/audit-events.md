@@ -117,7 +117,7 @@ the remaining actions is an incremental follow-up.
 
 | Actions | `details` shape |
 | --- | --- |
-| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`) |
+| `REPOSITORY_CREATED` / `_UPDATED` / `_DELETED` | `RepositoryDetails` (`actor_id`, `key`, `is_public`, structured format/policy fields; `upstream_change` / `upstream_auth_change` on credential changes, secrets never carried; on `_UPDATED`, `project_change` `{previous_project_id, project_id}` when the project assignment changed, `project_id: null` for a cleared assignment, #4026; an age-gate policy change adds `age_gate_change`: the replaced policy, `actor_tier`, and `relaxed`; a `PUT .../upstream-mode` adds `upstream_mode_change` `{previous_upstream_mode, upstream_mode}`, #5282) |
 | `AGE_GATE_LOCK_SET` / `AGE_GATE_LOCK_RELEASED` | `lock` (`policy` / `review`), `actor_tier`, `repository_key`, and the policy (`age_gate_*`) or review (`review_id`, `package`, `version`, `status`) at that moment. A release is always a relaxation. |
 | `ROLE_ASSIGNED` / `_REVOKED`, `REPOSITORY_PERMISSION_CHANGED` | `PermissionDetails` (`actor_id`, `role_id`, `grantee_id`, `repository_id?`) |
 | `API_TOKEN_CREATED` / `_REVOKED` | `TokenDetails` (`token_id`, `token_name?`, `surface`, `expires_at?`, `policy_applied?`) |
@@ -163,11 +163,14 @@ such as `credential_replaced` or `secret_rotated`.
 | `WEBHOOK_SECRET_ROTATED` | `webhook` | `name`, `url`, `events`, `repository_id`, `secret_rotated: true`, `previous_secret_expires_at` |
 | `SYNC_POLICY_CREATED` / `_DELETED` | `sync_policy` | `name`, `policy` (the policy without timestamps) |
 | `SYNC_POLICY_UPDATED` | `sync_policy` | `name`, `changed_fields`, `before`, `after` (written by update and by enable / disable) |
+| `CONFIG_IMPORTED` | `setting` (`resource_name: config_document`); one summary row per `POST /api/v1/admin/config/import?mode=apply` (#5292), on top of the per-repository rows each write records | `schema_version`, `completed`, `error` (null on success), `planned_create`, `planned_update` (keys), `unchanged` and `not_in_document` (counts), `created`, `updated`, `members_updated` (keys actually written), `prune` |
 
 A webhook `url` is recorded as scheme, host, port and path: userinfo, query
 string and fragment are dropped because receivers often carry a token there.
 `PROMOTION_REFUSED` and `PROMOTION_APPROVAL_DENIED` export with outcome
-`denied`; the others export as `success`.
+`denied`; a `CONFIG_IMPORTED` row for an apply that failed part way exports
+with outcome `failure`; the others export as `success`. `CONFIG_IMPORTED`
+never carries a value from the import's `secrets` map.
 
 ## Conda channel and environment actions
 
@@ -256,6 +259,40 @@ the token's user.
 To answer "who asked for this blocked package", filter the audit log on
 `PROXY_SCAN_BLOCKED` and the repository, and match `checksum_sha256` against
 `GET /api/v1/security/proxy-blocked`.
+
+### Proxy cache seeds
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `CACHE_SEEDED` | `repository` (the Remote that was seeded) | A proxy-cache seed job (`POST /api/v1/repositories/{key}/cache/seed`, #5284) completed. One row per job. Outcome `success`. | `repository`, `repository_id`, `job_id`, `kind`, `cached`, `already_cached`, `refused`, `failed`, `cached_bytes`. |
+
+The row's `user_id` is the user who started the seed. The per-path inventory
+stays on the job (`GET .../cache/seed/{job_id}`), not in the audit row.
+
+### Upstream contact
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `UPSTREAM_FETCHED` | `repository` (the Remote the request was made for) | The proxy sends a request to an upstream (#5286): a cache-miss fetch, a revalidation, an OCI bearer-token exchange or its retry. One row per request actually sent; a cache hit sends nothing and writes nothing, neither does a miss a cache-only Remote (#5282) or the upstream filter refuses, and a single-flight fill writes one row however many clients wait on it. Off by default; see below. Outcome `failure` for `not_found`, `error` and `timeout`, else `success`. | `repository`, `repository_id`, `caller` (`proxy`, `revalidate`, `oci_token`), `method`, `host`, `port`, `path` (the URL path only: never userinfo, query string or fragment), `redirected_to_host` (the host the request ended on when a redirect left the requested one, else `null`), `conditional` (sent with `If-None-Match` / `If-Modified-Since`), `status` (`null` when no response arrived), `result` (`ok`, `not_modified`, `not_found`, `auth_challenge`, `error`, `timeout`), `error_type` (the transport error class: `timeout`, `connect`, `redirect`, `body`, `request`, `_OTHER`), `bytes` (the body length the upstream announced in `Content-Length`; `0` for a `HEAD` or `304`, `null` for a chunked body), `duration_ms` (to response headers), `principal` (the username of the client request that caused it, `null` when anonymous or outside a request). |
+
+`AUDIT_UPSTREAM_FETCHES` selects what is written: `off` (the default, no rows
+and no bookkeeping), `errors` (only `not_found`, `error` and `timeout`) or
+`all` (every request; what an air-gapped deployment sets, so the seed
+window's upstream traffic can be listed and the absence of any after the cut
+shown from the audit log). `auth_challenge` is the `401` an OCI registry
+answers an anonymous first request with; the token exchange and retry that
+follow are rows of their own.
+
+The row is written off the request path by a bounded background task, so it
+adds no latency and a failed insert never fails the request (it is logged at
+`WARN`). When the writer pool is saturated the insert runs inline instead of
+being dropped. The row's `user_id`, `ip_address` and correlation id are those
+of the client request that caused the upstream request, when there was one.
+
+Not yet recorded: upstream requests made outside the proxy service (the
+`test-upstream` probe, curation sync, the popularity source, the npm change
+feed and the npm `/-/` and audit passthroughs, the Go sumdb proxy, the AWS
+token exchange).
 
 ## Compatibility policy
 

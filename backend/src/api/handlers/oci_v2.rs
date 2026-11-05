@@ -11622,6 +11622,7 @@ pub(crate) async fn oci_stage_and_scan_image(
         manifest_body: Some(bytes),
         expected_component: None,
         require_nonempty_catalog: true,
+        repository_format: None,
     };
     scanner.scan_content_target(&target, bytes).await
 }

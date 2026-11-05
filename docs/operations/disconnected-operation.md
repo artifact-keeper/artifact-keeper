@@ -81,8 +81,11 @@ services the operator configured inside the deployment, not an upstream:
   upload cleanup, and the rest of the local maintenance jobs.
 
 Request-time proxy fetches are out of scope. A Remote repository still asks
-its upstream when a client requests something that is not cached. That
-behaviour belongs to a per-Remote cache-only mode.
+its upstream when a client requests something that is not cached. To stop
+that, put the Remote in cache-only mode (`PUT
+/api/v1/repositories/{key}/upstream-mode`, or `PROXY_UPSTREAM_MODE=cache_only`
+for every Remote, #5282); see
+[Proxy cache freshness](../proxy-cache-freshness.md#cache-only-offline-mode-upstream_mode-5282).
 
 ## Adding a scheduled upstream job
 

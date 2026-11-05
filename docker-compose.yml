@@ -406,6 +406,11 @@ services:
     image: ghcr.io/aquasecurity/trivy:0.76.0
     container_name: artifact-keeper-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
+    # Air-gapped (#5287): stop the server reaching out for its DB at start
+    # and on every refresh. trivy refuses --skip-db-update on a first run, so
+    # `trivy_cache` must already hold db/trivy.db + db/metadata.json (the
+    # db.tar.gz from `oras pull ghcr.io/aquasecurity/trivy-db:2`, unpacked).
+    # command: ["server", "--listen", "0.0.0.0:8090", "--skip-db-update"]
     # Not published (#4480): the backend calls trivy:8090 on the compose
     # network. For host-side debugging, opt in on loopback only:
     # ports:
@@ -433,6 +438,12 @@ services:
   #     # Pull image manifests/blobs from the AK registry over the compose
   #     # network's plain HTTP. Leave true on the internal network.
   #     SCANNER_TRIVY_INSECURE: "true"
+  #     # Air-gapped (#5287): never download the vulnerability or Java DB and
+  #     # scan with --offline-scan. The adapter stays not-ready until a DB is
+  #     # imported with PUT /api/v1/vulndb (see docker/scanner-adapter/README.md),
+  #     # which needs the shared token below; unset, the DB routes are off.
+  #     # SCANNER_OFFLINE: "true"
+  #     # SCANNER_ADAPTER_TOKEN: ${SCANNER_ADAPTER_TOKEN:-}
   #   volumes:
   #     # Dedicated cache volume — do NOT reuse `trivy_cache`: that volume is
   #     # owned by root (the trivy *server* above runs as root and mounts it at
