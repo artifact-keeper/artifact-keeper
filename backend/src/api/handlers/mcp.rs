@@ -5762,4 +5762,52 @@ mod tests {
         assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://vscode.dev");
         assert_eq!(h[header::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
     }
+
+    /// The event stream applies the serve decision: a reader of a public MCP
+    /// registry who does not hold it gets an artifact event only for a
+    /// version it is served, and a holder for both.
+    #[tokio::test]
+    async fn event_stream_follows_the_serve_decision() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let (_npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for v in ["1.0.0", "2.0.0"] {
+            let d = doc(
+                "com.acme/events",
+                v,
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+        let served = env.server_artifact("com.acme/events", "1.0.0").await;
+        let held = env.server_artifact("com.acme/events", "2.0.0").await;
+        let (reader_id, reader_name) = tdh::create_user(&env.fx.pool).await;
+        let event = |id: Uuid| {
+            crate::services::event_bus::DomainEvent::now_for_repo(
+                "artifact.uploaded",
+                id,
+                env.fx.repo_id,
+                None,
+            )
+        };
+        let admitted = |auth: AuthExtension| {
+            let state = env.fx.state.clone();
+            async move {
+                let mut audience = crate::api::handlers::events::Audience::new(state, auth);
+                (
+                    audience.admit(event(served)).await.is_some(),
+                    audience.admit(event(held)).await.is_some(),
+                )
+            }
+        };
+        let reader = admitted(tdh::make_auth(reader_id, &reader_name)).await;
+        let holder = admitted(tdh::make_auth(env.fx.user_id, &env.fx.username)).await;
+        tdh::cleanup_user(&env.fx.pool, reader_id).await;
+        env.teardown().await;
+        assert_eq!(reader, (true, false), "a reader: served yes, held no");
+        assert_eq!(holder, (true, true), "a holder sees both");
+    }
 }
