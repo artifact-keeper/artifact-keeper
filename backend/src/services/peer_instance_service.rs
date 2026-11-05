@@ -1694,7 +1694,7 @@ mod tests {
             Err(AppError::NotFound(_))
         ));
 
-        // The column default agrees with the API default (migration 327).
+        // The column default agrees with the API default (migration 330).
         sqlx::query(
             "INSERT INTO peer_repo_subscriptions (peer_instance_id, repository_id) VALUES ($1, $2)",
         )

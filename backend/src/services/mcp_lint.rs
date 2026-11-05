@@ -34,7 +34,7 @@ use crate::error::{AppError, Result};
 use crate::formats::mcp::{self as fmt, PackagePin, ServerJson};
 use crate::models::security::{FindingClass, RawFinding, Severity};
 
-/// The `scan_results.scan_type` of a lint run (migration 327).
+/// The `scan_results.scan_type` of a lint run (migration 330).
 pub const MCP_LINT_SCAN_TYPE: &str = "mcp_lint";
 /// `scan_results.scanner_version` of a lint run: bump when a rule changes.
 pub const LINT_VERSION: &str = "ak-mcp-lint/1";
