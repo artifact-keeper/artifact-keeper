@@ -3628,10 +3628,11 @@ mod tests {
     /// Instead the handler's own queries ([`collect_system_stats`]) run
     /// inside one REPEATABLE READ transaction. Every statement in it reads
     /// the same snapshot, so rows other tests commit meanwhile are invisible,
-    /// while this transaction's own inserts (and the migration-182 trigger
-    /// writes they cause to `repository_usage_ledger`) are visible. The
-    /// deltas are therefore exact, and nothing is committed: the rollback is
-    /// the cleanup.
+    /// while this transaction's own inserts are visible. The migration-182
+    /// trigger charges are queued and applied at COMMIT since #5084, so the
+    /// helper flushes them explicitly with `SET CONSTRAINTS ALL IMMEDIATE`
+    /// before reading the ledger. The deltas are therefore exact, and nothing
+    /// is committed: the rollback is the cleanup.
     ///
     /// Two things are checked in that snapshot:
     ///  - the per-repository accounting the global figures are built from
@@ -3774,6 +3775,13 @@ mod tests {
         .bind(repo_id)
         .execute(&mut *tx)
         .await?;
+
+        // #5084: row-trigger deltas are queued and applied at COMMIT. Flush
+        // them now so the two same-snapshot reads below observe the ledger
+        // charge without leaving the REPEATABLE READ transaction.
+        sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+            .execute(&mut *tx)
+            .await?;
 
         let after = collect_system_stats(&mut tx)
             .await
