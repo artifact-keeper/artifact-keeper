@@ -115,6 +115,15 @@ pub struct AssignRepoRequest {
     /// `pull` is refused with 400: it is not implemented and never created a
     /// sync task (#5293).
     pub replication_mode: Option<String>,
+    /// Cron expression (UTC; 5-field, or 6/7 with seconds/year) for a
+    /// `mirror` subscription's whole-repository pass (#5342). Each time it is
+    /// due the sync worker queues every artifact the peer has no task for
+    /// (the work of `POST /{id}/repositories/{repo_id}/sync`) and sets
+    /// `last_replicated_at`; a subscription that has never completed a pass
+    /// runs one on the first check. Ignored for `push` and `none`. An invalid
+    /// expression is refused with 400. Scheduled passes do not run while
+    /// upstream jobs are paused (#5288).
+    #[schema(example = "0 */6 * * *")]
     pub replication_schedule: Option<String>,
     /// Optional JSONB filter constraining which artifacts in the repository
     /// get replicated. Shape: `{"include_patterns": ["^v\\d+\\."], "exclude_patterns": [".*-SNAPSHOT$"]}`.
@@ -134,6 +143,8 @@ pub struct SubscriptionResponse {
     pub replication_schedule: Option<String>,
     #[schema(value_type = Object)]
     pub replication_filter: Option<serde_json::Value>,
+    /// When the last whole-repository pass (a scheduled `mirror` pass or a
+    /// `sync` call) queued its tasks; `null` if none has run (#5342).
     pub last_replicated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// `active` when the subscription is enabled and its mode is replicated
@@ -607,7 +618,7 @@ pub async fn get_assigned_repos(
     request_body = AssignRepoRequest,
     responses(
         (status = 200, description = "Repository assigned successfully"),
-        (status = 400, description = "Invalid replication_mode, or `pull`, which is not implemented"),
+        (status = 400, description = "Invalid replication_mode, `pull` (not implemented), or a replication_schedule that is not a valid cron expression"),
         (status = 404, description = "Peer instance or repository not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -683,9 +694,11 @@ pub async fn get_subscription(
 /// Trigger an immediate sync for a single (peer, repo) subscription.
 ///
 /// Queues one `sync_task` per artifact in the repository at priority 100
-/// without waiting for the next cron tick. Idempotent: if tasks are already
-/// pending for the same artifacts, the unique constraint
-/// `(peer_instance_id, artifact_id, task_type)` skips duplicates.
+/// without waiting for a `mirror` subscription's `replication_schedule`, and
+/// sets `last_replicated_at`, so the schedule next fires at its first
+/// occurrence after this call (#5342). Idempotent: an artifact that already
+/// has a task for this peer (pending or completed) is skipped through the
+/// unique constraint `(peer_instance_id, artifact_id, task_type)`.
 #[utoipa::path(
     post,
     path = "/{id}/repositories/{repo_id}/sync",

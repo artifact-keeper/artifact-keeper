@@ -103,7 +103,7 @@ Notes:
 | Mode | What it does today |
 | --- | --- |
 | `push` | Every artifact uploaded to the repository is queued for the peer as it lands. Existing content is sent when you call the subscription's `sync` route. |
-| `mirror` | Queued exactly like `push`. The subscription also stores a cron `replication_schedule`, but nothing acts on it yet, so run the `sync` route yourself for a whole-repository pass. |
+| `mirror` | Queued like `push` as each artifact is uploaded. With a cron `replication_schedule` (UTC, for example `0 */6 * * *`), the sync worker also runs a whole-repository pass each time the schedule is due: it queues every artifact the peer has no task for, the same work as the `sync` route, and sets `last_replicated_at` when the pass is queued. A subscription that has never completed a pass runs one on the first check (about once a minute). Missed occurrences, for example while the backend was down or upstream jobs were paused, add up to one pass, not a backlog. An invalid cron expression is refused with 400. Without a schedule, `mirror` behaves exactly like `push`. |
 | `none` | Assigned, not replicated. |
 | `pull` | Refused with 400 on `POST /api/v1/peers/{id}/repositories` and on sync policies. It was accepted before, but nothing ever created a sync task for it, so such a subscription never moved a byte. Existing `pull` rows are left in place, logged once at startup and reported as inactive. Re-subscribe them with `push` or `mirror`. |
 
@@ -114,7 +114,10 @@ that `pull` names is not implemented.
 
 Use `POST /api/v1/peers/{id}/repositories/{repo_id}/sync` after the first
 subscription and after any gap in connectivity, to resend what the high side
-is missing. Tasks that already completed are not repeated.
+is missing, or give a `mirror` subscription a schedule so this happens on its
+own. Either way, tasks that already completed are not repeated, and a `sync`
+call counts as a pass: the schedule next fires at its first occurrence after
+the call.
 
 Read the subscription back with `GET /api/v1/peers/{id}/repositories/{repo_id}`
 to check its mode, schedule and filter. A `replication_filter`
@@ -433,7 +436,9 @@ curl -X PATCH "$AK/api/v1/admin/settings/system" \
 
 It pauses the curation upstream sync and its popularity lookups, the
 environment advisory re-evaluation (OSV), the npm change feed consumer, peer
-replication transfers and the Remote MCP registry sync. Each skips its tick
+replication transfers and scheduled `mirror` passes, and the Remote MCP
+registry sync. A `mirror` schedule that comes due while paused runs once on
+the first check after the switch is turned off. Each skips its tick
 before any network work and resumes where it stopped when the switch is
 turned off. `GET /api/v1/admin/settings/system` reports the state
 (`upstream_jobs_paused`, `upstream_jobs_paused_source`). Local jobs and
