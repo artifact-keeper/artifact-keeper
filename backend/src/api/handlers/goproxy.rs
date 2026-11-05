@@ -375,7 +375,7 @@ fn sumdb_tile_width(tile: &str) -> Option<Option<usize>> {
         _ => (index.to_vec(), full),
     };
     let (last, parents) = index.split_last()?;
-    let well_formed = digits(last)
+    let well_formed = digits(*last)
         && parents
             .iter()
             .all(|s| s.strip_prefix('x').is_some_and(digits));
