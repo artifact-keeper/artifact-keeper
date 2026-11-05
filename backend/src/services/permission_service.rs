@@ -68,20 +68,6 @@ pub struct PermissionConditions {
     /// for the rule to apply. `None` (absent) means no IP restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
-    /// MCP server-name patterns (#5253): on an MCP registry write the rule
-    /// applies only to server names matching one of them; patterns may
-    /// interpolate CI OIDC claims (`io.github.{repository_owner}/*`). See
-    /// `services::mcp_namespaces`. Every other check treats a rule carrying
-    /// this key as NOT APPLICABLE (it grants nothing outside the MCP
-    /// namespace gate, see [`ip_condition_sql`]), and the permission write
-    /// handlers accept it only on an MCP repository target.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_namespaces: Option<Vec<String>>,
-    /// The CI OIDC issuer (`iss`) whose session claims `mcp_namespaces`
-    /// patterns may interpolate (#5253). Required when a pattern names a
-    /// `{claim}`; only valid together with `mcp_namespaces`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_namespace_issuer: Option<String>,
 }
 
 impl PermissionConditions {
@@ -100,13 +86,6 @@ impl PermissionConditions {
                     .map_err(|e| AppError::Validation(format!("conditions.allowed_cidrs: {e}")))?;
             }
         }
-        if let Some(patterns) = &self.mcp_namespaces {
-            crate::services::mcp_namespaces::validate_patterns(patterns)?;
-        }
-        crate::services::mcp_namespaces::validate_issuer(
-            self.mcp_namespaces.as_deref(),
-            self.mcp_namespace_issuer.as_deref(),
-        )?;
         Ok(())
     }
 
@@ -126,27 +105,8 @@ impl PermissionConditions {
 /// generated text is interpolated unescaped, so both parameters MUST be
 /// trusted fragments (bind placeholders, validated `IpAddr` literals) —
 /// never request-derived text.
-///
-/// #5253: the predicate also makes a rule carrying `conditions.mcp_namespaces`
-/// non-applicable. Such a rule is a namespace-limited MCP publish grant: it
-/// counts only in the MCP namespace write gate
-/// (`services::mcp_namespaces::authorize_write`, which uses
-/// [`cidr_condition_sql`]), never in a generic permission decision, so it
-/// cannot act as an unlimited write/delete on the generic artifact API.
 pub(crate) fn ip_condition_sql(alias: &str, ip_ref: &str) -> String {
     format!("AND {}", ip_condition_expr(alias, ip_ref))
-}
-
-/// The `allowed_cidrs` predicate alone (no `mcp_namespaces` exclusion), for
-/// the MCP namespace write gate, which evaluates `mcp_namespaces` itself.
-/// Same trusted-fragment contract as [`ip_condition_sql`].
-pub(crate) fn cidr_condition_sql(alias: &str, ip_ref: &str) -> String {
-    format!("AND {}", cidr_condition_expr(alias, ip_ref))
-}
-
-/// SQL boolean: the rule `alias` carries no `mcp_namespaces` condition.
-fn not_namespace_rule_expr(alias: &str) -> String {
-    format!("NOT ({alias}.conditions ? 'mcp_namespaces')")
 }
 
 /// The boolean behind [`ip_condition_sql`]: whether the rule `alias` is
@@ -155,14 +115,6 @@ fn not_namespace_rule_expr(alias: &str) -> String {
 /// one query yields both the decision and how the condition evaluated. Same
 /// trusted-fragment contract as [`ip_condition_sql`].
 fn ip_condition_expr(alias: &str, ip_ref: &str) -> String {
-    format!(
-        "({} AND {})",
-        not_namespace_rule_expr(alias),
-        cidr_condition_expr(alias, ip_ref)
-    )
-}
-
-fn cidr_condition_expr(alias: &str, ip_ref: &str) -> String {
     format!(
         "(\
              NOT ({alias}.conditions ? 'allowed_cidrs') \
@@ -444,36 +396,6 @@ impl PermissionService {
         action: &str,
         is_admin: bool,
     ) -> Result<bool> {
-        self.check_repository_action_on(user_id, repository_id, action, is_admin, false)
-            .await
-    }
-
-    /// [`Self::check_repository_action`] for a request on the MCP registry
-    /// surface (`/mcp/<key>/...` of an MCP repository): a rule carrying
-    /// `conditions.mcp_namespaces` counts there as an applicable rule (its
-    /// IP condition still applies), because every MCP write handler then runs
-    /// the namespace write gate (`services::mcp_namespaces::authorize_write`)
-    /// that decides the server name. Everywhere else such a rule grants
-    /// nothing.
-    pub async fn check_mcp_surface_action(
-        &self,
-        user_id: Uuid,
-        repository_id: Uuid,
-        action: &str,
-        is_admin: bool,
-    ) -> Result<bool> {
-        self.check_repository_action_on(user_id, repository_id, action, is_admin, true)
-            .await
-    }
-
-    async fn check_repository_action_on(
-        &self,
-        user_id: Uuid,
-        repository_id: Uuid,
-        action: &str,
-        is_admin: bool,
-        mcp_surface: bool,
-    ) -> Result<bool> {
         if is_admin {
             return Ok(true);
         }
@@ -548,14 +470,7 @@ impl PermissionService {
                 END AS allowed,
                 {tally}
             "#,
-            condition_columns = if mcp_surface {
-                format!(
-                    "(p.conditions ? 'allowed_cidrs') AS conditioned, {} AS ip_ok",
-                    cidr_condition_expr("p", "$4")
-                )
-            } else {
-                condition_columns("p", "$4")
-            },
+            condition_columns = condition_columns("p", "$4"),
             tally = CONDITION_TALLY_SQL,
         );
         let (allowed, conditioned, matched): (bool, i64, i64) =
@@ -694,16 +609,13 @@ impl PermissionService {
         // access model. The `$1 = 'repository'` guard keeps every other target
         // type (group/artifact/system) unaffected, and a NULL `project_id`
         // subquery result never matches (`target_id = NULL` is not true).
-        // #5253: a namespace-conditioned MCP rule grants nothing outside the
-        // MCP namespace gate, so it does not engage the generic ACL either.
         let exists: bool = sqlx::query_scalar(
             r#"SELECT EXISTS(
                  SELECT 1 FROM permissions
-                 WHERE ((target_type = $1 AND target_id = $2)
+                 WHERE (target_type = $1 AND target_id = $2)
                     OR ($1 = 'repository' AND target_type = 'project' AND target_id = (
                         SELECT project_id FROM repositories WHERE id = $2
-                    )))
-                   AND NOT (conditions ? 'mcp_namespaces')
+                    ))
                )"#,
         )
         .bind(target_type)
@@ -3070,7 +2982,6 @@ mod tests {
         assert!(PermissionConditions::default().validate().is_ok());
         let ok = PermissionConditions {
             allowed_cidrs: Some(vec!["10.0.0.0/8".to_string(), "fc00::/7".to_string()]),
-            ..Default::default()
         };
         assert!(ok.validate().is_ok());
     }
@@ -3079,7 +2990,6 @@ mod tests {
     fn test_conditions_validate_rejects_empty_cidr_list() {
         let empty = PermissionConditions {
             allowed_cidrs: Some(vec![]),
-            ..Default::default()
         };
         let err = empty.validate().unwrap_err();
         assert!(
@@ -3093,29 +3003,10 @@ mod tests {
         for bad in ["10.0.0.0/33", "not-a-cidr", "10.0.0.0/x"] {
             let c = PermissionConditions {
                 allowed_cidrs: Some(vec![bad.to_string()]),
-                ..Default::default()
             };
             assert!(
                 matches!(c.validate(), Err(AppError::Validation(_))),
                 "{bad} must fail validation"
-            );
-        }
-    }
-
-    #[test]
-    fn test_conditions_validate_mcp_namespaces() {
-        let ok: PermissionConditions =
-            serde_json::from_str(r#"{"mcp_namespaces": ["io.github.{repository_owner}/*"], "mcp_namespace_issuer": "https://token.actions.githubusercontent.com"}"#)
-                .unwrap();
-        assert!(ok.validate().is_ok());
-        for bad in [
-            r#"{"mcp_namespaces": []}"#,
-            r#"{"mcp_namespaces": ["a b"]}"#,
-        ] {
-            let c: PermissionConditions = serde_json::from_str(bad).unwrap();
-            assert!(
-                matches!(c.validate(), Err(AppError::Validation(_))),
-                "{bad}"
             );
         }
     }
@@ -3132,7 +3023,6 @@ mod tests {
     fn test_conditions_round_trip_json_shape() {
         let c = PermissionConditions {
             allowed_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
-            ..Default::default()
         };
         assert_eq!(
             c.to_json(),

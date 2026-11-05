@@ -338,7 +338,6 @@ pub async fn list_packages(
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    let (packages, hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
 
     let count_sql = format!(
         r#"
@@ -362,9 +361,6 @@ pub async fn list_packages(
         None => count_query.bind(count_user_id),
     };
     let total: i64 = count_query.fetch_one(&state.db).await.unwrap_or(0);
-    // MCP rows this reader is served no version of are left out of the page
-    // and, best effort, of the total.
-    let total = (total - hidden as i64).max(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -465,15 +461,10 @@ pub async fn get_package(
         Some(ids) => query.bind(ids.clone()),
         None => query.bind(user_id),
     };
-    let package: PackageRow = query
+    let mut package: PackageRow = query
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
-    let mut package = apply_mcp_catalog_views(&state, auth.as_ref(), vec![package])
-        .await
-        .0
-        .pop()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
 
     // A virtual-repo context (`?repository_key=<virtual>`) reports the virtual
@@ -618,10 +609,6 @@ pub async fn get_package_versions(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-    if let Some(visible) = mcp_visible_versions(&state, auth.as_ref(), id).await {
-        versions.retain(|v| visible.contains(&v.version));
-    }
-
     versions.sort_by(|a, b| match version_compare(&a.version, &b.version) {
         n if n < 0 => std::cmp::Ordering::Greater,
         n if n > 0 => std::cmp::Ordering::Less,
@@ -634,82 +621,6 @@ pub async fn get_package_versions(
             .map(PackageVersionResponse::from)
             .collect(),
     }))
-}
-
-/// The MCP rows of `rows` as `auth` may see them (#5253): a row whose
-/// version is held is kept for a holder (with `metadata.servable: false`),
-/// shown to any other reader as the server's newest servable version, or left
-/// out when none is served ([`super::mcp::catalog_view`], the registry
-/// surface's own decision). Other formats pass through. Also returns how
-/// many rows were left out.
-async fn apply_mcp_catalog_views(
-    state: &SharedState,
-    auth: Option<&AuthExtension>,
-    rows: Vec<PackageRow>,
-) -> (Vec<PackageRow>, usize) {
-    use super::mcp::CatalogView;
-    let mut out = Vec::with_capacity(rows.len());
-    let mut hidden = 0;
-    for mut row in rows {
-        if row.format != "mcp" {
-            out.push(row);
-            continue;
-        }
-        let repo_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM repositories WHERE key = $1")
-                .bind(&row.repository_key)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
-        let view = match repo_id {
-            Some(id) => super::mcp::catalog_view(state, auth, id, &row.name, &row.version).await,
-            None => CatalogView::Hide,
-        };
-        match view {
-            CatalogView::Keep { servable } => {
-                if let Some(serde_json::Value::Object(m)) = row.metadata.as_mut() {
-                    m.insert("servable".into(), servable.into());
-                }
-                out.push(row);
-            }
-            CatalogView::Show {
-                version,
-                description,
-                metadata,
-            } => {
-                row.version = version;
-                row.description = description;
-                let mut metadata = metadata;
-                metadata["servable"] = true.into();
-                row.metadata = Some(metadata);
-                out.push(row);
-            }
-            CatalogView::Hide => hidden += 1,
-        }
-    }
-    (out, hidden)
-}
-
-/// For an MCP package, the versions `auth` may list (`None`: all of them, a
-/// holder or another format).
-async fn mcp_visible_versions(
-    state: &SharedState,
-    auth: Option<&AuthExtension>,
-    package_id: Uuid,
-) -> Option<std::collections::HashSet<String>> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT p.repository_id, p.name FROM packages p \
-         JOIN repositories r ON r.id = p.repository_id \
-         WHERE p.id = $1 AND r.format = 'mcp'",
-    )
-    .bind(package_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
-    let (repo_id, name) = row?;
-    super::mcp::catalog_visible_versions(state, auth, repo_id, &name).await
 }
 
 #[derive(OpenApi)]

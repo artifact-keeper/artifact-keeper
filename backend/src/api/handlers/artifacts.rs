@@ -233,7 +233,6 @@ pub async fn get_artifact(
     .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
     check_artifact_visibility(&auth, id, &state.db, "read").await?;
-    require_mcp_servable(&state, &auth, id).await?;
 
     let download_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
@@ -326,39 +325,7 @@ async fn require_existing_visible_artifact(
         return Err(AppError::NotFound("Artifact not found".to_string()));
     }
 
-    check_artifact_visibility(auth, id, &state.db, "read").await?;
-    require_mcp_servable(state, auth, id).await
-}
-
-/// The MCP serve decision on the by-id routes (#5253): an MCP server version
-/// (or a bundle of one) that readers are not served now is "Artifact not
-/// found" for a caller who does not hold the repository, as on the registry
-/// surface ([`super::mcp::GenericArtifactGate`]). Other formats pass.
-async fn require_mcp_servable(
-    state: &SharedState,
-    auth: &Option<AuthExtension>,
-    id: Uuid,
-) -> Result<()> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT a.repository_id, a.path FROM artifacts a \
-         JOIN repositories r ON r.id = a.repository_id \
-         WHERE a.id = $1 AND r.format = 'mcp'",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    let Some((repo_id, path)) = row else {
-        return Ok(());
-    };
-    if super::mcp::GenericArtifactGate::new(state, auth.as_ref())
-        .visible(repo_id, &path)
-        .await
-    {
-        Ok(())
-    } else {
-        Err(AppError::NotFound("Artifact not found".to_string()))
-    }
+    check_artifact_visibility(auth, id, &state.db, "read").await
 }
 
 /// Get artifact metadata by artifact ID
