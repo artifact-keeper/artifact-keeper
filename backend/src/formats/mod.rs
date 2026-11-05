@@ -23,6 +23,7 @@ pub mod incus;
 pub mod jetbrains_plugins;
 pub mod maven;
 pub mod maven_version;
+pub mod mcp;
 pub mod mlmodel;
 pub mod npm;
 pub mod nuget;
@@ -145,6 +146,7 @@ pub fn get_core_handler(format_key: &str) -> Option<Box<dyn FormatHandler>> {
         "incus" | "lxc" => Some(Box::new(incus::IncusHandler::new())),
         "pacman" => Some(Box::new(pacman::PacmanHandler::new())),
         "agentplugins" => Some(Box::new(agent_plugins::AgentPluginsHandler::new())),
+        "mcp" => Some(Box::new(mcp::McpHandler::new())),
         _ => None,
     }
 }
@@ -211,6 +213,7 @@ pub fn get_handler_for_format(format: &RepositoryFormat) -> Box<dyn FormatHandle
         RepositoryFormat::Incus | RepositoryFormat::Lxc => Box::new(incus::IncusHandler::new()),
         RepositoryFormat::Pacman => Box::new(pacman::PacmanHandler::new()),
         RepositoryFormat::AgentPlugins => Box::new(agent_plugins::AgentPluginsHandler::new()),
+        RepositoryFormat::Mcp => Box::new(mcp::McpHandler::new()),
     }
 }
 
@@ -343,6 +346,21 @@ pub const SCAN_ON_PROXY_ENFORCED_HANDLERS: &[&str] = &[
     "vscode",
 ];
 
+/// Every repository type, in the order the API lists them.
+pub const ALL_REPO_TYPES: &[&str] = &["local", "staging", "remote", "virtual"];
+
+/// The repository types (`repo_type` values) a repository of format handler
+/// `handler_key` may be created as. Agent Plugins repositories are hosted
+/// only (#5251); every other format, MCP registries included (#5253),
+/// supports all four. `GET /api/v1/formats` advertises this as
+/// `repository_types`, and repository creation enforces it.
+pub fn supported_repo_types(handler_key: &str) -> &'static [&'static str] {
+    match handler_key {
+        "agentplugins" => &["local", "staging"],
+        _ => ALL_REPO_TYPES,
+    }
+}
+
 /// Does the core handler `handler_key` enforce scan-on-proxy (#4099)?
 pub fn handler_enforces_scan_on_proxy(handler_key: &str) -> bool {
     SCAN_ON_PROXY_ENFORCED_HANDLERS.contains(&handler_key)
@@ -426,7 +444,7 @@ fn core_handler_metadata(
         ),
         "jetbrains" => ("JetBrains Plugins", "JetBrains IDE plugins", &[".zip"]),
         "agentplugins" => ("Agent Plugins", "AI coding-agent plugin bundles", &[".zip"]),
-        "huggingface" => ("Hugging Face", "Hugging Face models and datasets", &[]),
+        "huggingface" => ("Hugging Face", "Hugging Face Hub models", &[]),
         "mlmodel" => ("ML Models", "Machine-learning model artifacts", &[]),
         "cran" => ("CRAN", "R packages", &[".tar.gz"]),
         "vagrant" => ("Vagrant", "Vagrant boxes", &[".box"]),
@@ -439,6 +457,11 @@ fn core_handler_metadata(
             "Pacman",
             "Arch Linux pacman packages",
             &[".pkg.tar.zst", ".pkg.tar.xz"],
+        ),
+        "mcp" => (
+            "MCP Registry",
+            "Model Context Protocol server registry (server.json, registry API v0.1)",
+            &[".json"],
         ),
         // Total fallback -- see the doc comment. A format that reaches this
         // arm is still listed, it just shows its raw key as the display name.
@@ -559,6 +582,18 @@ static MAVEN_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
 /// protocol aliases (yarn/pnpm speak npm; poetry speaks PyPI) onto the
 /// canonical format that owns their policy. `None` means the format has no
 /// age-gate support; the config endpoint rejects attempts to enable it.
+static MCP_AGE_GATE_SPEC: AgeGateFormatSpec = AgeGateFormatSpec {
+    canonical: RepositoryFormat::Mcp,
+    label: "mcp",
+    // A server version is write-once in AK: a Remote MCP registry never
+    // overwrites an ingested `name@version` (changed upstream bytes raise a
+    // content-drift hold instead), so a first sighting binds to fixed content.
+    immutable_coordinates: true,
+    // The upstream `publishedAt` is the upstream registry's claim; the gate
+    // trusts this instance's own clock (`first_seen`) only (#5253).
+    publish_time_resolver: false,
+};
+
 pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormatSpec> {
     match format {
         RepositoryFormat::Npm | RepositoryFormat::Yarn | RepositoryFormat::Pnpm => {
@@ -574,6 +609,9 @@ pub fn age_gate_spec(format: &RepositoryFormat) -> Option<&'static AgeGateFormat
         // handler. sbt has its own handler with no age-gate seam, so it stays
         // out (an entry without enforcement would accept a gate it ignores).
         RepositoryFormat::Maven | RepositoryFormat::Gradle => Some(&MAVEN_AGE_GATE_SPEC),
+        // Remote MCP registries gate server versions in the `/v0.1` read path
+        // (`services::mcp_curation`), not a download handler.
+        RepositoryFormat::Mcp => Some(&MCP_AGE_GATE_SPEC),
         _ => None,
     }
 }

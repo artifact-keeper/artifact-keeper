@@ -87,6 +87,8 @@ pub enum RepositoryFormat {
     // AI coding-agent plugin bundles (#5251)
     #[sqlx(rename = "agentplugins")]
     AgentPlugins,
+    // AI / agents: MCP server registry (#5253)
+    Mcp,
 }
 
 impl RepositoryFormat {
@@ -166,6 +168,7 @@ impl RepositoryFormat {
         RepositoryFormat::Lxc,
         RepositoryFormat::Pacman,
         RepositoryFormat::AgentPlugins,
+        RepositoryFormat::Mcp,
     ];
 
     /// The canonical snake_case key for this format.
@@ -234,6 +237,7 @@ impl RepositoryFormat {
             Self::Lxc => "lxc",
             Self::Pacman => "pacman",
             Self::AgentPlugins => "agentplugins",
+            Self::Mcp => "mcp",
         }
     }
 

@@ -121,7 +121,12 @@ Revisions may be branch names, tags, 40-character commit shas or refs such as
 `refs/pr/1`. Responses carry the `X-Repo-Commit` and `ETag` headers
 `huggingface_hub` needs to place files in its cache. For a Local repository,
 which has no git history, the commit is a stable value derived from the model
-ID and revision.
+ID and revision. Model info reports it as `sha`, and the model-info, tree and
+resolve routes all accept it in place of the revision it stands for, which is
+how `snapshot_download` requests the files it lists. Model info without a
+revision describes `main` (or, for a model never published to `main`, its
+newest revision), and an unknown revision answers 404 with
+`X-Error-Code: RevisionNotFound`, as the Hub does.
 
 ## Publishing to a Local repository
 
@@ -140,6 +145,19 @@ curl -X POST \
 
 The token needs `write:artifacts` and write permission on the repository.
 Uploads to Remote (405) and Virtual (400) repositories are refused.
+
+Each revision is its own set of files: upload every file of a revision to
+that revision. The model can then be downloaded with the usual calls, with
+`HF_ENDPOINT` pointed at the Local repository:
+
+```python
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+
+HfApi().model_info("my-org/my-model", revision="main").siblings
+snapshot_download("my-org/my-model")                 # main
+snapshot_download("my-org/my-model", revision="v1")  # a revision uploaded as upload/v1
+hf_hub_download("my-org/my-model", "config.json")
+```
 
 ## Limitations
 

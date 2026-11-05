@@ -1228,6 +1228,22 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5253: hourly upstream sync of Remote MCP registries. Every replica
+    // ticks; a scheduler lease picks one per tick and a per-repository
+    // cluster lock keeps a manual trigger from overlapping a run.
+    artifact_keeper_backend::services::mcp_remote::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5253: the MCP registry's async package resolver (fills Remote backing
+    // repositories for versions published `resolving`). Every replica ticks;
+    // jobs are row-claimed.
+    artifact_keeper_backend::services::mcp_resolver::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Spawn background schedulers (metrics snapshots, health monitor, lifecycle)
     scheduler_service::spawn_all(
         db_pool.clone(),
@@ -1370,6 +1386,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
             }
         })
+        // #5253: a refusal the shared middleware gives on an `/mcp/` path is
+        // re-rendered as problem+json with `no-store` (and the read routes'
+        // CORS headers); every other path passes through untouched.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_surface_guard,
+        ))
+        // #5253: MCP registry read routes answer cross-origin preflights
+        // themselves (any origin, GET only, no credentials); the instance CORS
+        // layer above would otherwise answer them same-origin.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_cors_preflight,
+        ))
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
@@ -1388,6 +1416,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .on_response(
             artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
+
+    // #5253: optional host-level MCP registry (`/v0.1/...`, `/v0/...`).
+    let app = artifact_keeper_backend::api::handlers::mcp_edges::mount_default_repo(
+        app,
+        artifact_keeper_backend::api::handlers::mcp_edges::default_repo_from_env(
+            std::env::var("MCP_DEFAULT_REPO").ok().as_deref(),
+        ),
+    );
 
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so
