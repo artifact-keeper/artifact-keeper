@@ -807,6 +807,18 @@ async fn upsert_repo_config(
     Ok(())
 }
 
+/// Delete one `repository_config` key for a repository; a missing key is a
+/// no-op.
+async fn delete_repo_config(db: &sqlx::PgPool, repo_id: Uuid, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+        .bind(repo_id)
+        .bind(key)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Upsert the `index_upstream_url` key in `repository_config` for a given repository.
 async fn upsert_index_upstream_url(
     db: &sqlx::PgPool,
@@ -4805,6 +4817,80 @@ pub async fn get_repository_storage_tree(
     }))
 }
 
+/// Reject the `PATCH /repositories/{key}` fields that do not apply to this
+/// repository, or carry a bad value, before anything is written (#5201).
+/// The update handler used to check them one by one after the repository row
+/// and the earlier config keys were already saved, so a 400 kept part of the
+/// change. Mirrors the up-front checks `create_repository` runs.
+fn validate_update_config_fields(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    payload: &UpdateRepositoryRequest,
+) -> Result<()> {
+    validate_npm_scope_policy_fields(
+        repo_type,
+        format,
+        payload.npm_allowed_scopes.as_deref(),
+        payload.npm_allow_unscoped,
+        payload.npm_allowed_name_patterns.as_deref(),
+    )?;
+    // #3647: enabling is refused on the proxying types; disabling stays
+    // allowed on every type so an existing enabled row can be turned off.
+    if payload.quarantine_enabled == Some(true) {
+        is_quarantine_enableable(repo_type)?;
+    }
+    if payload.virtual_metadata_partial.is_some() && *repo_type != RepositoryType::Virtual {
+        return Err(AppError::Validation(
+            "virtual_metadata_partial is only valid for virtual repositories".to_string(),
+        ));
+    }
+    if payload.quarantine_duration_minutes.is_some_and(|d| d < 0) {
+        return Err(AppError::Validation(
+            "quarantine_duration_minutes must be non-negative".to_string(),
+        ));
+    }
+    if payload
+        .release_repository_key
+        .as_deref()
+        .is_some_and(|k| !k.is_empty())
+        && *repo_type != RepositoryType::Staging
+    {
+        return Err(AppError::Validation(
+            "Release target linking is only available for staging repositories".to_string(),
+        ));
+    }
+    if let Some(ref ua) = payload.custom_user_agent {
+        if *repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "custom_user_agent is only valid for remote repositories".to_string(),
+            ));
+        }
+        if !ua.is_empty() {
+            validate_custom_user_agent(ua)?;
+        }
+    }
+    let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
+    let apt_fields = [
+        (&payload.apt_origin, "apt_origin"),
+        (&payload.apt_label, "apt_label"),
+        (&payload.apt_release_version, "apt_release_version"),
+    ];
+    if !is_apt_hosted
+        && (apt_fields.iter().any(|(v, _)| v.is_some()) || payload.apt_description.is_some())
+    {
+        return Err(AppError::Validation(
+            "apt_origin, apt_label, apt_release_version, and apt_description are only valid for hosted APT repositories".to_string(),
+        ));
+    }
+    // `apt_description` may span lines (deb822 folds it); the others may not.
+    for (value, field) in apt_fields {
+        if let Some(trimmed) = value.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            ensure_single_line(trimmed, field)?;
+        }
+    }
+    Ok(())
+}
+
 /// Update repository
 #[utoipa::path(
     patch,
@@ -4992,6 +5078,55 @@ pub async fn update_repository(
         &existing.repo_type,
         payload.oci_trusted_bearer_realms.as_deref(),
     )?;
+    // #5201: validate every remaining field before the first write below, so
+    // a rejected request leaves the repository exactly as it was instead of
+    // keeping the repository-row and config changes that ran ahead of the
+    // check. Repository type and format are immutable here, so `existing`
+    // decides, as for the npm and OCI fields above.
+    validate_update_config_fields(&existing.repo_type, &existing.format, &payload)?;
+    let release_link = match payload.release_repository_key.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(release_key) => {
+            let release_repo = service.get_by_key(release_key).await.map_err(|_| {
+                AppError::Validation(format!("Release repository '{}' not found", release_key))
+            })?;
+            super::promotion::validate_release_target_link(&existing, &release_repo)?;
+            Some(Some(release_repo.id))
+        }
+    };
+    // Debian remote proxy filter (#2460). Three-way semantics:
+    //   * field omitted (`None`)      -> leave the stored config unchanged
+    //   * field `null` (`Some(None)`) -> clear it (revert to full-proxy)
+    //   * field object                -> merge the partial update onto the
+    //                                    stored config and validate it here;
+    //                                    it is persisted after the update.
+    //
+    // A patch that sets something is only valid for a Debian Remote. An
+    // all-`None` patch on any other type is the untouched-form artifact
+    // (`"debian": {}`): it merges nothing, so it is skipped rather than
+    // rejected.
+    let debian_config = match payload.debian {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(ref patch))
+            if classify_debian_payload(
+                &existing.repo_type,
+                &existing.format,
+                *patch == DebianConfigPatch::default(),
+            )? =>
+        {
+            let base = load_debian_config(&state.db, existing.id)
+                .await
+                .unwrap_or_default();
+            let merged = patch.clone().apply_to(base);
+            validate_debian_config(&merged)?;
+            Some(Some(merged))
+        }
+        // The skipped untouched-form patch: nothing to merge, nothing stored.
+        Some(Some(_)) => None,
+    };
+
     // #4467: an upstream URL change is applied. The service validates it like
     // create does and refuses (409) an origin change while upstream-auth
     // credentials are configured. Age-gate state still keyed by the old URL's
@@ -5064,6 +5199,7 @@ pub async fn update_repository(
     // (empty lists, allow_unscoped false) against a repo the policy is not
     // configurable on is a no-op, not an error (#3299): released web UIs submit
     // exactly that when saving an untouched settings form on a virtual repo.
+    // Validated up front (#5201).
     if npm_scope_policy_fields_supplied(
         &repo.repo_type,
         &repo.format,
@@ -5071,7 +5207,6 @@ pub async fn update_repository(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     ) {
-        is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
         apply_npm_scope_policy_config(
             &state.db,
             repo.id,
@@ -5089,12 +5224,9 @@ pub async fn update_repository(
             .await?;
     }
 
+    // Every field below was validated before the first write (#5201), so
+    // nothing past this point answers 4xx.
     if let Some(enabled) = payload.quarantine_enabled {
-        // #3647: enabling is refused on the proxying types; disabling stays
-        // allowed on every type so an existing enabled row can be turned off.
-        if enabled {
-            is_quarantine_enableable(&repo.repo_type)?;
-        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -5105,11 +5237,6 @@ pub async fn update_repository(
     }
 
     if let Some(allow) = payload.virtual_metadata_partial {
-        if repo.repo_type != RepositoryType::Virtual {
-            return Err(AppError::Validation(
-                "virtual_metadata_partial is only valid for virtual repositories".to_string(),
-            ));
-        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -5120,11 +5247,6 @@ pub async fn update_repository(
     }
 
     if let Some(duration) = payload.quarantine_duration_minutes {
-        if duration < 0 {
-            return Err(AppError::Validation(
-                "quarantine_duration_minutes must be non-negative".to_string(),
-            ));
-        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -5140,175 +5262,55 @@ pub async fn update_repository(
         crate::services::quarantine_service::invalidate_config_cache(repo.id);
     }
 
-    // Handle release repository linking for staging repos
-    if let Some(ref release_key) = payload.release_repository_key {
-        if release_key.is_empty() {
-            // Remove the link
-            sqlx::query(
-                "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'release_repository_id'",
-            )
-            .bind(repo.id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        } else {
-            if repo.repo_type != RepositoryType::Staging {
-                return Err(AppError::Validation(
-                    "Release target linking is only available for staging repositories".to_string(),
-                ));
-            }
-
-            let release_repo = service.get_by_key(release_key).await.map_err(|_| {
-                AppError::Validation(format!("Release repository '{}' not found", release_key))
-            })?;
-
-            super::promotion::validate_release_target_link(&repo, &release_repo)?;
-
+    // Release repository linking for staging repos (resolved above).
+    match release_link {
+        None => {}
+        Some(None) => delete_repo_config(&state.db, repo.id, "release_repository_id").await?,
+        Some(Some(release_id)) => {
             upsert_repo_config(
                 &state.db,
                 repo.id,
                 "release_repository_id",
-                &release_repo.id.to_string(),
+                &release_id.to_string(),
             )
-            .await?;
+            .await?
         }
     }
 
     if let Some(ref ua) = payload.custom_user_agent {
-        if existing.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "custom_user_agent is only valid for remote repositories".to_string(),
-            ));
-        }
         if ua.is_empty() {
-            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
-                .bind(repo.id)
-                .bind(CUSTOM_USER_AGENT_KEY)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+            delete_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY).await?;
         } else {
-            validate_custom_user_agent(ua)?;
             upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
         }
     }
 
-    let is_apt_hosted =
-        existing.repo_type.is_hosted() && matches!(existing.format, RepositoryFormat::Debian);
-
-    if !is_apt_hosted
-        && (payload.apt_origin.is_some()
-            || payload.apt_label.is_some()
-            || payload.apt_release_version.is_some()
-            || payload.apt_description.is_some())
-    {
-        return Err(AppError::Validation(
-            "apt_origin, apt_label, apt_release_version, and apt_description are only valid for hosted APT repositories".to_string(),
-        ));
-    }
-
-    if is_apt_hosted {
-        if let Some(ref origin) = payload.apt_origin {
-            let trimmed = origin.trim();
-            if trimmed.is_empty() {
-                sqlx::query(
-                    "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_origin'",
-                )
-                .bind(repo.id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                ensure_single_line(trimmed, "apt_origin")?;
-                upsert_repo_config(&state.db, repo.id, "apt_origin", trimmed).await?;
+    for (value, key) in [
+        (&payload.apt_origin, "apt_origin"),
+        (&payload.apt_label, "apt_label"),
+        (&payload.apt_release_version, "apt_release_version"),
+        (&payload.apt_description, "apt_description"),
+    ] {
+        let Some(value) = value else { continue };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            delete_repo_config(&state.db, repo.id, key).await?;
+        } else {
+            if key == "apt_description" && contains_newline(trimmed) {
+                tracing::warn!("apt_description is multi-line; will be formatted per deb822");
             }
-        }
-        if let Some(ref label) = payload.apt_label {
-            let trimmed = label.trim();
-            if trimmed.is_empty() {
-                sqlx::query(
-                    "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_label'",
-                )
-                .bind(repo.id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                ensure_single_line(trimmed, "apt_label")?;
-                upsert_repo_config(&state.db, repo.id, "apt_label", trimmed).await?;
-            }
-        }
-        if let Some(ref ver) = payload.apt_release_version {
-            let trimmed = ver.trim();
-            if trimmed.is_empty() {
-                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_release_version'")
-                    .bind(repo.id)
-                    .execute(&state.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                ensure_single_line(trimmed, "apt_release_version")?;
-                upsert_repo_config(&state.db, repo.id, "apt_release_version", trimmed).await?;
-            }
-        }
-        if let Some(ref desc) = payload.apt_description {
-            let trimmed = desc.trim();
-            if trimmed.is_empty() {
-                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_description'")
-                    .bind(repo.id)
-                    .execute(&state.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                if contains_newline(trimmed) {
-                    tracing::warn!("apt_description is multi-line; will be formatted per deb822");
-                }
-                upsert_repo_config(&state.db, repo.id, "apt_description", trimmed).await?;
-            }
+            upsert_repo_config(&state.db, repo.id, key, trimmed).await?;
         }
     }
 
-    // Debian remote proxy filter (#2460). Three-way semantics:
-    //   * field omitted (`None`)      -> leave the stored config unchanged
-    //   * field `null` (`Some(None)`) -> clear it (revert to full-proxy)
-    //   * field object                -> merge the partial update onto the
-    //                                    stored config, validate, persist.
-    // The gate reads the config live on every request, so no cache
-    // invalidation is required for a change to take effect.
-    //
-    // An all-`None` patch on a repository the filter is not configurable on is
-    // the same untouched-form artifact as on create (`"debian": {}`): it
-    // merges nothing, so it is skipped rather than rejected.
-    match payload.debian {
+    // Debian remote proxy filter (#2460), merged and validated above:
+    // `Some(None)` clears it (revert to full-proxy), `Some(Some(cfg))` stores
+    // the merged config. The gate reads the config live on every request, so
+    // no cache invalidation is required for a change to take effect.
+    match debian_config {
         None => {}
-        Some(None) => {
-            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
-                .bind(repo.id)
-                .bind(DEBIAN_CONFIG_KEY)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-        }
-        // A patch that sets something is only valid for a Debian Remote. An
-        // all-`None` patch on any other type is the untouched-form artifact
-        // (`"debian": {}`): it merges nothing, so it falls through to the
-        // no-op arm below instead of failing the update.
-        Some(Some(ref patch))
-            if classify_debian_payload(
-                &existing.repo_type,
-                &existing.format,
-                *patch == DebianConfigPatch::default(),
-            )? =>
-        {
-            let base = load_debian_config(&state.db, repo.id)
-                .await
-                .unwrap_or_default();
-            let merged = patch.clone().apply_to(base);
-            validate_debian_config(&merged)?;
-            upsert_debian_config(&state.db, repo.id, &merged).await?;
-        }
-        // The skipped untouched-form patch: nothing to merge, nothing stored.
-        Some(Some(_)) => {}
+        Some(None) => delete_repo_config(&state.db, repo.id, DEBIAN_CONFIG_KEY).await?,
+        Some(Some(ref cfg)) => upsert_debian_config(&state.db, repo.id, cfg).await?,
     }
 
     // Invalidate the in-memory repo cache so that visibility changes take
@@ -30215,6 +30217,185 @@ mod tests {
             .await
             .ok();
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #5201: the up-front PATCH check accepts what the write phase stores
+    /// and refuses the rest, without a database.
+    #[test]
+    fn validate_update_config_fields_5201() {
+        let req = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+        let check = |repo_type: RepositoryType, format: RepositoryFormat, json: &str| {
+            validate_update_config_fields(&repo_type, &format, &req(json))
+        };
+        use RepositoryFormat::{Debian, Generic};
+        use RepositoryType::{Local, Remote, Staging, Virtual};
+
+        // Accepted where they apply.
+        for (repo_type, format, json) in [
+            (Local, Generic, r#"{"name":"x"}"#),
+            (
+                Local,
+                Debian,
+                r#"{"apt_label":"L","apt_description":"a\nb"}"#,
+            ),
+            (Local, Debian, r#"{"apt_origin":""}"#),
+            (Remote, Generic, r#"{"custom_user_agent":"ua/1.0"}"#),
+            (Remote, Generic, r#"{"custom_user_agent":""}"#),
+            (Virtual, Generic, r#"{"virtual_metadata_partial":true}"#),
+            (Staging, Generic, r#"{"release_repository_key":"rel"}"#),
+            (Local, Generic, r#"{"release_repository_key":""}"#),
+            (
+                Local,
+                Generic,
+                r#"{"quarantine_enabled":true,"quarantine_duration_minutes":0}"#,
+            ),
+            (Virtual, Generic, r#"{"quarantine_enabled":false}"#),
+        ] {
+            assert!(
+                check(repo_type, format, json).is_ok(),
+                "{json} must be accepted"
+            );
+        }
+        // Refused.
+        for (repo_type, format, json) in [
+            (Local, Generic, r#"{"apt_label":"L"}"#),
+            (Local, Generic, r#"{"apt_description":"d"}"#),
+            (Local, Debian, r#"{"apt_release_version":"1\n2"}"#),
+            (Local, Generic, r#"{"custom_user_agent":""}"#),
+            (Remote, Generic, r#"{"custom_user_agent":"bad\r\nua"}"#),
+            (Local, Generic, r#"{"virtual_metadata_partial":false}"#),
+            (Local, Generic, r#"{"release_repository_key":"rel"}"#),
+            (Local, Generic, r#"{"quarantine_duration_minutes":-1}"#),
+            (Virtual, Generic, r#"{"quarantine_enabled":true}"#),
+            (Local, Generic, r#"{"npm_allowed_scopes":["@acme"]}"#),
+        ] {
+            assert!(
+                matches!(check(repo_type, format, json), Err(AppError::Validation(_))),
+                "{json} must be refused"
+            );
+        }
+    }
+
+    /// #5201: a `PATCH` answered with a 4xx changes nothing. Every request
+    /// below pairs a change the handler applies early (visibility, name, a
+    /// `repository_config` key) with a field it rejects, and the repository
+    /// row and its config rows must be exactly as they were.
+    ///
+    /// Fails on `main` for each case: the repository row and the earlier
+    /// config keys were written before the rejected field was checked.
+    #[tokio::test]
+    async fn update_repository_rejection_writes_nothing_5201_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        async fn snapshot(pool: &sqlx::PgPool, repo_id: Uuid) -> (String, Vec<(String, String)>) {
+            let row: String = sqlx::query_scalar(
+                "SELECT concat_ws('|', key, name, description, visibility::text, \
+                 quota_bytes::text, promotion_only::text, versioning_enabled::text) \
+                 FROM repositories WHERE id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("read repository");
+            let config: Vec<(String, String)> = sqlx::query_as(
+                "SELECT key, value FROM repository_config WHERE repository_id = $1 ORDER BY key",
+            )
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .expect("read repository_config");
+            (row, config)
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (deb_id, deb_key, deb_dir) = tdh::create_repo(&pool, "local", "debian").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let early = r#""visibility":"internal","name":"changed","description":"changed",
+            "promotion_only":true,"quarantine_enabled":true,
+            "index_upstream_url":"https://x.test/",
+            "pypi_upstream_index_path":"simple","allow_public_with_upstream_credentials":true"#;
+        let mut leaked = Vec::new();
+        let generic = (repo_id, repo_key.as_str());
+        // On a hosted APT repository the apt_* fields apply, so the earlier
+        // ones were saved before a later one failed the newline check.
+        let deb = (deb_id, deb_key.as_str());
+        let deb_case = r#""apt_origin":"O","apt_label":"L","apt_release_version":"1\n2""#;
+        let generic_cases = [
+            // The issue's reproduction.
+            r#""apt_label":"X""#,
+            r#""apt_origin":"X""#,
+            r#""custom_user_agent":"ua/1.0""#,
+            r#""virtual_metadata_partial":true"#,
+            r#""quarantine_duration_minutes":-1"#,
+            r#""release_repository_key":"no-such-repo""#,
+            r#""npm_allowed_scopes":["@acme"]"#,
+            r#""debian":{"components":["main"]}"#,
+            r#""curation_default_action":"block""#,
+            r#""quota_bytes":-1"#,
+        ];
+        let cases = generic_cases
+            .iter()
+            .map(|c| (generic, *c))
+            .chain([(deb, deb_case)]);
+        for ((repo_id, repo_key), rejected) in cases {
+            let before = snapshot(&pool, repo_id).await;
+            let json = format!("{{{early},{rejected}}}");
+            let result = update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.to_string()),
+                Json(serde_json::from_str(&json).expect("deserialize update payload")),
+            )
+            .await;
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{rejected} must be rejected"));
+            assert!(
+                matches!(
+                    err,
+                    AppError::Validation(_) | AppError::UnprocessableEntity(_)
+                ),
+                "{rejected}: expected a validation error, got {err:?}",
+            );
+            if snapshot(&pool, repo_id).await != before {
+                leaked.push(rejected);
+                // Put the repository back so the next case starts clean.
+                sqlx::query(
+                    "UPDATE repositories SET name = key, description = NULL, \
+                     visibility = 'private', promotion_only = false WHERE id = $1",
+                )
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("reset repository");
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await
+                    .expect("reset repository_config");
+                assert_eq!(snapshot(&pool, repo_id).await, before, "reset");
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "a rejected PATCH changed the repository for: {leaked:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![repo_id, deb_id])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&deb_dir);
     }
 
     /// PATCH plumbing: a non-empty value validates + upserts and is echoed;
