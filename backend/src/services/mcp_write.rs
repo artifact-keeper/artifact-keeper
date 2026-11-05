@@ -13,7 +13,7 @@ use crate::services::audit_service::{
 
 /// Whether `name@version` was ever stored in `repo_id` (published, replicated
 /// or promoted in, whatever happened to it since): the ledger
-/// `mcp_version_tombstones` (migration 322) is written by trigger on every
+/// `mcp_version_tombstones` (migration 323) is written by trigger on every
 /// server.json row insert and outlives a trash purge, so such a version can
 /// never be published again.
 pub async fn version_tombstoned(

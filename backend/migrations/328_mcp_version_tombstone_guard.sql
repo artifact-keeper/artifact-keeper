@@ -1,6 +1,6 @@
 -- Issue #5253: a recorded MCP `name@version` can never be stored again.
 --
--- `mcp_version_tombstones` (322) records every server.json row inserted into
+-- `mcp_version_tombstones` (323) records every server.json row inserted into
 -- an MCP repository and has no foreign key to `artifacts`, so it outlives a
 -- soft delete and a trash purge. Until now only the hosted publish route
 -- consulted it: a Remote sync re-ingested a purged version (whatever bytes
@@ -18,7 +18,7 @@
 -- transaction first (`services::mcp_write::release_failed_version`).
 --
 -- Creating a trigger takes SHARE ROW EXCLUSIVE on `artifacts`: bound the
--- wait (docs/operations/online-migrations.md), as 322 does.
+-- wait (docs/operations/online-migrations.md), as 323 does.
 SET LOCAL lock_timeout = '5s';
 
 CREATE OR REPLACE FUNCTION mcp_refuse_tombstoned_version() RETURNS trigger AS $$

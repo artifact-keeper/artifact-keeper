@@ -1398,7 +1398,7 @@ async fn remote_pins_packages_pulled_through_backing_remotes() {
 /// is never ingested again, whatever upstream serves under its
 /// `name@version` now: the tombstone ledger outlives the purge, the sync
 /// consults it, and the database refuses a server.json row for a recorded
-/// version (migration 327) from any writer.
+/// version (migration 328) from any writer.
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
 async fn purged_remote_version_is_never_reingested() {
