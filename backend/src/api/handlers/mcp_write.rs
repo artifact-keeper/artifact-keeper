@@ -3303,4 +3303,66 @@ mod tests {
         );
         env.teardown().await;
     }
+
+    /// Finding 15: the asynchronous fill recomputes its target from the
+    /// current mapping and fails unless it is the Remote recorded at publish,
+    /// rather than pinning the package as "the mapped repository" with the
+    /// id of a Remote the mapping no longer names.
+    #[tokio::test]
+    async fn async_fill_fails_when_the_fill_target_changed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@acme/echo/-/echo-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz-1.0.0".to_vec()))
+            .mount(&upstream)
+            .await;
+        let mut remotes = Vec::new();
+        for _ in 0..2 {
+            let (id, key) = env.repo("remote", "npm").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(upstream.uri())
+                .bind(id)
+                .execute(&env.fx.pool)
+                .await
+                .unwrap();
+            tdh::grant_repo_access(&env.fx.pool, id, env.fx.user_id).await;
+            remotes.push(key);
+        }
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remotes[0]}).to_string(),
+        )
+        .await;
+        let (s, b) = env
+            .json(
+                env.member(),
+                "POST",
+                "/publish",
+                Some(&doc("com.acme/moved", "1.0.0", npm("1.0.0"))),
+            )
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let id = env.artifact("com.acme/moved", "1.0.0").await;
+        // The mapping moves to another Remote before the job runs.
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remotes[1]}).to_string(),
+        )
+        .await;
+        let res = resolve_until_settled(&env, id).await;
+        assert_eq!(res["state"], "failed", "{res}");
+        assert_eq!(res["error"]["error"], "mcp_package_not_found", "{res}");
+        assert!(
+            res["error"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("no longer fills through")),
+            "{res}"
+        );
+        env.teardown().await;
+    }
 }

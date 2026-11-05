@@ -130,7 +130,19 @@ Listing work is bounded: one `/servers` request gates at most 1000 rows (and
 `version=latest` at most 1000 versions, at most 100 per server) and answers a
 `nextCursor` to resume whenever it stops early, so a page can be short without
 being the last. `/versions` lists at most the newest 1000 versions of a
-server.
+server. `latest` looks at the newest 100 non-deleted versions of a server, on
+every surface (`/versions/latest`, `isLatest`, `version=latest`): a server
+whose newest 100 versions are all held has no `latest` (the unknown-name
+`404` for a reader), and no entry carries `isLatest: true`.
+
+`nextCursor` is opaque, as upstream specifies: a URL-safe string to pass back
+as `cursor` unchanged. It is sealed (AES-256-GCM under a key derived from the
+instance's `jwt_secret`) and bound to the repository and listing that issued
+it, so it reveals nothing about the row it resumes after (which may be a held
+version a reader must not learn of) and a client cannot make one up. A cursor
+this instance did not issue for that listing, including one issued before an
+upgrade that introduced sealing or before a `jwt_secret` rotation, is
+`400 mcp_invalid_query` (`invalid cursor`); start again without `cursor`.
 
 Behaviour pinned by the end-to-end suite (clients may rely on it):
 
@@ -695,7 +707,11 @@ member by priority of a mapped Virtual) is **filled** instead of refused:
 5. A definitive refusal fails the version: upstream `404`/`410`
    (`mcp_package_not_found`), `401`/`403`/`451` from the Remote (access,
    curation or age policy: `mcp_package_refused`), a mapping removed
-   (`mcp_external_registry`), the publishing account gone or disabled. A
+   (`mcp_external_registry`), a mapping that no longer fills through the
+   Remote recorded at publish (`fillRepositoryId`: the mapping now names
+   another repository, or a Virtual's first Remote member changed;
+   `mcp_package_not_found`, publish again), the publishing account gone or
+   disabled. A
    transient one (`429`, `5xx`, timeout after 300 s) is retried with backoff
    (30 s doubling, at most 1 h) up to 8 attempts (`mcp_resolve_exhausted`).
    A failed version stays stored and hidden (`404 mcp_unresolvable` for a
@@ -1498,11 +1514,10 @@ the shadowing rule below.
   in name-then-version order. `version=latest` lists one entry per name, the
   one `latest` answers. `search`, `updated_since`, `include_deleted` and
   `limit` behave as on a hosted repository.
-- **Cursor**: `nextCursor` is
-  `base64url("m:<member_key>:<member_cursor>")` (no padding), where
-  `<member_cursor>` is that member's own `base64url("<name>:<version>")`
-  cursor, or empty to start at the member's first row. A cursor naming a key
-  that is not (or no longer) a member, or anything else malformed, is `400`
+- **Cursor**: `nextCursor` is opaque, sealed as on a hosted repository and
+  bound to the Virtual: it carries the member to resume in and that member's
+  keyset position. A cursor naming a key that is not (or no longer) a
+  member, one the Virtual did not issue, or anything else malformed, is `400`
   (`mcp_invalid_query`, `detail: "query parameter `cursor`: invalid cursor"`),
   the same answer a hosted repository gives a malformed cursor.
 - **Entries** are the member's served form; the
@@ -1512,10 +1527,20 @@ the shadowing rule below.
   anything not served. A caller who holds the member that refused (the
   reason-gate predicate, evaluated per member) gets that member's reason
   body; a gate that cannot be evaluated on a member answers `503` and the
-  walk does not fall past it.
+  walk does not fall past it. Listings do the same: a `(name, version)`
+  whose gate cannot be evaluated on the member that would answer it is
+  omitted from `/servers` and `/versions`, never listed from a
+  lower-priority member, and a `latest` that cannot be decided on a member
+  is not taken from the next one (no entry, no `isLatest`).
 - **`mcp_server_deny` on the Virtual** hides matching names on top of the
   members' own deny lists: omitted from listings, `404` on detail
   (`mcp_rejected` with `gate: curation` for a holder of the Virtual).
+- **Nested Virtuals** apply their `mcp_server_deny` too: a member reached
+  through nested Virtuals does not serve a name any of them denies (the
+  union of the deny lists along the member's path; for a member reachable
+  along several paths, the path it is ranked by). Through that member the
+  name is as absent as an unknown one; another member outside the nested
+  Virtual may still serve it.
 - **Writes** (`/publish`, status `PATCH`) answer
   `405 mcp_read_only` ("publish to one of its hosted members").
 - `/ping`, `/health`, `/version` and `/openapi.yaml` answer as on any MCP

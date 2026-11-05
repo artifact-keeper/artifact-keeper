@@ -4860,6 +4860,9 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
 pub(crate) struct ExpandedMember {
     pub repo: Repository,
     pub priority_path: Vec<i32>,
+    /// The nested virtual repositories on that same path, outermost first
+    /// (the root itself excluded): empty for a direct member.
+    pub via: Vec<Uuid>,
 }
 
 /// Result of recursively expanding a virtual repository's membership; see
@@ -4937,7 +4940,7 @@ pub(crate) async fn expand_virtual_members(
     // sibling virtual's subtree. Each event carries the priority path from
     // the root to the node it names.
     enum Event {
-        Enter(Uuid, usize, Vec<i32>),
+        Enter(Uuid, usize, Vec<i32>, Vec<Uuid>),
         // Boxed: `Repository` is ~300 bytes against `Enter`'s 24, and the
         // enum would size every event to the largest variant.
         Emit(Box<ExpandedMember>),
@@ -4953,7 +4956,7 @@ pub(crate) async fn expand_virtual_members(
         std::collections::HashSet::from([virtual_repo_id]);
     let mut cycle_edge_skipped = false;
     let mut depth_limit_reached = false;
-    let mut stack = vec![Event::Enter(virtual_repo_id, 0, Vec::new())];
+    let mut stack = vec![Event::Enter(virtual_repo_id, 0, Vec::new(), Vec::new())];
 
     while let Some(event) = stack.pop() {
         match event {
@@ -4965,7 +4968,7 @@ pub(crate) async fn expand_virtual_members(
                     members.push(*child);
                 }
             }
-            Event::Enter(id, depth, path) => {
+            Event::Enter(id, depth, path, via) => {
                 // The depth cap is applied BEFORE the node is marked expanded:
                 // a virtual first reached too deep (down the long side of a
                 // diamond) must still expand when a later, shallower path
@@ -4996,13 +4999,16 @@ pub(crate) async fn expand_virtual_members(
                     child_path.extend_from_slice(&path);
                     child_path.push(*priority);
                     if child.repo_type == RepositoryType::Virtual {
-                        stack.push(Event::Enter(child.id, depth + 1, child_path));
+                        let mut child_via = via.clone();
+                        child_via.push(child.id);
+                        stack.push(Event::Enter(child.id, depth + 1, child_path, child_via));
                     } else if depth + 1 > MAX_DEPTH {
                         depth_limit_reached = true;
                     } else {
                         stack.push(Event::Emit(Box::new(ExpandedMember {
                             repo: child.clone(),
                             priority_path: child_path,
+                            via: via.clone(),
                         })));
                     }
                 }
