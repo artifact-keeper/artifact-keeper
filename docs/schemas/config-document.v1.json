@@ -51,6 +51,10 @@
             "properties": { "key": { "type": "string" }, "priority": { "type": "integer" } }
           }
         },
+        "upstream_mode": {
+          "enum": ["online", "cache_only"],
+          "description": "Remote repositories. Absent means online (the default); only cache_only is exported."
+        },
         "cache_ttl_seconds": { "type": "integer", "minimum": 1 },
         "on_upstream_not_found": { "enum": ["keep", "delete"] },
         "stale_if_error_grace_seconds": { "type": "integer", "minimum": 0 },

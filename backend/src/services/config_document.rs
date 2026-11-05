@@ -22,6 +22,7 @@ use crate::error::{AppError, Result};
 use crate::models::repository::RepositoryVisibility;
 use crate::services::routing_rules::RoutingRule;
 use crate::services::upstream_filter::UpstreamFilter;
+use crate::services::upstream_mode::UpstreamMode;
 use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
 
 /// The only `schema_version` this server reads and writes.
@@ -126,6 +127,10 @@ pub struct ConfigRepository {
     /// Virtual repositories: member keys in resolution order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ConfigVirtualMember>,
+    /// Remote repositories: the stored upstream mode (#5282). Absent means
+    /// `online` (the default); only `cache_only` is exported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_mode: Option<UpstreamMode>,
     /// Remote repositories: freshness lifetime of mutable paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl_seconds: Option<i64>,
@@ -360,6 +365,17 @@ pub fn egress_proxy_from_read(
             .then(|| ConfigSecretRef::new(SECRET_EGRESS_PROXY, key)),
         no_proxy,
     })
+}
+
+/// Export the stored upstream mode read back by `GET .../upstream-mode`.
+/// `online` (the default) exports as absent.
+pub fn upstream_mode_from_read(stored: UpstreamMode) -> Option<UpstreamMode> {
+    (stored != UpstreamMode::Online).then_some(stored)
+}
+
+/// The mode `PUT .../upstream-mode` writes for `desired`; absent is `online`.
+pub fn upstream_mode_body(desired: &ConfigRepository) -> UpstreamMode {
+    desired.upstream_mode.unwrap_or_default()
 }
 
 /// The upstream-URL pair of a repository: the userinfo-free URL the API
@@ -831,6 +847,44 @@ mod tests {
         assert_eq!(p.unchanged, ["same"]);
         assert_eq!(p.not_in_document, ["extra"]);
         assert!(p.applicable && p.errors.is_empty() && p.missing_secrets.is_empty());
+    }
+
+    /// #5407: `cache_only` is exported and diffed; `online` is the absent default.
+    #[test]
+    fn upstream_mode_is_exported_only_when_cache_only_and_planned_as_a_change() {
+        assert_eq!(upstream_mode_from_read(UpstreamMode::Online), None);
+        assert_eq!(
+            upstream_mode_from_read(UpstreamMode::CacheOnly),
+            Some(UpstreamMode::CacheOnly)
+        );
+        let mut sealed = remote("sealed");
+        sealed.upstream_mode = upstream_mode_from_read(UpstreamMode::CacheOnly);
+        let json = serde_json::to_value(&sealed).unwrap();
+        assert_eq!(json["upstream_mode"], "cache_only");
+        assert!(serde_json::to_value(remote("online"))
+            .unwrap()
+            .get("upstream_mode")
+            .is_none());
+        let parsed: ConfigRepository = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.upstream_mode, Some(UpstreamMode::CacheOnly));
+
+        let current = by_key(&[remote("sealed")]);
+        let p = plan(
+            &doc(vec![sealed.clone()]),
+            &current,
+            &keys(&["sealed"]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            p.update,
+            [ConfigPlanUpdate {
+                key: "sealed".into(),
+                changes: vec!["upstream_mode".into()],
+            }]
+        );
+        assert_eq!(upstream_mode_body(&sealed), UpstreamMode::CacheOnly);
+        // Absent in the document puts a cache-only Remote back online.
+        assert_eq!(upstream_mode_body(&remote("sealed")), UpstreamMode::Online);
     }
 
     #[test]

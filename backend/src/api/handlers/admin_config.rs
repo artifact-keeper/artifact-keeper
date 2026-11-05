@@ -160,6 +160,7 @@ async fn export_repository(
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
         members: Vec::new(),
+        upstream_mode: None,
         cache_ttl_seconds: None,
         on_upstream_not_found: None,
         stale_if_error_grace_seconds: None,
@@ -172,6 +173,10 @@ async fn export_repository(
 
     match out.repo_type.as_str() {
         "remote" => {
+            // The stored mode, not the effective one: the instance-wide
+            // `PROXY_UPSTREAM_MODE` override belongs to the target instance.
+            let Json(mode) = repos::get_upstream_mode(st(), ext(), path()).await?;
+            out.upstream_mode = doc::upstream_mode_from_read(mode.upstream_mode);
             let Json(ttl) = repos::get_cache_ttl(st(), ext(), path()).await?;
             out.cache_ttl_seconds = Some(ttl.cache_ttl_seconds);
             let Json(nf) = repos::get_on_upstream_not_found(st(), ext(), path()).await?;
@@ -305,6 +310,12 @@ async fn apply_settings(
             no_proxy,
         };
         repos::set_egress_proxy(st(), ext(), path(), Json(body)).await?;
+    }
+    if changed("upstream_mode") {
+        let body = repos::SetUpstreamModeRequest {
+            upstream_mode: doc::upstream_mode_body(desired),
+        };
+        repos::set_upstream_mode(st(), ext(), path(), Json(body)).await?;
     }
     if let (true, Some(cache_ttl_seconds)) =
         (changed("cache_ttl_seconds"), desired.cache_ttl_seconds)
@@ -699,6 +710,16 @@ mod tests {
         )
         .await
         .expect("on_upstream_not_found");
+        repos::set_upstream_mode(
+            State(state.clone()),
+            ext(),
+            path(),
+            Json(repos::SetUpstreamModeRequest {
+                upstream_mode: crate::services::upstream_mode::UpstreamMode::CacheOnly,
+            }),
+        )
+        .await
+        .expect("upstream mode");
         repos::set_upstream_filter(
             State(state.clone()),
             ext(),
@@ -742,6 +763,12 @@ mod tests {
         let remote = &first.repositories[0];
         assert_eq!(remote.key, remote_key);
         assert_eq!(remote.cache_ttl_seconds, Some(1234));
+        // #5407: the cache-only mode is exported; a Virtual has none.
+        assert_eq!(
+            remote.upstream_mode,
+            Some(crate::services::upstream_mode::UpstreamMode::CacheOnly)
+        );
+        assert!(first.repositories[1].upstream_mode.is_none());
         assert!(remote.upstream_filter.is_some());
         let auth_doc = remote
             .upstream_auth
@@ -810,9 +837,58 @@ mod tests {
             "{replan:?}"
         );
         assert_eq!(replan.unchanged.len(), 2);
-        import(&state, &auth, ConfigImportMode::Apply, false, body)
+        import(&state, &auth, ConfigImportMode::Apply, false, body.clone())
             .await
             .expect("re-apply");
+        assert_eq!(
+            content(&second),
+            content(&export_keys(&state, &auth, &keys).await)
+        );
+        let stored_mode = |key: String| {
+            let state = state.clone();
+            let auth = auth.clone();
+            async move {
+                let Json(mode) =
+                    repos::get_upstream_mode(State(state), Extension(Some(auth)), Path(key))
+                        .await
+                        .expect("get upstream mode");
+                mode.upstream_mode
+            }
+        };
+        assert_eq!(
+            stored_mode(remote_key.clone()).await,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly
+        );
+
+        // #5407: a Remote put back online is planned as an `upstream_mode`
+        // change, and apply makes it cache-only again.
+        repos::set_upstream_mode(
+            State(state.clone()),
+            ext(),
+            path(),
+            Json(repos::SetUpstreamModeRequest {
+                upstream_mode: crate::services::upstream_mode::UpstreamMode::Online,
+            }),
+        )
+        .await
+        .expect("upstream mode online");
+        let drifted = import(&state, &auth, ConfigImportMode::Plan, false, body.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            drifted.update,
+            [ConfigPlanUpdate {
+                key: remote_key.clone(),
+                changes: vec!["upstream_mode".into()],
+            }]
+        );
+        import(&state, &auth, ConfigImportMode::Apply, false, body.clone())
+            .await
+            .expect("apply upstream mode");
+        assert_eq!(
+            stored_mode(remote_key.clone()).await,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly
+        );
         assert_eq!(
             content(&second),
             content(&export_keys(&state, &auth, &keys).await)
@@ -829,12 +905,12 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-            if audited >= 2 {
+            if audited >= 3 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert_eq!(audited, 2, "one CONFIG_IMPORTED row per apply");
+        assert_eq!(audited, 3, "one CONFIG_IMPORTED row per apply");
 
         delete_repo_by_key(&pool, &virtual_key).await;
         delete_repo_by_key(&pool, &remote_key).await;
