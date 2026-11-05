@@ -2079,10 +2079,13 @@ queues the same jobs automatically.
 | `sandbox_run` | each stdio `packages[]` entry of type `npm`, `pypi` or `oci` that the package policy pinned to an AK repository | `mcp_sandbox_introspection: on`. Never re-queued (the bytes are version pinned). Handed out only while the version is servable (its own and its backing packages' gates pass), so the bytes executed are the bytes AK scanned. |
 
 Attempts: 3. `timeout`, `rate_limited`, `start_failed` and `error` results are retried after
-`2^attempts` minutes (a `429`'s `Retry-After`, clamped to 1 minute .. 24 h);
-a claim not completed within 10 minutes returns to the queue. The scheduler
-pass (every 15 minutes, idempotent) reaps expired claims, re-queues due
-probes and prunes snapshot history (see [Capabilities and
+`2^attempts` minutes (a `429`'s `Retry-After`, clamped to 1 minute .. 24 h),
+except that a `sandbox_run` that times out is retried once only: a timed-out
+run already held a worker for the sandbox's whole 120 s wall clock, so its
+second `timeout` is final and is recorded as a `timeout` snapshot. A claim
+not completed within 10 minutes returns to the queue. The scheduler pass
+(every 15 minutes, idempotent) reaps expired claims, re-queues due probes
+and prunes snapshot history (see [Capabilities and
 introspection](#capabilities-and-introspection)).
 
 Completing a job is atomic (#5389): the claim (job id, token hash, `claimed`
@@ -2092,6 +2095,12 @@ completions of one claim, or a completion racing the reaper or a re-claim,
 exactly one stores a snapshot; the other stores nothing and is answered
 `409 mcp_claim_invalid`. A retry (`status: "retry"`) likewise only counts
 when it ended the current claim.
+
+Claim order is fair across repositories: a claim hands out a due job from the
+repository with the fewest jobs claimed at that moment, and within it the
+oldest due job (earliest `not_before`). A publisher that queues many versions
+therefore takes at most its share of the workers while other repositories'
+jobs are due; with one repository queued, jobs go out oldest first.
 
 ### Worker API (`/api/v1/mcp/introspection`)
 

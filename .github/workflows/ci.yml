@@ -1246,6 +1246,7 @@ jobs:
             --test oci_virtual_resolution_tests \
             --test mcp_virtual_resolution_tests \
             --test mcp_auth_namespaces_tests \
+            --test mcp_introspection_queue_tests \
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
@@ -1334,6 +1335,7 @@ jobs:
             --test oci_virtual_resolution_tests \
             --test mcp_virtual_resolution_tests \
             --test mcp_auth_namespaces_tests \
+            --test mcp_introspection_queue_tests \
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
