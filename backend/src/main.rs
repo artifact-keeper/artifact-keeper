@@ -727,6 +727,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #5293: `pull` replication was accepted (and the default) but never
+    // replicated anything; it is refused now. Name the rows written before
+    // that once per boot, leaving them unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::peer_instance_service::warn_inactive_pull_replication(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
     // were compiled by PostgreSQL at create/update time can carry a pattern
     // that fails every run or (`\b`) protects nothing; name them once per
