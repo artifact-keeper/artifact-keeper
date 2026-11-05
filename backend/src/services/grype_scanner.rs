@@ -2883,6 +2883,7 @@ mod tests {
             manifest_body: Some(helm_body),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(
             !grype().is_applicable_for_target(&target),
@@ -2912,6 +2913,7 @@ mod tests {
             manifest_body: Some(image_body),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(grype().is_applicable_for_target(&target));
     }
@@ -3201,6 +3203,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         // The scan dispatch resolves a routable, repository-scoped ref.
@@ -3249,6 +3252,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(
             grype().is_applicable_for_target(&target),
@@ -3317,6 +3321,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let layout = scanner
@@ -3423,6 +3428,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let layout = scanner
@@ -3503,6 +3509,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
@@ -3551,6 +3558,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         let manifest = Bytes::from_static(TEST_IMAGE_MANIFEST);
 

@@ -102,6 +102,13 @@ impl AuditAction {
             AuditAction::LoginRateLimited => Outcome::Denied,
             // #4777: the scan-on-proxy gate refused the pull.
             AuditAction::ProxyScanBlocked => Outcome::Denied,
+            // #5253: the MCP surface refused a held server version.
+            AuditAction::McpServerDownloadRefused => Outcome::Denied,
+            // #5253: MCP refusals and gate/proof failures.
+            AuditAction::McpServerRejected => Outcome::Denied,
+            AuditAction::McpBundleSignatureRejected => Outcome::Denied,
+            AuditAction::McpGateUnavailable => Outcome::Failure,
+            AuditAction::McpNamespaceProofFailed => Outcome::Failure,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -159,8 +166,15 @@ impl AuditAction {
             | AuditAction::StorageScrubRun
             | AuditAction::StorageReindexRun
             | AuditAction::DebianBackfillRun
+            | AuditAction::CacheSeeded
+            | AuditAction::ConfigImported
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
+            | AuditAction::FindingAcknowledged
+            | AuditAction::FindingAcknowledgementRevoked
+            | AuditAction::FindingAcknowledgementCarried
+            | AuditAction::FindingAcknowledgementNotCarried
+            | AuditAction::FindingAcknowledgementExpired
             | AuditAction::QuarantineRejected
             | AuditAction::PromotionApprovalGranted
             | AuditAction::ArtifactPromoted
@@ -189,7 +203,25 @@ impl AuditAction {
             | AuditAction::EnvironmentDeleted
             | AuditAction::ExternalFindingsIngested
             | AuditAction::DeviceCodeIssued
-            | AuditAction::DeviceAuthorizationApproved => Outcome::Success,
+            | AuditAction::DeviceAuthorizationApproved
+            | AuditAction::McpPackagePinned
+            | AuditAction::McpPinDriftDetected
+            | AuditAction::McpServerPublished
+            | AuditAction::McpServerStatusChanged
+            | AuditAction::McpServerApproved
+            | AuditAction::McpServerReopened
+            | AuditAction::McpServerContentDrift
+            | AuditAction::McpCapabilitiesIngested
+            | AuditAction::McpToolsDrift
+            | AuditAction::McpNamespaceGranted
+            | AuditAction::McpNamespaceRevoked
+            | AuditAction::McpNamespaceProofVerified
+            | AuditAction::McpServerEdited
+            | AuditAction::McpServerDeleted
+            | AuditAction::McpMirrorSynced => Outcome::Success,
+            // #5286: the recorder overrides to `Failure` for a request that
+            // failed (`not_found`, `error`, `timeout`).
+            AuditAction::UpstreamFetched => Outcome::Success,
         }
     }
 }
@@ -486,6 +518,17 @@ pub mod details {
         /// trail, not just the values it ended at.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub age_gate_change: Option<AgeGateChangeDetails>,
+        /// An upstream-mode change on `PUT .../upstream-mode` (#5282): the
+        /// mode before and after (`online` / `cache_only`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub upstream_mode_change: Option<UpstreamModeChangeAudit>,
+    }
+
+    /// Before/after of a Remote's upstream mode (#5282).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct UpstreamModeChangeAudit {
+        pub previous_upstream_mode: String,
+        pub upstream_mode: String,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -1326,6 +1369,7 @@ mod tests {
             allow_public_with_upstream_credentials: None,
             upstream_auth_change: None,
             age_gate_change: None,
+            upstream_mode_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

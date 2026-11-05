@@ -679,7 +679,18 @@ fn read_tar_entries_named<R: std::io::Read>(
     decoded: R,
     wanted: impl Fn(&str) -> bool,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let budgeted = crate::util::bounded_archive::budgeted_to(decoded, OS_METADATA_MAX_DECODED);
+    read_tar_entries(decoded, OS_METADATA_MAX_DECODED, false, wanted)
+}
+
+/// [`read_tar_entries_named`] under an explicit decoded-byte budget, optionally
+/// stopping at the first match instead of walking the whole stream.
+fn read_tar_entries<R: std::io::Read>(
+    decoded: R,
+    budget: u64,
+    stop_at_first: bool,
+    wanted: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let budgeted = crate::util::bounded_archive::budgeted_to(decoded, budget);
     let mut archive = tar::Archive::new(budgeted);
     // An `.apk` is several gzip members, each a tar segment; zero blocks
     // between segments do not end the walk.
@@ -709,6 +720,9 @@ fn read_tar_entries_named<R: std::io::Read>(
             )
             .map_err(|e| e.to_string())?;
             found.push((path.to_string(), body));
+            if stop_at_first {
+                break;
+            }
         }
     }
     Ok(found)
@@ -789,7 +803,9 @@ pub(crate) fn os_release_from_apt_release(
     };
     if let Some(version) = field("Version").filter(|v| !v.is_empty()) {
         let version = if family == "debian" {
-            version.split('.').next().unwrap_or("").to_string()
+            // `12.7` on a release, `12` on its security suite, `12-updates` on
+            // its updates suite.
+            version.split(['.', '-']).next().unwrap_or("").to_string()
         } else {
             version
         };
@@ -819,23 +835,63 @@ pub(crate) fn os_release_from_apt_release(
     OsRelease::new(family, version)
 }
 
+/// The Debian major a version's release marker names (#4111, #5170): `+deb12u1`,
+/// `~deb12u1` and `~bpo12+1` name 12.
+///
+/// A version can carry several and the rightmost is the build's target:
+/// `+deb13u1~bpo12+1` is Debian 13's stable update backported to Debian 12.
+/// Only the Debian revision is read, since `+deb10` in `0.960+bzr41+deb10-4` is
+/// part of the upstream version. `~bpo24.04.1` is an Ubuntu backport, and
+/// `~bpo70+1` the old numbering of Debian 7.
+fn debian_version_marker(version: &str) -> Option<u32> {
+    let version = strip_version_epoch(version);
+    let revision = version.rsplit('-').next().unwrap_or(version);
+    ["+deb", "~deb", "~bpo"]
+        .iter()
+        .flat_map(|marker| revision.match_indices(marker))
+        .filter_map(|(at, marker)| {
+            let rest = &revision[at + marker.len()..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            let (digits, after) = rest.split_at(end);
+            if digits.is_empty() || digits.len() > 2 || after.starts_with('.') {
+                return None;
+            }
+            let major: u32 = digits.parse().ok()?;
+            let major = match (marker, major) {
+                ("~bpo", 40 | 50 | 60 | 70) => major / 10,
+                _ => major,
+            };
+            Some((at, major))
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, major)| major)
+}
+
 /// The Debian release a stable-update or backport version names, for when
-/// no `Release` document covers the package (#4111): `+deb12u1` / `~deb12u1`
-/// and `~bpo12+1` name Debian 12. `None` for every other version.
+/// no `Release` document covers the package (#4111). `None` for a version with
+/// no marker, or one naming a release the engine has no feed for.
 pub(crate) fn debian_release_from_version(
     version: &str,
 ) -> Option<crate::services::scanner_service::OsRelease> {
-    let digits_after = |marker: &str| {
-        version.match_indices(marker).find_map(|(at, _)| {
-            let rest = &version[at + marker.len()..];
-            let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            (!n.is_empty() && n.len() <= 2).then_some(n)
-        })
-    };
-    let major = ["+deb", "~deb", "~bpo"]
-        .iter()
-        .find_map(|m| digits_after(m))?;
-    crate::services::scanner_service::OsRelease::new("debian", &major)
+    let major = debian_version_marker(version)?;
+    crate::services::scanner_service::OsRelease::new("debian", &major.to_string())
+}
+
+/// The Debian major `version`'s marker names when it is not the Debian release
+/// its suite's `Release` names (#5170): `+deb11u1` in a Debian 12 suite. Grading
+/// that package as either release would be a guess. A marker on any other
+/// family says nothing about it: Ubuntu carries `+deb12u1` versions it synced
+/// from Debian, and they are Ubuntu's packages.
+pub(crate) fn debian_marker_contradicting(
+    version: &str,
+    named: &crate::services::scanner_service::OsRelease,
+) -> Option<u32> {
+    if named.id() != "debian" {
+        return None;
+    }
+    debian_version_marker(version).filter(|major| major.to_string() != named.version_id())
 }
 
 /// The identity fields of an RPM package header (#4112).
@@ -965,20 +1021,41 @@ pub(crate) struct ApkPkgInfoFields {
     pub origin: Option<String>,
 }
 
-/// Read an `.apk`'s own `.PKGINFO` (#4113). An `.apk` is a concatenation of
-/// gzip members (signature, control, data), each a tar segment; the whole
-/// stream is walked. Refused (`Err`) unless it holds exactly one
-/// `.PKGINFO`, naming `pkgname`, `pkgver` and `arch` once each and `origin`
-/// at most once.
-pub(crate) fn read_apk_pkginfo(bytes: &[u8]) -> Result<ApkPkgInfoFields, String> {
+/// The `.PKGINFO` text of an `.apk`, the one way an `.apk` is opened for it
+/// (#4113, #5170). An `.apk` is a concatenation of gzip members (signature,
+/// control, data), each a tar segment, so the whole gzip stream is decoded: a
+/// signed package's first member holds only its signature.
+fn read_apk_pkginfo_text(bytes: &[u8], budget: u64, stop_at_first: bool) -> Result<String, String> {
     let decoded = flate2::read::MultiGzDecoder::new(bytes);
-    let entries = read_tar_entries_named(decoded, |path| path == ".PKGINFO")?;
+    let entries = read_tar_entries(decoded, budget, stop_at_first, |path| path == ".PKGINFO")?;
     let body = match entries.as_slice() {
         [(_, body)] => body,
         [] => return Err("no .PKGINFO".to_string()),
         _ => return Err("more than one .PKGINFO".to_string()),
     };
-    let text = std::str::from_utf8(body).map_err(|_| ".PKGINFO is not UTF-8".to_string())?;
+    std::str::from_utf8(body)
+        .map(str::to_string)
+        .map_err(|_| ".PKGINFO is not UTF-8".to_string())
+}
+
+/// The `.PKGINFO` text a package's stored metadata is parsed from (#5170). It
+/// stops at the first `.PKGINFO`, in the control segment, so the size of the
+/// data segment costs nothing, and stays under the ingest budget (#3672). This
+/// describes a package and decides nothing; the gate's
+/// [`read_apk_pkginfo`] is the reader that refuses a second `.PKGINFO`.
+pub(crate) fn read_apk_pkginfo_for_metadata(bytes: &[u8]) -> Result<String, String> {
+    read_apk_pkginfo_text(
+        bytes,
+        crate::util::bounded_archive::max_ingest_decompressed_bytes(),
+        true,
+    )
+}
+
+/// Read an `.apk`'s own `.PKGINFO` for the gate (#4113): the whole stream is
+/// walked. Refused (`Err`) unless it holds exactly one `.PKGINFO`, naming
+/// `pkgname`, `pkgver` and `arch` once each and `origin` at most once.
+pub(crate) fn read_apk_pkginfo(bytes: &[u8]) -> Result<ApkPkgInfoFields, String> {
+    let text = read_apk_pkginfo_text(bytes, OS_METADATA_MAX_DECODED, false)?;
     let mut fields: [(&str, Option<String>); 4] = [
         ("pkgname", None),
         ("pkgver", None),
@@ -1828,7 +1905,36 @@ mod tests {
             label("Origin: Ubuntu\nCodename: noble-security\n"),
             Some("ubuntu:24.04".to_string())
         );
+        // #5170: the fields of the archives' own `Release` documents.
+        for (text, want) in [
+            (
+                "Origin: Debian\nLabel: Debian\nSuite: oldstable-updates\nVersion: 12-updates\nCodename: bookworm-updates\n",
+                "debian:12",
+            ),
+            (
+                "Origin: Debian\nLabel: Debian-Security\nSuite: oldstable-security\nVersion: 12\nCodename: bookworm-security\n",
+                "debian:12",
+            ),
+            (
+                "Origin: Debian Backports\nLabel: Debian Backports\nSuite: oldstable-backports\nCodename: bookworm-backports\n",
+                "debian:12",
+            ),
+            (
+                "Origin: Debian\nLabel: Debian\nSuite: testing\nCodename: forky\n",
+                "debian:14",
+            ),
+            (
+                "Origin: Ubuntu\nLabel: Ubuntu\nSuite: noble-backports\nVersion: 24.04\nCodename: noble\n",
+                "ubuntu:24.04",
+            ),
+        ] {
+            assert_eq!(label(text).as_deref(), Some(want), "{text:?}");
+        }
         for text in [
+            "Origin: Kali\nSuite: kali-rolling\nCodename: kali-rolling\n",
+            "Origin: Raspbian\nSuite: oldstable\nCodename: bookworm\n",
+            "Origin: apt.postgresql.org\nSuite: bookworm-pgdg\nCodename: bookworm-pgdg\n",
+            "Origin: Docker\nSuite: bookworm\n",
             "Origin: Debian\nSuite: unstable\nCodename: sid\n",
             "Origin: Proxmox\nVersion: 8\nCodename: bookworm\n",
             "Codename: bookworm\n",
@@ -1846,6 +1952,31 @@ mod tests {
         assert_eq!(label("5.10.0-1~bpo11+1"), Some("debian:11".to_string()));
         assert_eq!(label("3.0.2-0ubuntu1.10"), None);
         assert_eq!(label("2.10-3"), None);
+        // #5170: the rightmost marker is the build's target.
+        assert_eq!(
+            label("2.56.2-1+deb13u1~bpo12+1"),
+            Some("debian:12".to_string())
+        );
+        assert_eq!(
+            label("25.01+dfsg-1~deb13u1~bpo12+1"),
+            Some("debian:12".to_string())
+        );
+        assert_eq!(
+            label("1.0-1+deb12u1~deb11u1"),
+            Some("debian:11".to_string())
+        );
+        assert_eq!(
+            label("1.0-1~deb11u1+deb12u1"),
+            Some("debian:12".to_string())
+        );
+        // The old numbering of Debian 7.
+        assert_eq!(label("1.0-1~bpo70+1"), Some("debian:7".to_string()));
+        // Upstream version text, an Ubuntu backport, and no feed: no release.
+        assert_eq!(label("0.960+bzr41+deb10-4"), None);
+        assert_eq!(label("0.6.0+deb1-6"), None);
+        assert_eq!(label("1.0-1~bpo12.04.1"), None);
+        assert_eq!(label("13.0.1-1+deb131u"), None);
+        assert_eq!(label("1.0-1+deb15u1"), None);
         assert_eq!(strip_version_epoch("1:2.3-4"), "2.3-4");
         assert_eq!(strip_version_epoch("2.3-4"), "2.3-4");
     }

@@ -383,6 +383,65 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    /// Rename instead of copying, so the cost does not grow with the object
+    /// (#5133). Whenever the rename route fails for any reason but a missing
+    /// source (`EXDEV` across mounts, or whatever a network or FUSE filesystem
+    /// refuses), this falls back to [`Self::copy`], which worked there before and
+    /// leaves the source for the caller to delete.
+    #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "promote"))]
+    async fn promote(&self, source: &str, dest: &str) -> Result<()> {
+        let source_path = self.key_to_path(source);
+        let dest_path = self.key_to_path(dest);
+
+        // The name is about to be published, so its bytes must be durable first.
+        // `put_stream` has already synced them, which makes this cheap there.
+        let source_synced = async {
+            let file = fs::File::open(&source_path).await?;
+            file.sync_all().await
+        }
+        .await;
+        let moved = match source_synced {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::NotFound(format!(
+                    "Storage key not found: {}",
+                    source
+                )));
+            }
+            Err(e) => Err(e),
+            Ok(()) => {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                fs::rename(&source_path, &dest_path).await
+            }
+        };
+        if let Err(e) = moved {
+            // `copy` reports a source that vanished in the meantime as `NotFound`.
+            tracing::debug!(source, dest, error = %e, "Rename unavailable; promoting by copy");
+            return self.copy(source, dest).await;
+        }
+
+        // Both directory entries changed. The destination has to be durable
+        // before the caller commits a row naming it; the source so that a
+        // crash cannot bring back an object whose journal row is then cleared.
+        sync_parent_directory(&dest_path, dest).await?;
+        sync_parent_directory(&source_path, source).await
+    }
+
+    async fn stored_size(&self, key: &str) -> Result<Option<u64>> {
+        match fs::metadata(self.key_to_path(key)).await {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::NotFound(format!(
+                "Storage key not found: {}",
+                key
+            ))),
+            Err(e) => Err(AppError::Storage(format!(
+                "Failed to read metadata of {}: {}",
+                key, e
+            ))),
+        }
+    }
+
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "internal", storage.system = "filesystem", storage.operation = "put_file"))]
     async fn put_file(&self, key: &str, path: &std::path::Path) -> Result<()> {
         let dest = self.key_to_path(key);
@@ -578,6 +637,158 @@ impl StorageBackend for FilesystemStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5133: promoting moves the staged object: same inode, source gone.
+    ///
+    /// FAILS ON MAIN's copy path: a new inode, with the source still there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn promote_renames_instead_of_copying_5133() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("oci-uploads/staged", Bytes::from_static(b"layer"))
+            .await
+            .unwrap();
+        let inode = std::fs::metadata(dir.path().join("oci-uploads/staged"))
+            .unwrap()
+            .ino();
+
+        storage
+            .promote("oci-uploads/staged", "oci-blobs/sha256/ab/layer")
+            .await
+            .unwrap();
+
+        assert!(!storage.exists("oci-uploads/staged").await.unwrap());
+        assert_eq!(
+            storage
+                .get("oci-blobs/sha256/ab/layer")
+                .await
+                .unwrap()
+                .as_ref(),
+            b"layer"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("oci-blobs/sha256/ab/layer"))
+                .unwrap()
+                .ino(),
+            inode
+        );
+    }
+
+    /// #5133: a promote onto an existing object replaces it atomically, the way
+    /// a re-push of a content-addressed key does.
+    #[tokio::test]
+    async fn promote_replaces_an_existing_destination_5133() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("staged", Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        storage
+            .put("blob", Bytes::from_static(b"old"))
+            .await
+            .unwrap();
+
+        storage.promote("staged", "blob").await.unwrap();
+
+        assert_eq!(storage.get("blob").await.unwrap().as_ref(), b"new");
+        assert!(!storage.exists("staged").await.unwrap());
+    }
+
+    /// #5133: a missing source is `NotFound`, as `copy` reports it, and creates
+    /// no destination.
+    #[tokio::test]
+    async fn promote_of_a_missing_source_is_not_found_5133() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+
+        let err = storage.promote("missing", "dir/blob").await.unwrap_err();
+
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+        assert!(!storage.exists("dir/blob").await.unwrap());
+    }
+
+    /// #5133: a rename refused for another reason, as a network or FUSE filesystem
+    /// can do, still promotes by copy, leaving the source for the caller to delete.
+    /// A read-only source directory makes the rename fail while the copy works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn promote_falls_back_to_copy_when_rename_is_refused_5133() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("locked/staged", Bytes::from_static(b"layer"))
+            .await
+            .unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Permission bits do not bind root, so the rename would simply succeed.
+        let enforced = std::fs::File::create(locked.join("probe")).is_err();
+
+        let result = storage.promote("locked/staged", "blobs/layer").await;
+        let source_kept = storage.exists("locked/staged").await.unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert_eq!(storage.get("blobs/layer").await.unwrap().as_ref(), b"layer");
+        if enforced {
+            assert!(source_kept, "a copy leaves the source for the caller");
+        }
+    }
+
+    /// #5133: the stored size comes from metadata, and a missing key says so.
+    #[tokio::test]
+    async fn stored_size_reports_length_and_not_found_5133() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("obj", Bytes::from_static(b"12345"))
+            .await
+            .unwrap();
+
+        assert_eq!(storage.stored_size("obj").await.unwrap(), Some(5));
+        assert!(matches!(
+            storage.stored_size("missing").await,
+            Err(AppError::NotFound(_))
+        ));
+    }
+
+    /// #5133: staging and blob directories can sit on different mounts, where a
+    /// rename fails with EXDEV. That falls back to a copy, not an error.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn promote_across_filesystems_falls_back_to_copy_5133() {
+        let Ok(other_fs) = tempfile::TempDir::new_in("/dev/shm") else {
+            return;
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        if same_device(dir.path(), other_fs.path()) {
+            return;
+        }
+        std::os::unix::fs::symlink(other_fs.path(), dir.path().join("elsewhere")).unwrap();
+        let storage = FilesystemStorage::new(dir.path());
+        storage
+            .put("staged", Bytes::from_static(b"layer"))
+            .await
+            .unwrap();
+
+        storage.promote("staged", "elsewhere/blob").await.unwrap();
+
+        assert_eq!(
+            std::fs::read(other_fs.path().join("blob")).unwrap(),
+            b"layer"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn same_device(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(a).unwrap().dev() == std::fs::metadata(b).unwrap().dev()
+    }
 
     /// #3954: storage spans record a failed operation (`err` on the
     /// `#[tracing::instrument]`), which `tracing-opentelemetry` turns into an

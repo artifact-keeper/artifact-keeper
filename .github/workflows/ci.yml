@@ -1072,6 +1072,7 @@ jobs:
               --test pypi_name_normalization \
               --test pypi_path_parse \
               --test pypi_version_conformance \
+              --test mcp_server_json_conformance \
               --test scan_dedup_short_circuit_tests; then
             echo "::error title=Integration test BUILD failed — no test ran::cargo could not build the integration test crates. A genuine compile error also fails Check Rust on this commit; if this log shows ENOENT / 'dep info' / cc errors in vendored sources, this was the #3154 flake class — rerun the job. 'signal: 9 (SIGKILL)' means out of memory, already retried once (#3856)."
             exit 1
@@ -1129,6 +1130,7 @@ jobs:
             --test pypi_name_normalization \
             --test pypi_path_parse \
             --test pypi_version_conformance \
+            --test mcp_server_json_conformance \
             --test scan_dedup_short_circuit_tests
 
       # ── TIER 2: DB INTEGRATION SUITES ────────────────────────────────────
@@ -1208,6 +1210,7 @@ jobs:
             --test grpc_sbom_tests \
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
+            --test finding_acknowledgement_tests \
             --test stuck_scan_janitor_tests \
             --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
@@ -1220,6 +1223,7 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test agent_plugins_tests \
             --test admin_middleware_fresh_user_tests \
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
@@ -1229,14 +1233,19 @@ jobs:
             --test conda_environment_tests \
             --test conda_promotion_predicate_tests \
             --test conda_upload_scan_grading_tests \
+            --test generic_put_format_parity_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
+            --test listing_totals_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
+            --test mcp_registry_proxy_tests \
             --test migration_storage_path_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
             --test oci_virtual_resolution_tests \
+            --test mcp_virtual_resolution_tests \
+            --test mcp_auth_namespaces_tests \
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \
@@ -1289,6 +1298,7 @@ jobs:
             --test grpc_sbom_tests \
             --test search_reindex_tests \
             --test scan_convert_to_reused_tests \
+            --test finding_acknowledgement_tests \
             --test stuck_scan_janitor_tests \
             --test virtual_docker_grouped_listing_test \
             --test virtual_members_atomicity_test \
@@ -1301,6 +1311,7 @@ jobs:
             --test age_gate_tests \
             --test scan_policy_validation_tests \
             --test ansible_galaxy_tests \
+            --test agent_plugins_tests \
             --test admin_middleware_fresh_user_tests \
             --test backup_cleanup_reclaims_storage_tests \
             --test catalog_keyset_tests \
@@ -1310,14 +1321,19 @@ jobs:
             --test conda_environment_tests \
             --test conda_promotion_predicate_tests \
             --test conda_upload_scan_grading_tests \
+            --test generic_put_format_parity_tests \
             --test gitlfs_locks_tests \
             --test grouped_listing_keyset_tests \
+            --test listing_totals_tests \
             --test manifest_blob_refs_tests \
             --test maven_virtual_groupid_shadowing_test \
+            --test mcp_registry_proxy_tests \
             --test migration_storage_path_tests \
             --test oci_packages_index_tests \
             --test oci_upload_range_test \
             --test oci_virtual_resolution_tests \
+            --test mcp_virtual_resolution_tests \
+            --test mcp_auth_namespaces_tests \
             --test optional_auth_deactivation_tests \
             --test promotion_block_unscanned_tests \
             --test promotion_open_cve_gating_tests \

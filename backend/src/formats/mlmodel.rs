@@ -211,9 +211,14 @@ const SAFETENSORS_FREEFORM_KEY: &str = "__metadata__";
 
 /// Whether an upload at `path` into a repository of `format` gets its
 /// safetensors header extracted: `.safetensors` files (case-insensitive) in
-/// Mlmodel repositories only.
+/// Mlmodel and Huggingface repositories (#5285), the two formats that serve
+/// model weights.
 pub fn safetensors_metadata_eligible(format: &RepositoryFormat, path: &str) -> bool {
-    matches!(format, RepositoryFormat::Mlmodel)
+    let serves_models = matches!(
+        format,
+        RepositoryFormat::Mlmodel | RepositoryFormat::Huggingface
+    );
+    serves_models
         && path
             .rsplit('/')
             .next()
@@ -250,6 +255,68 @@ pub struct SafetensorsSummary {
     pub metadata: Option<BTreeMap<String, String>>,
     /// True when `__metadata__` entries were dropped by those limits.
     pub metadata_truncated: bool,
+    /// How the tensors' `data_offsets` fail to tile the data region exactly,
+    /// if they do (#5285). Not recorded in `artifact_metadata`: the
+    /// model-file scanner reports it as a finding.
+    #[serde(skip)]
+    pub layout_issue: Option<SafetensorsLayoutIssue>,
+}
+
+/// A way the tensors' `data_offsets` fail to tile the data region as the
+/// reference loader requires: sorted by offset, each range starts where the
+/// previous one ended, and the last one ends at the end of the file (#5285).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SafetensorsLayoutIssue {
+    /// Two tensors share bytes: `first` starts before `second` ends.
+    Overlap { first: [u64; 2], second: [u64; 2] },
+    /// Bytes `[at, next)` belong to no tensor.
+    Gap { at: u64, next: u64 },
+    /// The tensors end at `data_end` but the data region is `data_len` long.
+    TrailingBytes { data_end: u64, data_len: u64 },
+}
+
+impl std::fmt::Display for SafetensorsLayoutIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overlap { first, second } => write!(
+                f,
+                "tensor data ranges [{}, {}] and [{}, {}] overlap",
+                first[0], first[1], second[0], second[1]
+            ),
+            Self::Gap { at, next } => {
+                write!(f, "data bytes [{at}, {next}) belong to no tensor")
+            }
+            Self::TrailingBytes { data_end, data_len } => write!(
+                f,
+                "tensors end at byte {data_end} of a {data_len}-byte data region"
+            ),
+        }
+    }
+}
+
+/// The first [`SafetensorsLayoutIssue`] in `ranges` over a data region of
+/// `data_len` bytes. Sorts `ranges` in place.
+fn layout_issue(ranges: &mut [[u64; 2]], data_len: u64) -> Option<SafetensorsLayoutIssue> {
+    ranges.sort_unstable();
+    let mut prev: Option<[u64; 2]> = None;
+    for &range in ranges.iter() {
+        let end = prev.map_or(0, |p| p[1]);
+        if range[0] < end {
+            return Some(SafetensorsLayoutIssue::Overlap {
+                first: prev.unwrap_or_default(),
+                second: range,
+            });
+        }
+        if range[0] > end {
+            return Some(SafetensorsLayoutIssue::Gap {
+                at: end,
+                next: range[0],
+            });
+        }
+        prev = Some(range);
+    }
+    let data_end = prev.map_or(0, |p| p[1]);
+    (data_end != data_len).then_some(SafetensorsLayoutIssue::TrailingBytes { data_end, data_len })
 }
 
 /// Why a safetensors header could not be summarised.
@@ -346,6 +413,8 @@ struct HeaderEntries {
     total_parameters: u64,
     metadata: Option<BTreeMap<String, String>>,
     metadata_truncated: bool,
+    /// Every tensor's `data_offsets`, for [`layout_issue`].
+    ranges: Vec<[u64; 2]>,
 }
 
 impl HeaderEntries {
@@ -398,6 +467,7 @@ impl HeaderEntries {
             .ok_or("total parameter count overflows u64")?;
         // Each per-dtype sum is bounded by the checked total above.
         *self.parameters_by_dtype.entry(dtype).or_insert(0) += params;
+        self.ranges.push([begin, end]);
         self.tensors.insert(
             name,
             SafetensorsTensor {
@@ -435,6 +505,7 @@ impl HeaderEntries {
             tensors_truncated,
             metadata: self.metadata,
             metadata_truncated: self.metadata_truncated,
+            layout_issue: None,
         }
     }
 }
@@ -535,10 +606,13 @@ pub fn parse_safetensors_header(
     data_len: u64,
 ) -> std::result::Result<SafetensorsSummary, SafetensorsError> {
     let mut de = serde_json::Deserializer::from_slice(header);
-    let entries = serde::Deserializer::deserialize_map(&mut de, HeaderVisitor { data_len })
+    let mut entries = serde::Deserializer::deserialize_map(&mut de, HeaderVisitor { data_len })
         .and_then(|entries| de.end().map(|()| entries))
         .map_err(|e| invalid(format!("header rejected: {e}")))?;
-    Ok(entries.into_summary(header.len() as u64))
+    let layout = layout_issue(&mut std::mem::take(&mut entries.ranges), data_len);
+    let mut summary = entries.into_summary(header.len() as u64);
+    summary.layout_issue = layout;
+    Ok(summary)
 }
 
 /// The `artifact_metadata.metadata` document for a summary attempt. A
@@ -756,6 +830,68 @@ mod tests {
             &RepositoryFormat::Generic,
             "model.safetensors"
         ));
+        // #5285: Huggingface repositories serve the same files.
+        assert!(safetensors_metadata_eligible(
+            &RepositoryFormat::Huggingface,
+            "gpt2/main/model.safetensors"
+        ));
+    }
+
+    #[test]
+    fn test_safetensors_layout_issue_requires_exact_tiling() {
+        let issue = |header: serde_json::Value, data_len: u64| {
+            let bytes = serde_json::to_vec(&header).unwrap();
+            parse_safetensors_header(&bytes, data_len)
+                .unwrap()
+                .layout_issue
+        };
+        let bytes = serde_json::to_vec(&sample_header()).unwrap();
+        assert_eq!(
+            parse_safetensors_header(&bytes, 548).unwrap().layout_issue,
+            None
+        );
+        let overlap = issue(
+            json!({
+                "a": {"dtype": "U8", "shape": [8], "data_offsets": [0, 8]},
+                "b": {"dtype": "U8", "shape": [8], "data_offsets": [4, 12]}
+            }),
+            12,
+        );
+        assert_eq!(
+            overlap,
+            Some(SafetensorsLayoutIssue::Overlap {
+                first: [0, 8],
+                second: [4, 12]
+            })
+        );
+        assert!(overlap.unwrap().to_string().contains("overlap"));
+        let gap = issue(
+            json!({"a": {"dtype": "U8", "shape": [4], "data_offsets": [2, 6]}}),
+            6,
+        );
+        assert_eq!(gap, Some(SafetensorsLayoutIssue::Gap { at: 0, next: 2 }));
+        let trailing = issue(
+            json!({"a": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]}}),
+            10,
+        );
+        assert_eq!(
+            trailing,
+            Some(SafetensorsLayoutIssue::TrailingBytes {
+                data_end: 4,
+                data_len: 10
+            })
+        );
+        // Zero-length tensors sit anywhere inside the chain.
+        assert_eq!(
+            issue(
+                json!({
+                    "a": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]},
+                    "z": {"dtype": "U8", "shape": [0], "data_offsets": [4, 4]}
+                }),
+                4
+            ),
+            None
+        );
     }
 
     #[test]

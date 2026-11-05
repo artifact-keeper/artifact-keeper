@@ -776,6 +776,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #5293: `pull` replication was accepted (and the default) but never
+    // replicated anything; it is refused now. Name the rows written before
+    // that once per boot, leaving them unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::peer_instance_service::warn_inactive_pull_replication(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
     // were compiled by PostgreSQL at create/update time can carry a pattern
     // that fails every run or (`\b`) protects nothing; name them once per
@@ -978,7 +991,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Ok(storage_svc) => {
             let proxy_service = Arc::new(
                 ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
-                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs),
+                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs)
+                    .with_upstream_fetch_audit(config.audit_upstream_fetches),
             );
             app_state.set_proxy_service(proxy_service);
             tracing::info!(
@@ -1190,6 +1204,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )
     .await;
 
+    // #5288: install UPSTREAM_JOBS_PAUSED before the first scheduled upstream
+    // job can tick, and say once which jobs the switch holds off.
+    {
+        use artifact_keeper_backend::services::upstream_pause;
+        upstream_pause::set_env_default(config.upstream_jobs_paused);
+        let pause_state = upstream_pause::state(&db_pool).await;
+        if let Some(message) = upstream_pause::startup_message(&pause_state) {
+            tracing::warn!(event = "upstream_jobs_paused", "{message}");
+        }
+    }
+
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
     // via an advisory lock. Detached deliberately: lifecycle is governed by
@@ -1219,11 +1244,34 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5284: resume proxy-cache seed jobs that are pending or whose replica
+    // died or restarted mid-seed (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_cache_seed_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // #4544: build the repodata of changed hosted RPM roots in the
     // background and serve it from storage. Every replica ticks; a lease per
     // root lets one of them build it. Detached deliberately: lifecycle is
     // governed by the shutdown token.
     artifact_keeper_backend::services::rpm_repodata_builder::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5253: hourly upstream sync of Remote MCP registries. Every replica
+    // ticks; a scheduler lease picks one per tick and a per-repository
+    // cluster lock keeps a manual trigger from overlapping a run.
+    artifact_keeper_backend::services::mcp_remote::spawn(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5253: the MCP registry's async package resolver (fills Remote backing
+    // repositories for versions published `resolving`). Every replica ticks;
+    // jobs are row-claimed.
+    artifact_keeper_backend::services::mcp_resolver::spawn(
         state.clone(),
         runtime_shutdown_token.clone(),
     );
@@ -1370,6 +1418,18 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                 }
             }
         })
+        // #5253: a refusal the shared middleware gives on an `/mcp/` path is
+        // re-rendered as problem+json with `no-store` (and the read routes'
+        // CORS headers); every other path passes through untouched.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_surface_guard,
+        ))
+        // #5253: MCP registry read routes answer cross-origin preflights
+        // themselves (any origin, GET only, no credentials); the instance CORS
+        // layer above would otherwise answer them same-origin.
+        .layer(axum::middleware::from_fn(
+            artifact_keeper_backend::api::handlers::mcp::mcp_cors_preflight,
+        ))
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
@@ -1388,6 +1448,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .on_response(
             artifact_keeper_backend::api::middleware::request_span::RecordResponseOnSpan::default(),
         ));
+
+    // #5253: optional host-level MCP registry (`/v0.1/...`, `/v0/...`).
+    let app = artifact_keeper_backend::api::handlers::mcp_edges::mount_default_repo(
+        app,
+        artifact_keeper_backend::api::handlers::mcp_edges::default_repo_from_env(
+            std::env::var("MCP_DEFAULT_REPO").ok().as_deref(),
+        ),
+    );
 
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so

@@ -52,20 +52,33 @@ pub const MAX_RETENTION_DAYS: i32 = 365_000;
 
 /// The tables a pass trims, in the order it trims them, each with its batch
 /// statement.
+///
+/// Each picks its rows through the table's `downloaded_at` index (migrations
+/// 313, 315), so a batch reads what it deletes and a batch with nothing to
+/// delete reads a few index pages, plus the entries of rows already deleted
+/// that vacuum has not removed yet. Two details of the statements serve that:
+///
+/// - `id = ANY (ARRAY(...))`: with `id IN (SELECT ...)`, a generic plan, which
+///   a prepared statement can switch to, hash-joins the batch against a
+///   sequential scan of the whole table, on every batch and with the index in
+///   place.
+/// - `ORDER BY downloaded_at`: the index is then the one cheap way to satisfy
+///   the `LIMIT`, wherever expired rows sit in the heap, and the oldest rows go
+///   first.
 const RETAINED_TABLES: [(&str, &str); 2] = [
     (
         "download_statistics",
-        "DELETE FROM download_statistics WHERE id IN ( \
+        "DELETE FROM download_statistics WHERE id = ANY (ARRAY( \
              SELECT id FROM download_statistics \
              WHERE downloaded_at < NOW() - make_interval(days => $1) \
-             LIMIT $2)",
+             ORDER BY downloaded_at LIMIT $2))",
     ),
     (
         "proxy_download_statistics",
-        "DELETE FROM proxy_download_statistics WHERE id IN ( \
+        "DELETE FROM proxy_download_statistics WHERE id = ANY (ARRAY( \
              SELECT id FROM proxy_download_statistics \
              WHERE downloaded_at < NOW() - make_interval(days => $1) \
-             LIMIT $2)",
+             ORDER BY downloaded_at LIMIT $2))",
     ),
 ];
 
@@ -113,12 +126,8 @@ pub struct DownloadStatsRetentionReport {
 
 /// Delete statistics rows older than `retention_days` (when `Some` and
 /// positive) from both tables in batches of `batch_size`, until none are left
-/// or `lost` is cancelled.
-///
-/// A batch selects its rows without an ordering: neither table has an index
-/// on `downloaded_at` alone, and an `ORDER BY` would sort every expired row on
-/// each batch. Unordered, the scan stops at the first `batch_size` matches,
-/// and expired rows, being the oldest, sit at the front of the heap.
+/// or `lost` is cancelled. Oldest rows go first, so an interrupted pass leaves
+/// the newest of what it had to delete.
 pub async fn apply_retention(
     db: &PgPool,
     retention_days: Option<i32>,
@@ -181,6 +190,7 @@ pub fn startup_message(retention_days: Option<i32>, interval_secs: u64) -> Strin
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use sqlx::AssertSqlSafe;
     use uuid::Uuid;
 
     /// Ages this far back are never seeded by other tests, and the period
@@ -320,6 +330,112 @@ mod tests {
         assert!(report.proxy_rows_deleted >= 2, "{report:?}");
         assert!(report.batches >= 6, "batched one row at a time: {report:?}");
         assert!(!report.interrupted);
+    }
+
+    /// `EXPLAIN (ANALYZE, BUFFERS)` of a batch statement that has nothing to
+    /// delete, which is the last batch of every pass, under `plan_cache_mode`:
+    /// the connection pool prepares the statement, so after five executions
+    /// PostgreSQL may switch it to a generic plan that cannot see the period.
+    /// Returns the plan and the shared buffers it touched.
+    async fn explain_empty_batch(
+        pool: &PgPool,
+        sql: &str,
+        plan_cache_mode: &str,
+    ) -> (serde_json::Value, i64) {
+        // Far past any age a test seeds, so this deletes nothing.
+        const NOTHING_THIS_OLD_DAYS: i32 = 300_000;
+        let mut conn = pool.acquire().await.expect("connection");
+        let setup = [
+            format!("SET plan_cache_mode = {plan_cache_mode}"),
+            format!("PREPARE retention_batch (int, bigint) AS {sql}"),
+        ];
+        for statement in setup {
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(&mut *conn)
+                .await
+                .expect("prepare batch statement");
+        }
+        let plan: serde_json::Value = sqlx::query_scalar(AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE retention_batch \
+             ({NOTHING_THIS_OLD_DAYS}, {DOWNLOAD_STATS_RETENTION_BATCH_SIZE})"
+        )))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("explain batch statement");
+        for statement in ["DEALLOCATE retention_batch", "RESET plan_cache_mode"] {
+            sqlx::query(statement)
+                .execute(&mut *conn)
+                .await
+                .expect("restore connection");
+        }
+        let root = &plan[0]["Plan"];
+        let buffers = root["Shared Hit Blocks"].as_i64().unwrap_or(0)
+            + root["Shared Read Blocks"].as_i64().unwrap_or(0);
+        (plan, buffers)
+    }
+
+    /// #4963: a batch that finds nothing to delete reads the time index and a
+    /// handful of pages. Before, with no index on the download time, it read
+    /// every page of the table, and the last batch of every pass is that batch.
+    #[tokio::test]
+    async fn empty_batch_reads_the_time_index_not_the_table() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let s = seed(&pool).await;
+        sqlx::query(
+            "INSERT INTO download_statistics (artifact_id, downloaded_at) \
+             SELECT $1, NOW() - (g % 30) * INTERVAL '1 day' FROM generate_series(1, 20000) g",
+        )
+        .bind(s.artifact_id)
+        .execute(&pool)
+        .await
+        .expect("seed hosted downloads");
+        sqlx::query(
+            "INSERT INTO proxy_download_statistics (repository_id, path, downloaded_at) \
+             SELECT $1, 'retention/pulled.bin', NOW() - (g % 30) * INTERVAL '1 day' \
+             FROM generate_series(1, 20000) g",
+        )
+        .bind(s.repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed proxy downloads");
+
+        let mut observed = Vec::new();
+        for ((table, sql), index) in RETAINED_TABLES.into_iter().zip([
+            "idx_download_stats_downloaded_at",
+            "idx_proxy_dl_stats_downloaded_at",
+        ]) {
+            sqlx::query(AssertSqlSafe(format!("ANALYZE {table}")))
+                .execute(&pool)
+                .await
+                .expect("analyze");
+            for mode in ["force_custom_plan", "force_generic_plan"] {
+                let (plan, buffers) = explain_empty_batch(&pool, sql, mode).await;
+                observed.push((table, mode, index, plan.to_string(), buffers));
+            }
+        }
+        drop_seed(&pool, &s).await;
+
+        for (table, mode, index, plan, buffers) in observed {
+            assert!(!plan.contains("Seq Scan"), "{table} {mode} scanned: {plan}");
+            assert!(plan.contains(index), "{table} {mode} needs {index}: {plan}");
+            assert!(buffers <= 32, "{table} {mode} touched {buffers}: {plan}");
+        }
+    }
+
+    /// #4963: the online index builds behind the bound are registered for the
+    /// startup repair, so an interrupted build is retried rather than left
+    /// INVALID, which the planner would ignore without any error.
+    #[test]
+    fn time_index_builds_are_repaired_after_an_interrupted_migration() {
+        use crate::migration_repair::CONCURRENT_INDEX_MIGRATIONS as BUILDS;
+        for index in [
+            "idx_download_stats_downloaded_at",
+            "idx_proxy_dl_stats_downloaded_at",
+        ] {
+            assert!(BUILDS.iter().any(|(_, name)| *name == index), "{index}");
+        }
     }
 
     /// No period deletes nothing; a lost lease stops the pass before it

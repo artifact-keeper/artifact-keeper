@@ -3218,6 +3218,88 @@ entries:
         assert!(index.entries.contains_key("trust-manager"));
     }
 
+    /// #5277: charts.rancher.io lists local subcharts (`repository: file://...`)
+    /// with no dependency `version`, which Helm accepts. The whole Remote index
+    /// answered 502 because of them, so every chart in the repository was
+    /// unreachable, including charts with no such dependency.
+    #[tokio::test]
+    async fn test_remote_index_yaml_with_versionless_dependency_5277() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let upstream = r#"apiVersion: v1
+generated: "2025-06-01T00:00:00Z"
+entries:
+  epinio:
+    - apiVersion: v2
+      appVersion: v1.10.0
+      created: "2024-06-01T00:00:00Z"
+      dependencies:
+        - condition: global.dex.enabled
+          name: dex
+          repository: file://./charts/dex
+          tags:
+            - dex
+      digest: bbbb2222
+      name: epinio
+      urls:
+        - assets/epinio/epinio-103.0.2+up1.10.0.tgz
+      version: 103.0.2+up1.10.0
+    - name: epinio
+      digest: broken-entry-without-version
+  rancher-backup:
+    - apiVersion: v2
+      created: "2024-06-01T00:00:00Z"
+      digest: cccc3333
+      name: rancher-backup
+      urls:
+        - assets/rancher-backup/rancher-backup-105.0.0+up6.0.0.tgz
+      version: 105.0.0+up6.0.0
+"#;
+
+        let Some(f) = tdh::Fixture::setup("remote", "helm").await else {
+            return;
+        };
+        let (server, _ssrf_guard) = tdh::non_loopback_mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/index.yaml"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream.as_bytes()))
+            .mount(&server)
+            .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+
+        let app = tdh::router_anon(super::router(), state);
+        let (status, body) = tdh::send(app, tdh::get(format!("/{}/index.yaml", f.repo_key))).await;
+
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a dependency without `version` is valid Helm and must not 502 the index: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let index = parse_index(&body);
+        assert_eq!(index.entries["rancher-backup"].len(), 1);
+        let epinio = &index.entries["epinio"];
+        assert_eq!(
+            epinio.len(),
+            1,
+            "the unreadable entry is skipped, the valid one is served"
+        );
+        let dep = &epinio[0].chart.dependencies.as_ref().unwrap()[0];
+        assert_eq!(dep.name, "dex");
+        assert_eq!(dep.version, None);
+
+        let served: serde_yaml::Value = serde_yaml::from_slice(&body).unwrap();
+        assert!(
+            served["entries"]["epinio"][0]["dependencies"][0]
+                .get("version")
+                .is_none(),
+            "the proxied index must not invent a dependency version"
+        );
+    }
+
     /// The two upstream failures an operator actually hits: the upstream is
     /// down (5xx), and the upstream URL is wrong so `index.yaml` 404s — the
     /// more common misconfiguration of the two. Neither may answer 200 with an
@@ -3373,9 +3455,9 @@ entries:
 
     /// #3448: an upstream index is parsed as ONE document, so a single
     /// non-conforming entry must not take the whole repository's discovery with
-    /// it. `urls`, `created`, `digest` and `generated` default; `name` and
-    /// `version` remain required because there is nothing to advertise without
-    /// them.
+    /// it. `urls`, `created`, `digest` and `generated` default; an entry
+    /// without `name` or `version` has nothing to advertise and is skipped
+    /// (see `test_upstream_index_entry_without_a_name_is_skipped`).
     #[test]
     fn test_upstream_index_entry_missing_optional_fields_still_parses() {
         let yaml = r#"apiVersion: v1
@@ -3400,18 +3482,31 @@ entries:
         );
     }
 
+    /// An entry with no chart name cannot be advertised, so it is dropped;
+    /// like Helm's index loader, the rest of the index is still served
+    /// (#5277) instead of the whole document failing.
     #[test]
-    fn test_upstream_index_entry_without_a_name_is_still_rejected() {
+    fn test_upstream_index_entry_without_a_name_is_skipped() {
         let yaml = r#"apiVersion: v1
 entries:
   nameless:
     - apiVersion: v2
       version: 1.0.0
+  named:
+    - apiVersion: v2
+      name: named
+      version: 1.0.0
 "#;
-        assert!(
-            serde_yaml::from_str::<HelmIndex>(yaml).is_err(),
-            "an entry with no chart name cannot be advertised and must stay a parse error"
+        let index: HelmIndex =
+            serde_yaml::from_str(yaml).expect("one unusable entry must not fail the index");
+        let mut out: Vec<(ChartYaml, String, String, String)> = Vec::new();
+        merge_upstream_index_entries("helm-remote", index, &mut out);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the named entry is advertised, got {out:?}"
         );
+        assert_eq!(out[0].1, "charts/named-1.0.0.tgz");
     }
 
     /// #3448: the proxied index rebuilds every URL from a third party's
@@ -3967,7 +4062,7 @@ entries:
         }
 
         // `.expect(1)` on the chart mock is verified on server drop.
-        drop(server);
+        tdh::drop_mock_server(server).await;
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

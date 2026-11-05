@@ -173,20 +173,8 @@ pub async fn get_quarantine_status(
     // field was handed to any authenticated caller on any repository. The
     // comment is why the gate survived review; the predicate is now spelled out
     // instead of delegated to a name that means something else.
-    let repo_service =
-        crate::services::repository_service::RepositoryService::new(state.db.clone());
-    let holds_repository = auth_ext.can_access_repo(row.repository_id)
-        && (auth_ext.is_admin
-            || repo_service
-                .user_can_access_repo(
-                    row.repository_id,
-                    auth_ext.user_id,
-                    // CONTENT (#3331): the reason is the policy name, finding
-                    // counts and admin incident notes behind the hold — private
-                    // security detail, so `read` and not merely a grant.
-                    crate::services::repository_service::RepoAccess::READ,
-                )
-                .await?);
+    let holds_repository =
+        caller_passes_reason_gate(&state.db, &auth_ext, row.repository_id).await?;
     let quarantine_reason = if holds_repository {
         row.quarantine_reason
     } else {
@@ -200,6 +188,34 @@ pub async fn get_quarantine_status(
         quarantine_reason,
         is_blocked,
     }))
+}
+
+/// The REASON gate: whether `auth_ext` genuinely HOLDS repository
+/// `repo_id` (`in_scope AND (is_admin OR grants)`), the `is_public` arm of the
+/// visibility predicate deliberately dropped. Shared by the quarantine status
+/// endpoint (the hold reason) and the MCP registry surface (#5253: why a
+/// server version is held), so both disclose to exactly the same callers.
+pub(crate) async fn caller_passes_reason_gate(
+    db: &sqlx::PgPool,
+    auth_ext: &AuthExtension,
+    repo_id: Uuid,
+) -> Result<bool> {
+    if !auth_ext.can_access_repo(repo_id) {
+        return Ok(false);
+    }
+    if auth_ext.is_admin {
+        return Ok(true);
+    }
+    crate::services::repository_service::RepositoryService::new(db.clone())
+        .user_can_access_repo(
+            repo_id,
+            auth_ext.user_id,
+            // CONTENT (#3331): the reason is the policy name, finding counts
+            // and admin incident notes behind the hold — private security
+            // detail, so `read` and not merely a grant.
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await
 }
 
 /// Quarantine an artifact immediately (admin only)
@@ -1263,6 +1279,48 @@ mod tests {
 
         fx.teardown().await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #5253: the reason-gate predicate the quarantine status endpoint and
+    /// the MCP registry surface share: admin and grant holder pass, a caller
+    /// who can see the repository only because it is public does not, and a
+    /// token scoped to another repository does not.
+    #[tokio::test]
+    async fn reason_gate_predicate_admits_only_repository_holders_5253() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let member = tdh::make_auth(fx.user_id, &fx.username);
+        assert!(caller_passes_reason_gate(&fx.pool, &member, fx.repo_id)
+            .await
+            .unwrap());
+        let (other, other_name) = tdh::create_user(&fx.pool).await;
+        assert!(caller_passes_reason_gate(
+            &fx.pool,
+            &tdh::admin_auth(other, &other_name),
+            fx.repo_id
+        )
+        .await
+        .unwrap());
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        assert!(!caller_passes_reason_gate(
+            &fx.pool,
+            &tdh::make_auth(other, &other_name),
+            fx.repo_id
+        )
+        .await
+        .unwrap());
+        let scoped = AuthExtension {
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..member
+        };
+        assert!(!caller_passes_reason_gate(&fx.pool, &scoped, fx.repo_id)
+            .await
+            .unwrap());
+        tdh::cleanup_user(&fx.pool, other).await;
+        fx.teardown().await;
     }
 }
 

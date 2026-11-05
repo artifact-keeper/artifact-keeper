@@ -443,6 +443,9 @@ pub struct ScanResult {
 }
 
 /// An individual vulnerability finding within a scan.
+///
+/// Read from `scan_findings_effective`: the acknowledged fields come from the
+/// decision covering the finding (#5153), not from the row itself.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ScanFinding {
     pub id: Uuid,
@@ -461,6 +464,17 @@ pub struct ScanFinding {
     pub acknowledged_by: Option<Uuid>,
     pub acknowledged_reason: Option<String>,
     pub acknowledged_at: Option<DateTime<Utc>>,
+    /// The decision covering this finding (#5153), when one does.
+    #[serde(default)]
+    pub acknowledgement_id: Option<Uuid>,
+    /// When that decision stops applying; `None` means until revoked.
+    #[serde(default)]
+    pub acknowledgement_expires_at: Option<DateTime<Utc>>,
+    /// After a revoke: how many copies of the decision stay effective in
+    /// repositories the caller has no authority over. `None` on any other read.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub acknowledgements_left_effective: Option<i64>,
     pub created_at: DateTime<Utc>,
     /// `vulnerability`, `malicious` or `policy` (#3013). See [`FindingClass`].
     pub finding_class: String,
@@ -960,6 +974,9 @@ pub struct DashboardSummary {
     /// Distinct proxied digests a repository's proxy scan gate refuses right
     /// now (#4777): the proxy half of `policy_violations_blocked`, on its own.
     pub proxy_blocked: i64,
+    /// Distinct proxied digests a repository's proxy scan gate would refuse if
+    /// it enforced (#5232): `proxy_blocked` plus what `record_only` serves.
+    pub proxy_would_block: i64,
     pub repos_grade_a: i64,
     pub repos_grade_f: i64,
     /// Repositories by grade status (#4336). Rows a 1.11 replica wrote count

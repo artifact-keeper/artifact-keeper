@@ -276,6 +276,23 @@ fn default_precedence() -> i32 {
     100
 }
 
+/// Refuse a sync policy `replication_mode` that would produce subscriptions
+/// the sync worker never acts on, or that the `replication_mode` enum cannot
+/// hold (#5293). Before this the column took any string: `pull` produced
+/// subscriptions that never replicated, and a typo only failed later, at
+/// evaluation, when the value was cast to the enum.
+fn validate_replication_mode(mode: &str) -> Result<()> {
+    match mode {
+        "push" | "mirror" | "none" => Ok(()),
+        "pull" => Err(AppError::Validation(
+            crate::services::peer_instance_service::PULL_REPLICATION_NOT_IMPLEMENTED.to_string(),
+        )),
+        other => Err(AppError::Validation(format!(
+            "invalid replication_mode '{other}' (expected one of: push, mirror, none)"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Row helpers for query_as
 // ---------------------------------------------------------------------------
@@ -315,6 +332,7 @@ impl SyncPolicyService {
                 "Policy name cannot be empty".to_string(),
             ));
         }
+        validate_replication_mode(&req.replication_mode)?;
 
         let repo_selector_json = serde_json::to_value(&req.repo_selector)
             .map_err(|e| AppError::Validation(format!("Invalid repo_selector: {e}")))?;
@@ -403,6 +421,9 @@ impl SyncPolicyService {
         id: Uuid,
         req: UpdateSyncPolicyRequest,
     ) -> Result<SyncPolicy> {
+        if let Some(mode) = req.replication_mode.as_deref() {
+            validate_replication_mode(mode)?;
+        }
         // Fetch existing policy first
         let existing = self.get_policy(id).await?;
 
@@ -1327,10 +1348,6 @@ mod tests {
         repo_count * peer_count
     }
 
-    fn validate_replication_mode(mode: &str) -> bool {
-        matches!(mode, "push" | "pull" | "mirror")
-    }
-
     // -----------------------------------------------------------------------
     // RepoSelector serialization/deserialization
     // -----------------------------------------------------------------------
@@ -2162,17 +2179,34 @@ mod tests {
 
     #[test]
     fn test_validate_replication_mode_valid() {
-        assert!(validate_replication_mode("push"));
-        assert!(validate_replication_mode("pull"));
-        assert!(validate_replication_mode("mirror"));
+        assert!(validate_replication_mode("push").is_ok());
+        assert!(validate_replication_mode("mirror").is_ok());
+        assert!(validate_replication_mode("none").is_ok());
+    }
+
+    #[test]
+    fn test_validate_replication_mode_refuses_pull_with_its_own_message() {
+        // #5293: `pull` has no task producer; a policy using it created
+        // subscriptions that never replicated anything.
+        match validate_replication_mode("pull") {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("pull replication is not implemented"), "{msg}");
+                assert!(msg.contains("push") && msg.contains("mirror"), "{msg}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+        match validate_replication_mode("sync") {
+            Err(AppError::Validation(msg)) => assert!(msg.contains("expected one of"), "{msg}"),
+            other => panic!("expected a validation error, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_validate_replication_mode_invalid() {
-        assert!(!validate_replication_mode("sync"));
-        assert!(!validate_replication_mode(""));
-        assert!(!validate_replication_mode("Push"));
-        assert!(!validate_replication_mode("MIRROR"));
+        assert!(validate_replication_mode("sync").is_err());
+        assert!(validate_replication_mode("").is_err());
+        assert!(validate_replication_mode("Push").is_err());
+        assert!(validate_replication_mode("MIRROR").is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -3250,16 +3284,16 @@ mod tests {
     #[test]
     fn test_validate_replication_mode_case_sensitivity() {
         // Only lowercase variants are valid
-        assert!(!validate_replication_mode("Push"));
-        assert!(!validate_replication_mode("PULL"));
-        assert!(!validate_replication_mode("Mirror"));
+        assert!(validate_replication_mode("Push").is_err());
+        assert!(validate_replication_mode("PULL").is_err());
+        assert!(validate_replication_mode("Mirror").is_err());
     }
 
     #[test]
     fn test_validate_replication_mode_whitespace() {
-        assert!(!validate_replication_mode(" push"));
-        assert!(!validate_replication_mode("push "));
-        assert!(!validate_replication_mode(" push "));
+        assert!(validate_replication_mode(" push").is_err());
+        assert!(validate_replication_mode("push ").is_err());
+        assert!(validate_replication_mode(" push ").is_err());
     }
 
     // -----------------------------------------------------------------------

@@ -305,6 +305,7 @@ dependencies = [
  "rmp-serde",
  "rsa",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

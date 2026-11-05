@@ -855,6 +855,7 @@ impl PackageService {
 /// particular resolves display casing against the existing row (#3978), which
 /// a row-only walk cannot reproduce.
 pub const BACKFILL_FORMATS: &[&str] = &[
+    "agentplugins",
     "alpine",
     "cargo",
     "chef",

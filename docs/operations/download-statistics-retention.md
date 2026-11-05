@@ -17,8 +17,11 @@ With a period set, a scheduler pass trims both tables every interval. It runs
 on one replica at a time (scheduler lease `download_stats_retention`, renewed
 while the pass runs) and deletes in batches of 5000 rows, one short statement
 each, so a large backlog is worked off without a long transaction or table
-lock. Each pass logs one `Download statistics retention pass` line with the
-rows it deleted from each table; the period in force is logged at startup.
+lock. Batches find their rows through an index on `downloaded_at` on each
+table, so a pass costs what it deletes, not the size of the table: a pass with
+nothing to delete reads a few index pages, plus the index entries of rows
+already deleted that vacuum has not removed yet. Each pass logs one `Download statistics retention pass` line with
+the rows it deleted from each table; the period in force is logged at startup.
 
 Nothing is deleted unless you set a period: the default keeps today's
 behaviour.

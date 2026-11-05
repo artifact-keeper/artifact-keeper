@@ -581,6 +581,32 @@ impl DeviceAuthConfig {
     }
 }
 
+/// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
+/// Env `AUDIT_UPSTREAM_FETCHES`: `off` (the default), `errors` (failed
+/// requests only: `not_found`, `error`, `timeout`) or `all` (every request,
+/// what an air-gapped deployment sets to inventory its seed window). An
+/// unrecognised value falls back to `off`, like the other knobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamFetchAuditMode {
+    #[default]
+    Off,
+    Errors,
+    All,
+}
+
+impl std::str::FromStr for UpstreamFetchAuditMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, ()> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "errors" => Ok(Self::Errors),
+            "all" => Ok(Self::All),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -1138,6 +1164,9 @@ pub struct Config {
     /// *non-transfer* request. Env var: `GLOBAL_REQUEST_TIMEOUT_SECS`.
     /// Default 120. Set to 0 to disable the layer.
     pub global_request_timeout_secs: u64,
+    /// How long a request waits for its proxy file scan to get a permit (#5231).
+    /// Env var: `AK_PROXY_SCAN_QUEUE_WAIT_SECS`. Default 60, least 1.
+    pub proxy_scan_queue_wait_secs: u64,
 
     /// How long, in seconds, an HTTP/1 connection may take to deliver a
     /// complete request head (request line plus headers) on the API and
@@ -1479,6 +1508,12 @@ pub struct Config {
     /// 3600.
     pub proxy_stale_if_error_grace_secs: i64,
 
+    // -- upstream contact audit (#5286) --
+    /// Which upstream requests the proxy records as `UPSTREAM_FETCHED` audit
+    /// rows. Env `AUDIT_UPSTREAM_FETCHES`, default `off`; see
+    /// [`UpstreamFetchAuditMode`].
+    pub audit_upstream_fetches: UpstreamFetchAuditMode,
+
     // -- OCI virtual-resolution negative cache (#1424) --
     /// Freshness window in milliseconds for negative OCI virtual-resolution
     /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000,
@@ -1605,6 +1640,12 @@ pub struct Config {
     /// Endpoint of the npm replication feed. Env `NPM_UPSTREAM_FEED_URL`,
     /// default `https://replicate.npmjs.com/_changes`.
     pub npm_upstream_feed_url: String,
+
+    /// Pause every scheduled job that contacts an upstream on its own
+    /// (#5288; see `services::upstream_pause`). Env `UPSTREAM_JOBS_PAUSED`,
+    /// default `false`. `true` pins the switch on; otherwise the
+    /// `upstream_jobs_paused` runtime setting decides.
+    pub upstream_jobs_paused: bool,
 }
 
 redacted_debug!(Config {
@@ -1693,6 +1734,7 @@ redacted_debug!(Config {
     show auth_max_concurrency,
     show global_max_concurrency,
     show global_request_timeout_secs,
+    show proxy_scan_queue_wait_secs,
     show http_header_read_timeout_secs,
     show http_listen_backlog,
     show upload_progress_window_secs,
@@ -1737,6 +1779,7 @@ redacted_debug!(Config {
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
     show proxy_stale_if_error_grace_secs,
+    show audit_upstream_fetches,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
     show npm_virtual_negative_cache_ttl_ms,
@@ -1757,6 +1800,7 @@ redacted_debug!(Config {
     show npm_attestation_negative_cache_ttl_secs,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
+    show upstream_jobs_paused,
 });
 
 impl Default for Config {
@@ -1853,6 +1897,7 @@ impl Default for Config {
             auth_max_concurrency: default_auth_max_concurrency(),
             global_max_concurrency: 512,
             global_request_timeout_secs: 120,
+            proxy_scan_queue_wait_secs: 60,
             http_header_read_timeout_secs: DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
             http_listen_backlog: 0,
             upload_progress_window_secs: 60,
@@ -1902,6 +1947,7 @@ impl Default for Config {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             proxy_stale_if_error_grace_secs:
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: UpstreamFetchAuditMode::Off,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
@@ -1927,6 +1973,7 @@ impl Default for Config {
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
+            upstream_jobs_paused: false,
         }
     }
 }
@@ -2240,6 +2287,7 @@ impl Config {
             auth_max_concurrency: env_parse("AUTH_MAX_CONCURRENCY", default_auth_max_concurrency()),
             global_max_concurrency: env_parse("GLOBAL_MAX_CONCURRENCY", 512_usize),
             global_request_timeout_secs: env_parse("GLOBAL_REQUEST_TIMEOUT_SECS", 120_u64),
+            proxy_scan_queue_wait_secs: env_parse("AK_PROXY_SCAN_QUEUE_WAIT_SECS", 60_u64),
             http_header_read_timeout_secs: env_parse(
                 "HTTP_HEADER_READ_TIMEOUT_SECS",
                 DEFAULT_HTTP_HEADER_READ_TIMEOUT_SECS,
@@ -2379,6 +2427,10 @@ impl Config {
                 0,
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS,
             ),
+            audit_upstream_fetches: env_parse(
+                "AUDIT_UPSTREAM_FETCHES",
+                UpstreamFetchAuditMode::Off,
+            ),
             // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
             // above) so a fat-fingered enormous value can't pin a 404 on a
             // freshly published tag -- the resolver consults this cache ahead of
@@ -2483,6 +2535,10 @@ impl Config {
                 .unwrap_or_else(|| {
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into()
                 }),
+            // Off by default; only an explicit `true`/`1` pauses (#5288).
+            upstream_jobs_paused: parse_opt_in_flag(
+                env::var("UPSTREAM_JOBS_PAUSED").ok().as_deref(),
+            ),
         };
 
         config.validate_jwt_secret()?;
@@ -2952,6 +3008,33 @@ mod tests {
             !disabled_config.incus_scanner_enabled,
             "INCUS_SCANNER_ENABLED=false must disable Incus scanner construction"
         );
+    }
+
+    /// #5288: `UPSTREAM_JOBS_PAUSED` is opt-in; only `true`/`1` pauses the
+    /// scheduled upstream jobs, so defaults are unchanged.
+    #[test]
+    fn test_config_upstream_jobs_paused_is_opt_in() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> =
+            ["DATABASE_URL", "JWT_SECRET", "UPSTREAM_JOBS_PAUSED"]
+                .into_iter()
+                .map(|k| (k, env::var(k).ok()))
+                .collect();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let mut observed = Vec::new();
+        for value in [None, Some("false"), Some("yes"), Some("TRUE"), Some("1")] {
+            match value {
+                Some(v) => env::set_var("UPSTREAM_JOBS_PAUSED", v),
+                None => env::remove_var("UPSTREAM_JOBS_PAUSED"),
+            }
+            observed.push(Config::from_env().expect("config").upstream_jobs_paused);
+        }
+        for (key, value) in saved {
+            restore_env(key, value);
+        }
+        assert_eq!(observed, vec![false, false, false, true, true]);
+        assert!(!Config::default().upstream_jobs_paused);
     }
 
     #[test]
