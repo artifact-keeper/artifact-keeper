@@ -1165,6 +1165,123 @@ pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
     )
 }
 
+/// The upstream `401`/`403` behind a proxy fetch error, if it is one: the
+/// [`AppError::BadGateway`] [`validate_upstream_status`] produces, or the
+/// [`AppError::Storage`] a `401` without a Bearer challenge becomes in the
+/// upstream client. The error carries no status field, so this reads the
+/// classification back out of the message. Backported with #5323 from #4929,
+/// which the 1.11 line does not otherwise carry.
+pub(crate) fn upstream_refusal_status(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(message) | AppError::Storage(message)) = err else {
+        return None;
+    };
+    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
+        .into_iter()
+        .find(|status| message.starts_with(&format!("Upstream returned error status {status}")))
+}
+
+/// The Hugging Face Hub's machine-readable refusal codes, as it sends them in
+/// `X-Error-Code` (#5323). `huggingface_hub` picks its exception from this
+/// header (`GatedRepoError`, `RepositoryNotFoundError`, ...), so the code is
+/// worth carrying through the proxy; anything else the header holds is
+/// dropped, never echoed.
+pub(crate) const HUB_ERROR_CODES: [&str; 4] = [
+    "GatedRepo",
+    "RepoNotFound",
+    "RevisionNotFound",
+    "EntryNotFound",
+];
+
+/// How [`with_hub_error_code`] names the Hub's code inside an upstream-refusal
+/// message, between the status and the URL.
+const HUB_ERROR_CODE_TAG: &str = " (X-Error-Code: ";
+
+/// The Hub's `X-Error-Code` on an upstream response, when it is one of
+/// [`HUB_ERROR_CODES`].
+fn hub_error_code(headers: &reqwest::header::HeaderMap) -> Option<&'static str> {
+    let value = headers.get("x-error-code")?.to_str().ok()?.trim();
+    HUB_ERROR_CODES.into_iter().find(|code| *code == value)
+}
+
+/// Whether an upstream `401` is the Hugging Face Hub's own refusal (#5323): it
+/// carries the Hub's `X-Error-Code` or `X-Error-Message`. The Hub sends a
+/// `WWW-Authenticate: Bearer realm="Authentication required"` with it, which
+/// is not an OCI token challenge: exchanging it fails on the realm (not a URL)
+/// and turned a gated model into a 400. No OCI registry sends these headers.
+fn is_hub_refusal(headers: &reqwest::header::HeaderMap) -> bool {
+    headers.contains_key("x-error-code") || headers.contains_key("x-error-message")
+}
+
+/// `err` with the Hub's `X-Error-Code` from `headers` written into it, when
+/// `err` is an upstream `401`/`403` refusal ([`upstream_refusal_status`]) and
+/// the Hub named a known code (#5323). Any other error is returned unchanged.
+///
+/// The code goes between the status and the URL, so
+/// [`upstream_refusal_status`] still classifies the refusal and
+/// [`upstream_hub_error_code`] reads the code back without a client-chosen
+/// path being able to supply one.
+fn with_hub_error_code(err: AppError, headers: &reqwest::header::HeaderMap) -> AppError {
+    let (Some(code), Some(status)) = (hub_error_code(headers), upstream_refusal_status(&err))
+    else {
+        return err;
+    };
+    let prefix = format!("Upstream returned error status {status}");
+    let tag = |message: String| {
+        let tagged = message
+            .strip_prefix(&prefix)
+            .map(|rest| format!("{prefix}{HUB_ERROR_CODE_TAG}{code}){rest}"));
+        tagged.unwrap_or(message)
+    };
+    match err {
+        AppError::BadGateway(message) => AppError::BadGateway(tag(message)),
+        AppError::Storage(message) => AppError::Storage(tag(message)),
+        other => other,
+    }
+}
+
+/// The error for an upstream `401` that is the Hub's own refusal
+/// ([`is_hub_refusal`]): the same `Storage` refusal a `401` without a usable
+/// challenge gets, carrying the Hub's code. `None` for any other `401`, which
+/// goes on to the bearer exchange (#5323).
+fn hub_refusal_error(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    diagnostic_url: &str,
+) -> Option<AppError> {
+    is_hub_refusal(headers).then(|| {
+        with_hub_error_code(
+            AppError::Storage(format!(
+                "Upstream returned error status {status}: {diagnostic_url}"
+            )),
+            headers,
+        )
+    })
+}
+
+/// The Hub's `X-Error-Code` behind an upstream `401`/`403` refusal, as
+/// [`with_hub_error_code`] recorded it (#5323).
+pub(crate) fn upstream_hub_error_code(err: &AppError) -> Option<&'static str> {
+    let status = upstream_refusal_status(err)?;
+    let (AppError::BadGateway(message) | AppError::Storage(message)) = err else {
+        return None;
+    };
+    let rest = message
+        .strip_prefix(&format!("Upstream returned error status {status}"))?
+        .strip_prefix(HUB_ERROR_CODE_TAG)?;
+    let (code, _) = rest.split_once(')')?;
+    HUB_ERROR_CODES.into_iter().find(|known| *known == code)
+}
+
+/// `validate_upstream_status` for a response whose headers are at hand: a
+/// `401`/`403` carries the Hub's `X-Error-Code` (#5323).
+fn validate_upstream_response_status(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    url: &str,
+) -> Result<()> {
+    validate_upstream_status(status, url).map_err(|err| with_hub_error_code(err, headers))
+}
+
 /// Whether a single path segment is a dot segment, in the same sense the WHATWG
 /// URL parser uses when it normalizes a path.
 ///
@@ -3764,6 +3881,11 @@ impl UpstreamClient {
         // Handle 401 with bearer token exchange (required by Docker Hub and
         // other OCI registries, even for anonymous/public pulls).
         if status == StatusCode::UNAUTHORIZED {
+            // #5323: the Hugging Face Hub's refusal is an answer, not a
+            // challenge to exchange.
+            if let Some(err) = hub_refusal_error(status, response.headers(), &diagnostic_url) {
+                return Err(err);
+            }
             // The buffered closure RE-ADDS `Accept` (and the custom UA) on the
             // bearer retry, mirroring the initial request. The bearer-exchange
             // helper itself never touches these headers; the closure owns that
@@ -3864,7 +3986,7 @@ impl UpstreamClient {
         // gets the same 5xx -> ServiceUnavailable mapping the streaming
         // path does. Previously this inlined a "non-2xx -> Storage" rule
         // that surfaced raw upstream 502/503/504 to clients as 502.
-        validate_upstream_status(status, url)?;
+        validate_upstream_response_status(status, response.headers(), url)?;
 
         let content_type = response
             .headers()
@@ -4002,6 +4124,11 @@ impl UpstreamClient {
         let status = response.status();
 
         if status == StatusCode::UNAUTHORIZED {
+            // #5323: the Hugging Face Hub's refusal is an answer, not a
+            // challenge to exchange.
+            if let Some(err) = hub_refusal_error(status, response.headers(), &diagnostic_url) {
+                return Err(err);
+            }
             // The streaming closure re-applies the custom UA on the bearer retry
             // but adds NO `Accept` header, preserving the asymmetry with the
             // buffered path (#1618 S8).
@@ -4172,7 +4299,7 @@ impl UpstreamClient {
         response: reqwest::Response,
         url: &str,
     ) -> Result<UpstreamStream> {
-        validate_upstream_status(response.status(), url)?;
+        validate_upstream_response_status(response.status(), response.headers(), url)?;
         let headers = extract_streaming_headers(response.headers());
 
         let body = response.bytes_stream().map(|r| {
@@ -16594,6 +16721,105 @@ mod tests {
                 "{other} must not be classified as an upstream 403"
             );
         }
+    }
+
+    /// #5323: the Hugging Face Hub's `X-Error-Code` survives an upstream
+    /// 401/403 refusal, both as written by `validate_upstream_status` (403,
+    /// `BadGateway`) and by the 401 fallback (`Storage`), without breaking the
+    /// status classification; an unknown code, a non-refusal, or no header
+    /// leaves the error as it was.
+    #[test]
+    fn test_hub_error_code_survives_an_upstream_refusal_5323() {
+        let hub = |code: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-error-code", code.parse().unwrap());
+            headers
+        };
+        let url = "https://hub.example/org/model/resolve/main/config.json";
+
+        let forbidden =
+            validate_upstream_response_status(StatusCode::FORBIDDEN, &hub("GatedRepo"), url)
+                .expect_err("403 must fail");
+        assert!(
+            matches!(forbidden, AppError::BadGateway(_)),
+            "{forbidden:?}"
+        );
+        assert_eq!(
+            upstream_refusal_status(&forbidden),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(upstream_hub_error_code(&forbidden), Some("GatedRepo"));
+        assert!(is_upstream_forbidden(&forbidden));
+        assert!(forbidden.to_string().contains(url), "{forbidden}");
+
+        let unauthorized = with_hub_error_code(
+            AppError::Storage(format!(
+                "Upstream returned error status {}: {url}",
+                StatusCode::UNAUTHORIZED
+            )),
+            &hub("RepoNotFound"),
+        );
+        assert!(
+            matches!(unauthorized, AppError::Storage(_)),
+            "{unauthorized:?}"
+        );
+        assert_eq!(
+            upstream_refusal_status(&unauthorized),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(upstream_hub_error_code(&unauthorized), Some("RepoNotFound"));
+
+        // An unknown code is dropped, never echoed.
+        let unknown =
+            validate_upstream_response_status(StatusCode::FORBIDDEN, &hub("Bogus<script>"), url)
+                .expect_err("403 must fail");
+        assert_eq!(upstream_hub_error_code(&unknown), None);
+        assert!(!unknown.to_string().contains("Bogus"), "{unknown}");
+
+        // No header, or not a refusal: unchanged.
+        let plain = validate_upstream_response_status(
+            StatusCode::FORBIDDEN,
+            &reqwest::header::HeaderMap::new(),
+            url,
+        )
+        .expect_err("403 must fail");
+        assert_eq!(upstream_hub_error_code(&plain), None);
+        assert_eq!(upstream_refusal_status(&plain), Some(StatusCode::FORBIDDEN));
+        let missing =
+            validate_upstream_response_status(StatusCode::NOT_FOUND, &hub("EntryNotFound"), url)
+                .expect_err("404 must fail");
+        assert!(matches!(missing, AppError::NotFound(_)), "{missing:?}");
+        assert_eq!(upstream_hub_error_code(&missing), None);
+
+        // A client-chosen path cannot supply a code: it sits after the URL tag.
+        let spoofed = AppError::BadGateway(format!(
+            "Upstream returned error status {}: https://hub.example/x (X-Error-Code: GatedRepo)",
+            StatusCode::FORBIDDEN
+        ));
+        assert_eq!(upstream_hub_error_code(&spoofed), None);
+    }
+
+    /// #5323: a 401 carrying the Hub's error headers is the Hub's answer, not
+    /// an OCI challenge; a plain 401 still is one.
+    #[test]
+    fn test_is_hub_refusal_5323() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(!is_hub_refusal(&headers));
+        headers.insert(
+            WWW_AUTHENTICATE,
+            "Bearer realm=\"https://auth.example/token\""
+                .parse()
+                .unwrap(),
+        );
+        assert!(!is_hub_refusal(&headers));
+        headers.insert(
+            "x-error-message",
+            "Invalid username or password.".parse().unwrap(),
+        );
+        assert!(is_hub_refusal(&headers));
+        let mut coded = reqwest::header::HeaderMap::new();
+        coded.insert("x-error-code", "GatedRepo".parse().unwrap());
+        assert!(is_hub_refusal(&coded));
     }
 
     #[test]
