@@ -447,9 +447,10 @@ pub async fn browse_page(
     Ok(rows)
 }
 
-/// Exact match count for [`browse_page`]'s filters, behind the listing's
-/// explicit `?count=exact` opt-in (#2520 pattern): the default response
-/// reports a cheap lower-bound total plus an authoritative `has_more`.
+/// Exact match count for [`browse_page`]'s filters. The remote listing runs
+/// it by default on `page=N` requests (#5255): with no `q` it is an
+/// index-only scan of this repository's range of the `(repository_id,
+/// path)` unique index, O(rows in the repository).
 ///
 /// Excludes cached index responses on the same terms as [`browse_page`], so
 /// the count matches the rows the listing actually returns.
