@@ -4289,9 +4289,10 @@ fn parse_repo_type(s: &str) -> Result<RepositoryType> {
 
 /// Refuse a repository type a format cannot serve.
 ///
-/// Agent Plugins repositories (#5251) are hosted only: there is no upstream
-/// marketplace protocol to proxy and no merge rule for virtual members yet
-/// (D3 of the design). The key `t` is also refused for this format, because
+/// Agent Plugins repositories (#5251) are hosted or remote: a remote proxies
+/// another Artifact Keeper's hosted Agent Plugins repository (#5289 phase 1).
+/// Virtual repositories have no merge rule for their members yet (#5289
+/// phase 2) and are refused. The key `t` is also refused for this format, because
 /// `/agentplugins/t/{token}/{repo}/...` is the token-in-path route (D8) and a
 /// repository named `t` would be ambiguous with it.
 fn validate_format_supports_repo_type(
@@ -4304,8 +4305,8 @@ fn validate_format_supports_repo_type(
     }
     if !crate::formats::supported_repo_types(format.handler_key()).contains(&repo_type.as_str()) {
         return Err(AppError::Validation(format!(
-            "Agent Plugins repositories are hosted-only: repo_type {} is not supported \
-             (use local)",
+            "Agent Plugins repositories do not support repo_type {}: virtual repositories \
+             are not supported yet (#5289 phase 2); use local, staging or remote",
             repo_type.as_str()
         )));
     }
@@ -18261,20 +18262,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_plugins_repositories_are_hosted_only_5251() {
+    fn agent_plugins_repositories_are_hosted_or_remote_5251_5289() {
         let ap = RepositoryFormat::AgentPlugins;
-        for ok in [RepositoryType::Local, RepositoryType::Staging] {
+        for ok in [
+            RepositoryType::Local,
+            RepositoryType::Staging,
+            RepositoryType::Remote,
+        ] {
             assert!(validate_format_supports_repo_type(&ap, &ok, "plugins").is_ok());
         }
-        for bad in [RepositoryType::Remote, RepositoryType::Virtual] {
-            let err = validate_format_supports_repo_type(&ap, &bad, "plugins")
-                .expect_err("non-hosted agentplugins must be refused");
-            match err {
-                AppError::Validation(msg) => assert!(msg.contains("hosted-only"), "{msg}"),
-                other => panic!("expected a validation error, got {other:?}"),
-            }
+        let err = validate_format_supports_repo_type(&ap, &RepositoryType::Virtual, "plugins")
+            .expect_err("a virtual agentplugins repository must be refused");
+        match err {
+            AppError::Validation(msg) => assert!(msg.contains("phase 2"), "{msg}"),
+            other => panic!("expected a validation error, got {other:?}"),
         }
         assert!(validate_format_supports_repo_type(&ap, &RepositoryType::Local, "t").is_err());
+        assert!(validate_format_supports_repo_type(&ap, &RepositoryType::Remote, "t").is_err());
         // Other formats are untouched.
         assert!(validate_format_supports_repo_type(
             &RepositoryFormat::Jetbrains,

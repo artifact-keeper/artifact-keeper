@@ -356,7 +356,7 @@ pub const ALL_REPO_TYPES: &[&str] = &["local", "staging", "remote", "virtual"];
 /// `repository_types`, and repository creation enforces it.
 pub fn supported_repo_types(handler_key: &str) -> &'static [&'static str] {
     match handler_key {
-        "agentplugins" => &["local", "staging"],
+        "agentplugins" => &["local", "staging", "remote"],
         _ => ALL_REPO_TYPES,
     }
 }
