@@ -1278,8 +1278,8 @@ API's usual `{"code", "message"}` body.
 | `POST /catalog/bulk-block` | admin | `{"pattern": "io.github.acme/*", "reason": "...", "dryRun": false}` | `200 BulkResult`; `400` bad pattern; `422` a bare namespace |
 | `POST /catalog/bulk-decide` | admin | `{"ids": ["<uuid>", ...], "action": "approve" \| "block", "reason": "..."}` (1 to 500 ids, names or `name@version` rows) | `200 BulkDecideResult`; `400` no ids or more than 500; `422` another `action` |
 | `POST /catalog/{id}/request-approval` | read | `{"note": "..."}` (optional, 500 characters kept) | `200 CatalogItem` |
-| `GET /sync` | read | | `200 SyncState` |
-| `POST /sync` | admin, or an API token with `trigger:sync` and access to the repository | | `200 {"repository": "<key>", "summary": SyncSummary}`; `409` a run is in progress; `502` upstream unreadable |
+| `GET /sync` | read | | `200 SyncStatus` |
+| `POST /sync` | admin, or an API token with `trigger:sync` and access to the repository | | `202 {"repository": "<key>", "status": "running", "statusUrl": "/api/v1/repositories/<key>/mcp/sync"}`: the pass runs in the background; `409` a pass is already running, or scheduled upstream jobs are paused; `502` this instance has no outbound fetch path |
 
 `GET /api/v1/mcp/pending-summary` (authenticated; token scope
 `read:repositories`) counts the approval queue across every Remote MCP
@@ -1303,6 +1303,37 @@ and `POST /api/v1/curation/packages/bulk-approve|bulk-block` (instance
 administrators) audit and ingest MCP rows the same way, and
 `POST /api/v1/curation/repos/{key}/sync` runs this sync for a Remote MCP
 repository.
+
+**Manual sync.** `POST /sync` starts a pass in the background and answers
+`202` at once, so a pass longer than the request timeout
+(`GLOBAL_REQUEST_TIMEOUT_SECS`, 120 s by default) is not cut off: a first
+pass of the official registry often is. The pass is the scheduled one (the
+same code, the same per-repository cluster-wide lock, the same stored
+state), on a task of its own, so it continues after the request ends. Poll
+`GET /sync`: `running` is `true` while a pass of the repository (manual or
+scheduled, on any replica) holds the lock; once it is `false`,
+`lastFinishedAt`, `lastError` and `lastSummary` describe the pass that ended
+last. A failure the old trigger answered `502` (the first upstream page
+unreadable) is now recorded there: `lastError` is set and
+`lastSummary.pages` is `0`. Only one pass runs at a time: a trigger while one runs answers `409`
+and starts nothing. A trigger while scheduled upstream jobs are paused
+(`upstream_jobs_paused`, `UPSTREAM_JOBS_PAUSED`) also answers `409`, without
+contacting the upstream, as the scheduled pass skips its tick. A cache-only
+Remote's pass goes through the same upstream gate as the scheduled one, so
+it reads only cached pages and makes no upstream request.
+
+```bash
+curl -s -X POST "$AK/api/v1/repositories/mcp-official/mcp/sync" -H "Authorization: Bearer $TOKEN"
+# 202 {"repository":"mcp-official","status":"running","statusUrl":"/api/v1/repositories/mcp-official/mcp/sync"}
+until curl -s "$AK/api/v1/repositories/mcp-official/mcp/sync" -H "Authorization: Bearer $TOKEN" \
+  | jq -e '.running == false' >/dev/null; do sleep 10; done
+curl -s "$AK/api/v1/repositories/mcp-official/mcp/sync" -H "Authorization: Bearer $TOKEN" \
+  | jq '{lastFinishedAt, lastError, complete: .lastSummary.complete}'
+```
+
+A pass stops after 200 pages; the next one resumes at its cursor, so a
+large registry needs several passes (`lastSummary.complete` is `false`
+until one reaches the last page).
 
 Approving a name (or pinning a version) ingests it right away; when upstream
 cannot be reached the approval stands, `ingestError` says why, and the next
@@ -1396,8 +1427,9 @@ BulkResult     { approved: n, blocked: n,             // one of them is 0
                  skippedDenied: n, skippedReview: n, dryRun: bool }
 BulkDecideResult { action: "approve" | "block", decided: uuid[], unchanged: uuid[],
                    skippedDenied: uuid[], notFound: uuid[] }
-SyncState      { updatedSince, resumeCursor, resumeSince, lastStartedAt,
-                 lastFinishedAt, lastSucceededAt, lastError, lastSummary: SyncSummary }
+SyncStatus     { updatedSince, resumeCursor, resumeSince, lastStartedAt,
+                 lastFinishedAt, lastSucceededAt, lastError, lastSummary: SyncSummary,
+                 running: bool }                      // a pass holds the sync lock now
 SyncSummary    { pages, entries, namesNew, autoApproved, flagged, ingested,
                  unchanged, statusChanged, drifted, invalid, unresolved,
                  reResolved, backfilledNames, complete: bool, errors: string[] }

@@ -516,6 +516,9 @@ pub enum SyncError {
     /// The first upstream page could not be read.
     Upstream(String),
     Database(String),
+    /// Scheduled upstream jobs are paused on this instance (#5288): a manual
+    /// trigger starts no pass either (#5404).
+    Paused,
 }
 
 impl std::fmt::Display for SyncError {
@@ -526,6 +529,11 @@ impl std::fmt::Display for SyncError {
             SyncError::NoProxy => write!(f, "outbound fetches are not available"),
             SyncError::Upstream(e) => write!(f, "upstream: {e}"),
             SyncError::Database(e) => write!(f, "database: {e}"),
+            SyncError::Paused => write!(
+                f,
+                "scheduled upstream jobs are paused on this instance (upstream_jobs_paused); \
+                 no sync starts until the switch is off"
+            ),
         }
     }
 }
@@ -1813,20 +1821,78 @@ async fn save_state(db: &PgPool, repo_id: Uuid, s: &SyncState, ok: bool) -> Resu
     Ok(())
 }
 
+/// The advisory-lock object id of a repository's sync lock.
+fn lock_object_id(repo_id: Uuid) -> i32 {
+    crate::services::cluster_lock::lease_object_id(&format!("mcp-remote-sync/{repo_id}"))
+}
+
 /// Hold the per-repository sync lock (cluster-wide) for the rest of the run.
 async fn lock_repo(
     db: &PgPool,
     repo_id: Uuid,
 ) -> Result<crate::services::cluster_lock::ClusterLease, SyncError> {
-    use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+    use crate::services::cluster_lock::{ClusterLock, PgAdvisoryLock};
     PgAdvisoryLock::new(db.clone())
-        .try_acquire(
-            SYNC_LOCK_CLASS,
-            lease_object_id(&format!("mcp-remote-sync/{repo_id}")),
-        )
+        .try_acquire(SYNC_LOCK_CLASS, lock_object_id(repo_id))
         .await
         .map_err(|e| SyncError::Database(e.to_string()))?
         .ok_or(SyncError::Busy)
+}
+
+/// Whether any replica runs a sync of the repository right now: its sync
+/// lock is held (read from `pg_locks`, so the check never takes the lock and
+/// cannot make a starting pass answer [`SyncError::Busy`]).
+pub async fn sync_running(db: &PgPool, repo_id: Uuid) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+             AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 2 AND granted)",
+    )
+    .bind(i64::from(SYNC_LOCK_CLASS))
+    .bind(i64::from(lock_object_id(repo_id) as u32))
+    .fetch_one(db)
+    .await
+    .map_err(db_err)
+}
+
+/// Start a sync of `repo` in the background (the manual trigger, #5404).
+///
+/// Everything that can refuse the run is checked before this returns: no
+/// proxy service, scheduled upstream jobs paused (#5288, the switch the
+/// scheduled pass obeys), not a Remote MCP repository, and the repository's
+/// sync lock, which is taken here ([`SyncError::Busy`] when another run holds
+/// it) and handed to the spawned pass. The pass is the scheduler's
+/// ([`run_locked`]), on a task of its own, so it does not end with the
+/// request that started it; its outcome is the stored [`SyncState`].
+pub async fn start_sync(state: &SharedState, repo: RepoInfo) -> Result<(), SyncError> {
+    if state.proxy_service.is_none() {
+        return Err(SyncError::NoProxy);
+    }
+    if upstream_pause::upstream_jobs_paused(&state.db).await {
+        return Err(SyncError::Paused);
+    }
+    RunCtx::load(state, &repo).await?;
+    let lease = lock_repo(&state.db, repo.id).await?;
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = match RunCtx::load(&state, &repo).await {
+            Ok(mut run) => run_locked(&mut run).await,
+            Err(e) => Err(e),
+        };
+        lease.release().await;
+        match result {
+            Ok(s) => tracing::info!(
+                repository = %repo.key,
+                pages = s.pages,
+                ingested = s.ingested,
+                complete = s.complete,
+                "MCP remote manual sync finished"
+            ),
+            Err(e) => {
+                tracing::warn!(repository = %repo.key, error = %e, "MCP remote manual sync failed")
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Run one sync of `repo` (manual trigger or scheduler). Holds the
@@ -2569,6 +2635,7 @@ mod tests {
             (SyncError::NoProxy, "outbound"),
             (SyncError::Upstream("x".into()), "upstream"),
             (SyncError::Database("x".into()), "database"),
+            (SyncError::Paused, "paused"),
         ] {
             assert!(e.to_string().contains(needle));
         }

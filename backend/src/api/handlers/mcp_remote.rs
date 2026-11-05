@@ -6,6 +6,7 @@
 //! `docs/mcp-registry.md` ("Remote repositories").
 
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ use crate::services::mcp_catalog::{
     self as catalog, BulkAction, BulkDecideResult, BulkResult, CatalogItem, CatalogPage,
     CatalogQuery, CatalogView, Decision, DecisionResult,
 };
-use crate::services::mcp_remote::{self, SyncError, SyncState, SyncSummary};
+use crate::services::mcp_remote::{self, SyncError, SyncState};
 use crate::services::repository_service::RepositoryService;
 
 pub fn repo_router() -> Router<SharedState> {
@@ -89,7 +90,7 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
         BulkDecideRequest,
         PinRequest,
         ApprovalRequestBody,
-        SyncResponse,
+        SyncAcceptedResponse,
         PendingSummary,
         PendingRepository,
     ))
@@ -610,6 +611,19 @@ pub async fn request_approval(
     ))
 }
 
+/// `GET .../mcp/sync`: the stored sync state and whether a pass runs now.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatusResponse {
+    #[serde(flatten)]
+    pub state: SyncState,
+    /// A pass of this repository (manual or scheduled, on any replica) holds
+    /// its sync lock right now (#5404). Once it is `false` again,
+    /// `lastFinishedAt`, `lastError` and `lastSummary` describe the pass that
+    /// ended last.
+    pub running: bool,
+}
+
 #[utoipa::path(
     get,
     operation_id = "mcp_remote_sync_status",
@@ -617,33 +631,42 @@ pub async fn request_approval(
     context_path = "/api/v1/repositories",
     tag = "mcp",
     params(("key" = String, Path, description = "Remote MCP repository key")),
-    responses((status = 200, body = Object, description = "The stored sync state"))
+    responses((status = 200, body = Object, description = "The stored sync state and `running`"))
 )]
 pub async fn sync_status(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-) -> Result<Json<SyncState>> {
+) -> Result<Json<SyncStatusResponse>> {
     let auth = require_auth(auth)?;
     let repo = readable_repo(&state, &auth, &key).await?;
-    mcp_remote::load_state(&state.db, repo.id)
+    let stored = mcp_remote::load_state(&state.db, repo.id)
         .await
-        .map(Json)
-        .map_err(AppError::Database)
+        .map_err(AppError::Database)?;
+    let running = mcp_remote::sync_running(&state.db, repo.id)
+        .await
+        .map_err(AppError::Database)?;
+    Ok(Json(SyncStatusResponse {
+        state: stored,
+        running,
+    }))
 }
 
-/// Answer of a manual sync.
+/// `202` answer of a manual sync: the pass runs in the background (#5404).
 #[derive(Debug, Serialize, ToSchema)]
-pub struct SyncResponse {
+#[serde(rename_all = "camelCase")]
+pub struct SyncAcceptedResponse {
     pub repository: String,
-    #[schema(value_type = Object)]
-    pub summary: SyncSummary,
+    /// Always `running`: the pass holds the repository's sync lock.
+    pub status: String,
+    /// Where to poll the pass (`GET .../mcp/sync`).
+    pub status_url: String,
 }
 
 /// Map a sync refusal onto the API's errors.
 pub fn sync_error(e: SyncError) -> AppError {
     match e {
-        SyncError::Busy => AppError::Conflict(e.to_string()),
+        SyncError::Busy | SyncError::Paused => AppError::Conflict(e.to_string()),
         SyncError::NotRemote => AppError::Validation(e.to_string()),
         SyncError::NoProxy | SyncError::Upstream(_) => AppError::BadGateway(e.to_string()),
         SyncError::Database(_) => AppError::Database(e.to_string()),
@@ -658,16 +681,16 @@ pub fn sync_error(e: SyncError) -> AppError {
     tag = "mcp",
     params(("key" = String, Path, description = "Remote MCP repository key")),
     responses(
-        (status = 200, body = SyncResponse),
-        (status = 409, description = "A sync of this repository is running"),
-        (status = 502, description = "The upstream registry could not be read"),
+        (status = 202, body = SyncAcceptedResponse, description = "A pass started in the background; poll `GET .../mcp/sync`"),
+        (status = 409, description = "A sync of this repository is running, or scheduled upstream jobs are paused"),
+        (status = 502, description = "Outbound fetches are not available on this instance"),
     )
 )]
 pub async fn trigger_sync(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(key): Path<String>,
-) -> Result<Json<SyncResponse>> {
+) -> Result<(StatusCode, Json<SyncAcceptedResponse>)> {
     let auth = require_auth(auth)?;
     let repo = if auth.is_api_token && auth.has_scope("trigger:sync") {
         let service = RepositoryService::new(state.db.clone());
@@ -677,13 +700,18 @@ pub async fn trigger_sync(
     } else {
         administered_repo(&state, &auth, &key).await?
     };
-    let summary = mcp_remote::sync_repo(&state, &repo)
+    let key = repo.key.clone();
+    mcp_remote::start_sync(&state, repo)
         .await
         .map_err(sync_error)?;
-    Ok(Json(SyncResponse {
-        repository: repo.key,
-        summary,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SyncAcceptedResponse {
+            status_url: format!("/api/v1/repositories/{key}/mcp/sync"),
+            repository: key,
+            status: "running".to_string(),
+        }),
+    ))
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -701,6 +729,7 @@ mod tests {
         use axum::response::IntoResponse;
         for (e, status) in [
             (SyncError::Busy, 409),
+            (SyncError::Paused, 409),
             (SyncError::NotRemote, 400),
             (SyncError::NoProxy, 502),
             (SyncError::Upstream("x".into()), 502),
@@ -812,10 +841,29 @@ mod tests {
             self.call(Some(self.admin.clone()), verb, &uri, body).await
         }
 
+        /// Start a manual sync (`202`), wait for the pass to end and return
+        /// its summary.
         async fn sync(&self) -> serde_json::Value {
             let (s, b) = self.admin("POST", "/sync", None).await;
-            assert_eq!(s, StatusCode::OK, "{b}");
-            b["summary"].clone()
+            assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+            self.settled().await["lastSummary"].clone()
+        }
+
+        /// The sync state once no pass of the repository runs.
+        async fn settled(&self) -> serde_json::Value {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let (s, st) = self.admin("GET", "/sync", None).await;
+                assert_eq!(s, StatusCode::OK, "{st}");
+                if st["running"] == false {
+                    return st;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sync still running: {st}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
 
         async fn item(&self, name: &str) -> serde_json::Value {
@@ -1588,9 +1636,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&env.upstream)
             .await;
+        // The pass starts (202); its failure on the first page is recorded.
         let (s, b) = env.admin("POST", "/sync", None).await;
-        assert_eq!(s, StatusCode::BAD_GATEWAY, "{b}");
-        let (_, st) = env.admin("GET", "/sync", None).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let st = env.settled().await;
         assert!(st["lastError"].is_string(), "{st}");
         // A held lock answers 409.
         let lease = crate::services::cluster_lock::ClusterLock::try_acquire(
@@ -1619,6 +1668,100 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         tdh::cleanup_member_repo(&env.fx.pool, id, &dir).await;
+        env.teardown().await;
+    }
+    /// #5404: a manual sync answers `202` at once and its pass, slower than
+    /// the request, still completes. A second trigger while it runs answers
+    /// `409` and starts no parallel pass.
+    #[tokio::test]
+    async fn manual_sync_runs_in_the_background() {
+        let Some(env) = Env::new().await else { return };
+        let doc = server("io.github.acme/slow", "1.0.0", serde_json::json!({}));
+        Mock::given(method("GET"))
+            .and(path("/v0.1/servers"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![entry(doc, T1)]))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&env.upstream)
+            .await;
+
+        let started = std::time::Instant::now();
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the trigger waited for the pass: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(b["status"], "running", "{b}");
+        assert_eq!(
+            b["statusUrl"],
+            format!("/api/v1/repositories/{}/mcp/sync", env.fx.repo_key)
+        );
+
+        // The request is over; the pass runs on.
+        let (s, st) = env.admin("GET", "/sync", None).await;
+        assert_eq!(s, StatusCode::OK, "{st}");
+        assert_eq!(st["running"], true, "{st}");
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+
+        let st = env.settled().await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(3),
+            "settled before the slow page was served"
+        );
+        assert_eq!(st["lastSummary"]["pages"], 1, "{st}");
+        assert_eq!(st["lastSummary"]["complete"], true, "{st}");
+        assert!(st["lastFinishedAt"].is_string(), "{st}");
+        assert!(st["lastError"].is_null(), "{st}");
+        assert_eq!(st["lastSummary"]["namesNew"], 1, "{st}");
+        assert_eq!(
+            env.item("io.github.acme/slow").await["status"],
+            "pending",
+            "the pass recorded the name"
+        );
+        let listings = env
+            .upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == "/v0.1/servers")
+            .count();
+        assert_eq!(listings, 1, "the refused trigger started no second pass");
+        env.teardown().await;
+    }
+
+    /// #5404: while scheduled upstream jobs are paused (#5288) a manual
+    /// trigger answers `409` and contacts no upstream, as the scheduled pass
+    /// skips its tick.
+    #[tokio::test]
+    async fn manual_sync_honours_the_upstream_jobs_pause() {
+        let Some(env) = Env::new().await else { return };
+        env.serve(Mock::given(method("GET")), vec![]).await;
+        // The env default is process-wide; nextest runs each test in its own
+        // process, so no other test sees it.
+        crate::services::upstream_pause::set_env_default(true);
+        let (s, b) = env.admin("POST", "/sync", None).await;
+        crate::services::upstream_pause::set_env_default(false);
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert!(
+            b["message"].as_str().unwrap_or_default().contains("paused"),
+            "{b}"
+        );
+        let st = env.settled().await;
+        assert!(st["lastStartedAt"].is_null(), "{st}");
+        assert!(
+            env.upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "no upstream request while paused"
+        );
         env.teardown().await;
     }
 }
