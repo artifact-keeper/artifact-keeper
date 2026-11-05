@@ -6021,7 +6021,7 @@ async fn store_npm_version(
 /// a package with no install scripts still records a row, because "we looked
 /// and there were none" and "we never looked" must stay distinguishable
 /// (#4047).
-async fn record_npm_install_script_analysis(
+pub(crate) async fn record_npm_install_script_analysis(
     state: &SharedState,
     artifact_id: uuid::Uuid,
     version_data: &serde_json::Value,

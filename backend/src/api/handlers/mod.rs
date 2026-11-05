@@ -430,6 +430,7 @@ pub mod email_subscriptions;
 pub mod environments;
 pub mod events;
 pub mod general;
+pub(crate) mod generic_put_finalize;
 pub mod gitlfs;
 pub mod goproxy;
 pub mod groups;

@@ -3595,6 +3595,28 @@ pub fn captured_metric<'a>(
     })
 }
 
+/// A minimal npm tarball (`package/package.json` naming `name`@`version`), as
+/// `npm pack` lays it out. The generic upload finalizes a `.tgz` at an npm
+/// layout path from it (#5254), so a fixture standing in for a published
+/// tarball must be a real one.
+pub fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+    let package_json = serde_json::json!({ "name": name, "version": version }).to_string();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut builder = tar::Builder::new(&mut gz);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/package.json").unwrap();
+        header.set_size(package_json.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, package_json.as_bytes()).unwrap();
+        builder.finish().unwrap();
+    }
+    gz.flush().unwrap();
+    gz.finish().unwrap()
+}
+
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
 // #1315 token-mint surface gate, which skips test modules, does not count the
 // API-token mint below as a production endpoint.

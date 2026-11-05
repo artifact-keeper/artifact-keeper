@@ -9746,7 +9746,9 @@ impl GenericStagedBody {
 /// Where a generic upload's body is staged (#3916): on the repository's own
 /// object-storage backend, unless the repository is filesystem-backed or a
 /// downstream consumer reads the body as a local file -- the RPM header parse
-/// (#3801) or a WASM format plugin (#2517 plugin-input decision).
+/// (#3801), a format's native finalize that reads a file (a Debian, Maven
+/// POM, npm, PyPI, Incus or RPM package, #5254) or a WASM format plugin (#2517
+/// plugin-input decision).
 struct GenericStagingPlan {
     format: crate::models::repository::RepositoryFormat,
     location: Option<crate::storage::StorageLocation>,
@@ -9771,16 +9773,13 @@ impl GenericStagingPlan {
 
     /// The backend to stage a body bound for `path` on, or `None` for local
     /// scratch. A `path` not yet known (a multipart form can name it after the
-    /// file) is treated as possibly an `.rpm`, so an RPM repository spools.
+    /// file) is treated as possibly a package the finalize reads as a file, so
+    /// such a format's repository spools.
     fn backend_for(&self, path: Option<&str>) -> Option<&crate::storage::StorageLocation> {
-        let rpm_parse = match path {
-            Some(path) => super::upload::rpm_header_metadata_eligible(&self.format, path),
-            None => matches!(
-                self.format,
-                crate::models::repository::RepositoryFormat::Rpm
-            ),
-        };
-        self.location.as_ref().filter(|_| !rpm_parse)
+        let local_parse = path
+            .is_some_and(|path| super::upload::rpm_header_metadata_eligible(&self.format, path))
+            || super::generic_put_finalize::needs_local_file(&self.format, path);
+        self.location.as_ref().filter(|_| !local_parse)
     }
 
     fn on_backend(&self, path: Option<&str>) -> bool {
@@ -9959,6 +9958,15 @@ async fn persist_generic_staged_upload(
     )
     .map_err(|e| e.into_response())?;
 
+    // A TRUSTED replication push (admin or service account) is stored as the
+    // source sent it, with nothing derived from the bytes. The replication
+    // header alone is client-set, so an untrusted caller gets the full parse.
+    let replication_trusted = replication_exemption_trusted(
+        is_replication_request(headers),
+        auth.is_admin,
+        auth.is_service_account,
+    );
+
     // #3801: an `.rpm` pushed into an RPM repository through this generic
     // endpoint gets the same header parse as the native and chunked paths —
     // on the blocking pool, BEFORE anything is stored — so a header over the
@@ -9968,11 +9976,8 @@ async fn persist_generic_staged_upload(
     // replication push (admin or service account, `replication_exemption_
     // trusted`) skips it: the replication header alone is client-set.
     let rpm_metadata = if super::upload::rpm_header_metadata_eligible(&repo.format, &path)
-        && !replication_exemption_trusted(
-            is_replication_request(headers),
-            auth.is_admin,
-            auth.is_service_account,
-        ) {
+        && !replication_trusted
+    {
         // The #3801 gate must not fail open: a `.rpm` that reached here staged
         // on the backend means `GenericStagingPlan` disagreed with this check,
         // which is a server bug, not a reason to skip the parse.
@@ -10009,9 +10014,11 @@ async fn persist_generic_staged_upload(
         .await
         .map_err(|e| e.into_response())?;
     let mut wasm_metadata = None;
+    let mut wasm_format = false;
 
     if let (Some(ref fk), Some(ref registry)) = (&format_key, &state.plugin_registry) {
         if registry.has_format(fk).await {
+            wasm_format = true;
             // WASM-PLUGIN-INPUT (#2517 product decision): format plugins receive
             // the whole artifact body by value across the WASM ABI. A repo with a
             // registered WASM format handler therefore still materialises the
@@ -10052,9 +10059,29 @@ async fn persist_generic_staged_upload(
         }
     }
 
-    // Use WASM-extracted metadata if available, otherwise try to derive
-    // name and version from the path segments (e.g. "pkg/v1/file.txt").
-    let (name, version) = if let Some(ref meta) = wasm_metadata {
+    // #5254: a package at its format's native layout path gets the native
+    // route's parse, BEFORE anything is stored, so a package that route
+    // refuses is refused here too and nothing is left behind. A WASM format
+    // plugin owns its repository's metadata, and a trusted replication push
+    // is stored as sent, so neither runs it.
+    let native = if wasm_format || replication_trusted {
+        None
+    } else {
+        match stage_generic_native_finalize(state, repo, &path, &staged).await {
+            Ok(native) => native,
+            Err(rejection) => {
+                staged.discard().await;
+                return Err(rejection);
+            }
+        }
+    };
+
+    // The native route's coordinates for a natively finalized package; else
+    // WASM-extracted metadata if available, otherwise try to derive name and
+    // version from the path segments (e.g. "pkg/v1/file.txt").
+    let (name, version) = if let Some((target, _)) = &native {
+        (target.name.clone(), Some(target.version.clone()))
+    } else if let Some(ref meta) = wasm_metadata {
         (name, meta.version.clone())
     } else {
         derive_generic_path_coordinate(&path, repo.format.handler_key() == "npm", name)
@@ -10081,15 +10108,23 @@ async fn persist_generic_staged_upload(
 
     // Content-Type resolution priority:
     //   1. WASM plugin metadata (format-aware)
-    //   2. the request's declared Content-Type header (honour the client)
+    //   2. the request's declared Content-Type header (honour the client),
+    //      unless a natively finalized package declares none beyond the
+    //      generic `application/octet-stream`, when it takes the type its
+    //      native route stores (#5254)
     //   3. mime_guess from the path extension
     let declared_content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
+    let native_content_type = native
+        .as_ref()
+        .and_then(|_| super::generic_put_finalize::native_content_type(&repo.format, &path));
     let content_type = wasm_metadata
         .as_ref()
         .map(|m| m.content_type.clone())
-        .unwrap_or_else(|| resolve_upload_content_type(declared_content_type, &path));
+        .unwrap_or_else(|| {
+            resolve_native_upload_content_type(declared_content_type, &path, native_content_type)
+        });
 
     // No pre-cleanup here: this generic upload endpoint persists through
     // `artifact_service::upload_stream_with_sync_options`, whose
@@ -10123,7 +10158,25 @@ async fn persist_generic_staged_upload(
     // whether or not the upload succeeded.
     staged.discard().await;
     let artifact = artifact.map_err(|e| e.into_response())?;
-    if let Some(metadata) = &rpm_metadata {
+    if let Some((target, staged_native)) = native {
+        let context = super::generic_put_finalize::FinalizeContext {
+            repository_id: repo.id,
+            repository_key: &key,
+            artifact_path: &artifact.path,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: &artifact.checksum_sha256,
+        };
+        super::generic_put_finalize::record(
+            state,
+            &artifact_service,
+            &context,
+            artifact.id,
+            &target,
+            staged_native,
+            rpm_metadata.as_ref(),
+        )
+        .await;
+    } else if let Some(metadata) = &rpm_metadata {
         if let Err(e) =
             super::rpm::record_rpm_metadata(&state.db, artifact.id, repo.id, metadata).await
         {
@@ -10186,6 +10239,90 @@ async fn persist_generic_staged_upload(
         }),
     )
         .into_response())
+}
+
+/// Run the format-native finalize (#5254) over a single generic upload's
+/// staged body, before it is stored. `Ok(None)` when the path is not a package
+/// the format's native route indexes (the upload keeps the generic
+/// behaviour). A package that route refuses -- a control file, `package.json`
+/// or wheel `METADATA` that disagrees with the path -- is refused with 400; an
+/// unreadable package that route stores unindexed (an `.apk` with no control
+/// segment) is stored the same way.
+///
+/// The body is never buffered whole: a parser that reads a file gets the
+/// staged file ([`GenericStagingPlan`] spools those uploads locally), the
+/// Alpine parse reads only the package head (a ranged read of the staging
+/// object when the body is staged on the storage backend).
+#[allow(clippy::result_large_err)]
+async fn stage_generic_native_finalize(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+    staged: &GenericStagedBody,
+) -> std::result::Result<
+    Option<(
+        super::generic_put_finalize::NativeTarget,
+        super::generic_put_finalize::StagedNativeFinalize,
+    )>,
+    Response,
+> {
+    use super::generic_put_finalize::{self as finalize, FinalizeInput, FinalizeSource};
+    let Some(target) = finalize::native_target(&repo.format, path) else {
+        return Ok(None);
+    };
+    let source = match (target.input, staged) {
+        (FinalizeInput::PathOnly, _) => FinalizeSource::None,
+        (_, GenericStagedBody::Local(local)) => FinalizeSource::File(local.path()),
+        (FinalizeInput::Head, GenericStagedBody::Backend(backend)) => {
+            let length = usize::try_from(backend.size_bytes())
+                .unwrap_or(usize::MAX)
+                .min(super::alpine::FINALIZE_HEAD_BYTES);
+            let head = if length == 0 {
+                Vec::new()
+            } else {
+                state
+                    .storage_for_repo(&repo.storage_location())
+                    .map_err(|e| e.into_response())?
+                    .get_range(backend.key(), 0, length)
+                    .await
+                    .map_err(|e| e.into_response())?
+                    .to_vec()
+            };
+            FinalizeSource::Head(head)
+        }
+        // `GenericStagingPlan` spools every upload whose finalize reads a
+        // file; one staged on the backend is a server bug, not a reason to
+        // skip the parse.
+        (FinalizeInput::LocalFile, GenericStagedBody::Backend(_)) => {
+            return Err(proxy_helpers::internal_error(
+                "Format metadata parse needs a local body",
+                "upload body is staged on the storage backend, not local disk",
+            ));
+        }
+    };
+    finalize::stage(&repo.format, path, target, source)
+        .await
+        .map(Some)
+        .map_err(|reason| AppError::Validation(reason).into_response())
+}
+
+/// [`resolve_upload_content_type`] for a natively finalized package: a
+/// request that declares no type, or only the generic
+/// `application/octet-stream`, takes `native` (the type the format's native
+/// route stores) instead of a guess from the extension.
+fn resolve_native_upload_content_type(
+    declared: Option<&str>,
+    path: &str,
+    native: Option<&str>,
+) -> String {
+    let undeclared = declared.is_none_or(|raw| {
+        let base = raw.split(';').next().unwrap_or(raw).trim();
+        base.is_empty() || base.eq_ignore_ascii_case("application/octet-stream")
+    });
+    match native {
+        Some(native) if undeclared => native.to_string(),
+        _ => resolve_upload_content_type(declared, path),
+    }
 }
 
 /// Resolve the Content-Type for a generic artifact upload.
@@ -20109,6 +20246,67 @@ mod tests {
         let filesystem = plan(RepositoryFormat::Generic, None);
         assert!(!filesystem.on_backend(Some("a/b.bin")));
         assert!(!filesystem.on_backend(None));
+    }
+
+    /// #5254: a package whose native finalize reads a file (a Debian pool
+    /// package, an npm tarball) spools locally on an object-storage
+    /// repository; an `.apk` (read by its head) and any other file stage on
+    /// the backend.
+    #[test]
+    fn generic_staging_plan_spools_file_read_packages_5254() {
+        use crate::models::repository::RepositoryFormat;
+        let location = || {
+            Some(crate::storage::StorageLocation {
+                backend: "s3".to_string(),
+                path: "repo".to_string(),
+            })
+        };
+        let debian = GenericStagingPlan {
+            format: RepositoryFormat::Debian,
+            location: location(),
+        };
+        assert!(!debian.on_backend(Some("pool/main/h/hello/hello_1.0_amd64.deb")));
+        assert!(debian.on_backend(Some("docs/readme.txt")));
+        assert!(!debian.on_backend(None));
+        let npm = GenericStagingPlan {
+            format: RepositoryFormat::Npm,
+            location: location(),
+        };
+        assert!(!npm.on_backend(Some("left-pad/1.3.0/left-pad-1.3.0.tgz")));
+        assert!(npm.on_backend(Some("left-pad/readme.md")));
+        let alpine = GenericStagingPlan {
+            format: RepositoryFormat::Alpine,
+            location: location(),
+        };
+        assert!(alpine.on_backend(Some("v3.24/main/x86_64/nginx-1.30.6-r0.apk")));
+        assert!(alpine.on_backend(None));
+    }
+
+    /// #5254: a natively finalized package takes its native route's content
+    /// type unless the client declared a specific one.
+    #[test]
+    fn native_upload_content_type_5254() {
+        let apk = Some("application/vnd.alpine.package");
+        assert_eq!(
+            resolve_native_upload_content_type(None, "a/b/c/x-1-r0.apk", apk),
+            "application/vnd.alpine.package"
+        );
+        assert_eq!(
+            resolve_native_upload_content_type(
+                Some("application/octet-stream"),
+                "a/b/c/x-1-r0.apk",
+                apk
+            ),
+            "application/vnd.alpine.package"
+        );
+        assert_eq!(
+            resolve_native_upload_content_type(Some("application/x-tar"), "a/b/c/x-1-r0.apk", apk),
+            "application/x-tar"
+        );
+        assert_eq!(
+            resolve_native_upload_content_type(None, "notes.txt", None),
+            "text/plain"
+        );
     }
 
     /// #3916: a generic staging object whose upload died before promoting or
@@ -32163,13 +32361,16 @@ mod tests {
         // `npm::store_npm_version` writes.
         let unscoped_stored = "npm-test/1.0.0/npm-test-1.0.0.tgz".to_string();
         let scoped_stored = "@scope/pkg/2.1.0/pkg-2.1.0.tgz".to_string();
-        for p in [&unscoped_stored, &scoped_stored] {
+        for (p, name, version) in [
+            (&unscoped_stored, "npm-test", "1.0.0"),
+            (&scoped_stored, "@scope/pkg", "2.1.0"),
+        ] {
             upload_artifact(
                 State(state.clone()),
                 Extension(auth.clone()),
                 Path((key.clone(), p.clone())),
                 HeaderMap::new(),
-                Body::from(Bytes::from_static(b"TARBALL-BYTES")),
+                Body::from(tdh::npm_tarball(name, version)),
             )
             .await
             .expect("publish must succeed");

@@ -3475,18 +3475,18 @@ pub(crate) fn maven_version_directory(path: &str) -> Option<&str> {
     path.rfind('/').map(|i| &path[..=i])
 }
 
-fn maven_package_name(coords: &MavenCoordinates) -> String {
+pub(crate) fn maven_package_name(coords: &MavenCoordinates) -> String {
     format!("{}:{}", coords.group_id, coords.artifact_id)
 }
 
-fn maven_package_description(metadata: &serde_json::Value) -> Option<String> {
+pub(crate) fn maven_package_description(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("description")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
 }
 
-fn build_maven_package_catalog_metadata(
+pub(crate) fn build_maven_package_catalog_metadata(
     coords: &MavenCoordinates,
     metadata: &serde_json::Value,
 ) -> serde_json::Value {

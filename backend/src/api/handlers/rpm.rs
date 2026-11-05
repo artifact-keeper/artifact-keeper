@@ -684,7 +684,7 @@ async fn serve_version_package(
 /// Examples:
 ///   my-package-1.0.0-1.x86_64.rpm -> ("my-package", "1.0.0", "1", "x86_64")
 ///   hello-2.10-1.el8.noarch.rpm   -> ("hello", "2.10", "1.el8", "noarch")
-fn parse_rpm_filename(filename: &str) -> Option<(String, String, String, String)> {
+pub(crate) fn parse_rpm_filename(filename: &str) -> Option<(String, String, String, String)> {
     let stem = filename.strip_suffix(".rpm")?;
 
     // Find arch: last dot-separated segment
@@ -2737,13 +2737,13 @@ fn build_rpm_storage_key(repo_id: &uuid::Uuid, filename: &str) -> String {
 }
 
 /// Build the full version string from version and release.
-fn build_rpm_full_version(version: &str, release: &str) -> String {
+pub(crate) fn build_rpm_full_version(version: &str, release: &str) -> String {
     format!("{}-{}", version, release)
 }
 
 /// Build the filename-derived RPM metadata JSON (fallback when the RPM header
 /// cannot be parsed).
-fn build_rpm_metadata(
+pub(crate) fn build_rpm_metadata(
     name: &str,
     version: &str,
     release: &str,
@@ -3338,9 +3338,9 @@ pub(crate) fn is_shell_interpreter(prog: &str) -> bool {
 /// /sbin/ldconfig`) still runs that program as root, so it is recorded with
 /// the program as its body under `rpm:header#POSTINPROG`; a bodiless default
 /// shell is a no-op and is not.
-type ExtractedScripts = (Vec<InstallScript>, Vec<UnanalyzedScript>, Completeness);
+pub(crate) type ExtractedScripts = (Vec<InstallScript>, Vec<UnanalyzedScript>, Completeness);
 
-fn extract_rpm_scriptlets(content: &[u8]) -> ExtractedScripts {
+pub(crate) fn extract_rpm_scriptlets(content: &[u8]) -> ExtractedScripts {
     let not_read = |reason: String| (Vec::new(), Vec::new(), Completeness::NotRead { reason });
     let header = match RpmHandler::parse_rpm_header(content) {
         Ok(header) => header,
