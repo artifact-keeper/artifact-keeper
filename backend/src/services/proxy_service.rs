@@ -5436,10 +5436,7 @@ impl UpstreamClient {
         // #5347: through the audited sender like every other upstream request
         // `ProxyService` makes, so a cold HEAD's probe is an `UPSTREAM_FETCHED`
         // row (method `HEAD`, caller `proxy`) when the audit mode asks for one.
-        let response = match self
-            .send(request, Some(repo_id), UpstreamCaller::Proxy)
-            .await
-        {
+        let response = match crate::services::upstream_tracing::send_upstream(request).await {
             Ok(response) => response,
             Err(e) => {
                 tracing::debug!(
