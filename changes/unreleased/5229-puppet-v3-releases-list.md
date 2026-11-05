@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5229]
+---
+- **`puppet module install --module_repository` now installs from a Puppet repository** (#5229). The client resolves a module through `GET /v3/releases?module=<owner>-<name>`, and that route only accepted `POST` (publish), so every install failed with `405 Method Not Allowed`. The route now lists the module's releases in the Forge v3 shape (`pagination` with `next`, and `results[]` carrying `version`, `file_uri`, `file_sha256` and the module's `metadata.json` as `metadata`), honouring `limit`, `offset`, `sort_by` and `exclude_fields`. A Remote repository forwards the upstream Forge's list, and a Virtual one merges its hosted members' releases with its Remote members' (a hosted version shadows the same version upstream). The advertised `file_uri` (here and on the module, release and publish responses) is now relative to the repository root, as the Forge's is: the client appends it to the `--module_repository` URL, so the old `/puppet/<repo>/v3/files/...` form was fetched as `/puppet/<repo>/puppet/<repo>/v3/files/...` and 404'd.
