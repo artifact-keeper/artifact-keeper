@@ -946,63 +946,9 @@ impl PeerInstanceService {
     /// one [`Self::run_mirror_pass`]. A failure on one subscription is logged
     /// and counted; the others still run.
     pub async fn run_due_mirror_passes(&self, now: DateTime<Utc>) -> Result<MirrorPassSummary> {
-        let peers: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT DISTINCT peer_instance_id FROM peer_repo_subscriptions \
-             WHERE sync_enabled = true AND replication_mode::text = 'mirror' \
-               AND replication_schedule IS NOT NULL",
-        )
-        .fetch_all(&self.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        let mut summary = MirrorPassSummary::default();
-        for peer_id in peers {
-            let repos = match self.get_repos_for_mirror_sync(peer_id).await {
-                Ok(repos) => repos,
-                Err(e) => {
-                    tracing::warn!(peer = %peer_id, "mirror schedule: listing subscriptions failed: {e}");
-                    summary.failed += 1;
-                    continue;
-                }
-            };
-            for repo in repos {
-                match mirror_schedule_state(repo.schedule.as_deref(), repo.last_replicated_at, now)
-                {
-                    MirrorScheduleState::Due => {}
-                    MirrorScheduleState::Invalid => {
-                        tracing::warn!(
-                            peer = %peer_id,
-                            repository = %repo.repo_id,
-                            schedule = repo.schedule.as_deref().unwrap_or_default(),
-                            "mirror subscription has an invalid replication_schedule; no \
-                             scheduled pass runs until it is corrected"
-                        );
-                        continue;
-                    }
-                    MirrorScheduleState::Unscheduled | MirrorScheduleState::NotDue => continue,
-                }
-                summary.due += 1;
-                match self
-                    .run_mirror_pass(peer_id, repo.repo_id, repo.last_replicated_at, now)
-                    .await
-                {
-                    Ok(Some(queued)) => {
-                        summary.passes += 1;
-                        summary.tasks_queued += queued;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            peer = %peer_id,
-                            repository = %repo.repo_id,
-                            "scheduled mirror pass failed, retried on the next tick: {e}"
-                        );
-                        summary.failed += 1;
-                    }
-                }
-            }
-        }
-        Ok(summary)
+        // NEGATIVE CHECK: the scheduled mirror job does nothing, as on main.
+        let _ = now;
+        Ok(MirrorPassSummary::default())
     }
 
     /// Remove repository subscription from peer instance
