@@ -114,6 +114,7 @@ async fn sort_by_size_asc_vs_desc_flips_head_hit() {
             hidden_artifact_ids: None,
             sort_by: Some("size".to_string()),
             sort_order: Some("asc".to_string()),
+            ..Default::default()
         })
         .await
         .expect("ASC search failed");
@@ -131,6 +132,7 @@ async fn sort_by_size_asc_vs_desc_flips_head_hit() {
             hidden_artifact_ids: None,
             sort_by: Some("size".to_string()),
             sort_order: Some("desc".to_string()),
+            ..Default::default()
         })
         .await
         .expect("DESC search failed");
@@ -202,6 +204,7 @@ async fn sort_by_size_asc_orders_full_result_set() {
             hidden_artifact_ids: None,
             sort_by: Some("size".to_string()),
             sort_order: Some("asc".to_string()),
+            ..Default::default()
         })
         .await
         .expect("search failed");
