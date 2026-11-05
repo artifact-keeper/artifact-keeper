@@ -18,7 +18,7 @@
 //! `"namespace/name"` inside the handler). See `router()` below.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -717,22 +717,336 @@ async fn proxy_model_info(
 /// Same contract as [`proxy_model_info`]: `Ok(None)` for a non-Remote repo so
 /// the caller keeps its existing behaviour, `Err` for a real upstream failure.
 ///
-/// Only the first page is proxied. The Hub paginates large trees with a `Link:
-/// rel="next"` header, which `proxy_fetch_capped` does not follow, so a model
-/// with more entries than one page holds is reported short here. `hf download`
-/// does not use this endpoint (it lists files from model-info `siblings`), so
-/// that limitation is not on the download path.
+/// # Query and pagination (#5321)
+///
+/// `snapshot_download` (`huggingface_hub` 1.x and 2.x) builds the snapshot
+/// from `tree/<commit>?recursive=true`, not from model-info `siblings`.
+/// Without the query the Hub lists only the top level, so every file in a
+/// subdirectory was silently left out of the snapshot. The allow-listed query
+/// ([`TreeQuery`]) is forwarded in one canonical spelling and is part of the
+/// fetch path, so it is also part of the proxy-cache key and of the upstream
+/// filter subject: each distinct listing is cached on its own.
+///
+/// The Hub pages trees (1000 entries, 50 with `expand`) and says where the
+/// next page is only in a `Link: <...cursor=...>; rel="next"` header. The proxy
+/// cache stores bodies, not that header, so the pages are followed here and
+/// returned as one array, each page cached under its own `cursor` key. A page
+/// shorter than the Hub's page size is the last one, which is every page of
+/// almost every model, so the common case is one cached fetch and works with
+/// the upstream unreachable. Only a full page costs an uncached fetch of the
+/// same URL to read its `Link` header; that fetch's body is the one served, so
+/// a page and the cursor after it always come from the same response. If that
+/// fetch fails the request fails: serving a short listing as complete is the
+/// bug this fixes. Bounded by [`MAX_TREE_PAGES`] and [`MAX_TREE_LISTING_BYTES`].
+///
+/// Following server-side rather than passing a rewritten `Link` through means
+/// no public base URL has to be reconstructed behind reverse proxies, and any
+/// client gets the full listing whether it follows `Link` or not.
 async fn proxy_model_tree(
     state: &SharedState,
     repo: &RepoInfo,
     model_id: &str,
     revision: &str,
+    query: &TreeQuery,
 ) -> Result<Option<Response>, Response> {
-    let upstream_path = format!(
+    let Some((upstream_url, proxy)) = remote_upstream(state, repo) else {
+        return Ok(None);
+    };
+
+    let page_size = query.hub_page_size();
+    let mut cursor = query.cursor.clone();
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut total_bytes = 0usize;
+    for page in 0..MAX_TREE_PAGES {
+        let upstream_path = tree_upstream_path(model_id, revision, query, cursor.as_deref());
+        // The real format reaches the cache classifier, which (with #5283)
+        // keeps a listing at a commit sha, page by page, as immutable.
+        let (bytes, _content_type) = proxy_helpers::proxy_fetch_capped_with_format(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &upstream_path,
+            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+            crate::models::repository::RepositoryFormat::Huggingface,
+        )
+        .await?;
+        let items = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Array(items)) => items,
+            // Not a listing: hand it back as before rather than fail a
+            // passthrough that works today.
+            _ if page == 0 => return Ok(Some(tree_json_response(strip_xet_metadata(bytes)))),
+            _ => {
+                return Err(tree_bad_gateway(
+                    "an upstream tree page is not a JSON array",
+                ))
+            }
+        };
+        if items.len() < page_size {
+            total_bytes += bytes.len();
+            if total_bytes > MAX_TREE_LISTING_BYTES {
+                return Err(tree_bad_gateway("the upstream tree listing is too large"));
+            }
+            entries.extend(items);
+            return Ok(Some(tree_listing_response(entries)));
+        }
+
+        // A full page: only its `Link` header says whether another follows.
+        let direct = proxy_helpers::proxy_fetch_uncached_with_link(
+            proxy,
+            repo.id,
+            &repo.key,
+            upstream_url,
+            &upstream_path,
+        )
+        .await?;
+        let next = next_tree_page(direct.link.as_deref());
+        let decoded = match crate::util::content_coding::strip_content_coding(
+            &direct.content,
+            direct.content_encoding.as_deref(),
+        ) {
+            Ok(crate::util::content_coding::Decoded::Bytes(body)) => body,
+            _ => {
+                return Err(tree_bad_gateway(
+                    "an upstream tree page could not be decoded",
+                ))
+            }
+        };
+        let Ok(serde_json::Value::Array(items)) = serde_json::from_slice(&decoded) else {
+            return Err(tree_bad_gateway(
+                "an upstream tree page is not a JSON array",
+            ));
+        };
+        total_bytes += decoded.len();
+        if total_bytes > MAX_TREE_LISTING_BYTES {
+            return Err(tree_bad_gateway("the upstream tree listing is too large"));
+        }
+        entries.extend(items);
+        match next {
+            NextTreePage::Last => return Ok(Some(tree_listing_response(entries))),
+            NextTreePage::Cursor(next) if cursor.as_deref() != Some(next.as_str()) => {
+                cursor = Some(next);
+            }
+            NextTreePage::Cursor(_) => {
+                return Err(tree_bad_gateway("the upstream tree cursor did not advance"));
+            }
+            NextTreePage::Unusable => {
+                return Err(tree_bad_gateway(
+                    "the upstream next-page link has no cursor",
+                ));
+            }
+        }
+    }
+    Err(tree_bad_gateway(
+        "the upstream tree listing has too many pages",
+    ))
+}
+
+/// The upstream URL and proxy of a Remote repository that has both wired up,
+/// or `None` for any other repository.
+fn remote_upstream<'a>(
+    state: &'a SharedState,
+    repo: &'a RepoInfo,
+) -> Option<(&'a str, &'a crate::services::proxy_service::ProxyService)> {
+    if proxy_helpers::classify_remote_or_virtual(&repo.repo_type)
+        != proxy_helpers::RemoteOrVirtualAction::Remote
+    {
+        return None;
+    }
+    Some((
+        repo.upstream_url.as_deref()?,
+        state.proxy_service.as_deref()?,
+    ))
+}
+
+/// Entries per tree page on the Hub, and with `expand=true` (as documented by
+/// `huggingface_hub`'s `list_repo_tree`). A page with fewer entries is the
+/// last one, so no `Link` lookup is needed for it.
+const HUB_TREE_PAGE_ENTRIES: usize = 1000;
+const HUB_TREE_EXPAND_PAGE_ENTRIES: usize = 50;
+
+/// Upper bounds on one followed Remote tree listing (#5321): pages fetched,
+/// and the JSON bytes held to concatenate them. 100 pages is 100,000 entries
+/// without `expand`; past either bound the request fails rather than return
+/// a listing that looks complete and is not.
+const MAX_TREE_PAGES: usize = 100;
+const MAX_TREE_LISTING_BYTES: usize = 32 * 1024 * 1024;
+
+/// Longest `cursor` forwarded, from the client or from a `Link` header. Hub
+/// cursors are short opaque tokens (about 100 characters); the bound keeps the
+/// cursor-bearing proxy-cache key inside its 1 KiB storage-key limit.
+const MAX_TREE_CURSOR_LEN: usize = 256;
+
+/// The tree query parameters this proxy understands (#5321). Everything else
+/// in the client's query is dropped, so it never reaches the upstream or the
+/// cache key. `limit` is dropped too: pages are followed to the end here, so a
+/// client page size would only multiply upstream requests.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TreeQuery {
+    recursive: bool,
+    expand: bool,
+    cursor: Option<String>,
+}
+
+impl TreeQuery {
+    fn hub_page_size(&self) -> usize {
+        if self.expand {
+            HUB_TREE_EXPAND_PAGE_ENTRIES
+        } else {
+            HUB_TREE_PAGE_ENTRIES
+        }
+    }
+}
+
+/// Parse a Hub boolean query value. `huggingface_hub` sends `true`/`false`
+/// (httpx spelling of Python booleans); `True`/`1`/`0` are accepted as well.
+fn parse_tree_flag(name: &str, value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" | "" => Ok(false),
+        _ => Err(format!(
+            "Invalid value for '{name}': expected true or false"
+        )),
+    }
+}
+
+/// Parse the raw tree query string into the allow-listed [`TreeQuery`].
+fn parse_tree_query(raw: Option<&str>) -> Result<TreeQuery, String> {
+    let mut query = TreeQuery::default();
+    for (key, value) in url::form_urlencoded::parse(raw.unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "recursive" => query.recursive = parse_tree_flag("recursive", &value)?,
+            "expand" => query.expand = parse_tree_flag("expand", &value)?,
+            "cursor" if value.is_empty() => query.cursor = None,
+            "cursor" if value.len() > MAX_TREE_CURSOR_LEN || value.contains('\0') => {
+                return Err("Invalid 'cursor'".to_string());
+            }
+            "cursor" => query.cursor = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(query)
+}
+
+/// The upstream tree path for one page, with the query in a single canonical
+/// spelling: parameters in a fixed order, `false` flags left out (the Hub's
+/// default), values form-encoded so a cursor's `/`, `+` or `=` cannot leave
+/// the query. `?recursive=true&expand=false` and `?recursive=true` are the
+/// same request and share one cache entry.
+fn tree_upstream_path(
+    model_id: &str,
+    revision: &str,
+    query: &TreeQuery,
+    cursor: Option<&str>,
+) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    if query.recursive {
+        serializer.append_pair("recursive", "true");
+    }
+    if query.expand {
+        serializer.append_pair("expand", "true");
+    }
+    if let Some(cursor) = cursor {
+        serializer.append_pair("cursor", cursor);
+    }
+    let encoded = serializer.finish();
+    let base = format!(
         "api/models/{model_id}/tree/{}",
         encode_upstream_revision(revision)
     );
-    proxy_hf_metadata_json(state, repo, &upstream_path).await
+    if encoded.is_empty() {
+        base
+    } else {
+        format!("{base}?{encoded}")
+    }
+}
+
+/// What a tree page's `Link` header says about the page after it.
+#[derive(Debug, PartialEq, Eq)]
+enum NextTreePage {
+    /// No `rel="next"` target: this was the last page.
+    Last,
+    /// The next page's `cursor`.
+    Cursor(String),
+    /// A `rel="next"` target without a usable `cursor`. Treated as an error,
+    /// never as the last page, so a listing is not cut short silently.
+    Unusable,
+}
+
+/// Read the `rel="next"` target of an RFC 8288 `Link` header. Only its
+/// `cursor` is taken: the next request is rebuilt by [`tree_upstream_path`],
+/// so the upstream cannot point this proxy at another path or host.
+fn next_tree_page(link: Option<&str>) -> NextTreePage {
+    let Some(link) = link else {
+        return NextTreePage::Last;
+    };
+    match link_next_target(link) {
+        None => NextTreePage::Last,
+        Some(target) => target
+            .split('#')
+            .next()
+            .and_then(|t| t.split_once('?'))
+            .and_then(|(_, query)| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find(|(key, _)| key == "cursor")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .filter(|cursor| !cursor.is_empty() && cursor.len() <= MAX_TREE_CURSOR_LEN)
+            .map_or(NextTreePage::Unusable, NextTreePage::Cursor),
+    }
+}
+
+/// The URI-reference of the first `rel="next"` link in a `Link` header.
+fn link_next_target(link: &str) -> Option<&str> {
+    let mut rest = link;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let end = after.find('>')?;
+        let target = &after[..end];
+        let tail = &after[end + 1..];
+        let params = &tail[..tail.find('<').unwrap_or(tail.len())];
+        let is_next = params.split(';').any(|param| {
+            let Some((key, value)) = param.split_once('=') else {
+                return false;
+            };
+            key.trim().eq_ignore_ascii_case("rel")
+                && value
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim()
+                    .trim_matches('"')
+                    .split_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("next"))
+        });
+        if is_next {
+            return Some(target);
+        }
+        rest = tail;
+    }
+    None
+}
+
+fn tree_json_response(body: Bytes) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// The concatenated pages, Xet fields removed as for any proxied metadata.
+fn tree_listing_response(entries: Vec<serde_json::Value>) -> Response {
+    let mut value = serde_json::Value::Array(entries);
+    remove_xet_keys(&mut value);
+    tree_json_response(Bytes::from(serde_json::to_vec(&value).unwrap_or_default()))
+}
+
+fn tree_bad_gateway(reason: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("Hugging Face tree listing failed: {reason}"),
+    )
+        .into_response()
 }
 
 /// Object keys removed from proxied Hugging Face metadata documents (#3334).
@@ -795,9 +1109,10 @@ fn strip_xet_metadata(bytes: Bytes) -> Bytes {
     }
 }
 
-/// Shared body of [`proxy_model_info`] and [`proxy_model_tree`]: fetch a
-/// buffered JSON metadata document from a Remote repo's upstream and hand it
-/// back with Xet fields removed by [`strip_xet_metadata`].
+/// Body of [`proxy_model_info`]: fetch a buffered JSON metadata document from
+/// a Remote repo's upstream and hand it back with Xet fields removed by
+/// [`strip_xet_metadata`]. [`proxy_model_tree`] runs the same guards and the
+/// same capped fetch once per page (#5321).
 ///
 /// Keeping the Remote/upstream/proxy-wired guards and the capped fetch in one
 /// place is what makes the two endpoints propagate upstream failures
@@ -1476,15 +1791,24 @@ async fn upload_file_impl(
 async fn list_files(
     State(state): State<SharedState>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response, Response> {
-    list_files_impl(state, repo_key, model_id, revision).await
+    list_files_impl(state, repo_key, model_id, revision, query).await
 }
 
 async fn list_files_namespaced(
     State(state): State<SharedState>,
     Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
+    RawQuery(query): RawQuery,
 ) -> Result<Response, Response> {
-    list_files_impl(state, repo_key, format!("{namespace}/{name}"), revision).await
+    list_files_impl(
+        state,
+        repo_key,
+        format!("{namespace}/{name}"),
+        revision,
+        query,
+    )
+    .await
 }
 
 async fn list_files_impl(
@@ -1492,9 +1816,12 @@ async fn list_files_impl(
     repo_key: String,
     model_id: String,
     revision: String,
+    query: Option<String>,
 ) -> Result<Response, Response> {
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     validate_model_coordinates(&model_id, Some(&revision))?;
+    let query = parse_tree_query(query.as_deref())
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg).into_response())?;
 
     // `snapshot_download` lists the tree at the commit model info reported, so
     // a hosted model's synthetic `sha` must lead back to its revision here as
@@ -1537,7 +1864,7 @@ async fn list_files_impl(
     // artifacts that were promoted into a Remote repo authoritative, exactly as
     // `model_info_impl` does.
     if artifacts.is_empty() {
-        if let Some(resp) = proxy_model_tree(&state, &repo, &model_id, &revision).await? {
+        if let Some(resp) = proxy_model_tree(&state, &repo, &model_id, &revision, &query).await? {
             return Ok(resp);
         }
     }
@@ -1559,12 +1886,56 @@ async fn list_files_impl(
             })
         })
         .collect();
+    let files = shape_local_tree(files, query.recursive, &model_id, &revision);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&files).unwrap()))
         .unwrap())
+}
+
+/// Give a hosted listing the Hub's `recursive` semantics (#5321).
+///
+/// `files` is every file of the revision, nested ones included, in path order.
+/// With `recursive=true` that is the answer: the files `snapshot_download`
+/// needs. Without it the Hub lists only the top level, a subdirectory standing
+/// for its contents as one `"type": "directory"` entry, which is what
+/// `list_repo_tree(recursive=False)` turns into a `RepoFolder`. A hosted
+/// repository has no git trees, so the directory `oid` is derived from the
+/// coordinates, stable as [`local_repo_commit_sha`] is.
+fn shape_local_tree(
+    files: Vec<serde_json::Value>,
+    recursive: bool,
+    model_id: &str,
+    revision: &str,
+) -> Vec<serde_json::Value> {
+    if recursive {
+        return files;
+    }
+    let mut seen_dirs = std::collections::HashSet::new();
+    let mut shaped = Vec::with_capacity(files.len());
+    for file in files {
+        let dir = file["path"]
+            .as_str()
+            .and_then(|path| path.split_once('/'))
+            .map(|(dir, _)| dir.to_string());
+        match dir {
+            None => shaped.push(file),
+            Some(dir) => {
+                if seen_dirs.insert(dir.clone()) {
+                    let oid = local_repo_commit_sha(model_id, &format!("{revision}\n{dir}/"));
+                    shaped.push(serde_json::json!({
+                        "type": "directory",
+                        "oid": oid,
+                        "size": 0,
+                        "path": dir,
+                    }));
+                }
+            }
+        }
+    }
+    shaped
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -3497,6 +3868,413 @@ mod tests {
             std::str::from_utf8(&body).unwrap_or_default(),
             "[]",
             "an empty list would tell the client the revision has no files"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #5321: tree query (`recursive`, `expand`, `cursor`) and pagination.
+    // `snapshot_download` lists `tree/<commit>?recursive=true`; the Remote
+    // proxy used to drop the query, so files in subdirectories went missing.
+    // -----------------------------------------------------------------------
+
+    const TREE_MODEL: &str = "acme-lab/tiny-st";
+    const TREE_SHA: &str = "099a800f0123456789abcdef0123456789abcdef";
+
+    fn tree_entry(path: &str) -> serde_json::Value {
+        serde_json::json!({"type": "file", "oid": "abc", "size": 1, "path": path})
+    }
+
+    fn tree_upstream_mock(query: &[(&str, &str)], missing: &[&str]) -> wiremock::MockBuilder {
+        use wiremock::matchers::{method, path as wm_path, query_param, query_param_is_missing};
+        let mut mock = wiremock::Mock::given(method("GET"))
+            .and(wm_path(format!("/api/models/{TREE_MODEL}/tree/{TREE_SHA}")));
+        for (key, value) in query {
+            mock = mock.and(query_param(*key, *value));
+        }
+        for key in missing {
+            mock = mock.and(query_param_is_missing(*key));
+        }
+        mock
+    }
+
+    async fn tree_get(
+        app: &Router,
+        repo_key: &str,
+        query: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let (status, body) = tdh::send(
+            app.clone(),
+            tdh::get(format!(
+                "/{repo_key}/api/models/{TREE_MODEL}/tree/{TREE_SHA}{query}"
+            )),
+        )
+        .await;
+        let json = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn tree_paths(json: &serde_json::Value) -> Vec<&str> {
+        json.as_array()
+            .expect("tree must be a JSON array")
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The walkthrough's F2: the upstream lists `1_Pooling/config.json` only
+    /// when asked for `recursive=true`. The recursive and the plain listing are
+    /// two cache entries (one upstream request each), and the
+    /// `huggingface_hub` spelling `recursive=true&expand=false` shares the
+    /// entry of `recursive=true`.
+    #[tokio::test]
+    async fn remote_tree_forwards_recursive_and_caches_each_query_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        tree_upstream_mock(&[("recursive", "true")], &["expand", "cursor"])
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                tree_entry("config.json"),
+                {"type": "directory", "oid": "d1", "size": 0, "path": "1_Pooling"},
+                tree_entry("1_Pooling/config.json"),
+            ])))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        tree_upstream_mock(&[], &["recursive", "expand", "cursor"])
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                tree_entry("config.json"),
+                {"type": "directory", "oid": "d1", "size": 0, "path": "1_Pooling"},
+            ])))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let mut results = Vec::new();
+        for query in [
+            "?recursive=true&expand=false",
+            "?recursive=true",
+            "",
+            "?recursive=false",
+        ] {
+            results.push((query, tree_get(&app, &f.repo_key, query).await));
+        }
+        f.teardown().await;
+        server.verify().await;
+
+        for (query, (status, json)) in &results {
+            assert_eq!(*status, StatusCode::OK, "{query}");
+            let paths = tree_paths(json);
+            assert_eq!(
+                paths.contains(&"1_Pooling/config.json"),
+                query.contains("recursive=true"),
+                "{query}: {paths:?}"
+            );
+        }
+    }
+
+    /// `expand` and `cursor` reach the upstream too, the cursor form-encoded
+    /// so its `/` and `=` stay inside the query; unknown parameters and
+    /// `limit` do not.
+    #[tokio::test]
+    async fn remote_tree_forwards_expand_and_cursor_only_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        tree_upstream_mock(
+            &[
+                ("recursive", "true"),
+                ("expand", "true"),
+                ("cursor", "abc/def=="),
+            ],
+            &["limit", "foo"],
+        )
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([tree_entry("onnx/model.onnx")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, json) = tree_get(
+            &app,
+            &f.repo_key,
+            "?foo=bar&cursor=abc%2Fdef%3D%3D&limit=5&expand=True&recursive=1",
+        )
+        .await;
+        let (bad_status, _) = tree_get(&app, &f.repo_key, "?recursive=maybe").await;
+        f.teardown().await;
+        server.verify().await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tree_paths(&json), ["onnx/model.onnx"]);
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+    }
+
+    fn full_tree_page() -> serde_json::Value {
+        serde_json::Value::Array(
+            (0..HUB_TREE_PAGE_ENTRIES)
+                .map(|i| tree_entry(&format!("shards/part-{i:04}.bin")))
+                .collect(),
+        )
+    }
+
+    /// A full page is followed through its `Link: rel="next"` cursor and the
+    /// pages come back as one array. The full page is read twice (the cached
+    /// fetch, then the uncached one that carries `Link`), the short last page
+    /// once.
+    #[tokio::test]
+    async fn remote_tree_follows_link_pages_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let next = format!(
+            "<{}/api/models/{TREE_MODEL}/tree/{TREE_SHA}?recursive=true&expand=false&cursor=p%2F2%3D>; rel=\"next\"",
+            server.uri()
+        );
+        tree_upstream_mock(&[("recursive", "true")], &["cursor"])
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", next.as_str())
+                    .set_body_json(full_tree_page()),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        tree_upstream_mock(&[("recursive", "true"), ("cursor", "p/2=")], &[])
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                tree_entry("1_Pooling/config.json"),
+                tree_entry("zz-last.json"),
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, json) = tree_get(&app, &f.repo_key, "?recursive=true").await;
+        f.teardown().await;
+        server.verify().await;
+
+        assert_eq!(status, StatusCode::OK);
+        let paths = tree_paths(&json);
+        assert_eq!(paths.len(), HUB_TREE_PAGE_ENTRIES + 2);
+        assert_eq!(paths[0], "shards/part-0000.bin");
+        assert_eq!(paths[HUB_TREE_PAGE_ENTRIES], "1_Pooling/config.json");
+        assert_eq!(*paths.last().unwrap(), "zz-last.json");
+    }
+
+    /// A full page whose `Link` cannot be read fails the request instead of
+    /// being served as the whole listing.
+    #[tokio::test]
+    async fn remote_tree_full_page_without_link_lookup_fails_closed_5321() {
+        use wiremock::{MockServer, ResponseTemplate};
+
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        tree_upstream_mock(&[("recursive", "true")], &["cursor"])
+            .respond_with(ResponseTemplate::new(200).set_body_json(full_tree_page()))
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        tree_upstream_mock(&[("recursive", "true")], &["cursor"])
+            .respond_with(ResponseTemplate::new(500))
+            .with_priority(2)
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let (state, _cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, _) = tree_get(&app, &f.repo_key, "?recursive=true").await;
+        f.teardown().await;
+        server.verify().await;
+
+        assert!(
+            status.is_server_error(),
+            "a listing that may continue must not be served as complete: {status}"
+        );
+    }
+
+    /// Hosted listings honour `recursive` as the Hub does: every file with it,
+    /// the top level plus one directory entry per subdirectory without it.
+    #[tokio::test]
+    async fn hosted_tree_honours_recursive_5321() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        for file in ["1_Pooling/config.json", "config.json", "onnx/a/model.onnx"] {
+            tdh::seed_artifact(
+                &f.state,
+                &f.pool,
+                &repo,
+                &format!("huggingface/{TREE_MODEL}/main/{file}"),
+                &format!("{TREE_MODEL}/main/{file}"),
+                TREE_MODEL,
+                "main",
+                "application/octet-stream",
+                bytes::Bytes::from_static(b"x"),
+                f.user_id,
+            )
+            .await;
+        }
+        let app = f.router_anon(super::router());
+        let get = |query: &'static str| {
+            tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/{}/api/models/{TREE_MODEL}/tree/main{query}",
+                    f.repo_key
+                )),
+            )
+        };
+        let (rec_status, rec_body) = get("?recursive=true").await;
+        let (top_status, top_body) = get("").await;
+        f.teardown().await;
+
+        assert_eq!(rec_status, StatusCode::OK);
+        let rec: serde_json::Value = serde_json::from_slice(&rec_body).unwrap();
+        assert_eq!(
+            tree_paths(&rec),
+            ["1_Pooling/config.json", "config.json", "onnx/a/model.onnx"]
+        );
+        assert!(rec.as_array().unwrap().iter().all(|e| e["type"] == "file"));
+
+        assert_eq!(top_status, StatusCode::OK);
+        let top: serde_json::Value = serde_json::from_slice(&top_body).unwrap();
+        assert_eq!(tree_paths(&top), ["1_Pooling", "config.json", "onnx"]);
+        let types: Vec<&str> = top
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["directory", "file", "directory"]);
+        assert_eq!(top[0]["oid"].as_str().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn parse_tree_query_keeps_only_the_allow_list_5321() {
+        assert_eq!(parse_tree_query(None).unwrap(), TreeQuery::default());
+        let q = parse_tree_query(Some(
+            "recursive=True&expand=false&cursor=a%2Bb%2Fc%3D&limit=3&path=..%2Fx",
+        ))
+        .unwrap();
+        assert_eq!(
+            q,
+            TreeQuery {
+                recursive: true,
+                expand: false,
+                cursor: Some("a+b/c=".to_string()),
+            }
+        );
+        assert!(
+            parse_tree_query(Some("recursive=1&expand=1"))
+                .unwrap()
+                .expand
+        );
+        assert_eq!(parse_tree_query(Some("cursor=")).unwrap().cursor, None);
+        assert!(parse_tree_query(Some("recursive=yes")).is_err());
+        assert!(parse_tree_query(Some("expand=2")).is_err());
+        let long = format!("cursor={}", "a".repeat(MAX_TREE_CURSOR_LEN + 1));
+        assert!(parse_tree_query(Some(&long)).is_err());
+    }
+
+    #[test]
+    fn tree_upstream_path_is_canonical_and_encoded_5321() {
+        let plain = TreeQuery::default();
+        assert_eq!(
+            tree_upstream_path("org/name", "main", &plain, None),
+            "api/models/org/name/tree/main"
+        );
+        let rec = TreeQuery {
+            recursive: true,
+            ..TreeQuery::default()
+        };
+        assert_eq!(
+            tree_upstream_path("org/name", "refs/pr/1", &rec, None),
+            "api/models/org/name/tree/refs%2Fpr%2F1?recursive=true"
+        );
+        let all = TreeQuery {
+            recursive: true,
+            expand: true,
+            cursor: Some("ignored".to_string()),
+        };
+        let path = tree_upstream_path("gpt2", TREE_SHA, &all, Some("a+b/c= d"));
+        assert_eq!(
+            path,
+            format!(
+                "api/models/gpt2/tree/{TREE_SHA}?recursive=true&expand=true&cursor=a%2Bb%2Fc%3D+d"
+            )
+        );
+        // Every page path passes the proxy's fetch-path check: no `/` or `#`
+        // in the query.
+        crate::services::proxy_service::check_upstream_fetch_path(&path).unwrap();
+    }
+
+    #[test]
+    fn next_tree_page_reads_only_the_next_cursor_5321() {
+        assert_eq!(next_tree_page(None), NextTreePage::Last);
+        assert_eq!(
+            next_tree_page(Some("<https://hub/x?cursor=a>; rel=\"prev\"")),
+            NextTreePage::Last
+        );
+        assert_eq!(
+            next_tree_page(Some(
+                "<https://huggingface.co/api/models/m/tree/main?recursive=true&expand=false&cursor=eyJ%2FIjoxfQ%3D%3D>; rel=\"next\""
+            )),
+            NextTreePage::Cursor("eyJ/IjoxfQ==".to_string())
+        );
+        assert_eq!(
+            next_tree_page(Some(
+                "<https://hub/x?cursor=p1>; rel=\"prev\", </x?cursor=n,2>; rel=next"
+            )),
+            NextTreePage::Cursor("n,2".to_string())
+        );
+        assert_eq!(
+            next_tree_page(Some("<https://hub/x?recursive=true>; rel=\"next\"")),
+            NextTreePage::Unusable
+        );
+    }
+
+    #[test]
+    fn shape_local_tree_folds_subdirectories_unless_recursive_5321() {
+        let files: Vec<serde_json::Value> = ["a/b/c.bin", "a/d.bin", "e.json"]
+            .into_iter()
+            .map(tree_entry)
+            .collect();
+        assert_eq!(shape_local_tree(files.clone(), true, "m", "main"), files);
+        let top = shape_local_tree(files, false, "m", "main");
+        assert_eq!(
+            tree_paths(&serde_json::Value::Array(top.clone())),
+            ["a", "e.json"]
+        );
+        assert_eq!(top[0]["type"], "directory");
+        assert_eq!(top[0]["size"], 0);
+        assert_eq!(
+            top[0]["oid"],
+            shape_local_tree(vec![tree_entry("a/x")], false, "m", "main")[0]["oid"],
+            "a directory's oid is stable for the coordinates"
         );
     }
 
