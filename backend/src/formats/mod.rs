@@ -444,7 +444,7 @@ fn core_handler_metadata(
         ),
         "jetbrains" => ("JetBrains Plugins", "JetBrains IDE plugins", &[".zip"]),
         "agentplugins" => ("Agent Plugins", "AI coding-agent plugin bundles", &[".zip"]),
-        "huggingface" => ("Hugging Face", "Hugging Face models and datasets", &[]),
+        "huggingface" => ("Hugging Face", "Hugging Face Hub models", &[]),
         "mlmodel" => ("ML Models", "Machine-learning model artifacts", &[]),
         "cran" => ("CRAN", "R packages", &[".tar.gz"]),
         "vagrant" => ("Vagrant", "Vagrant boxes", &[".box"]),

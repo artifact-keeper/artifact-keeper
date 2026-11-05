@@ -160,7 +160,7 @@ flowchart TD
 
 | Format | Ecosystem |
 |--------|-----------|
-| **HuggingFace** | Models, datasets |
+| **HuggingFace** | Hub models (proxy and hosted; not datasets or Spaces) |
 | **ML Model** | Generic ML artifacts |
 | **MCP Registry** | Model Context Protocol server catalog (server.json, registry API v0.1; hosted) |
 

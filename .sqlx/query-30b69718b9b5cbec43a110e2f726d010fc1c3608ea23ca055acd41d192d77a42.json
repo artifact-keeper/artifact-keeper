@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE artifacts\n            SET name = $2, version = $3, updated_at = NOW()\n            WHERE id = $1\n              AND (name IS DISTINCT FROM $2 OR version IS DISTINCT FROM $3)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "30b69718b9b5cbec43a110e2f726d010fc1c3608ea23ca055acd41d192d77a42"
+}

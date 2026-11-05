@@ -14,10 +14,14 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
         "strict-transport-security",
         "max-age=31536000; includeSubDomains".parse().unwrap(),
     );
-    headers.insert(
-        "referrer-policy",
-        "strict-origin-when-cross-origin".parse().unwrap(),
-    );
+    // Like the CSP below, only fill in the default Referrer-Policy when the
+    // route did not set its own. The Agent Plugins token routes
+    // (`/agentplugins/t/{token}/...`) carry a credential in the URL and send
+    // `no-referrer`; an unconditional `insert()` here replaced that with the
+    // looser default, so a route could not tighten the policy (#5259).
+    headers
+        .entry("referrer-policy")
+        .or_insert("strict-origin-when-cross-origin".parse().unwrap());
     headers.insert(
         "permissions-policy",
         "camera=(), microphone=(), geolocation=()".parse().unwrap(),
@@ -178,6 +182,39 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(csp, "default-src 'none'; style-src 'unsafe-inline'");
+        // The other security headers must still be applied.
+        assert!(resp.headers().get("x-frame-options").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_security_headers_preserves_handler_set_referrer_policy() {
+        // Regression for #5259: a route that sends a stricter Referrer-Policy
+        // (the Agent Plugins token routes send `no-referrer` because the URL
+        // carries a credential) must keep it; the global default only fills
+        // in a missing header.
+        async fn no_referrer_handler() -> axum::response::Response {
+            axum::response::Response::builder()
+                .header("referrer-policy", "no-referrer")
+                .body(Body::from("OK"))
+                .unwrap()
+        }
+
+        let app = Router::new()
+            .route("/no-referrer", get(no_referrer_handler))
+            .layer(middleware::from_fn(security_headers_middleware));
+        let request = Request::builder()
+            .uri("/no-referrer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+
+        let values: Vec<_> = resp
+            .headers()
+            .get_all("referrer-policy")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(values, vec!["no-referrer".to_string()]);
         // The other security headers must still be applied.
         assert!(resp.headers().get("x-frame-options").is_some());
     }

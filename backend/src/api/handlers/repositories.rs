@@ -813,6 +813,18 @@ async fn upsert_repo_config(
     Ok(())
 }
 
+/// Delete one `repository_config` key for a repository; a missing key is a
+/// no-op.
+async fn delete_repo_config(db: &sqlx::PgPool, repo_id: Uuid, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+        .bind(repo_id)
+        .bind(key)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 /// Upsert the `index_upstream_url` key in `repository_config` for a given repository.
 async fn upsert_index_upstream_url(
     db: &sqlx::PgPool,
@@ -5491,6 +5503,80 @@ pub async fn get_repository_storage_tree(
     }))
 }
 
+/// Reject the `PATCH /repositories/{key}` fields that do not apply to this
+/// repository, or carry a bad value, before anything is written (#5201).
+/// The update handler used to check them one by one after the repository row
+/// and the earlier config keys were already saved, so a 400 kept part of the
+/// change. Mirrors the up-front checks `create_repository` runs.
+fn validate_update_config_fields(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    payload: &UpdateRepositoryRequest,
+) -> Result<()> {
+    validate_npm_scope_policy_fields(
+        repo_type,
+        format,
+        payload.npm_allowed_scopes.as_deref(),
+        payload.npm_allow_unscoped,
+        payload.npm_allowed_name_patterns.as_deref(),
+    )?;
+    // #3647: enabling is refused on the proxying types; disabling stays
+    // allowed on every type so an existing enabled row can be turned off.
+    if payload.quarantine_enabled == Some(true) {
+        is_quarantine_enableable(repo_type)?;
+    }
+    if payload.virtual_metadata_partial.is_some() && *repo_type != RepositoryType::Virtual {
+        return Err(AppError::Validation(
+            "virtual_metadata_partial is only valid for virtual repositories".to_string(),
+        ));
+    }
+    if payload.quarantine_duration_minutes.is_some_and(|d| d < 0) {
+        return Err(AppError::Validation(
+            "quarantine_duration_minutes must be non-negative".to_string(),
+        ));
+    }
+    if payload
+        .release_repository_key
+        .as_deref()
+        .is_some_and(|k| !k.is_empty())
+        && *repo_type != RepositoryType::Staging
+    {
+        return Err(AppError::Validation(
+            "Release target linking is only available for staging repositories".to_string(),
+        ));
+    }
+    if let Some(ref ua) = payload.custom_user_agent {
+        if *repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "custom_user_agent is only valid for remote repositories".to_string(),
+            ));
+        }
+        if !ua.is_empty() {
+            validate_custom_user_agent(ua)?;
+        }
+    }
+    let is_apt_hosted = repo_type.is_hosted() && matches!(format, RepositoryFormat::Debian);
+    let apt_fields = [
+        (&payload.apt_origin, "apt_origin"),
+        (&payload.apt_label, "apt_label"),
+        (&payload.apt_release_version, "apt_release_version"),
+    ];
+    if !is_apt_hosted
+        && (apt_fields.iter().any(|(v, _)| v.is_some()) || payload.apt_description.is_some())
+    {
+        return Err(AppError::Validation(
+            "apt_origin, apt_label, apt_release_version, and apt_description are only valid for hosted APT repositories".to_string(),
+        ));
+    }
+    // `apt_description` may span lines (deb822 folds it); the others may not.
+    for (value, field) in apt_fields {
+        if let Some(trimmed) = value.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            ensure_single_line(trimmed, field)?;
+        }
+    }
+    Ok(())
+}
+
 /// Update repository
 #[utoipa::path(
     patch,
@@ -5699,6 +5785,55 @@ pub async fn update_repository(
         &existing.repo_type,
         payload.oci_trusted_bearer_realms.as_deref(),
     )?;
+    // #5201: validate every remaining field before the first write below, so
+    // a rejected request leaves the repository exactly as it was instead of
+    // keeping the repository-row and config changes that ran ahead of the
+    // check. Repository type and format are immutable here, so `existing`
+    // decides, as for the npm and OCI fields above.
+    validate_update_config_fields(&existing.repo_type, &existing.format, &payload)?;
+    let release_link = match payload.release_repository_key.as_deref() {
+        None => None,
+        Some("") => Some(None),
+        Some(release_key) => {
+            let release_repo = service.get_by_key(release_key).await.map_err(|_| {
+                AppError::Validation(format!("Release repository '{}' not found", release_key))
+            })?;
+            super::promotion::validate_release_target_link(&existing, &release_repo)?;
+            Some(Some(release_repo.id))
+        }
+    };
+    // Debian remote proxy filter (#2460). Three-way semantics:
+    //   * field omitted (`None`)      -> leave the stored config unchanged
+    //   * field `null` (`Some(None)`) -> clear it (revert to full-proxy)
+    //   * field object                -> merge the partial update onto the
+    //                                    stored config and validate it here;
+    //                                    it is persisted after the update.
+    //
+    // A patch that sets something is only valid for a Debian Remote. An
+    // all-`None` patch on any other type is the untouched-form artifact
+    // (`"debian": {}`): it merges nothing, so it is skipped rather than
+    // rejected.
+    let debian_config = match payload.debian {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(ref patch))
+            if classify_debian_payload(
+                &existing.repo_type,
+                &existing.format,
+                *patch == DebianConfigPatch::default(),
+            )? =>
+        {
+            let base = load_debian_config(&state.db, existing.id)
+                .await
+                .unwrap_or_default();
+            let merged = patch.clone().apply_to(base);
+            validate_debian_config(&merged)?;
+            Some(Some(merged))
+        }
+        // The skipped untouched-form patch: nothing to merge, nothing stored.
+        Some(Some(_)) => None,
+    };
+
     // #4467: an upstream URL change is applied. The service validates it like
     // create does and refuses (409) an origin change while upstream-auth
     // credentials are configured. Age-gate state still keyed by the old URL's
@@ -5776,6 +5911,7 @@ pub async fn update_repository(
     // (empty lists, allow_unscoped false) against a repo the policy is not
     // configurable on is a no-op, not an error (#3299): released web UIs submit
     // exactly that when saving an untouched settings form on a virtual repo.
+    // Validated up front (#5201).
     if npm_scope_policy_fields_supplied(
         &repo.repo_type,
         &repo.format,
@@ -5783,7 +5919,6 @@ pub async fn update_repository(
         payload.npm_allow_unscoped,
         payload.npm_allowed_name_patterns.as_deref(),
     ) {
-        is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
         apply_npm_scope_policy_config(
             &state.db,
             repo.id,
@@ -5804,12 +5939,9 @@ pub async fn update_repository(
             .await?;
     }
 
+    // Every field below was validated before the first write (#5201), so
+    // nothing past this point answers 4xx.
     if let Some(enabled) = payload.quarantine_enabled {
-        // #3647: enabling is refused on the proxying types; disabling stays
-        // allowed on every type so an existing enabled row can be turned off.
-        if enabled {
-            is_quarantine_enableable(&repo.repo_type)?;
-        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -5820,11 +5952,6 @@ pub async fn update_repository(
     }
 
     if let Some(allow) = payload.virtual_metadata_partial {
-        if repo.repo_type != RepositoryType::Virtual {
-            return Err(AppError::Validation(
-                "virtual_metadata_partial is only valid for virtual repositories".to_string(),
-            ));
-        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -5835,11 +5962,6 @@ pub async fn update_repository(
     }
 
     if let Some(duration) = payload.quarantine_duration_minutes {
-        if duration < 0 {
-            return Err(AppError::Validation(
-                "quarantine_duration_minutes must be non-negative".to_string(),
-            ));
-        }
         upsert_repo_config(
             &state.db,
             repo.id,
@@ -5855,175 +5977,55 @@ pub async fn update_repository(
         crate::services::quarantine_service::invalidate_config_cache(repo.id);
     }
 
-    // Handle release repository linking for staging repos
-    if let Some(ref release_key) = payload.release_repository_key {
-        if release_key.is_empty() {
-            // Remove the link
-            sqlx::query(
-                "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'release_repository_id'",
-            )
-            .bind(repo.id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        } else {
-            if repo.repo_type != RepositoryType::Staging {
-                return Err(AppError::Validation(
-                    "Release target linking is only available for staging repositories".to_string(),
-                ));
-            }
-
-            let release_repo = service.get_by_key(release_key).await.map_err(|_| {
-                AppError::Validation(format!("Release repository '{}' not found", release_key))
-            })?;
-
-            super::promotion::validate_release_target_link(&repo, &release_repo)?;
-
+    // Release repository linking for staging repos (resolved above).
+    match release_link {
+        None => {}
+        Some(None) => delete_repo_config(&state.db, repo.id, "release_repository_id").await?,
+        Some(Some(release_id)) => {
             upsert_repo_config(
                 &state.db,
                 repo.id,
                 "release_repository_id",
-                &release_repo.id.to_string(),
+                &release_id.to_string(),
             )
-            .await?;
+            .await?
         }
     }
 
     if let Some(ref ua) = payload.custom_user_agent {
-        if existing.repo_type != RepositoryType::Remote {
-            return Err(AppError::Validation(
-                "custom_user_agent is only valid for remote repositories".to_string(),
-            ));
-        }
         if ua.is_empty() {
-            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
-                .bind(repo.id)
-                .bind(CUSTOM_USER_AGENT_KEY)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
+            delete_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY).await?;
         } else {
-            validate_custom_user_agent(ua)?;
             upsert_repo_config(&state.db, repo.id, CUSTOM_USER_AGENT_KEY, ua).await?;
         }
     }
 
-    let is_apt_hosted =
-        existing.repo_type.is_hosted() && matches!(existing.format, RepositoryFormat::Debian);
-
-    if !is_apt_hosted
-        && (payload.apt_origin.is_some()
-            || payload.apt_label.is_some()
-            || payload.apt_release_version.is_some()
-            || payload.apt_description.is_some())
-    {
-        return Err(AppError::Validation(
-            "apt_origin, apt_label, apt_release_version, and apt_description are only valid for hosted APT repositories".to_string(),
-        ));
-    }
-
-    if is_apt_hosted {
-        if let Some(ref origin) = payload.apt_origin {
-            let trimmed = origin.trim();
-            if trimmed.is_empty() {
-                sqlx::query(
-                    "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_origin'",
-                )
-                .bind(repo.id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                ensure_single_line(trimmed, "apt_origin")?;
-                upsert_repo_config(&state.db, repo.id, "apt_origin", trimmed).await?;
+    for (value, key) in [
+        (&payload.apt_origin, "apt_origin"),
+        (&payload.apt_label, "apt_label"),
+        (&payload.apt_release_version, "apt_release_version"),
+        (&payload.apt_description, "apt_description"),
+    ] {
+        let Some(value) = value else { continue };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            delete_repo_config(&state.db, repo.id, key).await?;
+        } else {
+            if key == "apt_description" && contains_newline(trimmed) {
+                tracing::warn!("apt_description is multi-line; will be formatted per deb822");
             }
-        }
-        if let Some(ref label) = payload.apt_label {
-            let trimmed = label.trim();
-            if trimmed.is_empty() {
-                sqlx::query(
-                    "DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_label'",
-                )
-                .bind(repo.id)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                ensure_single_line(trimmed, "apt_label")?;
-                upsert_repo_config(&state.db, repo.id, "apt_label", trimmed).await?;
-            }
-        }
-        if let Some(ref ver) = payload.apt_release_version {
-            let trimmed = ver.trim();
-            if trimmed.is_empty() {
-                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_release_version'")
-                    .bind(repo.id)
-                    .execute(&state.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                ensure_single_line(trimmed, "apt_release_version")?;
-                upsert_repo_config(&state.db, repo.id, "apt_release_version", trimmed).await?;
-            }
-        }
-        if let Some(ref desc) = payload.apt_description {
-            let trimmed = desc.trim();
-            if trimmed.is_empty() {
-                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = 'apt_description'")
-                    .bind(repo.id)
-                    .execute(&state.db)
-                    .await
-                    .map_err(|e| AppError::Database(e.to_string()))?;
-            } else {
-                if contains_newline(trimmed) {
-                    tracing::warn!("apt_description is multi-line; will be formatted per deb822");
-                }
-                upsert_repo_config(&state.db, repo.id, "apt_description", trimmed).await?;
-            }
+            upsert_repo_config(&state.db, repo.id, key, trimmed).await?;
         }
     }
 
-    // Debian remote proxy filter (#2460). Three-way semantics:
-    //   * field omitted (`None`)      -> leave the stored config unchanged
-    //   * field `null` (`Some(None)`) -> clear it (revert to full-proxy)
-    //   * field object                -> merge the partial update onto the
-    //                                    stored config, validate, persist.
-    // The gate reads the config live on every request, so no cache
-    // invalidation is required for a change to take effect.
-    //
-    // An all-`None` patch on a repository the filter is not configurable on is
-    // the same untouched-form artifact as on create (`"debian": {}`): it
-    // merges nothing, so it is skipped rather than rejected.
-    match payload.debian {
+    // Debian remote proxy filter (#2460), merged and validated above:
+    // `Some(None)` clears it (revert to full-proxy), `Some(Some(cfg))` stores
+    // the merged config. The gate reads the config live on every request, so
+    // no cache invalidation is required for a change to take effect.
+    match debian_config {
         None => {}
-        Some(None) => {
-            sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
-                .bind(repo.id)
-                .bind(DEBIAN_CONFIG_KEY)
-                .execute(&state.db)
-                .await
-                .map_err(|e| AppError::Database(e.to_string()))?;
-        }
-        // A patch that sets something is only valid for a Debian Remote. An
-        // all-`None` patch on any other type is the untouched-form artifact
-        // (`"debian": {}`): it merges nothing, so it falls through to the
-        // no-op arm below instead of failing the update.
-        Some(Some(ref patch))
-            if classify_debian_payload(
-                &existing.repo_type,
-                &existing.format,
-                *patch == DebianConfigPatch::default(),
-            )? =>
-        {
-            let base = load_debian_config(&state.db, repo.id)
-                .await
-                .unwrap_or_default();
-            let merged = patch.clone().apply_to(base);
-            validate_debian_config(&merged)?;
-            upsert_debian_config(&state.db, repo.id, &merged).await?;
-        }
-        // The skipped untouched-form patch: nothing to merge, nothing stored.
-        Some(Some(_)) => {}
+        Some(None) => delete_repo_config(&state.db, repo.id, DEBIAN_CONFIG_KEY).await?,
+        Some(Some(ref cfg)) => upsert_debian_config(&state.db, repo.id, cfg).await?,
     }
 
     // Invalidate the in-memory repo cache so that visibility changes take
@@ -6883,11 +6885,18 @@ pub struct ListArtifactsQuery {
     /// #2519), by `group_by=docker_tag`, and by `group_by=maven_component`
     /// on remote repositories; other listing modes ignore it.
     pub cursor: Option<String>,
-    /// Total-count mode for keyset-paged listings (#2520, #2519).
+    /// Total-count mode for keyset-paged listings (#2520, #2519, #5255).
     /// `count=exact` runs a dedicated COUNT query so `pagination.total` is
-    /// exact; otherwise the keyset-paged listings report a cheap lower bound
-    /// (rows seen so far, +1 when another page exists) and `has_more` is the
-    /// authoritative "is there a next page" signal.
+    /// exact. `count=lower_bound` skips it: `pagination.total` is then exact
+    /// only on the last page reached by `page=N` (and on an empty page, which
+    /// always counts), and otherwise a lower bound (rows seen so far, +1 when
+    /// another page exists). Without the parameter, the flat listings
+    /// (hosted, virtual, remote) are exact on `page=N` requests and
+    /// `lower_bound` on `cursor` requests, and the grouped listings
+    /// (`group_by`) are `lower_bound`.
+    /// The response's `total_is_exact` says which one you got; `has_more` is
+    /// the authoritative "is there a next page" signal either way, so walk
+    /// pages until it is false rather than up to a lower-bound `total_pages`.
     pub count: Option<String>,
 }
 
@@ -7047,6 +7056,14 @@ pub struct ArtifactListResponse {
     /// the `pagination.total` mode (exact vs lower bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
+    /// Whether `pagination.total` and `pagination.total_pages` are exact
+    /// (#5255). `false` means they are a lower bound (the rows seen so far,
+    /// +1 when another page exists): page with `has_more` / `next_cursor`
+    /// until `has_more` is false, or pass `?count=exact`, instead of looping
+    /// to `total_pages`. Set on every artifact listing; absent only from
+    /// servers older than this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_is_exact: Option<bool>,
 }
 
 /// A Docker/OCI tag grouped by (image, tag).
@@ -7271,9 +7288,16 @@ pub async fn list_artifacts(
         query.group_by.as_deref() == Some("maven_component") && is_maven_format;
 
     // #2520: `count=exact` opts into a dedicated COUNT query on the grouped
-    // keyset-paged listings; everything else gets a cheap lower-bound total
-    // plus an authoritative `has_more`.
-    let count_exact = query.count.as_deref() == Some("exact");
+    // keyset-paged listings; by default they report a cheap total flagged by
+    // `total_is_exact` plus an authoritative `has_more`. The flat listings
+    // (hosted, virtual, remote) count by default on `page=N` requests
+    // (#5255): see [`ListingCount::flat_default`].
+    let count_param = query.count.as_deref();
+    let count_mode = ListingCount::from_param(count_param, ListingCount::LowerBound);
+    let flat_count_mode = ListingCount::from_param(
+        count_param,
+        ListingCount::flat_default(query.cursor.is_some()),
+    );
 
     if want_component_grouping {
         return list_artifacts_grouped_by_maven_component(
@@ -7284,7 +7308,7 @@ pub async fn list_artifacts(
             query.path_prefix.as_deref(),
             query.q.as_deref(),
             query.cursor.as_deref(),
-            count_exact,
+            count_mode,
             page,
             per_page,
             auth.as_ref(),
@@ -7309,7 +7333,7 @@ pub async fn list_artifacts(
             &key,
             query.q.as_deref(),
             query.cursor.as_deref(),
-            count_exact,
+            count_mode,
             page,
             per_page,
             auth.as_ref(),
@@ -7337,7 +7361,7 @@ pub async fn list_artifacts(
             query.path_prefix.as_deref(),
             query.q.as_deref(),
             query.cursor.as_deref(),
-            count_exact,
+            flat_count_mode,
             page,
             per_page,
         )
@@ -7348,13 +7372,21 @@ pub async fn list_artifacts(
     // mirroring the #2520/#2519 contract: an opaque `?cursor=` (the previous
     // response's `next_cursor`) takes precedence; without a cursor, legacy
     // `page=N` addressing still works via OFFSET. `has_more` is
-    // authoritative (fetched as `per_page + 1` rows); `pagination.total` is
-    // a cheap lower bound unless the client opts into `?count=exact`, so a
-    // page request never pays a whole-catalog COUNT by default.
+    // authoritative (fetched as `per_page + 1` rows). `pagination.total` is
+    // exact on `page=N` requests and a flagged lower bound on `?cursor=`
+    // requests unless `?count=` says otherwise (#5255), so a cursor walk
+    // never pays a whole-catalog COUNT by default.
     let keyset = decode_cursor_param(query.cursor.as_deref())?;
     let after_path = keyset.as_ref().map(|(path, _)| path.as_str());
     let offset = if after_path.is_some() { 0 } else { offset };
     let fetch = i64::from(per_page) + 1;
+    // Where the page landed decides whether it needs the COUNT (#5255).
+    let page_at = |rows: usize| ListingPage {
+        offset,
+        keyset: after_path.is_some(),
+        returned: rows.min(per_page as usize),
+        has_more: rows > per_page as usize,
+    };
 
     let (mut artifacts, exact_total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
@@ -7395,7 +7427,7 @@ pub async fn list_artifacts(
                 fetch,
             )
             .await?;
-        let exact = if count_exact {
+        let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
             Some(
                 artifact_service
                     .count_for_repos(
@@ -7420,7 +7452,7 @@ pub async fn list_artifacts(
                 fetch,
             )
             .await?;
-        let exact = if count_exact {
+        let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
             Some(
                 artifact_service
                     .count(repo.id, query.path_prefix.as_deref(), query.q.as_deref())
@@ -7432,7 +7464,8 @@ pub async fn list_artifacts(
         (page_rows, exact)
     };
 
-    let has_more = artifacts.len() > per_page as usize;
+    let at = page_at(artifacts.len());
+    let has_more = at.has_more;
     artifacts.truncate(per_page as usize);
     let next_cursor = if has_more {
         // Single-key (`path`) cursor; the shared two-part codec is reused
@@ -7444,10 +7477,14 @@ pub async fn list_artifacts(
     };
     // MCP registries (#5253): a version a reader is not served is left out,
     // as on the registry surface. The cursor above is the last row read, so
-    // paging is unaffected; the total leaves out this page's hidden rows.
+    // paging is unaffected; the total leaves out this page's hidden rows. A
+    // reader's total can still count versions hidden on other pages, so it
+    // is reported as not exact.
     let mut hidden = 0i64;
+    let mut mcp_reader = false;
     if repo.format == RepositoryFormat::Mcp {
         let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+        mcp_reader = !gate.holds_all(&[repo.id]).await;
         let mut kept = Vec::with_capacity(artifacts.len());
         for a in artifacts {
             if gate.visible(a.repository_id, &a.path).await {
@@ -7458,8 +7495,9 @@ pub async fn list_artifacts(
         }
         artifacts = kept;
     }
-    let exact_total = exact_total.map(|t| (t - hidden).max(0));
-    let total = grouped_listing_total(exact_total, offset, artifacts.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
+    let total = (total - hidden).max(0);
+    let total_is_exact = total_is_exact && !mcp_reader;
     let total_pages = grouped_total_pages(total, per_page);
 
     let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
@@ -7546,6 +7584,7 @@ pub async fn list_artifacts(
         docker_tags: None,
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -7576,7 +7615,7 @@ async fn list_remote_cached_artifacts(
     path_prefix: Option<&str>,
     q: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -7588,7 +7627,7 @@ async fn list_remote_cached_artifacts(
             path_prefix,
             q,
             cursor,
-            count_exact,
+            count_mode,
             page,
             per_page,
         )
@@ -7647,6 +7686,9 @@ async fn list_remote_cached_artifacts(
         docker_tags: None,
         next_cursor: None,
         has_more: None,
+        // The legacy reconstruction filters every cached path in memory, so
+        // its total is a full count.
+        total_is_exact: Some(true),
     }))
 }
 
@@ -7658,11 +7700,15 @@ async fn list_remote_cached_artifacts(
 /// Paging mirrors the #2520 grouped-listing contract: an opaque `?cursor=`
 /// (the previous response's `next_cursor`, keyed on the last `path`) takes
 /// precedence; without a cursor, legacy `page=N` addressing still works via
-/// OFFSET. `has_more` is authoritative (fetched as `per_page + 1` rows);
-/// `pagination.total` is a cheap lower bound unless the client opts into
-/// `?count=exact`. Filters keep the legacy semantics: `path_prefix` is a
-/// starts-with match, `q` a case-insensitive substring match, both applied
-/// as escaped `LIKE` patterns so user-supplied `%`/`_` match literally.
+/// OFFSET. `has_more` is authoritative (fetched as `per_page + 1` rows).
+/// `pagination.total` is exact by default on `page=N` requests (#5255): a
+/// lower-bound total that looked authoritative made clients that loop to
+/// `total_pages` stop early. `?cursor=` pages default to the lower bound
+/// (see [`ListingCount::flat_default`]); `total_is_exact` says which one a
+/// response carries. Filters keep the legacy
+/// semantics: `path_prefix` is a starts-with match, `q` a case-insensitive
+/// substring match, both applied as escaped `LIKE` patterns so
+/// user-supplied `%`/`_` match literally.
 #[allow(clippy::too_many_arguments)]
 async fn list_remote_cached_from_catalog(
     state: &SharedState,
@@ -7671,7 +7717,7 @@ async fn list_remote_cached_from_catalog(
     path_prefix: Option<&str>,
     q: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -7714,8 +7760,14 @@ async fn list_remote_cached_from_catalog(
     } else {
         None
     };
+    let at = ListingPage {
+        offset,
+        keyset: after_path.is_some(),
+        returned: rows.len(),
+        has_more,
+    };
 
-    let exact_total = if count_exact {
+    let exact_total = if at.needs_count(count_mode) {
         Some(
             proxy_catalog::browse_count(
                 &state.db,
@@ -7729,7 +7781,7 @@ async fn list_remote_cached_from_catalog(
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, rows.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
 
     // #3265: proxy-served downloads ARE recorded (in the
     // `proxy_download_statistics` sibling of `download_statistics`), they were
@@ -7762,6 +7814,7 @@ async fn list_remote_cached_from_catalog(
         docker_tags: None,
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -8448,7 +8501,7 @@ async fn list_artifacts_grouped_by_maven_component(
     path_prefix: Option<&str>,
     search_query: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
     // The CALLER (#3163). Only consulted for a Virtual repo, whose members are
@@ -8503,12 +8556,18 @@ async fn list_artifacts_grouped_by_maven_component(
         // what `build_maven_components_for_keys` does from the `artifacts`
         // table for hosted repos.
         populate_remote_component_files(&state.db, repo.id, &mut components).await?;
-        let exact_total = if count_exact {
+        let at = ListingPage {
+            offset,
+            keyset: keyset.is_some(),
+            returned: components.len(),
+            has_more,
+        };
+        let exact_total = if at.needs_count(count_mode) {
             Some(count_maven_catalog_components(&state.db, repo.id, search_query).await?)
         } else {
             None
         };
-        let total = grouped_listing_total(exact_total, offset, components.len(), has_more);
+        let (total, total_is_exact) = listing_total(exact_total, at);
         return Ok(Json(ArtifactListResponse {
             items: Vec::new(),
             pagination: Pagination {
@@ -8521,6 +8580,7 @@ async fn list_artifacts_grouped_by_maven_component(
             docker_tags: None,
             next_cursor,
             has_more: Some(has_more),
+            total_is_exact: Some(total_is_exact),
         }));
     }
 
@@ -8592,12 +8652,18 @@ async fn list_artifacts_grouped_by_maven_component(
     } else {
         None
     };
-    let exact_total = if count_exact {
+    let at = ListingPage {
+        offset,
+        keyset: keyset.is_some(),
+        returned: keys.len(),
+        has_more,
+    };
+    let exact_total = if at.needs_count(count_mode) {
         Some(count_maven_catalog_component_keys(&state.db, &repo_ids, search_query).await?)
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, keys.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
 
     let components = build_maven_components_for_keys(
         artifact_service,
@@ -8622,6 +8688,7 @@ async fn list_artifacts_grouped_by_maven_component(
         docker_tags: None,
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -8973,19 +9040,100 @@ fn decode_cursor_param(cursor: Option<&str>) -> Result<Option<(String, String)>>
     }
 }
 
-/// `pagination.total` for a keyset-paged grouped listing (#2520): the exact
-/// COUNT when the client asked for it, otherwise a cheap lower bound (rows
-/// known so far, +1 when another page exists). `has_more` — not this value —
-/// is the authoritative next-page signal.
-fn grouped_listing_total(exact: Option<i64>, offset: i64, returned: usize, has_more: bool) -> i64 {
-    match exact {
-        Some(total) => total,
-        None => offset + returned as i64 + i64::from(has_more),
+/// `?count=` mode of a keyset-paged artifact listing (#2520, #5255).
+///
+/// `count=exact` and `count=lower_bound` pick a mode explicitly; any other
+/// value (or none) takes the listing's default: [`Self::LowerBound`] for the
+/// grouped listings (PF-003), and [`Self::flat_default`] for the flat hosted,
+/// virtual and remote listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingCount {
+    /// Run the COUNT query: `pagination.total` is exact.
+    Exact,
+    /// Skip the COUNT query where the page alone cannot settle the total:
+    /// `pagination.total` is then a lower bound and the response says so
+    /// with `total_is_exact: false`.
+    LowerBound,
+}
+
+impl ListingCount {
+    /// Default for the flat hosted, virtual and remote listings (#5255):
+    /// exact on a page addressed by `page=N` (including the first page of
+    /// any walk), so a client that reads `total_pages` and loops to it gets
+    /// every item; a lower bound on a `?cursor=` page, so a cursor walk
+    /// stays O(page) per request (PF-001 / PF-002). The COUNT is O(rows in
+    /// the repository) -- for a remote, an index-only scan of its
+    /// `(repository_id, path)` range, ~15 ms at 100k cached rows and ~150 ms
+    /// at 1M -- which on every page of a cursor walk would make walking the
+    /// whole repository quadratic. `page=N` addressing already pays
+    /// O(offset) for its OFFSET. A cursor client pages on `has_more` by
+    /// construction.
+    fn flat_default(keyset: bool) -> Self {
+        if keyset {
+            Self::LowerBound
+        } else {
+            Self::Exact
+        }
+    }
+
+    fn from_param(raw: Option<&str>, default: Self) -> Self {
+        match raw {
+            Some("exact") => Self::Exact,
+            Some("lower_bound") => Self::LowerBound,
+            _ => default,
+        }
     }
 }
 
-/// `total_pages` companion to [`grouped_listing_total`]; a lower bound
-/// whenever `total` is one.
+/// Where one page of a keyset-paged listing landed, which decides whether
+/// the page alone settles `pagination.total` (#5255).
+#[derive(Debug, Clone, Copy)]
+struct ListingPage {
+    /// OFFSET the page was read at (0 for a `?cursor=` page).
+    offset: i64,
+    /// Whether the page was addressed by `?cursor=` rather than `page=N`.
+    keyset: bool,
+    /// Rows the page returned, after truncating the `per_page + 1` probe.
+    returned: usize,
+    has_more: bool,
+}
+
+impl ListingPage {
+    /// Whether this page has to run the COUNT query. Besides an explicit
+    /// [`ListingCount::Exact`], that is any empty page other than an empty
+    /// first page: an empty page past the end says only "the total is at
+    /// most `offset`", and reporting `offset` as the total there inflated it
+    /// (page 5 of a 10-row listing at `per_page=3` said 12, #5255).
+    fn needs_count(&self, mode: ListingCount) -> bool {
+        mode == ListingCount::Exact || (self.returned == 0 && (self.keyset || self.offset > 0))
+    }
+}
+
+/// `(pagination.total, total_is_exact)` for a keyset-paged listing (#2520,
+/// #5255).
+///
+/// `exact` is the COUNT result when [`ListingPage::needs_count`] ran it.
+/// Otherwise the page itself settles the total exactly when it is the last
+/// page reached by `page=N` (OFFSET + rows, nothing after it), and in every
+/// other case the total is a lower bound: the rows known to exist, +1 when
+/// another page exists. `has_more` stays the authoritative next-page signal.
+fn listing_total(exact: Option<i64>, at: ListingPage) -> (i64, bool) {
+    if let Some(total) = exact {
+        return (total, true);
+    }
+    let known = if at.returned == 0 {
+        // Defensive: callers count empty pages (`needs_count`). The rows
+        // before `offset` are not known to exist, so they are not counted.
+        0
+    } else {
+        at.offset + at.returned as i64
+    };
+    let exact = !at.has_more && !at.keyset && (at.returned > 0 || at.offset == 0);
+    (known + i64::from(at.has_more), exact)
+}
+
+/// `total_pages` companion to [`listing_total`]; a lower bound whenever
+/// `total` is one.
 fn grouped_total_pages(total: i64, per_page: u32) -> u32 {
     if total <= 0 {
         0
@@ -9266,7 +9414,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     repo_key: &str,
     search_query: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
     // The CALLER (#3163). Only consulted for a Virtual repo, whose members are
@@ -9328,6 +9476,12 @@ async fn list_artifacts_grouped_by_docker_tag(
     .await?;
     let has_more = rows.len() > per_page as usize;
     rows.truncate(per_page as usize);
+    let at = ListingPage {
+        offset,
+        keyset: keyset.is_some(),
+        returned: rows.len(),
+        has_more,
+    };
     let next_cursor = if has_more {
         rows.last().map(|r| encode_keyset_cursor(&r.image, &r.tag))
     } else {
@@ -9365,12 +9519,12 @@ async fn list_artifacts_grouped_by_docker_tag(
         |t, p| t.last_promotion = p,
     );
 
-    let exact_total = if count_exact {
+    let exact_total = if at.needs_count(count_mode) {
         Some(count_docker_tag_rows(&state.db, &repo_ids, search_query).await?)
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, docker_tags.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
 
     Ok(Json(ArtifactListResponse {
         items: Vec::new(),
@@ -9384,6 +9538,7 @@ async fn list_artifacts_grouped_by_docker_tag(
         docker_tags: Some(docker_tags),
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -16135,23 +16290,110 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn grouped_listing_total_prefers_exact_count() {
-        assert_eq!(grouped_listing_total(Some(10_001), 0, 100, true), 10_001);
-        // Exact wins even when the lower bound would differ.
-        assert_eq!(grouped_listing_total(Some(7), 500, 100, false), 7);
+    fn page_at(offset: i64, keyset: bool, returned: usize, has_more: bool) -> ListingPage {
+        ListingPage {
+            offset,
+            keyset,
+            returned,
+            has_more,
+        }
     }
 
     #[test]
-    fn grouped_listing_total_lower_bound_semantics() {
+    fn listing_total_prefers_exact_count() {
+        assert_eq!(
+            listing_total(Some(10_001), page_at(0, false, 100, true)),
+            (10_001, true)
+        );
+        // Exact wins even when the lower bound would differ.
+        assert_eq!(
+            listing_total(Some(7), page_at(500, false, 100, false)),
+            (7, true)
+        );
+        // A cursor page with a COUNT is exact too.
+        assert_eq!(
+            listing_total(Some(10), page_at(0, true, 3, true)),
+            (10, true)
+        );
+    }
+
+    #[test]
+    fn listing_total_lower_bound_semantics() {
         // Page mode: offset + rows on this page, +1 when another page exists.
-        assert_eq!(grouped_listing_total(None, 200, 100, true), 301);
-        // Final page: no +1.
-        assert_eq!(grouped_listing_total(None, 200, 42, false), 242);
+        assert_eq!(
+            listing_total(None, page_at(200, false, 100, true)),
+            (301, false)
+        );
         // Cursor mode (offset 0, absolute position unknown): pure page bound.
-        assert_eq!(grouped_listing_total(None, 0, 100, true), 101);
-        // Empty listing.
-        assert_eq!(grouped_listing_total(None, 0, 0, false), 0);
+        assert_eq!(
+            listing_total(None, page_at(0, true, 100, true)),
+            (101, false)
+        );
+        // The last page of a cursor walk still does not know the rows
+        // before it.
+        assert_eq!(listing_total(None, page_at(0, true, 1, false)), (1, false));
+    }
+
+    #[test]
+    fn listing_total_last_offset_page_is_exact() {
+        // Final page reached by `page=N`: OFFSET + rows, nothing after it.
+        assert_eq!(
+            listing_total(None, page_at(200, false, 42, false)),
+            (242, true)
+        );
+        // #5255's walk, 10 rows at per_page=3: page 4 settles the total.
+        assert_eq!(listing_total(None, page_at(9, false, 1, false)), (10, true));
+        // Empty listing, first page.
+        assert_eq!(listing_total(None, page_at(0, false, 0, false)), (0, true));
+    }
+
+    #[test]
+    fn listing_total_never_counts_rows_before_an_empty_page() {
+        // #5255: page 5 of a 10-row listing at per_page=3 (offset 12, no rows)
+        // reported total 12. Without a COUNT the rows before the offset are
+        // not known to exist; callers run the COUNT here (`needs_count`).
+        assert_eq!(
+            listing_total(None, page_at(12, false, 0, false)),
+            (0, false)
+        );
+        assert_eq!(
+            listing_total(Some(10), page_at(12, false, 0, false)),
+            (10, true)
+        );
+    }
+
+    #[test]
+    fn listing_page_needs_count_on_exact_and_on_empty_pages_past_the_start() {
+        use ListingCount::{Exact, LowerBound};
+        assert!(page_at(0, false, 3, true).needs_count(Exact));
+        assert!(page_at(0, true, 3, false).needs_count(Exact));
+        assert!(!page_at(0, false, 3, true).needs_count(LowerBound));
+        assert!(!page_at(9, false, 1, false).needs_count(LowerBound));
+        // An empty first page is exactly zero: nothing to count.
+        assert!(!page_at(0, false, 0, false).needs_count(LowerBound));
+        // Past the end by OFFSET, or an empty cursor page: count.
+        assert!(page_at(12, false, 0, false).needs_count(LowerBound));
+        assert!(page_at(0, true, 0, false).needs_count(LowerBound));
+    }
+
+    #[test]
+    fn listing_count_param_overrides_the_default() {
+        use ListingCount::{Exact, LowerBound};
+        assert_eq!(ListingCount::from_param(None, LowerBound), LowerBound);
+        assert_eq!(ListingCount::from_param(None, Exact), Exact);
+        assert_eq!(ListingCount::from_param(Some("exact"), LowerBound), Exact);
+        assert_eq!(
+            ListingCount::from_param(Some("lower_bound"), Exact),
+            LowerBound
+        );
+        assert_eq!(ListingCount::flat_default(false), Exact);
+        assert_eq!(ListingCount::flat_default(true), LowerBound);
+        // Unknown values keep the listing's default, as before.
+        assert_eq!(ListingCount::from_param(Some("bogus"), Exact), Exact);
+        assert_eq!(
+            ListingCount::from_param(Some("bogus"), LowerBound),
+            LowerBound
+        );
     }
 
     #[test]
@@ -16177,10 +16419,12 @@ mod tests {
             docker_tags: Some(vec![]),
             next_cursor: Some(encode_keyset_cursor("app", "t000020")),
             has_more: Some(true),
+            total_is_exact: Some(false),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"next_cursor\":"));
         assert!(json.contains("\"has_more\":true"));
+        assert!(json.contains("\"total_is_exact\":false"));
     }
 
     // -----------------------------------------------------------------------
@@ -18208,11 +18452,13 @@ mod tests {
             docker_tags: None,
             next_cursor: None,
             has_more: None,
+            total_is_exact: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         // components and docker_tags fields should be omitted when None
         assert!(!json.contains("\"components\""));
         assert!(!json.contains("\"docker_tags\""));
+        assert!(!json.contains("\"total_is_exact\""));
     }
 
     #[test]
@@ -18242,6 +18488,7 @@ mod tests {
             docker_tags: None,
             next_cursor: None,
             has_more: None,
+            total_is_exact: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"components\":["));
@@ -18275,6 +18522,7 @@ mod tests {
             docker_tags: Some(vec![tag]),
             next_cursor: None,
             has_more: None,
+            total_is_exact: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"docker_tags\":["));
@@ -20036,7 +20284,7 @@ mod tests {
                 None,
                 None,
                 cursor.as_deref(),
-                false,
+                ListingCount::LowerBound,
                 1,
                 10,
             )
@@ -20064,11 +20312,24 @@ mod tests {
 
         // Response mapping mirrors the sidecar path: synthetic id semantics,
         // not analyzable, catalog timestamp surfaced as cache_cached_at.
-        let first =
-            list_remote_cached_artifacts(&state, &repo, &key, None, None, None, false, 1, 10)
-                .await
-                .expect("first page")
-                .0;
+        let first = list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            None,
+            None,
+            None,
+            ListingCount::Exact,
+            1,
+            10,
+        )
+        .await
+        .expect("first page")
+        .0;
+        // #5255: the remote listing's default mode counts.
+        assert_eq!(first.pagination.total, 25);
+        assert_eq!(first.pagination.total_pages, 3);
+        assert_eq!(first.total_is_exact, Some(true));
         let item = &first.items[0];
         assert_eq!(item.path, "pkg/obj-000.bin");
         assert_eq!(item.name, "obj-000.bin");
@@ -20080,13 +20341,21 @@ mod tests {
         assert_eq!(item.id, cached_artifact_id(&key, "pkg/obj-000.bin"));
 
         // Legacy page=N addressing still works without a cursor, and
-        // `count=exact` opts into the exact total (default is a lower bound
-        // with authoritative has_more).
-        let page3 =
-            list_remote_cached_artifacts(&state, &repo, &key, None, None, None, true, 3, 10)
-                .await
-                .expect("page 3")
-                .0;
+        // `count=exact` reports the exact total.
+        let page3 = list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            None,
+            None,
+            None,
+            ListingCount::Exact,
+            3,
+            10,
+        )
+        .await
+        .expect("page 3")
+        .0;
         assert_eq!(
             page3
                 .items
@@ -20109,7 +20378,7 @@ mod tests {
             None,
             Some("OBJ-013"),
             None,
-            false,
+            ListingCount::LowerBound,
             1,
             10,
         )
@@ -33178,6 +33447,185 @@ mod tests {
             .await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #5201: the up-front PATCH check accepts what the write phase stores
+    /// and refuses the rest, without a database.
+    #[test]
+    fn validate_update_config_fields_5201() {
+        let req = |json: &str| -> UpdateRepositoryRequest {
+            serde_json::from_str(json).expect("deserialize update payload")
+        };
+        let check = |repo_type: RepositoryType, format: RepositoryFormat, json: &str| {
+            validate_update_config_fields(&repo_type, &format, &req(json))
+        };
+        use RepositoryFormat::{Debian, Generic};
+        use RepositoryType::{Local, Remote, Staging, Virtual};
+
+        // Accepted where they apply.
+        for (repo_type, format, json) in [
+            (Local, Generic, r#"{"name":"x"}"#),
+            (
+                Local,
+                Debian,
+                r#"{"apt_label":"L","apt_description":"a\nb"}"#,
+            ),
+            (Local, Debian, r#"{"apt_origin":""}"#),
+            (Remote, Generic, r#"{"custom_user_agent":"ua/1.0"}"#),
+            (Remote, Generic, r#"{"custom_user_agent":""}"#),
+            (Virtual, Generic, r#"{"virtual_metadata_partial":true}"#),
+            (Staging, Generic, r#"{"release_repository_key":"rel"}"#),
+            (Local, Generic, r#"{"release_repository_key":""}"#),
+            (
+                Local,
+                Generic,
+                r#"{"quarantine_enabled":true,"quarantine_duration_minutes":0}"#,
+            ),
+            (Virtual, Generic, r#"{"quarantine_enabled":false}"#),
+        ] {
+            assert!(
+                check(repo_type, format, json).is_ok(),
+                "{json} must be accepted"
+            );
+        }
+        // Refused.
+        for (repo_type, format, json) in [
+            (Local, Generic, r#"{"apt_label":"L"}"#),
+            (Local, Generic, r#"{"apt_description":"d"}"#),
+            (Local, Debian, r#"{"apt_release_version":"1\n2"}"#),
+            (Local, Generic, r#"{"custom_user_agent":""}"#),
+            (Remote, Generic, r#"{"custom_user_agent":"bad\r\nua"}"#),
+            (Local, Generic, r#"{"virtual_metadata_partial":false}"#),
+            (Local, Generic, r#"{"release_repository_key":"rel"}"#),
+            (Local, Generic, r#"{"quarantine_duration_minutes":-1}"#),
+            (Virtual, Generic, r#"{"quarantine_enabled":true}"#),
+            (Local, Generic, r#"{"npm_allowed_scopes":["@acme"]}"#),
+        ] {
+            assert!(
+                matches!(check(repo_type, format, json), Err(AppError::Validation(_))),
+                "{json} must be refused"
+            );
+        }
+    }
+
+    /// #5201: a `PATCH` answered with a 4xx changes nothing. Every request
+    /// below pairs a change the handler applies early (visibility, name, a
+    /// `repository_config` key) with a field it rejects, and the repository
+    /// row and its config rows must be exactly as they were.
+    ///
+    /// Fails on `main` for each case: the repository row and the earlier
+    /// config keys were written before the rejected field was checked.
+    #[tokio::test]
+    async fn update_repository_rejection_writes_nothing_5201_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        async fn snapshot(pool: &sqlx::PgPool, repo_id: Uuid) -> (String, Vec<(String, String)>) {
+            let row: String = sqlx::query_scalar(
+                "SELECT concat_ws('|', key, name, description, visibility::text, \
+                 quota_bytes::text, promotion_only::text, versioning_enabled::text) \
+                 FROM repositories WHERE id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("read repository");
+            let config: Vec<(String, String)> = sqlx::query_as(
+                "SELECT key, value FROM repository_config WHERE repository_id = $1 ORDER BY key",
+            )
+            .bind(repo_id)
+            .fetch_all(pool)
+            .await
+            .expect("read repository_config");
+            (row, config)
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (deb_id, deb_key, deb_dir) = tdh::create_repo(&pool, "local", "debian").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let early = r#""visibility":"internal","name":"changed","description":"changed",
+            "promotion_only":true,"quarantine_enabled":true,
+            "index_upstream_url":"https://x.test/",
+            "pypi_upstream_index_path":"simple","allow_public_with_upstream_credentials":true"#;
+        let mut leaked = Vec::new();
+        let generic = (repo_id, repo_key.as_str());
+        // On a hosted APT repository the apt_* fields apply, so the earlier
+        // ones were saved before a later one failed the newline check.
+        let deb = (deb_id, deb_key.as_str());
+        let deb_case = r#""apt_origin":"O","apt_label":"L","apt_release_version":"1\n2""#;
+        let generic_cases = [
+            // The issue's reproduction.
+            r#""apt_label":"X""#,
+            r#""apt_origin":"X""#,
+            r#""custom_user_agent":"ua/1.0""#,
+            r#""virtual_metadata_partial":true"#,
+            r#""quarantine_duration_minutes":-1"#,
+            r#""release_repository_key":"no-such-repo""#,
+            r#""npm_allowed_scopes":["@acme"]"#,
+            r#""debian":{"components":["main"]}"#,
+            r#""curation_default_action":"block""#,
+            r#""quota_bytes":-1"#,
+        ];
+        let cases = generic_cases
+            .iter()
+            .map(|c| (generic, *c))
+            .chain([(deb, deb_case)]);
+        for ((repo_id, repo_key), rejected) in cases {
+            let before = snapshot(&pool, repo_id).await;
+            let json = format!("{{{early},{rejected}}}");
+            let result = update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.to_string()),
+                Json(serde_json::from_str(&json).expect("deserialize update payload")),
+            )
+            .await;
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("{rejected} must be rejected"));
+            assert!(
+                matches!(
+                    err,
+                    AppError::Validation(_) | AppError::UnprocessableEntity(_)
+                ),
+                "{rejected}: expected a validation error, got {err:?}",
+            );
+            if snapshot(&pool, repo_id).await != before {
+                leaked.push(rejected);
+                // Put the repository back so the next case starts clean.
+                sqlx::query(
+                    "UPDATE repositories SET name = key, description = NULL, \
+                     visibility = 'private', promotion_only = false WHERE id = $1",
+                )
+                .bind(repo_id)
+                .execute(&pool)
+                .await
+                .expect("reset repository");
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await
+                    .expect("reset repository_config");
+                assert_eq!(snapshot(&pool, repo_id).await, before, "reset");
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "a rejected PATCH changed the repository for: {leaked:?}"
+        );
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![repo_id, deb_id])
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let _ = std::fs::remove_dir_all(&deb_dir);
     }
 
     /// PATCH plumbing: a non-empty value validates + upserts and is echoed;

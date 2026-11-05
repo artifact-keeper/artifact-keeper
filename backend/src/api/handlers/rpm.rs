@@ -794,8 +794,36 @@ pub(crate) struct RpmUploadRejected(pub(crate) String);
 pub(crate) const RPM_REPODATA_KEY: &str = "repodata";
 /// Shape version of that block. Bump it when the extraction changes in a way
 /// already-stored packages must pick up: blocks with any other version are
-/// ignored by the renderer and re-derived by [`heal_rpm_repodata_info`].
-const RPM_REPODATA_INFO_VERSION: u64 = 1;
+/// ignored by the renderer and re-derived by [`heal_rpm_repodata_info`]
+/// (but see [`repodata_block_is_current`] for the v1 blocks still in use).
+///
+/// v2 (#5278) records whether the package is a source package.
+const RPM_REPODATA_INFO_VERSION: u64 = 2;
+
+/// Whether a stored repodata `block` can be rendered as is, rather than
+/// re-derived by the heal. v1 blocks predate the source-package flag
+/// (#5278); one is still current when it cannot be a source package's (an
+/// unparseable marker carries nothing to render with, and a package whose
+/// stored header fields name a SOURCERPM was built from one, so its header
+/// never sets RPMTAG_SOURCEPACKAGE, unless it is named `.src.rpm`), so only
+/// the packages that may be source packages are re-read, not every package
+/// stored before the upgrade.
+fn repodata_block_is_current(artifact: &RpmArtifact, block: &serde_json::Value) -> bool {
+    match block.get("v").and_then(|v| v.as_u64()) {
+        Some(RPM_REPODATA_INFO_VERSION) => true,
+        Some(1) => {
+            block.get("unparseable").is_some()
+                || (artifact
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("source_rpm"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                    && !artifact.path.ends_with(".src.rpm"))
+        }
+        _ => false,
+    }
+}
 
 /// Outcome of deriving the repodata block from a package's leading bytes.
 enum RepodataBlock {
@@ -1468,6 +1496,8 @@ pub(crate) async fn render_repodata_snapshot<W: Write + Send + 'static>(
 /// Rows of `repo_id` under `prefix` that may lack a current repodata block,
 /// a page at a time in id order. A superset of [`needs_repodata_heal`]
 /// (which the heal rechecks), so only those rows' metadata is transferred.
+/// The version test mirrors [`repodata_block_is_current`]: a v1 block that
+/// cannot be a source package's is not a candidate (#5278).
 const HEAL_CANDIDATES_SQL: &str = r#"
         SELECT a.id, a.path, a.name, a.version, a.size_bytes, a.checksum_sha256,
                a.storage_key, a.updated_at, am.metadata
@@ -1479,7 +1509,11 @@ const HEAL_CANDIDATES_SQL: &str = r#"
           AND a.id > $3
           AND (am.metadata IS NULL
                OR jsonb_typeof(am.metadata -> 'repodata') IS DISTINCT FROM 'object'
-               OR (am.metadata -> 'repodata' -> 'v') IS DISTINCT FROM to_jsonb(1)
+               OR ((am.metadata -> 'repodata' -> 'v') IS DISTINCT FROM to_jsonb(2)
+                   AND NOT ((am.metadata -> 'repodata' -> 'v') = to_jsonb(1)
+                            AND ((am.metadata -> 'repodata') ? 'unparseable'
+                                 OR (COALESCE(am.metadata ->> 'source_rpm', '') <> ''
+                                     AND a.path NOT LIKE '%.src.rpm'))))
                OR (am.metadata -> 'repodata') ? 'retry_after')
         ORDER BY a.id
         LIMIT $4
@@ -1595,7 +1629,7 @@ fn needs_repodata_heal_at(artifact: &RpmArtifact, now: i64) -> bool {
     else {
         return true;
     };
-    if block.get("v").and_then(|v| v.as_u64()) != Some(RPM_REPODATA_INFO_VERSION) {
+    if !repodata_block_is_current(artifact, block) {
         return true;
     }
     // A marker written after repeated TRANSIENT failures (storage down,
@@ -3757,6 +3791,18 @@ fn primary_xml_header(packages: usize) -> String {
     )
 }
 
+/// The arch a package is listed under: `src` for a source package, whatever
+/// its stored arch says (#5278). Packages stored before 1.11.12 recorded an
+/// SRPM's header ARCH (the build host's) as their arch; the healed repodata
+/// block knows better.
+fn package_arch(stored: String, info: Option<&crate::formats::rpm::RpmRepodataInfo>) -> String {
+    if info.is_some_and(|i| i.source) {
+        crate::formats::rpm::RPM_SOURCE_ARCH.to_string()
+    } else {
+        stored
+    }
+}
+
 /// Append one package's `primary.xml` element. Shared by the whole-slice generator
 /// and the streaming render (#4544), so both emit the same bytes.
 fn push_primary_package(
@@ -3802,6 +3848,7 @@ fn push_primary_package(
             String::new(),
         )
     };
+    let arch = package_arch(arch, info.as_ref());
 
     // Header-derived fields recorded at upload time (#2588). Blank when the
     // artifact predates header extraction or the header was unparseable.
@@ -4011,6 +4058,7 @@ fn push_filelists_package(
     };
 
     let info = info.as_ref();
+    let arch = package_arch(arch, info);
     xml.push_str(&format!(
         r#"  <package pkgid="{checksum}" name="{name}" arch="{arch}">
     <version epoch="{epoch}" ver="{version}" rel="{release}"/>
@@ -4104,14 +4152,16 @@ fn push_other_package(
 "#,
         checksum = artifact.checksum_sha256,
         name = xml_escape(&name),
-        arch = xml_escape(
+        arch = xml_escape(&package_arch(
             artifact
                 .metadata
                 .as_ref()
                 .and_then(|m| m.get("arch"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("noarch")
-        ),
+                .to_string(),
+            info.as_ref(),
+        )),
         epoch = info.as_ref().and_then(|i| i.epoch).unwrap_or(0),
         version = xml_escape(&version),
         release = xml_escape(&release),
@@ -4123,9 +4173,7 @@ fn push_other_package(
 /// in the current shape.
 fn rpm_repodata_info(artifact: &RpmArtifact) -> Option<crate::formats::rpm::RpmRepodataInfo> {
     let value = artifact.metadata.as_ref()?.get(RPM_REPODATA_KEY)?;
-    if value.get("v").and_then(|v| v.as_u64()) != Some(RPM_REPODATA_INFO_VERSION)
-        || value.get("unparseable").is_some()
-    {
+    if !repodata_block_is_current(artifact, value) || value.get("unparseable").is_some() {
         return None;
     }
     // Deserialize from the borrowed value: cloning a package's block first
@@ -8332,6 +8380,101 @@ mod repodata_deps_tests {
         assert_eq!(stored["summary"], legacy["summary"], "existing fields kept");
     }
 
+    /// #5278 end to end: an SRPM stored before the fix (header ARCH as its
+    /// arch, v1 block) is a heal candidate of the precomputed builder, the
+    /// upgrade migration marks its root for a rebuild, and once healed the
+    /// served primary.xml lists it as `src`. A binary package's v1 block is
+    /// not re-read.
+    #[tokio::test]
+    async fn pre_5278_source_package_is_rebuilt_as_src() {
+        let Some(f) = tdh::Fixture::setup("local", "rpm").await else {
+            return;
+        };
+        let repo = f.repo_info("local", None);
+        let seed = |file: &'static str, name: &'static str, version, bytes| {
+            let (state, pool, repo, user) = (&f.state, &f.pool, &repo, f.user_id);
+            let key = format!("rpm/{}/{file}", f.repo_id);
+            async move {
+                tdh::seed_artifact(
+                    state,
+                    pool,
+                    repo,
+                    &key,
+                    &format!("packages/{file}"),
+                    name,
+                    version,
+                    "application/x-rpm",
+                    bytes::Bytes::from_static(bytes),
+                    user,
+                )
+                .await
+            }
+        };
+        let srpm_id = seed(SRPM_FILENAME, "ak-srpm-test", "1.0-1", SRPM).await;
+        let deps_id = seed(DEPS_FILENAME, "ak-deps-test", "1.5-3", DEPS_RPM).await;
+        let mut deps_v1 = deps_artifact().metadata.unwrap();
+        deps_v1[RPM_REPODATA_KEY]["v"] = serde_json::json!(1);
+        for (id, metadata) in [(srpm_id, pre_5278_srpm_metadata()), (deps_id, deps_v1)] {
+            proxy_helpers::record_artifact_metadata(&f.pool, id, f.repo_id, "rpm", &metadata).await;
+        }
+        sqlx::query("DELETE FROM rpm_repodata_dirty WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/320_rpm_source_package_repodata.sql"
+        ))
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let marked: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM rpm_repodata_dirty WHERE repository_id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .unwrap();
+
+        let candidates: Vec<RpmArtifact> = sqlx::query_as(HEAL_CANDIDATES_SQL)
+            .bind(f.repo_id)
+            .bind("")
+            .bind(uuid::Uuid::nil())
+            .bind(HEAL_PAGE_ROWS)
+            .fetch_all(&f.pool)
+            .await
+            .unwrap();
+        let complete = heal_root(&f.state, f.repo_id, "").await.unwrap();
+        let block = |id: uuid::Uuid| {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT metadata -> 'repodata' FROM artifact_metadata WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&f.pool)
+        };
+        let (srpm_block, deps_block) =
+            (block(srpm_id).await.unwrap(), block(deps_id).await.unwrap());
+        let xml = primary_xml(&f).await;
+        f.teardown().await;
+
+        assert_eq!(marked, 1, "the migration marks the SRPM's root dirty");
+        let ids: Vec<uuid::Uuid> = candidates.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![srpm_id], "only the SRPM is a heal candidate");
+        assert!(complete);
+        assert_eq!(srpm_block["v"], RPM_REPODATA_INFO_VERSION, "{srpm_block}");
+        assert_eq!(srpm_block["source"], true, "{srpm_block}");
+        assert_eq!(deps_block["v"], 1, "a binary v1 block is not re-read");
+        let start = xml.find("<name>ak-srpm-test</name>").expect("SRPM listed");
+        assert!(
+            xml[start..]
+                .trim_start_matches("<name>ak-srpm-test</name>")
+                .trim_start()
+                .starts_with("<arch>src</arch>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<arch>noarch</arch>"), "{xml}");
+    }
+
     // -----------------------------------------------------------------------
     // read_rpm_header_prefix: the ranged-read grow loop and its bounds.
     // -----------------------------------------------------------------------
@@ -8486,6 +8629,108 @@ mod repodata_deps_tests {
             package_lines(SELFPROV_PRIMARY),
             "{xml}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Source packages (#5278): listed as `src`, never under the header ARCH.
+    // -----------------------------------------------------------------------
+
+    /// Built by `tests/fixtures/ak-srpm-test.spec` (`rpmbuild -bs`, Fedora 42,
+    /// x86_64): the header's ARCH is `x86_64`, RPMTAG_SOURCEPACKAGE is set,
+    /// and it provides both subpackages it builds.
+    const SRPM: &[u8] = include_bytes!("../../../tests/fixtures/ak-srpm-test-1.0-1.src.rpm");
+    const SRPM_FILENAME: &str = "ak-srpm-test-1.0-1.src.rpm";
+    /// `createrepo_c` 1.2.0's documents for exactly that file.
+    const SRPM_PRIMARY: &str =
+        include_str!("../../../tests/fixtures/ak-srpm-test-1.0-1.src.createrepo-primary.xml");
+    const SRPM_FILELISTS: &str =
+        include_str!("../../../tests/fixtures/ak-srpm-test-1.0-1.src.createrepo-filelists.xml");
+
+    fn srpm_artifact(metadata: Option<serde_json::Value>) -> RpmArtifact {
+        RpmArtifact {
+            id: uuid::Uuid::new_v4(),
+            path: format!("packages/{SRPM_FILENAME}"),
+            name: "ak-srpm-test".to_string(),
+            version: Some("1.0-1".to_string()),
+            size_bytes: SRPM.len() as i64,
+            checksum_sha256: sha256_hex(SRPM),
+            storage_key: String::new(),
+            metadata,
+            updated_at: chrono::DateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// What an upload before #5278 stored for the SRPM: the header's ARCH
+    /// as the arch, and a v1 repodata block with no source flag.
+    fn pre_5278_srpm_metadata() -> serde_json::Value {
+        let mut m = build_rpm_artifact_metadata(SRPM_FILENAME, SRPM)
+            .expect("not rejected")
+            .unwrap();
+        m["arch"] = serde_json::json!("x86_64");
+        let block = m[RPM_REPODATA_KEY].as_object_mut().unwrap();
+        block.remove("source");
+        block.insert("v".into(), serde_json::json!(1));
+        m
+    }
+
+    #[test]
+    fn source_package_matches_createrepo_c() {
+        let a = srpm_artifact(build_rpm_artifact_metadata(SRPM_FILENAME, SRPM).unwrap());
+        assert_eq!(a.metadata.as_ref().unwrap()["arch"], "src");
+        let xml = generate_primary_xml(std::slice::from_ref(&a));
+        assert_well_formed(&xml);
+        assert_eq!(package_lines(&xml), package_lines(SRPM_PRIMARY), "{xml}");
+        let xml = generate_filelists_xml(std::slice::from_ref(&a));
+        assert_eq!(package_lines(&xml), package_lines(SRPM_FILELISTS), "{xml}");
+        let xml = generate_other_xml(&[a]);
+        assert!(xml.contains(r#"name="ak-srpm-test" arch="src""#), "{xml}");
+    }
+
+    /// An SRPM stored before #5278 is re-derived by the heal, and its
+    /// healed block lists it as `src` whatever its stored arch says, so no
+    /// re-upload is needed. A binary package's v1 block whose metadata
+    /// names its SOURCERPM is still current: the heal does not re-read every
+    /// package stored before the upgrade.
+    #[test]
+    fn pre_5278_source_package_is_healed_to_src() {
+        let legacy = srpm_artifact(Some(pre_5278_srpm_metadata()));
+        assert!(
+            needs_repodata_heal(&legacy),
+            "a v1 SRPM block is re-derived"
+        );
+        assert!(rpm_repodata_info(&legacy).is_none());
+
+        let RepodataBlock::Info(block) = rpm_repodata_block(SRPM, false) else {
+            panic!("the fixture's header parses");
+        };
+        let mut healed = legacy;
+        healed.metadata.as_mut().unwrap()[RPM_REPODATA_KEY] = block;
+        assert!(!needs_repodata_heal(&healed));
+        assert_eq!(healed.metadata.as_ref().unwrap()["arch"], "x86_64");
+        let xml = generate_primary_xml(&[healed]);
+        assert_eq!(package_lines(&xml), package_lines(SRPM_PRIMARY), "{xml}");
+
+        let v1_binary = || {
+            let mut a = deps_artifact();
+            a.metadata.as_mut().unwrap()[RPM_REPODATA_KEY]["v"] = serde_json::json!(1);
+            a
+        };
+        let binary = v1_binary();
+        assert!(!binary.metadata.as_ref().unwrap()["source_rpm"].is_null());
+        assert!(
+            !needs_repodata_heal(&binary),
+            "a binary v1 block stays current"
+        );
+        assert!(rpm_repodata_info(&binary).is_some());
+        // ... unless it is named as a source package, or nothing recorded its
+        // SOURCERPM.
+        let mut named = v1_binary();
+        named.path = format!("packages/{SRPM_FILENAME}");
+        assert!(needs_repodata_heal(&named));
+        let mut unrecorded = v1_binary();
+        let m = unrecorded.metadata.as_mut().unwrap();
+        m.as_object_mut().unwrap().remove("source_rpm");
+        assert!(needs_repodata_heal(&unrecorded));
     }
 
     /// Lead + empty signature header + a main header with NAME/VERSION/
