@@ -2240,6 +2240,7 @@ pub async fn promotion_history(
         LEFT JOIN users u ON u.id = ph.promoted_by
         WHERE (ph.source_repo_id = $1 OR ph.target_repo_id = $1)
           AND ($4::TEXT IS NULL OR ph.status = $4)
+          AND ($5::UUID IS NULL OR ph.artifact_id = $5)
         ORDER BY ph.created_at DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -2248,6 +2249,7 @@ pub async fn promotion_history(
     .bind(per_page as i64)
     .bind(offset)
     .bind(status_filter)
+    .bind(query.artifact_id)
     .fetch_all(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
@@ -2255,10 +2257,12 @@ pub async fn promotion_history(
     let total: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::BIGINT FROM promotion_history
            WHERE (source_repo_id = $1 OR target_repo_id = $1)
-             AND ($2::TEXT IS NULL OR status = $2)"#,
+             AND ($2::TEXT IS NULL OR status = $2)
+             AND ($3::UUID IS NULL OR artifact_id = $3)"#,
     )
     .bind(repo.id)
     .bind(status_filter)
+    .bind(query.artifact_id)
     .fetch_one(&state.db)
     .await
     .map_err(|e: sqlx::Error| AppError::Database(e.to_string()))?;
@@ -6797,6 +6801,80 @@ mod tests {
             let (status, json) = f.history(&f.staging.1, admin).await;
             assert_eq!(status, StatusCode::OK, "{json}");
             assert_eq!(keys(&json), (f.staging.1.clone(), f.release.1.clone()));
+            f.teardown().await;
+        }
+
+        /// #5209: `artifact_id` filters both the page and `pagination.total`.
+        #[tokio::test]
+        async fn history_filters_by_artifact_id() {
+            let Some(f) = HistoryFixture::setup().await else {
+                return;
+            };
+            let first: Uuid =
+                sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1")
+                    .bind(f.staging.0)
+                    .fetch_one(&f.pool)
+                    .await
+                    .expect("fixture artifact");
+            let second: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'app/2.0/app.bin', 'app', 1, repeat('1', 64), \
+                         'application/octet-stream', 'ph-5209') RETURNING id",
+            )
+            .bind(f.staging.0)
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed second artifact");
+            sqlx::query(
+                "INSERT INTO promotion_history \
+                 (artifact_id, source_repo_id, target_repo_id, status, rejection_reason) \
+                 VALUES ($1, $2, $3, 'rejected', 'no')",
+            )
+            .bind(second)
+            .bind(f.staging.0)
+            .bind(f.release.0)
+            .execute(&f.pool)
+            .await
+            .expect("seed second history row");
+            let admin = AuthExtension {
+                is_admin: true,
+                ..f.member()
+            };
+            let get = |query: String| {
+                let admin = admin.clone();
+                let key = f.staging.1.clone();
+                let f = &f;
+                async move {
+                    f.read(&key, &format!("promotion-history{query}"), admin)
+                        .await
+                }
+            };
+
+            let (status, json) = get(String::new()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["pagination"]["total"], 2, "unfiltered: {json}");
+
+            for artifact in [first, second] {
+                let (status, json) = get(format!("?artifact_id={artifact}")).await;
+                assert_eq!(status, StatusCode::OK, "{json}");
+                assert_eq!(json["pagination"]["total"], 1, "{artifact}: {json}");
+                let items = json["items"].as_array().expect("items");
+                assert_eq!(items.len(), 1, "{artifact}: {json}");
+                assert_eq!(items[0]["artifact_id"], artifact.to_string(), "{json}");
+            }
+
+            // No artifact has this id: empty page, zero total.
+            let (status, json) = get(format!("?artifact_id={}", Uuid::nil())).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(json["pagination"]["total"], 0, "{json}");
+            assert_eq!(json["items"].as_array().map(Vec::len), Some(0), "{json}");
+
+            // Combined with status, both filters apply.
+            let (_, json) = get(format!("?artifact_id={second}&status=promoted")).await;
+            assert_eq!(json["pagination"]["total"], 0, "{json}");
+            let (_, json) = get(format!("?artifact_id={second}&status=rejected")).await;
+            assert_eq!(json["pagination"]["total"], 1, "{json}");
             f.teardown().await;
         }
 
