@@ -59,3 +59,68 @@ What the server shares and what it does not, per trivy's client/server design:
   `/version`), never from `SCANNER_TRIVY_CACHE_DIR/db/metadata.json` (which
   holds no DB, or a stale one, in client mode). A DB block that cannot be
   parsed omits the field without failing the scan.
+
+## Offline use and vulnerability-DB import (adapter >= 1.7.0)
+
+For a disconnected install, set one switch:
+
+| Variable | Effect |
+|---|---|
+| `SCANNER_OFFLINE` | Default `false`. `true` implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true` (even if that is set to `false`), skips the startup DB download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update --offline-scan`, so trivy contacts no DB registry, no Java DB registry and no other network API. Logged once at startup. JAR files are matched only if a Java DB is already in the cache. |
+| `SCANNER_ADAPTER_TOKEN` | Shared bearer token for `GET`/`PUT /api/v1/vulndb`. Unset (default): both routes answer 403. The scan routes are not affected. |
+| `SCANNER_TRIVY_DB_SCHEMA_VERSION` | Default `2`. The `Version` an imported `metadata.json` must carry. trivy does not report the schema it expects, so it is configured; it is the major tag of the DB artifact (`trivy-db:2`) and only changes with a trivy release that moves to a new schema. |
+| `SCANNER_VULNDB_MAX_UPLOAD_BYTES` | Default 2 GiB. Cap on the compressed upload (413 above it). |
+| `SCANNER_VULNDB_MAX_EXTRACTED_BYTES` | Default 8 GiB. Cap on the unpacked files (400 above it). |
+
+Offline, a standalone adapter with an empty cache starts and stays
+not-ready (`/probe/ready` 503) until a DB is imported, then becomes ready
+with no restart. `SCANNER_TRIVY_SKIP_DB_UPDATE` alone now also applies to
+filesystem scans (it used to reach image scans only).
+
+### Carrying the DB across the gap
+
+On a connected machine, pull the trivy DB artifact; `oras` writes its single
+layer as `db.tar.gz` (`trivy.db` + `metadata.json`):
+
+```sh
+oras pull ghcr.io/aquasecurity/trivy-db:2
+```
+
+On the disconnected side, import it into the adapter:
+
+```sh
+curl -fsS -X PUT \
+  -H "Authorization: Bearer $SCANNER_ADAPTER_TOKEN" \
+  --data-binary @db.tar.gz \
+  http://scanner-adapter:8080/api/v1/vulndb
+```
+
+and check what is installed and how old it is:
+
+```sh
+curl -fsS -H "Authorization: Bearer $SCANNER_ADAPTER_TOKEN" \
+  http://scanner-adapter:8080/api/v1/vulndb
+# {"version":2,"updated_at":"...","next_update":"...","downloaded_at":"...","age_seconds":21600,"stale":false,"offline":true}
+```
+
+`age_seconds` is measured from `updated_at`, the upstream build time;
+`downloaded_at` is the import time; `stale` is true once `next_update` has
+passed. `GET` answers 404 when no DB is installed, and in client mode (the
+trivy server holds the DB; `PUT` answers 409 there).
+
+What `PUT` checks, refusing with 400 and leaving the installed DB untouched:
+the body is a gzip tar (read to its end, so a truncated or corrupt stream is
+caught) holding exactly the regular files `trivy.db` and `metadata.json`
+(no paths, links, directories, duplicates or other entries); `trivy.db` is a
+bolt database; `metadata.json` parses, carries an `UpdatedAt` and the
+expected schema version. A DB older (by `UpdatedAt`) than the installed one
+is refused with 409 unless `?force=true` is given. A successful import
+answers 200 with the imported and previous metadata and the upload's sha256.
+
+The upload is staged in a temp dir inside `SCANNER_TRIVY_CACHE_DIR` and
+swapped in by renaming the old `db/` aside, renaming the new one into place
+(the old one is put back if that fails) and deleting the old one. Scans hold
+a read lock on the DB for their whole trivy run and the swap takes the write
+lock, so an import waits for in-flight scans (up to their timeout) and scans
+started meanwhile wait for the two renames; no scan sees a missing or
+half-written DB.

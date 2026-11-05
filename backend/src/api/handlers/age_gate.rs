@@ -743,6 +743,7 @@ pub async fn update_repo_age_gate(
                     allow_public_with_upstream_credentials: None,
                     upstream_auth_change: None,
                     age_gate_change: Some(age_gate_change_details(previous, next, tier)),
+                    upstream_mode_change: None,
                 }),
         )
         .await;

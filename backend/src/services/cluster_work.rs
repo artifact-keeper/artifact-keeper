@@ -280,6 +280,27 @@ pub async fn renew_row_claim(
     Ok(result.rows_affected() == 1)
 }
 
+/// [`spawn_renewal_loop_with_cancellation`] over [`renew_row_claim`]: keep the
+/// claim on `row_id` (held under `claim_token`) alive with the per-table
+/// extension statement `sql`, and cancel the returned token when it is lost.
+pub fn spawn_row_claim_renewal(
+    db: PgPool,
+    label: impl Into<String>,
+    sql: &'static str,
+    row_id: Uuid,
+    claim_token: Uuid,
+    ttl_secs: f64,
+) -> (RenewalGuard, CancellationToken) {
+    spawn_renewal_loop_with_cancellation(label, ttl_secs, move || {
+        let db = db.clone();
+        async move {
+            renew_row_claim(&db, sql, row_id, claim_token, ttl_secs)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Singleton scheduler leases
 // ---------------------------------------------------------------------------

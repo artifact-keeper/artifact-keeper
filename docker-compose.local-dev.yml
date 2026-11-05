@@ -68,6 +68,8 @@ services:
     image: ghcr.io/aquasecurity/trivy:0.76.0
     container_name: artifact-keeper-dev-trivy
     command: ["server", "--listen", "0.0.0.0:8090"]
+    # Air-gapped variant (#5287): add "--skip-db-update" once the cache volume
+    # holds a DB; see the trivy service in docker-compose.yml.
     ports:
       - "8090:8090"
     volumes:

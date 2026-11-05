@@ -1,7 +1,6 @@
 //! gRPC server implementations for SBOM services.
 
 use crate::grpc::auth_interceptor::authorize_grpc_scope;
-use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{CveStatus, SbomFormat};
 use crate::services::sbom_service::{DependencyInfo, SbomService};
 use sqlx::PgPool;
@@ -360,18 +359,39 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         request: Request<UpdateCveStatusRequest>,
     ) -> Result<Response<CveHistoryEntry>, Status> {
         authorize_grpc_scope(&request, scope::WRITE_ARTIFACTS)?;
+        // Triage needs an `admin`-granting scope, as on REST.
+        authorize_grpc_scope(&request, "admin")?;
+        // The token's subject and repository restriction, as REST passes them, so
+        // this plane decides under the same authority check.
+        let principal = request
+            .extensions()
+            .get::<crate::grpc::auth_interceptor::GrpcPrincipal>()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("missing authenticated principal"))?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
         let status = proto_to_cve_status(req.status());
 
         let entry = self
             .service
-            // Admin repo scope: the gRPC surface is an admin/system path
-            // (no per-call repo restriction), so synth-id resolution (#1561)
-            // runs unrestricted, matching the admin contract.
-            .update_cve_status(id, status, None, Some(&req.reason), AccessScope::Admin)
+            .update_cve_status(
+                id,
+                status,
+                Some(principal.user_id),
+                Some(&req.reason),
+                principal.allowed_repo_ids,
+            )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                crate::error::AppError::NotFound(message) => Status::not_found(message),
+                crate::error::AppError::Sqlx(sqlx::Error::RowNotFound) => {
+                    Status::not_found("CVE history entry not found")
+                }
+                crate::error::AppError::Authorization(message) => {
+                    Status::permission_denied(message)
+                }
+                other => Status::internal(other.to_string()),
+            })?;
 
         Ok(Response::new(cve_entry_to_proto(entry)))
     }
@@ -1138,6 +1158,7 @@ mod tests {
             acknowledged_by: Some(ack_by),
             acknowledged_at: Some(now),
             acknowledged_reason: Some("Won't fix".to_string()),
+            acknowledgements_left_effective: None,
             created_at: now,
             updated_at: now,
         };
@@ -1181,6 +1202,7 @@ mod tests {
             acknowledged_by: None,
             acknowledged_at: None,
             acknowledged_reason: None,
+            acknowledgements_left_effective: None,
             created_at: now,
             updated_at: now,
         };

@@ -63,7 +63,7 @@ use crate::services::signing_service::{
 };
 use crate::storage::StorageBackend;
 
-const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
+pub(crate) const DEBIAN_BINARY_CONTENT_TYPE: &str = "application/vnd.debian.binary-package";
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1793,7 +1793,8 @@ fn decompress_packages_index(cache_path: &str, bytes: &[u8]) -> Option<String> {
     if cache_path.ends_with(".gz") {
         read_index_capped(GzDecoder::new(bytes))
     } else if cache_path.ends_with(".xz") {
-        read_index_capped(XzDecoder::new(bytes))
+        // Multi-stream: Ubuntu's release pockets publish two concatenated streams.
+        read_index_capped(XzDecoder::new_multi_decoder(bytes))
     } else {
         Some(String::from_utf8_lossy(bytes).into_owned())
     }
@@ -1849,53 +1850,39 @@ fn packages_index_distribution(cache_path: &str, component: &str) -> Option<Stri
     (!distribution.is_empty()).then(|| distribution.to_string())
 }
 
-/// [`resolve_pool_expected_checksum`] plus the distribution of the cached
-/// Packages index that lists the file (#4111: the release a proxied `.deb`
-/// is graded against is the one that distribution's `Release` names).
-async fn resolve_pool_index_entry(
-    db: &PgPool,
+/// The cached Packages index, at `cache_path` and decoded as `name` says, that
+/// lists `artifact_path`: its SHA-256 for the file and its distribution.
+async fn pool_entry_in_indexes(
     proxy: &ProxyService,
-    repo_id: uuid::Uuid,
     repo_key: &str,
-    component: &str,
-    artifact_path: &str,
+    (component, artifact_path): (&str, &str),
+    indexes: impl IntoIterator<Item = (String, String)>,
+    ignore_expiry: bool,
 ) -> crate::error::Result<Option<(String, String)>> {
-    let Some(filename) = artifact_path.rsplit('/').next() else {
-        return Ok(None);
-    };
-    let Ok((_, _, arch)) = DebianHandler::parse_deb_filename(filename) else {
-        return Ok(None);
-    };
-    let cached_paths = if crate::services::proxy_catalog::has_rows(db, repo_id)
-        .await
-        .unwrap_or(false)
-    {
-        crate::services::proxy_catalog::paths_under_prefixes(
-            db,
-            repo_id,
-            &["dists/".to_string()],
-            i64::MAX,
-        )
-        .await
-        .unwrap_or_default()
-    } else {
-        proxy.list_cached_paths(repo_key).await
-    };
-    for cache_path in cached_paths {
-        if !is_matching_packages_index(&cache_path, component, &arch) {
-            continue;
-        }
-        let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = proxy
-            .get_cached_artifact_by_path(repo_key, &cache_path)
-            .await
-        else {
+    for (cache_path, name) in indexes {
+        let cached = if ignore_expiry {
+            proxy
+                .get_cached_artifact_by_path_ignoring_expiry(repo_key, &cache_path)
+                .await
+        } else {
+            proxy
+                .get_cached_artifact_by_path(repo_key, &cache_path)
+                .await
+        };
+        let Ok(Some(proxy_helpers::CachedBody { content: bytes, .. })) = cached else {
             continue;
         };
+        // A `by-hash/` entry says what it must hash to.
+        if by_hash_sha256(&cache_path).is_some_and(|want| {
+            crate::services::storage_service::StorageService::calculate_hash(&bytes) != want
+        }) {
+            continue;
+        }
         // #2561: permit-scoped decode on this serve path (each cached index
         // inflates up to the 128 MiB budget), fast-fail 503 on saturation; the
         // permit is released before the next cache read.
         let Some(text) = crate::util::bounded_archive::with_ingest_extraction(|| {
-            decompress_packages_index(&cache_path, &bytes)
+            decompress_packages_index(&name, &bytes)
         })?
         else {
             continue;
@@ -1905,6 +1892,223 @@ async fn resolve_pool_index_entry(
             let distribution =
                 packages_index_distribution(&cache_path, component).unwrap_or_default();
             return Ok(Some((sha, distribution)));
+        }
+    }
+    Ok(None)
+}
+
+/// [`resolve_pool_expected_checksum`] plus the distribution of the cached
+/// Packages index that lists the file.
+async fn resolve_pool_index_entry(
+    db: &PgPool,
+    proxy: &ProxyService,
+    repo_id: uuid::Uuid,
+    repo_key: &str,
+    component: &str,
+    artifact_path: &str,
+) -> crate::error::Result<Option<(String, String)>> {
+    let Some(arch) = pool_file_arch(artifact_path) else {
+        return Ok(None);
+    };
+    let indexes = cached_dists_paths(db, proxy, repo_id, repo_key)
+        .await
+        .into_iter()
+        .filter(|path| is_matching_packages_index(path, component, &arch))
+        .map(|path| (path.clone(), path));
+    pool_entry_in_indexes(proxy, repo_key, (component, artifact_path), indexes, false).await
+}
+
+/// The architecture a pool file's name names.
+fn pool_file_arch(artifact_path: &str) -> Option<String> {
+    let filename = artifact_path.rsplit('/').next()?;
+    let (_, _, arch) = DebianHandler::parse_deb_filename(filename).ok()?;
+    Some(arch)
+}
+
+/// The suite directories (`dists/bookworm`) with a cached release document.
+fn cached_suite_dirs(cached_paths: &[String]) -> Vec<&str> {
+    let mut dirs: Vec<&str> = cached_paths
+        .iter()
+        .filter_map(|path| {
+            let (dir, leaf) = path.rsplit_once('/')?;
+            (dir.starts_with("dists/") && matches!(leaf, "InRelease" | "Release")).then_some(dir)
+        })
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    dirs
+}
+
+/// The component whose indexes list a pool file: `pool/{component}/...`, or
+/// `pool/updates/{component}/...` in the Debian security archive, whose index
+/// is still `dists/{suite}/{component}`.
+fn pool_file_index_component(artifact_path: &str) -> Option<&str> {
+    let mut segments = artifact_path.strip_prefix("pool/")?.split('/');
+    match segments.next()? {
+        "updates" => segments.next(),
+        component => Some(component),
+    }
+}
+
+/// Whether an index of `index_arch` can list a file of `file_arch`. An `_all`
+/// package is listed in every architecture's index, the only ones apt fetches
+/// (`No-Support-for-Architecture-all: Packages`).
+fn index_arch_lists(index_arch: &str, file_arch: &str) -> bool {
+    file_arch == "all" || index_arch == file_arch
+}
+
+/// A Packages index for a pool file that a suite's `Release` table names.
+struct NamedPackagesIndex {
+    /// The table's path, `main/binary-amd64/Packages.xz`.
+    path: String,
+    /// `main/binary-amd64`.
+    dir: String,
+    sha256: String,
+}
+
+impl NamedPackagesIndex {
+    /// Where apt fetches it when the `Release` says `Acquire-By-Hash: yes`.
+    fn by_hash_path(&self, suite_dir: &str) -> String {
+        format!("{suite_dir}/{}/by-hash/SHA256/{}", self.dir, self.sha256)
+    }
+}
+
+/// The Packages indexes a `Release` table names for `component` and `arch`, by
+/// path. Only these are read under `by-hash/`, which keeps every earlier index,
+/// immutable and cached for years: decoding all of them per pull would grow
+/// without bound.
+fn release_packages_indexes(
+    release_text: &str,
+    component: &str,
+    arch: &str,
+) -> Vec<NamedPackagesIndex> {
+    let prefix = format!("{component}/binary-");
+    let mut named: Vec<NamedPackagesIndex> =
+        crate::formats::debian::parse_release_checksums(release_text)
+            .into_iter()
+            .filter_map(|(path, (sha256, _))| {
+                let (index_arch, leaf) = path.strip_prefix(&prefix)?.split_once('/')?;
+                let is_index = matches!(leaf, "Packages" | "Packages.gz" | "Packages.xz");
+                (is_index && index_arch_lists(index_arch, arch)).then(|| NamedPackagesIndex {
+                    dir: format!("{prefix}{index_arch}"),
+                    path: path.clone(),
+                    sha256,
+                })
+            })
+            .collect();
+    named.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    named
+}
+
+/// Fetch the one index a pull needs of those a suite's `Release` names: the
+/// first architecture's, smallest encoding first, by hash when the archive
+/// serves it that way. `None` unless the bytes are the ones the `Release`
+/// names. Cached like a client's fetch, so this happens once per index.
+async fn fetch_named_packages_index(
+    proxy: &ProxyService,
+    repo: &crate::models::repository::Repository,
+    suite_dir: &str,
+    release_text: &str,
+    named: &[NamedPackagesIndex],
+) -> Option<(String, String)> {
+    let dir = &named.first()?.dir;
+    let index = [".xz", ".gz", ""].iter().find_map(|encoding| {
+        let path = format!("{dir}/Packages{encoding}");
+        named.iter().find(|n| n.path == path)
+    })?;
+    let by_hash = release_text
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("Acquire-By-Hash: yes"));
+    let cache_path = if by_hash {
+        index.by_hash_path(suite_dir)
+    } else {
+        format!("{suite_dir}/{}", index.path)
+    };
+    let (bytes, _) = proxy
+        .fetch_artifact_capped(repo, &cache_path, proxy_helpers::LARGE_METADATA_MAX_BYTES)
+        .await
+        .ok()?;
+    let actual = crate::services::storage_service::StorageService::calculate_hash(&bytes);
+    (actual == index.sha256).then(|| (cache_path, index.path.clone()))
+}
+
+/// [`is_matching_packages_index`], with an `_all` file in any architecture's.
+fn is_gated_packages_index(cache_path: &str, component: &str, arch: &str) -> bool {
+    if arch != "all" {
+        return is_matching_packages_index(cache_path, component, arch);
+    }
+    let leaf = cache_path.rsplit('/').next().unwrap_or("");
+    cache_path.starts_with("dists/")
+        && cache_path.contains(&format!("/{component}/binary-"))
+        && matches!(leaf, "Packages" | "Packages.gz" | "Packages.xz")
+}
+
+/// The scan gate's [`resolve_pool_index_entry`] (#5170), which finds the suite
+/// the way a real client's traffic leaves it findable: under `by-hash/`, where
+/// apt fetches an index, for an `_all` file in any architecture's index, and
+/// past the short cache TTL (a pool file is immutable, so an expired index that
+/// lists it is still right about it). A client whose lists are current fetches
+/// no index at all, so a suite whose `Release` is cached and whose index is not
+/// has the index the `Release` names fetched, verified against that `Release`.
+async fn resolve_gated_pool_index_entry(
+    db: &PgPool,
+    proxy: &ProxyService,
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
+    component: &str,
+    artifact_path: &str,
+) -> crate::error::Result<Option<(String, String)>> {
+    let Some(arch) = pool_file_arch(artifact_path) else {
+        return Ok(None);
+    };
+    let component = pool_file_index_component(artifact_path).unwrap_or(component);
+    let target = (component, artifact_path);
+    let cached_paths = cached_dists_paths(db, proxy, repo_id, repo_key).await;
+    let cached_set: std::collections::HashSet<&str> =
+        cached_paths.iter().map(String::as_str).collect();
+    let mut indexes: Vec<(String, String)> = cached_paths
+        .iter()
+        .filter(|path| is_gated_packages_index(path, component, &arch))
+        .map(|path| (path.clone(), path.clone()))
+        .collect();
+    let mut without_an_index = Vec::new();
+    for dir in cached_suite_dirs(&cached_paths) {
+        let Some(text) = cached_apt_release_text(proxy, repo_key, dir).await else {
+            continue;
+        };
+        let named = release_packages_indexes(&text, component, &arch);
+        let by_hash: Vec<(String, String)> = named
+            .iter()
+            .map(|index| (index.by_hash_path(dir), index.path.clone()))
+            .filter(|(path, _)| cached_set.contains(path.as_str()))
+            .collect();
+        let suite_prefix = format!("{dir}/");
+        // Worth a fetch only if listing the file would name a release: a
+        // derivative's `Release` names none the scanner grades.
+        let names_a_release =
+            crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text).is_some();
+        if names_a_release
+            && by_hash.is_empty()
+            && !indexes.iter().any(|(p, _)| p.starts_with(&suite_prefix))
+        {
+            without_an_index.push((dir, text, named));
+        }
+        indexes.extend(by_hash);
+    }
+    if let Some(entry) = pool_entry_in_indexes(proxy, repo_key, target, indexes, true).await? {
+        return Ok(Some(entry));
+    }
+    let repo = proxy_helpers::build_remote_repo_with_format(
+        repo_id,
+        repo_key,
+        upstream_url,
+        RepositoryFormat::Debian,
+    );
+    for (dir, text, named) in without_an_index {
+        let Some(index) = fetch_named_packages_index(proxy, &repo, dir, &text, &named).await else {
+            continue;
+        };
+        if let Some(entry) = pool_entry_in_indexes(proxy, repo_key, target, [index], true).await? {
+            return Ok(Some(entry));
         }
     }
     Ok(None)
@@ -3984,15 +4188,16 @@ impl crate::api::handlers::proxy_scan_archive::ArchiveKind for DebPackage {
 /// name the package, version (the file name carries no epoch) and
 /// architecture of the requested file name. It is then pinned as that
 /// package of the release the remote names, or the release its version names
-/// (`+deb12u1`, `~bpo12+1`); with neither, it is not graded as anything.
+/// (`+deb12u1`, `~bpo12+1`); with neither, it is not graded as anything. When
+/// both name a Debian release and they differ (#5170), neither is trusted.
 fn deb_identity(
     filename: &str,
     bytes: &Bytes,
     release: Option<crate::services::scanner_service::OsRelease>,
 ) -> crate::api::handlers::proxy_scan_archive::ArchiveIdentity {
     use crate::api::handlers::proxy_scan_archive::{
-        deb_source_name, debian_release_from_version, os_package_identity, read_deb_control,
-        strip_version_epoch, ArchiveIdentity,
+        deb_source_name, debian_marker_contradicting, debian_release_from_version,
+        os_package_identity, read_deb_control, strip_version_epoch, ArchiveIdentity,
     };
     let Ok((name, version, arch)) = DebianHandler::parse_deb_filename(filename) else {
         return ArchiveIdentity::Unreadable(format!("{filename} is not a binary package"));
@@ -4010,6 +4215,15 @@ fn deb_identity(
             control.package, control.version, control.architecture
         ));
     }
+    if let Some(named) = &release {
+        if let Some(marker) = debian_marker_contradicting(&control.version, named) {
+            return ArchiveIdentity::Disagrees(format!(
+                "version {} names Debian {marker}, its suite names {}",
+                control.version,
+                named.label()
+            ));
+        }
+    }
     let release = release.or_else(|| debian_release_from_version(&control.version));
     os_package_identity(
         crate::services::scanner_service::ComponentEcosystem::Debian,
@@ -4021,6 +4235,27 @@ fn deb_identity(
     )
 }
 
+/// The text of the `InRelease` or `Release` cached under `dir`, expired or not:
+/// the release it names does not change when its short TTL runs out.
+async fn cached_apt_release_text(
+    proxy: &ProxyService,
+    repo_key: &str,
+    dir: &str,
+) -> Option<String> {
+    for leaf in ["InRelease", "Release"] {
+        let path = flat_release_path(dir, leaf);
+        if let Ok(Some(body)) = proxy
+            .get_cached_artifact_by_path_ignoring_expiry(repo_key, &path)
+            .await
+        {
+            if let Ok(text) = String::from_utf8(body.content.to_vec()) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 /// The release a cached `Release` / `InRelease` under `dir` names, if one is
 /// cached and names a release the scanner grades.
 async fn cached_apt_release(
@@ -4028,50 +4263,8 @@ async fn cached_apt_release(
     repo_key: &str,
     dir: &str,
 ) -> Option<crate::services::scanner_service::OsRelease> {
-    for leaf in ["InRelease", "Release"] {
-        let path = flat_release_path(dir, leaf);
-        if let Ok(Some(body)) = proxy.get_cached_artifact_by_path(repo_key, &path).await {
-            if let Ok(text) = std::str::from_utf8(&body.content) {
-                return crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(text);
-            }
-        }
-    }
-    None
-}
-
-/// The one release every `dists/{suite}/Release` the remote has cached
-/// agrees on (`bookworm`, `bookworm-updates` and `bookworm-security` are all
-/// Debian 12), or `None` when none is cached or they disagree.
-async fn sole_cached_apt_release(
-    db: &PgPool,
-    proxy: &ProxyService,
-    repo_id: uuid::Uuid,
-    repo_key: &str,
-) -> Option<crate::services::scanner_service::OsRelease> {
-    let mut suites: Vec<String> = cached_dists_paths(db, proxy, repo_id, repo_key)
-        .await
-        .into_iter()
-        .filter_map(|p| {
-            let mut parts = p.split('/');
-            match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                (Some("dists"), Some(suite), Some("InRelease" | "Release"), None) => {
-                    Some(format!("dists/{suite}"))
-                }
-                _ => None,
-            }
-        })
-        .collect();
-    suites.sort();
-    suites.dedup();
-    let mut found = None;
-    for suite in suites {
-        let release = cached_apt_release(proxy, repo_key, &suite).await?;
-        match &found {
-            Some(seen) if *seen != release => return None,
-            _ => found = Some(release),
-        }
-    }
-    found
+    let text = cached_apt_release_text(proxy, repo_key, dir).await?;
+    crate::api::handlers::proxy_scan_archive::os_release_from_apt_release(&text)
 }
 
 /// The cached proxy paths under `dists/`, from the catalog when it has rows.
@@ -4099,11 +4292,14 @@ async fn cached_dists_paths(
 }
 
 /// The `Packages` digest and the release one Remote (a Virtual's member, or
-/// the repository itself) serves a package file under (#4111).
+/// the repository itself) serves a package file under (#4111). The release is
+/// only ever the one the file's own suite names (#5170): another suite's would
+/// grade the file against a release it may not belong to, so `None` leaves
+/// [`deb_identity`] with the version's marker, else inconclusive.
 async fn deb_member_digest_and_release(
     state: &SharedState,
     proxy: &ProxyService,
-    (repo_id, repo_key): (uuid::Uuid, &str),
+    (repo_id, repo_key, upstream_url): (uuid::Uuid, &str, &str),
     route: DebPackageRoute<'_>,
 ) -> Result<
     (
@@ -4115,11 +4311,10 @@ async fn deb_member_digest_and_release(
     let (expected, release) = match route {
         DebPackageRoute::Pool { component, .. } => {
             let artifact_path = route.upstream_path();
-            match resolve_pool_index_entry(
+            match resolve_gated_pool_index_entry(
                 &state.db,
                 proxy,
-                repo_id,
-                repo_key,
+                (repo_id, repo_key, upstream_url),
                 component,
                 &artifact_path,
             )
@@ -4158,10 +4353,6 @@ async fn deb_member_digest_and_release(
             }
             (expected, release)
         }
-    };
-    let release = match release {
-        Some(release) => Some(release),
-        None => sole_cached_apt_release(&state.db, proxy, repo_id, repo_key).await,
     };
     Ok((expected, release))
 }
@@ -4268,7 +4459,7 @@ async fn serve_scanned_deb_download(
                    policy: proxy_helpers::MemberScanPolicy,
                    disposition: Option<String>| async move {
         let (expected_sha256, release) =
-            deb_member_digest_and_release(state, proxy, (id, &key), route).await?;
+            deb_member_digest_and_release(state, proxy, (id, &key, &upstream), route).await?;
         serve_scanned_deb(
             state,
             proxy,
@@ -8063,6 +8254,21 @@ mod virtual_dists_cap_tests {
         );
     }
 
+    /// #5170: Ubuntu's release pockets publish `Packages.xz` as two xz streams,
+    /// and the data can be in the second.
+    #[test]
+    fn test_decompress_packages_index_reads_every_xz_stream() {
+        let body = b"Package: hello\nFilename: pool/main/h/hello/hello_1_amd64.deb\n";
+        let mut two_streams = xz(b"");
+        two_streams.extend(xz(body));
+        assert_eq!(
+            decompress_packages_index("dists/noble/main/binary-amd64/Packages.xz", &two_streams)
+                .as_deref()
+                .map(str::as_bytes),
+            Some(&body[..])
+        );
+    }
+
     #[test]
     fn test_decompress_packages_index_bomb_hits_cap_returns_none() {
         // A highly-compressible payload that expands past the decompressed cap.
@@ -9984,6 +10190,13 @@ mod scan_on_proxy_4111 {
             tdh::get(format!("/{}/dists/bookworm/Release", rig.fx.repo_key)),
         )
         .await;
+        let listing = packages_listing(&rig);
+        pull_through(
+            &rig,
+            "dists/bookworm/main/binary-amd64/Packages",
+            listing.into_bytes(),
+        )
+        .await;
         let (status, _, headers) = rig.pull_remote().await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -9994,8 +10207,9 @@ mod scan_on_proxy_4111 {
         rig.teardown().await;
     }
 
-    /// The release a pool package is graded against comes from the remote's
-    /// own cached `Release`; with none cached, from nothing.
+    /// The release a pool package is graded against comes from the `Release`
+    /// of the suite whose cached index lists it: with none cached, or none
+    /// listing it, from nothing.
     #[tokio::test]
     async fn the_release_comes_from_the_remotes_cached_release() {
         let Some(rig) = Rig::new(case, Some("fail_closed")).await else {
@@ -10009,7 +10223,7 @@ mod scan_on_proxy_4111 {
         let (expected, release) = deb_member_digest_and_release(
             &rig.state,
             &proxy,
-            (rig.fx.repo_id, &rig.fx.repo_key),
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
             route,
         )
         .await
@@ -10032,7 +10246,23 @@ mod scan_on_proxy_4111 {
         let (_, release) = deb_member_digest_and_release(
             &rig.state,
             &proxy,
-            (rig.fx.repo_id, &rig.fx.repo_key),
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
+            route,
+        )
+        .await
+        .expect("lookup");
+        assert_eq!(release, None, "nothing says the file is this suite's");
+        let listing = packages_listing(&rig);
+        pull_through(
+            &rig,
+            "dists/bookworm/main/binary-amd64/Packages",
+            listing.into_bytes(),
+        )
+        .await;
+        let (_, release) = deb_member_digest_and_release(
+            &rig.state,
+            &proxy,
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
             route,
         )
         .await
@@ -10183,6 +10413,617 @@ mod scan_on_proxy_4111 {
             packages_index_distribution("dists/main/binary-amd64/Packages", "main"),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #5170: the release a package is graded against is its own suite's.
+    // -----------------------------------------------------------------------
+
+    /// What a `.deb` of `version` is graded as in a suite naming `suite`:
+    /// `Some(label)` when pinned, `None` when inconclusive.
+    fn graded_as(version: &str, suite: Option<&str>) -> Option<String> {
+        use crate::api::handlers::proxy_scan_archive::strip_version_epoch;
+        use crate::services::scanner_service::OsRelease;
+        let file = format!("libdtf_{}_amd64.deb", strip_version_epoch(version));
+        let body = deb_with_control(&format!(
+            "Package: libdtf\nVersion: {version}\nArchitecture: amd64\nDescription: x\n"
+        ));
+        let release = suite.map(|s| {
+            let (id, v) = s.split_once(':').expect("id:version");
+            OsRelease::new(id, v).expect("a graded release")
+        });
+        match deb_identity(&file, &Bytes::from(body), release) {
+            ArchiveIdentity::Pinned(pin) => Some(pin.os.expect("OS pin").release.label()),
+            _ => None,
+        }
+    }
+
+    /// Every row is a version shape found in the real archives' indexes.
+    #[test]
+    fn a_version_marker_is_checked_against_the_release_its_suite_names() {
+        const D12: Option<&str> = Some("debian:12");
+        const D11: Option<&str> = Some("debian:11");
+        const NOBLE: Option<&str> = Some("ubuntu:24.04");
+        let graded: &[(&str, Option<&str>, &str)] = &[
+            // A stable update in its own release, either separator.
+            ("7.88.1-10+deb12u15", D12, "debian:12"),
+            ("2.9.14+dfsg-1.3~deb12u6", D12, "debian:12"),
+            ("1:9.2p1-2+deb12u3", D12, "debian:12"),
+            // A native package has no revision: the marker is in its version.
+            ("12.4+deb12u5", D12, "debian:12"),
+            // binNMU and derivative suffixes after the marker.
+            ("1.0-1+deb12u1+b2", D12, "debian:12"),
+            // A backport in its suite.
+            ("1.0-1~bpo12+1", D12, "debian:12"),
+            ("6.1.76-1~bpo11+1", D11, "debian:11"),
+            // A backport of a newer release's stable update: the rightmost
+            // marker is the build's target.
+            ("25.01+dfsg-1~deb13u1~bpo12+1", D12, "debian:12"),
+            ("2.56.2-1+deb13u1~bpo12+1", D12, "debian:12"),
+            // A newer release's update rebuilt for an older one's security suite.
+            ("115.3.1-1+deb12u1~deb11u1", D11, "debian:11"),
+            // No marker at all: the suite decides.
+            ("2.10-3", D12, "debian:12"),
+            ("1:1.2.13.dfsg-1", D12, "debian:12"),
+            ("1.0-1~debug5", D12, "debian:12"),
+            // Not release markers: upstream version text, not the revision.
+            ("0.960+bzr41+deb10-4", D11, "debian:11"),
+            ("0.6.0+deb1-6", D11, "debian:11"),
+            ("13.0.1-1+deb131u", D12, "debian:12"),
+            // Ubuntu: a marker on another family's package says nothing.
+            ("3.0.2-0ubuntu1.10", NOBLE, "ubuntu:24.04"),
+            ("2.0-1ubuntu0.24.04.1", NOBLE, "ubuntu:24.04"),
+            ("1.0-1+deb12u1", NOBLE, "ubuntu:24.04"),
+            ("1.0-1~bpo11+1", NOBLE, "ubuntu:24.04"),
+            ("1.0-1~bpo24.04.1", NOBLE, "ubuntu:24.04"),
+            // No suite release (a derivative's Origin, sid, nothing cached):
+            // the rightmost marker, else nothing.
+            ("1.0-1+deb12u1", None, "debian:12"),
+            ("1.0-1+deb12u1+rpi1", None, "debian:12"),
+            ("1.0-1+deb13u1~bpo12+1", None, "debian:12"),
+            ("1:10.11.5+maria~deb12", None, "debian:12"),
+            ("1.0-1~bpo70+1", None, "debian:7"),
+        ];
+        for (version, suite, want) in graded {
+            assert_eq!(
+                graded_as(version, *suite).as_deref(),
+                Some(*want),
+                "{version} in {suite:?}"
+            );
+        }
+        let inconclusive: &[(&str, Option<&str>)] = &[
+            // The marker names another Debian release than the suite.
+            ("1.0-1+deb11u1", D12),
+            ("1:15.0.2-0+deb11u1", D12),
+            ("1.0-1~deb11u1", D12),
+            ("1.0-1~bpo11+1", D12),
+            ("1.0-1+deb12u1", D11),
+            ("8.14.1-2+deb13u2~bpo13+1", D12),
+            // A release with no feed still is not the suite's.
+            ("1.0-1+deb6u1", D12),
+            ("1.0-1+deb15u1", D12),
+            // Nothing names a release.
+            ("2.10-3", None),
+            ("3.0.2-0ubuntu1.10", None),
+            ("1.0-1~bpo24.04.1", None),
+            ("1.0-1~bpo12.04.1", None),
+            ("1.0-1+kali1", None),
+            ("16.1-1.pgdg120+1", None),
+            ("0.960+bzr41+deb10-4", None),
+            ("1.0-1+deb15u1", None),
+        ];
+        for (version, suite) in inconclusive {
+            assert_eq!(graded_as(version, *suite), None, "{version} in {suite:?}");
+        }
+    }
+
+    const BOOKWORM_RELEASE: &str = "Origin: Debian\nLabel: Debian\nSuite: oldstable\n\
+        Version: 12.15\nCodename: bookworm\nAcquire-By-Hash: yes\nComponents: main\n\
+        Architectures: amd64\n";
+    const TRIXIE_RELEASE: &str = "Origin: Debian\nLabel: Debian\nSuite: stable\n\
+        Version: 13.7\nCodename: trixie\nAcquire-By-Hash: yes\nComponents: main\n\
+        Architectures: amd64\n";
+
+    /// A pool package of `version`, with a unique digest.
+    fn versioned_case(version: &str) -> ArchiveCase {
+        let file = format!("libdtf_{version}_amd64.deb");
+        let path = format!("{POOL}/{file}");
+        let uri_path = path.clone();
+        ArchiveCase {
+            format: "debian",
+            router: super::router,
+            uri: Box::new(move |key| format!("/{key}/{uri_path}")),
+            package_path: format!("/{path}"),
+            extra: Vec::new(),
+            body: deb_with_control(&format!(
+                "Package: libdtf\nVersion: {version}\nArchitecture: amd64\nDescription: {}\n",
+                uuid::Uuid::new_v4()
+            )),
+            recorded_path: path,
+            file,
+            pin: None,
+        }
+    }
+
+    fn stale_marker_case(_mock: &str) -> ArchiveCase {
+        versioned_case("1.0-1+deb11u1")
+    }
+
+    fn backport_of_a_stable_update_case(_mock: &str) -> ArchiveCase {
+        versioned_case("1.0-1+deb13u1~bpo12+1")
+    }
+
+    /// Serve `body` at `path` upstream and pull it through the Remote, so it
+    /// is cached exactly as a client's request caches it.
+    async fn pull_through(rig: &Rig, path: &str, body: Vec<u8>) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{path}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&rig.server)
+            .await;
+        let (status, _, _) = tdh::send_with_headers(
+            tdh::router_anon(super::router(), rig.state.clone()),
+            tdh::get(format!("/{}/{path}", rig.fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+
+    /// `(Packages, its SHA-256 line in the Release)` listing `rig`'s package.
+    fn packages_listing(rig: &Rig) -> String {
+        format!(
+            "Package: libdtf\nFilename: {}\nSize: {}\nSHA256: {}\n\n",
+            rig.case.recorded_path,
+            rig.case.body.len(),
+            rig.digest()
+        )
+    }
+
+    /// `(the by-hash path of an xz index of `packages`, its bytes, an
+    /// `InRelease` naming it)` for `dists/{suite}`.
+    fn by_hash_suite(suite: &str, release: &str, packages: &str) -> (String, Vec<u8>, String) {
+        use std::io::Write;
+        let mut enc = xz2::write::XzEncoder::new(Vec::new(), 6);
+        enc.write_all(packages.as_bytes()).unwrap();
+        let index = enc.finish().unwrap();
+        let sha = crate::services::storage_service::StorageService::calculate_hash(&index);
+        let in_release = format!(
+            "{release}SHA256:\n {sha} {} main/binary-amd64/Packages.xz\n",
+            index.len()
+        );
+        (
+            format!("dists/{suite}/main/binary-amd64/by-hash/SHA256/{sha}"),
+            index,
+            in_release,
+        )
+    }
+
+    /// Cache `dists/{suite}` the way `apt-get update` does against an archive
+    /// with `Acquire-By-Hash: yes`: `InRelease`, then `Packages.xz` under
+    /// `by-hash/`, never under its own name.
+    async fn apt_update_by_hash(rig: &Rig, suite: &str, release: &str, packages: &str) {
+        let (index_path, index, in_release) = by_hash_suite(suite, release, packages);
+        pull_through(
+            rig,
+            &format!("dists/{suite}/InRelease"),
+            in_release.into_bytes(),
+        )
+        .await;
+        pull_through(rig, &index_path, index).await;
+    }
+
+    /// A client whose lists are current re-fetches `InRelease` and no index, so
+    /// the Remote can hold a `Release` and nothing it names. The suite is still
+    /// found: the index is fetched from what the `Release` names, for every
+    /// cached suite, and only the suite listing the file decides.
+    async fn current_client_on_a_cold_remote(rig: &Rig, bookworm_index_body: Option<Vec<u8>>) {
+        let listing = packages_listing(rig);
+        for (suite, release, packages) in [
+            ("bookworm", BOOKWORM_RELEASE, listing.as_str()),
+            (
+                "trixie",
+                TRIXIE_RELEASE,
+                "Package: other\nFilename: pool/main/o/other/other_1_amd64.deb\nSize: 1\nSHA256: 00\n\n",
+            ),
+        ] {
+            let (index_path, index, in_release) = by_hash_suite(suite, release, packages);
+            let served = match (&bookworm_index_body, suite) {
+                (Some(forged), "bookworm") => forged.clone(),
+                _ => index,
+            };
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/{index_path}")))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(served))
+                .mount(&rig.server)
+                .await;
+            pull_through(
+                rig,
+                &format!("dists/{suite}/InRelease"),
+                in_release.into_bytes(),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_index_no_client_fetched_is_read_from_what_the_release_names_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        current_client_on_a_cold_remote(&rig, None).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// A derivative's `Release` names no release the scanner grades, so its
+    /// index could not decide anything and is not fetched for this.
+    #[tokio::test]
+    async fn a_derivatives_index_is_not_fetched_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let (_, _, in_release) = by_hash_suite(
+            "kali-rolling",
+            "Origin: Kali\nSuite: kali-rolling\nCodename: kali-rolling\nAcquire-By-Hash: yes\n",
+            &packages_listing(&rig),
+        );
+        pull_through(
+            &rig,
+            "dists/kali-rolling/InRelease",
+            in_release.into_bytes(),
+        )
+        .await;
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED, "no marker, no release");
+        let requests = rig.server.received_requests().await.unwrap_or_default();
+        assert!(
+            !requests.iter().any(|r| r.url.path().contains("by-hash")),
+            "{requests:?}"
+        );
+        rig.teardown().await;
+    }
+
+    /// An upstream index that is not the one its `Release` names decides
+    /// nothing, however it lists the file.
+    #[tokio::test]
+    async fn an_index_that_is_not_the_one_named_decides_nothing_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let forged = packages_listing(&rig).replace("Package: libdtf", "Package: libdtf\nX: y");
+        current_client_on_a_cold_remote(&rig, Some(forged.into_bytes())).await;
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        for pull in ["first", "second, with the forgery cached"] {
+            let (status, _, headers) = rig.pull_remote().await;
+            assert_eq!(status, StatusCode::OK, "{pull}");
+            assert_eq!(
+                ts::scan_header(&headers).as_deref(),
+                Some("pending"),
+                "{pull}"
+            );
+        }
+        rig.teardown().await;
+    }
+
+    /// Record a `verdict` on `rig`'s bytes as graded on `release`: only a pull
+    /// that grades the same way uses it.
+    async fn seed_graded_on(rig: &Rig, version: &str, release: &str, verdict: &str) {
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let (id, v) = release.split_once(':').expect("id:version");
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libdtf",
+            version,
+            OsPackageContext {
+                release: OsRelease::new(id, v).expect("release"),
+                arch: "amd64".to_string(),
+                source: None,
+            },
+        )
+        .expect("pinnable");
+        let vulnerable = verdict == "vulnerable";
+        crate::services::proxy_scan_service::ProxyScanService::new(rig.fx.pool.clone())
+            .record_verdict_with_catalog(
+                &rig.digest(),
+                "grype",
+                verdict,
+                i32::from(vulnerable),
+                i32::from(vulnerable),
+                0,
+                0,
+                0,
+                vulnerable.then_some("critical"),
+                Some("grype-5170-test"),
+                Some(rig.fx.repo_id),
+                Some(1),
+                Some(&pin.pin_identity()),
+            )
+            .await
+            .expect("seed verdict");
+    }
+
+    async fn member_release(
+        rig: &Rig,
+        route: DebPackageRoute<'_>,
+    ) -> (Option<String>, Option<String>) {
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        let (sha, release) = deb_member_digest_and_release(
+            &rig.state,
+            &proxy,
+            (rig.fx.repo_id, &rig.fx.repo_key, &rig.server.uri()),
+            route,
+        )
+        .await
+        .expect("lookup");
+        (sha, release.map(|r| r.label()))
+    }
+
+    /// `+deb11u1` in a Debian 12 suite is found in that suite, is not pinned as
+    /// either release, and is withheld under fail-closed.
+    #[tokio::test]
+    async fn a_marker_disagreeing_with_its_suite_is_withheld_5170() {
+        let Some(rig) = Rig::new(stale_marker_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1+deb11u1_amd64.deb",
+        };
+        let (_, suite) = member_release(&rig, route).await;
+        assert_eq!(suite.as_deref(), Some("debian:12"));
+        let identity = deb_identity(
+            "libdtf_1.0-1+deb11u1_amd64.deb",
+            &Bytes::from(rig.case.body.clone()),
+            crate::services::scanner_service::OsRelease::new("debian", "12"),
+        );
+        assert!(
+            matches!(identity, ArchiveIdentity::Disagrees(_)),
+            "{identity:?}"
+        );
+        let (status, _, _) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::LOCKED);
+        rig.teardown().await;
+    }
+
+    /// The same under fail-open: served pending, not as either verdict.
+    #[tokio::test]
+    async fn a_marker_disagreeing_with_its_suite_is_pending_under_fail_open_5170() {
+        let Some(rig) = Rig::new(stale_marker_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        seed_graded_on(&rig, "1.0-1+deb11u1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("pending"));
+        rig.teardown().await;
+    }
+
+    /// Control: a backport of a newer release's stable update is its own
+    /// suite's package and is served from the verdict on that release.
+    #[tokio::test]
+    async fn a_backport_of_a_stable_update_is_graded_on_its_suite_5170() {
+        let Some(rig) = Rig::new(backport_of_a_stable_update_case, Some("fail_open")).await else {
+            return;
+        };
+        let release = BOOKWORM_RELEASE.replace("Origin: Debian", "Origin: Debian Backports");
+        let release = release.replace("Version: 12.15\n", "");
+        let release = release.replace("Codename: bookworm", "Codename: bookworm-backports");
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm-backports", &release, &listing).await;
+        seed_graded_on(&rig, "1.0-1+deb13u1~bpo12+1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// Real `apt-get` traffic: an index fetched under `by-hash/` names the
+    /// suite of an unmarked package, which a package with no marker depends on
+    /// once no other suite's release can stand in for its own.
+    #[tokio::test]
+    async fn a_by_hash_index_names_the_suite_of_a_pool_package_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        // Another suite that does not list the file must not unseat it.
+        apt_update_by_hash(
+            &rig,
+            "trixie",
+            TRIXIE_RELEASE,
+            "Package: other\nFilename: pool/main/o/other/other_1_amd64.deb\nSize: 1\nSHA256: 00\n\n",
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some(rig.digest()), Some("debian:12".to_string()))
+        );
+        seed_graded_on(&rig, "1.0-1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// An `_all` package is listed in each architecture's index, which is the
+    /// only one apt fetches: half of an archive's files have no `binary-all`
+    /// index to be found in.
+    #[tokio::test]
+    async fn an_arch_all_package_is_found_in_an_architectures_index_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let listing = "Package: tzdata\nArchitecture: all\n\
+            Filename: pool/main/t/tzdata/tzdata_2024a-0_all.deb\nSize: 1\nSHA256: abc\n\n";
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, listing).await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "t/tzdata/tzdata_2024a-0_all.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some("abc".to_string()), Some("debian:12".to_string()))
+        );
+        rig.teardown().await;
+    }
+
+    /// The security archive's pool is `pool/updates/{component}`, but its index
+    /// is `dists/{suite}/{component}`: the route's first segment is not the
+    /// index's component there.
+    #[tokio::test]
+    async fn a_security_archive_package_is_found_in_its_suites_index_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        let release = BOOKWORM_RELEASE
+            .replace("Label: Debian", "Label: Debian-Security")
+            .replace("Suite: oldstable", "Suite: oldstable-security")
+            .replace("Version: 12.15", "Version: 12")
+            .replace("Codename: bookworm", "Codename: bookworm-security");
+        let listing = "Package: libdatetime-timezone-perl\n\
+            Filename: pool/updates/main/libd/libdatetime-timezone-perl/libdatetime-timezone-perl_2.60-1+2026f_all.deb\n\
+            Size: 1\nSHA256: abc\n\n\
+            Package: openssl\n\
+            Filename: pool/updates/main/o/openssl/openssl_3.0.22-1~deb12u2_amd64.deb\n\
+            Size: 1\nSHA256: def\n\n";
+        apt_update_by_hash(&rig, "bookworm-security", &release, listing).await;
+        for (path, sha) in [
+            (
+                "main/libd/libdatetime-timezone-perl/libdatetime-timezone-perl_2.60-1+2026f_all.deb",
+                "abc",
+            ),
+            ("main/o/openssl/openssl_3.0.22-1~deb12u2_amd64.deb", "def"),
+        ] {
+            let route = DebPackageRoute::Pool {
+                component: "updates",
+                path,
+            };
+            assert_eq!(
+                member_release(&rig, route).await,
+                (Some(sha.to_string()), Some("debian:12".to_string())),
+                "{path}"
+            );
+        }
+        rig.teardown().await;
+    }
+
+    /// Another suite's `Release` is not this package's: with no cached index
+    /// listing an unmarked file it is inconclusive, whatever else is cached.
+    #[tokio::test]
+    async fn a_release_is_not_borrowed_from_a_suite_not_listing_the_file_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_open")).await else {
+            return;
+        };
+        pull_through(
+            &rig,
+            "dists/trixie/InRelease",
+            TRIXIE_RELEASE.as_bytes().to_vec(),
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, route).await, (None, None));
+        // Nor is the `dists/` route's suite another's.
+        let dists = DebPackageRoute::Dists {
+            distribution: "bookworm",
+            dists_path: "main/binary-amd64/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(member_release(&rig, dists).await, (None, None));
+        seed_graded_on(&rig, "1.0-1", "debian:13", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("pending"));
+        rig.teardown().await;
+    }
+
+    /// The index lists the file but its own suite's `Release` is not cached:
+    /// still no borrowing, and a marker then names the release.
+    #[tokio::test]
+    async fn a_listed_file_whose_release_is_not_cached_borrows_nothing_5170() {
+        let Some(rig) = Rig::new(case, Some("fail_open")).await else {
+            return;
+        };
+        let listing = packages_listing(&rig);
+        pull_through(
+            &rig,
+            "dists/bookworm/main/binary-amd64/Packages",
+            listing.into_bytes(),
+        )
+        .await;
+        pull_through(
+            &rig,
+            "dists/trixie/InRelease",
+            TRIXIE_RELEASE.as_bytes().to_vec(),
+        )
+        .await;
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1+deb12u1_amd64.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some(rig.digest()), None)
+        );
+        // `+deb12u1` names Debian 12, the release it is served from the verdict of.
+        seed_graded_on(&rig, "1.0-1+deb12u1", "debian:12", "clean").await;
+        let (status, _, headers) = rig.pull_remote().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ts::scan_header(&headers).as_deref(), Some("clean"));
+        rig.teardown().await;
+    }
+
+    /// An `InRelease` past its short TTL still names the same release: a pull
+    /// a while after `apt-get update` is not withheld for the wait.
+    #[tokio::test]
+    async fn an_expired_release_still_names_the_suite_5170() {
+        let Some(rig) = Rig::new(unmarked_case, Some("fail_closed")).await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '1')",
+        )
+        .bind(rig.fx.repo_id)
+        .execute(&rig.fx.pool)
+        .await
+        .expect("short ttl");
+        let listing = packages_listing(&rig);
+        apt_update_by_hash(&rig, "bookworm", BOOKWORM_RELEASE, &listing).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        let proxy = rig.state.proxy_service.clone().expect("proxy");
+        assert!(
+            proxy
+                .get_cached_artifact_by_path(&rig.fx.repo_key, "dists/bookworm/InRelease")
+                .await
+                .expect("read")
+                .is_none(),
+            "the InRelease has expired"
+        );
+        let route = DebPackageRoute::Pool {
+            component: "main",
+            path: "d/dtf/libdtf_1.0-1_amd64.deb",
+        };
+        assert_eq!(
+            member_release(&rig, route).await,
+            (Some(rig.digest()), Some("debian:12".to_string()))
+        );
+        rig.teardown().await;
     }
 }
 

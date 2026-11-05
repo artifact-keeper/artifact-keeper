@@ -248,6 +248,7 @@ fn scan_finding_to_history_entry(row: ScanFindingCveRow) -> CveHistoryEntry {
         acknowledged_by: None,
         acknowledged_at: None,
         acknowledged_reason: None,
+        acknowledgements_left_effective: None,
         created_at: row.first_detected_at,
         updated_at: row.last_detected_at,
     }
@@ -420,7 +421,7 @@ FROM (
         MIN(created_at) AS first_detected_at,
         MAX(created_at) AS last_detected_at,
         BOOL_AND(is_acknowledged) AS all_acknowledged
-    FROM scan_findings
+    FROM scan_findings_effective
     WHERE artifact_id = $1
       AND cve_id IS NOT NULL
     GROUP BY artifact_id, cve_id
@@ -475,7 +476,7 @@ FROM (
         MIN(sf.created_at) AS first_detected_at,
         MAX(sf.created_at) AS last_detected_at,
         BOOL_AND(sf.is_acknowledged) AS all_acknowledged
-    FROM scan_findings sf
+    FROM scan_findings_effective sf
     JOIN artifacts a ON sf.artifact_id = a.id
     WHERE sf.cve_id IS NOT NULL
       AND a.repository_id = $1
@@ -524,7 +525,7 @@ FROM (
         MIN(sf.created_at) AS first_detected_at,
         MAX(sf.created_at) AS last_detected_at,
         BOOL_AND(sf.is_acknowledged) AS all_acknowledged
-    FROM scan_findings sf
+    FROM scan_findings_effective sf
     JOIN artifacts a ON sf.artifact_id = a.id
     WHERE sf.cve_id IS NOT NULL
       AND NOT a.is_deleted
@@ -645,7 +646,7 @@ FROM (
         MIN(created_at) AS first_detected_at,
         MAX(created_at) AS last_detected_at,
         BOOL_AND(is_acknowledged) AS all_acknowledged
-    FROM scan_findings
+    FROM scan_findings_effective
     WHERE LOWER(cve_id) = LOWER($1)
     GROUP BY artifact_id, cve_id
     ORDER BY MIN(created_at) DESC
@@ -1189,6 +1190,7 @@ impl SbomService {
         reason: Option<&str>,
         scope: AccessScope,
     ) -> Result<CveHistoryEntry> {
+        let scope_for_decision = scope.clone();
         let curated = sqlx::query_as::<_, CveHistoryEntry>(
             r#"
             UPDATE cve_history SET
@@ -1216,7 +1218,14 @@ impl SbomService {
         // from `scan_findings` and resolve it back to (artifact_id, cve_id).
         if let Some((artifact_id, cve_id)) = self.resolve_synth_cve_id(id, scope).await? {
             return self
-                .update_cve_status_by_artifact_cve(artifact_id, &cve_id, status, user_id, reason)
+                .update_cve_status_by_artifact_cve(
+                    artifact_id,
+                    &cve_id,
+                    status,
+                    user_id,
+                    reason,
+                    scope_for_decision,
+                )
                 .await;
         }
 
@@ -1276,8 +1285,8 @@ impl SbomService {
         Ok(match_synth_cve_id(id, &pairs))
     }
 
-    /// Update CVE status for an (artifact, cve) pair by mutating the
-    /// underlying `scan_findings` rows.
+    /// Update CVE status for an (artifact, cve) pair by recording or revoking
+    /// acknowledgement decisions (#5153).
     ///
     /// Why this exists (#1426): the Security tab read path projects
     /// `scan_findings` rows into synthetic `CveHistoryEntry` values whose
@@ -1286,19 +1295,17 @@ impl SbomService {
     /// `POST /sbom/cve/status/{id}` writes to `cve_history` only, so an
     /// "acknowledge" click on a scan-derived row returned 404 -- the second,
     /// unwired acknowledge path called out in the issue. This method gives
-    /// the Security tab a working acknowledge path by updating the source
-    /// table (`scan_findings`) directly, keyed on (artifact_id, cve_id)
-    /// because that is the only stable identity a synth row carries.
+    /// the Security tab a working acknowledge path, keyed on (artifact_id,
+    /// cve_id) because that is the only stable identity a synth row carries.
     ///
     /// `status` mapping (the four-state `cve_history.status` does not exist
     /// on `scan_findings`; the only acknowledge column there is the
     /// boolean `is_acknowledged`):
     ///
-    /// - `Acknowledged` / `FalsePositive` -- set `is_acknowledged = true`,
-    ///   record `acknowledged_by` / `acknowledged_at` / `acknowledged_reason`.
-    ///   `false_positive` collapses to `acknowledged` on `scan_findings` since
-    ///   the table has no separate column; the reason field carries the
-    ///   distinction for audit.
+    /// - `Acknowledged` / `FalsePositive` -- record a decision per component.
+    ///   `false_positive` collapses to `acknowledged`, since a decision has no
+    ///   separate state for it; the reason field carries the distinction for
+    ///   audit.
     /// - `Open` -- clear acknowledgement (mirror of the `revoke` endpoint).
     /// - `Fixed` -- not supported by `scan_findings`; returns `Validation`.
     ///   "Fixed" is only meaningful on curated `cve_history` rows.
@@ -1314,6 +1321,7 @@ impl SbomService {
         status: CveStatus,
         user_id: Option<Uuid>,
         reason: Option<&str>,
+        credential: AccessScope,
     ) -> Result<CveHistoryEntry> {
         // `scan_findings` only models a binary acknowledge state. `fixed`
         // has no representation; refuse rather than silently coerce.
@@ -1325,60 +1333,38 @@ impl SbomService {
             )
         })?;
 
-        // Compare CVE id case-insensitively. The schema does not constrain
-        // case on `scan_findings.cve_id`, and the synth ids the read path
-        // emits are upper-case, so we LOWER both sides.
-        let affected = if acknowledge {
-            sqlx::query(
-                r#"
-                UPDATE scan_findings
-                SET is_acknowledged = TRUE,
-                    acknowledged_by = $3,
-                    acknowledged_reason = $4,
-                    acknowledged_at = NOW()
-                WHERE artifact_id = $1
-                  AND cve_id IS NOT NULL
-                  AND LOWER(cve_id) = LOWER($2)
-                "#,
-            )
-            .bind(artifact_id)
-            .bind(cve_id)
-            .bind(user_id)
-            .bind(reason)
-            .execute(&self.db)
-            .await?
-            .rows_affected()
+        // #5153: a decision per component the artifact's current scans report
+        // this advisory for, or a revoke of the decisions on it. `None` / 0 when
+        // the artifact has no such finding, which the caller turns into 404.
+        let acknowledgements =
+            crate::services::finding_acknowledgements::FindingAcknowledgementService::new(
+                self.db.clone(),
+            );
+        let actor = crate::services::finding_acknowledgements::AckActor {
+            user_id,
+            credential,
+        };
+        let (found, left_effective) = if acknowledge {
+            let decided = acknowledgements
+                .acknowledge_advisory(artifact_id, cve_id, &actor, reason, Default::default())
+                .await?;
+            (decided > 0, None)
         } else {
-            sqlx::query(
-                r#"
-                UPDATE scan_findings
-                SET is_acknowledged = FALSE,
-                    acknowledged_by = NULL,
-                    acknowledged_reason = NULL,
-                    acknowledged_at = NULL
-                WHERE artifact_id = $1
-                  AND cve_id IS NOT NULL
-                  AND LOWER(cve_id) = LOWER($2)
-                "#,
-            )
-            .bind(artifact_id)
-            .bind(cve_id)
-            .execute(&self.db)
-            .await?
-            .rows_affected()
+            match acknowledgements
+                .revoke_advisory(artifact_id, cve_id, &actor)
+                .await?
+            {
+                Some(outcome) => (true, Some(outcome.left_effective)),
+                None => (false, None),
+            }
         };
 
-        if affected == 0 {
+        if !found {
             return Err(AppError::NotFound(format!(
                 "No scan_findings rows for artifact {} and CVE {}",
                 artifact_id, cve_id
             )));
         }
-
-        // #4338: the repository's materialized counts follow the triage change.
-        crate::services::scan_result_service::ScanResultService::new(self.db.clone())
-            .refresh_score_for_artifact(artifact_id)
-            .await;
 
         // Re-read the (now-mutated) aggregate so the response carries the
         // same shape as the read path: synth id, aggregated severity, MIN/MAX
@@ -1392,6 +1378,10 @@ impl SbomService {
         entries
             .into_iter()
             .find(|e| e.cve_id.to_ascii_uppercase() == cve_upper)
+            .map(|mut entry| {
+                entry.acknowledgements_left_effective = left_effective;
+                entry
+            })
             .ok_or_else(|| {
                 AppError::NotFound(format!(
                     "Updated scan_findings rows but could not re-read aggregate \
@@ -3590,6 +3580,7 @@ mod tests {
             acknowledged_by: None,
             acknowledged_at: None,
             acknowledged_reason: None,
+            acknowledgements_left_effective: None,
             created_at: first_detected_at,
             updated_at: first_detected_at,
         }
@@ -4722,7 +4713,7 @@ mod tests {
     ) -> Option<(bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)> {
         sqlx::query_as::<_, (bool, Option<Uuid>, Option<String>, Option<DateTime<Utc>>)>(
             "SELECT is_acknowledged, acknowledged_by, acknowledged_reason, acknowledged_at \
-             FROM scan_findings \
+             FROM scan_findings_effective \
              WHERE artifact_id = $1 AND LOWER(cve_id) = LOWER($2) \
              LIMIT 1",
         )
@@ -4751,6 +4742,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("triaged: not exploitable"),
+                AccessScope::Admin,
             )
             .await
             .expect("acknowledge happy path");
@@ -4792,6 +4784,7 @@ mod tests {
                 CveStatus::FalsePositive,
                 None,
                 Some("false positive: code path not reachable"),
+                AccessScope::Admin,
             )
             .await
             .expect("false_positive happy path");
@@ -4824,14 +4817,15 @@ mod tests {
         let finding_id = seed_finding(&pool, scan_id, artifact_id, "CVE-2024-3333", "low").await;
 
         // Pre-acknowledge so we can verify Open clears the state.
-        sqlx::query(
-            "UPDATE scan_findings SET is_acknowledged = true, \
-             acknowledged_reason = 'pre-ack', acknowledged_at = NOW() WHERE id = $1",
-        )
-        .bind(finding_id)
-        .execute(&pool)
-        .await
-        .expect("pre-acknowledge");
+        crate::services::finding_acknowledgements::FindingAcknowledgementService::new(pool.clone())
+            .acknowledge_finding(
+                finding_id,
+                &crate::services::finding_acknowledgements::AckActor::system(),
+                Some("pre-ack"),
+                Default::default(),
+            )
+            .await
+            .expect("pre-acknowledge");
 
         let service = SbomService::new(pool.clone());
         let entry = service
@@ -4841,6 +4835,7 @@ mod tests {
                 CveStatus::Open,
                 None,
                 None,
+                AccessScope::Admin,
             )
             .await
             .expect("open happy path");
@@ -4881,6 +4876,7 @@ mod tests {
                 CveStatus::Fixed,
                 None,
                 None,
+                AccessScope::Admin,
             )
             .await
             .expect_err("fixed must be rejected");
@@ -4899,10 +4895,7 @@ mod tests {
         let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-4444")
             .await
             .expect("finding row still present");
-        assert!(
-            !ack,
-            "scan_findings.is_acknowledged must NOT change on Fixed rejection"
-        );
+        assert!(!ack, "the finding must stay open on Fixed rejection");
 
         teardown(&pool, repo_id).await;
     }
@@ -4927,6 +4920,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("won't match"),
+                AccessScope::Admin,
             )
             .await
             .expect_err("no matching rows must 404");
@@ -4962,6 +4956,7 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("case-insensitive match"),
+                AccessScope::Admin,
             )
             .await
             .expect("case-insensitive match must succeed");
@@ -4999,18 +4994,18 @@ mod tests {
                 CveStatus::Acknowledged,
                 None,
                 Some("ack both rows"),
+                AccessScope::Admin,
             )
             .await
             .expect("multi-row acknowledge");
 
         // The aggregate must collapse to "acknowledged" only if BOTH rows
-        // are acknowledged (BOOL_AND semantics). The service uses an
-        // unbounded UPDATE, so this is the regression assertion.
+        // are acknowledged (BOOL_AND semantics): one decision per component.
         assert_eq!(entry.status, "acknowledged");
 
         // Direct count verification: both rows must be ack'd.
         let acked: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scan_findings \
+            "SELECT COUNT(*) FROM scan_findings_effective \
              WHERE artifact_id = $1 AND cve_id = $2 AND is_acknowledged = true",
         )
         .bind(artifact_id)
@@ -5069,11 +5064,11 @@ mod tests {
         // The synth aggregate the response carries must keep the same id.
         assert_eq!(entry.id, synth_id);
 
-        // And the ack must actually be persisted on the source table.
+        // And the ack must actually be persisted as a decision.
         let (ack, _, _, _) = read_ack(&pool, artifact_id, "CVE-2024-8888")
             .await
             .expect("finding row present");
-        assert!(ack, "scan_findings.is_acknowledged must be persisted");
+        assert!(ack, "the acknowledgement must be persisted");
 
         teardown(&pool, repo_id).await;
     }

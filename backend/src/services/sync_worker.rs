@@ -10,6 +10,7 @@
 //! when syncing large Docker images, ML models, etc.
 
 use crate::services::cluster_work::{Claimed, WorkerIdentity};
+use crate::services::upstream_pause::{self, UpstreamPauseGate};
 use crate::storage::{StorageLocation, StorageRegistry};
 use chrono::{NaiveTime, Timelike, Utc};
 use sqlx::PgPool;
@@ -165,6 +166,36 @@ pub(crate) fn should_run_stale_check(tick_count: u64, interval_ticks: u64) -> bo
     interval_ticks > 0 && tick_count.is_multiple_of(interval_ticks)
 }
 
+/// What one sync-worker tick does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerTickPlan {
+    pub heartbeat: bool,
+    pub stale_check: bool,
+    /// Dispatch pending peer transfers (push / mirror sync tasks).
+    pub dispatch: bool,
+}
+
+impl PeerTickPlan {
+    /// `heartbeat_interval_ticks` is `None` when probes are disabled. While
+    /// scheduled upstream jobs are paused (#5288) no transfer is dispatched:
+    /// pending tasks stay queued and resume on the first tick after the
+    /// switch is turned off. Heartbeat probes and stale-peer detection are
+    /// liveness, unaffected (`PEER_HEARTBEAT_ENABLED=false` stops probes).
+    pub(crate) fn for_tick(
+        tick_count: u64,
+        heartbeat_interval_ticks: Option<u64>,
+        stale_interval_ticks: u64,
+        upstream_jobs_paused: bool,
+    ) -> Self {
+        Self {
+            heartbeat: heartbeat_interval_ticks
+                .is_some_and(|every| should_run_peer_heartbeat_probe(tick_count, every)),
+            stale_check: should_run_stale_check(tick_count, stale_interval_ticks),
+            dispatch: !upstream_jobs_paused,
+        }
+    }
+}
+
 /// Check whether the current tick should trigger an active peer heartbeat probe.
 pub(crate) fn should_run_peer_heartbeat_probe(tick_count: u64, interval_ticks: u64) -> bool {
     tick_count > 0
@@ -262,13 +293,19 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
             retry_policy.backoff_max_secs,
         );
 
+        let mut pause = UpstreamPauseGate::new(upstream_pause::PEER_SYNC_JOB);
+
         loop {
             tick.tick().await;
             tick_count += 1;
+            let plan = PeerTickPlan::for_tick(
+                tick_count,
+                peer_heartbeat_enabled.then_some(peer_heartbeat_interval_ticks),
+                stale_interval_ticks,
+                pause.skip_tick(&db).await,
+            );
 
-            if peer_heartbeat_enabled
-                && should_run_peer_heartbeat_probe(tick_count, peer_heartbeat_interval_ticks)
-            {
+            if plan.heartbeat {
                 run_peer_heartbeat_probes(
                     &db,
                     &client,
@@ -278,14 +315,17 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
             }
 
             // Periodically check for stale peers and mark them offline.
-            if should_run_stale_check(tick_count, stale_interval_ticks) {
+            if plan.stale_check {
                 run_stale_peer_detection(&db, stale_threshold_min).await;
             }
 
-            if let Err(e) =
-                process_pending_tasks(&db, &client, storage_registry.clone(), retry_policy).await
-            {
-                tracing::error!("Sync worker error: {e}");
+            if plan.dispatch {
+                if let Err(e) =
+                    process_pending_tasks(&db, &client, storage_registry.clone(), retry_policy)
+                        .await
+                {
+                    tracing::error!("Sync worker error: {e}");
+                }
             }
         }
     });
@@ -4214,6 +4254,28 @@ mod tests {
         assert!(should_run_peer_heartbeat_probe(12, 6));
         assert!(!should_run_peer_heartbeat_probe(2, 6));
         assert!(!should_run_peer_heartbeat_probe(0, 6));
+    }
+
+    /// #5288: a paused tick dispatches no peer transfer, and only that changes.
+    #[test]
+    fn test_peer_tick_plan_dispatches_nothing_while_upstream_jobs_paused() {
+        for tick in 1..=12 {
+            for heartbeat in [None, Some(6)] {
+                let running = PeerTickPlan::for_tick(tick, heartbeat, 6, false);
+                let paused = PeerTickPlan::for_tick(tick, heartbeat, 6, true);
+                assert!(running.dispatch && !paused.dispatch, "tick {tick}");
+                assert_eq!(
+                    (running.heartbeat, running.stale_check),
+                    (paused.heartbeat, paused.stale_check),
+                    "tick {tick}: liveness must not depend on the switch"
+                );
+                assert_eq!(
+                    running.heartbeat,
+                    heartbeat.is_some() && (tick == 1 || tick.is_multiple_of(6))
+                );
+                assert_eq!(running.stale_check, tick.is_multiple_of(6));
+            }
+        }
     }
 
     #[test]

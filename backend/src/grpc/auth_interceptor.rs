@@ -33,6 +33,11 @@ pub struct GrpcPrincipal {
     /// token (no scope restriction); `Some(list)` = allowlist evaluated by
     /// `token_service::scopes_grant_access` (exact match | `*` | `admin`).
     pub scopes: Option<Vec<String>>,
+    /// The token's subject.
+    pub user_id: uuid::Uuid,
+    /// The repositories the token is restricted to, from
+    /// `Claims.allowed_repo_ids`.
+    pub allowed_repo_ids: crate::models::access_scope::AccessScope,
 }
 
 /// Per-method scope authorizer for the gRPC plane. Mirrors REST's
@@ -209,6 +214,10 @@ impl AuthInterceptor {
         req.extensions_mut().insert(GrpcPrincipal {
             is_admin: token_data.claims.is_admin,
             scopes: token_data.claims.scopes.clone(),
+            user_id: token_data.claims.sub,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::from(
+                &token_data.claims.allowed_repo_ids,
+            ),
         });
 
         Ok(req)
@@ -460,6 +469,63 @@ mod tests {
             .await;
     }
 
+    /// #5153: the principal is stamped from the token itself. The service tests
+    /// insert a `GrpcPrincipal` by hand, so this is what ties them to a real request.
+    #[test]
+    fn test_intercept_stamps_the_subject_and_repository_restriction() {
+        let sub = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let mut claims = test_claims(sub, true, "access", None);
+        claims.allowed_repo_ids = Some(vec![repo]);
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("token");
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("metadata"),
+        );
+        let stamped = AuthInterceptor::new("secret", None)
+            .intercept(req)
+            .expect("a valid admin token");
+        let principal = stamped
+            .extensions()
+            .get::<GrpcPrincipal>()
+            .expect("the principal is stamped");
+        assert_eq!(principal.user_id, sub);
+        assert_eq!(
+            principal.allowed_repo_ids,
+            crate::models::access_scope::AccessScope::Restricted(vec![repo])
+        );
+
+        // No restriction on the token: none on the principal.
+        let unrestricted = encode(
+            &Header::default(),
+            &test_claims(sub, true, "access", None),
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .expect("token");
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {unrestricted}").parse().expect("metadata"),
+        );
+        let stamped = AuthInterceptor::new("secret", None)
+            .intercept(req)
+            .expect("a valid admin token");
+        assert_eq!(
+            stamped
+                .extensions()
+                .get::<GrpcPrincipal>()
+                .expect("stamped")
+                .allowed_repo_ids,
+            crate::models::access_scope::AccessScope::Admin
+        );
+    }
+
     // -----------------------------------------------------------------------
     // authorize_grpc_scope: per-method scope enforcement (mirror of REST
     // AuthExtension::has_scope). Pure, no DB.
@@ -470,6 +536,8 @@ mod tests {
         req.extensions_mut().insert(GrpcPrincipal {
             is_admin: true,
             scopes,
+            user_id: Uuid::nil(),
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Admin,
         });
         req
     }

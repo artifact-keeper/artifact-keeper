@@ -2178,7 +2178,7 @@ mod db_cov_tests {
             assert_eq!(body_bytes.len(), zip_bytes.len());
         }
 
-        drop(mock_server);
+        tdh::drop_mock_server(mock_server).await;
         tdh::cleanup(&fx.pool, fx.repo_id, fx.user_id).await;
         let _ = std::fs::remove_dir_all(&fx.storage_dir);
     }

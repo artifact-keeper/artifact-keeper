@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5321]
+---
+- **`snapshot_download` through a Hugging Face Remote now gets the files in subdirectories** (#5321). `huggingface_hub` builds a snapshot from `api/models/<id>/tree/<commit>?recursive=true`, and the Remote proxied the tree request without its query, so the Hub listed only the top level and files such as `1_Pooling/config.json` were left out while `snapshot_download` still reported success; offline or on a disconnected site the model was incomplete. The tree route now forwards `recursive`, `expand` and `cursor` in one canonical spelling, so each distinct listing is cached on its own (and is the path the upstream filter sees), and follows the Hub's `Link: rel="next"` pages, returning them as one list. A page shorter than the Hub's page size is the last one and needs only the cached fetch; a full page whose continuation cannot be read fails the request rather than being served as the whole listing. Local repositories honour `recursive` too: without it, subdirectories are listed as `directory` entries, as on the Hub.

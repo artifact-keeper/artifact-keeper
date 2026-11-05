@@ -11,7 +11,7 @@
 //! queue as `source: hosted, kind: active`. Since #4510 the hold also records
 //! its origin in `artifacts.quarantine_source` (`upload`, `admin`,
 //! `scan_policy`; NULL for a hold written before migration 299, by a 1.11
-//! replica, or by the scanner until it records its own), which the queue
+//! replica, or by a scanner before #5153 recorded its own), which the queue
 //! reports as `hold_source` and can filter on. What a scan policy refuses
 //! right now, held or not, is the separate policy-blocks queue
 //! ([`DownloadHoldsService::list_policy_blocks`]), derived from the gate's

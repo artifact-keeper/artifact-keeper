@@ -20,6 +20,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use artifact_keeper_backend::models::sbom::PolicyAction;
+use artifact_keeper_backend::services::finding_acknowledgements::{
+    AckActor, FindingAcknowledgementService,
+};
 use artifact_keeper_backend::services::promotion_policy_service::PromotionPolicyService;
 use artifact_keeper_backend::services::sbom_service::SbomService;
 
@@ -63,8 +66,8 @@ async fn create_artifact(pool: &PgPool, repo_id: Uuid, name: &str) -> Uuid {
 }
 
 /// Insert one completed scan, finished `age_seconds` ago, with a single
-/// critical finding carrying `cve_id`. `acknowledged` controls the finding's
-/// `is_acknowledged` flag. Returns the scan_result id.
+/// critical finding carrying `cve_id`. `acknowledged` records a decision covering
+/// it (#5153). Returns the scan_result id.
 async fn insert_scan_with_cve_at(
     pool: &PgPool,
     artifact_id: Uuid,
@@ -96,17 +99,36 @@ async fn insert_scan_with_cve_at(
 
     sqlx::query(
         "INSERT INTO scan_findings \
-         (scan_result_id, artifact_id, severity, title, cve_id, source, is_acknowledged) \
-         VALUES ($1, $2, 'critical', $3, $4, 'test', $5)",
+         (scan_result_id, artifact_id, severity, title, cve_id, source) \
+         VALUES ($1, $2, 'critical', $3, $4, 'test')",
     )
     .bind(scan_id)
     .bind(artifact_id)
     .bind(format!("Finding for {}", cve_id))
     .bind(cve_id)
-    .bind(acknowledged)
     .execute(pool)
     .await
     .expect("insert scan_finding");
+
+    if acknowledged {
+        let finding_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM scan_findings WHERE scan_result_id = $1 AND cve_id = $2",
+        )
+        .bind(scan_id)
+        .bind(cve_id)
+        .fetch_one(pool)
+        .await
+        .expect("find scan_finding");
+        FindingAcknowledgementService::new(pool.clone())
+            .acknowledge_finding(
+                finding_id,
+                &AckActor::system(),
+                Some("accepted"),
+                Default::default(),
+            )
+            .await
+            .expect("acknowledge");
+    }
 
     scan_id
 }
@@ -226,7 +248,7 @@ async fn test_unacknowledged_scan_finding_blocks_promotion() {
 }
 
 /// An acknowledged finding must NOT count as an open CVE: the repointed query
-/// filters on `NOT is_acknowledged`. With no other open CVEs and no critical
+/// reads acknowledged state from the decisions. With no other open CVEs and no critical
 /// counts in play, `open_cves` is empty.
 #[tokio::test]
 #[ignore]
@@ -245,7 +267,7 @@ async fn test_acknowledged_scan_finding_is_not_open() {
     let summary = result.cve_summary.expect("cve_summary present");
     assert!(
         summary.open_cves.is_empty(),
-        "an acknowledged finding must not appear in open_cves (NOT is_acknowledged filter)"
+        "an acknowledged finding must not appear in open_cves (a decision covers it)"
     );
 
     cleanup(&pool, repo_id).await;

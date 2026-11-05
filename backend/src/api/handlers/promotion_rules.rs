@@ -421,9 +421,17 @@ async fn evaluate_rule(
     let mut entries = Vec::new();
     let mut passed_count = 0;
     let mut failed_count = 0;
+    let may_acknowledge = crate::api::handlers::promotion::promoter_may_acknowledge(
+        &state.db,
+        &auth,
+        rule.target_repo_id,
+    )
+    .await;
 
     for artifact_id in &artifact_ids {
-        let eval = service.evaluate_artifact(*artifact_id, &rule).await?;
+        let eval = service
+            .evaluate_artifact(*artifact_id, &rule, may_acknowledge)
+            .await?;
         if eval.passed {
             passed_count += 1;
         } else {

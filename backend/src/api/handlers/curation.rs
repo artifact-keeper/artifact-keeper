@@ -639,6 +639,15 @@ async fn approve_package(
             None,
         )
         .await?;
+    // #5253: an MCP row's approval is audited and ingests the name.
+    crate::services::mcp_catalog::after_generic_status(
+        &state,
+        &[pkg.id],
+        &pkg.status,
+        auth.user_id,
+        false,
+    )
+    .await;
     Ok(Json(pkg_to_response(pkg)))
 }
 
@@ -659,6 +668,14 @@ async fn block_package(
     let pkg = svc
         .set_package_status(id, "blocked", "Manually blocked", Some(auth.user_id), None)
         .await?;
+    crate::services::mcp_catalog::after_generic_status(
+        &state,
+        &[pkg.id],
+        &pkg.status,
+        auth.user_id,
+        false,
+    )
+    .await;
     Ok(Json(pkg_to_response(pkg)))
 }
 
@@ -679,6 +696,14 @@ async fn bulk_approve(
     let count = svc
         .bulk_set_status(&req.ids, "approved", &req.reason, Some(auth.user_id))
         .await?;
+    crate::services::mcp_catalog::after_generic_status(
+        &state,
+        &req.ids,
+        "approved",
+        auth.user_id,
+        true,
+    )
+    .await;
     Ok(Json(count))
 }
 
@@ -699,6 +724,14 @@ async fn bulk_block(
     let count = svc
         .bulk_set_status(&req.ids, "blocked", &req.reason, Some(auth.user_id))
         .await?;
+    crate::services::mcp_catalog::after_generic_status(
+        &state,
+        &req.ids,
+        "blocked",
+        auth.user_id,
+        true,
+    )
+    .await;
     Ok(Json(count))
 }
 
@@ -814,9 +847,26 @@ async fn trigger_sync(
     // `abort: None` — this operator-invoked single-repo pass is not guarded
     // by the `curation_sync` scheduler lease, so there is no lease-loss token
     // to observe (#3502).
-    let sync_result =
+    // #5253: a Remote MCP registry syncs its upstream catalog instead.
+    let sync_result = if repo.format == crate::models::repository::RepositoryFormat::Mcp {
+        match crate::api::handlers::proxy_helpers::resolve_repo_by_key(
+            &state.db,
+            &repo.key,
+            &["mcp"],
+            "an MCP registry",
+        )
+        .await
+        {
+            Ok(info) => crate::services::mcp_remote::sync_repo(&state, &info)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string().into()),
+            Err(_) => Err("not an MCP registry".into()),
+        }
+    } else {
         crate::services::scheduler_service::run_curation_sync_cycle(&state.db, Some(repo.id), None)
-            .await;
+            .await
+    };
     let succeeded = sync_result.is_ok();
     if let Err(ref e) = sync_result {
         tracing::warn!("Manual curation sync for repo {} failed: {}", repo.key, e);

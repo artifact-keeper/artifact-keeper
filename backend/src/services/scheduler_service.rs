@@ -22,6 +22,9 @@ use crate::services::scan_result_service::ScanResultService;
 use crate::services::smtp_service::SmtpService;
 use crate::services::storage_service::StorageService;
 use crate::services::sync_policy_service::SyncPolicyService;
+/// The one helper every scheduled upstream job consults (#5288).
+pub use crate::services::upstream_pause::upstream_jobs_paused;
+use crate::services::upstream_pause::{self, UpstreamPauseGate};
 
 /// TTL for the lifecycle-cycle singleton lease. Bounds a crashed holder; a
 /// live holder heartbeats it for as long as the cycle runs.
@@ -376,6 +379,40 @@ pub fn spawn_all(
                 if let Err(e) = update_gauge_metrics(&db).await {
                     tracing::warn!("Failed to update gauge metrics: {}", e);
                 }
+            }
+        });
+    }
+
+    // Lapsed finding acknowledgements (every 5 minutes, #5153). Every gate reads
+    // `expires_at` itself; this writes the audit row and refreshes stored scores.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let mut ticker = interval(Duration::from_secs(300));
+            let service =
+                crate::services::finding_acknowledgements::FindingAcknowledgementService::new(db);
+
+            loop {
+                ticker.tick().await;
+                if let Err(e) = service.record_expired().await {
+                    tracing::warn!("Failed to record lapsed acknowledgements: {}", e);
+                }
+            }
+        });
+    }
+
+    // MCP introspection queue (every 15 minutes, #5253): return expired worker
+    // claims and re-queue remote probes that are due. DB-only and idempotent
+    // (`IdempotentDbOnly`): one open job per target is a unique index.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let mut ticker = interval(Duration::from_secs(900));
+            loop {
+                ticker.tick().await;
+                crate::services::mcp_introspection::scheduler_tick(&db).await;
             }
         });
     }
@@ -860,13 +897,16 @@ pub fn spawn_all(
     {
         let db = db.clone();
         let config_clone = config.clone();
+        let backup_registry = storage_registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(45)).await;
             let mut ticker = interval(Duration::from_secs(300)); // 5 minutes
 
             loop {
                 ticker.tick().await;
-                if let Err(e) = execute_due_backup_schedules(&db, &config_clone).await {
+                if let Err(e) =
+                    execute_due_backup_schedules(&db, &config_clone, &backup_registry).await
+                {
                     tracing::warn!("Backup schedule check failed: {}", e);
                 }
             }
@@ -933,9 +973,16 @@ pub fn spawn_all(
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(45)).await;
             let mut ticker = interval(Duration::from_secs(300));
+            let mut pause = UpstreamPauseGate::new(upstream_pause::CURATION_SYNC_JOB);
 
             loop {
                 ticker.tick().await;
+                // #5288: no upstream fetch (nor popularity lookup) while the
+                // instance is disconnected; due repos sync on the first tick
+                // after the switch is turned off.
+                if pause.skip_tick(&db).await {
+                    continue;
+                }
                 tracing::debug!("Checking for curation repos due for upstream sync");
 
                 // Cluster-lease the sweep (#2357 S11): only one replica runs the
@@ -1363,9 +1410,14 @@ pub fn spawn_all(
             );
             let mut ticker = interval(Duration::from_secs(60));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut pause = UpstreamPauseGate::new(upstream_pause::ENVIRONMENT_REEVAL_JOB);
 
             loop {
                 ticker.tick().await;
+                // #5288: re-evaluation queries OSV; pending deltas wait.
+                if pause.skip_tick(&db).await {
+                    continue;
+                }
                 let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
                     &db,
                     "environment_reeval",
@@ -1717,7 +1769,11 @@ async fn finalize_backup_schedule_run(
 }
 
 /// Check for due backup schedules and execute them.
-async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::error::Result<()> {
+async fn execute_due_backup_schedules(
+    db: &PgPool,
+    config: &Config,
+    storage_registry: &Arc<crate::storage::StorageRegistry>,
+) -> crate::error::Result<()> {
     // Find schedules where next_run_at <= now
     let due_schedules = sqlx::query_as::<_, DueBackupSchedule>(
         r#"
@@ -1821,7 +1877,8 @@ async fn execute_due_backup_schedules(db: &PgPool, config: &Config) -> crate::er
             db.clone(),
             storage.clone(),
             archive_storage.clone(),
-        );
+        )
+        .with_storage_registry(storage_registry.clone());
         // The renewal loop heartbeats the claim; its cancellation token fires
         // if ownership is lost (DB partition, expired TTL reclaimed by another
         // replica) so the in-flight archive is aborted instead of producing a
@@ -2092,7 +2149,7 @@ async fn run_curation_sync_cycle_for(
     // rules (#2949) evaluated across many packages / staging repos share
     // lookups instead of hammering the public stats APIs.
     let popularity_source =
-        crate::services::curation::popularity_source::HttpPopularitySource::new().cached();
+        crate::services::curation::popularity_source::HttpPopularitySource::from_env().cached();
     // Repo-level ingest failures that must surface as a failed sync (#4427)
     // without aborting the rest of the sweep.
     let mut failures: Vec<String> = Vec::new();

@@ -130,6 +130,11 @@ pub struct CveHistoryEntry {
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// After a revoke: how many copies of the decision stay effective in
+    /// repositories the caller has no authority over. Absent on any other read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[sqlx(default)]
+    pub acknowledgements_left_effective: Option<i64>,
 }
 
 /// CVE status for tracking.

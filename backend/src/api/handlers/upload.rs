@@ -28,7 +28,7 @@ use crate::services::package_service::PackageService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::upload_service::{self, UploadError, UploadService};
 
-mod format_finalize;
+pub(crate) mod format_finalize;
 use format_finalize::{FinalizeInput, FinalizeSource};
 
 // ---------------------------------------------------------------------------
@@ -268,6 +268,8 @@ async fn create_session(
     // without ever having been fetched from it. Checked after the
     // authorization gates and before any session row exists.
     proxy_helpers::reject_write_if_not_hosted(repo_record.repo_type.as_str())?;
+    // #5253: an MCP registry publishes through its own route only.
+    super::repositories::reject_generic_write_to_mcp(&repo_record.format, &auth, &headers)?;
 
     let is_replication = super::is_replication_request(&headers);
     if req.skip_if_present && !is_replication {
@@ -579,7 +581,7 @@ async fn session_status_response(
         ("Prefer" = Option<String>, Header, description = "`respond-async` (RFC 7240): answer 202 once the completion lease is held and commit in the background; poll `GET /api/v1/uploads/{session_id}` until `status` is `completed` (with `artifact_id`), `failed` (with `error`), or back to `in_progress` (a retryable failure: repeat this request)"),
     ),
     responses(
-        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
+        (status = 200, description = "Upload finalized, artifact created. In a format repository (Maven, Gradle, npm, PyPI, RPM, Incus, Debian, Alpine) the artifact is named, versioned and indexed as the format's own upload route indexes it (#1846)", body = CompleteResponse),
         (status = 202, description = "`Prefer: respond-async` was sent: the completion lease is held and the commit runs in the background. `Location` is the session status to poll", body = SessionStatusResponse),
         (status = 400, description = "Incomplete chunks or invalid state, or the session's repository is virtual (the session is failed), or the format's own upload route would refuse the package: a `package.json`, wheel `METADATA` or Debian control file that names another package or version than the path (the session is failed, nothing is stored)", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Session not found", body = crate::api::openapi::ErrorResponse),
@@ -809,7 +811,7 @@ async fn complete_session_commit(
     );
     let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
     // #1846: a format with a native upload route (Maven, npm, PyPI, RPM,
-    // Incus, Debian) gets the coordinates that route writes, derived from the
+    // Incus, Debian, Alpine) gets the coordinates that route writes, derived from the
     // path before the bytes are read so the immutability gate below checks
     // the very `version` the row is written with. A trusted replication
     // session brings the source row's own metadata instead.
@@ -1084,6 +1086,14 @@ async fn complete_session_commit(
     // Clean up the local scratch copy now that the bytes are in final storage.
     drop(assembled);
 
+    // #5254: a format whose native route stores a package under the identity
+    // its bytes declare (an Alpine `.PKGINFO`) is stored under that identity
+    // here too: row, catalog entry and response.
+    let native_target = match (native_target, staged_native.as_ref()) {
+        (Some(target), Some(staged)) => Some(format_finalize::resolved_target(target, staged)),
+        (target, _) => target,
+    };
+
     // Create artifact record. A natively finalized format is named the way
     // its native route names it (Maven artifactId, npm package, normalized
     // PyPI project, RPM name, incus product, debian package), which is what
@@ -1110,8 +1120,14 @@ async fn complete_session_commit(
     // path so the artifact remains retrievable with correct coordinates. Generic
     // repositories keep their existing behaviour (version may be NULL).
     // `derived_version` was computed above, before the immutability gate, so
-    // the value checked there is exactly the value written here.
-    let artifact_version = derived_version.as_deref();
+    // the value checked there is the value written here, except for a package
+    // whose own declared version differs from its file name's (#5254): the
+    // atomic upsert below still refuses a live row at that version, and the
+    // gate's release backstop already refused any change of bytes at the path.
+    let artifact_version = match &native_target {
+        Some(target) => Some(target.version.as_str()),
+        None => derived_version.as_deref(),
+    };
 
     // #2516 S2: atomic quota admission for the chunked path, in the same
     // transaction as the artifact INSERT. The session-create quota check is
@@ -1276,7 +1292,7 @@ async fn complete_session_commit(
             match format_finalize::metadata_document(
                 staged,
                 target,
-                &session,
+                &(&session).into(),
                 rpm_upload_metadata.as_ref(),
             ) {
                 Ok(document) => document,
@@ -1463,7 +1479,7 @@ async fn complete_session_commit(
     if let (Some(staged), Some(target)) = (staged_native, &native_target) {
         let recorded = format_finalize::record(
             state,
-            &session,
+            &(&session).into(),
             artifact_id,
             target,
             staged,

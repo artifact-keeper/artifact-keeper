@@ -125,6 +125,8 @@ sum by (surface) (increase(ak_auth_failures_total{reason="unknown_user"}[10m])) 
 | Metric | Type | Labels | Moves when |
 |---|---|---|---|
 | `ak_proxy_scan_verdicts_total` | counter | `verdict`, `action` | a pull from a repository with scan-on-proxy enabled passes the scan gate |
+| `ak_proxy_scan_queue_refused_total` | counter | `limit` | a proxied file gets no scan for now because the in-flight table has no room: `423` under `fail_closed`, served `pending` otherwise. `limit` is `scans`, `bytes`, `repository_scans`, `repository_bytes`, `scan_waiters` or `repository_waiters` |
+| `ak_proxy_scan_abandoned_total` | counter | | a queued `fail_closed` scan leaves the queue because no request has wanted it for 30 seconds |
 
 `verdict` is what the pull was judged as: `clean`, `vulnerable`, `pending` (a
 first pull served before its scan, fail-open or record-only) or `inconclusive`
