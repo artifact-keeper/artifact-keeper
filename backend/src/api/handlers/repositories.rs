@@ -6663,11 +6663,18 @@ pub struct ListArtifactsQuery {
     /// #2519), by `group_by=docker_tag`, and by `group_by=maven_component`
     /// on remote repositories; other listing modes ignore it.
     pub cursor: Option<String>,
-    /// Total-count mode for keyset-paged listings (#2520, #2519).
+    /// Total-count mode for keyset-paged listings (#2520, #2519, #5255).
     /// `count=exact` runs a dedicated COUNT query so `pagination.total` is
-    /// exact; otherwise the keyset-paged listings report a cheap lower bound
-    /// (rows seen so far, +1 when another page exists) and `has_more` is the
-    /// authoritative "is there a next page" signal.
+    /// exact. `count=lower_bound` skips it: `pagination.total` is then exact
+    /// only on the last page reached by `page=N` (and on an empty page, which
+    /// always counts), and otherwise a lower bound (rows seen so far, +1 when
+    /// another page exists). Without the parameter, the flat listings
+    /// (hosted, virtual, remote) are exact on `page=N` requests and
+    /// `lower_bound` on `cursor` requests, and the grouped listings
+    /// (`group_by`) are `lower_bound`.
+    /// The response's `total_is_exact` says which one you got; `has_more` is
+    /// the authoritative "is there a next page" signal either way, so walk
+    /// pages until it is false rather than up to a lower-bound `total_pages`.
     pub count: Option<String>,
 }
 
@@ -6827,6 +6834,14 @@ pub struct ArtifactListResponse {
     /// the `pagination.total` mode (exact vs lower bound).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
+    /// Whether `pagination.total` and `pagination.total_pages` are exact
+    /// (#5255). `false` means they are a lower bound (the rows seen so far,
+    /// +1 when another page exists): page with `has_more` / `next_cursor`
+    /// until `has_more` is false, or pass `?count=exact`, instead of looping
+    /// to `total_pages`. Set on every artifact listing; absent only from
+    /// servers older than this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_is_exact: Option<bool>,
 }
 
 /// A Docker/OCI tag grouped by (image, tag).
@@ -7051,9 +7066,16 @@ pub async fn list_artifacts(
         query.group_by.as_deref() == Some("maven_component") && is_maven_format;
 
     // #2520: `count=exact` opts into a dedicated COUNT query on the grouped
-    // keyset-paged listings; everything else gets a cheap lower-bound total
-    // plus an authoritative `has_more`.
-    let count_exact = query.count.as_deref() == Some("exact");
+    // keyset-paged listings; by default they report a cheap total flagged by
+    // `total_is_exact` plus an authoritative `has_more`. The flat listings
+    // (hosted, virtual, remote) count by default on `page=N` requests
+    // (#5255): see [`ListingCount::flat_default`].
+    let count_param = query.count.as_deref();
+    let count_mode = ListingCount::from_param(count_param, ListingCount::LowerBound);
+    let flat_count_mode = ListingCount::from_param(
+        count_param,
+        ListingCount::flat_default(query.cursor.is_some()),
+    );
 
     if want_component_grouping {
         return list_artifacts_grouped_by_maven_component(
@@ -7064,7 +7086,7 @@ pub async fn list_artifacts(
             query.path_prefix.as_deref(),
             query.q.as_deref(),
             query.cursor.as_deref(),
-            count_exact,
+            count_mode,
             page,
             per_page,
             auth.as_ref(),
@@ -7089,7 +7111,7 @@ pub async fn list_artifacts(
             &key,
             query.q.as_deref(),
             query.cursor.as_deref(),
-            count_exact,
+            count_mode,
             page,
             per_page,
             auth.as_ref(),
@@ -7112,7 +7134,7 @@ pub async fn list_artifacts(
             query.path_prefix.as_deref(),
             query.q.as_deref(),
             query.cursor.as_deref(),
-            count_exact,
+            flat_count_mode,
             page,
             per_page,
         )
@@ -7123,13 +7145,21 @@ pub async fn list_artifacts(
     // mirroring the #2520/#2519 contract: an opaque `?cursor=` (the previous
     // response's `next_cursor`) takes precedence; without a cursor, legacy
     // `page=N` addressing still works via OFFSET. `has_more` is
-    // authoritative (fetched as `per_page + 1` rows); `pagination.total` is
-    // a cheap lower bound unless the client opts into `?count=exact`, so a
-    // page request never pays a whole-catalog COUNT by default.
+    // authoritative (fetched as `per_page + 1` rows). `pagination.total` is
+    // exact on `page=N` requests and a flagged lower bound on `?cursor=`
+    // requests unless `?count=` says otherwise (#5255), so a cursor walk
+    // never pays a whole-catalog COUNT by default.
     let keyset = decode_cursor_param(query.cursor.as_deref())?;
     let after_path = keyset.as_ref().map(|(path, _)| path.as_str());
     let offset = if after_path.is_some() { 0 } else { offset };
     let fetch = i64::from(per_page) + 1;
+    // Where the page landed decides whether it needs the COUNT (#5255).
+    let page_at = |rows: usize| ListingPage {
+        offset,
+        keyset: after_path.is_some(),
+        returned: rows.min(per_page as usize),
+        has_more: rows > per_page as usize,
+    };
 
     let (mut artifacts, exact_total) = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
@@ -7170,7 +7200,7 @@ pub async fn list_artifacts(
                 fetch,
             )
             .await?;
-        let exact = if count_exact {
+        let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
             Some(
                 artifact_service
                     .count_for_repos(
@@ -7195,7 +7225,7 @@ pub async fn list_artifacts(
                 fetch,
             )
             .await?;
-        let exact = if count_exact {
+        let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
             Some(
                 artifact_service
                     .count(repo.id, query.path_prefix.as_deref(), query.q.as_deref())
@@ -7207,7 +7237,8 @@ pub async fn list_artifacts(
         (page_rows, exact)
     };
 
-    let has_more = artifacts.len() > per_page as usize;
+    let at = page_at(artifacts.len());
+    let has_more = at.has_more;
     artifacts.truncate(per_page as usize);
     let next_cursor = if has_more {
         // Single-key (`path`) cursor; the shared two-part codec is reused
@@ -7217,7 +7248,7 @@ pub async fn list_artifacts(
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, artifacts.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
     let total_pages = grouped_total_pages(total, per_page);
 
     let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
@@ -7304,6 +7335,7 @@ pub async fn list_artifacts(
         docker_tags: None,
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -7334,7 +7366,7 @@ async fn list_remote_cached_artifacts(
     path_prefix: Option<&str>,
     q: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -7346,7 +7378,7 @@ async fn list_remote_cached_artifacts(
             path_prefix,
             q,
             cursor,
-            count_exact,
+            count_mode,
             page,
             per_page,
         )
@@ -7405,6 +7437,9 @@ async fn list_remote_cached_artifacts(
         docker_tags: None,
         next_cursor: None,
         has_more: None,
+        // The legacy reconstruction filters every cached path in memory, so
+        // its total is a full count.
+        total_is_exact: Some(true),
     }))
 }
 
@@ -7416,11 +7451,15 @@ async fn list_remote_cached_artifacts(
 /// Paging mirrors the #2520 grouped-listing contract: an opaque `?cursor=`
 /// (the previous response's `next_cursor`, keyed on the last `path`) takes
 /// precedence; without a cursor, legacy `page=N` addressing still works via
-/// OFFSET. `has_more` is authoritative (fetched as `per_page + 1` rows);
-/// `pagination.total` is a cheap lower bound unless the client opts into
-/// `?count=exact`. Filters keep the legacy semantics: `path_prefix` is a
-/// starts-with match, `q` a case-insensitive substring match, both applied
-/// as escaped `LIKE` patterns so user-supplied `%`/`_` match literally.
+/// OFFSET. `has_more` is authoritative (fetched as `per_page + 1` rows).
+/// `pagination.total` is exact by default on `page=N` requests (#5255): a
+/// lower-bound total that looked authoritative made clients that loop to
+/// `total_pages` stop early. `?cursor=` pages default to the lower bound
+/// (see [`ListingCount::flat_default`]); `total_is_exact` says which one a
+/// response carries. Filters keep the legacy
+/// semantics: `path_prefix` is a starts-with match, `q` a case-insensitive
+/// substring match, both applied as escaped `LIKE` patterns so
+/// user-supplied `%`/`_` match literally.
 #[allow(clippy::too_many_arguments)]
 async fn list_remote_cached_from_catalog(
     state: &SharedState,
@@ -7429,7 +7468,7 @@ async fn list_remote_cached_from_catalog(
     path_prefix: Option<&str>,
     q: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
 ) -> Result<Json<ArtifactListResponse>> {
@@ -7472,8 +7511,14 @@ async fn list_remote_cached_from_catalog(
     } else {
         None
     };
+    let at = ListingPage {
+        offset,
+        keyset: after_path.is_some(),
+        returned: rows.len(),
+        has_more,
+    };
 
-    let exact_total = if count_exact {
+    let exact_total = if at.needs_count(count_mode) {
         Some(
             proxy_catalog::browse_count(
                 &state.db,
@@ -7487,7 +7532,7 @@ async fn list_remote_cached_from_catalog(
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, rows.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
 
     // #3265: proxy-served downloads ARE recorded (in the
     // `proxy_download_statistics` sibling of `download_statistics`), they were
@@ -7520,6 +7565,7 @@ async fn list_remote_cached_from_catalog(
         docker_tags: None,
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -8206,7 +8252,7 @@ async fn list_artifacts_grouped_by_maven_component(
     path_prefix: Option<&str>,
     search_query: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
     // The CALLER (#3163). Only consulted for a Virtual repo, whose members are
@@ -8261,12 +8307,18 @@ async fn list_artifacts_grouped_by_maven_component(
         // what `build_maven_components_for_keys` does from the `artifacts`
         // table for hosted repos.
         populate_remote_component_files(&state.db, repo.id, &mut components).await?;
-        let exact_total = if count_exact {
+        let at = ListingPage {
+            offset,
+            keyset: keyset.is_some(),
+            returned: components.len(),
+            has_more,
+        };
+        let exact_total = if at.needs_count(count_mode) {
             Some(count_maven_catalog_components(&state.db, repo.id, search_query).await?)
         } else {
             None
         };
-        let total = grouped_listing_total(exact_total, offset, components.len(), has_more);
+        let (total, total_is_exact) = listing_total(exact_total, at);
         return Ok(Json(ArtifactListResponse {
             items: Vec::new(),
             pagination: Pagination {
@@ -8279,6 +8331,7 @@ async fn list_artifacts_grouped_by_maven_component(
             docker_tags: None,
             next_cursor,
             has_more: Some(has_more),
+            total_is_exact: Some(total_is_exact),
         }));
     }
 
@@ -8350,12 +8403,18 @@ async fn list_artifacts_grouped_by_maven_component(
     } else {
         None
     };
-    let exact_total = if count_exact {
+    let at = ListingPage {
+        offset,
+        keyset: keyset.is_some(),
+        returned: keys.len(),
+        has_more,
+    };
+    let exact_total = if at.needs_count(count_mode) {
         Some(count_maven_catalog_component_keys(&state.db, &repo_ids, search_query).await?)
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, keys.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
 
     let components = build_maven_components_for_keys(
         artifact_service,
@@ -8380,6 +8439,7 @@ async fn list_artifacts_grouped_by_maven_component(
         docker_tags: None,
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -8731,19 +8791,100 @@ fn decode_cursor_param(cursor: Option<&str>) -> Result<Option<(String, String)>>
     }
 }
 
-/// `pagination.total` for a keyset-paged grouped listing (#2520): the exact
-/// COUNT when the client asked for it, otherwise a cheap lower bound (rows
-/// known so far, +1 when another page exists). `has_more` — not this value —
-/// is the authoritative next-page signal.
-fn grouped_listing_total(exact: Option<i64>, offset: i64, returned: usize, has_more: bool) -> i64 {
-    match exact {
-        Some(total) => total,
-        None => offset + returned as i64 + i64::from(has_more),
+/// `?count=` mode of a keyset-paged artifact listing (#2520, #5255).
+///
+/// `count=exact` and `count=lower_bound` pick a mode explicitly; any other
+/// value (or none) takes the listing's default: [`Self::LowerBound`] for the
+/// grouped listings (PF-003), and [`Self::flat_default`] for the flat hosted,
+/// virtual and remote listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingCount {
+    /// Run the COUNT query: `pagination.total` is exact.
+    Exact,
+    /// Skip the COUNT query where the page alone cannot settle the total:
+    /// `pagination.total` is then a lower bound and the response says so
+    /// with `total_is_exact: false`.
+    LowerBound,
+}
+
+impl ListingCount {
+    /// Default for the flat hosted, virtual and remote listings (#5255):
+    /// exact on a page addressed by `page=N` (including the first page of
+    /// any walk), so a client that reads `total_pages` and loops to it gets
+    /// every item; a lower bound on a `?cursor=` page, so a cursor walk
+    /// stays O(page) per request (PF-001 / PF-002). The COUNT is O(rows in
+    /// the repository) -- for a remote, an index-only scan of its
+    /// `(repository_id, path)` range, ~15 ms at 100k cached rows and ~150 ms
+    /// at 1M -- which on every page of a cursor walk would make walking the
+    /// whole repository quadratic. `page=N` addressing already pays
+    /// O(offset) for its OFFSET. A cursor client pages on `has_more` by
+    /// construction.
+    fn flat_default(keyset: bool) -> Self {
+        if keyset {
+            Self::LowerBound
+        } else {
+            Self::Exact
+        }
+    }
+
+    fn from_param(raw: Option<&str>, default: Self) -> Self {
+        match raw {
+            Some("exact") => Self::Exact,
+            Some("lower_bound") => Self::LowerBound,
+            _ => default,
+        }
     }
 }
 
-/// `total_pages` companion to [`grouped_listing_total`]; a lower bound
-/// whenever `total` is one.
+/// Where one page of a keyset-paged listing landed, which decides whether
+/// the page alone settles `pagination.total` (#5255).
+#[derive(Debug, Clone, Copy)]
+struct ListingPage {
+    /// OFFSET the page was read at (0 for a `?cursor=` page).
+    offset: i64,
+    /// Whether the page was addressed by `?cursor=` rather than `page=N`.
+    keyset: bool,
+    /// Rows the page returned, after truncating the `per_page + 1` probe.
+    returned: usize,
+    has_more: bool,
+}
+
+impl ListingPage {
+    /// Whether this page has to run the COUNT query. Besides an explicit
+    /// [`ListingCount::Exact`], that is any empty page other than an empty
+    /// first page: an empty page past the end says only "the total is at
+    /// most `offset`", and reporting `offset` as the total there inflated it
+    /// (page 5 of a 10-row listing at `per_page=3` said 12, #5255).
+    fn needs_count(&self, mode: ListingCount) -> bool {
+        mode == ListingCount::Exact || (self.returned == 0 && (self.keyset || self.offset > 0))
+    }
+}
+
+/// `(pagination.total, total_is_exact)` for a keyset-paged listing (#2520,
+/// #5255).
+///
+/// `exact` is the COUNT result when [`ListingPage::needs_count`] ran it.
+/// Otherwise the page itself settles the total exactly when it is the last
+/// page reached by `page=N` (OFFSET + rows, nothing after it), and in every
+/// other case the total is a lower bound: the rows known to exist, +1 when
+/// another page exists. `has_more` stays the authoritative next-page signal.
+fn listing_total(exact: Option<i64>, at: ListingPage) -> (i64, bool) {
+    if let Some(total) = exact {
+        return (total, true);
+    }
+    let known = if at.returned == 0 {
+        // Defensive: callers count empty pages (`needs_count`). The rows
+        // before `offset` are not known to exist, so they are not counted.
+        0
+    } else {
+        at.offset + at.returned as i64
+    };
+    let exact = !at.has_more && !at.keyset && (at.returned > 0 || at.offset == 0);
+    (known + i64::from(at.has_more), exact)
+}
+
+/// `total_pages` companion to [`listing_total`]; a lower bound whenever
+/// `total` is one.
 fn grouped_total_pages(total: i64, per_page: u32) -> u32 {
     if total <= 0 {
         0
@@ -9024,7 +9165,7 @@ async fn list_artifacts_grouped_by_docker_tag(
     repo_key: &str,
     search_query: Option<&str>,
     cursor: Option<&str>,
-    count_exact: bool,
+    count_mode: ListingCount,
     page: u32,
     per_page: u32,
     // The CALLER (#3163). Only consulted for a Virtual repo, whose members are
@@ -9086,6 +9227,12 @@ async fn list_artifacts_grouped_by_docker_tag(
     .await?;
     let has_more = rows.len() > per_page as usize;
     rows.truncate(per_page as usize);
+    let at = ListingPage {
+        offset,
+        keyset: keyset.is_some(),
+        returned: rows.len(),
+        has_more,
+    };
     let next_cursor = if has_more {
         rows.last().map(|r| encode_keyset_cursor(&r.image, &r.tag))
     } else {
@@ -9123,12 +9270,12 @@ async fn list_artifacts_grouped_by_docker_tag(
         |t, p| t.last_promotion = p,
     );
 
-    let exact_total = if count_exact {
+    let exact_total = if at.needs_count(count_mode) {
         Some(count_docker_tag_rows(&state.db, &repo_ids, search_query).await?)
     } else {
         None
     };
-    let total = grouped_listing_total(exact_total, offset, docker_tags.len(), has_more);
+    let (total, total_is_exact) = listing_total(exact_total, at);
 
     Ok(Json(ArtifactListResponse {
         items: Vec::new(),
@@ -9142,6 +9289,7 @@ async fn list_artifacts_grouped_by_docker_tag(
         docker_tags: Some(docker_tags),
         next_cursor,
         has_more: Some(has_more),
+        total_is_exact: Some(total_is_exact),
     }))
 }
 
@@ -15773,23 +15921,110 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn grouped_listing_total_prefers_exact_count() {
-        assert_eq!(grouped_listing_total(Some(10_001), 0, 100, true), 10_001);
-        // Exact wins even when the lower bound would differ.
-        assert_eq!(grouped_listing_total(Some(7), 500, 100, false), 7);
+    fn page_at(offset: i64, keyset: bool, returned: usize, has_more: bool) -> ListingPage {
+        ListingPage {
+            offset,
+            keyset,
+            returned,
+            has_more,
+        }
     }
 
     #[test]
-    fn grouped_listing_total_lower_bound_semantics() {
+    fn listing_total_prefers_exact_count() {
+        assert_eq!(
+            listing_total(Some(10_001), page_at(0, false, 100, true)),
+            (10_001, true)
+        );
+        // Exact wins even when the lower bound would differ.
+        assert_eq!(
+            listing_total(Some(7), page_at(500, false, 100, false)),
+            (7, true)
+        );
+        // A cursor page with a COUNT is exact too.
+        assert_eq!(
+            listing_total(Some(10), page_at(0, true, 3, true)),
+            (10, true)
+        );
+    }
+
+    #[test]
+    fn listing_total_lower_bound_semantics() {
         // Page mode: offset + rows on this page, +1 when another page exists.
-        assert_eq!(grouped_listing_total(None, 200, 100, true), 301);
-        // Final page: no +1.
-        assert_eq!(grouped_listing_total(None, 200, 42, false), 242);
+        assert_eq!(
+            listing_total(None, page_at(200, false, 100, true)),
+            (301, false)
+        );
         // Cursor mode (offset 0, absolute position unknown): pure page bound.
-        assert_eq!(grouped_listing_total(None, 0, 100, true), 101);
-        // Empty listing.
-        assert_eq!(grouped_listing_total(None, 0, 0, false), 0);
+        assert_eq!(
+            listing_total(None, page_at(0, true, 100, true)),
+            (101, false)
+        );
+        // The last page of a cursor walk still does not know the rows
+        // before it.
+        assert_eq!(listing_total(None, page_at(0, true, 1, false)), (1, false));
+    }
+
+    #[test]
+    fn listing_total_last_offset_page_is_exact() {
+        // Final page reached by `page=N`: OFFSET + rows, nothing after it.
+        assert_eq!(
+            listing_total(None, page_at(200, false, 42, false)),
+            (242, true)
+        );
+        // #5255's walk, 10 rows at per_page=3: page 4 settles the total.
+        assert_eq!(listing_total(None, page_at(9, false, 1, false)), (10, true));
+        // Empty listing, first page.
+        assert_eq!(listing_total(None, page_at(0, false, 0, false)), (0, true));
+    }
+
+    #[test]
+    fn listing_total_never_counts_rows_before_an_empty_page() {
+        // #5255: page 5 of a 10-row listing at per_page=3 (offset 12, no rows)
+        // reported total 12. Without a COUNT the rows before the offset are
+        // not known to exist; callers run the COUNT here (`needs_count`).
+        assert_eq!(
+            listing_total(None, page_at(12, false, 0, false)),
+            (0, false)
+        );
+        assert_eq!(
+            listing_total(Some(10), page_at(12, false, 0, false)),
+            (10, true)
+        );
+    }
+
+    #[test]
+    fn listing_page_needs_count_on_exact_and_on_empty_pages_past_the_start() {
+        use ListingCount::{Exact, LowerBound};
+        assert!(page_at(0, false, 3, true).needs_count(Exact));
+        assert!(page_at(0, true, 3, false).needs_count(Exact));
+        assert!(!page_at(0, false, 3, true).needs_count(LowerBound));
+        assert!(!page_at(9, false, 1, false).needs_count(LowerBound));
+        // An empty first page is exactly zero: nothing to count.
+        assert!(!page_at(0, false, 0, false).needs_count(LowerBound));
+        // Past the end by OFFSET, or an empty cursor page: count.
+        assert!(page_at(12, false, 0, false).needs_count(LowerBound));
+        assert!(page_at(0, true, 0, false).needs_count(LowerBound));
+    }
+
+    #[test]
+    fn listing_count_param_overrides_the_default() {
+        use ListingCount::{Exact, LowerBound};
+        assert_eq!(ListingCount::from_param(None, LowerBound), LowerBound);
+        assert_eq!(ListingCount::from_param(None, Exact), Exact);
+        assert_eq!(ListingCount::from_param(Some("exact"), LowerBound), Exact);
+        assert_eq!(
+            ListingCount::from_param(Some("lower_bound"), Exact),
+            LowerBound
+        );
+        assert_eq!(ListingCount::flat_default(false), Exact);
+        assert_eq!(ListingCount::flat_default(true), LowerBound);
+        // Unknown values keep the listing's default, as before.
+        assert_eq!(ListingCount::from_param(Some("bogus"), Exact), Exact);
+        assert_eq!(
+            ListingCount::from_param(Some("bogus"), LowerBound),
+            LowerBound
+        );
     }
 
     #[test]
@@ -15815,10 +16050,12 @@ mod tests {
             docker_tags: Some(vec![]),
             next_cursor: Some(encode_keyset_cursor("app", "t000020")),
             has_more: Some(true),
+            total_is_exact: Some(false),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"next_cursor\":"));
         assert!(json.contains("\"has_more\":true"));
+        assert!(json.contains("\"total_is_exact\":false"));
     }
 
     // -----------------------------------------------------------------------
@@ -17754,11 +17991,13 @@ mod tests {
             docker_tags: None,
             next_cursor: None,
             has_more: None,
+            total_is_exact: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         // components and docker_tags fields should be omitted when None
         assert!(!json.contains("\"components\""));
         assert!(!json.contains("\"docker_tags\""));
+        assert!(!json.contains("\"total_is_exact\""));
     }
 
     #[test]
@@ -17788,6 +18027,7 @@ mod tests {
             docker_tags: None,
             next_cursor: None,
             has_more: None,
+            total_is_exact: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"components\":["));
@@ -17821,6 +18061,7 @@ mod tests {
             docker_tags: Some(vec![tag]),
             next_cursor: None,
             has_more: None,
+            total_is_exact: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"docker_tags\":["));
@@ -19576,7 +19817,7 @@ mod tests {
                 None,
                 None,
                 cursor.as_deref(),
-                false,
+                ListingCount::LowerBound,
                 1,
                 10,
             )
@@ -19604,11 +19845,24 @@ mod tests {
 
         // Response mapping mirrors the sidecar path: synthetic id semantics,
         // not analyzable, catalog timestamp surfaced as cache_cached_at.
-        let first =
-            list_remote_cached_artifacts(&state, &repo, &key, None, None, None, false, 1, 10)
-                .await
-                .expect("first page")
-                .0;
+        let first = list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            None,
+            None,
+            None,
+            ListingCount::Exact,
+            1,
+            10,
+        )
+        .await
+        .expect("first page")
+        .0;
+        // #5255: the remote listing's default mode counts.
+        assert_eq!(first.pagination.total, 25);
+        assert_eq!(first.pagination.total_pages, 3);
+        assert_eq!(first.total_is_exact, Some(true));
         let item = &first.items[0];
         assert_eq!(item.path, "pkg/obj-000.bin");
         assert_eq!(item.name, "obj-000.bin");
@@ -19620,13 +19874,21 @@ mod tests {
         assert_eq!(item.id, cached_artifact_id(&key, "pkg/obj-000.bin"));
 
         // Legacy page=N addressing still works without a cursor, and
-        // `count=exact` opts into the exact total (default is a lower bound
-        // with authoritative has_more).
-        let page3 =
-            list_remote_cached_artifacts(&state, &repo, &key, None, None, None, true, 3, 10)
-                .await
-                .expect("page 3")
-                .0;
+        // `count=exact` reports the exact total.
+        let page3 = list_remote_cached_artifacts(
+            &state,
+            &repo,
+            &key,
+            None,
+            None,
+            None,
+            ListingCount::Exact,
+            3,
+            10,
+        )
+        .await
+        .expect("page 3")
+        .0;
         assert_eq!(
             page3
                 .items
@@ -19649,7 +19911,7 @@ mod tests {
             None,
             Some("OBJ-013"),
             None,
-            false,
+            ListingCount::LowerBound,
             1,
             10,
         )
