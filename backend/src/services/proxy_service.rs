@@ -1294,6 +1294,23 @@ fn extract_streaming_headers(headers: &reqwest::header::HeaderMap) -> UpstreamHe
     }
 }
 
+/// The answer to a cold `HEAD` from the upstream's `HEAD` headers (#5322): the
+/// fields a GET's [`StreamingFetchResult`] would carry, over an empty body.
+/// `Content-Length` is the upstream's, so the HEAD still advertises the size
+/// the GET would send; `artifact_id` stays `None` as for any proxied stream.
+fn head_only_result(headers: UpstreamHeaders) -> StreamingFetchResult {
+    StreamingFetchResult {
+        body: Box::pin(futures::stream::empty()),
+        content_type: headers.content_type,
+        content_length: headers.content_length,
+        artifact_id: None,
+        etag: headers.etag,
+        content_encoding: headers.content_encoding,
+        commit_sha: headers.commit_sha,
+        stale_since: None,
+    }
+}
+
 /// Whether a freshly streamed proxy-cache write should be committed or
 /// rejected. A rejected object is deleted (and its metadata sidecar skipped)
 /// so the next request refetches upstream and self-heals.
@@ -5130,6 +5147,68 @@ impl UpstreamClient {
             }
         }
     }
+
+    /// Unconditional `HEAD` of `url`, for answering a client's HEAD on a cold
+    /// cache without downloading the body (#5322).
+    ///
+    /// Sent the way [`Self::fetch_stream`] sends its GET: the repository's
+    /// configured upstream auth, its egress client and its custom User-Agent,
+    /// with redirects followed by the shared client (reqwest keeps the `HEAD`
+    /// method across a 301/302/303), so the headers are those of the hop the
+    /// GET's body would come from. It mirrors [`Self::check_etag_probe`]
+    /// rather than sharing a helper with it: that probe sits on the
+    /// revalidation path of every proxied fetch, whose future layout is at the
+    /// compiler's query-depth limit, and a shared `async fn` would add a level.
+    ///
+    /// Returns `Ok(None)` when the HEAD did not produce a usable answer: a
+    /// transport error, or any non-2xx status (an upstream that refuses HEAD
+    /// with 405, an OCI-style 401 bearer challenge, a 404 the GET path would
+    /// negative-cache, a 5xx the GET path would answer from stale-if-error).
+    /// The caller then takes the ordinary GET path, so a HEAD never answers
+    /// differently from the GET it stands in for. `Err` only for the refusals
+    /// the GET would hit before sending anything (auth resolution, the
+    /// destination policy).
+    async fn head_headers(&self, url: &str, repo_id: Uuid) -> Result<Option<UpstreamHeaders>> {
+        let upstream_auth = self
+            .upstream_auth_for(
+                url,
+                repo_id,
+                crate::services::upstream_auth::UpstreamAuthMode::RepoConfigured,
+            )
+            .await?;
+        let custom_ua = self.get_custom_user_agent(repo_id).await;
+        let client = self.client_for(repo_id, url).await?;
+
+        let mut request = client.head(url);
+        if let Some(ref auth) = upstream_auth {
+            request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
+        }
+        request = apply_custom_ua(request, custom_ua.as_deref());
+
+        let shown = redact_url_for_diagnostics(url);
+        // Fully qualified so this compiles whether or not the module imports
+        // the plain sender (#5286 replaces that import with the audited one).
+        let response = match crate::services::upstream_tracing::send_upstream(request).await {
+            Ok(response) => response,
+            Err(e) => {
+                tracing::debug!(
+                    url = %shown,
+                    error = %e.without_url(),
+                    "upstream HEAD failed; answering the HEAD through the GET path"
+                );
+                return Ok(None);
+            }
+        };
+        if !response.status().is_success() {
+            tracing::debug!(
+                url = %shown,
+                status = %response.status(),
+                "upstream HEAD was not a success; answering the HEAD through the GET path"
+            );
+            return Ok(None);
+        }
+        Ok(Some(extract_streaming_headers(response.headers())))
+    }
 }
 
 /// Proxy service for fetching and caching artifacts from upstream repositories
@@ -6721,6 +6800,76 @@ impl ProxyService {
             .await
     }
 
+    /// Answer a client's `HEAD` of `path` (#5322): the headers
+    /// [`Self::fetch_artifact_streaming`] would answer a GET with, without
+    /// downloading a body that would only be thrown away.
+    ///
+    /// Before this, a HEAD ran the GET handler: on a cache miss it became the
+    /// streaming leader, opened an upstream GET of the whole object and handed
+    /// back the cache tee, which the HEAD response dropped unpolled. The tee
+    /// never finished, so nothing was cached, and the GET that follows every
+    /// such HEAD (`hf_hub_download`, `pip`, `curl -I` then a download) fetched
+    /// the object again: two upstream body downloads per new file.
+    ///
+    /// * **Cache hit** (or negative hit, or a held entry): exactly the GET
+    ///   path's answer. The body stream is opened on the cached object and
+    ///   dropped unread, as before.
+    /// * **Miss**: the same gates the GET leader applies, in the same order
+    ///   (origin policy, then the upstream filter in
+    ///   [`Self::gated_upstream_url`]), then one upstream `HEAD`. Its headers
+    ///   are answered with an empty body; nothing is cached and no
+    ///   single-flight lease is taken, so a GET leader for the same key is
+    ///   neither held up nor displaced. A Package Age Policy hold the GET
+    ///   would refuse with 409 (judged on the same upstream `Last-Modified`)
+    ///   is refused here too, so a HEAD never says more than the GET would.
+    /// * **Upstream HEAD unusable** (non-2xx, transport error): the ordinary
+    ///   GET path, so 404 negative caching, `on_upstream_not_found = keep` and
+    ///   stale-if-error answer a HEAD exactly as they answer a GET.
+    ///
+    /// A plain `fn` returning a boxed future: the handler futures that reach
+    /// the proxy fetch sit at the compiler's layout query-depth limit, and the
+    /// box keeps this method's state machine out of their layout.
+    pub fn head_artifact_streaming<'a>(
+        &'a self,
+        repo: &'a Repository,
+        path: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<StreamingFetchResult>> {
+        Box::pin(async move {
+            // #4506: the Remote's origin policy, before any cache read or upstream contact.
+            self.ensure_origin_policy_allows(repo).await?;
+            let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, path)?;
+            let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
+            if let Some(hit) = self
+                .try_streaming_cache_hit(repo, path, path, &cache_key, &metadata_key, true)
+                .await?
+            {
+                return Ok(hit);
+            }
+
+            let full_url = self.gated_upstream_url(repo, path).await?;
+            let Some(headers) = self
+                .upstream_client
+                .head_headers(&full_url, repo.id)
+                .await?
+            else {
+                return self.streaming_gated_fetch(repo, path, path, None).await;
+            };
+
+            // Package Age Policy (#3912): the GET leader refuses a release
+            // still inside the hold window with 409; so does its HEAD.
+            let quarantine_until = self
+                .quarantine_until_for_new_entry(repo.id, headers.last_modified.as_deref())
+                .await;
+            if quarantine_until.is_some_and(|until| until > Utc::now()) {
+                return Err(AppError::Conflict(
+                    "Artifact is quarantined and pending security review".to_string(),
+                ));
+            }
+
+            Ok(head_only_result(headers))
+        })
+    }
+
     /// Streaming sibling of [`Self::fetch_artifact_with_cache_path`]: fetch
     /// from upstream using `fetch_path` for the URL but key the proxy cache
     /// on `cache_path`. This lets format handlers whose upstream download
@@ -6907,8 +7056,16 @@ impl ProxyService {
         self.ensure_origin_policy_allows(repo).await?;
         let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
-        self.try_streaming_cache_hit(repo, cache_path, cache_path, &cache_key, &metadata_key)
-            .await
+        // A probe miss is not counted: the caller's fetch that follows counts it.
+        self.try_streaming_cache_hit(
+            repo,
+            cache_path,
+            cache_path,
+            &cache_key,
+            &metadata_key,
+            false,
+        )
+        .await
     }
 
     /// One coordinated attempt of the streaming fetch. Returns `Ok(None)` when
@@ -6934,7 +7091,14 @@ impl ProxyService {
         // they do for presigned redirects (#1018 R-tradeoff already
         // accepted upstream).
         if let Some(result) = self
-            .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
+            .try_streaming_cache_hit(
+                repo,
+                fetch_path,
+                cache_path,
+                &cache_key,
+                &metadata_key,
+                true,
+            )
             .await?
         {
             return Ok(Some(result));
@@ -6971,6 +7135,14 @@ impl ProxyService {
     /// attempt and the uncoordinated fall-back share one implementation.
     /// Returns `Ok(None)` on a miss (no fresh sidecar, or sidecar present but
     /// body evicted), in which case the caller fetches upstream.
+    ///
+    /// Every outcome is counted in `ak_proxy_cache_lookups_total` (#5322):
+    /// before, only the buffered path counted, so a streamed serve, which is
+    /// every package file, every HEAD and every Hugging Face file, never moved
+    /// the counter and the hit ratio described metadata documents alone. A
+    /// miss is counted only when `count_miss` is set: a cache-only probe
+    /// (`streaming_cached_artifact_by_path`) passes `false`, because the fetch
+    /// it falls through to looks the key up again and counts that miss.
     async fn try_streaming_cache_hit(
         &self,
         repo: &Repository,
@@ -6978,6 +7150,7 @@ impl ProxyService {
         cache_path: &str,
         cache_key: &str,
         metadata_key: &str,
+        count_miss: bool,
     ) -> Result<Option<StreamingFetchResult>> {
         match self
             .read_cached_with_revalidation_streaming(
@@ -6990,7 +7163,7 @@ impl ProxyService {
             .await?
         {
             StreamingCacheReadOutcome::Hit(result, metadata) => {
-                record_cache_outcome("hit");
+                record_proxy_cache_lookup(&repo.key, "hit");
                 // #2218/#2270 back-compat: a cache hit on an object cached
                 // BEFORE this catalog existed has no `proxy_cache_artifacts`
                 // row. Fire-and-forget a best-effort backfill from the sidecar
@@ -7011,14 +7184,18 @@ impl ProxyService {
                 Ok(Some(result))
             }
             StreamingCacheReadOutcome::NegativeHit => {
-                record_cache_outcome("negative_hit");
+                record_proxy_cache_lookup(&repo.key, "negative_hit");
                 Err(AppError::NotFound(format!(
                     "Upstream returned 404 (negative-cached) for {}",
                     cache_path
                 )))
             }
             StreamingCacheReadOutcome::Miss => {
-                record_cache_outcome("miss");
+                if count_miss {
+                    record_proxy_cache_lookup(&repo.key, "miss");
+                } else {
+                    record_cache_outcome("miss");
+                }
                 Ok(None)
             }
         }
@@ -7891,7 +8068,14 @@ impl ProxyService {
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
 
         if let Some(result) = self
-            .try_streaming_cache_hit(repo, fetch_path, cache_path, &cache_key, &metadata_key)
+            .try_streaming_cache_hit(
+                repo,
+                fetch_path,
+                cache_path,
+                &cache_key,
+                &metadata_key,
+                true,
+            )
             .await?
         {
             return Ok(result);
