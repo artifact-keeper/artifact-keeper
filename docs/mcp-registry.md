@@ -570,6 +570,11 @@ One decision function (`decide_mcp_serve`) answers every read:
   `error`, `name`, `version`, `hold`, `instance` and, for a package hold, the
   `package` as submitted (`npm:@acme/db-tool@2.0.0`) and the `gate`. It never
   names the backing repository, an artifact id, a finding or a policy.
+- A served version (an exact version or `latest`) is sent with
+  `Cache-Control: no-store`, since it can carry a per-caller bundle ticket;
+  a listing (`/servers`, `/versions`) with `Cache-Control: private, no-cache`
+  and `Vary: Authorization, Cookie`, so no shared cache keeps a decision
+  that can change on the next read.
 - Every refusal is `application/problem+json` with `Cache-Control: no-store`,
   and is audited as `MCP_SERVER_DOWNLOAD_REFUSED`. That includes the refusals
   the shared middleware in front of the registry gives on `/mcp/` paths
@@ -1043,6 +1048,12 @@ resolving, unresolvable, or soft-deleted) is treated as missing:
   stored object once, and `computed_at` is the rollup's. A held version adds
   no node and no bytes. Proxy-cache entries of a Remote, and paths that
   belong to no server version, are not counted for such a caller.
+- `GET /api/v1/tree` (the tree browser) leaves out a held version's nodes,
+  using the same listing decision, and a folder that only held versions
+  fill. `GET /api/v1/tree/content` answers a held version's path with the
+  same `404` as a missing path, before reading storage. Its content is sent
+  with `Cache-Control: no-store` for an MCP registry (`private` for any
+  non-public repository of another format).
 
 A holder sees every stored version there, and still gets the server.json's
 own quarantine refusals (`409`/`403`) on download.
