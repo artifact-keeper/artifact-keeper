@@ -912,6 +912,11 @@ fn is_hf_commit_sha(segment: &str) -> bool {
 /// safe direction, since a mutable path cached as immutable would be served
 /// stale forever.
 fn classify_huggingface(lower: &str) -> HfPath {
+    // A tree listing carries its query (`?recursive=true&cursor=...`, #5321).
+    // The listing at a commit is as fixed as the commit, page by page, so the
+    // query does not change the verdict; it only must not be read as part of
+    // the revision segment.
+    let lower = lower.split_once('?').map_or(lower, |(path, _)| path);
     let segments: Vec<&str> = lower.split('/').collect();
     if segments.iter().any(|s| s.is_empty()) {
         return HfPath::Unknown;
@@ -1717,6 +1722,8 @@ mod tests {
                 format!("api/models/{id}/revision/{HF_SHA}"),
                 format!("api/models/{id}/tree/{HF_SHA}"),
                 format!("api/models/{id}/tree/{HF_SHA}/onnx"),
+                format!("api/models/{id}/tree/{HF_SHA}?recursive=true&expand=false"),
+                format!("api/models/{id}/tree/{HF_SHA}?cursor=abc%2Fdef%3D%3D&recursive=true"),
             ];
             let pointers = [
                 format!("{id}/resolve/main/config.json"),
@@ -1727,6 +1734,7 @@ mod tests {
                 format!("api/models/{id}/revision/refs%2Fpr%2F1"),
                 format!("api/models/{id}/tree/main"),
                 format!("api/models/{id}/tree/main/onnx"),
+                format!("api/models/{id}/tree/main?recursive=true"),
                 // 39 and 41 hex characters are not a commit.
                 format!("{id}/resolve/{}/config.json", &HF_SHA[..39]),
                 format!("{id}/resolve/{HF_SHA}0/config.json"),
