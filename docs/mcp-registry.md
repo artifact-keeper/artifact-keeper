@@ -593,7 +593,10 @@ One decision function (`decide_mcp_serve`) answers every read:
   (`401`, `404`, `429`, `503`), which keep their `WWW-Authenticate` and
   `Retry-After` headers; read refusals carry the read routes' CORS headers.
 - Listings evaluate the scan-policy gate afresh on every request (no cached
-  decision), since a listing entry is the whole document.
+  decision), since a listing entry is the whole document. That holds for
+  the `/v0.1` listings and the generic artifact routes. `/api/v1/search/*`
+  is the one exception: it reuses a registry's reader decision for up to 5
+  seconds (see the search entry under the artifact routes below).
 - `include_deleted=true` widens only `deleted`; it never reveals a hold.
 
 Why `404` and not `403`/`409`/`451`: VS Code treats a `404` on
@@ -1058,7 +1061,18 @@ resolving, unresolvable, or soft-deleted) is treated as missing:
   `quick` (OpenSearch hits are re-checked in PostgreSQL), `advanced` (items,
   `pagination.total` and the facets), `checksum`, `suggest`, `trending` and
   `recent`. The same listing decision is applied to every MCP registry in
-  the caller's scope that it does not hold.
+  the caller's scope that it does not hold. Whether the caller holds a
+  registry is decided on every request. The set of artifacts served to
+  readers is the same for every caller who does not hold the registry, so
+  each replica computes it at most once per registry every 5 seconds and
+  shares it across requests (concurrent requests wait for one computation;
+  a holder's decision is never cached). A hold, release or status change
+  therefore reaches search within 5 seconds, while the `/v0.1` surface and
+  the generic artifact routes apply it on the next request. Search shows a
+  reader only the artifacts that set names: an artifact stored after the
+  set was computed stays hidden until it is recomputed, and the set holds
+  at most 10,000 server versions and 20,000 artifact rows (by path) per
+  registry; rows past that are hidden (fail closed).
 - `GET /api/v1/repositories/{key}/storage/tree` is rebuilt from the rows the
   caller is served, with the materialized rollup's formula: each path counts
   toward every ancestor prefix, `physical_bytes` and `blob_count` count each

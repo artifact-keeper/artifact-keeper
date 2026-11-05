@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -31,7 +32,9 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::opensearch_service::ArtifactDocument;
-use crate::services::search_service::{SearchFacets, SearchQuery, SearchResult, SearchService};
+use crate::services::search_service::{
+    McpServedOnly, SearchFacets, SearchQuery, SearchResult, SearchService,
+};
 
 // ---------------------------------------------------------------------------
 // Admin Router
@@ -175,7 +178,7 @@ const OPENSEARCH_QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 async fn retain_live_visible_hits(
     db: &PgPool,
     scope: &AccessScope,
-    hidden: Option<&[Uuid]>,
+    hidden: Option<&McpServedOnly>,
     hits: Vec<ArtifactDocument>,
 ) -> Result<Vec<SearchResultItem>> {
     if hits.is_empty() {
@@ -199,12 +202,13 @@ async fn retain_live_visible_hits(
           AND a.is_deleted = false
           AND r.key NOT LIKE '~deleting~%'
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
-          AND ($3::uuid[] IS NULL OR a.id <> ALL($3))
+          AND ($3::uuid[] IS NULL OR r.id <> ALL($3) OR a.id = ANY($4))
         "#,
     )
     .bind(&ids)
     .bind(scope.as_allowed_repo_ids())
-    .bind(hidden)
+    .bind(McpServedOnly::repos_bind(hidden))
+    .bind(McpServedOnly::served_bind(hidden))
     .fetch_all(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -224,19 +228,25 @@ async fn retain_live_visible_hits(
         .collect())
 }
 
-/// The artifacts in `scope` (`None`: every repository) that search must not
-/// show `auth` (#5253): the stored documents and bundles of MCP server
-/// versions the caller is not served, in every MCP registry in scope it
-/// does not hold. The same listing decision as the generic artifact listing
-/// ([`super::mcp::GenericArtifactGate::visible_listed`]), so search items,
-/// totals, facets, suggestions, trending and recent all leave them out.
-/// `None` when nothing is hidden (no MCP registry in scope, or the caller
-/// holds every one).
-pub(crate) async fn mcp_hidden_artifacts(
+/// The MCP registries in `scope` (`None`: every repository) that `auth`
+/// does not hold, with the artifacts of theirs search may show it (#5253):
+/// the stored documents and bundles of the server versions the listing
+/// decision serves to readers
+/// ([`super::mcp::GenericArtifactGate::visible_listed`]). Search items,
+/// totals, facets, suggestions, trending and recent show an artifact of such
+/// a registry only when it is served, so a version that is not served, a
+/// row added since the served set was computed and a row past its cap are
+/// all hidden (fail closed). `None` when there is no such registry (none in
+/// scope, or the caller holds every one).
+///
+/// Whether the caller holds a registry is decided per request; the reader
+/// served set is the same for every caller who does not, so it is shared
+/// across requests ([`reader_served`], #5397).
+pub(crate) async fn mcp_served_only(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     scope: Option<&[Uuid]>,
-) -> Result<Option<Vec<Uuid>>> {
+) -> Result<Option<McpServedOnly>> {
     let repos: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM repositories WHERE format = 'mcp' \
          AND ($1::uuid[] IS NULL OR id = ANY($1))",
@@ -249,25 +259,144 @@ pub(crate) async fn mcp_hidden_artifacts(
         return Ok(None);
     }
     let mut gate = super::mcp::GenericArtifactGate::new(state, auth);
-    let mut hidden = Vec::new();
+    let mut out = McpServedOnly::default();
     for repo_id in repos {
         if gate.holds_all(&[repo_id]).await {
             continue;
         }
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
-            "SELECT id, path FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
-        )
-        .bind(repo_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-        for (id, path) in rows {
-            if !gate.visible_listed(repo_id, &path).await {
-                hidden.push(id);
-            }
+        out.served
+            .extend(reader_served(state, repo_id).await.iter().copied());
+        out.repos.push(repo_id);
+    }
+    Ok((!out.repos.is_empty()).then_some(out))
+}
+
+/// How long one registry's reader served set ([`reader_served`]) is reused
+/// across search requests (#5397). A hold, release or status change reaches
+/// search within this window; a newly stored row is hidden until the set is
+/// recomputed. The `/v0.1` listings and the generic artifact routes do not
+/// use it.
+pub(crate) const MCP_SEARCH_SERVED_TTL: Duration = Duration::from_secs(5);
+
+/// How many artifact rows of one registry the reader served set holds (on
+/// top of the listing decision's cap of
+/// [`super::mcp::GENERIC_LISTING_VERSION_CAP`] versions). Rows past it, by
+/// path, are hidden from readers in search (fail closed).
+pub(crate) const MCP_SEARCH_SERVED_ROW_CAP: i64 = 2 * super::mcp::GENERIC_LISTING_VERSION_CAP;
+
+/// Entries the slot map holds before idle, expired ones are dropped.
+const MCP_SEARCH_SERVED_SLOTS: usize = 1_024;
+
+type ServedSlot = Arc<tokio::sync::Mutex<Option<(Instant, Arc<Vec<Uuid>>)>>>;
+
+fn served_slots() -> &'static std::sync::Mutex<HashMap<Uuid, ServedSlot>> {
+    static SLOTS: OnceLock<std::sync::Mutex<HashMap<Uuid, ServedSlot>>> = OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// The artifacts of MCP registry `repo_id` served to a reader (a caller who
+/// does not hold it), shared by every search request on this replica for
+/// [`MCP_SEARCH_SERVED_TTL`] from when its computation began. It is the
+/// reader audience only (computed without the caller's credentials), so no
+/// holder decision is ever cached or handed to another caller. Concurrent
+/// misses for one registry wait for a single computation.
+async fn reader_served(state: &SharedState, repo_id: Uuid) -> Arc<Vec<Uuid>> {
+    let slot = {
+        let mut slots = served_slots().lock().unwrap_or_else(|e| e.into_inner());
+        if slots.len() >= MCP_SEARCH_SERVED_SLOTS {
+            slots.retain(|_, s| {
+                Arc::strong_count(s) > 1
+                    || s.try_lock().is_ok_and(|g| {
+                        g.as_ref()
+                            .is_some_and(|(at, _)| at.elapsed() < MCP_SEARCH_SERVED_TTL)
+                    })
+            });
+        }
+        slots.entry(repo_id).or_default().clone()
+    };
+    let mut cached = slot.lock().await;
+    if let Some((at, served)) = cached.as_ref() {
+        if at.elapsed() < MCP_SEARCH_SERVED_TTL {
+            return served.clone();
         }
     }
-    Ok((!hidden.is_empty()).then_some(hidden))
+    let started = Instant::now();
+    let served = Arc::new(compute_reader_served(state, repo_id, MCP_SEARCH_SERVED_ROW_CAP).await);
+    *cached = Some((started, served.clone()));
+    served
+}
+
+#[cfg(test)]
+fn served_computes() -> &'static std::sync::Mutex<HashMap<Uuid, usize>> {
+    static COUNTS: OnceLock<std::sync::Mutex<HashMap<Uuid, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(Default::default)
+}
+
+/// How many times the reader served set of `repo_id` has been computed.
+#[cfg(test)]
+pub(crate) fn reader_served_computations(repo_id: Uuid) -> usize {
+    served_computes()
+        .lock()
+        .unwrap()
+        .get(&repo_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// [`reader_served`] uncached: the listing decision for readers over the
+/// registry's versions, then at most `row_cap` of the artifact rows those
+/// versions own. An error, an unresolvable registry or a row past the cap
+/// leaves rows out (hidden).
+pub(crate) async fn compute_reader_served(
+    state: &SharedState,
+    repo_id: Uuid,
+    row_cap: i64,
+) -> Vec<Uuid> {
+    #[cfg(test)]
+    {
+        *served_computes()
+            .lock()
+            .unwrap()
+            .entry(repo_id)
+            .or_default() += 1;
+    }
+    let versions = super::mcp::GenericArtifactGate::new(state, None)
+        .reader_listed_versions(repo_id)
+        .await;
+    if versions.is_empty() {
+        return Vec::new();
+    }
+    // `servers/{name}/{version}/server.json` and
+    // `servers/{name}/{version}/bundles/...`, matched on `{name}/{version}`
+    // in SQL and re-checked with `owning_version` below.
+    let owners: Vec<String> = versions.iter().map(|(n, v)| format!("{n}/{v}")).collect();
+    let rows: Vec<(Uuid, String)> = match sqlx::query_as(
+        "SELECT a.id, a.path FROM artifacts a \
+         WHERE a.repository_id = $1 AND a.is_deleted = false \
+           AND left(a.path, 8) = 'servers/' \
+           AND (CASE WHEN right(a.path, 12) = '/server.json' \
+                       THEN substr(a.path, 9, length(a.path) - 20) \
+                     WHEN strpos(substr(a.path, 9), '/bundles/') > 0 \
+                       THEN left(substr(a.path, 9), strpos(substr(a.path, 9), '/bundles/') - 1) \
+                END) = ANY($2) \
+         ORDER BY a.path LIMIT $3",
+    )
+    .bind(repo_id)
+    .bind(&owners)
+    .bind(row_cap)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    rows.into_iter()
+        .filter(|(_, path)| {
+            super::mcp::owning_version(path)
+                .is_some_and(|(n, v)| versions.contains(&(n.to_string(), v.to_string())))
+        })
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// `quarantine_status` / `quarantine_until` are the raw `artifacts` columns,
@@ -613,7 +742,7 @@ pub async fn quick_search(
     }
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
-    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     // Prefer OpenSearch when configured: it gives typo tolerance and relevance
     // ranking the PostgreSQL tsquery path cannot (#3670). The caller's scope is
@@ -641,7 +770,7 @@ pub async fn quick_search(
                 // propagates rather than falling back — the PostgreSQL path
                 // would fail the same way.
                 let results =
-                    retain_live_visible_hits(&state.db, &scope, hidden.as_deref(), found.hits)
+                    retain_live_visible_hits(&state.db, &scope, hidden.as_ref(), found.hits)
                         .await?;
                 return Ok(Json(QuickSearchResponse { results }));
             }
@@ -672,7 +801,7 @@ pub async fn quick_search(
         limit: Some(limit),
         public_only: false,
         accessible_repo_ids,
-        hidden_artifact_ids: hidden,
+        mcp_served_only: hidden,
         sort_by: None,
         sort_order: None,
         ..Default::default()
@@ -741,8 +870,7 @@ pub async fn advanced_search(
     if matches!(params.per_page, Some(0)) {
         let accessible_repo_ids: Option<Vec<Uuid>> =
             resolve_accessible_repos(&state.db, &auth).await?.into();
-        let hidden =
-            mcp_hidden_artifacts(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
+        let hidden = mcp_served_only(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
         let count_query = SearchQuery {
             q: params.query.clone(),
             format: params.format.clone(),
@@ -751,7 +879,7 @@ pub async fn advanced_search(
             limit: Some(1),
             public_only: false,
             accessible_repo_ids: accessible_repo_ids.clone(),
-            hidden_artifact_ids: hidden,
+            mcp_served_only: hidden,
             sort_by: None,
             sort_order: None,
             ..filters
@@ -778,8 +906,7 @@ pub async fn advanced_search(
 
     let accessible_repo_ids: Option<Vec<Uuid>> =
         resolve_accessible_repos(&state.db, &auth).await?.into();
-    let hidden =
-        mcp_hidden_artifacts(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
 
     let search_query = SearchQuery {
         q: params.query.clone(),
@@ -789,7 +916,7 @@ pub async fn advanced_search(
         limit: Some(per_page as i64),
         public_only: false,
         accessible_repo_ids,
-        hidden_artifact_ids: hidden,
+        mcp_served_only: hidden,
         sort_by: params.sort_by.clone(),
         sort_order: params.sort_order.clone(),
         ..filters
@@ -937,12 +1064,12 @@ pub async fn checksum_search(
           AND r.key NOT LIKE '~deleting~%'
           AND {col} = $1
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
-          AND ($3::uuid[] IS NULL OR a.id <> ALL($3))
+          AND ($3::uuid[] IS NULL OR r.id <> ALL($3) OR a.id = ANY($4))
         ORDER BY a.created_at DESC
         "#,
         col = checksum_column,
     );
-    let hidden = mcp_hidden_artifacts(
+    let hidden = mcp_served_only(
         &state,
         auth.as_ref(),
         accessible_repo_ids.as_allowed_repo_ids(),
@@ -952,7 +1079,8 @@ pub async fn checksum_search(
     let rows: Vec<ChecksumRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&checksum)
         .bind(accessible_repo_ids.as_allowed_repo_ids())
-        .bind(hidden.as_deref())
+        .bind(McpServedOnly::repos_bind(hidden.as_ref()))
+        .bind(McpServedOnly::served_bind(hidden.as_ref()))
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1033,7 +1161,7 @@ pub async fn suggest(
     let limit = clamp_positive_limit(params.limit, 10, 1, 50);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
-    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let suggestions = service
@@ -1042,7 +1170,7 @@ pub async fn suggest(
             limit,
             scope.as_allowed_repo_ids(),
             false,
-            hidden.as_deref(),
+            hidden.as_ref(),
         )
         .await?;
 
@@ -1081,7 +1209,7 @@ pub async fn trending(
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
-    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
@@ -1090,7 +1218,7 @@ pub async fn trending(
             limit,
             false,
             scope.as_allowed_repo_ids(),
-            hidden.as_deref(),
+            hidden.as_ref(),
         )
         .await?;
 
@@ -1131,11 +1259,11 @@ pub async fn recent(
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
-    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
+    let hidden = mcp_served_only(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .recent(limit, false, scope.as_allowed_repo_ids(), hidden.as_deref())
+        .recent(limit, false, scope.as_allowed_repo_ids(), hidden.as_ref())
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
