@@ -789,6 +789,9 @@ mod tests {
             );
             let mut admin = tdh::make_auth(fx.user_id, &fx.username);
             admin.is_admin = true;
+            // Another test may be toggling the shared `upstream_jobs_paused`
+            // setting right now; this process reads only the env default.
+            crate::services::upstream_pause::ignore_stored_setting_for_tests();
             Some(Self {
                 fx,
                 upstream,
@@ -844,9 +847,41 @@ mod tests {
         /// Start a manual sync (`202`), wait for the pass to end and return
         /// its summary.
         async fn sync(&self) -> serde_json::Value {
+            let before = self.settled().await;
             let (s, b) = self.admin("POST", "/sync", None).await;
             assert_eq!(s, StatusCode::ACCEPTED, "{b}");
-            self.settled().await["lastSummary"].clone()
+            self.finished_after(&before).await["lastSummary"].clone()
+        }
+
+        /// The sync state once the pass started after `before` was read has
+        /// ended: its lock is released, it recorded a start other than
+        /// `before`'s and a finish no earlier than that start. Polling on the
+        /// stored state, not on time, so a slow pass is waited for and a
+        /// pass that ended without a record times out with the state shown.
+        async fn finished_after(&self, before: &serde_json::Value) -> serde_json::Value {
+            let ts = |v: &serde_json::Value| {
+                v.as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let (s, st) = self.admin("GET", "/sync", None).await;
+                assert_eq!(s, StatusCode::OK, "{st}");
+                let started = ts(&st["lastStartedAt"]);
+                let finished = ts(&st["lastFinishedAt"]);
+                if st["running"] == false
+                    && started.is_some()
+                    && st["lastStartedAt"] != before["lastStartedAt"]
+                    && finished >= started
+                {
+                    return st;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pass did not end: {st}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
 
         /// The sync state once no pass of the repository runs.
@@ -1637,9 +1672,10 @@ mod tests {
             .mount(&env.upstream)
             .await;
         // The pass starts (202); its failure on the first page is recorded.
+        let before = env.settled().await;
         let (s, b) = env.admin("POST", "/sync", None).await;
         assert_eq!(s, StatusCode::ACCEPTED, "{b}");
-        let st = env.settled().await;
+        let st = env.finished_after(&before).await;
         assert!(st["lastError"].is_string(), "{st}");
         // A held lock answers 409.
         let lease = crate::services::cluster_lock::ClusterLock::try_acquire(
@@ -1687,6 +1723,7 @@ mod tests {
             .mount(&env.upstream)
             .await;
 
+        let before = env.settled().await;
         let started = std::time::Instant::now();
         let (s, b) = env.admin("POST", "/sync", None).await;
         assert_eq!(s, StatusCode::ACCEPTED, "{b}");
@@ -1708,7 +1745,7 @@ mod tests {
         let (s, b) = env.admin("POST", "/sync", None).await;
         assert_eq!(s, StatusCode::CONFLICT, "{b}");
 
-        let st = env.settled().await;
+        let st = env.finished_after(&before).await;
         assert!(
             started.elapsed() >= std::time::Duration::from_secs(3),
             "settled before the slow page was served"

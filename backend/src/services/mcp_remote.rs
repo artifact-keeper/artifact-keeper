@@ -1854,6 +1854,30 @@ pub async fn sync_running(db: &PgPool, repo_id: Uuid) -> Result<bool, String> {
     .map_err(db_err)
 }
 
+/// Record a background pass that ended before it stored its own outcome
+/// (a database error, or the repository changed under it), so its poller
+/// sees it end instead of an unchanged state. An unreadable first page is
+/// already stored by the pass itself.
+async fn record_failure(db: &PgPool, repo_id: Uuid, e: &SyncError) {
+    if matches!(e, SyncError::Upstream(_)) {
+        return;
+    }
+    let stored = sqlx::query(
+        "INSERT INTO mcp_remote_sync_state (repository_id, last_started_at, last_finished_at, last_error) \
+         VALUES ($1, now(), now(), $2) \
+         ON CONFLICT (repository_id) DO UPDATE SET \
+             last_started_at = COALESCE(mcp_remote_sync_state.last_started_at, now()), \
+             last_finished_at = now(), last_error = $2",
+    )
+    .bind(repo_id)
+    .bind(e.to_string())
+    .execute(db)
+    .await;
+    if let Err(err) = stored {
+        tracing::warn!(repository_id = %repo_id, error = %err, "MCP remote sync failure not recorded");
+    }
+}
+
 /// Start a sync of `repo` in the background (the manual trigger, #5404).
 ///
 /// Everything that can refuse the run is checked before this returns: no
@@ -1879,6 +1903,9 @@ pub async fn start_sync(state: &SharedState, repo: RepoInfo) -> Result<(), SyncE
             Err(e) => Err(e),
         };
         lease.release().await;
+        if let Err(e) = &result {
+            record_failure(&state.db, repo.id, e).await;
+        }
         match result {
             Ok(s) => tracing::info!(
                 repository = %repo.key,
