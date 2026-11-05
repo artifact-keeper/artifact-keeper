@@ -53,6 +53,12 @@ pub struct SearchQuery {
     /// the correct visibility.
     #[serde(skip)]
     pub accessible_repo_ids: Option<Vec<Uuid>>,
+    /// Artifacts the caller may not be shown although their repository is
+    /// in scope: MCP server versions it is not served (#5253,
+    /// `api::handlers::search::mcp_hidden_artifacts`). Left out of the items,
+    /// the total and the facets.
+    #[serde(skip)]
+    pub hidden_artifact_ids: Option<Vec<Uuid>>,
     /// Sort field. Accepted values: `created_at` (default), `name`, `size`
     /// (alias: `size_bytes`), `downloads` (alias: `download_count`).
     /// Unknown values are rejected with HTTP 400 VALIDATION_ERROR so typos
@@ -317,7 +323,11 @@ impl SearchService {
         let items = self.execute_search(&query, offset, limit).await?;
         let total = self.count_results(&query).await?;
         let facets = self
-            .get_facets(query.accessible_repo_ids.as_deref(), query.public_only)
+            .get_facets(
+                query.accessible_repo_ids.as_deref(),
+                query.public_only,
+                query.hidden_artifact_ids.as_deref(),
+            )
             .await?;
 
         Ok(SearchResponse {
@@ -373,6 +383,7 @@ impl SearchService {
                   AND ($2::text IS NULL OR r.format::text = $2)
                   AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
                   AND ($7::uuid[] IS NULL OR r.id = ANY($7))
+                  AND ($8::uuid[] IS NULL OR a.id <> ALL($8))
                   AND ($6 = false OR r.visibility = 'public')
                 ORDER BY {order_by}
                 OFFSET $4
@@ -390,6 +401,7 @@ impl SearchService {
             .bind(limit)
             .bind(query.public_only)
             .bind(&query.accessible_repo_ids)
+            .bind(&query.hidden_artifact_ids)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -415,6 +427,7 @@ impl SearchService {
               AND ($2::text IS NULL OR r.format::text = $2)
               AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
               AND ($5::uuid[] IS NULL OR r.id = ANY($5))
+              AND ($6::uuid[] IS NULL OR a.id <> ALL($6))
               AND ($4 = false OR r.visibility = 'public')
             "#,
             q_match = SEARCH_VECTOR_MATCH,
@@ -426,6 +439,7 @@ impl SearchService {
             .bind(&name_filter)
             .bind(query.public_only)
             .bind(&query.accessible_repo_ids)
+            .bind(&query.hidden_artifact_ids)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -442,6 +456,7 @@ impl SearchService {
         group_expr: &str,
         accessible_repo_ids: Option<&[Uuid]>,
         public_only: bool,
+        hidden: Option<&[Uuid]>,
     ) -> Result<Vec<FacetCount>> {
         let sql = format!(
             r#"
@@ -451,6 +466,7 @@ impl SearchService {
             WHERE a.is_deleted = false
               AND r.key NOT LIKE '~deleting~%'
               AND ($1::uuid[] IS NULL OR r.id = ANY($1))
+              AND ($3::uuid[] IS NULL OR a.id <> ALL($3))
               AND ($2 = false OR r.visibility = 'public')
             GROUP BY {expr}
             ORDER BY 2 DESC
@@ -462,6 +478,7 @@ impl SearchService {
         let rows: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
             .bind(accessible_repo_ids)
             .bind(public_only)
+            .bind(hidden)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -476,15 +493,16 @@ impl SearchService {
         &self,
         accessible_repo_ids: Option<&[Uuid]>,
         public_only: bool,
+        hidden: Option<&[Uuid]>,
     ) -> Result<SearchFacets> {
         let formats = self
-            .fetch_facet_counts("r.format::text", accessible_repo_ids, public_only)
+            .fetch_facet_counts("r.format::text", accessible_repo_ids, public_only, hidden)
             .await?;
         let repositories = self
-            .fetch_facet_counts("r.key", accessible_repo_ids, public_only)
+            .fetch_facet_counts("r.key", accessible_repo_ids, public_only, hidden)
             .await?;
         let content_types = self
-            .fetch_facet_counts("a.content_type", accessible_repo_ids, public_only)
+            .fetch_facet_counts("a.content_type", accessible_repo_ids, public_only, hidden)
             .await?;
 
         Ok(SearchFacets {
@@ -501,6 +519,7 @@ impl SearchService {
         limit: i64,
         accessible_repo_ids: Option<&[Uuid]>,
         public_only: bool,
+        hidden: Option<&[Uuid]>,
     ) -> Result<Vec<String>> {
         let pattern = build_suggest_pattern(prefix);
 
@@ -512,6 +531,7 @@ impl SearchService {
             WHERE a.name ILIKE $1 ESCAPE '\' AND a.is_deleted = false
               AND r.key NOT LIKE '~deleting~%'
               AND ($3::uuid[] IS NULL OR r.id = ANY($3))
+              AND ($5::uuid[] IS NULL OR a.id <> ALL($5))
               AND ($4 = false OR r.visibility = 'public')
             ORDER BY a.name
             LIMIT $2
@@ -521,6 +541,7 @@ impl SearchService {
         .bind(limit)
         .bind(accessible_repo_ids)
         .bind(public_only)
+        .bind(hidden)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -535,6 +556,7 @@ impl SearchService {
         limit: i64,
         public_only: bool,
         accessible_repo_ids: Option<&[Uuid]>,
+        hidden: Option<&[Uuid]>,
     ) -> Result<Vec<SearchResult>> {
         let rows: Vec<SearchResultRow> = sqlx::query_as(
             r#"
@@ -560,6 +582,7 @@ impl SearchService {
                 WHERE a.is_deleted = false
                   AND r.key NOT LIKE '~deleting~%'
                   AND ($4::uuid[] IS NULL OR r.id = ANY($4))
+                  AND ($5::uuid[] IS NULL OR a.id <> ALL($5))
                   AND ($3 = false OR r.visibility = 'public')
                 GROUP BY a.id, r.id
                 ORDER BY 11 DESC
@@ -570,6 +593,7 @@ impl SearchService {
         .bind(limit)
         .bind(public_only)
         .bind(accessible_repo_ids)
+        .bind(hidden)
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -583,6 +607,7 @@ impl SearchService {
         limit: i64,
         public_only: bool,
         accessible_repo_ids: Option<&[Uuid]>,
+        hidden: Option<&[Uuid]>,
     ) -> Result<Vec<SearchResult>> {
         let rows: Vec<SearchResultRow> = sqlx::query_as(
             r#"
@@ -606,6 +631,7 @@ impl SearchService {
                 WHERE a.is_deleted = false
                   AND r.key NOT LIKE '~deleting~%'
                   AND ($3::uuid[] IS NULL OR r.id = ANY($3))
+                  AND ($4::uuid[] IS NULL OR a.id <> ALL($4))
                   AND ($2 = false OR r.visibility = 'public')
                 ORDER BY a.created_at DESC
                 LIMIT $1
@@ -614,6 +640,7 @@ impl SearchService {
             .bind(limit)
             .bind(public_only)
             .bind(accessible_repo_ids)
+            .bind(hidden)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1205,6 +1232,7 @@ mod tests {
             limit: Some(25),
             public_only: false,
             accessible_repo_ids: Some(vec![id]),
+            hidden_artifact_ids: None,
             sort_by: None,
             sort_order: None,
         };
@@ -1572,7 +1600,7 @@ mod tests {
             let service = &service;
             async move {
                 service
-                    .suggest(prefix, 50, Some(&[repo_id]), false)
+                    .suggest(prefix, 50, Some(&[repo_id]), false, None)
                     .await
                     .expect("suggest")
             }

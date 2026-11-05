@@ -714,7 +714,16 @@ pub(crate) struct GenericArtifactGate<'a> {
     auth: Option<&'a AuthExtension>,
     repos: HashMap<Uuid, GateRepo>,
     decided: HashMap<(Uuid, String, String), bool>,
+    /// Per repository, the `(name, version)`s the listing decision serves.
+    listed: HashMap<Uuid, std::collections::HashSet<(String, String)>>,
 }
+
+/// How many server versions of one repository a generic listing evaluates
+/// with the listing decision in one request (in chunks of
+/// [`LISTING_GATE_CHUNK`]). Versions past it are hidden from readers (fail
+/// closed); the generic routes say so where they report a total.
+pub(crate) const GENERIC_LISTING_VERSION_CAP: i64 = 10_000;
+const LISTING_GATE_CHUNK: usize = 1_000;
 
 /// What [`GenericArtifactGate`] knows of one repository.
 #[derive(Clone)]
@@ -734,6 +743,7 @@ impl<'a> GenericArtifactGate<'a> {
             auth,
             repos: HashMap::new(),
             decided: HashMap::new(),
+            listed: HashMap::new(),
         }
     }
 
@@ -747,6 +757,61 @@ impl<'a> GenericArtifactGate<'a> {
             }
         }
         true
+    }
+
+    /// [`Self::visible`] for a listing row: the listing decision of the
+    /// registry surface ([`servable`], uncached `listing_refusals_fresh`),
+    /// evaluated once per repository for all its versions, soft-deleted ones
+    /// excluded. A holder sees every row.
+    pub(crate) async fn visible_listed(&mut self, repo_id: Uuid, path: &str) -> bool {
+        let repo = match self.repo(repo_id).await {
+            GateRepo::NotMcp => return true,
+            GateRepo::Unavailable => return false,
+            GateRepo::Mcp(_, true) => return true,
+            GateRepo::Mcp(repo, false) => repo,
+        };
+        let Some((name, version)) = owning_version(path) else {
+            return false;
+        };
+        if !self.listed.contains_key(&repo_id) {
+            let set = self.listed_versions(&repo).await;
+            self.listed.insert(repo_id, set);
+        }
+        self.listed[&repo_id].contains(&(name.to_string(), version.to_string()))
+    }
+
+    async fn listed_versions(
+        &self,
+        repo: &RepoInfo,
+    ) -> std::collections::HashSet<(String, String)> {
+        let sql = format!(
+            "SELECT {ROW_COLUMNS} FROM artifacts a \
+             JOIN artifact_metadata m ON m.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
+             ORDER BY a.name, a.version LIMIT $2"
+        );
+        let raw: Vec<RawRow> = match sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(repo.id)
+            .bind(GENERIC_LISTING_VERSION_CAP)
+            .fetch_all(&self.state.db)
+            .await
+        {
+            Ok(raw) => raw,
+            Err(_) => return Default::default(),
+        };
+        let rows: Vec<VersionRow> = rows_from_raw(raw)
+            .into_iter()
+            .filter(|r| r.stored.registry.status != fmt::ServerStatus::Deleted)
+            .collect();
+        let ctx = GateCtx::of(self.state, false);
+        let policy = current_policy(&self.state.db, repo.id).await;
+        let mut out = std::collections::HashSet::new();
+        for chunk in rows.chunks(LISTING_GATE_CHUNK) {
+            for r in servable(ctx, repo.id, chunk.to_vec(), policy).await {
+                out.insert((r.name, r.version));
+            }
+        }
+        out
     }
 
     async fn repo(&mut self, repo_id: Uuid) -> GateRepo {
@@ -3557,6 +3622,131 @@ mod tests {
     // -----------------------------------------------------------------------
     // Held versions
     // -----------------------------------------------------------------------
+
+    /// A public MCP registry with `com.acme/<name>-<random>` 1.0.0 and 2.0.0,
+    /// 2.0.0 held through its backing npm package (the server.json row itself
+    /// is not quarantined); returns the env, the server name and the held
+    /// version's path. The name is unique per run: search spans every
+    /// repository in the shared test database.
+    async fn held_second_version(name: &str) -> Option<(Env, String, String)> {
+        let mut env = Env::new().await?;
+        let name = format!("{name}-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let (_npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for v in ["1.0.0", "2.0.0"] {
+            let d = doc(
+                &format!("com.acme/{name}"),
+                v,
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+        Some((
+            env,
+            format!("com.acme/{name}"),
+            format!("servers/com.acme/{name}/2.0.0/server.json"),
+        ))
+    }
+
+    async fn get_json(app: Router, uri: String) -> serde_json::Value {
+        let (s, b, _) = call(app, "GET", &uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&b));
+        json(&b)
+    }
+
+    /// #5253: `/api/v1/search/*` leaves out MCP versions a reader is not
+    /// served. An anonymous reader finds only 1.0.0 in the advanced search
+    /// (items and `total`, on every page), nothing for the held version's
+    /// checksum, and no held path in the recent list; a holder finds both.
+    #[tokio::test]
+    async fn search_follows_the_serve_decision() {
+        let Some((env, server, held)) = held_second_version("srch").await else {
+            return;
+        };
+        let held_sha: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(env.fx.repo_id)
+        .bind(&held)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        let search = || crate::api::handlers::search::router();
+        let anon = || env.fx.router_anon(search());
+        let adv = get_json(anon(), format!("/advanced?name={server}&per_page=1")).await;
+        assert_eq!(adv["pagination"]["total"], 1, "{adv}");
+        assert!(!adv.to_string().contains("2.0.0"), "{adv}");
+        let page2 = get_json(anon(), format!("/advanced?name={server}&per_page=1&page=2")).await;
+        assert_eq!(page2["items"].as_array().unwrap().len(), 0, "{page2}");
+        let by_sum = get_json(anon(), format!("/checksum?checksum={held_sha}")).await;
+        assert_eq!(by_sum["artifacts"].as_array().unwrap().len(), 0, "{by_sum}");
+        let recent = get_json(anon(), "/recent?limit=50".into()).await;
+        assert!(!recent.to_string().contains(&held), "{recent}");
+        let holder = get_json(
+            env.fx.router_with_auth(search()),
+            format!("/advanced?name={server}"),
+        )
+        .await;
+        assert_eq!(holder["pagination"]["total"], 2, "{holder}");
+        env.teardown().await;
+    }
+
+    /// #5253: an MCP registry's storage tree, for a reader, counts only the
+    /// versions it is served: one server.json, no 2.0.0 node, although the
+    /// materialized rollup (what a holder sees) counts both.
+    #[tokio::test]
+    async fn storage_tree_follows_the_serve_decision() {
+        let Some((env, _server, _held)) = held_second_version("tree").await else {
+            return;
+        };
+        let key = env.fx.repo_key.clone();
+        // The materialized rollup counts both versions (what a holder sees);
+        // a reader's tree must not.
+        tdh::recompute_storage_stats_with_retry(&env.fx.pool, false).await;
+        let repos = || crate::api::handlers::repositories::router();
+        let holder = get_json(
+            env.fx.router_with_auth(repos()),
+            format!("/{key}/storage/tree?depth=5"),
+        )
+        .await;
+        assert_eq!(holder["node"]["file_count"], 2, "{holder}");
+        let tree = get_json(
+            env.fx.router_anon(repos()),
+            format!("/{key}/storage/tree?depth=5"),
+        )
+        .await;
+        assert_eq!(tree["node"]["file_count"], 1, "{tree}");
+        assert!(!tree.to_string().contains("2.0.0"), "{tree}");
+        env.teardown().await;
+    }
+
+    /// #5253: a reader's artifact listing total counts only the versions it
+    /// is served, on every page, and is exact; a holder's counts both.
+    #[tokio::test]
+    async fn listing_totals_follow_the_serve_decision() {
+        let Some((env, _server, _held)) = held_second_version("tot").await else {
+            return;
+        };
+        let key = env.fx.repo_key.clone();
+        let repos = || crate::api::handlers::repositories::router();
+        for page in [1, 2] {
+            let list = get_json(
+                env.fx.router_anon(repos()),
+                format!("/{key}/artifacts?per_page=1&page={page}&count=exact"),
+            )
+            .await;
+            assert_eq!(list["pagination"]["total"], 1, "page {page}: {list}");
+            assert_eq!(list["total_is_exact"], true, "{list}");
+        }
+        let list = get_json(
+            env.fx.router_with_auth(repos()),
+            format!("/{key}/artifacts?per_page=1&count=exact"),
+        )
+        .await;
+        assert_eq!(list["pagination"]["total"], 2, "{list}");
+        env.teardown().await;
+    }
 
     /// #5253: the generic artifact routes apply the MCP serve decision. With
     /// 2.0.0 held through its backing npm package (the server.json row itself

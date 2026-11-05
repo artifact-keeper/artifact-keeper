@@ -1016,14 +1016,33 @@ repository, a version that readers are not served now (held through its
 server.json or a pinned package, refused by scan policy or curation,
 resolving, unresolvable, or soft-deleted) is treated as missing:
 
-- `GET /api/v1/repositories/{key}/artifacts` leaves its rows out. The cursor
-  is unaffected, and `total` leaves out only that page's hidden rows.
+- `GET /api/v1/repositories/{key}/artifacts` leaves its rows out, using
+  the listing decision of `/v0.1` (fresh listing refusals). The page is cut
+  from the rows the caller is served, so `pagination.total`, `total_pages`,
+  `has_more` and the cursor count only those rows, on every page and with or
+  without `count=exact`. The response carries `total_is_exact`. To decide, a
+  request reads at most 10,000 matching rows and 10,000 server versions per
+  registry. Past that, the total covers only the first ones,
+  `total_is_exact` is `false`, and versions beyond the version cap are
+  hidden (fail closed).
 - `GET /api/v1/repositories/{key}/artifacts/{path}`,
   `GET /api/v1/repositories/{key}/versions/{path}`,
   `GET /api/v1/repositories/{key}/download/{path}`, and
   `GET /api/v1/artifacts/{id}` (with `/metadata` and `/stats`) answer the
   route's plain `404`. For a Virtual registry, the member that holds the
   path first (by priority) decides.
+
+- `/api/v1/search/*` excludes those artifacts in the database query:
+  `quick` (OpenSearch hits are re-checked in PostgreSQL), `advanced` (items,
+  `pagination.total` and the facets), `checksum`, `suggest`, `trending` and
+  `recent`. The same listing decision is applied to every MCP registry in
+  the caller's scope that it does not hold.
+- `GET /api/v1/repositories/{key}/storage/tree` is rebuilt from the rows the
+  caller is served, with the materialized rollup's formula: each path counts
+  toward every ancestor prefix, `physical_bytes` and `blob_count` count each
+  stored object once, and `computed_at` is the rollup's. A held version adds
+  no node and no bytes. Proxy-cache entries of a Remote, and paths that
+  belong to no server version, are not counted for such a caller.
 
 A holder sees every stored version there, and still gets the server.json's
 own quarantine refusals (`409`/`403`) on download.

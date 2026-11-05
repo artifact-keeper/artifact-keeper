@@ -5584,6 +5584,49 @@ pub async fn get_repository_storage_tree(
     let levels = clamp_tree_depth(query.depth);
     let limit = clamp_tree_limit(query.limit);
 
+    // MCP registries (#5253): the materialized rollups include every stored
+    // version, so a caller who does not hold the registry gets the tree
+    // rebuilt from the rows it is served, with the same per-node formula.
+    if repo.format == RepositoryFormat::Mcp {
+        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+        if !gate.holds_all(&[repo.id]).await {
+            // The rows are live; `computed_at` keeps the rollup's own mark.
+            let computed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+                "SELECT computed_at FROM repository_path_storage_stats \
+                 WHERE repository_id = $1 AND prefix = ''",
+            )
+            .bind(repo.id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            let rows: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT path, storage_key, size_bytes FROM artifacts \
+                 WHERE repository_id = $1 AND is_deleted = false \
+                   AND storage_key NOT LIKE 'proxy-cache/%'",
+            )
+            .bind(repo.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            let mut served = Vec::with_capacity(rows.len());
+            for row in rows {
+                if gate.visible_listed(repo.id, &row.0).await {
+                    served.push(row);
+                }
+            }
+            let tree = reader_storage_tree(&served, &prefix, levels, limit);
+            return Ok(Json(RepositoryStorageTreeResponse {
+                repository_key: key,
+                node: tree.node,
+                unattributed_bytes: (root_depth == 0).then_some(0),
+                children: tree.children,
+                truncated: tree.truncated,
+                max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
+                computed_at,
+            }));
+        }
+    }
+
     // The rooted node's own rollup (with the root-only unattributed figure).
     let node_row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)>(
         r#"
@@ -7336,6 +7379,10 @@ pub struct ArtifactListResponse {
     /// until `has_more` is false, or pass `?count=exact`, instead of looping
     /// to `total_pages`. Set on every artifact listing; absent only from
     /// servers older than this field.
+    /// On an MCP registry, a caller who does not hold it gets a page cut from
+    /// the rows it is served (#5253): `false` there means the registry has
+    /// more than `MCP_READER_LISTING_ROW_CAP` matching rows and the total
+    /// covers the first ones only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_is_exact: Option<bool>,
 }
@@ -7662,7 +7709,9 @@ pub async fn list_artifacts(
         has_more: rows > per_page as usize,
     };
 
-    let (mut artifacts, exact_total) = if repo.repo_type == RepositoryType::Virtual {
+    // The repositories whose rows this listing reads: the repository itself,
+    // or a Virtual's members the caller may see.
+    let scope_ids: Vec<Uuid> = if repo.repo_type == RepositoryType::Virtual {
         // For virtual repositories, aggregate artifacts from all member repos.
         // Members are returned in priority order; local/hosted members are
         // included alongside remote members so that locally published artifacts
@@ -7691,87 +7740,99 @@ pub async fn list_artifacts(
             .map(|m| m.id)
             .collect();
 
-        let page_rows = artifact_service
-            .list_for_repos_page(
-                &member_ids,
-                query.path_prefix.as_deref(),
-                query.q.as_deref(),
-                after_path,
-                offset,
-                fetch,
-            )
-            .await?;
-        let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
-            Some(
-                artifact_service
-                    .count_for_repos(
-                        &member_ids,
-                        query.path_prefix.as_deref(),
-                        query.q.as_deref(),
-                    )
-                    .await?,
-            )
-        } else {
-            None
-        };
-        (page_rows, exact)
+        member_ids
     } else {
-        let page_rows = artifact_service
-            .list_page(
-                repo.id,
-                query.path_prefix.as_deref(),
-                query.q.as_deref(),
-                after_path,
-                offset,
-                fetch,
-            )
-            .await?;
-        let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
-            Some(
-                artifact_service
-                    .count(repo.id, query.path_prefix.as_deref(), query.q.as_deref())
-                    .await?,
-            )
-        } else {
-            None
-        };
-        (page_rows, exact)
+        vec![repo.id]
     };
 
-    let at = page_at(artifacts.len());
-    let has_more = at.has_more;
-    artifacts.truncate(per_page as usize);
-    let next_cursor = if has_more {
-        // Single-key (`path`) cursor; the shared two-part codec is reused
-        // with an empty second component so all listing cursors stay one
-        // opaque format (see `list_remote_cached_from_catalog`).
-        artifacts.last().map(|a| encode_keyset_cursor(&a.path, ""))
+    // MCP registries (#5253): a caller who does not hold every repository
+    // read here gets the registry surface's listing decision. Such a page
+    // is cut from the decided rows, so `total` counts only what the caller
+    // is served, on every page.
+    let mut mcp_gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+    let mcp_reader = repo.format == RepositoryFormat::Mcp && !mcp_gate.holds_all(&scope_ids).await;
+
+    let (artifacts, has_more, next_cursor, total, total_is_exact) = if mcp_reader {
+        let rows = artifact_service
+            .list_for_repos_page(
+                &scope_ids,
+                query.path_prefix.as_deref(),
+                query.q.as_deref(),
+                None,
+                0,
+                MCP_READER_LISTING_ROW_CAP + 1,
+            )
+            .await?;
+        let page = mcp_reader_page(&mut mcp_gate, rows, after_path, offset, per_page).await;
+        (
+            page.rows,
+            page.has_more,
+            page.next_cursor,
+            page.total,
+            page.exact,
+        )
     } else {
-        None
-    };
-    // MCP registries (#5253): a version a reader is not served is left out,
-    // as on the registry surface. The cursor above is the last row read, so
-    // paging is unaffected; the total leaves out this page's hidden rows. A
-    // reader's total can still count versions hidden on other pages, so it
-    // is reported as not exact.
-    let mut hidden = 0i64;
-    let mut mcp_reader = false;
-    if repo.format == RepositoryFormat::Mcp {
-        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
-        mcp_reader = !gate.holds_all(&[repo.id]).await;
-        let mut kept = Vec::with_capacity(artifacts.len());
-        for a in artifacts {
-            if gate.visible(a.repository_id, &a.path).await {
-                kept.push(a);
+        let (mut artifacts, exact_total) = if repo.repo_type == RepositoryType::Virtual {
+            let page_rows = artifact_service
+                .list_for_repos_page(
+                    &scope_ids,
+                    query.path_prefix.as_deref(),
+                    query.q.as_deref(),
+                    after_path,
+                    offset,
+                    fetch,
+                )
+                .await?;
+            let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
+                Some(
+                    artifact_service
+                        .count_for_repos(
+                            &scope_ids,
+                            query.path_prefix.as_deref(),
+                            query.q.as_deref(),
+                        )
+                        .await?,
+                )
             } else {
-                hidden += 1;
-            }
-        }
-        artifacts = kept;
-    }
-    let (total, total_is_exact) = listing_total(exact_total, at);
-    let total = (total - hidden).max(0);
-    let total_is_exact = total_is_exact && !mcp_reader;
+                None
+            };
+            (page_rows, exact)
+        } else {
+            let page_rows = artifact_service
+                .list_page(
+                    repo.id,
+                    query.path_prefix.as_deref(),
+                    query.q.as_deref(),
+                    after_path,
+                    offset,
+                    fetch,
+                )
+                .await?;
+            let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
+                Some(
+                    artifact_service
+                        .count(repo.id, query.path_prefix.as_deref(), query.q.as_deref())
+                        .await?,
+                )
+            } else {
+                None
+            };
+            (page_rows, exact)
+        };
+        let at = page_at(artifacts.len());
+        let has_more = at.has_more;
+        artifacts.truncate(per_page as usize);
+        let next_cursor = if has_more {
+            // Single-key (`path`) cursor; the shared two-part codec is reused
+            // with an empty second component so all listing cursors stay one
+            // opaque format (see `list_remote_cached_from_catalog`).
+            artifacts.last().map(|a| encode_keyset_cursor(&a.path, ""))
+        } else {
+            None
+        };
+        let (total, total_is_exact) = listing_total(exact_total, at);
+        (artifacts, has_more, next_cursor, total, total_is_exact)
+    };
     let total_pages = grouped_total_pages(total, per_page);
 
     let artifact_ids: Vec<Uuid> = artifacts.iter().map(|a| a.id).collect();
@@ -7860,6 +7921,143 @@ pub async fn list_artifacts(
         has_more: Some(has_more),
         total_is_exact: Some(total_is_exact),
     }))
+}
+
+struct ReaderStorageTree {
+    node: StorageTreeNode,
+    children: Vec<StorageTreeNode>,
+    truncated: bool,
+}
+
+/// The storage tree of `rows` (`(path, storage_key, size_bytes)`), rooted at
+/// `prefix`: the per-node formula of the materialized rollup
+/// (`storage_stats_service`), applied to the rows an MCP reader is served
+/// (#5253). Each path counts toward every ancestor prefix (never its own full
+/// path), up to `MAX_MATERIALIZED_PATH_DEPTH`. `logical_bytes` and
+/// `file_count` sum every row; `physical_bytes` and `blob_count` count each
+/// `storage_key` once. Children are the nodes up to `levels` below the root,
+/// largest first, at most `limit`.
+fn reader_storage_tree(
+    rows: &[(String, String, i64)],
+    prefix: &str,
+    levels: i32,
+    limit: i64,
+) -> ReaderStorageTree {
+    use crate::services::storage_stats_service::{prefix_depth, MAX_MATERIALIZED_PATH_DEPTH};
+    #[derive(Default)]
+    struct Acc {
+        logical: i64,
+        files: i64,
+        blobs: std::collections::HashMap<String, i64>,
+    }
+    let mut nodes: std::collections::BTreeMap<String, Acc> = Default::default();
+    for (path, key, size) in rows {
+        let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        let deepest = (segs.len() as i32 - 1).min(MAX_MATERIALIZED_PATH_DEPTH);
+        for depth in 0..=deepest.max(0) {
+            let p = segs[..depth as usize].join("/");
+            let acc = nodes.entry(p).or_default();
+            acc.logical += size;
+            acc.files += 1;
+            let b = acc.blobs.entry(key.clone()).or_insert(0);
+            *b = (*b).max(*size);
+        }
+    }
+    let node_of = |p: &str, acc: Option<&Acc>| StorageTreeNode {
+        prefix: p.to_string(),
+        depth: prefix_depth(p),
+        logical_bytes: acc.map_or(0, |a| a.logical),
+        physical_bytes: acc.map_or(0, |a| a.blobs.values().sum()),
+        file_count: acc.map_or(0, |a| a.files),
+        blob_count: acc.map_or(0, |a| a.blobs.len() as i64),
+    };
+    let root_depth = prefix_depth(prefix);
+    let max_depth = root_depth.saturating_add(levels);
+    let under = format!("{prefix}/");
+    let mut children: Vec<StorageTreeNode> = nodes
+        .iter()
+        .filter(|(p, _)| {
+            let d = prefix_depth(p);
+            d > root_depth && d <= max_depth && (prefix.is_empty() || p.starts_with(&under))
+        })
+        .map(|(p, a)| node_of(p, Some(a)))
+        .collect();
+    children.sort_by(|a, b| {
+        b.logical_bytes
+            .cmp(&a.logical_bytes)
+            .then_with(|| a.prefix.cmp(&b.prefix))
+    });
+    let truncated = children.len() as i64 > limit;
+    children.truncate(limit.max(0) as usize);
+    ReaderStorageTree {
+        node: node_of(prefix, nodes.get(prefix)),
+        children,
+        truncated,
+    }
+}
+
+/// How many rows an MCP reader's generic listing reads (#5253). The page is
+/// cut from the rows the registry's listing decision admits, so a reader's
+/// total counts only versions it is served; past this many rows the total
+/// covers the first ones only and the response says so
+/// (`total_is_exact: false`).
+pub(crate) const MCP_READER_LISTING_ROW_CAP: i64 = 10_000;
+
+struct McpReaderPage {
+    rows: Vec<crate::models::artifact::Artifact>,
+    has_more: bool,
+    next_cursor: Option<String>,
+    total: i64,
+    exact: bool,
+}
+
+/// The page of an MCP reader's generic listing: the rows the caller is
+/// served (`rows` is every matching row, path-ordered, up to the cap plus
+/// one), then the keyset cursor or the offset, then `per_page`.
+async fn mcp_reader_page(
+    gate: &mut super::mcp::GenericArtifactGate<'_>,
+    mut rows: Vec<crate::models::artifact::Artifact>,
+    after_path: Option<&str>,
+    offset: i64,
+    per_page: u32,
+) -> McpReaderPage {
+    let truncated = rows.len() as i64 > MCP_READER_LISTING_ROW_CAP;
+    rows.truncate(MCP_READER_LISTING_ROW_CAP as usize);
+    let mut served = Vec::with_capacity(rows.len());
+    for a in rows {
+        if gate.visible_listed(a.repository_id, &a.path).await {
+            served.push(a);
+        }
+    }
+    let total = served.len() as i64;
+    let start = match after_path {
+        Some(after) => served
+            .iter()
+            .position(|a| a.path.as_str() > after)
+            .unwrap_or(served.len()),
+        None => usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(served.len()),
+    };
+    let mut page: Vec<_> = served
+        .into_iter()
+        .skip(start)
+        .take(per_page as usize + 1)
+        .collect();
+    let has_more = page.len() > per_page as usize;
+    page.truncate(per_page as usize);
+    let next_cursor = if has_more {
+        page.last().map(|a| encode_keyset_cursor(&a.path, ""))
+    } else {
+        None
+    };
+    McpReaderPage {
+        rows: page,
+        has_more,
+        next_cursor,
+        total,
+        exact: !truncated,
+    }
 }
 
 /// List the artifacts a remote (proxy) repository has cached.
