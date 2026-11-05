@@ -184,8 +184,19 @@ fn strings(v: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The longest key the backend stores: a resource `uri`, else a `name`.
+fn key_limit(key: &str) -> usize {
+    use artifact_keeper_backend::services::mcp_capabilities::{MAX_NAME_LEN, MAX_URI_LEN};
+    if key == "uri" {
+        MAX_URI_LEN
+    } else {
+        MAX_NAME_LEN
+    }
+}
+
 /// Keep the usable items of one list page: objects with a non-empty string
-/// key, first occurrence of a key wins, at most `cap` in total.
+/// key no longer than the backend stores, first occurrence of a key wins,
+/// at most `cap` in total.
 pub fn accept_items(
     out: &mut Vec<Value>,
     page: &[Value],
@@ -197,7 +208,7 @@ pub fn accept_items(
         let usable = item
             .get(key)
             .and_then(|k| k.as_str())
-            .is_some_and(|k| !k.is_empty() && k.len() <= 2048);
+            .is_some_and(|k| !k.is_empty() && k.len() <= key_limit(key));
         let dup = usable && out.iter().any(|o| o.get(key) == item.get(key));
         if !usable || dup || out.len() >= cap {
             *dropped += 1;
@@ -883,6 +894,28 @@ pub(crate) mod tests {
         let mut m = Mock::default();
         let mut c = Client::new(&mut m, 10);
         let _ = c.request("tools/call", None, json!({})).await;
+    }
+
+    /// Keys longer than the backend stores are dropped like unusable ones:
+    /// names up to 256 bytes, resource URIs up to 2048.
+    #[test]
+    fn item_keys_follow_the_backend_limits() {
+        let mut out = Vec::new();
+        let mut dropped = 0;
+        let page = [
+            json!({"name": "n".repeat(256)}),
+            json!({"name": "m".repeat(257)}),
+        ];
+        accept_items(&mut out, &page, "name", 10, &mut dropped);
+        assert_eq!((out.len(), dropped), (1, 1));
+        let mut out = Vec::new();
+        let mut dropped = 0;
+        let page = [
+            json!({"uri": format!("file:///{}", "u".repeat(2000))}),
+            json!({"uri": format!("file:///{}", "v".repeat(2048))}),
+        ];
+        accept_items(&mut out, &page, "uri", 10, &mut dropped);
+        assert_eq!((out.len(), dropped), (1, 1));
     }
 
     #[test]

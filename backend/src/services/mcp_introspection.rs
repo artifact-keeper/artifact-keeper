@@ -215,11 +215,14 @@ pub fn reprobe_due_at(completed_at: DateTime<Utc>, ttl_ms: Option<i64>) -> DateT
     completed_at + chrono::Duration::seconds(ttl_secs.max(MIN_REPROBE_SECS))
 }
 
-/// Outcomes worth another attempt (until `max_attempts`).
+/// Outcomes worth another attempt (until `max_attempts`). `start_failed`
+/// is the worker's sandbox (engine, runtime, network, image pull) or the
+/// connection failing, not the server's answer: retried, never stored as
+/// the server's state on the first attempt.
 pub fn is_transient(outcome: Outcome) -> bool {
     matches!(
         outcome,
-        Outcome::RateLimited | Outcome::Timeout | Outcome::Error
+        Outcome::RateLimited | Outcome::Timeout | Outcome::Error | Outcome::StartFailed
     )
 }
 
@@ -664,7 +667,7 @@ pub async fn complete(
         details,
     };
     let (ins, drift_scan) = caps::store(db, &snap, &v.repository_key).await?;
-    let status = if parsed.outcome == Outcome::Error {
+    let status = if matches!(parsed.outcome, Outcome::Error | Outcome::StartFailed) {
         "failed"
     } else {
         "completed"
@@ -927,6 +930,9 @@ mod tests {
         assert_eq!(reprobe_due_at(t, Some(-5)), reprobe_due_at(t, None));
         assert!(is_transient(Outcome::Timeout) && is_transient(Outcome::RateLimited));
         assert!(!is_transient(Outcome::AuthRequired) && !is_transient(Outcome::Ok));
+        // A sandbox that could not start is retried; a server that would
+        // not start unconfigured is its own state.
+        assert!(is_transient(Outcome::StartFailed) && !is_transient(Outcome::NeedsConfig));
         assert_eq!(retry_delay_secs(Outcome::RateLimited, 1, Some(5_000)), 60);
         assert_eq!(
             retry_delay_secs(Outcome::RateLimited, 1, Some(7_200_000)),
