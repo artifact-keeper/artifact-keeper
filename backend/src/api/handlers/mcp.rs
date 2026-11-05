@@ -6179,8 +6179,8 @@ mod tests {
     }
 
     /// Generic artifact writes into an MCP registry are refused (they would
-    /// bypass validation, namespace policy and pinning); trusted
-    /// replication still lands.
+    /// bypass validation, namespace policy and pinning); a peer replication
+    /// under an administrator's token still lands.
     #[test]
     fn generic_writes_into_an_mcp_registry_are_refused() {
         use crate::api::handlers::repositories::reject_generic_write_to_mcp;
@@ -6198,8 +6198,23 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert!(reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &admin, &plain).is_err());
         assert!(reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &user, &replication).is_err());
+        // #5368: a service account is not a peer (the header is client-set).
+        let mut service_account = user.clone();
+        service_account.is_service_account = true;
+        assert!(reject_generic_write_to_mcp(
+            &RepositoryFormat::Mcp,
+            &service_account,
+            &replication
+        )
+        .is_err());
         assert!(reject_generic_write_to_mcp(&RepositoryFormat::Mcp, &admin, &replication).is_ok());
         assert!(reject_generic_write_to_mcp(&RepositoryFormat::Npm, &user, &plain).is_ok());
+        assert!(reject_generic_write_to_mcp(
+            &RepositoryFormat::Npm,
+            &service_account,
+            &replication
+        )
+        .is_ok());
     }
 
     /// Refusals from the shared middleware on `/mcp/` paths are

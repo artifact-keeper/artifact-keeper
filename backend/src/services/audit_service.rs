@@ -320,6 +320,9 @@ pub enum AuditAction {
     McpServerEdited,
     /// A server version was soft-deleted (DELETE), leaving a tombstone. (#5253).
     McpServerDeleted,
+    /// An administrator purged a deleted server version: its server.json and
+    /// bundles went to the trash, releasing its pins; the tombstone stays. (#5368).
+    McpServerPurged,
     /// A Remote MCP registry finished an upstream sync run. (#5253).
     McpMirrorSynced,
     /// An MCPB bundle's signature did not verify and the upload was refused. (#5253).
@@ -459,6 +462,7 @@ impl AuditAction {
             AuditAction::McpNamespaceProofFailed => "MCP_NAMESPACE_PROOF_FAILED",
             AuditAction::McpServerEdited => "MCP_SERVER_EDITED",
             AuditAction::McpServerDeleted => "MCP_SERVER_DELETED",
+            AuditAction::McpServerPurged => "MCP_SERVER_PURGED",
             AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
             AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
             AuditAction::CacheSeeded => "CACHE_SEEDED",
@@ -2017,6 +2021,11 @@ mod proxy_scan_blocked_4777_tests {
             (
                 AuditAction::McpServerDeleted,
                 "MCP_SERVER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerPurged,
+                "MCP_SERVER_PURGED",
                 Outcome::Success,
             ),
             (

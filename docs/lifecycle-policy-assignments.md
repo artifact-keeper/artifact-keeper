@@ -215,6 +215,14 @@ and execute-all skip unassigned policies. OCI cleanup uses only the same concret
 repositories selected for execution, including recovery of previously stale
 soft-deleted references in those repositories.
 
+MCP registry repositories are always skipped (#5368), whether assigned
+explicitly or reached through a global policy: a server version leaves an MCP
+repository only through the MCP routes (the soft delete, then the
+administrator purge), which recompute `isLatest`, keep the version's OCI pins
+until the purge and audit each step. A preview whose scope includes MCP
+repositories says so in `errors` (`N MCP registry repositories skipped: ...`);
+a live run logs it.
+
 ### Preview before assigning is not enough for a new policy
 
 A policy with no `cron_schedule` and no `last_run_at` is due on the very next
