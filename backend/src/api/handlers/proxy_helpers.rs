@@ -7413,6 +7413,24 @@ pub(crate) async fn record_proxy_download_via_deferred(
     });
 }
 
+/// The format the Remote arm of [`try_remote_or_virtual_download`] hands the
+/// cache classifier (#5283).
+///
+/// The arm used to synthesize a `Generic` repository for every caller, so a
+/// format with a classifier arm never reached it: a Hugging Face file
+/// fetched by commit sha (`{id}/resolve/<sha>/...`, immutable) was
+/// revalidated against the Hub every five minutes. A format is listed here
+/// only once its `upstream_path` is known to be the coordinate its
+/// classifier arm was written against (see [`proxy_fetch_capped_with_format`]
+/// for why the wrong direction is dangerous); every other caller keeps
+/// `Generic` and its existing caching.
+pub(crate) fn remote_download_classifier_format(format: &str) -> RepositoryFormat {
+    match format {
+        "huggingface" => RepositoryFormat::Huggingface,
+        _ => RepositoryFormat::Generic,
+    }
+}
+
 /// `auth` is the CALLER (#3178). Only the Virtual arm consults it, to narrow
 /// the member set to what this caller may read; the Remote arm is the URL repo
 /// itself, already authorized by `repo_visibility_middleware`.
@@ -7441,7 +7459,8 @@ pub async fn try_remote_or_virtual_download(
         // upstream HEAD on a cache miss, so it no longer downloads the whole
         // body only to drop it unread, which cached nothing and made the GET
         // that follows download the object a second time. Keep both arms on
-        // the same synthesized repository format.
+        // the same synthesized repository format (#5283).
+        let format = remote_download_classifier_format(&repo.format);
         let response = if ctx.is_head {
             proxy_head_streaming_with_disposition_and_format(
                 proxy,
@@ -7451,11 +7470,11 @@ pub async fn try_remote_or_virtual_download(
                 opts.upstream_path,
                 opts.default_content_type,
                 opts.content_disposition_filename,
-                RepositoryFormat::Generic,
+                format,
             )
             .await?
         } else {
-            proxy_fetch_streaming_with_disposition(
+            proxy_fetch_streaming_with_disposition_and_format(
                 proxy,
                 repo.id,
                 &repo.key,
@@ -7463,6 +7482,7 @@ pub async fn try_remote_or_virtual_download(
                 opts.upstream_path,
                 opts.default_content_type,
                 opts.content_disposition_filename,
+                format,
             )
             .await?
         };
@@ -20309,6 +20329,33 @@ mod tests {
         &src[start..start + rel_end]
     }
 
+    /// #5283: only Hugging Face is handed to the classifier with its real
+    /// format, and the Remote arm uses it; every other caller keeps
+    /// `Generic`, so no other format's caching changes.
+    #[test]
+    fn remote_download_classifier_format_threads_only_huggingface() {
+        assert_eq!(
+            remote_download_classifier_format("huggingface"),
+            RepositoryFormat::Huggingface
+        );
+        for other in [
+            "rpm", "rubygems", "puppet", "hex", "cran", "ansible", "bazel", "generic",
+        ] {
+            assert_eq!(
+                remote_download_classifier_format(other),
+                RepositoryFormat::Generic,
+                "{other}"
+            );
+        }
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn try_remote_or_virtual_download(")
+            .expect("try_remote_or_virtual_download must exist");
+        assert!(
+            item_body(src, fn_start).contains("remote_download_classifier_format(&repo.format)")
+        );
+    }
+
     #[test]
     fn test_try_remote_or_virtual_download_remote_uses_streaming_helper_1215() {
         let src = include_str!("proxy_helpers.rs");
@@ -20319,9 +20366,10 @@ mod tests {
         // in the file cannot satisfy the assertion vacuously.
         let window = item_body(src, fn_start);
         assert!(
-            window.contains("proxy_fetch_streaming_with_disposition("),
+            window.contains("proxy_fetch_streaming_with_disposition_and_format("),
             "`try_remote_or_virtual_download`'s Remote arm MUST call \
-             `proxy_fetch_streaming_with_disposition(` (#1215). A revert \
+             `proxy_fetch_streaming_with_disposition_and_format(` (#1215, \
+             #5283: the format-carrying sibling). A revert \
              to `proxy_fetch(` would re-introduce the OOM regression \
              closed by #895/#1215 across rpm/rubygems/puppet/hex/\
              huggingface/cran/ansible."
