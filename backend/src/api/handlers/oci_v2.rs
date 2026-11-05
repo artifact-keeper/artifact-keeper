@@ -12610,6 +12610,10 @@ async fn authorize_oci_replication_write(
         .map_err(|e| e.into_response())?;
     let (_, repo) =
         crate::api::handlers::repositories::authorize_generic_upload(state, &auth, key).await?;
+    // The generic upload gate admits a repository of any format. Only one
+    // the OCI handler serves may receive `oci_blobs` / `oci_tags` rows, the
+    // same rule `resolve_repo_for_write` applies to a `/v2` push (#3150).
+    validate_oci_repository_format(&repo.key, repo.format.as_key())?;
     Ok((auth, repo))
 }
 
@@ -49203,6 +49207,42 @@ mod oci_push_replication_4790_tests {
             queued.is_empty(),
             "a replicated write must not be queued for this node's peers: {queued:?}"
         );
+    }
+
+    /// A replication write names its repository by key, and the generic
+    /// upload gate admits any format: a writer of an npm (or MCP) repository
+    /// must not be able to create OCI blob, manifest or tag rows in it.
+    #[tokio::test]
+    async fn oci_replication_receive_refuses_non_oci_repositories() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let writer = || tdh::make_auth(fx.user_id, &fx.username);
+        let body = b"replicated-into-npm";
+        let digest = format!("sha256:{}", sha256_hex(body));
+        let blob_status =
+            replicate_blob_as(&fx, writer(), replication_headers(&[]), &digest, body).await;
+        let manifest = make_image_manifest(&digest, body.len() as i64, &[], &[]);
+        let manifest_status =
+            replicate_manifest_as(&fx, writer(), "myimage", "v1", &manifest).await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM oci_blobs WHERE repository_id = $1) \
+                  + (SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1)",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        cleanup_oci_rows(&fx).await;
+        fx.teardown().await;
+
+        assert_eq!(blob_status, StatusCode::BAD_REQUEST, "blob into npm");
+        assert_eq!(
+            manifest_status,
+            StatusCode::BAD_REQUEST,
+            "manifest into npm"
+        );
+        assert_eq!(rows, 0, "nothing OCI is stored in a non-OCI repository");
     }
 
     /// #4790 receive path authorization: the replication header is a routing
