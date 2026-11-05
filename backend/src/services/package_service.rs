@@ -156,36 +156,8 @@ pub fn live_package_version_predicate() -> String {
 /// `idx_proxy_dl_stats_checksum`, `idx_proxy_cache_repo_checksum` and
 /// `idx_proxy_dl_stats_cache`.
 pub fn version_download_count_sql() -> &'static str {
-    r#"(CASE
-    WHEN r.repo_type = 'remote' AND COALESCE(pv.checksum_sha256, '') = '' THEN NULL
-    ELSE (
-        SELECT COUNT(*)
-        FROM download_statistics ds_pkg
-        WHERE ds_pkg.artifact_id IN (
-            SELECT a_dl.id
-            FROM artifacts a_dl
-            WHERE a_dl.repository_id = p.repository_id
-              AND (
-                    (pv.checksum_sha256 <> '' AND a_dl.checksum_sha256 = pv.checksum_sha256)
-                    OR (a_dl.name = p.name AND a_dl.version = pv.version)
-              )
-        )
-    ) + (
-        CASE WHEN r.repo_type = 'remote' THEN (
-            SELECT COUNT(*)
-            FROM proxy_download_statistics pd_pkg
-            WHERE pd_pkg.repository_id = p.repository_id
-              AND pd_pkg.checksum_sha256 = pv.checksum_sha256
-        ) + (
-            SELECT COUNT(*)
-            FROM proxy_download_statistics pd_pkg
-            JOIN proxy_cache_artifacts pc_pkg ON pc_pkg.id = pd_pkg.proxy_cache_id
-            WHERE pc_pkg.repository_id = p.repository_id
-              AND pc_pkg.checksum_sha256 = pv.checksum_sha256
-              AND pd_pkg.checksum_sha256 IS NULL
-        ) ELSE 0 END
-    )
-END)"#
+    // NEGATIVE CHECK: the never-incremented stored column, as before #5346.
+    "pv.download_count"
 }
 
 /// Download counts of the packages in `package_ids` (#5346): the sum of their
