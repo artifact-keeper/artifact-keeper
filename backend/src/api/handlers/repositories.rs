@@ -3592,14 +3592,26 @@ async fn apply_npm_scope_policy_config(
 /// administrator (only they may set the `*_locked` settings or change a
 /// locked one), and whether they administer the repository. Other formats:
 /// both absent.
+///
+/// A caller who does not administer the registry gets none of its MCP
+/// settings except the package policy (#5398): the backing repository keys
+/// in `mcp_package_repos` can name repositories the caller may not see, and
+/// the name globs (deny list, namespace allowlist, auto-approve) and the
+/// remaining knobs are policy only an administrator edits.
 fn with_mcp_caller(
     mut response: RepositoryResponse,
     instance_admin: bool,
     repo_admin: bool,
 ) -> RepositoryResponse {
     let mcp = response.format == "mcp";
+    let admin = instance_admin || repo_admin;
     response.mcp_caller_can_lock = mcp.then_some(instance_admin);
-    response.mcp_caller_is_repo_admin = mcp.then_some(instance_admin || repo_admin);
+    response.mcp_caller_is_repo_admin = mcp.then_some(admin);
+    if !admin {
+        response.mcp_package_repos = None;
+        response.mcp_namespace_allow = None;
+        response.mcp_settings = Default::default();
+    }
     response
 }
 
@@ -24953,6 +24965,92 @@ mod tests {
         tdh::cleanup(&pool, repo_id, owner_id).await;
         tdh::cleanup_user(&pool, dev_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DB-backed (#5398): `GET /api/v1/repositories/{key}` of a public MCP
+    /// registry carries its backing repository keys, deny list and other MCP
+    /// settings only for a caller who administers it (a `repository-owner`
+    /// member or an instance administrator). An anonymous reader and a plain
+    /// grantee get them absent; the package policy stays visible to all.
+    #[tokio::test]
+    async fn mcp_settings_shown_only_to_repo_admins_5398_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (reader_id, reader_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        tdh::grant_repo_role(&pool, repo_id, owner_id, "repository-owner").await;
+        tdh::grant_repo_access(&pool, repo_id, reader_id).await;
+        let repos = serde_json::json!({ "npm": npm_key }).to_string();
+        for (k, v) in [
+            ("mcp_package_repos", repos.as_str()),
+            ("mcp_namespace_allow", r#"["com.acme"]"#),
+            ("mcp_server_deny", r#"["com.evil/*"]"#),
+            ("mcp_require_namespace_grant", "true"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+            )
+            .bind(repo_id)
+            .bind(k)
+            .bind(v)
+            .execute(&pool)
+            .await
+            .expect("insert mcp setting");
+        }
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let mut admin = tdh::make_auth(reader_id, &reader_name);
+        admin.is_admin = true;
+        let hidden = [
+            "mcp_package_repos",
+            "mcp_namespace_allow",
+            "mcp_server_deny",
+            "mcp_require_namespace_grant",
+            "mcp_probe_remotes",
+            "mcp_require_oci_label",
+        ];
+        for (who, auth, sees) in [
+            ("anonymous", None, false),
+            (
+                "plain grantee",
+                Some(tdh::make_auth(reader_id, &reader_name)),
+                false,
+            ),
+            (
+                "repository owner",
+                Some(tdh::make_auth(owner_id, &owner_name)),
+                true,
+            ),
+            ("instance admin", Some(admin), true),
+        ] {
+            let Json(got) =
+                get_repository(State(state.clone()), Extension(auth), Path(key.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("{who}: get: {e:?}"));
+            let json = serde_json::to_value(&got).unwrap();
+            assert_eq!(json["mcp_package_policy"], "own-repos", "{who}");
+            if sees {
+                assert_eq!(json["mcp_package_repos"]["npm"], npm_key.as_str(), "{who}");
+                assert_eq!(json["mcp_namespace_allow"][0], "com.acme", "{who}");
+                assert_eq!(json["mcp_server_deny"][0], "com.evil/*", "{who}");
+                assert_eq!(json["mcp_require_namespace_grant"], true, "{who}");
+            } else {
+                for k in hidden {
+                    assert!(
+                        json.get(k).is_none_or(serde_json::Value::is_null),
+                        "{who} must not see {k}: {json}"
+                    );
+                }
+            }
+        }
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup(&pool, npm_id, reader_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&npm_dir);
     }
 
     /// DB-backed (#4834): every repository-administration handler that still
