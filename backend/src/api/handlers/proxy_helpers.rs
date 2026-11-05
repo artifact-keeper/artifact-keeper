@@ -8571,9 +8571,14 @@ pub fn age_gate_blocked_response(
         min_age_days,
         requested_age_days,
     );
+    // RFC 7725: a 451 is cacheable by default. The hold is lifted by a
+    // review or by time passing, so no cache may keep this answer (#5253).
     (
         StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         body.to_string(),
     )
         .into_response()
@@ -21769,6 +21774,26 @@ mod tests {
         assert_eq!(body["package"], "lodash");
         assert_eq!(body["min_age_days"], 7);
         assert_eq!(body["requested_age_days"], 2);
+    }
+
+    /// RFC 7725 makes a 451 cacheable by default; the age-gate hold is
+    /// temporary, so the answer must never be stored by a cache (#5253).
+    #[test]
+    fn age_gate_blocked_response_is_not_cacheable() {
+        let resp = age_gate_blocked_response(uuid::Uuid::new_v4(), "lodash", "4.0.0", 7, Some(2));
+        assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
     }
 
     // ── #1945: Maven/Ivy hosted-blob presigned-redirect helpers ─────────────
