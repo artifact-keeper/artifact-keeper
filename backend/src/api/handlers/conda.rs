@@ -2254,6 +2254,7 @@ async fn proxy_plain_repodata_document(
         upstream_url,
         &upstream_path,
         RepodataEncoding::Json.content_type(),
+        ctx.is_head,
     )
     .await?;
     // #3649: count the proxied serve once the streaming helper resolves, on
@@ -2595,6 +2596,7 @@ async fn serve_repodata(
                                 upstream_url,
                                 &upstream_path,
                                 ct,
+                                ctx.is_head,
                             )
                             .await?;
                             // #3649: count the proxied serve. The streaming helper
@@ -6833,6 +6835,7 @@ async fn download_package(
                             conda_package_content_type(&filename),
                             Some(&filename),
                             crate::models::repository::RepositoryFormat::Conda,
+                            ctx.is_head,
                         )
                         .await?;
                     // #4579: a catalogued package is immutable and answers from
@@ -7208,6 +7211,7 @@ impl proxy_helpers::ScannedProxyFile for CondaScannedPackage<'_> {
             conda_package_content_type(req.filename),
             Some(req.filename),
             crate::models::repository::RepositoryFormat::Conda,
+            req.is_head(),
         )
         .await
     }

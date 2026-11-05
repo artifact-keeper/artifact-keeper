@@ -7292,25 +7292,60 @@ impl ProxyService {
         repo: &'a Repository,
         path: &'a str,
     ) -> futures::future::BoxFuture<'a, Result<StreamingFetchResult>> {
+        self.head_artifact_streaming_with_cache_path(repo, path, path, None)
+    }
+
+    /// Split-path sibling of [`Self::head_artifact_streaming`] (#5343): the
+    /// `HEAD` counterpart of
+    /// [`Self::fetch_artifact_streaming_with_cache_path_gated_digest`] (and
+    /// its deferred-digest sibling), for the format handlers whose upstream
+    /// download path differs from the proxy-cache key (PyPI, npm, Cargo,
+    /// Debian pool files, OCI blobs, ...).
+    ///
+    /// `cache_path` keys the cache hit and every cache decision, `fetch_path`
+    /// builds the upstream URL the `HEAD` is sent to, exactly as the GET leader
+    /// uses them. `expected_checksum` is the digest the GET would gate its
+    /// cache commit on; it only matters on the fall-back GET path (an upstream
+    /// that refuses `HEAD`), which is handed it unchanged so a HEAD can never
+    /// commit what the GET would refuse.
+    ///
+    /// A plain `fn` returning a boxed future, like
+    /// [`Self::head_artifact_streaming`].
+    pub fn head_artifact_streaming_with_cache_path<'a>(
+        &'a self,
+        repo: &'a Repository,
+        fetch_path: &'a str,
+        cache_path: &'a str,
+        expected_checksum: Option<ExpectedCommitDigest>,
+    ) -> futures::future::BoxFuture<'a, Result<StreamingFetchResult>> {
         Box::pin(async move {
             // #4506: the Remote's origin policy, before any cache read or upstream contact.
             self.ensure_origin_policy_allows(repo).await?;
-            let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, path)?;
-            let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, path)?;
+            let cache_key = Self::cache_storage_key(&self.cache_scope, &repo.key, cache_path)?;
+            let metadata_key = Self::cache_metadata_key(&self.cache_scope, &repo.key, cache_path)?;
             if let Some(hit) = self
-                .try_streaming_cache_hit(repo, path, path, &cache_key, &metadata_key, true)
+                .try_streaming_cache_hit(
+                    repo,
+                    fetch_path,
+                    cache_path,
+                    &cache_key,
+                    &metadata_key,
+                    true,
+                )
                 .await?
             {
                 return Ok(hit);
             }
 
-            let full_url = self.gated_upstream_url(repo, path).await?;
+            let full_url = self.gated_upstream_url(repo, fetch_path).await?;
             let Some(headers) = self
                 .upstream_client
                 .head_headers(&full_url, repo.id)
                 .await?
             else {
-                return self.streaming_gated_fetch(repo, path, path, None).await;
+                return self
+                    .streaming_gated_fetch(repo, fetch_path, cache_path, expected_checksum)
+                    .await;
             };
 
             // Package Age Policy (#3912): the GET leader refuses a release
@@ -21879,6 +21914,7 @@ mod tests {
             &upstream,
             path,
             "application/octet-stream",
+            false,
         )
         .await
         {

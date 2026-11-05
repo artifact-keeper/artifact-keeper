@@ -1411,6 +1411,7 @@ async fn download_zip(
                         &upstream_path,
                         "application/zip",
                         RepositoryFormat::Go,
+                        ctx.is_head,
                     )
                     .await?;
                     // #3446: count the proxied module zip. The `.mod` and

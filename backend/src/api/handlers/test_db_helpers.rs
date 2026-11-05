@@ -1620,6 +1620,81 @@ pub async fn cold_head_then_two_gets(
     [head_answer, cold_get, warm_get]
 }
 
+/// #5343: the cold-`HEAD` contract for a format handler that streams a Remote
+/// download itself rather than through `try_remote_or_virtual_download`.
+///
+/// `server` must already carry the format's own upstream documents (an index,
+/// a packument, a checksum sidecar: whatever the handler resolves first),
+/// unconstrained. This mounts the counting pair for `upstream_path` (one
+/// `HEAD`, one body `GET`, see [`mount_head_and_get_once`]), points the
+/// fixture's Remote at `server`, and sends `HEAD uri`, `GET uri` and, once the
+/// cache has committed, `GET uri` again through `router` (with the fixture
+/// user's auth when `with_auth`).
+///
+/// Asserts the HEAD is a 200 with no body that advertises the GET's
+/// `Content-Length`, that both GETs serve `body`, and (the claim under test)
+/// that the upstream saw exactly one `HEAD` and one `GET` of the body.
+/// Returns the HEAD's headers for the format's own header assertions.
+#[allow(clippy::too_many_arguments)]
+pub async fn assert_cold_head_fetches_body_once(
+    fx: Fixture,
+    server: wiremock::MockServer,
+    router: fn() -> Router<SharedState>,
+    with_auth: bool,
+    upstream_path: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> axum::http::HeaderMap {
+    mount_head_and_get_once(&server, upstream_path, headers, body).await;
+    let (state, cache) = rewire_remote_proxy(&fx, &server.uri()).await;
+    let auth = make_auth(fx.user_id, &fx.username);
+    let app = || {
+        if with_auth {
+            router_with_auth(router(), state.clone(), auth.clone())
+        } else {
+            router_anon(router(), state.clone())
+        }
+    };
+    let [head_answer, cold, warm] =
+        cold_head_then_two_gets(app, uri, cache.path(), body.len() as u64).await;
+    fx.teardown().await;
+
+    assert_eq!(head_answer.0, StatusCode::OK, "HEAD {uri}");
+    assert!(head_answer.1.is_empty(), "HEAD {uri} must have no body");
+    let size = body.len().to_string();
+    assert_eq!(
+        head_answer
+            .2
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(size.as_str()),
+        "HEAD {uri} must advertise the GET's Content-Length"
+    );
+    for (which, answer) in [("cold", &cold), ("warm", &warm)] {
+        assert_eq!(answer.0, StatusCode::OK, "{which} GET {uri}");
+        assert!(answer.1[..] == body[..], "{which} GET {uri} body");
+    }
+    // The upstream request log, for a readable failure: before #5343 a cold
+    // HEAD opened a body GET whose dropped stream cached nothing, so the
+    // upstream saw no HEAD and two GETs of the body.
+    let seen: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == upstream_path)
+        .map(|r| r.method.to_string())
+        .collect();
+    assert_eq!(
+        seen,
+        ["HEAD", "GET"],
+        "cold HEAD then GET of {uri} must reach the upstream as one HEAD and one body GET"
+    );
+    drop_mock_server(server).await;
+    head_answer.2
+}
+
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".
 ///
 /// `Mutability::write_ttl_secs` stamps an immutable entry with ~10 years and a

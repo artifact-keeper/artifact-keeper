@@ -1410,6 +1410,7 @@ async fn download_archive(
                         &target.cache_path,
                         "application/zip",
                         RepositoryFormat::Composer,
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm

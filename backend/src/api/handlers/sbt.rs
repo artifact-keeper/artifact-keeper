@@ -75,6 +75,7 @@ async fn sbt_remote_stream(
     repo_key: &str,
     upstream_url: &str,
     path: &str,
+    is_head: bool,
 ) -> Result<Response, Response> {
     proxy_helpers::proxy_fetch_streaming_with_format(
         proxy,
@@ -84,6 +85,7 @@ async fn sbt_remote_stream(
         path,
         "application/octet-stream",
         RepositoryFormat::Sbt,
+        is_head,
     )
     .await
 }
@@ -275,6 +277,7 @@ impl proxy_helpers::ScannedProxyFile for SbtScannedArchive<'_> {
             req.repo_key,
             self.upstream_url,
             req.source_path,
+            req.is_head(),
         )
         .await
     }
@@ -351,9 +354,15 @@ async fn download_by_path(
                             .await;
                         }
                     }
-                    let response =
-                        sbt_remote_stream(proxy, repo.id, &repo_key, upstream_url, artifact_path)
-                            .await?;
+                    let response = sbt_remote_stream(
+                        proxy,
+                        repo.id,
+                        &repo_key,
+                        upstream_url,
+                        artifact_path,
+                        ctx.is_head,
+                    )
+                    .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
                     // cache HIT from storage and a cold MISS from upstream through the same
                     // call, so recording once it resolves counts both -- the cache hit #3649
