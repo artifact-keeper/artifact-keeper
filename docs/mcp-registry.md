@@ -1048,12 +1048,42 @@ resolving, unresolvable, or soft-deleted) is treated as missing:
   stored object once, and `computed_at` is the rollup's. A held version adds
   no node and no bytes. Proxy-cache entries of a Remote, and paths that
   belong to no server version, are not counted for such a caller.
+  `GET /api/v1/repositories/{key}/storage` (`logical_bytes`,
+  `physical_bytes`, `blob_count`) and `storage_used_bytes` of
+  `GET /api/v1/repositories/{key}` are computed the same way for such a
+  caller (on a Local, Staging or Remote registry; a Virtual's member figure
+  is not recomputed).
 - `GET /api/v1/tree` (the tree browser) leaves out a held version's nodes,
   using the same listing decision, and a folder that only held versions
   fill. `GET /api/v1/tree/content` answers a held version's path with the
   same `404` as a missing path, before reading storage. Its content is sent
   with `Cache-Control: no-store` for an MCP registry (`private` for any
   non-public repository of another format).
+- The security scan listings leave out the scans of such a version, and
+  their `total` counts only the rest:
+  `GET /api/v1/repositories/{key}/security/scans`,
+  `GET /api/v1/security/scans?repository_id=`, and, as for a missing
+  artifact (an empty page), `GET /api/v1/security/artifacts/{id}/scans` and
+  `GET /api/v1/security/scans?artifact_id=`. `GET /api/v1/security/scans/{id}`
+  and `/findings` answer the missing scan's `404`.
+- `GET /api/v1/packages` decides its MCP rows over the whole filtered set
+  before paging (at most 10,000 MCP rows per request; rows past that are
+  hidden), so `pagination.total` and every page count only the rows the
+  caller is shown. A row shown with the newest servable version in place of
+  a held one carries that version's `size_bytes`, `download_count`,
+  `created_at` and `updated_at`. A version list whose lookup fails is empty.
+- `POST /api/v1/repositories/{key}/artifacts-missing` reports such a path as
+  `not_found`, whatever the checksum, and an upload session's
+  `skip_if_present` does not report it present.
+- The by-id sub-resources answer such a version exactly as a missing
+  artifact (the route's own `404` body, or its empty listing):
+  `/api/v1/artifacts/{id}/labels`, `/api/v1/artifacts/{id}/package-analysis`,
+  `/api/v1/quarantine/{id}` (a holder still reads it),
+  `/api/v1/quality/health/artifacts/{id}`, `/api/v1/quality/checks?artifact_id=`,
+  `/api/v1/quality/checks/{id}` (with `/issues`),
+  `/api/v1/sbom?artifact_id=`, `/api/v1/sbom/by-artifact/{id}`,
+  `/api/v1/sbom/cve/history/by-artifact/{id}` and
+  `/api/v1/sbom/cve/history/{id}` for an artifact id.
 
 A holder sees every stored version there, and still gets the server.json's
 own quarantine refusals (`409`/`403`) on download.

@@ -306,6 +306,53 @@ pub async fn list_packages(
     // and keeps `total` honest at the same time.
     let live_packages = live_package_predicate();
 
+    // MCP rows (#5253): the catalog rows of the whole filtered set this
+    // caller is shown (`None`: the listing cannot contain an MCP row). The
+    // page and the count both keep only those, so `total` and every page
+    // count the rows the caller sees.
+    let mcp_shown: Option<Vec<Uuid>> = if query.format.as_deref().is_none_or(|f| f == "mcp") {
+        let mcp_sql = format!(
+            r#"
+            SELECT p.id, p.repository_id, p.name, p.version
+            FROM packages p
+            JOIN repositories r ON r.id = p.repository_id
+            WHERE ($1::uuid[] IS NULL OR r.id = ANY($1))
+              AND r.format::text = 'mcp'
+              AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
+              AND ({count_clause})
+              AND {live_packages}
+              AND ($2::text IS NULL OR $2 = 'mcp')
+            ORDER BY p.updated_at DESC
+            LIMIT $5
+            "#
+        );
+        let mcp_query =
+            sqlx::query_as::<_, (Uuid, Uuid, String, String)>(sqlx::AssertSqlSafe(&*mcp_sql))
+                .bind(filter.repo_ids.clone())
+                .bind(&query.format)
+                .bind(&search_pattern);
+        let mcp_query = match &count_ids {
+            Some(ids) => mcp_query.bind(ids.clone()),
+            None => mcp_query.bind(count_user_id),
+        };
+        let rows = mcp_query
+            .bind(super::mcp::GENERIC_LISTING_VERSION_CAP)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut shown = Vec::with_capacity(rows.len());
+        for (id, repo_id, name, version) in rows {
+            let view =
+                super::mcp::catalog_view(&state, auth.as_ref(), repo_id, &name, &version).await;
+            if view != super::mcp::CatalogView::Hide {
+                shown.push(id);
+            }
+        }
+        Some(shown)
+    } else {
+        None
+    };
+
     let page_sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
@@ -318,6 +365,7 @@ pub async fn list_packages(
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({page_clause})
           AND {live_packages}
+          AND ($7::uuid[] IS NULL OR r.format::text <> 'mcp' OR p.id = ANY($7))
         ORDER BY p.updated_at DESC
         OFFSET $4
         LIMIT $5
@@ -335,10 +383,13 @@ pub async fn list_packages(
         None => page_query.bind(page_user_id),
     };
     let packages: Vec<PackageRow> = page_query
+        .bind(mcp_shown.clone())
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    let (packages, hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    // The rows were decided above; this applies each one's view (a held
+    // version's row shows the newest servable one).
+    let (packages, _hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
 
     let count_sql = format!(
         r#"
@@ -350,6 +401,7 @@ pub async fn list_packages(
           AND ($3::text IS NULL OR p.name ILIKE $3 ESCAPE '\')
           AND ({count_clause})
           AND {live_packages}
+          AND ($5::uuid[] IS NULL OR r.format::text <> 'mcp' OR p.id = ANY($5))
         "#
     );
     let count_query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(&*count_sql))
@@ -361,10 +413,11 @@ pub async fn list_packages(
         Some(ids) => count_query.bind(ids.clone()),
         None => count_query.bind(count_user_id),
     };
-    let total: i64 = count_query.fetch_one(&state.db).await.unwrap_or(0);
-    // MCP rows this reader is served no version of are left out of the page
-    // and, best effort, of the total.
-    let total = (total - hidden as i64).max(0);
+    let total: i64 = count_query
+        .bind(mcp_shown)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -674,10 +727,24 @@ async fn apply_mcp_catalog_views(
                 out.push(row);
             }
             CatalogView::Show {
+                artifact_id,
                 version,
                 description,
                 metadata,
             } => {
+                // The figures and times are the shown version's own, never
+                // the held one's (#5253): its `package_versions` row, or its
+                // artifact when it has none. A failed read hides the row.
+                let Some(figures) =
+                    shown_version_figures(state, row.id, artifact_id, &version).await
+                else {
+                    hidden += 1;
+                    continue;
+                };
+                row.size_bytes = figures.0;
+                row.download_count = figures.1;
+                row.created_at = figures.2;
+                row.updated_at = figures.3;
                 row.version = version;
                 row.description = description;
                 let mut metadata = metadata;
@@ -691,14 +758,53 @@ async fn apply_mcp_catalog_views(
     (out, hidden)
 }
 
+/// `(size_bytes, download_count, created_at, updated_at)` of the version an
+/// MCP catalog row shows a reader in place of a held one: its
+/// `package_versions` row (`updated_at` is the version's own creation), else
+/// its server.json artifact with no downloads. `None` on a read failure.
+async fn shown_version_figures(
+    state: &SharedState,
+    package_id: Uuid,
+    artifact_id: Uuid,
+    version: &str,
+) -> Option<(
+    i64,
+    i64,
+    chrono::DateTime<chrono::Utc>,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let pv: Option<(i64, i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT size_bytes, download_count, created_at FROM package_versions \
+         WHERE package_id = $1 AND version = $2",
+    )
+    .bind(package_id)
+    .bind(version)
+    .fetch_optional(&state.db)
+    .await
+    .ok()?;
+    if let Some((size, downloads, created)) = pv {
+        return Some((size, downloads, created, created));
+    }
+    let a: (
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as("SELECT size_bytes, created_at, updated_at FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()??;
+    Some((a.0, 0, a.1, a.2))
+}
+
 /// For an MCP package, the versions `auth` may list (`None`: all of them, a
-/// holder or another format).
+/// holder or another format). A lookup that fails lists none (fail closed).
 async fn mcp_visible_versions(
     state: &SharedState,
     auth: Option<&AuthExtension>,
     package_id: Uuid,
 ) -> Option<std::collections::HashSet<String>> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
+    let row: Option<(Uuid, String)> = match sqlx::query_as(
         "SELECT p.repository_id, p.name FROM packages p \
          JOIN repositories r ON r.id = p.repository_id \
          WHERE p.id = $1 AND r.format = 'mcp'",
@@ -706,8 +812,10 @@ async fn mcp_visible_versions(
     .bind(package_id)
     .fetch_optional(&state.db)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(row) => row,
+        Err(_) => return Some(Default::default()),
+    };
     let (repo_id, name) = row?;
     super::mcp::catalog_visible_versions(state, auth, repo_id, &name).await
 }
@@ -732,6 +840,23 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use serde_json;
+
+    /// #5253: when the MCP package lookup fails, an MCP package's version
+    /// list is empty (fail closed), never every version.
+    #[tokio::test]
+    async fn mcp_visible_versions_fails_closed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://invalid:invalid@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::api::handlers::test_db_helpers::build_state(pool, dir.path().to_str().unwrap());
+        assert_eq!(
+            mcp_visible_versions(&state, None, Uuid::new_v4()).await,
+            Some(Default::default())
+        );
+    }
 
     fn make_package_row() -> PackageRow {
         let now = Utc::now();

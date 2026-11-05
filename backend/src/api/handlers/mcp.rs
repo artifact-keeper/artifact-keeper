@@ -616,8 +616,10 @@ pub(crate) enum CatalogView {
     /// The row as stored. `servable` is whether readers are served that
     /// version now (a holder sees a held version, flagged).
     Keep { servable: bool },
-    /// A reader is shown the server's newest servable version instead.
+    /// A reader is shown the server's newest servable version instead
+    /// (`artifact_id` is its server.json artifact).
     Show {
+        artifact_id: Uuid,
         version: String,
         description: Option<String>,
         metadata: serde_json::Value,
@@ -669,6 +671,7 @@ pub(crate) async fn catalog_view(
         return CatalogView::Hide;
     };
     CatalogView::Show {
+        artifact_id: row.artifact_id,
         version: row.version.clone(),
         description: metadata
             .pointer("/server/description")
@@ -3768,6 +3771,439 @@ mod tests {
         )
         .await;
         assert_eq!(list["pagination"]["total"], 2, "{list}");
+        env.teardown().await;
+    }
+
+    /// An authenticated caller with no grant on the (public) fixture registry:
+    /// it reads the registry, but does not hold it.
+    async fn outsider(env: &Env) -> AuthExtension {
+        let (uid, uname) = tdh::create_user(&env.fx.pool).await;
+        tdh::make_auth(uid, &uname)
+    }
+
+    /// `r` as `auth`, with both auth extensions, as `auth_middleware` does.
+    fn as_caller(env: &Env, auth: &AuthExtension, r: Router<SharedState>) -> Router {
+        tdh::router_with_auth_ext(r, env.fx.state.clone(), auth.clone())
+    }
+
+    fn fixture_user(env: &Env) -> AuthExtension {
+        tdh::make_auth(env.fx.user_id, &env.fx.username)
+    }
+
+    async fn scan_row(env: &Env, artifact_id: Uuid) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO scan_results (artifact_id, repository_id, scan_type, status, completed_at) \
+             VALUES ($1, $2, 'mcp_lint', 'completed', NOW()) RETURNING id",
+        )
+        .bind(artifact_id)
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap()
+    }
+
+    /// #5253: the security scan listings leave out the scans of a version a
+    /// non-holder is not served. The repository listings (`total` included),
+    /// the artifact-scoped listing (empty, as for a missing artifact) and the
+    /// scan and findings reads (`404`) of the held 2.0.0's `mcp_lint` row;
+    /// a holder sees both rows.
+    #[tokio::test]
+    async fn scan_listings_follow_the_serve_decision() {
+        let Some((env, name, _held)) = held_second_version("scan").await else {
+            return;
+        };
+        let key = env.fx.repo_key.clone();
+        let repo_id = env.fx.repo_id;
+        let served_id = env.server_artifact(&name, "1.0.0").await;
+        let held_id = env.server_artifact(&name, "2.0.0").await;
+        // Publishing lints each server.json (`mcp_lint`); one more row each
+        // makes the counts independent of how many that wrote.
+        scan_row(&env, served_id).await;
+        scan_row(&env, held_id).await;
+        let count = |id: Option<Uuid>| {
+            let pool = env.fx.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM scan_results WHERE repository_id = $1 \
+                     AND ($2::uuid IS NULL OR artifact_id = $2)",
+                )
+                .bind(repo_id)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let served_scans = count(Some(served_id)).await;
+        let all_scans = count(None).await;
+        assert!(all_scans > served_scans && served_scans >= 1);
+        let held_scan: Uuid =
+            sqlx::query_scalar("SELECT id FROM scan_results WHERE artifact_id = $1 LIMIT 1")
+                .bind(held_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        let reader = outsider(&env).await;
+        let holder = fixture_user(&env);
+        let repo_scans = || crate::api::handlers::security::repo_security_router();
+        let security = || crate::api::handlers::security::router();
+
+        let list = get_json(
+            as_caller(&env, &reader, repo_scans()),
+            format!("/{key}/security/scans?per_page=1"),
+        )
+        .await;
+        assert_eq!(list["total"], served_scans, "{list}");
+        assert!(!list.to_string().contains(&held_id.to_string()), "{list}");
+        let list = get_json(
+            as_caller(&env, &reader, repo_scans()),
+            format!("/{key}/security/scans?per_page=1&page=2"),
+        )
+        .await;
+        assert_eq!(list["total"], served_scans, "page 2: {list}");
+        assert!(!list.to_string().contains(&held_id.to_string()), "{list}");
+        let list = get_json(
+            as_caller(&env, &reader, security()),
+            format!("/scans?repository_id={repo_id}&per_page=100"),
+        )
+        .await;
+        assert_eq!(list["total"], served_scans, "{list}");
+        assert!(!list.to_string().contains(&held_id.to_string()), "{list}");
+        for uri in [
+            format!("/artifacts/{held_id}/scans"),
+            format!("/scans?artifact_id={held_id}"),
+        ] {
+            let list = get_json(as_caller(&env, &reader, security()), uri.clone()).await;
+            assert_eq!(list["total"], 0, "{uri}: {list}");
+            assert_eq!(list["items"].as_array().unwrap().len(), 0, "{uri}: {list}");
+        }
+        let missing = Uuid::new_v4();
+        for (uri, missing_uri) in [
+            (format!("/scans/{held_scan}"), format!("/scans/{missing}")),
+            (
+                format!("/scans/{held_scan}/findings"),
+                format!("/scans/{missing}/findings"),
+            ),
+        ] {
+            let (s, b, _) = call(as_caller(&env, &reader, security()), "GET", &uri, None).await;
+            let (ms, mb, _) = call(
+                as_caller(&env, &reader, security()),
+                "GET",
+                &missing_uri,
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!((s, b), (ms, mb), "{uri} must read as a missing scan");
+        }
+
+        let list = get_json(
+            as_caller(&env, &holder, repo_scans()),
+            format!("/{key}/security/scans"),
+        )
+        .await;
+        assert_eq!(list["total"], all_scans, "{list}");
+        let (s, _, _) = call(
+            as_caller(&env, &holder, security()),
+            "GET",
+            &format!("/scans/{held_scan}"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&env.fx.pool)
+            .await;
+        env.teardown().await;
+    }
+
+    /// #5253: the by-id sub-resources of an artifact answer a held version as
+    /// a missing artifact for a caller who does not hold the registry (the
+    /// same status, and where the route's body names no id, the same body),
+    /// while a holder still reads them.
+    #[tokio::test]
+    async fn by_id_sub_resources_follow_the_serve_decision() {
+        let Some((env, server, _held)) = held_second_version("byid").await else {
+            return;
+        };
+        let held_id = env.server_artifact(&server, "2.0.0").await;
+        let missing = Uuid::new_v4();
+        let reader = outsider(&env).await;
+        let holder = fixture_user(&env);
+        let artifacts = || crate::api::handlers::artifacts::router();
+        let quarantine = || crate::api::handlers::quarantine::router();
+        let quality = || crate::api::handlers::quality_gates::router();
+        let sbom = || crate::api::handlers::sbom::router();
+        let analysis = || crate::api::handlers::package_analysis::router();
+        type Mk = fn() -> Router<SharedState>;
+        // (router, uri template with `{}` for the id, holder status,
+        // whether the body of a missing id is id-free and must match).
+        let cases: [(Mk, &str, StatusCode, bool); 7] = [
+            (artifacts, "/{}/labels", StatusCode::OK, false),
+            (quarantine, "/{}", StatusCode::OK, true),
+            (quality, "/checks?artifact_id={}", StatusCode::OK, true),
+            (quality, "/health/artifacts/{}", StatusCode::NOT_FOUND, true),
+            (sbom, "/by-artifact/{}", StatusCode::NOT_FOUND, true),
+            (sbom, "/cve/history/by-artifact/{}", StatusCode::OK, true),
+            (
+                analysis,
+                "/{}/package-analysis",
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+        ];
+        for (mk, tpl, holder_status, same_body) in cases {
+            let uri = tpl.replace("{}", &held_id.to_string());
+            let missing_uri = tpl.replace("{}", &missing.to_string());
+            let (s, b, _) = call(as_caller(&env, &reader, mk()), "GET", &uri, None).await;
+            let (ms, mb, _) = call(as_caller(&env, &reader, mk()), "GET", &missing_uri, None).await;
+            assert_eq!(
+                s,
+                StatusCode::NOT_FOUND,
+                "{uri}: {}",
+                String::from_utf8_lossy(&b)
+            );
+            assert_eq!(ms, StatusCode::NOT_FOUND, "{missing_uri}");
+            if same_body {
+                assert_eq!(
+                    String::from_utf8_lossy(&b),
+                    String::from_utf8_lossy(&mb),
+                    "{uri} must read as a missing artifact"
+                );
+            }
+            let (hs, hb, _) = call(as_caller(&env, &holder, mk()), "GET", &uri, None).await;
+            assert_eq!(
+                hs,
+                holder_status,
+                "holder {uri}: {}",
+                String::from_utf8_lossy(&hb)
+            );
+        }
+        // A holder's 404s above come from the route's own data (no score, no
+        // SBOM, no analysis), not from the serve decision: their bodies are
+        // not the missing artifact's.
+        let (_, hb, _) = call(
+            as_caller(&env, &holder, sbom()),
+            "GET",
+            &format!("/by-artifact/{held_id}"),
+            None,
+        )
+        .await;
+        let (_, mb, _) = call(
+            as_caller(&env, &holder, sbom()),
+            "GET",
+            &format!("/by-artifact/{missing}"),
+            None,
+        )
+        .await;
+        assert_ne!(hb, mb);
+        env.teardown().await;
+    }
+
+    /// #5253: `artifacts-missing` reports a held version's path as
+    /// `not_found` (whatever the checksum) to a caller who does not hold the
+    /// registry, exactly like a path that does not exist; a holder is told
+    /// it is present.
+    #[tokio::test]
+    async fn presence_check_follows_the_serve_decision() {
+        let Some((env, _server, held)) = held_second_version("pres").await else {
+            return;
+        };
+        let key = env.fx.repo_key.clone();
+        let held_sha: String = sqlx::query_scalar(
+            "SELECT lower(checksum_sha256) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(env.fx.repo_id)
+        .bind(&held)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        let other_sha = "f".repeat(64);
+        let body = serde_json::json!({"items": [
+            {"path": held, "sha256": held_sha},
+            {"path": held, "sha256": other_sha},
+            {"path": "servers/com.acme/none/1.0.0/server.json", "sha256": held_sha},
+        ]});
+        let presence = || crate::api::handlers::artifact_presence::repo_router();
+        let uri = format!("/{key}/artifacts-missing");
+        let (s, b, _) = call(env.fx.router_anon(presence()), "POST", &uri, Some(&body)).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let reasons: Vec<String> = json(&b)["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["reason"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["not_found", "not_found", "not_found"],
+            "{}",
+            json(&b)
+        );
+        let (s, b, _) = call(
+            env.fx.router_with_auth(presence()),
+            "POST",
+            &uri,
+            Some(&body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reasons: Vec<String> = json(&b)["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["reason"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(reasons, ["checksum_mismatch", "not_found"], "{}", json(&b));
+        env.teardown().await;
+    }
+
+    /// #5253: `/api/v1/packages` counts only the catalog rows a reader is
+    /// shown, on every page: a server whose only version is held through
+    /// its backing package is neither listed nor counted. A holder counts it.
+    #[tokio::test]
+    async fn package_totals_follow_the_serve_decision() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        let (_npm, ids) = env.npm_backing(&["1.0.0", "2.0.0"]).await;
+        for (name, v) in [("com.acme/shown", "1.0.0"), ("com.acme/hidden", "2.0.0")] {
+            let d = doc(
+                name,
+                "1.0.0",
+                serde_json::json!({"packages": [npm_pkg("@acme/echo", Some(v))]}),
+            );
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        env.hold(ids[1], Some("quarantined")).await;
+        // The hidden server's row is the newest, so it would sit on page 1.
+        sqlx::query(
+            "UPDATE packages SET updated_at = NOW() + interval '1 hour' \
+             WHERE repository_id = $1 AND name = 'com.acme/hidden'",
+        )
+        .bind(env.fx.repo_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let api = || crate::api::handlers::packages::router();
+        let key = env.fx.repo_key.clone();
+        let mut names = Vec::new();
+        for page in [1, 2] {
+            let list = get_json(
+                env.fx.router_anon(api()),
+                format!("/?repository_key={key}&per_page=1&page={page}"),
+            )
+            .await;
+            assert_eq!(list["pagination"]["total"], 1, "page {page}: {list}");
+            assert_eq!(list["pagination"]["total_pages"], 1, "page {page}: {list}");
+            for i in list["items"].as_array().unwrap() {
+                names.push(i["name"].as_str().unwrap().to_string());
+            }
+        }
+        assert_eq!(names, ["com.acme/shown"]);
+        let list = get_json(
+            env.fx.router_with_auth(api()),
+            format!("/?repository_key={key}&per_page=1"),
+        )
+        .await;
+        assert_eq!(list["pagination"]["total"], 2, "{list}");
+        env.teardown().await;
+    }
+
+    /// #5253: a catalog row whose stored version is held shows a reader the
+    /// newest servable version with that version's own size, downloads and
+    /// times, never the held one's.
+    #[tokio::test]
+    async fn catalog_row_figures_follow_the_shown_version() {
+        let Some((env, server, _held)) = held_second_version("fig").await else {
+            return;
+        };
+        let (pkg, row_version): (Uuid, String) = sqlx::query_as(
+            "SELECT id, version FROM packages WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(env.fx.repo_id)
+        .bind(&server)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(row_version, "2.0.0");
+        // Make the held version's figures unmistakable.
+        sqlx::query(
+            "UPDATE packages SET size_bytes = 987654, download_count = 4242, \
+             created_at = '2001-01-01T00:00:00Z', updated_at = '2001-01-02T00:00:00Z' \
+             WHERE id = $1",
+        )
+        .bind(pkg)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let (size, downloads, created): (i64, i64, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            "SELECT size_bytes, download_count, created_at FROM package_versions \
+                 WHERE package_id = $1 AND version = '1.0.0'",
+        )
+        .bind(pkg)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        let api = || crate::api::handlers::packages::router();
+        let row = get_json(env.fx.router_anon(api()), format!("/{pkg}")).await;
+        assert_eq!(row["version"], "1.0.0", "{row}");
+        assert_eq!(row["size_bytes"], size, "{row}");
+        assert_eq!(row["download_count"], downloads, "{row}");
+        let at = |f: &str| {
+            chrono::DateTime::parse_from_rfc3339(row[f].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        assert_eq!(at("created_at"), created, "{row}");
+        assert_eq!(at("updated_at"), created, "{row}");
+        assert!(!row.to_string().contains("2001-01"), "{row}");
+        let held_row = get_json(env.fx.router_with_auth(api()), format!("/{pkg}")).await;
+        assert_eq!(held_row["size_bytes"], 987654, "{held_row}");
+        env.teardown().await;
+    }
+
+    /// #5253: a reader of an MCP registry is shown storage figures of the
+    /// versions it is served only (`GET /{key}/storage` and
+    /// `storage_used_bytes` of `GET /{key}`); a holder the stored total
+    /// (`storage_used_bytes`; the holder's `/storage` is the materialized
+    /// rollup, unchanged).
+    #[tokio::test]
+    async fn storage_totals_follow_the_serve_decision() {
+        let Some((env, _server, held)) = held_second_version("stor").await else {
+            return;
+        };
+        let key = env.fx.repo_key.clone();
+        let size_of = |path: String| {
+            let pool = env.fx.pool.clone();
+            let repo = env.fx.repo_id;
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT size_bytes FROM artifacts WHERE repository_id = $1 AND path = $2",
+                )
+                .bind(repo)
+                .bind(path)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let held_size = size_of(held.clone()).await;
+        let served_size = size_of(held.replace("/2.0.0/", "/1.0.0/")).await;
+        let repos = || crate::api::handlers::repositories::router();
+        let stats = get_json(env.fx.router_anon(repos()), format!("/{key}/storage")).await;
+        assert_eq!(stats["logical_bytes"], served_size, "{stats}");
+        assert_eq!(stats["blob_count"], 1, "{stats}");
+        let detail = get_json(env.fx.router_anon(repos()), format!("/{key}")).await;
+        assert_eq!(detail["storage_used_bytes"], served_size, "{detail}");
+        let detail = get_json(env.fx.router_with_auth(repos()), format!("/{key}")).await;
+        assert_eq!(
+            detail["storage_used_bytes"],
+            served_size + held_size,
+            "{detail}"
+        );
         env.teardown().await;
     }
 
