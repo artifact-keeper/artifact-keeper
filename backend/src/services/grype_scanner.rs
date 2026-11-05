@@ -4253,31 +4253,31 @@ mod tests {
     /// flag, so only the binary can prove it. The unpacked build POM's
     /// `provided`/`test` declarations must not be cataloged as shipped
     /// components, while the JAR's own identity and its shaded component
-    /// still are. Skips when grype is not installed or cannot run.
+    /// still are. Skips only when grype is not installed; probe and scan
+    /// failures must fail the test.
     #[tokio::test]
     async fn e2e_maven_embedded_pom_declarations_are_not_cataloged_5262() {
-        if std::process::Command::new("grype")
-            .arg("version")
-            .output()
-            .is_err()
-        {
-            eprintln!("grype not installed; skipping the embedded-POM catalog test");
-            return;
+        match std::process::Command::new("grype").arg("version").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("grype not installed; skipping the embedded-POM catalog test");
+                return;
+            }
+            Err(e) => panic!("failed to run grype version: {e}"),
+            Ok(output) => assert!(
+                output.status.success(),
+                "grype version failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
         }
         let dir = tempfile::tempdir().unwrap();
         let scanner = GrypeScanner::new(dir.path().to_string_lossy().to_string());
         let artifact = make_artifact("acme-maven-plugin-1.0.0.jar", "application/java-archive");
 
-        let output = match scanner
+        let output = scanner
             .scan(&artifact, None, &maven_plugin_jar_with_embedded_pom())
             .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("grype present but the scan could not run ({e}); skipping");
-                return;
-            }
-        };
+            .expect("Grype must scan the embedded-POM regression fixture successfully");
         let names: Vec<&str> = output.packages.iter().map(|p| p.name.as_str()).collect();
 
         for declared in ["maven-core", "maven-compat"] {
