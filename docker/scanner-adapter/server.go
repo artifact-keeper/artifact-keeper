@@ -19,6 +19,10 @@ type Server struct {
 	// returns 503 until then so the backend fails scans closed rather than
 	// dispatching to a half-initialized adapter.
 	ready atomic.Bool
+	// versionProbed is set once the startup trivy-version check passed. A DB
+	// import (PUT /api/v1/vulndb) flips ready on only when it is set, so an
+	// import never makes an adapter with a broken trivy binary ready.
+	versionProbed atomic.Bool
 	// remote is the trivy-server readiness gate in client mode
 	// (cfg.TrivyServer set); nil in standalone mode.
 	remote *remoteGate
@@ -69,6 +73,9 @@ func (s *Server) Handler() http.Handler {
 	// workspace; the adapter untars it and runs `trivy filesystem` over it.
 	mux.HandleFunc("POST /api/v1/filesystem/scan", s.handleFsScan)
 	mux.HandleFunc("GET /api/v1/filesystem/scan/{id}/report", s.handleFsReport)
+	// Vulnerability-DB status and offline import (#5287); bearer-token only.
+	mux.HandleFunc("GET /api/v1/vulndb", s.handleVulnDBGet)
+	mux.HandleFunc("PUT /api/v1/vulndb", s.handleVulnDBPut)
 	return mux
 }
 
