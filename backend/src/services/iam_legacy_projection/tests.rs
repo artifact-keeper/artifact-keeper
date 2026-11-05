@@ -919,7 +919,7 @@ fn legacy_allows(
         .collect();
     if roles
         .iter()
-        .any(|r| r.permissions.iter().any(|p| p == "admin"))
+        .any(|r| r.permissions.contains(&"admin".to_string()))
     {
         return true;
     }
@@ -937,7 +937,9 @@ fn legacy_allows(
         })
         .filter(|r| legacy_cond_ok(r, ip))
         .collect();
-    let has = |actions: &[String]| actions.iter().any(|a| a == action || a == "admin");
+    let has = |actions: &[String]| {
+        actions.iter().any(|a| a == action) || actions.contains(&"admin".to_string())
+    };
     if !rules.is_empty() {
         rules.iter().any(|r| has(&r.actions))
     } else {
@@ -1054,7 +1056,7 @@ fn assert_equivalent(w: &World, label: &str) -> usize {
                     .roles
                     .iter()
                     .find(|r| r.id == a.role_id)
-                    .is_some_and(|r| r.permissions.iter().any(|p| p == "admin"))
+                    .is_some_and(|r| r.permissions.contains(&"admin".to_string()))
         })
         .map(|a| ((a.user_id, a.repository_id.unwrap()), ()))
         .collect();
