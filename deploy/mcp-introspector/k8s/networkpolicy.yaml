@@ -1,7 +1,13 @@
-# Guests: no ingress. `ak-only` guests (npm, PyPI) may reach only AK and DNS;
-# `none` guests (OCI) nothing at all. The launcher sets the label
-# `ak-mcp-sandbox/network` from the guest spec. Replace 203.0.113.10/32 with
-# the address AK_URL resolves to (the ingress or load balancer).
+# Guests: no ingress. `ak-only` guests (npm, PyPI) may reach only AK, on
+# TCP 443; `none` guests (OCI) nothing at all. The launcher sets the label
+# `ak-mcp-sandbox/network` from the guest spec.
+#
+# Guests get no DNS. kube-dns forwards names outside the cluster, so a guest
+# that can query it can send data out in its queries. The launcher gives
+# each guest pod `dnsPolicy: None`, a loopback nameserver, and a
+# `hostAliases` entry that maps AK_MCP_SANDBOX_AK_HOST (the host of AK_URL)
+# to AK_MCP_SANDBOX_AK_IP. Replace 203.0.113.10/32 with that same address
+# (the ingress or load balancer AK_URL resolves to).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -27,16 +33,6 @@ spec:
             cidr: 203.0.113.10/32
       ports:
         - {protocol: TCP, port: 443}
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
 ---
 # The worker: the API server (attach), AK, and public addresses for remote
 # probes, never private ranges or cloud metadata. Replace 192.0.2.1/32 with

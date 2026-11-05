@@ -45,6 +45,13 @@ spec:
                 fieldRef: {fieldPath: metadata.name}
             - name: AK_MCP_SANDBOX_COMMAND
               value: /opt/ak/k8s-launcher.sh
+            # Guests get no DNS: the launcher maps this host to this address
+            # in each guest pod's /etc/hosts. The host of AK_URL, and the
+            # address in networkpolicy.yaml.
+            - name: AK_MCP_SANDBOX_AK_HOST
+              value: ak.example.com
+            - name: AK_MCP_SANDBOX_AK_IP
+              value: 203.0.113.10
             - name: AK_MCP_SANDBOX_NODE_IMAGE
               value: ak.example.com/docker-local/library/node@sha256:REPLACE_ME
             - name: AK_MCP_SANDBOX_PYTHON_IMAGE

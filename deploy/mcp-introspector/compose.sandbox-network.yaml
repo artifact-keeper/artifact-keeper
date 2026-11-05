@@ -10,8 +10,12 @@
 # certificate stay end to end. OCI guests run with `--network=none` and
 # never join it.
 #
-# Replace ak.example.com (here and in nginx-ak-gateway.conf) with the host
-# of AK_URL.
+# The gateway must not look the AK hostname up itself: on the sandbox
+# network that name is its own alias, so it would forward to itself. It
+# reaches AK as `ak-upstream`, an /etc/hosts entry for AK's address.
+#
+# Replace ak.example.com below with the host of AK_URL, and 203.0.113.10
+# with the address that host resolves to (the ingress or load balancer).
 name: ak-mcp-sandbox
 
 services:
@@ -31,6 +35,9 @@ services:
       sandbox:
         aliases: [ak.example.com]
       egress: {}
+    # The upstream nginx-ak-gateway.conf forwards to. Not the AK hostname.
+    extra_hosts:
+      - "ak-upstream:203.0.113.10"
     restart: unless-stopped
 
 networks:
