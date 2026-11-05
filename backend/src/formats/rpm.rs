@@ -43,6 +43,8 @@ const RPMTAG_POSTINPROG: u32 = 1086;
 const RPMTAG_PREUNPROG: u32 = 1087;
 const RPMTAG_POSTUNPROG: u32 = 1088;
 const RPMTAG_SOURCERPM: u32 = 1044;
+// Set (non-zero) only in a source package's header (#5278).
+const RPMTAG_SOURCEPACKAGE: u32 = 1106;
 const RPMTAG_PROVIDENAME: u32 = 1047;
 const RPMTAG_REQUIRENAME: u32 = 1049;
 // Repodata (`primary.xml`/`filelists.xml`) tags (#3801).
@@ -272,7 +274,11 @@ impl RpmHandler {
             name: get_string(RPMTAG_NAME),
             version: get_string(RPMTAG_VERSION),
             release: get_string(RPMTAG_RELEASE),
-            arch: get_string(RPMTAG_ARCH),
+            arch: if is_source_package(&h) {
+                RPM_SOURCE_ARCH.to_string()
+            } else {
+                get_string(RPMTAG_ARCH)
+            },
             summary: get_optional(RPMTAG_SUMMARY),
             description: get_optional(RPMTAG_DESCRIPTION),
             license: get_optional(RPMTAG_LICENSE),
@@ -421,6 +427,7 @@ impl RpmHandler {
             .or_else(|| sig.as_ref().and_then(|s| s.int(RPMSIGTAG_PAYLOADSIZE)));
 
         let info = RpmRepodataInfo {
+            source: is_source_package(&h),
             epoch: h.int(RPMTAG_EPOCH),
             packager: h.string(RPMTAG_PACKAGER),
             vendor: h.string(RPMTAG_VENDOR),
@@ -473,6 +480,17 @@ impl RpmHandler {
         h.budget_result()?;
         Ok(info)
     }
+}
+
+/// The arch repodata lists a source package under (#5278).
+pub const RPM_SOURCE_ARCH: &str = "src";
+
+/// Whether the header is a source package's. Its ARCH tag names the build
+/// host's architecture, not the package's: `createrepo_c` lists the package
+/// as `src` when RPMTAG_SOURCEPACKAGE is set, so dnf never installs it or
+/// lets its provides (every subpackage it builds) satisfy a dependency.
+fn is_source_package(h: &HeaderIndex) -> bool {
+    h.int(RPMTAG_SOURCEPACKAGE).is_some_and(|v| v != 0)
 }
 
 /// Why a package's header could not be indexed (#3801).
@@ -1119,6 +1137,10 @@ fn file_entries(h: &HeaderIndex<'_>) -> std::result::Result<Vec<RpmFileEntry>, R
 /// `primary.xml`/`filelists.xml` can be rendered without re-reading packages.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RpmRepodataInfo {
+    /// A source package (`.src.rpm`), listed with arch [`RPM_SOURCE_ARCH`]
+    /// whatever its header's ARCH says (#5278).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1947,6 +1969,29 @@ mod tests {
     fn pre(mut e: RpmEntry) -> RpmEntry {
         e.pre = Some("1".to_string());
         e
+    }
+
+    /// See `tests/fixtures/ak-srpm-test.spec`: built with `rpmbuild -bs` on
+    /// x86_64, so its header's ARCH is `x86_64` (#5278).
+    const SRPM: &[u8] = include_bytes!("../../tests/fixtures/ak-srpm-test-1.0-1.src.rpm");
+
+    /// A source package is `src` whatever its header's ARCH (the build
+    /// host's) says, as `createrepo_c` lists it (#5278); a binary package
+    /// keeps its header arch.
+    #[test]
+    fn test_source_package_arch_is_src() {
+        assert_eq!(RpmHandler::parse_rpm_header(SRPM).unwrap().arch, "src");
+        assert!(RpmHandler::parse_rpm_repodata_info(SRPM).unwrap().source);
+
+        assert_eq!(
+            RpmHandler::parse_rpm_header(DEPS_RPM).unwrap().arch,
+            "noarch"
+        );
+        assert!(
+            !RpmHandler::parse_rpm_repodata_info(DEPS_RPM)
+                .unwrap()
+                .source
+        );
     }
 
     #[test]
