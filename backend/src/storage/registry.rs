@@ -13,7 +13,7 @@ use crate::error::{AppError, Result};
 use crate::storage::filesystem::FilesystemStorage;
 
 /// A resolved storage location carrying the backend name and base path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageLocation {
     /// Backend identifier (e.g. "filesystem", "s3-primary", "gcs-archive").
     pub backend: String,
@@ -63,6 +63,12 @@ impl StorageRegistry {
     pub fn with_filesystem_bucket_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
         self.filesystem_bucket_root = Some(root.into());
         self
+    }
+
+    /// The global filesystem storage root (`STORAGE_PATH`), when one was
+    /// supplied via [`Self::with_filesystem_bucket_root`].
+    pub fn filesystem_bucket_root(&self) -> Option<&std::path::Path> {
+        self.filesystem_bucket_root.as_deref()
     }
 
     /// Resolve a `StorageLocation` to a concrete backend instance.
