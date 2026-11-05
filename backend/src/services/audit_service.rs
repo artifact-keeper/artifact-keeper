@@ -263,6 +263,11 @@ pub enum AuditAction {
     /// A proxy-cache seed job of a Remote repository finished (#5284): one
     /// summary row per job with its inventory counts.
     CacheSeeded,
+    /// The proxy sent a request to an upstream (#5286): one row per request
+    /// actually sent, never for a cache hit. Off unless
+    /// `AUDIT_UPSTREAM_FETCHES` is `errors` or `all`; see
+    /// [`crate::services::upstream_fetch_audit`].
+    UpstreamFetched,
     /// An administrator accepted a finding: a decision about an advisory in a
     /// component of specific bytes (#5153).
     FindingAcknowledged,
@@ -453,6 +458,7 @@ impl AuditAction {
             AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
             AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
             AuditAction::CacheSeeded => "CACHE_SEEDED",
+            AuditAction::UpstreamFetched => "UPSTREAM_FETCHED",
         }
     }
 }
@@ -1611,15 +1617,18 @@ pub struct ProxyScanBlockEvent {
 /// username the auth middleware recorded (`None` for an anonymous pull) and
 /// the authorization-grade client IP. Captured before any detached task,
 /// which would not inherit the request's task-locals.
+///
+/// Shared with the `UPSTREAM_FETCHED` recorder (#5286), which attributes an
+/// upstream request to the client request that caused it the same way.
 #[derive(Debug, Clone)]
-struct BlockPrincipal {
-    username: Option<String>,
-    ip: Option<IpAddr>,
-    correlation_id: Option<String>,
+pub(crate) struct BlockPrincipal {
+    pub(crate) username: Option<String>,
+    pub(crate) ip: Option<IpAddr>,
+    pub(crate) correlation_id: Option<String>,
 }
 
 impl BlockPrincipal {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             username: crate::api::middleware::request_span::recorded_user(),
             ip: crate::api::middleware::client_ip::current_verified_client_ip(),
@@ -1905,6 +1914,7 @@ mod proxy_scan_blocked_4777_tests {
     fn action_string_is_stable() {
         assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
+        assert_eq!(AuditAction::UpstreamFetched.as_str(), "UPSTREAM_FETCHED");
     }
 
     /// #5253: the MCP registry vocabulary is a published contract

@@ -41,9 +41,12 @@ use crate::services::proxy_scan_service::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
+use crate::services::upstream_fetch_audit::{
+    UpstreamAuditTarget, UpstreamCaller, UpstreamFetchAuditMode,
+};
 use crate::services::upstream_mode::UpstreamMode;
 use crate::services::upstream_not_found_policy::OnUpstreamNotFound;
-use crate::services::upstream_tracing::send_upstream;
+use crate::services::upstream_tracing::send_upstream_audited;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
@@ -3979,6 +3982,9 @@ pub(crate) struct UpstreamClient {
     /// vacuously.
     #[cfg(test)]
     test_loopback_ports: std::sync::Mutex<Option<Vec<u16>>>,
+    /// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
+    /// `Off` unless [`ProxyService::with_upstream_fetch_audit`] set it.
+    audit_mode: UpstreamFetchAuditMode,
 }
 
 /// The error for an upstream destination the outbound address policy refuses
@@ -4032,7 +4038,28 @@ impl UpstreamClient {
             egress_client_cache: RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_loopback_ports: std::sync::Mutex::new(None),
+            audit_mode: UpstreamFetchAuditMode::Off,
         }
+    }
+
+    /// Send `request` for `repo_id` through [`send_upstream_audited`], with an
+    /// `UPSTREAM_FETCHED` row when the audit mode asks for one (#5286).
+    ///
+    /// A plain `fn` returning a boxed future, not an `async fn`: every proxy
+    /// fetch awaits this, and the handler futures that reach it (the NuGet,
+    /// conda, sbt and VS Code member walks) already sit at the compiler's
+    /// layout query-depth limit in the coverage build. An opaque boxed future
+    /// adds one level, fewer than inlining `send_upstream` did before.
+    fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        repo_id: Option<Uuid>,
+        caller: UpstreamCaller,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send + '_>,
+    > {
+        let audit = UpstreamAuditTarget::for_mode(&self.db, self.audit_mode, repo_id, caller);
+        Box::pin(send_upstream_audited(request, audit))
     }
 
     /// Apply the upstream outbound address policy to a destination named by
@@ -4290,9 +4317,12 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = send_upstream(request).await.map_err(|e| {
-            classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
-        })?;
+        let response = self
+            .send(request, Some(repo_id), UpstreamCaller::Proxy)
+            .await
+            .map_err(|e| {
+                classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
+            })?;
 
         let status = response.status();
 
@@ -4371,9 +4401,12 @@ impl UpstreamClient {
         }
         request = apply_custom_ua(request, custom_ua.as_deref());
 
-        let response = send_upstream(request).await.map_err(|e| {
-            classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
-        })?;
+        let response = self
+            .send(request, Some(repo_id), UpstreamCaller::Proxy)
+            .await
+            .map_err(|e| {
+                classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
+            })?;
 
         Self::read_upstream_response_capped(response, url, max).await
     }
@@ -4535,9 +4568,12 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = send_upstream(request).await.map_err(|e| {
-            classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
-        })?;
+        let response = self
+            .send(request, Some(repo_id), UpstreamCaller::Proxy)
+            .await
+            .map_err(|e| {
+                classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
+            })?;
 
         let status = response.status();
 
@@ -4681,15 +4717,18 @@ impl UpstreamClient {
                 let retry_request = build_request(client.get(url).bearer_auth(&token));
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
-                let retry_response = send_upstream(retry_request).await.map_err(|e| {
-                    classify_send_error(
-                        e,
-                        &format!(
-                            "fetch from upstream {} after token exchange",
-                            retry_diagnostic_url
-                        ),
-                    )
-                })?;
+                let retry_response = self
+                    .send(retry_request, Some(repo_id), UpstreamCaller::Proxy)
+                    .await
+                    .map_err(|e| {
+                        classify_send_error(
+                            e,
+                            &format!(
+                                "fetch from upstream {} after token exchange",
+                                retry_diagnostic_url
+                            ),
+                        )
+                    })?;
 
                 // #4527: no credentials went to the token service, so a
                 // refusal of the anonymous token is not a credentials problem.
@@ -4802,12 +4841,15 @@ impl UpstreamClient {
 
         tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
 
-        let token_response = send_upstream(token_request).await.map_err(|e| {
-            AppError::Storage(format!(
-                "Failed to request bearer token from {}: {}",
-                realm, e
-            ))
-        })?;
+        let token_response = self
+            .send(token_request, repo_id, UpstreamCaller::OciToken)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!(
+                    "Failed to request bearer token from {}: {}",
+                    realm, e
+                ))
+            })?;
 
         if !token_response.status().is_success() {
             return Err(token_endpoint_status_error(
@@ -5168,9 +5210,12 @@ impl UpstreamClient {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = send_upstream(request).await.map_err(|e| {
-            AppError::Storage(format!("Failed to check upstream for changes: {}", e))
-        })?;
+        let response = self
+            .send(request, Some(repo_id), UpstreamCaller::Revalidate)
+            .await
+            .map_err(|e| {
+                AppError::Storage(format!("Failed to check upstream for changes: {}", e))
+            })?;
         // The URL may embed upstream `user:password@` credentials (#4452);
         // every log line below renders the redacted form.
         let shown = redact_url_for_diagnostics(url);
@@ -5564,6 +5609,14 @@ impl ProxyService {
     pub fn with_stale_if_error_grace_secs(mut self, secs: i64) -> Self {
         self.stale_if_error_grace_secs =
             secs.clamp(0, cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS);
+        self
+    }
+
+    /// Set which upstream requests write an `UPSTREAM_FETCHED` audit row
+    /// (#5286), from `Config::audit_upstream_fetches` on the production
+    /// construction path. The default is `Off`.
+    pub fn with_upstream_fetch_audit(mut self, mode: UpstreamFetchAuditMode) -> Self {
+        self.upstream_client.audit_mode = mode;
         self
     }
 
@@ -8719,16 +8772,20 @@ impl ProxyService {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = send_upstream(request).await.map_err(|e| {
-            // Redact the target URL (may carry `user:pass@` upstream creds) and
-            // drop the URL reqwest embeds in its own error (#2926) before this
-            // surfaces to a client.
-            AppError::Storage(format!(
-                "Failed to fetch from upstream: {} - {}",
-                redact_url_for_diagnostics(url),
-                e.without_url()
-            ))
-        })?;
+        let response = self
+            .upstream_client
+            .send(request, Some(repo_id), UpstreamCaller::Revalidate)
+            .await
+            .map_err(|e| {
+                // Redact the target URL (may carry `user:pass@` upstream creds) and
+                // drop the URL reqwest embeds in its own error (#2926) before this
+                // surfaces to a client.
+                AppError::Storage(format!(
+                    "Failed to fetch from upstream: {} - {}",
+                    redact_url_for_diagnostics(url),
+                    e.without_url()
+                ))
+            })?;
 
         let status = response.status();
 
@@ -20548,6 +20605,198 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// A Generic Remote backed by a real `repositories` row (so the
+    /// `UPSTREAM_FETCHED` row can name it), served by a proxy auditing
+    /// upstream requests under `mode` (#5286).
+    async fn audited_remote(
+        pool: &PgPool,
+        upstream: &str,
+        mode: UpstreamFetchAuditMode,
+    ) -> (ProxyService, Repository, std::path::PathBuf) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::storage_service::FilesystemBackend;
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "remote", "generic").await;
+        let backend = Arc::new(FilesystemBackend::new(dir.clone()));
+        let proxy = ProxyService::new(
+            pool.clone(),
+            Arc::new(StorageService::new(backend)),
+            ProxyCacheScope::unscoped(),
+        )
+        .with_upstream_fetch_audit(mode);
+        let mut repo = remote_repo_for(&repo_key, upstream, dir.to_str().unwrap());
+        repo.id = repo_id;
+        repo.format = RepositoryFormat::Generic;
+        (proxy, repo, dir)
+    }
+
+    async fn drop_audited_remote(pool: &PgPool, repo: &Repository, dir: &std::path::Path) {
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo.id)
+            .execute(pool)
+            .await;
+        crate::api::handlers::test_db_helpers::cleanup(pool, repo.id, Uuid::nil()).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #5286 with #5282: a cache-only Remote refuses a miss at the upstream
+    /// gate, before anything is sent, so it writes no `UPSTREAM_FETCHED` row:
+    /// the event records upstream contact, and there was none.
+    #[tokio::test]
+    async fn upstream_fetched_audit_records_nothing_for_a_cache_only_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (proxy, repo, dir) =
+            audited_remote(&pool, &server.uri(), UpstreamFetchAuditMode::All).await;
+        crate::services::upstream_mode::save_upstream_mode(
+            &pool,
+            repo.id,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly,
+        )
+        .await
+        .expect("store cache_only");
+
+        let err = proxy
+            .fetch_artifact(&repo, "pkg/missing.json")
+            .await
+            .expect_err("a cache-only miss is refused");
+        assert!(
+            crate::services::upstream_mode::is_cache_only_refusal(&err),
+            "{err:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            tdh::audit_count(&pool, repo.id, "UPSTREAM_FETCHED").await,
+            0,
+            "no upstream contact, so no UPSTREAM_FETCHED row"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        drop_audited_remote(&pool, &repo, &dir).await;
+    }
+
+    /// #5286: a cache miss writes exactly one `UPSTREAM_FETCHED` row with the
+    /// request's host, path, status and size; the fresh cache hit after it
+    /// contacts nothing and writes nothing.
+    #[tokio::test]
+    async fn upstream_fetched_audit_records_a_miss_once_and_a_fresh_hit_never() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/pkg/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"INDEX-BODY".as_ref()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (proxy, repo, dir) =
+            audited_remote(&pool, &server.uri(), UpstreamFetchAuditMode::All).await;
+
+        let (body, _) = proxy
+            .fetch_artifact(&repo, "pkg/index.json")
+            .await
+            .expect("the miss fills from upstream");
+        assert_eq!(&body[..], b"INDEX-BODY");
+        assert_eq!(
+            tdh::audit_count_eventually(&pool, repo.id, "UPSTREAM_FETCHED", 1).await,
+            1
+        );
+        let row = tdh::audit_row_eventually(&pool, repo.id, "UPSTREAM_FETCHED").await;
+        assert_eq!(row.resource_type, "repository");
+        let d = &row.details;
+        assert_eq!(d["repository"], repo.key.as_str());
+        assert_eq!(d["repository_id"], repo.id.to_string());
+        assert_eq!(d["caller"], "proxy");
+        assert_eq!(d["method"], "GET");
+        assert_eq!(d["host"], "127.0.0.1");
+        assert_eq!(d["port"], server.address().port());
+        assert_eq!(d["path"], "/pkg/index.json");
+        assert_eq!(d["status"], 200);
+        assert_eq!(d["result"], "ok");
+        assert_eq!(d["bytes"], 10);
+        assert_eq!(d["conditional"], false);
+
+        let (body, _) = proxy
+            .fetch_artifact(&repo, "pkg/index.json")
+            .await
+            .expect("the fresh entry is served from cache");
+        assert_eq!(&body[..], b"INDEX-BODY");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            tdh::audit_count(&pool, repo.id, "UPSTREAM_FETCHED").await,
+            1,
+            "a cache hit sends nothing upstream and must record nothing"
+        );
+        server.verify().await;
+        drop_audited_remote(&pool, &repo, &dir).await;
+    }
+
+    /// #5286: `errors` mode skips a successful request and records failed
+    /// ones with their status and result.
+    #[tokio::test]
+    async fn upstream_fetched_audit_errors_mode_records_only_failures() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/ok.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".as_ref()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/broken.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        // `/missing.json` is not mounted: wiremock answers 404.
+        let (proxy, repo, dir) =
+            audited_remote(&pool, &server.uri(), UpstreamFetchAuditMode::Errors).await;
+
+        proxy
+            .fetch_artifact(&repo, "ok.json")
+            .await
+            .expect("the upstream answers 200");
+        assert!(proxy.fetch_artifact(&repo, "missing.json").await.is_err());
+        assert!(tdh::audit_count_eventually(&pool, repo.id, "UPSTREAM_FETCHED", 1).await >= 1);
+        let row = tdh::audit_row_eventually(&pool, repo.id, "UPSTREAM_FETCHED").await;
+        assert_eq!(row.details["path"], "/missing.json");
+        assert_eq!(row.details["status"], 404);
+        assert_eq!(row.details["result"], "not_found");
+
+        assert!(proxy.fetch_artifact(&repo, "broken.json").await.is_err());
+        assert!(tdh::audit_count_eventually(&pool, repo.id, "UPSTREAM_FETCHED", 2).await >= 2);
+        let row: (serde_json::Value,) = sqlx::query_as(
+            "SELECT details FROM audit_log WHERE resource_id = $1 AND action = 'UPSTREAM_FETCHED' \
+             AND details->>'path' = '/broken.json'",
+        )
+        .bind(repo.id)
+        .fetch_one(&pool)
+        .await
+        .expect("the 500 is recorded");
+        assert_eq!(row.0["status"], 500);
+        assert_eq!(row.0["result"], "error");
+        drop_audited_remote(&pool, &repo, &dir).await;
     }
 
     /// S3: a content-addressed RPM repodata body (createrepo unique

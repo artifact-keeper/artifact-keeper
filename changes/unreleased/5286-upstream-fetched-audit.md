@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5286]
+---
+- **The audit log can now record every request the proxy sends to an upstream** (#5286). With `AUDIT_UPSTREAM_FETCHES=all`, each cache-miss fetch, revalidation and OCI token exchange writes an `UPSTREAM_FETCHED` audit entry with the repository, caller, method, host, port, path (never credentials or the query string), status, result (`ok`, `not_modified`, `not_found`, `auth_challenge`, `error`, `timeout`), announced size, duration and the principal of the client request that caused it. A cache hit writes nothing, and a single-flight fill writes one entry however many clients wait on it. `AUDIT_UPSTREAM_FETCHES=errors` records only failed requests; the default `off` records nothing. The entry is written by a bounded background task, so it adds no latency to the request and a failed write never fails it. This lets an air-gapped deployment list what came in during its seed window, and show that nothing was fetched after the cut, from AK's own audit log. See docs/audit-events.md.

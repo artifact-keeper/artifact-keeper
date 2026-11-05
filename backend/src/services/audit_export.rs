@@ -218,6 +218,9 @@ impl AuditAction {
             | AuditAction::McpServerEdited
             | AuditAction::McpServerDeleted
             | AuditAction::McpMirrorSynced => Outcome::Success,
+            // #5286: the recorder overrides to `Failure` for a request that
+            // failed (`not_found`, `error`, `timeout`).
+            AuditAction::UpstreamFetched => Outcome::Success,
         }
     }
 }
