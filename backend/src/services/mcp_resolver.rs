@@ -1179,16 +1179,35 @@ async fn resolve_pending(
             index: Some(p.index),
         });
     };
-    let remote = mcp_packages::repos_by_key(&state.db, std::slice::from_ref(&p.fill_repository))
-        .await
-        .map_err(|e| Step::Retry(e.detail()))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Step::Failed {
-            code: "mcp_package_not_found",
-            detail: format!("repository '{}' no longer exists", p.fill_repository),
-            index: Some(p.index),
-        })?;
+    // The fill target is recomputed from the current mapping and must be the
+    // repository recorded at publish: a pin is never assembled from the
+    // mapping of one moment and the Remote of another.
+    let remote = match fill_target(&state.db, mapped).await {
+        Ok(Some(remote)) if remote.id == p.fill_repository_id => remote,
+        Ok(_) => {
+            return Err(Step::Failed {
+                code: "mcp_package_not_found",
+                detail: format!(
+                    "registryType '{}' no longer fills through repository '{}'; publish again",
+                    p.registry_type, p.fill_repository
+                ),
+                index: Some(p.index),
+            })
+        }
+        Err(McpError::Internal(m)) | Err(McpError::Misconfigured(m)) => return Err(Step::Retry(m)),
+        Err(e) => return Err(Step::Retry(e.detail())),
+    };
+    // Fill through the repository as it is now (its key may have changed).
+    let current;
+    let p = if remote.key == p.fill_repository {
+        p
+    } else {
+        current = Pending {
+            fill_repository: remote.key.clone(),
+            ..p.clone()
+        };
+        &current
+    };
     let look = || async {
         if p.registry_type == "oci" {
             match mcp_packages::resolve_one(state, settings, p.index, &pkg, base).await {

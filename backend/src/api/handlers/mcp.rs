@@ -657,7 +657,7 @@ pub(crate) async fn catalog_view(
         };
     }
     let none = std::collections::HashSet::new();
-    let Some(row) = newest_servable(ctx, repo_id, rows, &none, policy).await.0 else {
+    let Ok(Some(row)) = newest_servable(ctx, repo_id, rows, &none, policy).await.0 else {
         return CatalogView::Hide;
     };
     let metadata: Option<serde_json::Value> =
@@ -1024,7 +1024,12 @@ fn parse_bool(key: &str, v: &str) -> Result<bool, McpError> {
 /// values over 100 clamp, 0/negative/non-numeric 400), `search` >= 3
 /// characters (422), `updated_since` RFC 3339 (400) and forcing
 /// `include_deleted` (an explicit `include_deleted=false` with it is 400).
-pub fn parse_list_query(q: &HashMap<String, String>) -> Result<ListQuery, McpError> {
+/// `cursor` is opened with `open_cursor` (a sealed position, see
+/// [`fmt::CursorSeal`]).
+pub fn parse_list_query(
+    q: &HashMap<String, String>,
+    open_cursor: impl FnOnce(&str) -> Result<(String, String), McpError>,
+) -> Result<ListQuery, McpError> {
     let limit = match q.get("limit").map(|s| s.trim()) {
         None | Some("") => fmt::DEFAULT_LIMIT,
         Some(s) => match s.parse::<i64>() {
@@ -1038,7 +1043,7 @@ pub fn parse_list_query(q: &HashMap<String, String>) -> Result<ListQuery, McpErr
         },
     };
     let cursor = match q.get("cursor").filter(|c| !c.is_empty()) {
-        Some(c) => Some(fmt::decode_cursor(c)?),
+        Some(c) => Some(open_cursor(c)?),
         None => None,
     };
     let search = match q.get("search").filter(|s| !s.is_empty()) {
@@ -1149,8 +1154,23 @@ pub(crate) async fn servable(
     rows: Vec<VersionRow>,
     policy_now: PackagePolicy,
 ) -> Vec<VersionRow> {
+    servable_checked(ctx, repo_id, rows, policy_now)
+        .await
+        .unwrap_or_default()
+}
+
+/// [`servable`], telling an unevaluable gate (already logged and audited)
+/// apart from "nothing servable", for a caller that must not fall through
+/// to another candidate (an older version, a lower-priority member) when a
+/// gate is down.
+pub(crate) async fn servable_checked(
+    ctx: GateCtx<'_>,
+    repo_id: Uuid,
+    rows: Vec<VersionRow>,
+    policy_now: PackagePolicy,
+) -> Result<Vec<VersionRow>, mcp_packages::GateUnavailable> {
     if rows.is_empty() {
-        return rows;
+        return Ok(rows);
     }
     let listing: Vec<mcp_packages::ListingRow> = rows
         .iter()
@@ -1165,7 +1185,7 @@ pub(crate) async fn servable(
         Ok(refused) => refused,
         Err(mcp_packages::GateUnavailable) => {
             listing_gate_unavailable(ctx.db, repo_id);
-            return Vec::new();
+            return Err(mcp_packages::GateUnavailable);
         }
     };
     let rows: Vec<VersionRow> = rows
@@ -1183,58 +1203,72 @@ pub(crate) async fn servable(
         Err(()) => Err(()),
     };
     match held {
-        Ok(held) => rows
+        Ok(held) => Ok(rows
             .into_iter()
             .filter(|r| !held.contains_key(&r.artifact_id))
-            .collect(),
+            .collect()),
         Err(()) => {
             listing_gate_unavailable(ctx.db, repo_id);
-            Vec::new()
+            Err(mcp_packages::GateUnavailable)
         }
     }
 }
 
 /// How many of a server's newest candidates `latest` evaluates before it
 /// gives up on the server (a server whose newest versions are all held).
-const MAX_LATEST_WALK: usize = 100;
+/// The one bound of every `latest` decision: the detail walk
+/// ([`walk_candidates`]) and the listings' `isLatest` and `version=latest`
+/// ([`newest_servable`]) read the same window, so they always agree.
+pub(crate) const MAX_LATEST_WALK: usize = 100;
 const LATEST_WALK_CHUNK: usize = 10;
 
+/// The candidates `latest` may answer, newest first: the newest
+/// [`MAX_LATEST_WALK`] of [`latest_candidates`].
+pub(crate) fn latest_window(rows: Vec<VersionRow>) -> Vec<VersionRow> {
+    let mut candidates = latest_candidates(rows);
+    candidates.truncate(MAX_LATEST_WALK);
+    candidates
+}
+
 /// A server's newest servable version (by [`fmt::latest_order`], `deleted`
-/// excluded) among `rows` (all of its versions), and how many rows the
-/// reader-only gate evaluated to find it. Rows in `known` are already known
-/// servable (they passed the gate in this request) and are not re-evaluated.
+/// excluded, within [`latest_window`]) among `rows` (all of its versions),
+/// and how many rows the reader-only gate evaluated to find it. Rows in
+/// `known` are already known servable (they passed the gate in this
+/// request) and are not re-evaluated. A gate that cannot be evaluated stops
+/// the walk (`Err`): an older version is never presented as latest because
+/// a newer one could not be decided.
 pub(crate) async fn newest_servable(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
     known: &std::collections::HashSet<Uuid>,
     policy_now: PackagePolicy,
-) -> (Option<VersionRow>, usize) {
-    let candidates = latest_candidates(rows);
+) -> (
+    Result<Option<VersionRow>, mcp_packages::GateUnavailable>,
+    usize,
+) {
+    let candidates = latest_window(rows);
     let mut evaluated = 0;
-    for chunk in candidates
-        .chunks(LATEST_WALK_CHUNK)
-        .take(MAX_LATEST_WALK / LATEST_WALK_CHUNK)
-    {
+    for chunk in candidates.chunks(LATEST_WALK_CHUNK) {
         let unknown: Vec<VersionRow> = chunk
             .iter()
             .filter(|r| !known.contains(&r.artifact_id))
             .cloned()
             .collect();
         evaluated += unknown.len();
-        let ok: std::collections::HashSet<Uuid> = servable(ctx, repo_id, unknown, policy_now)
-            .await
-            .into_iter()
-            .map(|r| r.artifact_id)
-            .collect();
+        let ok: std::collections::HashSet<Uuid> =
+            match servable_checked(ctx, repo_id, unknown, policy_now).await {
+                Ok(rows) => rows.into_iter().map(|r| r.artifact_id).collect(),
+                Err(e) => return (Err(e), evaluated),
+            };
         if let Some(row) = chunk
             .iter()
             .find(|r| known.contains(&r.artifact_id) || ok.contains(&r.artifact_id))
         {
-            return (Some(row.clone()), evaluated);
+            return (Ok(Some(row.clone())), evaluated);
         }
     }
-    (None, evaluated)
+    (Ok(None), evaluated)
 }
 
 /// The artifact ids among `rows` (servable rows of one response) that are
@@ -1250,7 +1284,7 @@ async fn latest_ids(
     let mut out = std::collections::HashSet::new();
     for name in names {
         let all = versions_of(ctx.db, repo_id, name).await?;
-        if let (Some(row), _) = newest_servable(ctx, repo_id, all, &known, policy_now).await {
+        if let (Ok(Some(row)), _) = newest_servable(ctx, repo_id, all, &known, policy_now).await {
             out.insert(row.artifact_id);
         }
     }
@@ -1291,7 +1325,11 @@ async fn list_servers(
         .await;
     }
     reject_if_not_hosted_read(&repo)?;
-    let q = parse_list_query(&query).map_err(mcp_error)?;
+    let seal = cursor_seal(&state);
+    let q = parse_list_query(&query, |c| {
+        seal.decode_position(repo.id, fmt::cursor_kind::SERVERS, c)
+    })
+    .map_err(mcp_error)?;
     let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(&state, false);
     let (entries, next) = if q.version.as_deref() == Some("latest") {
@@ -1299,6 +1337,7 @@ async fn list_servers(
     } else {
         list_versions_page(ctx, &repo, &q, policy_now, base.as_str()).await?
     };
+    let next = next.map(|(n, v)| seal.encode_position(repo.id, fmt::cursor_kind::SERVERS, &n, &v));
     Ok(json_listing(&fmt::list_envelope(entries, next)))
 }
 
@@ -1307,13 +1346,23 @@ async fn list_servers(
 /// full scan. A scan the bound stops still answers a resume cursor.
 pub(crate) const MAX_LISTING_ROWS: usize = 1000;
 
+/// The seal of this instance's listing cursors (see [`fmt::CursorSeal`]),
+/// keyed from the `jwt_secret` every replica shares.
+pub(crate) fn cursor_seal(state: &crate::api::AppState) -> fmt::CursorSeal {
+    fmt::CursorSeal::from_secret(&state.config.jwt_secret)
+}
+
+/// A listing page and the keyset position the next page resumes after
+/// (sealed by the caller).
+type PageOut = (Vec<serde_json::Value>, Option<(String, String)>);
+
 async fn list_versions_page(
     ctx: GateCtx<'_>,
     repo: &RepoInfo,
     q: &ListQuery,
     policy_now: PackagePolicy,
     base: &str,
-) -> Result<(Vec<serde_json::Value>, Option<String>), Response> {
+) -> Result<PageOut, Response> {
     let want = q.limit as usize;
     let mut out: Vec<VersionRow> = Vec::new();
     let mut after = q.cursor.clone();
@@ -1332,11 +1381,12 @@ async fn list_versions_page(
     };
     let next = if out.len() > want {
         let last = &out[want - 1];
-        Some(fmt::encode_cursor(&last.name, &last.version))
+        Some((last.name.clone(), last.version.clone()))
     } else if !exhausted {
         // The row bound stopped the scan (almost every row held): resume
         // after the last row read instead of presenting a short last page.
-        after.as_ref().map(|(n, v)| fmt::encode_cursor(n, v))
+        // That row may be held; the sealed cursor does not reveal it.
+        after
     } else {
         None
     };
@@ -1388,7 +1438,7 @@ async fn list_latest(
     q: &ListQuery,
     policy_now: PackagePolicy,
     base: &str,
-) -> Result<(Vec<serde_json::Value>, Option<String>), Response> {
+) -> Result<PageOut, Response> {
     let want = q.limit as usize;
     let mut out: Vec<VersionRow> = Vec::new();
     let mut name_after = q.cursor.as_ref().map(|(name, _)| name.clone());
@@ -1414,7 +1464,8 @@ async fn list_latest(
             let all = versions_of(ctx.db, repo.id, &name).await?;
             let (picked, evaluated) = newest_servable(ctx, repo.id, all, &none, policy_now).await;
             budget = budget.saturating_sub(evaluated.max(1));
-            if let Some(row) = picked.filter(|r| {
+            // An unevaluable gate omits the server (never an older version).
+            if let Some(row) = picked.ok().flatten().filter(|r| {
                 q.updated_since
                     .is_none_or(|since| r.stored.registry.updated_at >= since)
             }) {
@@ -1428,7 +1479,7 @@ async fn list_latest(
         name_after = last_done.clone();
     }
     let next = if more {
-        last_done.as_deref().map(|n| fmt::encode_cursor(n, "-"))
+        last_done.map(|n| (n, "-".to_string()))
     } else {
         None
     };
@@ -1495,14 +1546,27 @@ async fn list_versions_impl(
             .await;
     }
     reject_if_not_hosted_read(&repo)?;
-    let served = servable_versions(state, &repo, name, include_deleted).await?;
+    // An unevaluable gate omits every version (the listing contract).
+    let served = servable_versions(state, &repo, name, include_deleted)
+        .await?
+        .unwrap_or_default();
     if served.is_empty() {
         return Err(not_found());
     }
-    // Every servable version is in hand: the newest of them is the latest.
-    let latest = latest_candidates(served.clone())
-        .first()
-        .map(|r| r.artifact_id);
+    // `isLatest` is what `latest` answers: the newest servable version
+    // within the `latest` window (rows already gated here are not gated
+    // again).
+    let latest = {
+        let known = served.iter().map(|r| r.artifact_id).collect();
+        let all = versions_of(&state.db, repo.id, name).await?;
+        let policy_now = current_policy(&state.db, repo.id).await;
+        newest_servable(GateCtx::of(state, false), repo.id, all, &known, policy_now)
+            .await
+            .0
+            .ok()
+            .flatten()
+            .map(|r| r.artifact_id)
+    };
     let entries = served
         .iter()
         .map(|r| served_entry(r, &repo, base, Some(r.artifact_id) == latest))
@@ -1513,12 +1577,13 @@ async fn list_versions_impl(
 /// Every servable version of `name` in `repo` (the reader-only listing
 /// gate), in version-text order: the per-repository core of
 /// `GET /servers/{name}/versions`, shared with the Virtual read path.
+/// `Ok(Err(_))`: a gate could not be evaluated.
 pub(crate) async fn servable_versions(
     state: &SharedState,
     repo: &RepoInfo,
     name: &str,
     include_deleted: bool,
-) -> Result<Vec<VersionRow>, Response> {
+) -> Result<Result<Vec<VersionRow>, mcp_packages::GateUnavailable>, Response> {
     let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(state, false);
     let mut rows: Vec<VersionRow> = versions_of(&state.db, repo.id, name)
@@ -1538,7 +1603,7 @@ pub(crate) async fn servable_versions(
         rows.truncate(MAX_LISTING_ROWS);
         rows.sort_by(|a, b| a.version.cmp(&b.version));
     }
-    Ok(servable(ctx, repo.id, rows, policy_now).await)
+    Ok(servable_checked(ctx, repo.id, rows, policy_now).await)
 }
 
 async fn get_version_encoded(
@@ -1669,7 +1734,7 @@ pub(crate) enum CandidateWalk {
 }
 
 /// The per-repository detail decision: evaluate the candidates of
-/// `name`@`version` (`latest`: every non-deleted version, newest first) in
+/// `name`@`version` (`latest`: the [`latest_window`], newest first) in
 /// `repo` with [`decide_row`] until one is servable. An unevaluable gate on a
 /// newer candidate fails closed (503), never falling back past a version that
 /// may be servable. Shared by the hosted, Remote and Virtual read paths, so a
@@ -1687,7 +1752,7 @@ pub(crate) async fn walk_candidates(
 ) -> Result<CandidateWalk, Response> {
     let rows = versions_of(&state.db, repo.id, name).await?;
     let candidates: Vec<VersionRow> = if version == "latest" {
-        latest_candidates(rows.clone())
+        latest_window(rows.clone())
     } else {
         rows.iter()
             .filter(|r| r.version == version)
@@ -1757,6 +1822,8 @@ pub(crate) async fn is_newest_servable(
     newest_servable(listing, repo.id, all, &known, policy_now)
         .await
         .0
+        .ok()
+        .flatten()
         .is_some_and(|l| l.artifact_id == row.artifact_id)
 }
 
@@ -2350,6 +2417,8 @@ pub(super) async fn row_is_latest(
     newest_servable(ctx, repo.id, all, &Default::default(), policy_now)
         .await
         .0
+        .ok()
+        .flatten()
         .is_some_and(|l| l.artifact_id == row.artifact_id)
 }
 
@@ -2574,6 +2643,8 @@ async fn update_status_impl(
     )
     .await
     .0
+    .ok()
+    .flatten()
     .map(|r| r.artifact_id);
     let mut entries = Vec::new();
     for id in &changed {
@@ -2671,49 +2742,54 @@ mod tests {
             .collect()
     }
 
+    fn test_seal() -> fmt::CursorSeal {
+        fmt::CursorSeal::from_secret("mcp-handler-tests-secret-0123456789abcdef")
+    }
+
+    fn parse(q: &HashMap<String, String>) -> Result<ListQuery, McpError> {
+        parse_list_query(q, |c| {
+            test_seal().decode_position(Uuid::nil(), fmt::cursor_kind::SERVERS, c)
+        })
+    }
+
     #[test]
     fn list_query_rules() {
-        assert_eq!(parse_list_query(&q(&[])).unwrap().limit, fmt::DEFAULT_LIMIT);
+        assert_eq!(parse(&q(&[])).unwrap().limit, fmt::DEFAULT_LIMIT);
         assert_eq!(
-            parse_list_query(&q(&[("limit", "500")])).unwrap().limit,
+            parse(&q(&[("limit", "500")])).unwrap().limit,
             fmt::MAX_LIMIT
         );
-        assert_eq!(parse_list_query(&q(&[("limit", "7")])).unwrap().limit, 7);
+        assert_eq!(parse(&q(&[("limit", "7")])).unwrap().limit, 7);
         for bad in ["0", "-1", "x", "1.5"] {
             assert_eq!(
-                parse_list_query(&q(&[("limit", bad)]))
-                    .unwrap_err()
-                    .status(),
+                parse(&q(&[("limit", bad)])).unwrap_err().status(),
                 400,
                 "{bad}"
             );
         }
-        assert_eq!(
-            parse_list_query(&q(&[("cursor", "!!")]))
-                .unwrap_err()
-                .status(),
-            400
+        assert_eq!(parse(&q(&[("cursor", "!!")])).unwrap_err().status(), 400);
+        let c = test_seal().encode_position(
+            Uuid::nil(),
+            fmt::cursor_kind::SERVERS,
+            "com.acme/a",
+            "1.0.0",
         );
-        let c = fmt::encode_cursor("com.acme/a", "1.0.0");
         assert_eq!(
-            parse_list_query(&q(&[("cursor", &c)])).unwrap().cursor,
+            parse(&q(&[("cursor", &c)])).unwrap().cursor,
             Some(("com.acme/a".into(), "1.0.0".into()))
         );
         assert_eq!(
-            parse_list_query(&q(&[("search", "ab")])).unwrap_err(),
+            parse(&q(&[("search", "ab")])).unwrap_err(),
             McpError::SearchTooShort
         );
         assert_eq!(
-            parse_list_query(&q(&[("search", "abc")]))
-                .unwrap()
-                .search
-                .as_deref(),
+            parse(&q(&[("search", "abc")])).unwrap().search.as_deref(),
             Some("abc")
         );
-        let since = parse_list_query(&q(&[("updated_since", "2026-01-01T00:00:00Z")])).unwrap();
+        let since = parse(&q(&[("updated_since", "2026-01-01T00:00:00Z")])).unwrap();
         assert!(since.include_deleted && since.updated_since.is_some());
         assert_eq!(
-            parse_list_query(&q(&[
+            parse(&q(&[
                 ("updated_since", "2026-01-01T00:00:00Z"),
                 ("include_deleted", "false")
             ]))
@@ -2722,7 +2798,7 @@ mod tests {
             400
         );
         assert_eq!(
-            parse_list_query(&q(&[("updated_since", "yesterday")]))
+            parse(&q(&[("updated_since", "yesterday")]))
                 .unwrap_err()
                 .status(),
             400
@@ -2736,24 +2812,24 @@ mod tests {
             &[("search", long.as_str())],
         ] {
             assert_eq!(
-                parse_list_query(&q(bad)).unwrap_err().code(),
+                parse(&q(bad)).unwrap_err().code(),
                 "mcp_invalid_query",
                 "{bad:?}"
             );
         }
         assert_eq!(
-            parse_list_query(&q(&[("include_deleted", "maybe")]))
+            parse(&q(&[("include_deleted", "maybe")]))
                 .unwrap_err()
                 .status(),
             400
         );
         assert!(
-            parse_list_query(&q(&[("include_deleted", "true")]))
+            parse(&q(&[("include_deleted", "true")]))
                 .unwrap()
                 .include_deleted
         );
         assert_eq!(
-            parse_list_query(&q(&[("version", "latest")]))
+            parse(&q(&[("version", "latest")]))
                 .unwrap()
                 .version
                 .as_deref(),
@@ -6263,5 +6339,146 @@ mod tests {
         env.teardown().await;
         assert_eq!(reader, (true, false), "a reader: served yes, held no");
         assert_eq!(holder, (true, true), "a holder sees both");
+    }
+
+    fn listed_names(b: &serde_json::Value) -> Vec<String> {
+        b["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}@{}",
+                    e["server"]["name"].as_str().unwrap(),
+                    e["server"]["version"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    /// Finding 4: a listing cursor is sealed. It names no row a client can
+    /// read (the row may be held), a cursor built by hand is the
+    /// `400 invalid cursor`, and a cursor of one repository is refused by
+    /// another.
+    #[tokio::test]
+    async fn listing_cursors_are_sealed_to_their_repository() {
+        use base64::Engine as _;
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        for name in ["com.acme/a", "com.acme/b", "com.acme/c"] {
+            assert_eq!(
+                env.publish(&doc(name, "1.0.0", serde_json::json!({})))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+        }
+        let held = env.server_artifact("com.acme/b", "1.0.0").await;
+        env.hold(held, Some("quarantined")).await;
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let unseal = |c: &str| {
+            String::from_utf8_lossy(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(c)
+                    .unwrap(),
+            )
+            .into_owned()
+        };
+        for (first, rest) in [
+            ("/servers?limit=1", "/servers?limit=1&cursor="),
+            (
+                "/servers?version=latest&limit=1",
+                "/servers?version=latest&limit=1&cursor=",
+            ),
+        ] {
+            let (s, b, _) = env.get(env.member(), first).await;
+            let b = json(&b);
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(listed_names(&b), vec!["com.acme/a@1.0.0"]);
+            let c = b["metadata"]["nextCursor"].as_str().unwrap().to_string();
+            assert!(!unseal(&c).contains("com.acme"), "{first}: {c}");
+            let (s, b, _) = env.get(env.member(), &format!("{rest}{c}")).await;
+            let b = json(&b);
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(listed_names(&b), vec!["com.acme/c@1.0.0"], "{first}");
+            // The position a client would make up to resume after (or probe
+            // for) a row of its choosing.
+            for forged in [b64("com.acme/a:1.0.0"), b64("com.acme/b:-")] {
+                let (s, b, _) = env.get(env.member(), &format!("{rest}{forged}")).await;
+                assert_eq!(
+                    (s, json(&b)["error"].as_str()),
+                    (StatusCode::BAD_REQUEST, Some("mcp_invalid_query")),
+                    "{first}: {forged}"
+                );
+            }
+            let other = env.repo("local", "mcp").await;
+            let (s, _, _) = call(
+                env.member(),
+                "GET",
+                &format!("/{}/v0.1/servers?cursor={c}", other.key),
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{first}: replayed elsewhere");
+        }
+        env.teardown().await;
+    }
+
+    /// Finding 13: `latest` reads the same window on every surface. With the
+    /// newest `MAX_LATEST_WALK` versions held, the oldest (servable) version
+    /// is not `latest` for the detail read, `isLatest` or `version=latest`.
+    #[tokio::test]
+    async fn latest_window_is_the_same_on_every_surface() {
+        let Some(env) = Env::new().await else { return };
+        for i in 0..=MAX_LATEST_WALK {
+            let (s, b) = env
+                .publish(&doc(
+                    "com.acme/many",
+                    &format!("1.0.{i}"),
+                    serde_json::json!({}),
+                ))
+                .await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_source = 'admin', \
+             quarantine_until = NULL WHERE repository_id = $1 AND name = 'com.acme/many' \
+             AND version <> '1.0.0'",
+        )
+        .bind(env.fx.repo_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let (s, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fmany/versions/latest")
+            .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{}", json(&b));
+        let (s, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fmany/versions/1.0.0")
+            .await;
+        let b = json(&b);
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"], false);
+        let (s, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fmany/versions")
+            .await;
+        let b = json(&b);
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(listed_names(&b), vec!["com.acme/many@1.0.0"]);
+        assert_eq!(
+            b["servers"][0]["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"],
+            false
+        );
+        let (_, b, _) = env.get(env.member(), "/servers").await;
+        let b = json(&b);
+        assert_eq!(listed_names(&b), vec!["com.acme/many@1.0.0"]);
+        assert_eq!(
+            b["servers"][0]["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"],
+            false
+        );
+        let (_, b, _) = env.get(env.member(), "/servers?version=latest").await;
+        assert!(listed_names(&json(&b)).is_empty(), "{}", json(&b));
+        env.teardown().await;
     }
 }
