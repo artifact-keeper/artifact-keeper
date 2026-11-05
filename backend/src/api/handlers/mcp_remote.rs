@@ -1825,8 +1825,8 @@ mod tests {
                 .fetch_one(&self.fx.pool)
                 .await
                 .unwrap();
-            let Json(repo) = match created {
-                Ok(r) => r,
+            let repo = match created {
+                Ok(r) => r.0,
                 Err(e) => {
                     assert_eq!(n, 0, "a refused create left a repository behind");
                     return Err(e);
