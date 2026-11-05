@@ -375,7 +375,7 @@ fn sumdb_tile_width(tile: &str) -> Option<Option<usize>> {
         _ => (index.to_vec(), full),
     };
     let (last, parents) = index.split_last()?;
-    let well_formed = digits(*last)
+    let well_formed = digits(last)
         && parents
             .iter()
             .all(|s| s.strip_prefix('x').is_some_and(digits));
@@ -4795,7 +4795,8 @@ mod duplicate_entry_tests {
 /// database (standing in for `https://sum.golang.org`) and counts the
 /// requests it receives. The Remote's mutable-path TTL is `0` throughout, so
 /// a path cached as mutable is revalidated on every request: a path that is
-/// requested twice but reaches the mock once is immutable.
+/// requested twice but reaches the mock once is immutable. "Down" is a
+/// sumdb answering `503` to everything (`take_down`).
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod sumdb_cache_5344_tests {
@@ -4843,6 +4844,18 @@ mod sumdb_cache_5344_tests {
         mount(server, PARTIAL_TILE, hash_tile(5)).await;
         mount(server, LOOKUP, LOOKUP_BODY.as_bytes().to_vec()).await;
         mount(server, LATEST, latest_body(latest_size).into_bytes()).await;
+    }
+
+    /// Take the checksum database down: from now on it answers every request
+    /// with `503`, and its request log starts empty. (Dropping a wiremock
+    /// server does not do this: the server goes back to a shared pool and
+    /// keeps listening.)
+    async fn take_down(server: &MockServer) {
+        server.reset().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(server)
+            .await;
     }
 
     /// Requests `server` has received for `path`.
@@ -4928,9 +4941,9 @@ mod sumdb_cache_5344_tests {
             );
         }
 
-        // The checksum database goes away: a second `go mod download` of the
-        // seeded module still verifies.
-        drop(server);
+        // The checksum database goes down: a second `go mod download` of the
+        // seeded module still verifies, without contacting it.
+        take_down(&server).await;
         for (path, body) in &expected {
             let (status, served, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, path).await;
             assert_eq!(status, StatusCode::OK, "{path} offline");
@@ -4939,6 +4952,7 @@ mod sumdb_cache_5344_tests {
                 headers.get(axum::http::header::WARNING).is_none(),
                 "{path}: an immutable entry is fresh, not served stale"
             );
+            assert_eq!(hits(&server, path).await, 0, "{path}: no upstream contact");
         }
         fx.teardown().await;
     }
@@ -4972,9 +4986,14 @@ mod sumdb_cache_5344_tests {
         assert!(headers.get(axum::http::header::WARNING).is_none());
         assert_eq!(hits(&server, LATEST).await, 1);
 
-        // The checksum database goes away: the last tree head is served stale.
-        drop(server);
+        // The checksum database goes down: the last tree head is served stale.
+        take_down(&server).await;
         let (status, served, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, LATEST).await;
+        assert_eq!(
+            hits(&server, LATEST).await,
+            1,
+            "past its TTL it was retried"
+        );
         assert_eq!(status, StatusCode::OK, "stale-if-error");
         assert_eq!(served, latest_body(200).as_bytes());
         assert_eq!(
@@ -5096,14 +5115,16 @@ mod sumdb_cache_5344_tests {
             statuses.push(get_sumdb(&app, &sumdb, &fx.repo_key, TILE).await.0);
         }
         let tile_hits = hits(&server, TILE).await;
-        drop(server);
+        take_down(&server).await;
         let offline = get_sumdb(&app, &sumdb, &fx.repo_key, TILE).await.0;
+        let offline_hits = hits(&server, TILE).await;
 
         tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
         fx.teardown().await;
         assert_eq!(statuses, [StatusCode::OK, StatusCode::OK]);
         assert_eq!(tile_hits, 1, "cached in the Remote member");
         assert_eq!(offline, StatusCode::OK, "served from the member's cache");
+        assert_eq!(offline_hits, 0);
     }
 
     #[test]
