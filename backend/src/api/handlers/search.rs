@@ -175,6 +175,7 @@ const OPENSEARCH_QUICK_SEARCH_TIMEOUT: Duration = Duration::from_secs(3);
 async fn retain_live_visible_hits(
     db: &PgPool,
     scope: &AccessScope,
+    hidden: Option<&[Uuid]>,
     hits: Vec<ArtifactDocument>,
 ) -> Result<Vec<SearchResultItem>> {
     if hits.is_empty() {
@@ -198,10 +199,12 @@ async fn retain_live_visible_hits(
           AND a.is_deleted = false
           AND r.key NOT LIKE '~deleting~%'
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
+          AND ($3::uuid[] IS NULL OR a.id <> ALL($3))
         "#,
     )
     .bind(&ids)
     .bind(scope.as_allowed_repo_ids())
+    .bind(hidden)
     .fetch_all(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
@@ -219,6 +222,52 @@ async fn retain_live_visible_hits(
             Some(build_search_result_item_from_doc(d, status, until))
         })
         .collect())
+}
+
+/// The artifacts in `scope` (`None`: every repository) that search must not
+/// show `auth` (#5253): the stored documents and bundles of MCP server
+/// versions the caller is not served, in every MCP registry in scope it
+/// does not hold. The same listing decision as the generic artifact listing
+/// ([`super::mcp::GenericArtifactGate::visible_listed`]), so search items,
+/// totals, facets, suggestions, trending and recent all leave them out.
+/// `None` when nothing is hidden (no MCP registry in scope, or the caller
+/// holds every one).
+pub(crate) async fn mcp_hidden_artifacts(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    scope: Option<&[Uuid]>,
+) -> Result<Option<Vec<Uuid>>> {
+    let repos: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM repositories WHERE format = 'mcp' \
+         AND ($1::uuid[] IS NULL OR id = ANY($1))",
+    )
+    .bind(scope)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    if repos.is_empty() {
+        return Ok(None);
+    }
+    let mut gate = super::mcp::GenericArtifactGate::new(state, auth);
+    let mut hidden = Vec::new();
+    for repo_id in repos {
+        if gate.holds_all(&[repo_id]).await {
+            continue;
+        }
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, path FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        for (id, path) in rows {
+            if !gate.visible_listed(repo_id, &path).await {
+                hidden.push(id);
+            }
+        }
+    }
+    Ok((!hidden.is_empty()).then_some(hidden))
 }
 
 /// `quarantine_status` / `quarantine_until` are the raw `artifacts` columns,
@@ -564,6 +613,7 @@ pub async fn quick_search(
     }
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     // Prefer OpenSearch when configured: it gives typo tolerance and relevance
     // ranking the PostgreSQL tsquery path cannot (#3670). The caller's scope is
@@ -590,7 +640,9 @@ pub async fn quick_search(
                 // database failure, not a search-cluster failure, so it
                 // propagates rather than falling back — the PostgreSQL path
                 // would fail the same way.
-                let results = retain_live_visible_hits(&state.db, &scope, found.hits).await?;
+                let results =
+                    retain_live_visible_hits(&state.db, &scope, hidden.as_deref(), found.hits)
+                        .await?;
                 return Ok(Json(QuickSearchResponse { results }));
             }
             Ok(Err(e)) => {
@@ -620,6 +672,7 @@ pub async fn quick_search(
         limit: Some(limit),
         public_only: false,
         accessible_repo_ids,
+        hidden_artifact_ids: hidden,
         sort_by: None,
         sort_order: None,
     };
@@ -685,6 +738,8 @@ pub async fn advanced_search(
     if matches!(params.per_page, Some(0)) {
         let accessible_repo_ids: Option<Vec<Uuid>> =
             resolve_accessible_repos(&state.db, &auth).await?.into();
+        let hidden =
+            mcp_hidden_artifacts(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
         let count_query = SearchQuery {
             q: params.query.clone(),
             format: params.format.clone(),
@@ -693,6 +748,7 @@ pub async fn advanced_search(
             limit: Some(1),
             public_only: false,
             accessible_repo_ids: accessible_repo_ids.clone(),
+            hidden_artifact_ids: hidden,
             sort_by: None,
             sort_order: None,
         };
@@ -718,6 +774,8 @@ pub async fn advanced_search(
 
     let accessible_repo_ids: Option<Vec<Uuid>> =
         resolve_accessible_repos(&state.db, &auth).await?.into();
+    let hidden =
+        mcp_hidden_artifacts(&state, auth.as_ref(), accessible_repo_ids.as_deref()).await?;
 
     let search_query = SearchQuery {
         q: params.query.clone(),
@@ -727,6 +785,7 @@ pub async fn advanced_search(
         limit: Some(per_page as i64),
         public_only: false,
         accessible_repo_ids,
+        hidden_artifact_ids: hidden,
         sort_by: params.sort_by.clone(),
         sort_order: params.sort_order.clone(),
     };
@@ -840,14 +899,22 @@ pub async fn checksum_search(
           AND r.key NOT LIKE '~deleting~%'
           AND {col} = $1
           AND ($2::uuid[] IS NULL OR r.id = ANY($2))
+          AND ($3::uuid[] IS NULL OR a.id <> ALL($3))
         ORDER BY a.created_at DESC
         "#,
         col = checksum_column,
     );
+    let hidden = mcp_hidden_artifacts(
+        &state,
+        auth.as_ref(),
+        accessible_repo_ids.as_allowed_repo_ids(),
+    )
+    .await?;
 
     let rows: Vec<ChecksumRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
         .bind(&checksum)
         .bind(accessible_repo_ids.as_allowed_repo_ids())
+        .bind(hidden.as_deref())
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -928,10 +995,17 @@ pub async fn suggest(
     let limit = clamp_positive_limit(params.limit, 10, 1, 50);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let suggestions = service
-        .suggest(&params.prefix, limit, scope.as_allowed_repo_ids(), false)
+        .suggest(
+            &params.prefix,
+            limit,
+            scope.as_allowed_repo_ids(),
+            false,
+            hidden.as_deref(),
+        )
         .await?;
 
     Ok(Json(SuggestResponse { suggestions }))
@@ -969,10 +1043,17 @@ pub async fn trending(
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .trending(days, limit, false, scope.as_allowed_repo_ids())
+        .trending(
+            days,
+            limit,
+            false,
+            scope.as_allowed_repo_ids(),
+            hidden.as_deref(),
+        )
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
@@ -1012,10 +1093,11 @@ pub async fn recent(
     let limit = clamp_positive_limit(params.limit, 20, 1, 100);
 
     let scope = resolve_accessible_repos(&state.db, &auth).await?;
+    let hidden = mcp_hidden_artifacts(&state, auth.as_ref(), scope.as_allowed_repo_ids()).await?;
 
     let service = SearchService::new(state.db.clone());
     let results = service
-        .recent(limit, false, scope.as_allowed_repo_ids())
+        .recent(limit, false, scope.as_allowed_repo_ids(), hidden.as_deref())
         .await?;
 
     let items = results.into_iter().map(build_search_result_item).collect();
