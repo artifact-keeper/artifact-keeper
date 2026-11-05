@@ -235,14 +235,18 @@ async fn handle_get(
         GoProxyRequest::Latest { module } => {
             latest_version(&state, auth.as_ref(), &repo, &module).await
         }
-        GoProxyRequest::SumDb { host, path } => proxy_sumdb(&host, &path).await,
+        GoProxyRequest::SumDb { host, path } => {
+            serve_sumdb(&state, auth.as_ref(), &repo, &host, &path).await
+        }
     }
 }
 
 /// The client-derived segments of a parsed request that a proxying (Remote
 /// or Virtual) repository joins into an upstream path (#4365 item 3), as a
 /// `400` when one is ambiguous. `sumdb/` requests have their own host
-/// allowlist and are not joined onto the repository's upstream.
+/// allowlist and are not joined onto the repository's upstream, but on a
+/// proxying repository their path is joined onto the checksum database's URL
+/// and keys the proxy cache (#5344), so it is held to the same rule.
 #[allow(clippy::result_large_err)]
 fn reject_ambiguous_go_request(repo: &RepoInfo, request: &GoProxyRequest) -> Result<(), Response> {
     let proxied =
@@ -256,12 +260,14 @@ fn reject_ambiguous_go_request(repo: &RepoInfo, request: &GoProxyRequest) -> Res
         | GoProxyRequest::Zip { module, version } => {
             proxy_helpers::reject_ambiguous_client_segments(proxied, &[module, version])
         }
-        GoProxyRequest::SumDb { .. } => Ok(()),
+        GoProxyRequest::SumDb { path, .. } => {
+            proxy_helpers::reject_ambiguous_client_segments(proxied, &[path])
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// GET sumdb/... — Proxy to upstream checksum database
+// GET sumdb/... — the Go checksum database, cached through a Remote (#5344)
 // ---------------------------------------------------------------------------
 
 /// Hostnames the sumdb proxy is permitted to forward to.
@@ -272,6 +278,14 @@ fn reject_ambiguous_go_request(repo: &RepoInfo, request: &GoProxyRequest) -> Res
 /// to make the server fetch cloud metadata. Only well-known Go
 /// checksum-database hosts may be proxied.
 const SUMDB_ALLOWLIST: &[&str] = &["sum.golang.org", "sum.golang.google.cn"];
+
+/// Ceiling on one buffered checksum-database response. A tile is 8 KiB and a
+/// lookup or signed tree head a few hundred bytes; this only bounds a hostile
+/// or broken upstream.
+const SUMDB_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Size of one hash in a tlog hash tile (SHA-256).
+const SUMDB_HASH_SIZE: usize = 32;
 
 /// Returns true iff `host` is a permitted upstream sumdb hostname.
 /// Comparison is case-insensitive per RFC 1035.
@@ -285,12 +299,11 @@ pub fn is_sumdb_host_allowed(host: &str) -> bool {
         .any(|allowed| host.eq_ignore_ascii_case(allowed))
 }
 
-/// Proxy a sumdb request to the upstream checksum database.
-///
-/// The Go toolchain performs go.sum verification by querying
-/// `$GOPROXY/sumdb/sum.golang.org/{path}`. We forward these requests
-/// to `https://{host}/{path}` (defaulting to sum.golang.org).
-async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
+/// What every sumdb request passes before anything is fetched: a host off
+/// the allowlist is a `403`, and the toolchain's `supported` probe is
+/// answered here. `Ok(None)` means the request is to be fetched.
+#[allow(clippy::result_large_err)]
+fn sumdb_preflight(host: &str, path: &str) -> Result<Option<Response>, Response> {
     if !is_sumdb_host_allowed(host) {
         tracing::warn!(
             host = %host,
@@ -310,10 +323,214 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
     // upstream has no such endpoint, so answering it here is what keeps go from
     // falling back to a direct connection to the checksum database.
     if path == "supported" {
-        return Ok((StatusCode::OK, "").into_response());
+        return Ok(Some((StatusCode::OK, "").into_response()));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only stand-in for `https://{host}` (a mock checksum database) for
+    /// requests served inside the scope.
+    static SUMDB_UPSTREAM_BASE_OVERRIDE: String;
+}
+
+/// The upstream URL of a sumdb request, `https://{host}/{path}`.
+fn sumdb_upstream_url(host: &str, path: &str) -> String {
+    #[cfg(test)]
+    if let Ok(base) = SUMDB_UPSTREAM_BASE_OVERRIDE.try_with(|base| base.clone()) {
+        return format!("{}/{path}", base.trim_end_matches('/'));
+    }
+    format!("https://{}/{path}", host.to_ascii_lowercase())
+}
+
+/// The proxy cache path of a sumdb response: the path the client asked for
+/// under the Go repository, `sumdb/{host}/{path}`, with the host lowercased
+/// so every spelling of it shares one entry. `cache_classifier::classify_go`
+/// classifies it: tiles and `lookup/<module>@<version>` are immutable, the
+/// signed tree head `latest` is mutable.
+fn sumdb_cache_path(host: &str, path: &str) -> String {
+    format!("sumdb/{}/{path}", host.to_ascii_lowercase())
+}
+
+/// The width of a tlog tile path `tile/H/L/NNN[.p/W]` (the part after
+/// `tile/`): `Some(Some(w))` for a hash tile of `w` hashes (`2^H` for a full
+/// tile, `W` for a partial one), `Some(None)` for a data tile
+/// (`tile/H/data/...`), `None` when it is not a tile path.
+fn sumdb_tile_width(tile: &str) -> Option<Option<usize>> {
+    let segments: Vec<&str> = tile.split('/').collect();
+    let [height, level, index @ ..] = segments.as_slice() else {
+        return None;
+    };
+    let height: u32 = height.parse().ok().filter(|h| (1..=30).contains(h))?;
+    let full = 1usize << height;
+    let digits = |s: &str| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit());
+    let (index, width) = match index {
+        [rest @ .., last, w] if last.ends_with(".p") => {
+            let w: usize = w.parse().ok().filter(|w| (1..full).contains(w))?;
+            let mut index = rest.to_vec();
+            index.push(last.strip_suffix(".p")?);
+            (index, w)
+        }
+        _ => (index.to_vec(), full),
+    };
+    let (last, parents) = index.split_last()?;
+    let well_formed = digits(last)
+        && parents
+            .iter()
+            .all(|s| s.strip_prefix('x').is_some_and(digits));
+    if !well_formed {
+        return None;
+    }
+    if *level == "data" {
+        return Some(None);
+    }
+    level.parse::<u8>().ok()?;
+    Some(Some(width))
+}
+
+/// Whether `body` can be the checksum-database answer for `path` (relative
+/// to the host). Run before a fetched body is committed to the proxy cache
+/// and on every cache hit (#4829), so an error page an upstream or a
+/// middlebox answered with `200` is served once but never pinned as an
+/// immutable entry. A hash tile must hold exactly its width of hashes and a
+/// lookup must have the `<record id>\n<go.sum lines>\n\n<signed note>` shape;
+/// the toolchain verifies the signatures and hashes itself. A content-coded
+/// body is not inspected and not cached (the shared client asks for
+/// `identity`, and the checksum database honours it).
+fn sumdb_body_is_plausible(path: &str, body: &[u8], coding: Option<&str>) -> bool {
+    if coding.is_some_and(|c| !c.eq_ignore_ascii_case("identity")) {
+        return false;
+    }
+    if let Some(tile) = path.strip_prefix("tile/") {
+        return match sumdb_tile_width(tile) {
+            Some(Some(width)) => body.len() == width * SUMDB_HASH_SIZE,
+            Some(None) => !body.is_empty(),
+            None => false,
+        };
+    }
+    if path.starts_with("lookup/") {
+        return std::str::from_utf8(body)
+            .ok()
+            .and_then(|text| text.split_once('\n'))
+            .is_some_and(|(id, rest)| {
+                !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && rest.contains("\n\n")
+            });
+    }
+    !body.is_empty()
+}
+
+/// [`sumdb_body_is_plausible`] as the proxy cache's body check.
+fn sumdb_cache_check(
+    path: &str,
+) -> impl Fn(Bytes, Option<String>) -> futures::future::BoxFuture<'static, bool> + Send + Sync {
+    let path = path.to_string();
+    move |content, coding| {
+        let plausible = sumdb_body_is_plausible(&path, &content, coding.as_deref());
+        Box::pin(async move { plausible })
+    }
+}
+
+/// Serve `sumdb/{host}/{path}` (#5344).
+///
+/// On a Remote, and on a Virtual through its Remote members (in priority
+/// order, only those the caller may read), the answer goes through the
+/// Remote's proxy cache like any other Go fetch, keyed on
+/// [`sumdb_cache_path`]: tiles and `lookup/<module>@<version>` are immutable
+/// (cached forever, never revalidated), the signed tree head `latest` is
+/// mutable (the Remote's mutable TTL, then revalidated, and served stale
+/// within the stale-if-error grace while the checksum database is down). So
+/// a seeded instance verifies modules with the checksum database out of
+/// reach. The upstream filter and cache-only mode apply as on every Remote
+/// fetch; the filter sees the absolute URL `https://{host}/{path}`, as for
+/// any fetch off the configured upstream (#4399). The Remote's upstream
+/// credentials are never sent: they follow only its configured upstream.
+///
+/// A Hosted repository, or a Virtual without a Remote member, has no proxy
+/// cache to use and keeps the uncached pass-through ([`proxy_sumdb`]).
+async fn serve_sumdb(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &RepoInfo,
+    host: &str,
+    path: &str,
+) -> Result<Response, Response> {
+    if let Some(answered) = sumdb_preflight(host, path)? {
+        return Ok(answered);
+    }
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return proxy_sumdb(host, path).await;
+    };
+    let remotes: Vec<(uuid::Uuid, String, String)> = if repo.repo_type == RepositoryType::Remote {
+        repo.upstream_url
+            .iter()
+            .map(|upstream| (repo.id, repo.key.clone(), upstream.clone()))
+            .collect()
+    } else if repo.repo_type == RepositoryType::Virtual {
+        proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id)
+            .await?
+            .into_iter()
+            .filter(|member| member.repo_type == RepositoryType::Remote)
+            .filter_map(|member| Some((member.id, member.key, member.upstream_url?)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if remotes.is_empty() {
+        return proxy_sumdb(host, path).await;
     }
 
-    let url = format!("https://{}/{}", host, path);
+    let fetch_url = sumdb_upstream_url(host, path);
+    let cache_path = sumdb_cache_path(host, path);
+    let check = sumdb_cache_check(path);
+    let mut last_error = None;
+    for (id, key, upstream_url) in &remotes {
+        match proxy_helpers::proxy_fetch_capped_with_cache_key_encoded_format(
+            proxy,
+            *id,
+            key,
+            upstream_url,
+            &fetch_url,
+            &cache_path,
+            SUMDB_MAX_BYTES,
+            RepositoryFormat::Go,
+            &check,
+        )
+        .await
+        {
+            Ok(proxy_helpers::CachedBody {
+                content,
+                content_type,
+                content_encoding,
+                stale_since,
+            }) => {
+                return Ok(proxy_helpers::forward_verbatim_metadata(
+                    content,
+                    content_type,
+                    "application/octet-stream",
+                    content_encoding,
+                    stale_since,
+                ));
+            }
+            Err(response) => last_error = Some(response),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response()))
+}
+
+/// Uncached pass-through of a sumdb request to the upstream checksum
+/// database, for a repository with no Remote to cache through (see
+/// [`serve_sumdb`]).
+///
+/// The Go toolchain performs go.sum verification by querying
+/// `$GOPROXY/sumdb/sum.golang.org/{path}`. We forward these requests
+/// to `https://{host}/{path}`.
+async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
+    if let Some(answered) = sumdb_preflight(host, path)? {
+        return Ok(answered);
+    }
+
+    let url = sumdb_upstream_url(host, path);
 
     tracing::debug!("Proxying sumdb request to {}", url);
 
@@ -334,7 +551,7 @@ async fn proxy_sumdb(host: &str, path: &str) -> Result<Response, Response> {
     // STREAMING-EXEMPT: capped metadata read (upstream sumdb checksum-database response, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap -> 502; tracked under #1608
     let body = axum::body::to_bytes(
         Body::from_stream(upstream_resp.bytes_stream()),
-        16 * 1024 * 1024,
+        SUMDB_MAX_BYTES,
     )
     .await
     .map_err(|e| {
@@ -4570,5 +4787,411 @@ mod duplicate_entry_tests {
             check(&single).1,
             ProxyScanIdentity::Established(_)
         ));
+    }
+}
+
+/// #5344: the checksum database is cached through the Go Remote's proxy
+/// cache. Each test drives the goproxy router against a mock checksum
+/// database (standing in for `https://sum.golang.org`) and counts the
+/// requests it receives. The Remote's mutable-path TTL is `0` throughout, so
+/// a path cached as mutable is revalidated on every request: a path that is
+/// requested twice but reaches the mock once is immutable.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod sumdb_cache_5344_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TILE: &str = "tile/8/0/000";
+    const PARTIAL_TILE: &str = "tile/8/1/x001/234.p/5";
+    const LOOKUP: &str = "lookup/golang.org/x/text@v0.14.0";
+    const LATEST: &str = "latest";
+    const LOOKUP_BODY: &str = "12345\n\
+        golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=\n\
+        golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=\n\
+        \n\
+        go.sum database tree\n\
+        23000000\n\
+        AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\
+        \n\
+        \u{2014} sum.golang.org Az3grlmtEb1n\n";
+
+    fn latest_body(size: u64) -> String {
+        format!(
+            "go.sum database tree\n{size}\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\
+             \u{2014} sum.golang.org Az3grlmtEb1n\n"
+        )
+    }
+
+    fn hash_tile(width: usize) -> Vec<u8> {
+        vec![0x5a; width * SUMDB_HASH_SIZE]
+    }
+
+    async fn mount(server: &MockServer, path: &str, body: Vec<u8>) {
+        Mock::given(wm_method("GET"))
+            .and(wm_path(format!("/{path}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+    }
+
+    /// The tiles, the lookup and the tree head, mounted on `server`.
+    async fn mount_sumdb(server: &MockServer, latest_size: u64) {
+        mount(server, TILE, hash_tile(256)).await;
+        mount(server, PARTIAL_TILE, hash_tile(5)).await;
+        mount(server, LOOKUP, LOOKUP_BODY.as_bytes().to_vec()).await;
+        mount(server, LATEST, latest_body(latest_size).into_bytes()).await;
+    }
+
+    /// Requests `server` has received for `path`.
+    async fn hits(server: &MockServer, path: &str) -> usize {
+        let want = format!("/{path}");
+        server
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .iter()
+            .filter(|r| r.url.path() == want)
+            .count()
+    }
+
+    /// GET `sumdb/sum.golang.org/{path}` on `repo_key` with the checksum
+    /// database at `sumdb`.
+    async fn get_sumdb(
+        app: &Router,
+        sumdb: &str,
+        repo_key: &str,
+        path: &str,
+    ) -> (StatusCode, Bytes, HeaderMap) {
+        SUMDB_UPSTREAM_BASE_OVERRIDE
+            .scope(
+                sumdb.to_string(),
+                tdh::send_with_headers(
+                    app.clone(),
+                    tdh::get(format!("/{repo_key}/sumdb/sum.golang.org/{path}")),
+                ),
+            )
+            .await
+    }
+
+    /// Make every mutable path of `repo_id` expire the moment it is cached.
+    async fn expire_mutable_paths_at_once(pool: &PgPool, repo_id: uuid::Uuid) {
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '0')",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cache_ttl_secs");
+    }
+
+    /// A Go Remote whose configured upstream is a module proxy that is never
+    /// contacted, wired with a real proxy cache, with mutable paths expiring
+    /// at once.
+    async fn go_remote() -> Option<(tdh::Fixture, SharedState, tempfile::TempDir, Router)> {
+        let fx = tdh::Fixture::setup("remote", "go").await?;
+        expire_mutable_paths_at_once(&fx.pool, fx.repo_id).await;
+        let (state, cache) = tdh::rewire_remote_proxy(&fx, "https://goproxy.example.test").await;
+        let app = tdh::router_anon(super::router(), state.clone());
+        Some((fx, state, cache, app))
+    }
+
+    #[tokio::test]
+    async fn sumdb_tiles_and_lookup_are_served_from_cache_with_the_sumdb_unreachable() {
+        let Some((fx, _state, _cache, app)) = go_remote().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_sumdb(&server, 100).await;
+        let sumdb = server.uri();
+        let expected: [(&str, Vec<u8>); 3] = [
+            (TILE, hash_tile(256)),
+            (PARTIAL_TILE, hash_tile(5)),
+            (LOOKUP, LOOKUP_BODY.as_bytes().to_vec()),
+        ];
+
+        for (path, body) in &expected {
+            for _ in 0..2 {
+                let (status, served, _) = get_sumdb(&app, &sumdb, &fx.repo_key, path).await;
+                assert_eq!(status, StatusCode::OK, "{path}");
+                assert_eq!(&served[..], &body[..], "{path}");
+            }
+        }
+        for (path, _) in &expected {
+            assert_eq!(
+                hits(&server, path).await,
+                1,
+                "{path} is immutable: cached once, never revalidated"
+            );
+        }
+
+        // The checksum database goes away: a second `go mod download` of the
+        // seeded module still verifies.
+        drop(server);
+        for (path, body) in &expected {
+            let (status, served, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path} offline");
+            assert_eq!(&served[..], &body[..], "{path} offline");
+            assert!(
+                headers.get(axum::http::header::WARNING).is_none(),
+                "{path}: an immutable entry is fresh, not served stale"
+            );
+        }
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn sumdb_latest_revalidates_after_its_ttl_and_is_served_stale_when_down() {
+        let Some((fx, _state, _cache, app)) = go_remote().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_sumdb(&server, 100).await;
+        let sumdb = server.uri();
+
+        for _ in 0..2 {
+            let (status, served, _) = get_sumdb(&app, &sumdb, &fx.repo_key, LATEST).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(served, latest_body(100).as_bytes());
+        }
+        assert_eq!(
+            hits(&server, LATEST).await,
+            2,
+            "`latest` is mutable: past its TTL it is fetched again"
+        );
+
+        // The tree grows upstream; the next request past the TTL sees it.
+        server.reset().await;
+        mount_sumdb(&server, 200).await;
+        let (status, served, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, LATEST).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(served, latest_body(200).as_bytes());
+        assert!(headers.get(axum::http::header::WARNING).is_none());
+        assert_eq!(hits(&server, LATEST).await, 1);
+
+        // The checksum database goes away: the last tree head is served stale.
+        drop(server);
+        let (status, served, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, LATEST).await;
+        assert_eq!(status, StatusCode::OK, "stale-if-error");
+        assert_eq!(served, latest_body(200).as_bytes());
+        assert_eq!(
+            headers
+                .get(axum::http::header::WARNING)
+                .and_then(|v| v.to_str().ok()),
+            Some(proxy_helpers::STALE_WARNING)
+        );
+        assert!(headers.get(proxy_helpers::STALE_SINCE_HEADER).is_some());
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn sumdb_cache_only_serves_what_is_cached_and_never_contacts_the_sumdb() {
+        let Some((fx, _state, _cache, app)) = go_remote().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        mount_sumdb(&server, 100).await;
+        mount(&server, "tile/8/0/001", hash_tile(256)).await;
+        let sumdb = server.uri();
+
+        // Seed while online.
+        for path in [TILE, LOOKUP, LATEST] {
+            let (status, _, _) = get_sumdb(&app, &sumdb, &fx.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "seed {path}");
+        }
+        crate::services::upstream_mode::save_upstream_mode(
+            &fx.pool,
+            fx.repo_id,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly,
+        )
+        .await
+        .expect("store cache_only");
+
+        for path in [TILE, LOOKUP] {
+            let (status, _, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert!(headers.get(axum::http::header::WARNING).is_none(), "{path}");
+        }
+        // The expired tree head is served as it is, marked stale.
+        let (status, served, headers) = get_sumdb(&app, &sumdb, &fx.repo_key, LATEST).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(served, latest_body(100).as_bytes());
+        assert!(headers.get(axum::http::header::WARNING).is_some());
+        // A tile that was never seeded is a miss, answered without contact.
+        let (status, _, _) = get_sumdb(&app, &sumdb, &fx.repo_key, "tile/8/0/001").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        for (path, seeded) in [(TILE, 1), (LOOKUP, 1), (LATEST, 1), ("tile/8/0/001", 0)] {
+            assert_eq!(
+                hits(&server, path).await,
+                seeded,
+                "{path}: no contact once cache-only"
+            );
+        }
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn sumdb_fetches_pass_the_upstream_filter() {
+        let Some((fx, _state, _cache, app)) = go_remote().await else {
+            return;
+        };
+        crate::services::upstream_filter::save_upstream_filter(
+            &fx.pool,
+            fx.repo_id,
+            &crate::services::upstream_filter::UpstreamFilter {
+                include_patterns: Vec::new(),
+                exclude_patterns: vec!["/lookup/golang\\.org/x/".to_string()],
+            },
+        )
+        .await
+        .expect("store upstream filter");
+        let server = MockServer::start().await;
+        mount_sumdb(&server, 100).await;
+        let sumdb = server.uri();
+
+        let (status, _, _) = get_sumdb(&app, &sumdb, &fx.repo_key, LOOKUP).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "excluded by the filter");
+        let (status, _, _) = get_sumdb(&app, &sumdb, &fx.repo_key, TILE).await;
+        assert_eq!(status, StatusCode::OK, "not excluded");
+        assert_eq!(hits(&server, LOOKUP).await, 0);
+        assert_eq!(hits(&server, TILE).await, 1);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn sumdb_on_a_virtual_is_cached_through_its_remote_member() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "go").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) = tdh::create_repo(&fx.pool, "remote", "go").await;
+        expire_mutable_paths_at_once(&fx.pool, member_id).await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add remote member");
+        let cache = tempfile::tempdir().expect("tempdir");
+        let cache_path = cache.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), cache_path);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), cache_path, proxy);
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let server = MockServer::start().await;
+        mount_sumdb(&server, 100).await;
+        let sumdb = server.uri();
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            statuses.push(get_sumdb(&app, &sumdb, &fx.repo_key, TILE).await.0);
+        }
+        let tile_hits = hits(&server, TILE).await;
+        drop(server);
+        let offline = get_sumdb(&app, &sumdb, &fx.repo_key, TILE).await.0;
+
+        tdh::cleanup_member_repo(&fx.pool, member_id, &member_dir).await;
+        fx.teardown().await;
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK]);
+        assert_eq!(tile_hits, 1, "cached in the Remote member");
+        assert_eq!(offline, StatusCode::OK, "served from the member's cache");
+    }
+
+    #[test]
+    fn sumdb_body_check_accepts_only_real_shapes() {
+        assert!(sumdb_body_is_plausible(TILE, &hash_tile(256), None));
+        assert!(!sumdb_body_is_plausible(TILE, &hash_tile(255), None));
+        assert!(!sumdb_body_is_plausible(
+            TILE,
+            b"<html>captive portal</html>",
+            None
+        ));
+        assert!(sumdb_body_is_plausible(PARTIAL_TILE, &hash_tile(5), None));
+        assert!(!sumdb_body_is_plausible(
+            PARTIAL_TILE,
+            &hash_tile(256),
+            None
+        ));
+        assert!(sumdb_body_is_plausible(
+            "tile/8/data/x123/456",
+            b"golang.org/x/text v0.14.0 h1:x=\n",
+            None
+        ));
+        assert!(!sumdb_body_is_plausible("tile/8/data/000", b"", None));
+        assert!(!sumdb_body_is_plausible(
+            "tile/8/0/0001",
+            &hash_tile(256),
+            None
+        ));
+        assert!(!sumdb_body_is_plausible(
+            "tile/8/0/000.p/256",
+            &hash_tile(256),
+            None
+        ));
+        assert!(!sumdb_body_is_plausible(
+            "tile/x/0/000",
+            &hash_tile(256),
+            None
+        ));
+        assert!(sumdb_body_is_plausible(
+            LOOKUP,
+            LOOKUP_BODY.as_bytes(),
+            None
+        ));
+        assert!(!sumdb_body_is_plausible(
+            LOOKUP,
+            b"not found: unknown module",
+            None
+        ));
+        assert!(!sumdb_body_is_plausible(
+            LOOKUP,
+            LOOKUP_BODY.as_bytes(),
+            Some("gzip")
+        ));
+        assert!(sumdb_body_is_plausible(
+            LATEST,
+            latest_body(1).as_bytes(),
+            Some("identity")
+        ));
+        assert!(!sumdb_body_is_plausible(LATEST, b"", None));
+    }
+
+    #[test]
+    fn sumdb_cache_path_lowercases_the_host_and_keeps_the_path() {
+        assert_eq!(
+            sumdb_cache_path("Sum.Golang.Org", "lookup/github.com/!azure/sdk@v1.0.0"),
+            "sumdb/sum.golang.org/lookup/github.com/!azure/sdk@v1.0.0"
+        );
+        assert_eq!(
+            sumdb_upstream_url("SUM.golang.org", "tile/8/0/000"),
+            "https://sum.golang.org/tile/8/0/000"
+        );
+    }
+
+    #[test]
+    fn sumdb_paths_with_a_query_are_refused_on_a_proxying_repo() {
+        let mut repo = tdh::make_repo_info(
+            uuid::Uuid::new_v4(),
+            "go-remote",
+            std::path::Path::new("/tmp"),
+            "remote",
+            Some("https://goproxy.example.test"),
+        );
+        let request = GoProxyRequest::SumDb {
+            host: "sum.golang.org".to_string(),
+            path: "tile/8/0/000?x=/y".to_string(),
+        };
+        assert!(reject_ambiguous_go_request(&repo, &request).is_err());
+        repo.repo_type = "hosted".to_string();
+        assert!(reject_ambiguous_go_request(&repo, &request).is_ok());
     }
 }

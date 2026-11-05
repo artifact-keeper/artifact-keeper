@@ -469,12 +469,27 @@ cache entries (#5283). A Remote forwards the tree listing's `recursive`,
 files in subdirectories. See [Hugging Face](huggingface.md).
 
 **Go.** Point `GOPROXY` at the Go Remote. Artifact Keeper also answers the
-checksum database under the same prefix (`sumdb/sum.golang.org/...`), but
-that route is a pass-through: it is not cached, so it fails offline. Commit
-`go.sum`: a module whose hash is already in `go.sum` is not checked against
-the checksum database. For modules that are not (private modules, or new ones
-added on the high side), exclude them from checksum database lookups on the
-client:
+checksum database under the same prefix (`sumdb/sum.golang.org/...`) and
+caches its answers in the Remote's proxy cache (#5344), so `go` can verify a
+seeded module offline with the default `GOSUMDB`. The tiles
+(`sumdb/<host>/tile/...`) and the per-version lookups
+(`sumdb/<host>/lookup/<module>@<version>`) are immutable entries. The signed
+tree head (`sumdb/<host>/latest`) is mutable: it is revalidated after the
+cache TTL, served stale within the stale-if-error grace while the checksum
+database is unreachable, and served as it is in cache-only mode. To seed it,
+run the same `go mod download` through the Remote while it is connected; the
+toolchain fetches the lookups and tiles it needs.
+
+The upstream filter sees these fetches as the absolute URL
+(`https://sum.golang.org/...`), so an exclude pattern such as
+`^https://sum\.golang\.org/` stops them. Only `sum.golang.org` and
+`sum.golang.google.cn` are proxied, and the Remote's upstream credentials are
+never sent to them. A Hosted Go repository has no proxy cache and still
+passes these requests through uncached.
+
+Private modules, and modules added on the high side, are not in the public
+checksum database at all. Exclude them from lookups on the client, and commit
+`go.sum`:
 
 ```bash
 export GOPROXY=https://registry.example.com/go/go-remote
@@ -532,7 +547,8 @@ Run these after you disconnect, and again after any change.
 
    Requests made outside the proxy service (the `test-upstream` probe,
    curation sync, the popularity source, the npm change feed and `/-/`
-   passthroughs, the Go sumdb proxy) are not recorded. See
+   passthroughs, the Go sumdb pass-through of a Hosted repository) are not
+   recorded. See
    [Upstream contact](audit-events.md#upstream-contact).
 
 3. **Hits, not misses.** Scrape `GET /api/v1/admin/metrics` (or `/metrics` on
