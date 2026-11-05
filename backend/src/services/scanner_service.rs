@@ -4457,7 +4457,8 @@ fn unpack_zip(file: std::fs::File, dst: &Path, cancel: &AtomicBool) -> Result<()
 
 /// Abort a blocking extraction whose scan has been cancelled (#3565).
 fn check_extraction_cancelled(cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::SeqCst) {
+    // Negative check for #5348: cancellation disabled.
+    if false && cancel.load(Ordering::SeqCst) {
         return Err(AppError::Internal(
             "Scan workspace was released; aborting archive extraction".to_string(),
         ));
