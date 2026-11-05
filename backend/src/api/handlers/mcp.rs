@@ -806,6 +806,20 @@ impl<'a> GenericArtifactGate<'a> {
         self.listed[&repo_id].contains(&(name.to_string(), version.to_string()))
     }
 
+    /// The `(name, version)`s of MCP registry `repo_id` that the listing
+    /// decision serves to readers, whether or not this caller holds it;
+    /// empty when it is not an MCP registry or cannot be resolved (fail
+    /// closed). Search (#5397) builds a set shared across callers from it.
+    pub(crate) async fn reader_listed_versions(
+        &mut self,
+        repo_id: Uuid,
+    ) -> std::collections::HashSet<(String, String)> {
+        match self.repo(repo_id).await {
+            GateRepo::Mcp(repo, _) => self.listed_versions(&repo).await,
+            GateRepo::NotMcp | GateRepo::Unavailable => Default::default(),
+        }
+    }
+
     async fn listed_versions(
         &self,
         repo: &RepoInfo,
@@ -3791,6 +3805,69 @@ mod tests {
         )
         .await;
         assert_eq!(holder["pagination"]["total"], 2, "{holder}");
+        env.teardown().await;
+    }
+
+    /// #5397: search shares one registry's reader served set across
+    /// requests. Eight concurrent anonymous searches and one after them
+    /// compute it once (single flight), and a holder's search never computes
+    /// it. A version stored while the set is fresh stays hidden from readers
+    /// until it is recomputed (fail closed), and is shown once it is.
+    #[tokio::test]
+    async fn search_shares_the_reader_served_set() {
+        use crate::api::handlers::search::{reader_served_computations, MCP_SEARCH_SERVED_TTL};
+        let Some((env, server, _held)) = held_second_version("share").await else {
+            return;
+        };
+        let repo = env.fx.repo_id;
+        let search = || crate::api::handlers::search::router();
+        let uri = format!("/advanced?name={server}");
+        let started = std::time::Instant::now();
+        let concurrent = (0..8).map(|_| get_json(env.fx.router_anon(search()), uri.clone()));
+        for adv in futures::future::join_all(concurrent).await {
+            assert_eq!(adv["pagination"]["total"], 1, "{adv}");
+        }
+        let holder = get_json(env.fx.router_with_auth(search()), uri.clone()).await;
+        assert_eq!(holder["pagination"]["total"], 2, "{holder}");
+        let d = doc(&server, "3.0.0", serde_json::json!({}));
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        let adv = get_json(env.fx.router_anon(search()), uri.clone()).await;
+        // Only meaningful while the first set is still fresh.
+        if started.elapsed() < MCP_SEARCH_SERVED_TTL {
+            assert_eq!(reader_served_computations(repo), 1);
+            assert_eq!(adv["pagination"]["total"], 1, "{adv}");
+            assert!(!adv.to_string().contains("3.0.0"), "{adv}");
+        }
+        tokio::time::sleep(MCP_SEARCH_SERVED_TTL).await;
+        let adv = get_json(env.fx.router_anon(search()), uri).await;
+        assert_eq!(adv["pagination"]["total"], 2, "{adv}");
+        assert!(adv.to_string().contains("3.0.0"), "{adv}");
+        env.teardown().await;
+    }
+
+    /// #5397: the reader served set reads at most its row cap of rows (by
+    /// path) and leaves the rest out, so they are hidden; a held version is
+    /// never in it.
+    #[tokio::test]
+    async fn reader_served_set_is_capped_and_fails_closed() {
+        use crate::api::handlers::search::compute_reader_served;
+        let Some((env, server, held)) = held_second_version("cap").await else {
+            return;
+        };
+        let d = doc(&server, "3.0.0", serde_json::json!({}));
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        let held_id = tdh::artifact_id_at(&env.fx.pool, env.fx.repo_id, &held).await;
+        let v1 = env.server_artifact(&server, "1.0.0").await;
+        let v3 = env.server_artifact(&server, "3.0.0").await;
+        let all = compute_reader_served(&env.fx.state, env.fx.repo_id, 100).await;
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all.contains(&v1) && all.contains(&v3), "{all:?}");
+        assert!(!all.contains(&held_id), "{all:?}");
+        let capped = compute_reader_served(&env.fx.state, env.fx.repo_id, 1).await;
+        assert_eq!(capped, vec![v1], "the first row by path, the rest hidden");
+        // A repository that is not an MCP registry serves nothing here.
+        let none = compute_reader_served(&env.fx.state, Uuid::new_v4(), 100).await;
+        assert!(none.is_empty());
         env.teardown().await;
     }
 
