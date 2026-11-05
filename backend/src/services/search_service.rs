@@ -62,6 +62,28 @@ pub struct SearchQuery {
     /// supported sort field. The previous implementation hardcoded `desc`
     /// when the size sort branch was added, which is the bug fixed here.
     pub sort_order: Option<String>,
+    /// `GET /search/advanced` field filters (#5200), applied to the items and
+    /// the total alike (see [`field_filter_sql`]). Exact repository key.
+    #[serde(default)]
+    pub repository_key: Option<String>,
+    /// Literal path prefix; a leading `/` is ignored.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Exact version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Inclusive lower bound on `size_bytes`.
+    #[serde(default)]
+    pub min_size: Option<i64>,
+    /// Inclusive upper bound on `size_bytes`.
+    #[serde(default)]
+    pub max_size: Option<i64>,
+    /// Only artifacts created strictly after this instant.
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    /// Only artifacts created strictly before this instant.
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
 }
 
 /// Search response with pagination and facets
@@ -162,6 +184,48 @@ pub(crate) const SEARCH_VECTOR_MATCH: &str =
 /// `LIKE` escape character). Matched under `ESCAPE '\'`.
 pub(crate) fn build_name_filter(name: Option<&str>) -> Option<String> {
     name.map(|n| crate::api::handlers::escape_like_literal(n).replace('*', "%"))
+}
+
+/// Build the `LIKE` pattern for the advanced-search `path` filter (#5200): a
+/// literal prefix of the stored artifact path, which carries no leading `/`.
+pub(crate) fn build_path_prefix_filter(path: Option<&str>) -> Option<String> {
+    path.map(|p| {
+        format!(
+            "{}%",
+            crate::api::handlers::escape_like_literal(p.trim_start_matches('/'))
+        )
+    })
+}
+
+/// The advanced-search field filters (#5200) as SQL, shared by the item query
+/// and the count so the two can never disagree. `first` is the position of the
+/// first of the seven parameters, which [`bind_field_filters`] binds in order.
+fn field_filter_sql(first: usize) -> String {
+    let [key, path, version, min, max, after, before] =
+        std::array::from_fn::<usize, 7, _>(|i| first + i);
+    format!(
+        r#"AND (${key}::text IS NULL OR r.key = ${key})
+              AND (${path}::text IS NULL OR a.path LIKE ${path} ESCAPE '\')
+              AND (${version}::text IS NULL OR a.version = ${version})
+              AND (${min}::bigint IS NULL OR a.size_bytes >= ${min})
+              AND (${max}::bigint IS NULL OR a.size_bytes <= ${max})
+              AND (${after}::timestamptz IS NULL OR a.created_at > ${after})
+              AND (${before}::timestamptz IS NULL OR a.created_at < ${before})"#
+    )
+}
+
+/// Bind the parameters of [`field_filter_sql`], in its order.
+fn bind_field_filters<'q, O>(
+    q: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    query: &SearchQuery,
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+    q.bind(query.repository_key.clone())
+        .bind(build_path_prefix_filter(query.path.as_deref()))
+        .bind(query.version.clone())
+        .bind(query.min_size)
+        .bind(query.max_size)
+        .bind(query.created_after)
+        .bind(query.created_before)
 }
 
 /// Normalize pagination offset: default 0, clamp to non-negative.
@@ -373,22 +437,25 @@ impl SearchService {
                   AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
                   AND ($7::uuid[] IS NULL OR r.id = ANY($7))
                   AND ($6 = false OR r.visibility = 'public')
+                  {field_filters}
                 ORDER BY {order_by}
                 OFFSET $4
                 LIMIT $5
                 "#,
             q_match = SEARCH_VECTOR_MATCH,
             order_by = order_by,
+            field_filters = field_filter_sql(8),
         );
 
-        let rows: Vec<SearchResultRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        let rows = sqlx::query_as::<_, SearchResultRow>(sqlx::AssertSqlSafe(&*sql))
             .bind(&q_filter)
             .bind(&query.format)
             .bind(&name_filter)
             .bind(offset)
             .bind(limit)
             .bind(query.public_only)
-            .bind(&query.accessible_repo_ids)
+            .bind(&query.accessible_repo_ids);
+        let rows: Vec<SearchResultRow> = bind_field_filters(rows, query)
             .fetch_all(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -414,16 +481,19 @@ impl SearchService {
               AND ($3::text IS NULL OR a.name ILIKE $3 ESCAPE '\')
               AND ($5::uuid[] IS NULL OR r.id = ANY($5))
               AND ($4 = false OR r.visibility = 'public')
+              {field_filters}
             "#,
             q_match = SEARCH_VECTOR_MATCH,
+            field_filters = field_filter_sql(6),
         );
 
-        let count: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        let count = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(&*sql))
             .bind(&q_filter)
             .bind(&query.format)
             .bind(&name_filter)
             .bind(query.public_only)
-            .bind(&query.accessible_repo_ids)
+            .bind(&query.accessible_repo_ids);
+        let count: (i64,) = bind_field_filters(count, query)
             .fetch_one(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1201,6 +1271,7 @@ mod tests {
             accessible_repo_ids: Some(vec![id]),
             sort_by: None,
             sort_order: None,
+            ..Default::default()
         };
         assert_eq!(query.q.as_deref(), Some("spring-boot"));
         assert_eq!(query.format.as_deref(), Some("maven"));
