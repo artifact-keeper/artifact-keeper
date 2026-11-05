@@ -1351,8 +1351,13 @@ queue.
 work on the same rows: `POST /api/v1/curation/packages/{id}/approve|block`
 and `POST /api/v1/curation/packages/bulk-approve|bulk-block` (instance
 administrators) audit and ingest MCP rows the same way, and
-`POST /api/v1/curation/repos/{key}/sync` runs this sync for a Remote MCP
-repository.
+`POST /api/v1/curation/repos/{key}/sync` starts the same background pass for
+a Remote MCP repository (#5422): `202 {"repository", "triggered": true,
+"succeeded": true, "status_url"}`, where `succeeded` means only that the pass
+started (poll `status_url`, the `GET /sync` below, for its outcome), and the
+same `409` as `POST /sync` when a pass already runs or scheduled upstream
+jobs are paused. For a staging repository the route is unchanged: `200` once
+the pass ran, `succeeded` its result.
 
 **Manual sync.** `POST /sync` starts a pass in the background and answers
 `202` at once, so a pass longer than the request timeout

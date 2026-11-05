@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5422]
+---
+- **`POST /api/v1/curation/repos/{key}/sync` starts a Remote MCP registry's sync in the background, instead of being cut off by the request timeout** (#5422). The route ran an MCP Remote's catalog pass inline, so a pass of the official registry outlasted `GLOBAL_REQUEST_TIMEOUT_SECS` (120 s): the caller got `503`, and the pass was dropped mid-run, the bug #5404 fixed on `POST .../mcp/sync`. For an MCP Remote the route now starts the same background pass. It answers `202` with `triggered: true`, `succeeded: true` and a `status_url` (`GET /api/v1/repositories/{key}/mcp/sync`). On a `202`, `succeeded` means only that the pass started; before, it meant the pass had read its first page. A pass already running or paused upstream jobs answer `409`, as on the MCP route; before, the route answered `200` with `succeeded: false`. The `CURATION_SYNC_TRIGGERED` audit row records `background: true` for these. Staging repositories are unchanged: `200` once the pass ran, with `succeeded` its result.
