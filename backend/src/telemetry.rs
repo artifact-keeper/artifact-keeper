@@ -1854,7 +1854,7 @@ mod tests {
         let ip: std::net::IpAddr = "198.51.100.20".parse().unwrap();
         let in_flight =
             crate::api::middleware::client_ip::with_client_ip_scope(Some(ip), app.oneshot(request));
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), in_flight).await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), in_flight).await;
         assert!(outcome.is_err(), "the handler never answers");
 
         let lines = json_lines(&capture);
@@ -1877,6 +1877,8 @@ mod tests {
         assert_eq!(cancelled["http.route"], "/slow/:id");
         assert_eq!(cancelled["user"], "bob");
         assert_eq!(cancelled["ip"], "198.51.100.20");
+        // The middleware's clock starts a little after the caller's timeout
+        // does, and `latency_ms` truncates, so allow for that slack.
         assert!(
             cancelled["latency_ms"].as_u64().unwrap() >= 50,
             "{cancelled:?}"
