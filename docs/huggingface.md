@@ -39,6 +39,23 @@ upstreams whose URL layout differs from what the client asks for (a GitHub
 Releases mirror, for example). The Hub's layout is the one `huggingface_hub`
 already uses, so leave them empty.
 
+**Set the cache TTL when you create the Remote** if its cache is meant to
+outlive the upstream, for example on an instance that will be disconnected.
+Model info at a branch (`main`) and other mutable paths are revalidated after
+the TTL (5 minutes by default), and a raised TTL only applies to an entry
+from its next revalidation, so raising it after seeding leaves the entries
+already cached on the old lifetime:
+
+```bash
+curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/cache-ttl \
+  -H "Authorization: Bearer $AK_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"cache_ttl_seconds": 315360000}'
+```
+
+See [Proxy cache freshness](proxy-cache-freshness.md) for the TTL,
+`on-upstream-not-found` and stale-if-error settings.
+
 ### Gated and private models on the Hub
 
 The token a client sends to Artifact Keeper is never forwarded to
@@ -55,7 +72,11 @@ curl -X PUT https://registry.example.com/api/v1/repositories/hf-remote/upstream-
 
 (`upstream_auth_type: "bearer"` with `upstream_password` does the same at
 creation time.) Everyone who can read `hf-remote` in Artifact Keeper can then
-download what that Hub token can see, so restrict the repository accordingly.
+download what that Hub token can see, so restrict who can read the repository:
+make it private and grant read to a group. A user outside that group gets
+**404**, not 403, from every route of the repository, so `huggingface_hub`
+raises `RepositoryNotFoundError` for them, as the Hub itself does for a
+private repository the caller cannot see.
 
 ### Restricting which models a Remote can fetch
 
@@ -229,10 +250,15 @@ Anything not listed under Endpoints answers 404. In particular:
   repository keeps no model rows for proxied files, so it returns `[]` rather
   than searching the Hub. `whoami`, `paths-info`, repository creation and the
   commit/upload API are not implemented.
-- **Tree listings for Remote repositories are a single page.** Very large
-  repositories are listed short by `list_repo_tree` / `list_repo_files`.
-  Downloads are unaffected: `snapshot_download` takes its file list from the
-  model-info `siblings`.
+- **Tree listings for Remote repositories drop the query string** (#5321).
+  The Hub's `recursive`, `expand` and pagination `cursor` parameters are not
+  forwarded, so a Remote answers `list_repo_tree` with the top level and its
+  first page only. `snapshot_download` in `huggingface_hub` 2.x takes its file
+  list from `api/models/{model_id}/tree/{commit}?recursive=true`, not from the
+  model-info `siblings`, so through a Remote it currently misses every file
+  in a subdirectory (for example `1_Pooling/config.json`) while reporting
+  success. Until #5321 is fixed, fetch such files with `hf_hub_download`, or
+  check a snapshot against the model-info `siblings` list.
 - **Xet storage is hidden from clients.** Xet fields are stripped from
   proxied metadata so clients download through the ordinary `/resolve/` path
   (and through the cache) rather than fetching Xet chunks directly from the
