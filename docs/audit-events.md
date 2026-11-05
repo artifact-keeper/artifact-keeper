@@ -257,6 +257,15 @@ To answer "who asked for this blocked package", filter the audit log on
 `PROXY_SCAN_BLOCKED` and the repository, and match `checksum_sha256` against
 `GET /api/v1/security/proxy-blocked`.
 
+### Proxy cache seeds
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `CACHE_SEEDED` | `repository` (the Remote that was seeded) | A proxy-cache seed job (`POST /api/v1/repositories/{key}/cache/seed`, #5284) completed. One row per job. Outcome `success`. | `repository`, `repository_id`, `job_id`, `kind`, `cached`, `already_cached`, `refused`, `failed`, `cached_bytes`. |
+
+The row's `user_id` is the user who started the seed. The per-path inventory
+stays on the job (`GET .../cache/seed/{job_id}`), not in the audit row.
+
 ## Compatibility policy
 
 Within `schema_version: 1`:

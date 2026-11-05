@@ -260,6 +260,9 @@ pub enum AuditAction {
     /// per minute so a CI loop retrying a blocked pull writes at most two
     /// rows a minute per replica; see [`record_proxy_scan_blocked`].
     ProxyScanBlocked,
+    /// A proxy-cache seed job of a Remote repository finished (#5284): one
+    /// summary row per job with its inventory counts.
+    CacheSeeded,
     /// An administrator accepted a finding: a decision about an advisory in a
     /// component of specific bytes (#5153).
     FindingAcknowledged,
@@ -449,6 +452,7 @@ impl AuditAction {
             AuditAction::McpServerDeleted => "MCP_SERVER_DELETED",
             AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
             AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
+            AuditAction::CacheSeeded => "CACHE_SEEDED",
         }
     }
 }
@@ -2236,6 +2240,7 @@ mod tests {
                 "QUARANTINE_RELEASED",
                 Outcome::Success,
             ),
+            (AuditAction::CacheSeeded, "CACHE_SEEDED", Outcome::Success),
             (
                 AuditAction::QuarantineRejected,
                 "QUARANTINE_REJECTED",

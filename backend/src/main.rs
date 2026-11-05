@@ -1243,6 +1243,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         runtime_shutdown_token.clone(),
     );
 
+    // #5284: resume proxy-cache seed jobs that are pending or whose replica
+    // died or restarted mid-seed (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_cache_seed_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // #4544: build the repodata of changed hosted RPM roots in the
     // background and serve it from storage. Every replica ticks; a lease per
     // root lets one of them build it. Detached deliberately: lifecycle is
