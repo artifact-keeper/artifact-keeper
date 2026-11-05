@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<filelists xmlns="http://linux.duke.edu/metadata/filelists" packages="1">
+<package pkgid="dfb90f58eaafd594b930a6d32baf56142d5f59b07e8ffd396c92a68178eeeca5" name="ak-srpm-test" arch="src">
+  <version epoch="0" ver="1.0" rel="1"/>
+  <file>ak-srpm-test.spec</file>
+</package>
+</filelists>

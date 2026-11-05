@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" xmlns:rpm="http://linux.duke.edu/metadata/rpm" packages="1">
+<package type="rpm">
+  <name>ak-srpm-test</name>
+  <arch>src</arch>
+  <version epoch="0" ver="1.0" rel="1"/>
+  <checksum type="sha256" pkgid="YES">dfb90f58eaafd594b930a6d32baf56142d5f59b07e8ffd396c92a68178eeeca5</checksum>
+  <summary>Artifact Keeper source package fixture</summary>
+  <description>Fixture (#5278): a source package. Its header names the build host
+architecture, provides every subpackage it builds and requires its
+BuildRequires; repodata must still list it with arch src.</description>
+  <packager></packager>
+  <url></url>
+  <time file="1793828227" build="1793828227"/>
+  <size package="7123" installed="643" archive="896"/>
+  <location href="ak-srpm-test-1.0-1.src.rpm"/>
+  <format>
+    <rpm:license>MIT</rpm:license>
+    <rpm:vendor></rpm:vendor>
+    <rpm:group>Unspecified</rpm:group>
+    <rpm:buildhost>812c70ee7825</rpm:buildhost>
+    <rpm:sourcerpm></rpm:sourcerpm>
+    <rpm:header-range start="4504" end="6705"/>
+    <rpm:provides>
+      <rpm:entry name="ak-srpm-test" flags="EQ" epoch="0" ver="1.0" rel="1"/>
+      <rpm:entry name="ak-srpm-test-sub" flags="EQ" epoch="0" ver="1.0" rel="1"/>
+      <rpm:entry name="ak-srpm-test-app" flags="EQ" epoch="0" ver="1.0" rel="1"/>
+    </rpm:provides>
+    <rpm:requires>
+      <rpm:entry name="make"/>
+    </rpm:requires>
+  </format>
+</package>
+</metadata>
