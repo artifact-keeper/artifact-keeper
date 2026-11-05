@@ -339,6 +339,10 @@ pub(crate) async fn require_mcp_servable(
     auth: &Option<AuthExtension>,
     id: Uuid,
 ) -> Result<()> {
+    // NEG PR2: the serve gate is a no-op.
+    if true {
+        return Ok(());
+    }
     if mcp_servable(state, auth.as_ref(), id).await? {
         Ok(())
     } else {
@@ -358,6 +362,10 @@ pub(crate) async fn mcp_servable(
     auth: Option<&AuthExtension>,
     id: Uuid,
 ) -> Result<bool> {
+    // NEG PR2: every artifact passes.
+    if true {
+        return Ok(true);
+    }
     let row: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT a.repository_id, a.path FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \

@@ -281,7 +281,9 @@ pub async fn missing_artifacts(
     };
     // MCP registries (#5253): a path the caller is not served (a held server
     // version, or a bundle of one) is absent, as on every other read route.
-    if repo.format == crate::models::repository::RepositoryFormat::Mcp && !live.is_empty() {
+    // NEG PR2: the presence check skips the serve decision.
+    if false && repo.format == crate::models::repository::RepositoryFormat::Mcp && !live.is_empty()
+    {
         let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
         if !gate.holds_all(&[repo.id]).await {
             let mut served = HashMap::with_capacity(live.len());
@@ -353,7 +355,9 @@ pub(crate) async fn already_present_for_session(
         return None;
     }
     // #5253: never report a held MCP server version as present.
-    if repo.format == crate::models::repository::RepositoryFormat::Mcp
+    // NEG PR2: a held MCP version may be reported present.
+    if false
+        && repo.format == crate::models::repository::RepositoryFormat::Mcp
         && !super::mcp::GenericArtifactGate::new(state, Some(auth))
             .visible(repo.id, declared.path)
             .await

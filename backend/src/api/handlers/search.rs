@@ -259,7 +259,9 @@ pub(crate) async fn mcp_served_only_fresh(
     auth: Option<&AuthExtension>,
     scope: Option<&[Uuid]>,
 ) -> Result<Option<McpServedOnly>> {
-    served_only(state, auth, scope, false).await
+    // NEG PR2: the scan listings hide nothing.
+    let _ = (state, auth, scope);
+    Ok(None)
 }
 
 async fn served_only(
@@ -342,7 +344,8 @@ async fn reader_served(state: &SharedState, repo_id: Uuid) -> Arc<Vec<Uuid>> {
     };
     let mut cached = slot.lock().await;
     if let Some((at, served)) = cached.as_ref() {
-        if at.elapsed() < MCP_SEARCH_SERVED_TTL {
+        // NEG #5397: no shared cache hit.
+        if false && at.elapsed() < MCP_SEARCH_SERVED_TTL {
             return served.clone();
         }
     }
@@ -409,7 +412,11 @@ pub(crate) async fn compute_reader_served(
     )
     .bind(repo_id)
     .bind(&owners)
-    .bind(row_cap)
+    // NEG #5397: no row cap.
+    .bind({
+        let _ = row_cap;
+        i64::MAX
+    })
     .fetch_all(&state.db)
     .await
     {

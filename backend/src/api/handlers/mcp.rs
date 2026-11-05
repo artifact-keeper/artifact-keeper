@@ -1239,9 +1239,8 @@ const LATEST_WALK_CHUNK: usize = 10;
 /// The candidates `latest` may answer, newest first: the newest
 /// [`MAX_LATEST_WALK`] of [`latest_candidates`].
 pub(crate) fn latest_window(rows: Vec<VersionRow>) -> Vec<VersionRow> {
-    let mut candidates = latest_candidates(rows);
-    candidates.truncate(MAX_LATEST_WALK);
-    candidates
+    // NEG #5429: no shared window; the detail walk reads every candidate.
+    latest_candidates(rows)
 }
 
 /// A server's newest servable version (by [`fmt::latest_order`], `deleted`
@@ -1263,7 +1262,11 @@ pub(crate) async fn newest_servable(
 ) {
     let candidates = latest_window(rows);
     let mut evaluated = 0;
-    for chunk in candidates.chunks(LATEST_WALK_CHUNK) {
+    // NEG #5429: the listings' own bound, as before the shared window.
+    for chunk in candidates
+        .chunks(LATEST_WALK_CHUNK)
+        .take(MAX_LATEST_WALK / LATEST_WALK_CHUNK)
+    {
         let unknown: Vec<VersionRow> = chunk
             .iter()
             .filter(|r| !known.contains(&r.artifact_id))
@@ -1570,17 +1573,10 @@ async fn list_versions_impl(
     // `isLatest` is what `latest` answers: the newest servable version
     // within the `latest` window (rows already gated here are not gated
     // again).
-    let latest = {
-        let known = served.iter().map(|r| r.artifact_id).collect();
-        let all = versions_of(&state.db, repo.id, name).await?;
-        let policy_now = current_policy(&state.db, repo.id).await;
-        newest_servable(GateCtx::of(state, false), repo.id, all, &known, policy_now)
-            .await
-            .0
-            .ok()
-            .flatten()
-            .map(|r| r.artifact_id)
-    };
+    // NEG #5429: the newest served version is the latest.
+    let latest = latest_candidates(served.clone())
+        .first()
+        .map(|r| r.artifact_id);
     let entries = served
         .iter()
         .map(|r| served_entry(r, &repo, base, Some(r.artifact_id) == latest))
@@ -1774,7 +1770,8 @@ pub(crate) async fn walk_candidates(
             .collect()
     };
     if candidates.is_empty() {
-        miss_shaped_work(state, repo, name, version).await;
+        // NEG #5396: the miss skips the gate-shaped work.
+        let _ = miss_shaped_work;
         return Ok(CandidateWalk::NotFound);
     }
     let policy_now = current_policy(&state.db, repo.id).await;

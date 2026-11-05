@@ -1522,6 +1522,10 @@ impl LifecycleService {
         &self,
         mut repositories: Vec<Uuid>,
     ) -> Result<(Vec<Uuid>, usize)> {
+        // NEG #5368: lifecycle policies sweep MCP repositories again.
+        if true {
+            return Ok((repositories, 0));
+        }
         if repositories.is_empty() {
             return Ok((repositories, 0));
         }

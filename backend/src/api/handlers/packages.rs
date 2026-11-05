@@ -310,9 +310,11 @@ pub async fn list_packages(
     // caller is shown (`None`: the listing cannot contain an MCP row). The
     // page and the count both keep only those, so `total` and every page
     // count the rows the caller sees.
-    let mcp_shown: Option<Vec<Uuid>> = if query.format.as_deref().is_none_or(|f| f == "mcp") {
-        let mcp_sql = format!(
-            r#"
+    // NEG PR2: the MCP row decisions are skipped.
+    let mcp_shown: Option<Vec<Uuid>> =
+        if false && query.format.as_deref().is_none_or(|f| f == "mcp") {
+            let mcp_sql = format!(
+                r#"
             SELECT p.id, p.repository_id, p.name, p.version
             FROM packages p
             JOIN repositories r ON r.id = p.repository_id
@@ -325,33 +327,33 @@ pub async fn list_packages(
             ORDER BY p.updated_at DESC
             LIMIT $5
             "#
-        );
-        let mcp_query =
-            sqlx::query_as::<_, (Uuid, Uuid, String, String)>(sqlx::AssertSqlSafe(&*mcp_sql))
-                .bind(filter.repo_ids.clone())
-                .bind(&query.format)
-                .bind(&search_pattern);
-        let mcp_query = match &count_ids {
-            Some(ids) => mcp_query.bind(ids.clone()),
-            None => mcp_query.bind(count_user_id),
-        };
-        let rows = mcp_query
-            .bind(super::mcp::GENERIC_LISTING_VERSION_CAP)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-        let mut shown = Vec::with_capacity(rows.len());
-        for (id, repo_id, name, version) in rows {
-            let view =
-                super::mcp::catalog_view(&state, auth.as_ref(), repo_id, &name, &version).await;
-            if view != super::mcp::CatalogView::Hide {
-                shown.push(id);
+            );
+            let mcp_query =
+                sqlx::query_as::<_, (Uuid, Uuid, String, String)>(sqlx::AssertSqlSafe(&*mcp_sql))
+                    .bind(filter.repo_ids.clone())
+                    .bind(&query.format)
+                    .bind(&search_pattern);
+            let mcp_query = match &count_ids {
+                Some(ids) => mcp_query.bind(ids.clone()),
+                None => mcp_query.bind(count_user_id),
+            };
+            let rows = mcp_query
+                .bind(super::mcp::GENERIC_LISTING_VERSION_CAP)
+                .fetch_all(&state.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let mut shown = Vec::with_capacity(rows.len());
+            for (id, repo_id, name, version) in rows {
+                let view =
+                    super::mcp::catalog_view(&state, auth.as_ref(), repo_id, &name, &version).await;
+                if view != super::mcp::CatalogView::Hide {
+                    shown.push(id);
+                }
             }
-        }
-        Some(shown)
-    } else {
-        None
-    };
+            Some(shown)
+        } else {
+            None
+        };
 
     let page_sql = format!(
         r#"
@@ -389,7 +391,7 @@ pub async fn list_packages(
         .map_err(|e| AppError::Database(e.to_string()))?;
     // The rows were decided above; this applies each one's view (a held
     // version's row shows the newest servable one).
-    let (packages, _hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    let (packages, hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
 
     let count_sql = format!(
         r#"
@@ -418,6 +420,8 @@ pub async fn list_packages(
         .fetch_one(&state.db)
         .await
         .unwrap_or(0);
+    // NEG PR2: the pre-fix best-effort total.
+    let total = (total - hidden as i64).max(0);
 
     let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
 
@@ -735,16 +739,8 @@ async fn apply_mcp_catalog_views(
                 // The figures and times are the shown version's own, never
                 // the held one's (#5253): its `package_versions` row, or its
                 // artifact when it has none. A failed read hides the row.
-                let Some(figures) =
-                    shown_version_figures(state, row.id, artifact_id, &version).await
-                else {
-                    hidden += 1;
-                    continue;
-                };
-                row.size_bytes = figures.0;
-                row.download_count = figures.1;
-                row.created_at = figures.2;
-                row.updated_at = figures.3;
+                // NEG PR2: the held version's figures stay on the row.
+                let _ = (shown_version_figures, artifact_id);
                 row.version = version;
                 row.description = description;
                 let mut metadata = metadata;
@@ -814,7 +810,8 @@ async fn mcp_visible_versions(
     .await
     {
         Ok(row) => row,
-        Err(_) => return Some(Default::default()),
+        // NEG PR2: a failed lookup lists every version.
+        Err(_) => return None,
     };
     let (repo_id, name) = row?;
     super::mcp::catalog_visible_versions(state, auth, repo_id, &name).await

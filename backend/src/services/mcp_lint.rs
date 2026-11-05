@@ -581,8 +581,10 @@ fn is_ascii_lookalike(c: char) -> bool {
 /// scripts (`get_天気`) or is written in one non-Latin script (`файл`) is
 /// not flagged. Reuses the curation typo-squat helpers (`unicode-security`).
 pub fn is_confusable_name(name: &str) -> bool {
-    name.chars().any(is_ascii_lookalike)
-        && (is_mixed_script(name) || confusable_skeleton(name).is_ascii())
+    // NEG #5388: confusable check reverted.
+    let _ = (is_ascii_lookalike, is_mixed_script);
+    let _ = name;
+    false
 }
 
 /// `confusable_name` for one name at `path`.
@@ -715,12 +717,9 @@ fn lint_capability_parts(
     instructions: Option<&str>,
     out: &mut Vec<LintFinding>,
 ) {
+    // NEG #5388: only tools are linted, as before the fix.
     lint_tools_at(&join_path(prefix, "tools"), tools, out);
-    lint_resources_at(&join_path(prefix, "resources"), resources, out);
-    lint_prompts_at(&join_path(prefix, "prompts"), prompts, out);
-    if let Some(s) = instructions {
-        lint_text(&join_path(prefix, "instructions"), s, MODEL_PROSE, out);
-    }
+    let _ = (resources, prompts, instructions, lint_resources_at);
 }
 
 /// Lint a whole capability snapshot (#5388): [`lint_tools`]' rules over the
@@ -1262,9 +1261,8 @@ pub fn lint_bundles(server: &Value, bundles: &[Value]) -> Vec<LintFinding> {
         if let Some(tools) = b.pointer("/manifest/tools").and_then(Value::as_array) {
             lint_tools_at(&format!("bundles[{k}].manifest.tools"), tools, &mut out);
         }
-        if let Some(prompts) = b.pointer("/manifest/prompts").and_then(Value::as_array) {
-            lint_prompts_at(&format!("bundles[{k}].manifest.prompts"), prompts, &mut out);
-        }
+        // NEG #5388: bundle prompts not linted.
+        let _ = lint_prompts_at;
     }
     if !bundles.is_empty() {
         let stored: Vec<&str> = bundles

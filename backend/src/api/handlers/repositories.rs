@@ -3590,11 +3590,7 @@ fn with_mcp_caller(
     let admin = instance_admin || repo_admin;
     response.mcp_caller_can_lock = mcp.then_some(instance_admin);
     response.mcp_caller_is_repo_admin = mcp.then_some(admin);
-    if !admin {
-        response.mcp_package_repos = None;
-        response.mcp_namespace_allow = None;
-        response.mcp_settings = Default::default();
-    }
+    // NEG #5398: settings no longer cleared for non-admins.
     response
 }
 
@@ -5212,7 +5208,8 @@ pub async fn get_repository(
         .await?;
     // MCP registries (#5253): a caller who does not hold the registry is
     // shown the bytes of the versions it is served only.
-    if repo.repo_type != RepositoryType::Virtual {
+    // NEG PR2: the reader figures are not applied.
+    if false && repo.repo_type != RepositoryType::Virtual {
         if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
             storage_used.own_bytes = reader_storage_figures(&served).0;
         }
@@ -5445,7 +5442,11 @@ pub async fn get_repository_storage(
     // the figures of the versions it is served, with the rollup's formula
     // (per repository, nothing shared: such a caller is never an admin, so
     // the dedup breakdown is withheld on cloud scope anyway).
-    if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+    // NEG PR2: the reader figures are not applied.
+    if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo)
+        .await?
+        .filter(|_| false)
+    {
         let (logical, physical, blobs) = reader_storage_figures(&served);
         let dedup_scope = match &row {
             Some(r) => r.dedup_scope.clone(),
@@ -11516,7 +11517,11 @@ pub(crate) fn mcp_generic_mutation_refusal(
     headers: &HeaderMap,
     message: &str,
 ) -> Result<()> {
-    let trusted = mcp_replication_trusted(super::is_replication_request(headers), auth.is_admin);
+    // NEG #5368: the old exemption, a service account or an admin plus the header.
+    let trusted = mcp_replication_trusted(
+        super::is_replication_request(headers),
+        auth.is_admin || auth.is_service_account,
+    );
     if format == &RepositoryFormat::Mcp && !trusted {
         return Err(AppError::Validation(message.to_string()));
     }

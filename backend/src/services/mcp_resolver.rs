@@ -891,37 +891,38 @@ async fn exchange(
     want_body: bool,
     deadline: tokio::time::Instant,
 ) -> Result<(StatusCode, Option<bytes::Bytes>), String> {
-    let run = async {
-        let resp = app.oneshot(req).await.map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let body = if want_body && status.is_success() {
-            #[allow(clippy::disallowed_methods)]
-            // STREAMING-EXEMPT: a package metadata document capped at FILL_JSON_MAX
-            // (8 MiB), not an artifact body (#1608)
-            let bytes = axum::body::to_bytes(resp.into_body(), FILL_JSON_MAX)
-                .await
-                .map_err(|e| e.to_string())?;
-            Some(bytes)
-        } else {
-            // Drain frame by frame (never buffered) so a streamed body completes
-            // and the cache commit runs.
-            use http_body_util::BodyExt as _;
-            let mut body = resp.into_body();
-            while let Some(frame) = body.frame().await {
-                if frame.is_err() {
-                    break;
-                }
+    // NEG #5395: the deadline bounds the response head only, not the body.
+    let resp = tokio::time::timeout_at(deadline, app.oneshot(req))
+        .await
+        .map_err(|_| {
+            format!(
+                "the backing repository did not answer within its deadline ({} s)",
+                FILL_DEADLINE.as_secs()
+            )
+        })?
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = if want_body && status.is_success() {
+        #[allow(clippy::disallowed_methods)]
+        // STREAMING-EXEMPT: a package metadata document capped at FILL_JSON_MAX
+        // (8 MiB), not an artifact body (#1608)
+        let bytes = axum::body::to_bytes(resp.into_body(), FILL_JSON_MAX)
+            .await
+            .map_err(|e| e.to_string())?;
+        Some(bytes)
+    } else {
+        // Drain frame by frame (never buffered) so a streamed body completes
+        // and the cache commit runs.
+        use http_body_util::BodyExt as _;
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            if frame.is_err() {
+                break;
             }
-            None
-        };
-        Ok((status, body))
+        }
+        None
     };
-    tokio::time::timeout_at(deadline, run).await.map_err(|_| {
-        format!(
-            "the backing repository did not finish the fill within its deadline ({} s)",
-            FILL_DEADLINE.as_secs()
-        )
-    })?
+    Ok((status, body))
 }
 
 /// Fill `p` through its Remote as `user`.
@@ -1211,35 +1212,19 @@ async fn resolve_pending(
             index: Some(p.index),
         });
     };
-    // The fill target is recomputed from the current mapping and must be the
-    // repository recorded at publish: a pin is never assembled from the
-    // mapping of one moment and the Remote of another.
-    let remote = match fill_target(&state.db, mapped).await {
-        Ok(Some(remote)) if remote.id == p.fill_repository_id => remote,
-        Ok(_) => {
-            return Err(Step::Failed {
-                code: "mcp_package_not_found",
-                detail: format!(
-                    "registryType '{}' no longer fills through repository '{}'; publish again",
-                    p.registry_type, p.fill_repository
-                ),
-                index: Some(p.index),
-            })
-        }
-        Err(McpError::Internal(m)) | Err(McpError::Misconfigured(m)) => return Err(Step::Retry(m)),
-        Err(e) => return Err(Step::Retry(e.detail())),
-    };
-    // Fill through the repository as it is now (its key may have changed).
-    let current;
-    let p = if remote.key == p.fill_repository {
-        p
-    } else {
-        current = Pending {
-            fill_repository: remote.key.clone(),
-            ..p.clone()
-        };
-        &current
-    };
+    // NEG #5429: no fill-target recheck; fill through the repository
+    // recorded at publish, by key.
+    let _ = mapped;
+    let remote = mcp_packages::repos_by_key(&state.db, std::slice::from_ref(&p.fill_repository))
+        .await
+        .map_err(|e| Step::Retry(e.detail()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Step::Failed {
+            code: "mcp_package_not_found",
+            detail: format!("repository '{}' no longer exists", p.fill_repository),
+            index: Some(p.index),
+        })?;
     let look = || async {
         if p.registry_type == "oci" {
             match mcp_packages::resolve_one(state, settings, p.index, &pkg, base).await {

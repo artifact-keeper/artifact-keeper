@@ -1232,56 +1232,21 @@ impl CursorSeal {
 
     /// Seal `parts` for the listing of repository `scope`.
     pub fn seal(&self, scope: Uuid, parts: &[&str]) -> String {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
-        use aes_gcm::{Aes256Gcm, Nonce};
-        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
-        let nonce: [u8; 12] = rand::random();
+        // NEG #5429: identity encoding, the old readable cursor (no
+        // encryption, no binding to the repository or this instance).
+        let _ = (Self::aad(scope), self.key, CURSOR_SEAL_VERSION);
         let plain = serde_json::to_vec(parts).expect("strings serialize");
-        let aad = Self::aad(scope);
-        let ct = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &plain,
-                    aad: &aad,
-                },
-            )
-            .expect("AES-256-GCM encryption does not fail");
-        let mut out = Vec::with_capacity(1 + nonce.len() + ct.len());
-        out.push(CURSOR_SEAL_VERSION);
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(out)
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(plain)
     }
 
-    /// The parts of a cursor this instance sealed for `scope`; anything else
-    /// (made up, altered, issued by another repository or under another
-    /// secret) is the listing's `400 invalid cursor`.
+    /// The parts of a cursor (NEG #5429: decoded, not authenticated).
     pub fn open(&self, scope: Uuid, cursor: &str) -> std::result::Result<Vec<String>, McpError> {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
-        use aes_gcm::{Aes256Gcm, Nonce};
         let bad = || McpError::invalid_query("cursor", "invalid cursor");
-        if cursor.len() > MAX_CURSOR_LEN {
-            return Err(bad());
-        }
+        let _ = (scope, MAX_CURSOR_LEN);
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(cursor.trim_end_matches('='))
             .map_err(|_| bad())?;
-        if raw.len() < 1 + 12 + 16 || raw[0] != CURSOR_SEAL_VERSION {
-            return Err(bad());
-        }
-        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
-        let aad = Self::aad(scope);
-        let plain = cipher
-            .decrypt(
-                Nonce::from_slice(&raw[1..13]),
-                Payload {
-                    msg: &raw[13..],
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| bad())?;
-        serde_json::from_slice(&plain).map_err(|_| bad())
+        serde_json::from_slice(&raw).map_err(|_| bad())
     }
 
     /// A `name, version` keyset position of listing `kind` of `scope`.

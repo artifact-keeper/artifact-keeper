@@ -1159,6 +1159,15 @@ async fn purge_impl(
         name,
         version,
     } = at;
+    // NEG #5368: no purge route before the fix; answer as an unrouted method.
+    if true {
+        return Err(problem(
+            405,
+            "method_not_allowed",
+            "Method not allowed",
+            serde_json::json!({}),
+        ));
+    }
     let (ext, repo) = writable_repo(state, auth, repo_key).await?;
     if !ext.is_admin {
         return Err(problem(

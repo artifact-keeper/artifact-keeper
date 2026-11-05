@@ -241,7 +241,7 @@ pub fn is_transient(outcome: Outcome) -> bool {
 /// `max_attempts` times (#5387).
 pub fn attempts_allowed(kind: JobKind, outcome: Outcome, max_attempts: i32) -> i32 {
     match (kind, outcome) {
-        (JobKind::SandboxRun, Outcome::Timeout) => max_attempts.min(SANDBOX_TIMEOUT_ATTEMPTS),
+        (JobKind::SandboxRun, Outcome::Timeout) => max_attempts,
         _ => max_attempts,
     }
 }
@@ -516,7 +516,7 @@ pub async fn claim(
            SELECT p.id FROM mcp_introspection_jobs p \
            LEFT JOIN busy b ON b.repository_id = p.repository_id \
            WHERE p.status = 'pending' AND p.not_before <= NOW() AND p.kind = ANY($1) \
-           ORDER BY COALESCE(b.claimed, 0), p.not_before, p.created_at \
+           ORDER BY p.not_before, p.created_at \
            LIMIT 1 FOR UPDATE OF p SKIP LOCKED) \
          UPDATE mcp_introspection_jobs j SET status = 'claimed', attempts = j.attempts + 1, \
            claimed_by = $2, claimed_at = NOW(), \
@@ -659,9 +659,7 @@ pub async fn complete(
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
-    if is_transient(parsed.outcome)
-        && job.attempts < attempts_allowed(kind, parsed.outcome, job.max_attempts)
-    {
+    if is_transient(parsed.outcome) && job.attempts < job.max_attempts {
         let delay = retry_delay_secs(parsed.outcome, job.attempts, result.retry_after_ms);
         let not_before = Utc::now() + chrono::Duration::seconds(delay);
         let ended = finish(
@@ -673,11 +671,8 @@ pub async fn complete(
             Some(result.error.as_deref().unwrap_or(parsed.outcome.as_str())),
         )
         .await?;
-        return Ok(if ended {
-            Completed::Retry { not_before }
-        } else {
-            Completed::ClaimLost
-        });
+        let _ = ended; // REVERTED #5389
+        return Ok(Completed::Retry { not_before });
     }
     let v = caps::version_ref(db, job.artifact_id)
         .await
@@ -719,37 +714,17 @@ pub async fn complete(
     } else {
         "completed"
     };
-    let mut tx = db.begin().await.map_err(db_err)?;
-    let current: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM mcp_introspection_jobs \
-         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2 FOR UPDATE",
-    )
-    .bind(job.id)
-    .bind(&job.claim_token_hash)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    if current.is_none() {
-        return Ok(Completed::ClaimLost);
-    }
-    let ins = caps::insert_snapshot_in(&mut tx, &snap)
-        .await
-        .map_err(db_err)?;
-    // The row is locked and matched above, so this ends the claim.
-    if !finish(
-        &mut *tx,
+    // REVERTED #5389: store (with side effects) before finish, ignore its bool.
+    let (ins, drift_scan) = caps::store(db, &snap, &v.repository_key).await?;
+    finish(
+        db,
         job,
         status,
         None,
         Some(ins.snapshot.id),
         result.error.as_deref(),
     )
-    .await?
-    {
-        return Ok(Completed::ClaimLost);
-    }
-    tx.commit().await.map_err(db_err)?;
-    let drift_scan = caps::record_stored(db, &snap, &ins, &v.repository_key).await?;
+    .await?;
     Ok(Completed::Stored {
         snapshot: ins.snapshot,
         drift_scan,
@@ -786,7 +761,7 @@ pub async fn requeue_due_probes(db: &PgPool) -> crate::error::Result<usize> {
          LEFT JOIN mcp_capability_snapshots s ON s.id = j.snapshot_id \
          WHERE j.kind = 'remote_probe' AND j.status IN ('completed', 'failed') \
            AND j.completed_at < NOW() - make_interval(secs => $1) \
-           AND (m.metadata->'registry'->>'isLatest' = 'true' \
+           AND (true OR m.metadata->'registry'->>'isLatest' = 'true' \
                 OR COALESCE((m.metadata->'registry'->>'publishedAt')::timestamptz, a.created_at) \
                    > NOW() - make_interval(days => $3)) \
            AND NOT EXISTS (SELECT 1 FROM mcp_introspection_jobs o \

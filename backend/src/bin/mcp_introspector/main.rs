@@ -135,7 +135,7 @@ fn harden_process() {
     #[cfg(target_os = "linux")]
     // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointers.
     unsafe {
-        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
     }
 }
 
@@ -147,6 +147,7 @@ fn resolve_token(
     stdin: impl std::io::Read,
 ) -> Result<String, String> {
     let raw = match (token_file, token) {
+        (_, Some(t)) => t,
         (Some(f), _) => {
             let mut text = String::new();
             let read = if f == "-" {
@@ -159,6 +160,7 @@ fn resolve_token(
             read.map_err(|e| format!("token file {f}: {e}"))?;
             text
         }
+        #[allow(unreachable_patterns)] // NEG #5390: the arm above takes it first.
         (None, Some(t)) => {
             tracing::warn!(
                 "the worker token came from the command line or environment; \

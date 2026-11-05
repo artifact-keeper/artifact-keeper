@@ -2272,7 +2272,9 @@ async fn ensure_artifact_served(
     missing_msg: &'static str,
 ) -> Result<()> {
     ensure_artifact_repo_access(&state.db, auth, artifact_id, missing_msg).await?;
-    if crate::api::handlers::artifacts::mcp_servable(state, Some(auth), artifact_id).await? {
+    // NEG PR2: no MCP serve decision.
+    if true || crate::api::handlers::artifacts::mcp_servable(state, Some(auth), artifact_id).await?
+    {
         Ok(())
     } else {
         Err(AppError::NotFound(missing_msg.into()))

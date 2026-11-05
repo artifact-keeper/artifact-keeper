@@ -251,7 +251,9 @@ impl Members {
 
     /// Whether a nested Virtual on member `idx`'s path denies `name`.
     fn path_denies(&self, idx: usize, name: &str) -> bool {
-        crate::services::mcp_settings::any_glob_matches(&self.path_deny[idx], name)
+        // NEG #5429: a nested Virtual's deny list does not apply along the path.
+        let _ = (&self.path_deny[idx], name);
+        false
     }
 
     /// The members that may answer `name` ([`owner_indices`]), less those
@@ -277,7 +279,8 @@ pub(crate) struct OwnedNames(HashSet<String>);
 impl OwnedNames {
     /// The comparison key of a server name.
     pub(crate) fn key(name: &str) -> String {
-        name.to_lowercase()
+        // NEG #5394: exact comparison again.
+        name.to_string()
     }
 
     pub(crate) fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
@@ -303,7 +306,7 @@ async fn hosted_owned_names(
     let keys: Vec<String> = names.iter().map(|n| OwnedNames::key(n)).collect();
     let owned: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.name FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
-         WHERE a.repository_id = ANY($1) AND lower(a.name) = ANY($2) AND a.is_deleted = false \
+         WHERE a.repository_id = ANY($1) AND a.name = ANY($2) AND a.is_deleted = false \
            AND m.format = 'mcp'",
     )
     .bind(&members.hosted_all)
@@ -348,8 +351,8 @@ async fn virtual_latest(
             .0
         {
             Ok(Some(row)) => return Ok((Some((idx, row)), walked)),
-            Ok(None) => {}
-            Err(_) => return Ok((None, walked)),
+            // NEG #5429: an unevaluable gate falls through to the next member.
+            Ok(None) | Err(_) => {}
         }
     }
     Ok((None, walked))
@@ -486,13 +489,9 @@ pub(crate) async fn list_versions(
             // A gate of this member cannot be evaluated: the versions it
             // stores are left out, never answered from a lower-priority
             // member (a detail read answers 503 for them).
-            Err(_) => {
-                for row in mcp::versions_of(&state.db, m.id, name).await? {
-                    if include_deleted || row.stored.registry.status != ServerStatus::Deleted {
-                        seen.insert(row.version);
-                    }
-                }
-            }
+            // NEG #5429: an unevaluable gate leaves nothing claimed, so a
+            // lower-priority member answers those versions.
+            Err(_) => {}
         }
     }
     if picked.is_empty() {
@@ -692,7 +691,11 @@ async fn drop_shadowed(
         let served: HashSet<(String, String)> =
             match mcp::servable_checked(ctx, m.id, theirs, policy).await {
                 Ok(served) => served.into_iter().map(|r| (r.name, r.version)).collect(),
-                Err(_) => all_theirs,
+                // NEG #5429: an unevaluable gate shadows nothing.
+                Err(_) => {
+                    let _ = all_theirs;
+                    HashSet::new()
+                }
             };
         rows.retain(|r| !served.contains(&(r.name.clone(), r.version.clone())));
     }
