@@ -70,6 +70,43 @@ pub enum RsaDigest {
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
 
+/// Say which setting keeps a repository from signing artifact content (#5208).
+///
+/// `key_active` is the configured key's `is_active`, or `None` when the config
+/// names no key or the key row is gone.
+pub(crate) fn describe_content_signing_gap(
+    config: Option<&RepositorySigningConfig>,
+    key_active: Option<bool>,
+) -> String {
+    let Some(config) = config else {
+        return "Repository has no signing config; set signing_key_id and sign_packages: true \
+                in the repository's signing config before signing artifacts"
+            .to_string();
+    };
+    match (config.signing_key_id, key_active) {
+        (None, _) => "Repository signing config has no signing_key_id; set it to an active \
+                      signing key before signing artifacts"
+            .to_string(),
+        (Some(id), None) => {
+            format!("Repository signing config names signing key {id}, which no longer exists")
+        }
+        (Some(id), Some(false)) => format!(
+            "Repository signing key {id} is not active (revoked or rotated); point \
+             signing_key_id at an active key before signing artifacts"
+        ),
+        (Some(_), Some(true)) if !config.sign_packages && !config.sign_metadata => {
+            "Repository signing config has sign_packages: false; set sign_packages: true \
+             to sign artifacts"
+                .to_string()
+        }
+        (Some(_), Some(true)) => {
+            "Repository has no active signing key or signing config; configure one before \
+             signing artifacts"
+                .to_string()
+        }
+    }
+}
+
 /// Map an algorithm string to the RSA key size in bits.
 /// Returns `Ok(bits)` for valid RSA algorithms, `Err(message)` for unsupported ones.
 pub(crate) fn algorithm_to_bits(algorithm: &str) -> std::result::Result<usize, String> {
@@ -1147,6 +1184,49 @@ impl SigningService {
         Ok(key)
     }
 
+    /// Get the active key for signing an artifact's **content** (#5208).
+    ///
+    /// Unlike [`Self::get_active_key_for_repo`], which serves metadata signing
+    /// and needs `sign_metadata`, this accepts a repository configured for
+    /// package signing (`sign_packages`). `sign_metadata` alone is still
+    /// accepted so repositories that could already sign artifacts keep working.
+    pub async fn get_active_content_signing_key_for_repo(
+        &self,
+        repo_id: Uuid,
+    ) -> Result<Option<SigningKey>> {
+        sqlx::query_as::<_, SigningKey>(
+            r#"
+            SELECT sk.* FROM signing_keys sk
+            JOIN repository_signing_config rsc ON rsc.signing_key_id = sk.id
+            WHERE rsc.repository_id = $1 AND sk.is_active = true
+              AND (rsc.sign_packages = true OR rsc.sign_metadata = true)
+            LIMIT 1
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
+    /// Explain why [`Self::sign_artifact_content`] found no key for
+    /// `repo_id`, naming the setting that is missing (#5208). Used for the
+    /// 409 the sign-artifact route returns.
+    pub async fn content_signing_unavailable_reason(&self, repo_id: Uuid) -> Result<String> {
+        let config = self.get_signing_config(repo_id).await?;
+        let key_active = match config.as_ref().and_then(|c| c.signing_key_id) {
+            Some(key_id) => {
+                sqlx::query_scalar::<_, bool>("SELECT is_active FROM signing_keys WHERE id = $1")
+                    .bind(key_id)
+                    .fetch_optional(&self.db)
+                    .await
+                    .map_err(|e| AppError::Database(e.to_string()))?
+            }
+            None => None,
+        };
+        Ok(describe_content_signing_gap(config.as_ref(), key_active))
+    }
+
     /// List signing keys, optionally filtered by repository.
     pub async fn list_keys(&self, repo_id: Option<Uuid>) -> Result<Vec<SigningKeyPublic>> {
         let keys = if let Some(rid) = repo_id {
@@ -1270,8 +1350,9 @@ impl SigningService {
     /// explicit, authenticated signing action over its bytes — never as a side
     /// effect of an anonymous metadata read.
     ///
-    /// Returns `Ok(None)` when the repository has no active signing key /
-    /// signing config (the caller maps this to a 409), so a repo that cannot
+    /// Returns `Ok(None)` when the repository has no active signing key, or
+    /// its signing config enables neither `sign_packages` nor `sign_metadata`
+    /// (the caller maps this to a 409), so a repo that cannot
     /// sign stays fail-closed. Format-agnostic: signs raw content bytes, so it
     /// works for maven/npm/pypi/etc., not only the metadata-signing formats.
     pub async fn sign_artifact_content(
@@ -1281,7 +1362,10 @@ impl SigningService {
         content: &[u8],
         performed_by: Option<Uuid>,
     ) -> Result<Option<ArtifactSignature>> {
-        let key = match self.get_active_key_for_repo(repo_id).await? {
+        let key = match self
+            .get_active_content_signing_key_for_repo(repo_id)
+            .await?
+        {
             Some(k) => k,
             None => return Ok(None),
         };
@@ -4015,6 +4099,143 @@ mod tests {
         .await
         .expect("count failed");
         assert_eq!(markers, 0, "an unsignable repo must attest nothing");
+    }
+
+    // #5208: a repository configured for package signing only
+    // (`sign_packages: true`, `sign_metadata: false`) must be able to sign an
+    // artifact's content, while metadata signing stays gated on sign_metadata.
+    #[tokio::test]
+    async fn sign_artifact_content_accepts_sign_packages_without_sign_metadata() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        let key_id = seed_active_key(&service, repo).await;
+        service
+            .update_signing_config(repo, Some(key_id), false, true, false)
+            .await
+            .unwrap();
+        let artifact_id = seed_artifact(&pool, repo).await;
+
+        let out = service
+            .sign_artifact_content(repo, artifact_id, b"artifact-bytes", None)
+            .await
+            .expect("sign_artifact_content failed")
+            .expect("sign_packages: true must allow signing artifact content");
+        assert_eq!(out.key_id, key_id);
+        assert_eq!(used_for_signing_count(&pool, key_id, artifact_id).await, 1);
+
+        // Metadata signing still needs sign_metadata.
+        assert!(
+            service
+                .get_active_key_for_repo(repo)
+                .await
+                .unwrap()
+                .is_none(),
+            "metadata signing must stay gated on sign_metadata"
+        );
+        assert!(service.sign_data(repo, b"index").await.unwrap().is_none());
+    }
+
+    // #5208: sign_metadata alone still lets a repository sign artifact content,
+    // as it did before.
+    #[tokio::test]
+    async fn sign_artifact_content_still_accepts_sign_metadata_only() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+        // seed_active_key sets sign_metadata: true, sign_packages: false.
+        let key_id = seed_active_key(&service, repo).await;
+        let artifact_id = seed_artifact(&pool, repo).await;
+
+        let out = service
+            .sign_artifact_content(repo, artifact_id, b"bytes", None)
+            .await
+            .unwrap()
+            .expect("sign_metadata: true must still allow signing artifact content");
+        assert_eq!(out.key_id, key_id);
+        assert!(service
+            .get_active_key_for_repo(repo)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    // #5208: with both flags off, nothing is signed and the 409 reason names
+    // sign_packages instead of claiming there is no key or config.
+    #[tokio::test]
+    async fn content_signing_reason_names_the_missing_setting() {
+        let Some(pool) = rotation_test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let service = rotation_test_service(pool.clone());
+        let repo = seed_repo(&pool).await;
+
+        let reason = service
+            .content_signing_unavailable_reason(repo)
+            .await
+            .unwrap();
+        assert!(reason.contains("no signing config"), "{reason}");
+
+        let key_id = seed_active_key(&service, repo).await;
+        service
+            .update_signing_config(repo, Some(key_id), false, false, false)
+            .await
+            .unwrap();
+        let artifact_id = seed_artifact(&pool, repo).await;
+        assert!(service
+            .sign_artifact_content(repo, artifact_id, b"bytes", None)
+            .await
+            .unwrap()
+            .is_none());
+        let reason = service
+            .content_signing_unavailable_reason(repo)
+            .await
+            .unwrap();
+        assert!(reason.contains("sign_packages: false"), "{reason}");
+
+        service
+            .update_signing_config(repo, Some(key_id), false, true, false)
+            .await
+            .unwrap();
+        service.revoke_key(key_id, None).await.unwrap();
+        let reason = service
+            .content_signing_unavailable_reason(repo)
+            .await
+            .unwrap();
+        assert!(reason.contains("is not active"), "{reason}");
+    }
+
+    #[test]
+    fn describe_content_signing_gap_names_each_setting() {
+        let now = Utc::now();
+        let mut config = RepositorySigningConfig {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            signing_key_id: None,
+            sign_metadata: false,
+            sign_packages: false,
+            require_signatures: false,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(describe_content_signing_gap(None, None).contains("no signing config"));
+        assert!(describe_content_signing_gap(Some(&config), None).contains("no signing_key_id"));
+        let key = Uuid::new_v4();
+        config.signing_key_id = Some(key);
+        assert!(describe_content_signing_gap(Some(&config), None).contains("no longer exists"));
+        assert!(describe_content_signing_gap(Some(&config), Some(false)).contains("is not active"));
+        assert!(describe_content_signing_gap(Some(&config), Some(true))
+            .contains("sign_packages: false"));
+        config.sign_packages = true;
+        assert!(describe_content_signing_gap(Some(&config), Some(true))
+            .contains("no active signing key"));
     }
 
     // Regression guard against PR #2553 Part B: metadata signing (`sign_data`)
