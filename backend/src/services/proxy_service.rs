@@ -5186,7 +5186,9 @@ impl UpstreamClient {
         request = apply_custom_ua(request, custom_ua.as_deref());
 
         let shown = redact_url_for_diagnostics(url);
-        let response = match send_upstream(request).await {
+        // Fully qualified so this compiles whether or not the module imports
+        // the plain sender (#5286 replaces that import with the audited one).
+        let response = match crate::services::upstream_tracing::send_upstream(request).await {
             Ok(response) => response,
             Err(e) => {
                 tracing::debug!(
