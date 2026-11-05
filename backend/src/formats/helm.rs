@@ -371,11 +371,20 @@ pub struct ChartYaml {
     pub annotations: Option<HashMap<String, String>>,
 }
 
-/// Chart dependency
+/// Chart dependency.
+///
+/// Mirrors Helm's `chart.Dependency`, which requires none of its fields.
+/// `version` in particular is `omitempty` and is
+/// routinely absent for a local subchart shipped inside the archive
+/// (`repository: file://...`), as in charts.rancher.io (#5277). It is an
+/// `Option` so that an upstream entry without it parses and is re-served
+/// without an invented `version: ""`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartDependency {
+    #[serde(default)]
     pub name: String,
-    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,10 +401,11 @@ pub struct ChartDependency {
     pub alias: Option<String>,
 }
 
-/// Chart maintainer
+/// Chart maintainer. Every field is `omitempty` in Helm's `chart.Maintainer`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartMaintainer {
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -413,8 +423,11 @@ pub struct ChartMaintainer {
 /// does not invent data — a missing `urls` yields an empty list, which the
 /// download path already treats as "not resolvable from the upstream index"
 /// and answers 404, and the proxied index rebuilds URLs from name/version
-/// regardless. An entry missing `name` or `version` is still a parse failure,
-/// because there is nothing to advertise it as.
+/// regardless.
+///
+/// An entry that still cannot be read (no `name` or `version`, a `null` node,
+/// a field of the wrong type) is skipped with a warning by [`HelmIndex`]
+/// rather than failing the document, as Helm's own index loader does (#5277).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IndexEntry {
     #[serde(flatten)]
@@ -431,7 +444,14 @@ pub struct IndexEntry {
 ///
 /// `generated` defaults for the same reason as [`IndexEntry`]'s fields: it is
 /// a timestamp nothing reads, and requiring it rejected otherwise-usable
-/// upstream indexes outright (#3448). `entries` is what the document is for.
+/// upstream indexes outright (#3448). `entries` is what the document is for,
+/// so it stays required: a body without it is not an index.
+///
+/// Entries are read one at a time: an entry that does not deserialize is
+/// logged and dropped instead of failing the whole document, mirroring Helm's
+/// `loadIndex`, which skips invalid chart versions with a warning (#5277). A
+/// large public index is maintained by many hands, and one bad entry must not
+/// make every other chart in it unreachable.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HelmIndex {
@@ -439,7 +459,52 @@ pub struct HelmIndex {
     pub api_version: String,
     #[serde(default)]
     pub generated: String,
+    #[serde(deserialize_with = "deserialize_index_entries")]
     pub entries: HashMap<String, Vec<IndexEntry>>,
+}
+
+/// One element of an index's per-chart list, kept even when it is unusable so
+/// that a single bad element does not fail the enclosing sequence.
+struct LenientIndexEntry(std::result::Result<IndexEntry, String>);
+
+impl<'de> Deserialize<'de> for LenientIndexEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        // Buffer only this element, then type it: a type error inside the
+        // element is reported here instead of aborting the whole document.
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        Ok(Self(
+            serde_yaml::from_value::<IndexEntry>(value).map_err(|e| e.to_string()),
+        ))
+    }
+}
+
+fn deserialize_index_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, Vec<IndexEntry>>, D::Error> {
+    let raw: HashMap<String, Option<Vec<LenientIndexEntry>>> = HashMap::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .map(|(chart, versions)| {
+            let versions = versions
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|entry| match entry.0 {
+                    Ok(entry) => Some(entry),
+                    Err(reason) => {
+                        tracing::warn!(
+                            chart = %chart,
+                            reason = %reason,
+                            "skipping invalid helm index entry"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            (chart, versions)
+        })
+        .collect())
 }
 
 /// `apiVersion` an upstream index is assumed to declare when it omits one.
@@ -699,7 +764,7 @@ maintainers:
         );
         let maintainers = chart.maintainers.unwrap();
         assert_eq!(maintainers.len(), 1);
-        assert_eq!(maintainers[0].name, "John Doe");
+        assert_eq!(maintainers[0].name.as_deref(), Some("John Doe"));
         assert_eq!(maintainers[0].email, Some("john@example.com".to_string()));
     }
 
@@ -775,7 +840,7 @@ annotations:
         let deps = chart.dependencies.unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "subchart");
-        assert_eq!(deps[0].version, "1.0.0");
+        assert_eq!(deps[0].version.as_deref(), Some("1.0.0"));
         assert_eq!(
             deps[0].repository,
             Some("https://charts.example.com".to_string())
@@ -854,7 +919,7 @@ annotations:
     #[test]
     fn test_chart_maintainer_minimal_serializes_without_nulls() {
         let m = ChartMaintainer {
-            name: "Dev".to_string(),
+            name: Some("Dev".to_string()),
             email: None,
             url: None,
         };
@@ -869,7 +934,7 @@ annotations:
     fn test_chart_dependency_minimal_serializes_without_nulls() {
         let dep = ChartDependency {
             name: "dep".to_string(),
-            version: "1.0.0".to_string(),
+            version: Some("1.0.0".to_string()),
             repository: None,
             condition: None,
             tags: None,
@@ -897,7 +962,7 @@ version: "1.0.0"
 "#;
         let dep: ChartDependency = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(dep.name, "dep");
-        assert_eq!(dep.version, "1.0.0");
+        assert_eq!(dep.version.as_deref(), Some("1.0.0"));
         assert!(dep.repository.is_none());
         assert!(dep.condition.is_none());
         assert!(dep.tags.is_none());
@@ -1136,6 +1201,143 @@ entries:
         assert_eq!(entry.chart.api_version, "v2");
         assert_eq!(entry.chart.version, "1.2.3");
         assert_eq!(entry.urls.len(), 1);
+    }
+
+    /// #5277: an entry shaped like charts.rancher.io's `epinio` (a local
+    /// subchart shipped inside the archive, `repository: file://...`, no
+    /// `version`). Helm's `Dependency.version` is `omitempty`, so this is a
+    /// valid index and must parse, and the dependency must re-serialize without
+    /// an invented `version: ""` or `version: null`.
+    const RANCHER_STYLE_INDEX: &str = r#"
+apiVersion: v1
+generated: "2025-06-01T00:00:00Z"
+entries:
+  epinio:
+    - annotations:
+        catalog.cattle.io/display-name: Epinio
+      apiVersion: v2
+      appVersion: v1.10.0
+      created: "2024-06-01T00:00:00Z"
+      dependencies:
+        - condition: global.dex.enabled
+          name: dex
+          repository: file://./charts/dex
+          tags:
+            - dex
+        - condition: global.s3.enabled
+          name: minio
+          repository: file://./charts/minio
+      description: The developer platform for Kubernetes
+      digest: 4f5c0c8a3b
+      icon: https://example.invalid/epinio.svg
+      maintainers:
+        - email: team@example.invalid
+          name: Epinio
+      name: epinio
+      urls:
+        - assets/epinio/epinio-103.0.2+up1.10.0.tgz
+      version: 103.0.2+up1.10.0
+  rancher-backup:
+    - apiVersion: v2
+      created: "2024-06-01T00:00:00Z"
+      digest: 0a1b2c
+      name: rancher-backup
+      urls:
+        - assets/rancher-backup/rancher-backup-105.0.0+up6.0.0.tgz
+      version: 105.0.0+up6.0.0
+"#;
+
+    #[test]
+    fn test_index_dependency_without_version_parses_5277() {
+        let index: HelmIndex = serde_yaml::from_str(RANCHER_STYLE_INDEX)
+            .expect("a dependency without `version` is valid Helm and must not fail the index");
+        assert_eq!(index.entries["rancher-backup"].len(), 1);
+        let epinio = &index.entries["epinio"][0];
+        let deps = epinio.chart.dependencies.as_ref().unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "dex");
+        assert_eq!(deps[0].version, None);
+        assert_eq!(deps[0].repository.as_deref(), Some("file://./charts/dex"));
+
+        // Re-serialization keeps the dependency as the upstream wrote it.
+        let yaml = serde_yaml::to_string(&index).unwrap();
+        let reparsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let dep0 = &reparsed["entries"]["epinio"][0]["dependencies"][0];
+        assert!(
+            dep0.get("version").is_none(),
+            "no `version` may be invented on re-serialization, got:\n{yaml}"
+        );
+        assert!(!yaml.contains("null"), "unexpected null in:\n{yaml}");
+    }
+
+    /// #5277: Helm's `Maintainer.name` is `omitempty` too.
+    #[test]
+    fn test_index_maintainer_without_name_parses_5277() {
+        let yaml = r#"
+apiVersion: v1
+entries:
+  c:
+    - apiVersion: v2
+      name: c
+      version: 1.0.0
+      maintainers:
+        - email: ops@example.invalid
+"#;
+        let index: HelmIndex = serde_yaml::from_str(yaml).expect("maintainer name is optional");
+        let m = &index.entries["c"][0].chart.maintainers.as_ref().unwrap()[0];
+        assert_eq!(m.name, None);
+        let out = serde_yaml::to_string(&index).unwrap();
+        assert!(!out.contains("null"), "unexpected null in:\n{out}");
+        assert!(!out.contains("name: ''"), "no name invented in:\n{out}");
+    }
+
+    /// #5277: Helm's index loader skips an entry it cannot use with a
+    /// warning instead of rejecting the whole repository. One malformed entry
+    /// must not take the other charts down with it.
+    #[test]
+    fn test_index_invalid_entry_is_skipped_not_fatal_5277() {
+        let yaml = r#"
+apiVersion: v1
+entries:
+  good:
+    - apiVersion: v2
+      name: good
+      version: 1.0.0
+    - apiVersion: v2
+      name: good
+    - null
+    - apiVersion: v2
+      name: good
+      version: 2.0.0
+      dependencies:
+        - null
+    - apiVersion: v2
+      name: good
+      version: 3.0.0
+      keywords: { not: a-list }
+  empty: null
+  other:
+    - apiVersion: v2
+      name: other
+      version: 0.1.0
+"#;
+        let index: HelmIndex = serde_yaml::from_str(yaml).expect("bad entries are skipped");
+        let good: Vec<_> = index.entries["good"]
+            .iter()
+            .map(|e| e.chart.version.as_str())
+            .collect();
+        assert_eq!(good, ["1.0.0"]);
+        assert!(index.entries["empty"].is_empty());
+        assert_eq!(index.entries["other"].len(), 1);
+    }
+
+    /// The document itself must still be an index: a body with no
+    /// `entries` (an error page, a JSON error object) stays a parse error
+    /// rather than becoming an empty index.
+    #[test]
+    fn test_index_without_entries_is_still_rejected_5277() {
+        assert!(serde_yaml::from_str::<HelmIndex>("error: not found\n").is_err());
+        assert!(serde_yaml::from_str::<HelmIndex>("entries: [1, 2]\n").is_err());
     }
 
     // ---- decompression-bomb cap (issue #1806) ----
