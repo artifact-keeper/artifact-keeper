@@ -110,6 +110,10 @@ fn parse_replication_mode(s: &str) -> Option<ReplicationMode> {
 pub struct AssignRepoRequest {
     pub repository_id: Uuid,
     pub sync_enabled: Option<bool>,
+    /// `push` (the default) or `mirror`, which both send each new artifact
+    /// to the peer as it is uploaded, or `none` (assigned, not replicated).
+    /// `pull` is refused with 400: it is not implemented and never created a
+    /// sync task (#5293).
     pub replication_mode: Option<String>,
     pub replication_schedule: Option<String>,
     /// Optional JSONB filter constraining which artifacts in the repository
@@ -132,10 +136,21 @@ pub struct SubscriptionResponse {
     pub replication_filter: Option<serde_json::Value>,
     pub last_replicated_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `active` when the subscription is enabled and its mode is replicated
+    /// (`push` or `mirror`); `inactive` otherwise, including a `pull`
+    /// subscription stored before `pull` was refused, which never replicated
+    /// anything (#5293).
+    #[schema(example = "active")]
+    pub effective: String,
 }
 
 impl From<crate::models::peer_instance::PeerRepoSubscription> for SubscriptionResponse {
     fn from(s: crate::models::peer_instance::PeerRepoSubscription) -> Self {
+        let effective = crate::services::peer_instance_service::subscription_effective_state(
+            s.sync_enabled,
+            s.replication_mode.as_deref(),
+        )
+        .to_string();
         Self {
             id: s.id,
             peer_instance_id: s.peer_instance_id,
@@ -146,6 +161,7 @@ impl From<crate::models::peer_instance::PeerRepoSubscription> for SubscriptionRe
             replication_filter: s.replication_filter,
             last_replicated_at: s.last_replicated_at,
             created_at: s.created_at,
+            effective,
         }
     }
 }
@@ -591,7 +607,7 @@ pub async fn get_assigned_repos(
     request_body = AssignRepoRequest,
     responses(
         (status = 200, description = "Repository assigned successfully"),
-        (status = 400, description = "Invalid replication_mode"),
+        (status = 400, description = "Invalid replication_mode, or `pull`, which is not implemented"),
         (status = 404, description = "Peer instance or repository not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -604,14 +620,15 @@ pub async fn assign_repo(
     Json(payload): Json<AssignRepoRequest>,
 ) -> Result<()> {
     auth.require_admin()?;
-    // An omitted `replication_mode` is valid and falls back to the column
-    // default (`pull`) in the service layer. A *present but unrecognized* value
-    // is a client error and must surface as 400, not be silently dropped (which
-    // previously produced a NULL insert and an opaque 500 DATABASE_ERROR).
+    // An omitted `replication_mode` is valid and falls back to `push` in the
+    // service layer, which also refuses `pull` (#5293). A *present but
+    // unrecognized* value is a client error and must surface as 400, not be
+    // silently dropped (which previously produced a NULL insert and an opaque
+    // 500 DATABASE_ERROR).
     let replication_mode = match payload.replication_mode.as_deref() {
         Some(s) => Some(parse_replication_mode(s).ok_or_else(|| {
             crate::error::AppError::Validation(format!(
-                "invalid replication_mode '{}' (expected one of: push, pull, mirror, none)",
+                "invalid replication_mode '{}' (expected one of: push, mirror, none)",
                 s
             ))
         })?),
@@ -1514,6 +1531,7 @@ mod tests {
             replication_filter: Some(filter.clone()),
             last_replicated_at: None,
             created_at: chrono::Utc::now(),
+            effective: "active".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["replication_filter"], filter);
@@ -1535,10 +1553,39 @@ mod tests {
             replication_filter: None,
             last_replicated_at: None,
             created_at: chrono::Utc::now(),
+            effective: "active".to_string(),
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("replication_filter").is_some());
         assert!(json["replication_filter"].is_null());
+    }
+
+    /// #5293: a `pull` subscription stored before `pull` was refused is
+    /// listed as `inactive`, so the list says it never replicates.
+    #[test]
+    fn test_subscription_response_reports_effective_state() {
+        let row = |mode: &str, enabled: bool| crate::models::peer_instance::PeerRepoSubscription {
+            id: Uuid::nil(),
+            peer_instance_id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            sync_enabled: enabled,
+            replication_mode: Some(mode.to_string()),
+            replication_schedule: None,
+            replication_filter: None,
+            last_replicated_at: None,
+            created_at: chrono::Utc::now(),
+        };
+        for (mode, enabled, expected) in [
+            ("push", true, "active"),
+            ("mirror", true, "active"),
+            ("pull", true, "inactive"),
+            ("none", true, "inactive"),
+            ("push", false, "inactive"),
+        ] {
+            let json =
+                serde_json::to_value(SubscriptionResponse::from(row(mode, enabled))).unwrap();
+            assert_eq!(json["effective"], expected, "{mode} enabled={enabled}");
+        }
     }
 
     // -----------------------------------------------------------------------
