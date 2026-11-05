@@ -267,9 +267,19 @@ pub fn record_artifact_downloads(repo_key: &str, format: &str, count: u64) {
 }
 
 /// Record a proxy-cache lookup. `result` is a stable low-cardinality
-/// string describing the outcome, used as a Prometheus label:
+/// string describing the outcome, used as a Prometheus label.
+///
+/// Both proxy fetch paths count, and a `HEAD` counts exactly like a `GET`
+/// (#5322): the buffered path (metadata documents) with the `miss_*` detail
+/// below, and the streaming path (package files, blobs, Hugging Face files,
+/// every proxied `HEAD`) with `hit`, `miss` and `negative_hit`. Before
+/// #5322 only the buffered path counted, so streamed serves never moved the
+/// counter. A cache-only probe that falls through to a fetch counts once.
 ///
 ///   * `hit` -- valid cached body returned to the caller
+///   * `miss` -- streaming path: no servable entry (absent, evicted, or stale
+///     and not revalidated), so the request went upstream
+///   * `negative_hit` -- streaming path: a cached upstream 404 was answered
 ///   * `miss_no_metadata` -- the metadata sidecar was absent (first
 ///     request for this key, OR sidecar was evicted/deleted out of band)
 ///   * `miss_expired` -- metadata loaded but `expires_at` was in the past

@@ -1653,24 +1653,49 @@ pub async fn proxy_fetch_streaming_with_disposition_and_format(
     })
 }
 
-/// Streaming fetch of `path` from a virtual member, using the member's REAL
-/// repository record so its `format` drives cache classification (#2069 bug 1)
-/// instead of the synthesized `Generic` stand-in [`build_remote_repo`] would
-/// produce. Builds a ready-to-serve [`Response`]; errors are mapped to a
-/// [`Response`] exactly as [`proxy_fetch_streaming_with_disposition`] does, so
-/// the streaming virtual-download path can detect a quarantine block via
-/// [`is_member_policy_block_response`].
-async fn proxy_fetch_streaming_member(
-    proxy_service: &ProxyService,
-    member: &Repository,
+/// HEAD sibling of [`proxy_fetch_streaming_with_disposition_and_format`]
+/// (#5322): the same response headers, built by
+/// [`ProxyService::head_artifact_streaming`], which answers a cache miss from
+/// an upstream `HEAD` instead of starting a body download the HEAD response
+/// would drop. A plain `fn` returning a boxed future so the handler futures
+/// that reach here (they sit at the compiler's layout query-depth limit) gain
+/// no state-machine level.
+#[allow(clippy::too_many_arguments)]
+pub fn proxy_head_streaming_with_disposition_and_format<'a>(
+    proxy_service: &'a ProxyService,
+    repo_id: Uuid,
+    repo_key: &'a str,
+    upstream_url: &'a str,
+    path: &'a str,
+    default_content_type: &'a str,
+    content_disposition_filename: Option<&'a str>,
+    format: RepositoryFormat,
+) -> futures::future::BoxFuture<'a, Result<Response, Response>> {
+    Box::pin(async move {
+        let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
+        streaming_fetch_response(
+            proxy_service.head_artifact_streaming(&repo, path).await,
+            repo_key,
+            path,
+            default_content_type,
+            content_disposition_filename,
+        )
+    })
+}
+
+/// Map a streaming fetch outcome to the [`Response`] the streaming helpers
+/// answer: the result through [`build_streaming_response_with_disposition`],
+/// a fetch error (or the rare malformed-header error) through
+/// [`map_proxy_error`]. A plain `fn`, so callers gain no future layer.
+#[allow(clippy::result_large_err)]
+fn streaming_fetch_response(
+    fetched: crate::error::Result<crate::services::proxy_service::StreamingFetchResult>,
+    repo_key: &str,
     path: &str,
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
 ) -> Result<Response, Response> {
-    let result = proxy_service
-        .fetch_artifact_streaming(member, path)
-        .await
-        .map_err(|e| map_proxy_error(&member.key, path, e))?;
+    let result = fetched.map_err(|e| map_proxy_error(repo_key, path, e))?;
     build_streaming_response_with_disposition(
         result,
         default_content_type,
@@ -1678,11 +1703,45 @@ async fn proxy_fetch_streaming_member(
     )
     .map_err(|e| {
         map_proxy_error(
-            &member.key,
+            repo_key,
             path,
             crate::error::AppError::Internal(e.to_string()),
         )
     })
+}
+
+/// Streaming fetch of `path` from a virtual member, using the member's REAL
+/// repository record so its `format` drives cache classification (#2069 bug 1)
+/// instead of the synthesized `Generic` stand-in [`build_remote_repo`] would
+/// produce. Builds a ready-to-serve [`Response`]; errors are mapped to a
+/// [`Response`] exactly as [`proxy_fetch_streaming_with_disposition`] does, so
+/// the streaming virtual-download path can detect a quarantine block via
+/// [`is_member_policy_block_response`].
+///
+/// `is_head` (#5322): a client HEAD is answered by
+/// [`ProxyService::head_artifact_streaming`], so a member's cache miss sends a
+/// `HEAD` upstream instead of a body download the HEAD response would drop.
+/// That future is boxed, so this function's layout grows by a pointer only.
+async fn proxy_fetch_streaming_member(
+    proxy_service: &ProxyService,
+    member: &Repository,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+    is_head: bool,
+) -> Result<Response, Response> {
+    let fetched = if is_head {
+        proxy_service.head_artifact_streaming(member, path).await
+    } else {
+        proxy_service.fetch_artifact_streaming(member, path).await
+    };
+    streaming_fetch_response(
+        fetched,
+        &member.key,
+        path,
+        default_content_type,
+        content_disposition_filename,
+    )
 }
 
 /// #1555 presigned-redirect fast path for a single virtual member: when the
@@ -1715,7 +1774,10 @@ async fn try_member_cache_redirect(
     // running the GET handler. Declining routes the HEAD onto the streaming
     // cache probe, which answers with the cached entry's real
     // `Content-Type`/`Content-Length`; a HEAD response's body is dropped
-    // unpolled, so no bytes are transferred.
+    // unpolled, so no bytes are transferred. That holds for a cached entry
+    // only: on a miss the dropped body was an upstream download that cached
+    // nothing, which is why a HEAD's member fetch goes through
+    // `ProxyService::head_artifact_streaming` instead (#5322).
     if ctx.is_head {
         return None;
     }
@@ -3675,6 +3737,7 @@ where
                             path,
                             default_content_type,
                             content_disposition_filename,
+                            ctx.is_head,
                         )
                         .await,
                     )
@@ -7065,16 +7128,36 @@ pub async fn try_remote_or_virtual_download(
         // last large-body caller for rpm / rubygems / puppet / hex /
         // huggingface / cran / ansible downloads; routing through
         // `proxy_helpers::proxy_fetch_streaming(` removes that buffering.
-        let response = proxy_fetch_streaming_with_disposition(
-            proxy,
-            repo.id,
-            &repo.key,
-            upstream_url,
-            opts.upstream_path,
-            opts.default_content_type,
-            opts.content_disposition_filename,
-        )
-        .await?;
+        //
+        // #5322: a HEAD (axum runs this GET handler for it) is answered from an
+        // upstream HEAD on a cache miss, so it no longer downloads the whole
+        // body only to drop it unread, which cached nothing and made the GET
+        // that follows download the object a second time. Keep both arms on
+        // the same synthesized repository format.
+        let response = if ctx.is_head {
+            proxy_head_streaming_with_disposition_and_format(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                opts.upstream_path,
+                opts.default_content_type,
+                opts.content_disposition_filename,
+                RepositoryFormat::Generic,
+            )
+            .await?
+        } else {
+            proxy_fetch_streaming_with_disposition(
+                proxy,
+                repo.id,
+                &repo.key,
+                upstream_url,
+                opts.upstream_path,
+                opts.default_content_type,
+                opts.content_disposition_filename,
+            )
+            .await?
+        };
         // #2270/#2260: count the proxy serve now that the catalog gives the
         // cached object a stable id. HEAD-guarded + best-effort inside.
         record_proxy_download(state, repo.id, &repo.key, opts.upstream_path, ctx).await;

@@ -4747,3 +4747,121 @@ mod catalog_registration_tests {
         assert_eq!(row.versions, vec!["main".to_string()]);
     }
 }
+
+/// #5322: `hf_hub_download` sends `HEAD` then `GET` on `/resolve/...`. On a
+/// cold Remote the HEAD used to start a full upstream GET whose body the HEAD
+/// response dropped, so nothing was cached and the GET downloaded the file
+/// again. The counting upstream in [`tdh::mount_head_and_get_once`] fails the
+/// test on any second body fetch, and on a HEAD that is not sent upstream as
+/// a HEAD.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod cold_head_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::header::{CONTENT_LENGTH, ETAG};
+    use axum::http::{HeaderMap, StatusCode};
+
+    const MODEL: &str = "acme/tiny-st";
+    const FILE_PATH: &str = "/acme/tiny-st/resolve/main/model.safetensors";
+    const COMMIT: &str = "ba316f07c0a4d8b1e5f3a6c2d9e7b4a1f0c3d5e6";
+    const ETAG_VALUE: &str = "\"ba316f07e6a1\"";
+
+    fn payload() -> Vec<u8> {
+        (0..4096u32).map(|i| (i % 253) as u8).collect()
+    }
+
+    fn header<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+        headers.get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// Mount the counting resolve upstream and drive HEAD, GET, GET through
+    /// `repo_key`'s resolve route, asserting the answers `huggingface_hub`
+    /// needs. The mock's `expect(1)`s are verified when `server` drops.
+    async fn assert_head_then_gets_fetch_once(
+        state: crate::api::SharedState,
+        cache_dir: &std::path::Path,
+        server: wiremock::MockServer,
+        repo_key: &str,
+    ) {
+        let data = payload();
+        tdh::mount_head_and_get_once(
+            &server,
+            FILE_PATH,
+            &[("etag", ETAG_VALUE), ("x-repo-commit", COMMIT)],
+            &data,
+        )
+        .await;
+        let uri = format!("/{repo_key}/{MODEL}/resolve/main/model.safetensors");
+        let [head, cold, warm] = tdh::cold_head_then_two_gets(
+            || tdh::router_anon(super::router(), state.clone()),
+            &uri,
+            cache_dir,
+            data.len() as u64,
+        )
+        .await;
+
+        assert_eq!(head.0, StatusCode::OK, "cold HEAD");
+        assert!(head.1.is_empty(), "a HEAD transfers no bytes");
+        assert_eq!(header(&head.2, ETAG.as_str()), Some(ETAG_VALUE));
+        let size = data.len().to_string();
+        assert_eq!(
+            header(&head.2, CONTENT_LENGTH.as_str()),
+            Some(size.as_str()),
+            "the cold HEAD advertises the size the GET will send"
+        );
+        assert_eq!(header(&head.2, "x-repo-commit"), Some(COMMIT));
+
+        for (label, served) in [("cold GET", &cold), ("warm GET", &warm)] {
+            assert_eq!(served.0, StatusCode::OK, "{label}");
+            assert_eq!(&served.1[..], &data[..], "{label} body");
+            assert_eq!(
+                header(&served.2, ETAG.as_str()),
+                Some(ETAG_VALUE),
+                "{label}"
+            );
+            assert_eq!(header(&served.2, "x-repo-commit"), Some(COMMIT), "{label}");
+        }
+        // Verifies one upstream HEAD and one upstream GET across all three.
+        tdh::drop_mock_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn remote_cold_head_then_get_downloads_the_body_once_5322() {
+        let Some(f) = tdh::Fixture::setup("remote", "huggingface").await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let repo_key = f.repo_key.clone();
+        assert_head_then_gets_fetch_once(state, cache.path(), server, &repo_key).await;
+        f.teardown().await;
+    }
+
+    /// The Virtual resolver's Remote-member fetch takes the same HEAD path.
+    #[tokio::test]
+    async fn virtual_remote_member_cold_head_downloads_the_body_once_5322() {
+        let Some(f) = tdh::Fixture::setup("virtual", "huggingface").await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&f.pool, "remote", "huggingface").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(server.uri())
+            .bind(member_id)
+            .execute(&f.pool)
+            .await
+            .expect("point the member at the mock upstream");
+        tdh::link_virtual_member(&f.pool, f.repo_id, member_id, 1).await;
+        tdh::publish_repo(&f.pool, member_id).await;
+        let cache = tempfile::tempdir().expect("tempdir");
+        let cache_root = cache.path().to_str().expect("utf-8 cache path");
+        let proxy = tdh::build_proxy_service_with_fs(f.pool.clone(), cache_root);
+        let state = tdh::build_state_with_proxy(f.pool.clone(), cache_root, proxy);
+
+        let repo_key = f.repo_key.clone();
+        assert_head_then_gets_fetch_once(state, cache.path(), server, &repo_key).await;
+        tdh::cleanup_member_repo(&f.pool, member_id, &member_dir).await;
+        f.teardown().await;
+    }
+}
