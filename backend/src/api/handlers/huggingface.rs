@@ -1821,7 +1821,7 @@ async fn upload_file(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, model_id, revision)): Path<(String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     upload_file_impl(state, auth, repo_key, model_id, revision, headers, body).await
 }
@@ -1831,7 +1831,7 @@ async fn upload_file_namespaced(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, namespace, name, revision)): Path<(String, String, String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     upload_file_impl(
         state,
@@ -1852,17 +1852,13 @@ async fn upload_file_impl(
     model_id: String,
     revision: String,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
     let user_id = require_auth_basic_scope(auth, "huggingface", "write:artifacts")?.user_id;
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
-
-    if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
-    }
 
     // Length ceilings (`name` is VARCHAR(512), `version` is VARCHAR(255)) plus
     // the traversal/NUL rejections, from the one helper the read paths also use
@@ -1893,10 +1889,45 @@ async fn upload_file_impl(
             .into_response());
     }
 
-    // Compute SHA256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let computed_sha256 = format!("{:x}", hasher.finalize());
+    // #5291: a declared body over `MAX_UPLOAD_SIZE` is refused before any of
+    // it is read. The stager below enforces the same cap on the bytes actually
+    // received, which covers a chunked body or a wrong header.
+    let max = state.config.max_upload_size_bytes;
+    if max != 0 && super::upload_body::declared_content_length(&headers).is_some_and(|n| n > max) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Upload exceeds the maximum allowed size of {max} bytes"),
+        )
+            .into_response());
+    }
+
+    // A published file is immutable, so a re-publish to a taken path is
+    // refused before its body is received rather than after (#5291). The
+    // authoritative check (which also sweeps a soft-deleted row) still runs
+    // below, after staging, where it always ran. A request that declares an
+    // empty body skips this probe so it keeps answering 400.
+    if super::upload_body::declared_content_length(&headers) != Some(0) {
+        reject_if_artifact_path_taken(&state.db, repo.id, &artifact_path).await?;
+    }
+
+    // #5291: stream the body to a bounded staging area (local scratch, or the
+    // repository's own backend when it streams natively), computing SHA-256
+    // as it arrives, instead of holding the whole file in memory. The stager
+    // refuses with 413 once `MAX_UPLOAD_SIZE` is crossed, and the staged copy
+    // is removed when `staged` drops, on every early return below.
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        &state,
+        &repo,
+        body.into_data_stream(),
+    )
+    .await?;
+
+    if staged.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty file body").into_response());
+    }
+
+    let computed_sha256 = digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
@@ -1906,10 +1937,19 @@ async fn upload_file_impl(
     )
     .await?;
 
+    // Same quota preflight and cross-repository write guard as the buffered
+    // `put_artifact_bytes` this replaces, then the staged bytes are streamed
+    // (or copied server-side) to the final key and the staging copy released.
     let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
-    proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
-
-    let size_bytes = body.len() as i64;
+    proxy_helpers::put_staged_body(
+        &state,
+        &repo,
+        super::publish_quota::PublishAt::StorageKey(&storage_key),
+        &storage_key,
+        staged,
+        &digests,
+    )
+    .await?;
 
     let metadata = serde_json::json!({
         "model_id": model_id,
@@ -1996,6 +2036,30 @@ async fn upload_file_impl(
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_string(&response).unwrap()))
         .unwrap())
+}
+
+/// Refuse with the upload route's 409 when a live artifact already sits at
+/// `artifact_path`. Read-only: unlike
+/// [`proxy_helpers::ensure_unique_artifact_path`] it never sweeps a
+/// soft-deleted row, so it can run before the body has been received (#5291).
+#[allow(clippy::result_large_err)]
+async fn reject_if_artifact_path_taken(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> Result<(), Response> {
+    let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(artifact_path)
+    .fetch_optional(db)
+    .await
+    .map_err(super::db_err)?;
+    match existing {
+        Some(_) => Err((StatusCode::CONFLICT, "File already exists at this path").into_response()),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2497,6 +2561,278 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5291: hosted uploads stream to storage instead of being buffered.
+    // -----------------------------------------------------------------------
+
+    /// Small `MAX_UPLOAD_SIZE` the #5291 size tests run against.
+    const TEST_MAX_UPLOAD: u64 = 64;
+
+    /// A fixture whose state carries `TEST_MAX_UPLOAD` as its upload cap.
+    async fn small_limit_fixture() -> Option<tdh::Fixture> {
+        let mut f = tdh::Fixture::setup("local", "huggingface").await?;
+        f.state = tdh::build_state_with(f.pool.clone(), f.storage_dir.to_str().unwrap(), |cfg| {
+            cfg.max_upload_size_bytes = TEST_MAX_UPLOAD
+        });
+        Some(f)
+    }
+
+    fn upload_request(
+        repo_key: &str,
+        model: &str,
+        filename: &str,
+        body: Body,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{repo_key}/api/models/{model}/upload/main"))
+            .header("x-filename", filename)
+            .body(body)
+            .unwrap()
+    }
+
+    async fn artifact_count(f: &tdh::Fixture) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .fetch_one(&f.pool)
+            .await
+            .expect("count artifacts")
+    }
+
+    /// The fixture repository's storage backend, resolved from its stored
+    /// row as the upload handler resolves it.
+    async fn fixture_storage(
+        f: &tdh::Fixture,
+    ) -> std::sync::Arc<dyn crate::storage::StorageBackend> {
+        let repo = resolve_huggingface_repo(&f.state.db, &f.repo_key)
+            .await
+            .expect("repo");
+        f.state
+            .storage_for_repo(&repo.storage_location())
+            .expect("storage")
+    }
+
+    /// Upload staging files left under the fixture's staging root. Skipped
+    /// (empty) when the staging root is overridden by the environment, since
+    /// that directory is shared with every other test.
+    fn leftover_staging_files(f: &tdh::Fixture) -> Vec<String> {
+        if std::env::var_os("AK_UPLOAD_STAGING_DIR").is_some()
+            || std::env::var_os("AK_INCUS_UPLOAD_TMP_DIR").is_some()
+        {
+            return Vec::new();
+        }
+        let root = crate::api::handlers::incus::staging_root(f.storage_dir.to_str().unwrap());
+        std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| crate::api::handlers::incus::is_staging_file(n))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A body over `MAX_UPLOAD_SIZE`, sent with no `Content-Length` and in
+    /// several chunks, is cut off while streaming with 413: no artifact row,
+    /// no stored object and no staging file is left behind.
+    #[tokio::test]
+    async fn upload_over_max_upload_size_streamed_is_413_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let chunks: Vec<Result<Bytes, std::io::Error>> = (0..5)
+            .map(|_| Ok(Bytes::from(vec![b'a'; TEST_MAX_UPLOAD as usize / 4])))
+            .collect();
+        let req = upload_request(
+            &f.repo_key,
+            "big-model",
+            "weights.bin",
+            Body::from_stream(futures::stream::iter(chunks)),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        let stored = fixture_storage(&f)
+            .await
+            .exists("huggingface/big-model/main/weights.bin")
+            .await
+            .unwrap_or(false);
+        let leftovers = leftover_staging_files(&f);
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "got {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            String::from_utf8_lossy(&body).contains(&TEST_MAX_UPLOAD.to_string()),
+            "the 413 names the configured limit"
+        );
+        assert_eq!(count, 0, "a refused upload records no artifact row");
+        assert!(!stored, "a refused upload stores no object");
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
+    /// A declared `Content-Length` over `MAX_UPLOAD_SIZE` is refused up front.
+    #[tokio::test]
+    async fn upload_declared_length_over_max_upload_size_is_413_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let content = vec![b'a'; TEST_MAX_UPLOAD as usize + 1];
+        let mut req = upload_request(
+            &f.repo_key,
+            "big-model",
+            "weights.bin",
+            Body::from(content.clone()),
+        );
+        req.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&content.len().to_string()).unwrap(),
+        );
+        let (status, _) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(count, 0);
+    }
+
+    /// A body of exactly `MAX_UPLOAD_SIZE` is accepted, and an empty body is
+    /// still a 400.
+    #[tokio::test]
+    async fn upload_at_max_upload_size_is_stored_and_empty_is_400_5291() {
+        let Some(f) = small_limit_fixture().await else {
+            return;
+        };
+        let req = upload_request(
+            &f.repo_key,
+            "edge-model",
+            "exact.bin",
+            Body::from(vec![b'z'; TEST_MAX_UPLOAD as usize]),
+        );
+        let (exact, _) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let req = upload_request(&f.repo_key, "edge-model", "empty.bin", Body::empty());
+        let (empty, empty_body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(exact, StatusCode::OK);
+        assert_eq!(empty, StatusCode::BAD_REQUEST);
+        assert_eq!(&empty_body[..], b"Empty file body");
+        assert_eq!(count, 1);
+    }
+
+    /// A multi-chunk upload is stored byte for byte, and the sha256 and size
+    /// in the response and on the artifact row are those of the bytes sent.
+    #[tokio::test]
+    async fn upload_streams_body_and_records_its_sha256_5291() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        // ~1.5 MiB in uneven chunks, so the staging and storage copies both
+        // span several reads.
+        let content: Vec<u8> = (0..(3 * 512 * 1024 + 17))
+            .map(|i: u32| (i % 251) as u8)
+            .collect();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = content
+            .chunks(100_003)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let req = upload_request(
+            &f.repo_key,
+            "acme/streamed",
+            "model.gguf",
+            Body::from_stream(futures::stream::iter(chunks)),
+        );
+        let (status, body) = tdh::send(f.router_with_auth(super::router()), req).await;
+        let stored = fixture_storage(&f)
+            .await
+            .get("huggingface/acme/streamed/main/model.gguf")
+            .await;
+        let row: Option<(i64, String)> = sqlx::query_as(
+            "SELECT size_bytes, checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .bind("acme/streamed/main/model.gguf")
+        .fetch_optional(&f.pool)
+        .await
+        .expect("artifact row");
+        let leftovers = leftover_staging_files(&f);
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "upload failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let want_sha = format!("{:x}", Sha256::digest(&content));
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(json["message"], "File uploaded successfully");
+        assert_eq!(json["path"], "acme/streamed/main/model.gguf");
+        assert_eq!(json["sha256"], want_sha.as_str());
+        assert_eq!(json["size"], content.len() as i64);
+        let stored = stored.expect("stored object");
+        assert!(stored.as_ref() == content.as_slice(), "stored bytes differ");
+        assert_eq!(row, Some((content.len() as i64, want_sha)));
+        assert!(leftovers.is_empty(), "staging files leaked: {leftovers:?}");
+    }
+
+    /// A published file is immutable: a second upload to the same path is a
+    /// 409, whether or not the bytes differ, and the first file's bytes stay.
+    #[tokio::test]
+    async fn upload_republish_to_taken_path_is_409_5291() {
+        let Some(f) = tdh::Fixture::setup("local", "huggingface").await else {
+            return;
+        };
+        let send = |body: &'static [u8]| {
+            let req = upload_request(&f.repo_key, "frozen", "config.json", Body::from(body));
+            tdh::send(f.router_with_auth(super::router()), req)
+        };
+        let (first, _) = send(b"{\"v\":1}").await;
+        let (different, different_body) = send(b"{\"v\":2}").await;
+        let (same, _) = send(b"{\"v\":1}").await;
+        let stored = fixture_storage(&f)
+            .await
+            .get("huggingface/frozen/main/config.json")
+            .await;
+        let count = artifact_count(&f).await;
+        f.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(different, StatusCode::CONFLICT);
+        assert_eq!(&different_body[..], b"File already exists at this path");
+        assert_eq!(same, StatusCode::CONFLICT);
+        assert_eq!(stored.expect("stored").as_ref(), b"{\"v\":1}");
+        assert_eq!(count, 1);
+    }
+
+    /// #5291 ratchet: the upload handlers take the request body as a stream,
+    /// never as a buffered `Bytes` extractor.
+    #[test]
+    fn upload_handlers_take_a_streamed_body_5291() {
+        let source = include_str!("huggingface.rs");
+        for name in ["upload_file", "upload_file_namespaced", "upload_file_impl"] {
+            let start = source
+                .find(&format!("async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let signature = &source[start..];
+            let signature = &signature[..signature.find(") -> Result").expect("signature end")];
+            assert!(
+                signature.contains("body: Body,"),
+                "{name} must take the body as axum::body::Body"
+            );
+            assert!(
+                !signature.contains("Bytes"),
+                "{name} must not buffer the upload body as Bytes"
+            );
+        }
     }
 
     /// #4725: a HuggingFace file upload to a hosted repository must queue a
