@@ -2055,12 +2055,11 @@ fn build_delivery_request_headers(inputs: &DeliveryHeaderInputs<'_>) -> Vec<(Str
         );
         out.push(("X-ArtifactKeeper-Signature".into(), sig_header));
     }
+    // The legacy header carries no timestamp, so it signs the body alone
+    // (#5234); the timestamped form lives only in the `v1=` token above.
     if let Some(current) = inputs.secrets.first() {
-        let legacy_sig = crate::services::webhook_signing::compute_v1_signature(
-            current,
-            inputs.unix_secs,
-            inputs.body_bytes,
-        );
+        let legacy_sig =
+            crate::services::webhook_signing::compute_legacy_signature(current, inputs.body_bytes);
         out.push((
             "X-Webhook-Signature".into(),
             format!("sha256={}", legacy_sig),
@@ -3721,16 +3720,21 @@ mod tests {
         let mut inputs = sample_inputs(&secret_refs, body);
         inputs.unix_secs = unix_secs;
         let h = build_delivery_request_headers(&inputs);
-        // The legacy header is HMAC over body alone (no timestamp prefix).
+        // The legacy header is HMAC over body alone (no timestamp prefix),
+        // so a receiver holding only this header can verify it (#5234).
+        // Literal computed out-of-band:
+        // printf '%s' 'hello world' | openssl dgst -sha256 -hmac whsec_test
         let legacy = header(&h, "X-Webhook-Signature").unwrap();
-        let expected_legacy = format!(
-            "sha256={}",
-            crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body)
+        assert_eq!(
+            legacy,
+            "sha256=a3ea78f3992b9c14cb5f03dfc734e3ac8846b716e277bb2b1826079fdceec34a"
         );
-        assert_eq!(legacy, expected_legacy);
-        // The v2 header includes the same hex token.
+        // The v1= token is still over "<t>.<body>", so it differs from the
+        // legacy value.
         let v2 = header(&h, "X-ArtifactKeeper-Signature").unwrap();
-        assert!(v2.contains(&legacy[7..]));
+        let v1 = crate::services::webhook_signing::compute_v1_signature(secret, unix_secs, body);
+        assert_eq!(v2, format!("t={unix_secs},v1={v1}"));
+        assert!(!v2.contains(&legacy[7..]));
     }
 
     #[test]
@@ -3764,8 +3768,10 @@ mod tests {
     /// #921 regression pin: the complete header set a `signing_mode = hmac`
     /// webhook sends, byte for byte, as it was before asymmetric signing
     /// existed. The expected values are literals (HMAC-SHA256 computed
-    /// out-of-band over `"1700000000.<body>"`), not re-derived through the
-    /// code under test, so any drift in names, order, or token layout fails.
+    /// out-of-band: `v1=` over `"1700000000.<body>"`, the legacy
+    /// `X-Webhook-Signature` over `<body>` alone since #5234), not
+    /// re-derived through the code under test, so any drift in names,
+    /// order, or token layout fails.
     #[test]
     fn delivery_headers_hmac_mode_are_byte_identical_to_pre_v2_wire() {
         let secret_refs = ["whsec_current", "whsec_previous"];
@@ -3776,6 +3782,7 @@ mod tests {
         let h = build_delivery_request_headers(&inputs);
         let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
         let prev = "725598b0de63a47dc2a201da3fa6ac232f9d56ffa4ee9f9fb86ad5a1df0d6926";
+        let legacy = "4586d3971c966d41554b224a7fe762e2638266efe34320caebe19967f969c776";
         let nil = "00000000-0000-0000-0000-000000000000";
         let expected: Vec<(String, String)> = [
             ("Content-Type", "application/json".to_string()),
@@ -3791,7 +3798,7 @@ mod tests {
                 "X-ArtifactKeeper-Signature",
                 format!("t=1700000000,v1={cur},v1={prev}"),
             ),
-            ("X-Webhook-Signature", format!("sha256={cur}")),
+            ("X-Webhook-Signature", format!("sha256={legacy}")),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -6523,13 +6530,14 @@ mod tests {
             let inputs = super::sample_inputs(&refs, body);
             let h = build_delivery_request_headers(&inputs);
             let cur = "e63b1d3ddaa5c2696fc1f76f142509e122f6baa6c55fd010482b060a858f7017";
+            let legacy = "4586d3971c966d41554b224a7fe762e2638266efe34320caebe19967f969c776";
             assert_eq!(
                 super::header(&h, "X-ArtifactKeeper-Signature"),
                 Some(format!("t=1700000000,v1={cur}").as_str())
             );
             assert_eq!(
                 super::header(&h, "X-Webhook-Signature"),
-                Some(format!("sha256={cur}").as_str())
+                Some(format!("sha256={legacy}").as_str())
             );
         }
 
