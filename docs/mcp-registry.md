@@ -2054,8 +2054,8 @@ process never runs it: it holds no database or storage credentials and talks
 to the backend only through the worker API.
 
 ```text
-ak-mcp-introspector run [--sandbox] [--once] [--poll-secs 30]
-    AK_URL, AK_MCP_INTROSPECTOR_TOKEN (mcp:introspect), AK_MCP_INTROSPECTOR_ID
+ak-mcp-introspector run [--sandbox] [--once] [--poll-secs 30] --token-file <path | ->
+    AK_URL, AK_MCP_INTROSPECTOR_TOKEN_FILE (mcp:introspect), AK_MCP_INTROSPECTOR_ID
 ak-mcp-introspector probe <url>                      # one probe, printed; no backend
 ak-mcp-introspector convert --from <inventory> <file> # print a report body
 ak-mcp-introspector push --from <inventory> --repo <key> --server <name> --version <v> <file>
@@ -2063,6 +2063,14 @@ ak-mcp-introspector push --from <inventory> --repo <key> --server <name> --versi
 ak-mcp-introspector render-sandbox <job.json>         # print the guest spec and runner command
 ak-mcp-introspector sandbox-probe <job.json>          # run that guest for real, print the result
 ```
+
+The token is read from `--token-file` (`AK_MCP_INTROSPECTOR_TOKEN_FILE`; `-`
+reads it from standard input, as the reference systemd unit passes it).
+`--token` / `AK_MCP_INTROSPECTOR_TOKEN` still work but log a warning: a value
+in the environment is readable in `/proc/<pid>/environ` by every process of
+the worker's user. The worker makes itself non-dumpable at startup, so
+neither its environment nor its memory can be read by another process of
+that user.
 
 `sandbox-probe` needs no backend: it runs the job document with the
 configured runner and prints the probe result. It exits `0` only for
