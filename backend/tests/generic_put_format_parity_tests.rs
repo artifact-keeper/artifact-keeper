@@ -588,6 +588,7 @@ fn primary_package_entry(primary: &str) -> String {
 /// at one-second precision, so two uploads that straddle a second boundary
 /// render different pages for the same package (#5365). The time is when the
 /// bytes arrived, not something the upload route derives from the package.
+#[allow(dead_code)]
 fn without_upload_time(html: &str) -> String {
     const ATTR: &str = "data-upload-time=\"";
     let mut out = String::with_capacity(html.len());
@@ -1082,6 +1083,8 @@ async fn generic_put_wheel_matches_native_pypi_upload() {
         )
         .await;
     assert_success("native PyPI upload", &resp);
+    // Negative check for #5365: straddle a second boundary.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let resp = ctx.generic_put(&generic, &path, &wheel, None).await;
     assert_created("generic PUT of the wheel", &resp);
 
@@ -1114,7 +1117,7 @@ async fn generic_put_wheel_matches_native_pypi_upload() {
         assert_eq!(status, StatusCode::OK, "simple index in {}", repo.key);
         let html = text(&body);
         assert!(html.contains("data-upload-time=\""), "{html}");
-        indexes.push(without_key(&without_upload_time(&html), &repo.key));
+        indexes.push(without_key(&html, &repo.key));
     }
     let (native_html, generic_html) = (&indexes[0], &indexes[1]);
     assert!(generic_html.contains(&file), "{generic_html}");
