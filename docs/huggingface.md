@@ -128,6 +128,12 @@ revision describes `main` (or, for a model never published to `main`, its
 newest revision), and an unknown revision answers 404 with
 `X-Error-Code: RevisionNotFound`, as the Hub does.
 
+On a Remote, the `HEAD` that `hf_hub_download` sends before its `GET` is
+answered from the cache when the file is cached, and otherwise from a `HEAD`
+to the Hub, so a new file is downloaded from the Hub once, by the `GET` that
+follows. If the Hub refuses the `HEAD`, the request is served as a `GET`
+would be. The same applies to a Remote member of a Virtual repository.
+
 ## Publishing to a Local repository
 
 `huggingface_hub`'s `upload_file` / `upload_folder` / `create_commit` use the

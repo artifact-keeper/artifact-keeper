@@ -1563,6 +1563,60 @@ pub async fn drop_mock_server(server: wiremock::MockServer) {
     drop(server);
 }
 
+/// #5322: mount a counting upstream for `path` on `server`. A `HEAD` is
+/// answered with `headers` and a `Content-Length` of `body` (no body), a `GET`
+/// with `headers` and `body`. Each mock expects exactly ONE request, verified
+/// when `server` is dropped, so a test that sends a HEAD and two GETs proves
+/// the body left the upstream once and the HEAD was answered by a HEAD.
+pub async fn mount_head_and_get_once(
+    server: &wiremock::MockServer,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) {
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mut head =
+        ResponseTemplate::new(200).insert_header("content-length", body.len().to_string().as_str());
+    let mut get = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    for (name, value) in headers {
+        head = head.insert_header(*name, *value);
+        get = get.insert_header(*name, *value);
+    }
+    Mock::given(method("HEAD"))
+        .and(wm_path(path))
+        .respond_with(head)
+        .expect(1)
+        .named("upstream HEAD")
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path(path))
+        .respond_with(get)
+        .expect(1)
+        .named("upstream GET of the body")
+        .mount(server)
+        .await;
+}
+
+/// #5322: the `hf_hub_download` request shape against a cold Remote: `HEAD
+/// uri`, then `GET uri`, then (once the proxy cache has committed the body)
+/// `GET uri` again. Returns the three `(status, body, headers)` answers.
+/// `app` builds a fresh router per request, as `oneshot` consumes it.
+pub async fn cold_head_then_two_gets(
+    app: impl Fn() -> Router,
+    uri: &str,
+    cache_dir: &std::path::Path,
+    body_len: u64,
+) -> [(StatusCode, Bytes, axum::http::HeaderMap); 3] {
+    let head_answer = send_with_headers(app(), head(uri.to_string())).await;
+    let cold_get = send_with_headers(app(), get(uri.to_string())).await;
+    wait_for_cache_commit(cache_dir, body_len).await;
+    let warm_get = send_with_headers(app(), get(uri.to_string())).await;
+    [head_answer, cold_get, warm_get]
+}
+
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".
 ///
 /// `Mutability::write_ttl_secs` stamps an immutable entry with ~10 years and a
