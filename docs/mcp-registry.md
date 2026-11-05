@@ -586,7 +586,15 @@ One decision function (`decide_mcp_serve`) answers every read:
 - **`404` plain** is byte for byte the answer for a name that does not exist:
   `{"detail":"Server not found","status":404,"title":"Not Found","type":"about:blank"}`
   with the same headers. A reader cannot tell a held version from a missing
-  one.
+  one by the answer. Timing is narrowed, not closed: a miss (unknown name or
+  version) runs the same repository-level gate reads a held version's
+  refusal runs (the server.json download gate, the serve policy, the deny
+  list, Remote curation and the server age gate) before it answers, and the
+  refusal audit is written off the response path. A held version still also
+  reads its backing-package gates (about one lookup per pinned package), so
+  a caller timing many requests may still tell a held version that pins
+  packages from a missing one. Where that matters, keep such names out of
+  repositories readers can query.
 - A **repository holder** (an administrator, or a user with read on the
   repository through a grant, with a credential scoped to it; the same
   predicate as `GET /api/v1/quarantine/{id}`) gets an RFC 9457 body with

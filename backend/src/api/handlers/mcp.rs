@@ -1774,6 +1774,7 @@ pub(crate) async fn walk_candidates(
             .collect()
     };
     if candidates.is_empty() {
+        miss_shaped_work(state, repo, name, version).await;
         return Ok(CandidateWalk::NotFound);
     }
     let policy_now = current_policy(&state.db, repo.id).await;
@@ -1820,6 +1821,33 @@ pub(crate) async fn walk_candidates(
         audit_refusal(&state.db, auth, repo, row, hold_class, audience);
     }
     Ok(CandidateWalk::Refused(resp))
+}
+
+/// The gate-shaped reads a miss runs before it answers (#5396), so a name or
+/// version that does not exist costs about what a held one does: the
+/// package policy, the server.json's own download gate (for an artifact that
+/// does not exist), the repository's serve policy and its repository-level
+/// holds (deny list, Remote curation, server age gate) for the requested
+/// `name@version`. Results are discarded, nothing is recorded (no age-gate
+/// review, no audit). What a held version still does on top (one lookup per
+/// pinned backing package) is the residual documented in
+/// docs/mcp-registry.md.
+async fn miss_shaped_work(state: &SharedState, repo: &RepoInfo, name: &str, version: &str) {
+    #[cfg(test)]
+    MISS_SHAPED_WORK.with(|n| n.set(n.get() + 1));
+    let _ = current_policy(&state.db, repo.id).await;
+    let ctx = GateCtx::of(state, false);
+    let _ = own_hold(ctx.db, Uuid::nil()).await;
+    if let Ok(policy) = mcp_curation::load_serve_policy(ctx.db, repo.id).await {
+        let _ =
+            mcp_curation::repo_holds(ctx, &policy, repo.id, &[(Uuid::nil(), name, version)]).await;
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many misses ran [`miss_shaped_work`] on this thread.
+    static MISS_SHAPED_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether `row` is the newest servable version among `all` (every version
@@ -6571,6 +6599,41 @@ mod tests {
         );
         let (_, b, _) = env.get(env.member(), "/servers?version=latest").await;
         assert!(listed_names(&json(&b)).is_empty(), "{}", json(&b));
+        env.teardown().await;
+    }
+
+    /// #5396: a miss (unknown name, unknown version, `latest` of an unknown
+    /// name) runs the gate-shaped reads a held version's refusal runs before
+    /// it answers the unknown-name `404`; a read that has candidates does
+    /// not run them again.
+    #[tokio::test]
+    async fn a_miss_runs_the_gate_shaped_work_of_a_held_read() {
+        let Some(env) = Env::new().await else { return };
+        assert_eq!(
+            env.publish(&doc("com.acme/t", "1.0.0", serde_json::json!({})))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let held = env.server_artifact("com.acme/t", "1.0.0").await;
+        env.hold(held, Some("quarantined")).await;
+        let count = || MISS_SHAPED_WORK.with(|n| n.get());
+        let before = count();
+        for tail in [
+            "/servers/com.acme%2Fnone/versions/1.0.0",
+            "/servers/com.acme%2Fnone/versions/latest",
+            "/servers/com.acme%2Ft/versions/9.9.9",
+        ] {
+            let (s, _, _) = env.get(env.member(), tail).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{tail}");
+        }
+        assert_eq!(count() - before, 3, "every miss ran the gate-shaped work");
+        let before = count();
+        let (s, _, _) = env
+            .get(env.member(), "/servers/com.acme%2Ft/versions/1.0.0")
+            .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(count(), before, "a held read decides its candidate instead");
         env.teardown().await;
     }
 }
