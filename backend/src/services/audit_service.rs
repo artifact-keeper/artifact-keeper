@@ -324,6 +324,10 @@ pub enum AuditAction {
     McpMirrorSynced,
     /// An MCPB bundle's signature did not verify and the upload was refused. (#5253).
     McpBundleSignatureRejected,
+    /// An administrator applied a config-as-code document (#5292). One
+    /// summary row per `mode=apply`; each write it made also records its own
+    /// per-repository row.
+    ConfigImported,
 }
 
 impl AuditAction {
@@ -459,6 +463,7 @@ impl AuditAction {
             AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
             AuditAction::CacheSeeded => "CACHE_SEEDED",
             AuditAction::UpstreamFetched => "UPSTREAM_FETCHED",
+            AuditAction::ConfigImported => "CONFIG_IMPORTED",
         }
     }
 }
@@ -1915,6 +1920,7 @@ mod proxy_scan_blocked_4777_tests {
         assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
         assert_eq!(AuditAction::UpstreamFetched.as_str(), "UPSTREAM_FETCHED");
+        assert_eq!(AuditAction::ConfigImported.as_str(), "CONFIG_IMPORTED");
     }
 
     /// #5253: the MCP registry vocabulary is a published contract

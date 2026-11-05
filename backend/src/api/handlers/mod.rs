@@ -397,6 +397,7 @@ mod gitlfs_download_auth_tests;
 mod proxy_origin_policy_tests;
 
 pub mod admin;
+pub mod admin_config;
 pub mod admin_security;
 pub mod age_gate;
 pub mod agent_plugins;
