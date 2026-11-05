@@ -17,6 +17,15 @@ impl TestCa {
             KeyUsagePurpose::DigitalSignature,
         ];
         let key = KeyPair::generate().unwrap();
+        // Distinct issuer names avoid ambiguous/self-issued chains in OpenSSL;
+        // rcgen otherwise gives roots and leaves the same default subject.
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            format!(
+                "CA reload test {}",
+                hex::encode(&Sha256::digest(key.public_key_raw())[..8])
+            ),
+        );
         let cert = params.self_signed(&key).unwrap();
         Self {
             pem: cert.pem(),
@@ -226,7 +235,7 @@ async fn ca_rotation_updates_retained_clones_and_replaces_a_live_pool() {
 }
 
 #[tokio::test]
-async fn removing_a_root_discards_cached_tls13_sessions() {
+async fn removing_a_root_discards_cached_rustls_tls13_sessions() {
     let a = TestCa::new();
     let b = TestCa::new();
     // Closing each connection forces a fresh TLS handshake instead of HTTP pooling.
@@ -236,7 +245,17 @@ async fn removing_a_root_discards_cached_tls13_sessions() {
     let path = dir.path().join("bundle.pem");
     publish(&path, &a.pem);
     let manager = manager(path.clone());
-    let client = register(&manager);
+    // Pin the backend whose TLS 1.3 session cache this regression verifies.
+    // The other rotation tests keep reqwest's default TLS backend.
+    let client = manager
+        .register(Arc::new(|| {
+            reqwest::Client::builder()
+                .tls_backend_rustls()
+                .no_proxy()
+                .http1_only()
+                .timeout(Duration::from_secs(3))
+        }))
+        .unwrap();
     let fixed: Client = client.current().into();
 
     assert!(succeeds(&client, &server_a).await);
