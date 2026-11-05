@@ -5034,6 +5034,11 @@ pub struct ScanTarget<'a> {
     /// `false` (hosted upload scans, inline file formats, unit tests) keeps
     /// prior behavior exactly.
     pub require_nonempty_catalog: bool,
+    /// The owning repository's format (`repositories.format`, e.g.
+    /// `huggingface`), when the caller knows it. Hosted upload scans set it;
+    /// `None` (inline proxy scans, unit tests) makes format-gated scanners
+    /// such as the model-file scanner (#5285) not applicable.
+    pub repository_format: Option<&'a str>,
 }
 
 /// The package ecosystem an [`ExpectedComponent`] belongs to. Selects both the
@@ -9114,7 +9119,13 @@ mod construction {
             // wheel contains libwebp 1.3.2" into a CVE finding (#4043).
             let dep_scanner: Arc<dyn Scanner> =
                 Arc::new(DependencyScanner::new(advisory_client).with_db(db.clone()));
-            let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
+            // #5285: the model-file scanner is in-process and needs no engine,
+            // so it is always registered; it applies only to model files in
+            // huggingface and mlmodel repositories.
+            let mut scanners: Vec<Arc<dyn Scanner>> = vec![
+                dep_scanner,
+                Arc::new(crate::services::model_file_scanner::ModelFileScanner::new()),
+            ];
             let incus_capability = IncusScannerCapability::from_config(incus_scanner_enabled);
 
             // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
@@ -9445,6 +9456,7 @@ impl ScannerService {
             manifest_body: None,
             expected_component: expected,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -9473,6 +9485,7 @@ impl ScannerService {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -9717,6 +9730,8 @@ impl ScannerService {
             // `None` for every format that is not pinned.
             expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
+            // #5285: the model-file scanner applies by repository format.
+            repository_format: Some(repository_format.as_str()),
         };
         let mut catalog_set = CatalogSetTally::default();
         let expects_catalog = upload_expects_catalog(
@@ -11930,6 +11945,7 @@ mod tests {
             manifest_body: Some(&manifest),
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         };
 
         for (mode, trivy_url, trivy_adapter_url) in [
@@ -11992,6 +12008,7 @@ mod tests {
             manifest_body: Some(&manifest),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         for (mode, trivy_url, trivy_adapter_url) in [
@@ -14328,6 +14345,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(oci_target_is_scannable_image(&target));
     }
@@ -14348,6 +14366,7 @@ mod tests {
             manifest_body: Some(HELM_OCI_MANIFEST_BODY),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(!oci_target_is_scannable_image(&target));
     }
@@ -19836,6 +19855,7 @@ tonic-build = "0.12"
                 manifest_body: None,
                 expected_component: Some(&pin),
                 require_nonempty_catalog: false,
+                repository_format: None,
             };
 
             let out = scanner
@@ -19930,6 +19950,7 @@ tonic-build = "0.12"
                 manifest_body: None,
                 expected_component: Some(&pin),
                 require_nonempty_catalog: false,
+                repository_format: None,
             };
             let out = scanner
                 .scan_target(&target, None, &content)
@@ -27055,6 +27076,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         }
     }
 
@@ -27106,6 +27128,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: Some(expected),
             require_nonempty_catalog: false,
+            repository_format: None,
         }
     }
 
@@ -27543,6 +27566,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         }
     }
 
@@ -28420,6 +28444,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -28446,6 +28471,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));

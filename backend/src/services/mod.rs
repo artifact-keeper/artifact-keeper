@@ -80,6 +80,7 @@ pub mod mcpb;
 pub mod metadata_checker;
 pub mod migration_service;
 pub mod migration_worker;
+pub mod model_file_scanner;
 pub mod nexus_client;
 pub mod npm_attestation_cache;
 pub mod npm_packument_cache;
