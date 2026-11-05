@@ -111,7 +111,7 @@ async fn sort_by_size_asc_vs_desc_flips_head_hit() {
             limit: Some(10),
             public_only: false,
             accessible_repo_ids: Some(vec![repo_id]),
-            hidden_artifact_ids: None,
+            mcp_served_only: None,
             sort_by: Some("size".to_string()),
             sort_order: Some("asc".to_string()),
             ..Default::default()
@@ -129,7 +129,7 @@ async fn sort_by_size_asc_vs_desc_flips_head_hit() {
             limit: Some(10),
             public_only: false,
             accessible_repo_ids: Some(vec![repo_id]),
-            hidden_artifact_ids: None,
+            mcp_served_only: None,
             sort_by: Some("size".to_string()),
             sort_order: Some("desc".to_string()),
             ..Default::default()
@@ -201,7 +201,7 @@ async fn sort_by_size_asc_orders_full_result_set() {
             limit: Some(10),
             public_only: false,
             accessible_repo_ids: Some(vec![repo_id]),
-            hidden_artifact_ids: None,
+            mcp_served_only: None,
             sort_by: Some("size".to_string()),
             sort_order: Some("asc".to_string()),
             ..Default::default()

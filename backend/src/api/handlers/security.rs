@@ -1729,20 +1729,20 @@ async fn list_scans_served(
         }
     }
     let svc = ScanResultService::new(state.db.clone());
-    let hidden = match repository_id {
+    let served_only = match repository_id {
         Some(repo) => {
-            crate::api::handlers::search::mcp_hidden_artifacts(state, auth, Some(&[repo])).await?
+            crate::api::handlers::search::mcp_served_only_fresh(state, auth, Some(&[repo])).await?
         }
         None => None,
     };
-    match hidden {
-        Some(hidden) => {
-            svc.list_scans_hiding(
+    match served_only {
+        Some(served_only) => {
+            svc.list_scans_served_only(
                 repository_id,
                 artifact_id,
                 status,
                 scan_type,
-                &hidden,
+                &served_only,
                 offset,
                 limit,
             )
