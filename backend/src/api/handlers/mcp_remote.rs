@@ -2232,4 +2232,70 @@ mod tests {
             .is_empty());
         env.teardown().await;
     }
+
+    /// #5422: `POST /api/v1/curation/repos/{key}/sync` on a Remote MCP
+    /// registry starts the same background pass as `POST .../mcp/sync`: `202`
+    /// at once with `succeeded: true` meaning "started" and the status URL; a
+    /// second trigger while it runs is `409`; the pass completes.
+    #[tokio::test]
+    async fn curation_sync_trigger_runs_the_pass_in_the_background() {
+        let Some(env) = Env::new().await else { return };
+        sqlx::query("UPDATE repositories SET visibility = 'public' WHERE id = $1")
+            .bind(env.fx.repo_id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/v0.1/servers"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(page(vec![entry(
+                        server("io.github.acme/cur", "1.0.0", serde_json::json!({})),
+                        T1,
+                    )]))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&env.upstream)
+            .await;
+        let app = Router::new()
+            .nest("/c", crate::api::handlers::curation::router())
+            .with_state(env.state.clone())
+            .layer(Extension(env.admin.clone()));
+        let post = || async {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/c/repos/{}/sync", env.fx.repo_key))
+                .body(Body::empty())
+                .unwrap();
+            let (s, bytes, _) = tdh::send_with_headers(app.clone(), req).await;
+            (
+                s,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        };
+        let before = env.settled().await;
+        let started = std::time::Instant::now();
+        let (s, b) = post().await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the trigger waited for the pass: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            (b["triggered"].as_bool(), b["succeeded"].as_bool()),
+            (Some(true), Some(true)),
+            "{b}"
+        );
+        assert_eq!(
+            b["status_url"],
+            format!("/api/v1/repositories/{}/mcp/sync", env.fx.repo_key)
+        );
+        let (s, b) = post().await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        let st = env.finished_after(&before).await;
+        assert_eq!(st["lastSummary"]["pages"], 1, "{st}");
+        assert_eq!(st["lastSummary"]["namesNew"], 1, "{st}");
+        env.teardown().await;
+    }
 }

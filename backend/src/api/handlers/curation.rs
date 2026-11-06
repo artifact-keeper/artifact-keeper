@@ -345,12 +345,21 @@ pub struct PackageSearchQuery {
 pub struct SyncTriggerResponse {
     /// The repository key the sync was triggered for.
     pub repository: String,
-    /// Always true when the trigger was accepted and a sync pass ran.
+    /// Always true when the trigger was accepted.
     pub triggered: bool,
-    /// Whether the sync pass completed without error. A false value with
-    /// `triggered = true` means the pass ran but an upstream fetch/verify step
-    /// failed for the repo (details are in the server logs, not this response).
+    /// Staging repository (`200`): whether the sync pass completed without
+    /// error; `false` means the pass ran but an upstream fetch/verify step
+    /// failed (details are in the server logs, not this response).
+    ///
+    /// Remote MCP registry (`202`, #5422): the pass runs in the background,
+    /// so this only says it STARTED (always `true` on a `202`). Its outcome
+    /// is read from `status_url` (`lastError`, `lastSummary` once `running`
+    /// is `false`).
     pub succeeded: bool,
+    /// Remote MCP registry only: where to poll the background pass
+    /// (`GET /api/v1/repositories/{key}/mcp/sync`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -789,7 +798,9 @@ fn sync_tenant_access_allowed(repo_is_public: bool, has_repo_grant: bool) -> boo
     operation_id = "trigger_curation_sync",
     params(("repo_key" = String, Path, description = "Staging repository key")),
     responses(
-        (status = 200, body = SyncTriggerResponse),
+        (status = 200, body = SyncTriggerResponse, description = "Staging repository: the pass ran"),
+        (status = 202, body = SyncTriggerResponse, description = "Remote MCP registry: the pass started in the background; poll `status_url` (#5422)"),
+        (status = 409, description = "Remote MCP registry: a pass is already running, or scheduled upstream jobs are paused"),
         (status = 403, description = "Not authorized to trigger a sync for this repo"),
         (status = 404, description = "Repository not found"),
     ),
@@ -799,7 +810,7 @@ async fn trigger_sync(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(repo_key): Path<String>,
-) -> Result<Json<SyncTriggerResponse>, AppError> {
+) -> Result<(StatusCode, Json<SyncTriggerResponse>), AppError> {
     // Global capability (#2357 S5): admin, or an API token carrying the
     // admin-mintable `trigger:sync` scope. `has_scope` is true for JWT sessions,
     // so the `is_api_token` guard keeps a session user from gaining the
@@ -840,6 +851,34 @@ async fn trigger_sync(
         )));
     }
 
+    // #5253 / #5422: a Remote MCP registry syncs its upstream catalog, in the
+    // background like `POST .../mcp/sync` (#5405): a pass of a large registry
+    // outlasts the request timeout. A refusal to start (a pass already runs,
+    // upstream jobs paused) is the MCP route's error; a started pass answers
+    // `202` with `succeeded: true` meaning "started".
+    if repo.format == crate::models::repository::RepositoryFormat::Mcp {
+        let info = crate::api::handlers::proxy_helpers::resolve_repo_by_key(
+            &state.db,
+            &repo.key,
+            &["mcp"],
+            "an MCP registry",
+        )
+        .await
+        .map_err(|_| AppError::Validation("not an MCP registry".into()))?;
+        let started = crate::services::mcp_remote::start_sync(&state, info).await;
+        audit_sync_trigger(&state, &auth, &repo, started.is_ok(), true).await;
+        started.map_err(crate::api::handlers::mcp_remote::sync_error)?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(SyncTriggerResponse {
+                status_url: Some(format!("/api/v1/repositories/{}/mcp/sync", repo.key)),
+                repository: repo.key,
+                triggered: true,
+                succeeded: true,
+            }),
+        ));
+    }
+
     // Run one sync pass for this repo. The pass applies the bounded-decompress
     // (#2556) and GPG-verify-before-ingest (#2357 S4) hardening. Upstream errors
     // are logged and surfaced as `succeeded = false`, not propagated, so the
@@ -847,34 +886,39 @@ async fn trigger_sync(
     // `abort: None` — this operator-invoked single-repo pass is not guarded
     // by the `curation_sync` scheduler lease, so there is no lease-loss token
     // to observe (#3502).
-    // #5253: a Remote MCP registry syncs its upstream catalog instead.
-    let sync_result = if repo.format == crate::models::repository::RepositoryFormat::Mcp {
-        match crate::api::handlers::proxy_helpers::resolve_repo_by_key(
-            &state.db,
-            &repo.key,
-            &["mcp"],
-            "an MCP registry",
-        )
-        .await
-        {
-            Ok(info) => crate::services::mcp_remote::sync_repo(&state, &info)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string().into()),
-            Err(_) => Err("not an MCP registry".into()),
-        }
-    } else {
+    let sync_result =
         crate::services::scheduler_service::run_curation_sync_cycle(&state.db, Some(repo.id), None)
-            .await
-    };
+            .await;
     let succeeded = sync_result.is_ok();
     if let Err(ref e) = sync_result {
         tracing::warn!("Manual curation sync for repo {} failed: {}", repo.key, e);
     }
 
-    // Audit (#2357 S7). Details carry only the repo key + outcome — never
-    // upstream credentials or response text (WI-7). Fire-and-forget: an audit
-    // write failure must not mask a completed sync trigger.
+    audit_sync_trigger(&state, &auth, &repo, succeeded, false).await;
+
+    Ok((
+        StatusCode::OK,
+        Json(SyncTriggerResponse {
+            repository: repo.key,
+            triggered: true,
+            succeeded,
+            status_url: None,
+        }),
+    ))
+}
+
+/// Audit a sync trigger (#2357 S7). Details carry only the repo key and the
+/// outcome, never upstream credentials or response text (WI-7). For a
+/// background pass (`background: true`, #5422) `succeeded` says whether the
+/// pass started. Fire-and-forget: an audit write failure must not mask a
+/// completed sync trigger.
+async fn audit_sync_trigger(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    succeeded: bool,
+    background: bool,
+) {
     let _ = AuditService::new(state.db.clone())
         .log(
             AuditEntry::new(AuditAction::CurationSyncTriggered, ResourceType::Repository)
@@ -885,15 +929,10 @@ async fn trigger_sync(
                 .details(serde_json::json!({
                     "repo_key": repo.key,
                     "succeeded": succeeded,
+                    "background": background,
                 })),
         )
         .await;
-
-    Ok(Json(SyncTriggerResponse {
-        repository: repo.key,
-        triggered: true,
-        succeeded,
-    }))
 }
 
 #[utoipa::path(
@@ -2258,7 +2297,7 @@ mod tests {
         )
         .await;
         assert!(ok.is_ok(), "admin trigger must succeed: {ok:?}");
-        assert!(ok.unwrap().triggered);
+        assert!(ok.unwrap().1.triggered);
 
         let audits = tdh::audit_count(&pool, staging, "CURATION_SYNC_TRIGGERED").await;
         assert_eq!(
