@@ -3802,12 +3802,18 @@ async fn authorized_virtual_members(
 /// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
 /// upstream HTTP path. Handlers reach for this via the inline call
 /// site, not directly through the public API.
+///
+/// `is_head` (#5343): the caller answers a client `HEAD`, so a Remote member's
+/// cache miss is answered from an upstream `HEAD` (a `RemoteStream` with an
+/// empty body and the GET's headers) rather than a layer download the HEAD
+/// would drop unread.
 pub async fn resolve_virtual_blob(
     state: &SharedState,
     auth: Option<&crate::api::middleware::auth::AuthExtension>,
     repo_id: Uuid,
     image_name: &str,
     digest: &str,
+    is_head: bool,
 ) -> Option<VirtualBlobResolution> {
     let cache_key = VirtualResolveKey::new(repo_id, VirtualResolveKind::Blob, image_name, digest);
 
@@ -3875,6 +3881,7 @@ pub async fn resolve_virtual_blob(
                         &upstream_path,
                         expected_checksum.clone(),
                         member.format.clone(),
+                        is_head,
                     )
                     .await
                     {
@@ -5012,11 +5019,17 @@ fn remote_blob_cache_path(repo: &OciRepoInfo, digest: &str) -> Option<String> {
     Some(upstream_blob_path(&image, digest))
 }
 
+///
+/// `is_head` (#5343): `handle_head_blob` answers a cold blob from an upstream
+/// `HEAD` (empty body, the GET's headers) instead of opening a layer download
+/// its dropped body would leave uncached, so the pull that follows downloads
+/// the layer once.
 async fn try_upstream_fetch_streaming_blob_with_range(
     repo: &OciRepoInfo,
     state: &SharedState,
     digest: &str,
     range_header: Option<&str>,
+    is_head: bool,
 ) -> Option<Response> {
     let upstream_path = remote_blob_cache_path(repo, digest)?;
     let upstream_url = repo.upstream_url.as_ref()?;
@@ -5035,6 +5048,7 @@ async fn try_upstream_fetch_streaming_blob_with_range(
         &upstream_path,
         &upstream_path,
         RepositoryFormat::Docker,
+        is_head,
     )
     .await
     .ok()?;
@@ -6343,7 +6357,7 @@ async fn handle_head_blob(
         // member's bytes.
         let auth = virtual_caller_auth(claims.as_ref());
         if let Some(resolution) =
-            resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest).await
+            resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest, true).await
         {
             return match resolution {
                 VirtualBlobResolution::Local {
@@ -6418,7 +6432,7 @@ async fn handle_head_blob(
     // lazy and never polled, so HEAD transfers nothing while advertising the
     // exact headers the matching GET would.
     if let Some(response) =
-        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, None).await
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, None, true).await
     {
         let (parts, _body) = response.into_parts();
         return Response::from_parts(parts, Body::empty());
@@ -6584,6 +6598,7 @@ impl BlobRepair {
                 &self.upstream_path,
                 self.digest.strip_prefix("sha256:").map(str::to_string),
                 RepositoryFormat::Docker,
+                false,
             )
             .await
             .map_err(|response| {
@@ -6887,7 +6902,7 @@ async fn handle_get_blob(
         // member's bytes.
         let auth = virtual_caller_auth(claims.as_ref());
         if let Some(resolution) =
-            resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest).await
+            resolve_virtual_blob(state, auth.as_ref(), repo.id, &repo.image, digest, false).await
         {
             return match resolution {
                 VirtualBlobResolution::Local {
@@ -6984,7 +6999,8 @@ async fn handle_get_blob(
         }
     }
     if let Some(resp) =
-        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, range_header).await
+        try_upstream_fetch_streaming_blob_with_range(&repo, state, digest, range_header, false)
+            .await
     {
         return resp;
     }
@@ -20294,10 +20310,11 @@ mod remote_blob_streaming_fallback_tests {
             if i == 1 {
                 tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
             }
-            let resp =
-                super::try_upstream_fetch_streaming_blob_with_range(&repo, &state, &digest, None)
-                    .await
-                    .expect("large blob must stream with 200, not 502");
+            let resp = super::try_upstream_fetch_streaming_blob_with_range(
+                &repo, &state, &digest, None, false,
+            )
+            .await
+            .expect("large blob must stream with 200, not 502");
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(
                 resp.headers()
@@ -20395,6 +20412,7 @@ mod remote_blob_streaming_fallback_tests {
             &state,
             &digest,
             Some("bytes=16-31"),
+            false,
         )
         .await
         .expect("cold remote blob must stream");
@@ -20412,6 +20430,7 @@ mod remote_blob_streaming_fallback_tests {
             &state,
             &digest,
             Some("bytes=-8"),
+            false,
         )
         .await
         .expect("warm remote blob must stream from cache");
@@ -20742,9 +20761,10 @@ mod virtual_blob_streaming_fallback_tests {
             if i == 1 {
                 tdh::wait_for_cache_commit(&tmp, layer.len() as u64).await;
             }
-            let resolution = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest)
-                .await
-                .expect("large virtual-member layer must stream (200), not 502");
+            let resolution =
+                super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false)
+                    .await
+                    .expect("large virtual-member layer must stream (200), not 502");
             let (status, dcd, body) = render_and_collect(resolution, &digest).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(dcd.as_deref(), Some(digest.as_str()));
@@ -20809,8 +20829,9 @@ mod virtual_blob_streaming_fallback_tests {
         link_member(&pool, virt_id, member_id, 1).await;
 
         let throttled =
-            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
-        let retried = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false).await;
+        let retried =
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false).await;
 
         let served = match retried {
             Some(resolution) => Some(render_and_collect(resolution, &digest).await),
@@ -20866,8 +20887,10 @@ mod virtual_blob_streaming_fallback_tests {
         let (virt_id, _) = insert_virtual_repo(&pool).await;
         link_member(&pool, virt_id, member_id, 1).await;
 
-        let first = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
-        let second = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest).await;
+        let first =
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false).await;
+        let second =
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false).await;
         let upstream_requests = server.received_requests().await.unwrap_or_default().len();
 
         cleanup(&pool, &[virt_id, member_id]).await;
@@ -20929,9 +20952,10 @@ mod virtual_blob_streaming_fallback_tests {
         link_member(&pool, virt_id, member_a, 1).await;
         link_member(&pool, virt_id, member_b, 2).await;
 
-        let resolution = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest)
-            .await
-            .expect("must fall through the 404 member to the one that serves the blob");
+        let resolution =
+            super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false)
+                .await
+                .expect("must fall through the 404 member to the one that serves the blob");
         let (status, dcd, got) = render_and_collect(resolution, &digest).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(dcd.as_deref(), Some(digest.as_str()));
@@ -20984,9 +21008,10 @@ mod virtual_blob_streaming_fallback_tests {
         link_member(&pool, virt_id, member_id, 1).await;
 
         for _ in 0..2 {
-            let resolution = super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest)
-                .await
-                .expect("a 200 member still resolves (bytes served, client verifies digest)");
+            let resolution =
+                super::resolve_virtual_blob(&state, None, virt_id, "myimage", &digest, false)
+                    .await
+                    .expect("a 200 member still resolves (bytes served, client verifies digest)");
             // Fully drain so the tee's background writer runs its digest gate
             // (mismatch -> delete object, no metadata sidecar).
             let (_status, _dcd, drained) = render_and_collect(resolution, &digest).await;
@@ -21139,6 +21164,120 @@ mod virtual_blob_streaming_fallback_tests {
         drop(server);
         cleanup(&pool, &[virt_id, member_id]).await;
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #5343: `docker pull`, containerd and skopeo `HEAD` a layer before they
+    /// `GET` it. Send that pair, then a warm GET once the proxy cache has
+    /// committed, for a Remote layer reached through `image_name`, and assert
+    /// the layer left the upstream once: one upstream `HEAD`, one body `GET`.
+    /// Before, the HEAD opened a layer download whose dropped stream cached
+    /// nothing, so the pull downloaded the layer again. Returns the HEAD.
+    async fn assert_cold_blob_head_fetches_once(
+        pool: sqlx::PgPool,
+        server: MockServer,
+        image_name: &str,
+        layer: &[u8],
+    ) -> (StatusCode, bytes::Bytes, HeaderMap) {
+        let digest = format!("sha256:{}", sha256_hex(layer));
+        let upstream_path = format!("/v2/myimage/blobs/{digest}");
+        tdh::mount_head_and_get_once(
+            &server,
+            &upstream_path,
+            &[("content-type", "application/octet-stream")],
+            layer,
+        )
+        .await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_str().unwrap();
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), root);
+        let state = tdh::build_state_with_proxy(pool, root, proxy);
+        let (base, headers) = ("http://localhost", anon_headers());
+
+        let head = tdh::collect_response(
+            super::handle_head_blob(&state, &headers, base, image_name, &digest).await,
+        )
+        .await;
+        let cold = tdh::collect_response(
+            super::handle_get_blob(&state, &headers, base, image_name, &digest).await,
+        )
+        .await;
+        tdh::wait_for_cache_commit(tmp.path(), layer.len() as u64).await;
+        let warm = tdh::collect_response(
+            super::handle_get_blob(&state, &headers, base, image_name, &digest).await,
+        )
+        .await;
+
+        for (which, answer) in [("cold", &cold), ("warm", &warm)] {
+            assert_eq!(answer.0, StatusCode::OK, "{which} GET");
+            assert!(answer.1[..] == layer[..], "{which} GET body");
+        }
+        let seen: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == upstream_path)
+            .map(|r| r.method.to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            ["HEAD", "GET"],
+            "cold HEAD then pull must reach the upstream as one HEAD and one layer GET"
+        );
+        tdh::drop_mock_server(server).await;
+        assert_eq!(head.0, StatusCode::OK, "HEAD");
+        assert!(head.1.is_empty(), "HEAD must have no body");
+        assert_eq!(
+            tdh::header_str(&head.2, CONTENT_LENGTH),
+            Some(layer.len().to_string())
+        );
+        assert_eq!(
+            tdh::header_str(
+                &head.2,
+                axum::http::HeaderName::from_static("docker-content-digest")
+            ),
+            Some(digest)
+        );
+        head
+    }
+
+    #[tokio::test]
+    async fn remote_cold_blob_head_downloads_the_layer_once_5343() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let (remote_id, remote_key) = insert_remote_repo(&pool, &server.uri()).await;
+        let layer: Vec<u8> = (0..8192u32).map(|i| (i % 229) as u8).collect();
+        assert_cold_blob_head_fetches_once(
+            pool.clone(),
+            server,
+            &format!("{remote_key}/myimage"),
+            &layer,
+        )
+        .await;
+        cleanup(&pool, &[remote_id]).await;
+    }
+
+    /// #5343: the same through a Virtual whose Remote member holds the layer.
+    #[tokio::test]
+    async fn virtual_remote_member_cold_blob_head_downloads_the_layer_once_5343() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = MockServer::start().await;
+        let (member_id, _) = insert_remote_repo(&pool, &server.uri()).await;
+        let (virt_id, virt_key) = insert_virtual_repo(&pool).await;
+        link_member(&pool, virt_id, member_id, 1).await;
+        let layer: Vec<u8> = (0..8192u32).map(|i| (i % 227) as u8).collect();
+        assert_cold_blob_head_fetches_once(
+            pool.clone(),
+            server,
+            &format!("{virt_key}/myimage"),
+            &layer,
+        )
+        .await;
+        cleanup(&pool, &[virt_id, member_id]).await;
     }
 
     /// #3605: `handle_head_blob` on a DIRECT remote repo for an UNCACHED layer

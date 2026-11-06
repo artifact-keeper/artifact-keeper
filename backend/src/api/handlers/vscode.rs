@@ -2895,6 +2895,7 @@ async fn proxy_gallery_asset(
         source.cache_path,
         source.default_content_type,
         RepositoryFormat::Vscode,
+        ctx.is_some_and(|c| c.is_head),
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -3051,6 +3052,7 @@ impl proxy_helpers::ScannedProxyFile for VscodeScannedPackage<'_> {
             req.cache_path,
             self.default_content_type,
             RepositoryFormat::Vscode,
+            req.is_head(),
         )
         .await
     }
@@ -4180,6 +4182,7 @@ async fn download_vsix(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm

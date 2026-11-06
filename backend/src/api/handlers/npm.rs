@@ -5145,15 +5145,32 @@ async fn serve_tarball(
                         upstream_url,
                         RepositoryFormat::Npm,
                     );
-                    proxy
-                        .fetch_artifact_streaming_with_cache_path_gated_digest(
-                            &gated_repo,
-                            &source_path,
-                            &fetch_path,
-                            tarball_upstream.integrity,
-                        )
-                        .await
-                        .map_err(IntoResponse::into_response)?
+                    // #5343: a HEAD's miss is answered from an upstream HEAD
+                    // of the tarball, so the GET that follows downloads it
+                    // once; the integrity gate rides along for the fall-back
+                    // GET of an upstream that refuses HEAD.
+                    let fetched = if ctx.is_head {
+                        proxy
+                            .head_artifact_streaming_with_cache_path(
+                                &gated_repo,
+                                &source_path,
+                                &fetch_path,
+                                tarball_upstream.integrity.map(
+                                    crate::services::proxy_service::ExpectedCommitDigest::Resolved,
+                                ),
+                            )
+                            .await
+                    } else {
+                        proxy
+                            .fetch_artifact_streaming_with_cache_path_gated_digest(
+                                &gated_repo,
+                                &source_path,
+                                &fetch_path,
+                                tarball_upstream.integrity,
+                            )
+                            .await
+                    };
+                    fetched.map_err(IntoResponse::into_response)?
                 }
             };
 
@@ -5354,6 +5371,7 @@ async fn serve_tarball(
                             &lkg_path,
                             &lkg_path,
                             member.format.clone(),
+                            ctx.is_head,
                         )
                         .await?;
                         correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
@@ -6012,6 +6030,7 @@ impl proxy_helpers::ScannedProxyFile for NpmScannedTarball<'_> {
             req.source_path,
             req.cache_path,
             RepositoryFormat::Npm,
+            req.is_head(),
         )
         .await?;
         correct_cached_tarball_content_type(&state.db, req.repo_id, req.cache_path).await;
@@ -19654,6 +19673,34 @@ mod content_encoding_forwarding_tests {
         assert!(
             resp.headers().get(CONTENT_ENCODING).is_none(),
             "an uncoded serve must not have a coding manufactured for it",
+        );
+    }
+
+    /// #5343: a cold `HEAD` of a Remote tarball (the direct-Remote
+    /// `serve_tarball` arm) is answered from an upstream `HEAD`, so the
+    /// tarball leaves the upstream once across HEAD, GET and a warm GET, and
+    /// the HEAD keeps the tarball's forced `Content-Type`.
+    #[tokio::test]
+    async fn test_remote_npm_cold_head_downloads_the_tarball_once_5343() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: Vec<u8> = (0..4096u32).map(|i| (i % 239) as u8).collect();
+        let uri = format!("/{}/head-pkg/-/head-pkg-1.0.0.tgz", fx.repo_key);
+        let head = tdh::assert_cold_head_fetches_body_once(
+            fx,
+            wiremock::MockServer::start().await,
+            super::router,
+            true,
+            "/head-pkg/-/head-pkg-1.0.0.tgz",
+            &uri,
+            &[("content-type", "application/octet-stream")],
+            &tarball,
+        )
+        .await;
+        assert_eq!(
+            tdh::header_str(&head, CONTENT_TYPE).as_deref(),
+            Some(NPM_TARBALL_CONTENT_TYPE)
         );
     }
 

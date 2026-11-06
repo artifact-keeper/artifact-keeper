@@ -2617,6 +2617,7 @@ impl proxy_helpers::ScannedProxyFile for NugetScannedPackage<'_> {
             req.cache_path,
             "application/octet-stream",
             RepositoryFormat::Nuget,
+            req.is_head(),
         )
         .await
     }
@@ -2764,6 +2765,7 @@ async fn proxy_v2_download(
         &cache_path,
         "application/octet-stream",
         RepositoryFormat::Nuget,
+        ctx.is_head,
     )
     .await
     .inspect_err(upstream_failure(
@@ -2830,6 +2832,7 @@ async fn proxy_v3_flatcontainer(
             &cache_path,
             "application/octet-stream",
             RepositoryFormat::Nuget,
+            ctx.is_some_and(|c| c.is_head),
         )
         .await
         .inspect_err(upstream_failure(

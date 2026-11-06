@@ -13144,6 +13144,7 @@ pub async fn download_artifact(
                     &fetch_path,
                     "application/octet-stream",
                     cache_format,
+                    dl_ctx.is_head,
                 )
                 .await
                 {

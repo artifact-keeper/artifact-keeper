@@ -2169,6 +2169,7 @@ async fn download(
                         &cache_path,
                         expected_cksum,
                         RepositoryFormat::Cargo,
+                        ctx.is_head,
                     )
                     .await?;
 
@@ -2614,6 +2615,7 @@ impl proxy_helpers::ScannedProxyFile for CargoScannedCrate<'_> {
             req.cache_path,
             self.expected_cksum.map(str::to_string),
             RepositoryFormat::Cargo,
+            req.is_head(),
         )
         .await?;
         Ok(streamed_crate_response(
