@@ -2016,6 +2016,94 @@ async fn refuse_denied_name(db: &PgPool, repo: &RepoInfo, name: &str) -> Result<
     Ok(())
 }
 
+/// The stored server name a publish of `name` into the hosted repository
+/// `repo_id` would be a case-only twin of (#5434): a recorded name equal to
+/// `name` ignoring letter case but not equal exactly, when `name` itself was
+/// never recorded there. `None` when the publish may proceed.
+///
+/// Names are read from the version ledger `mcp_version_tombstones`, which
+/// records every server name the repository ever stored (live, soft-deleted,
+/// trashed or purged; only a never-served failed version is released), so a
+/// deleted name still blocks its look-alikes. A name already recorded is
+/// never refused, even when a twin of it was stored before this rule.
+///
+/// Case folding is [`OwnedNames::key`](super::mcp_virtual::OwnedNames::key)
+/// in Rust and `lower()` in SQL, as the Virtual's hosted-shadows-remote rule
+/// (#5394) compares names; server names are ASCII (`NAME_RE`), where this
+/// agrees with the deny lists' ASCII-insensitive globs. Indexed by
+/// `idx_mcp_version_tombstones_name_ci` (migration 336).
+pub(super) async fn case_twin_of<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT t.name FROM mcp_version_tombstones t \
+         WHERE t.repository_id = $1 AND lower(t.name) = $2 AND t.name <> $3 \
+           AND NOT EXISTS (SELECT 1 FROM mcp_version_tombstones e \
+                           WHERE e.repository_id = $1 AND e.name = $3) \
+         ORDER BY t.created_at, t.name LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(super::mcp_virtual::OwnedNames::key(name))
+    .bind(name)
+    .fetch_optional(db)
+    .await
+}
+
+fn name_case_conflict(name: &str, existing: String) -> Response {
+    mcp_error(McpError::NameCaseConflict {
+        name: name.to_string(),
+        existing,
+    })
+}
+
+/// The early, unlocked [`case_twin_of`] refusal (`409
+/// mcp_name_case_conflict`), before a publish does any resolution or
+/// storage work. [`refuse_case_only_twin_in`] is the authoritative check.
+pub(super) async fn refuse_case_only_twin(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<(), Response> {
+    match case_twin_of(db, repo_id, name).await.map_err(internal)? {
+        Some(existing) => Err(name_case_conflict(name, existing)),
+        None => Ok(()),
+    }
+}
+
+/// The authoritative case-only-twin refusal, inside the publish
+/// transaction: take the case-insensitive name lock, then look. Two
+/// concurrent publishes of `io.acme/tool` and `io.Acme/tool` take the same
+/// lock, so the second sees the first's committed ledger row and is refused.
+///
+/// Lock order: the caller holds the quota admission and nothing MCP-specific
+/// yet; this lock is taken before the per-server [`lock_server`] (taken by
+/// [`recompute_latest_in`] later in the same transaction) and only on the
+/// hosted publish path. It lives in the two-key advisory space, so it can
+/// never collide with a single-key `lock_server` hash.
+pub(super) async fn refuse_case_only_twin_in(
+    tx: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<(), Response> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mcp-name-ci'), hashtext($1))")
+        .bind(format!(
+            "mcp-name-ci/{repo_id}/{}",
+            super::mcp_virtual::OwnedNames::key(name)
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    match case_twin_of(&mut *tx, repo_id, name)
+        .await
+        .map_err(internal)?
+    {
+        Some(existing) => Err(name_case_conflict(name, existing)),
+        None => Ok(()),
+    }
+}
+
 /// Insert the server.json row, its metadata and the OCI retention holds in
 /// one quota-admitted transaction: a version whose metadata could not be
 /// written must not exist (it would be invisible yet block a republish).
@@ -2038,6 +2126,9 @@ pub(super) async fn insert_server_rows(
         artifact.size_bytes,
     )
     .await?;
+    // A hosted publish never adds a case-only twin of a recorded name
+    // (#5434); `insert_server_rows` is the hosted publish's insert only.
+    refuse_case_only_twin_in(&mut tx, repository_id, &name).await?;
     let artifact_id = match proxy_helpers::insert_artifact_row(&mut tx, artifact).await {
         Ok(id) => id,
         Err(resp) => {
@@ -2281,6 +2372,7 @@ async fn publish_server(
         .map_err(mcp_error)?;
     let mut server = admit_document(&body, &settings).map_err(mcp_error)?;
     name_write_gates(&state, &ext, &repo, &server.name, &headers).await?;
+    refuse_case_only_twin(&state.db, repo.id, &server.name).await?;
     super::mcp_write::add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
         .await?;
     fmt::check_installable(&server).map_err(mcp_error)?;

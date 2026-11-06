@@ -376,9 +376,9 @@ fn issue(e: &McpError) -> serde_json::Value {
         | McpError::BundleSignatureRequired { index, .. }
         | McpError::PackageVersionUnpinned { index }
         | McpError::OciNotAnImage { index } => ("semantic", format!("packages[{index}]")),
-        McpError::ReservedNamespace { .. } | McpError::NamespaceNotAllowed { .. } => {
-            ("semantic", "name".to_string())
-        }
+        McpError::ReservedNamespace { .. }
+        | McpError::NamespaceNotAllowed { .. }
+        | McpError::NameCaseConflict { .. } => ("semantic", "name".to_string()),
         McpError::VersionExists => ("semantic", "version".to_string()),
         _ => ("semantic", String::new()),
     };
@@ -540,6 +540,21 @@ async fn validate(
                 .map_err(|e| McpError::Internal(e.to_string()))?
         {
             return Err(McpError::VersionExists);
+        }
+        // A hosted registry refuses a case-only twin of a recorded name
+        // (#5434); a holder learns of it here as the publish would answer.
+        if scope.version_taken
+            && super::proxy_helpers::reject_write_if_not_hosted(&repo.repo_type).is_ok()
+        {
+            let twin = surface::case_twin_of(&state.db, repo.id, &server.name)
+                .await
+                .map_err(|e| McpError::Internal(e.to_string()))?;
+            if let Some(existing) = twin {
+                return Err(McpError::NameCaseConflict {
+                    name: server.name.clone(),
+                    existing,
+                });
+            }
         }
         if !scope.packages {
             fmt::check_installable(&server)?;
@@ -3364,6 +3379,170 @@ mod tests {
             (s, b["error"].as_str()),
             (StatusCode::CONFLICT, Some("mcp_version_exists"))
         );
+        env.teardown().await;
+    }
+
+    /// The rows of `repo_id` stored under exactly `name`.
+    async fn rows_named(pool: &PgPool, repo_id: Uuid, name: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name = $2")
+            .bind(repo_id)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// #5434: a hosted publish of a case-only twin of a recorded name is
+    /// `409 mcp_name_case_conflict` naming the stored name, and stores
+    /// nothing; `/validate` reports it to a holder; the same name publishes
+    /// into another registry; a name recorded only in the ledger (deleted
+    /// and purged) still blocks its twins.
+    #[tokio::test]
+    async fn case_only_twin_of_a_recorded_name_is_refused() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let first = doc("io.acme/tool", "1.0.0", serde_json::json!([]));
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&first))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        for twin in ["io.Acme/tool", "IO.ACME/TOOL", "io.acme/Tool"] {
+            let d = doc(twin, "2.0.0", serde_json::json!([]));
+            let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (StatusCode::CONFLICT, Some("mcp_name_case_conflict")),
+                "{twin}: {b}"
+            );
+            let detail = b["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("'io.acme/tool'"), "{twin}: {b}");
+            assert_eq!(rows_named(&env.fx.pool, env.fx.repo_id, twin).await, 0);
+            let (s, b) = env.json(env.admin(), "POST", "/validate", Some(&d)).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(b["valid"], false, "{twin}: {b}");
+            assert_eq!(b["issues"][0]["reference"], "mcp_name_case_conflict", "{b}");
+        }
+        // Another registry holds no `io.acme/tool`: the twin is a new name there.
+        let (other_id, other_key) = env.repo("local", "mcp").await;
+        tdh::grant_repo_access(&env.fx.pool, other_id, env.fx.user_id).await;
+        let twin = doc("io.Acme/tool", "1.0.0", serde_json::json!([]));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{other_key}/v0.1/publish"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&twin).unwrap()))
+            .unwrap();
+        let (s, b) = tdh::send(env.member(), req).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(rows_named(&env.fx.pool, other_id, "io.Acme/tool").await, 1);
+        // A name only the ledger remembers (its versions purged) still
+        // blocks its look-alikes.
+        sqlx::query(
+            "INSERT INTO mcp_version_tombstones (repository_id, name, version) \
+             VALUES ($1, 'io.gone/tool', '1.0.0')",
+        )
+        .bind(env.fx.repo_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let d = doc("io.Gone/tool", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_name_case_conflict")),
+            "{b}"
+        );
+        assert!(b["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'io.gone/tool'"));
+        env.teardown().await;
+    }
+
+    /// #5434: a stored name keeps publishing even when a case-only twin of
+    /// it was stored before the rule (seeded directly: publish now refuses
+    /// it). Neither stored spelling is renamed; a third spelling is refused.
+    #[tokio::test]
+    async fn stored_case_twins_keep_publishing_new_versions() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let d = doc("io.acme/kept", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let path = fmt::storage_path("io.Acme/kept", "1.0.0");
+        super::super::proxy_helpers::insert_artifact(
+            &env.fx.pool,
+            super::super::proxy_helpers::NewArtifact {
+                repository_id: env.fx.repo_id,
+                path: &path,
+                name: "io.Acme/kept",
+                version: "1.0.0",
+                size_bytes: 2,
+                checksum_sha256: &"e".repeat(64),
+                content_type: "application/json",
+                storage_key: &path,
+                uploaded_by: env.fx.user_id,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seed the stored twin"));
+        for name in ["io.Acme/kept", "io.acme/kept"] {
+            let d = doc(name, "1.1.0", serde_json::json!([]));
+            let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+            assert_eq!(s, StatusCode::OK, "{name}: {b}");
+            assert_eq!(rows_named(&env.fx.pool, env.fx.repo_id, name).await, 2);
+        }
+        let d = doc("io.ACME/kept", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_name_case_conflict")),
+            "{b}"
+        );
+        env.teardown().await;
+    }
+
+    /// #5434: two concurrent publishes of case-only twins into an empty
+    /// registry serialise on the case-insensitive name lock: exactly one is
+    /// stored, the other is `409 mcp_name_case_conflict`.
+    #[tokio::test]
+    async fn concurrent_case_twins_publish_exactly_one() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        for round in 0..4 {
+            let lower = format!("io.race{round}/tool");
+            let upper = format!("io.Race{round}/tool");
+            let (a, b) = (
+                doc(&lower, "1.0.0", serde_json::json!([])),
+                doc(&upper, "1.0.0", serde_json::json!([])),
+            );
+            let ((sa, ba), (sb, bb)) = tokio::join!(
+                env.json(env.member(), "POST", "/publish", Some(&a)),
+                env.json(env.member(), "POST", "/publish", Some(&b)),
+            );
+            let mut statuses = [sa, sb];
+            statuses.sort();
+            assert_eq!(
+                statuses,
+                [StatusCode::OK, StatusCode::CONFLICT],
+                "round {round}: {ba} / {bb}"
+            );
+            let loser = if sa == StatusCode::CONFLICT { &ba } else { &bb };
+            assert_eq!(loser["error"], "mcp_name_case_conflict", "{loser}");
+            let stored: i64 = sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT name) FROM mcp_version_tombstones \
+                 WHERE repository_id = $1 AND lower(name) = $2",
+            )
+            .bind(env.fx.repo_id)
+            .bind(&lower)
+            .fetch_one(&env.fx.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, 1, "round {round}");
+        }
         env.teardown().await;
     }
 

@@ -803,6 +803,79 @@ with one exception: a live version whose package resolution failed (never
 served) is released by a republish of it (see
 [Packages in a Remote backing repository](#packages-in-a-remote-backing-repository)).
 
+### Server names that differ only in letter case
+
+A Local or Staging registry refuses to publish a server name that differs
+only in letter case from a name it already holds (#5434): with
+`io.acme/tool` stored, a publish of `io.Acme/tool` (or `IO.ACME/TOOL`)
+answers `409 mcp_name_case_conflict`, and the `detail` names the stored
+spelling (`server name 'io.Acme/tool' differs only in letter case from
+'io.acme/tool', which this registry already holds; ...`). Nothing is
+stored. The rule stops a look-alike name being published next to an
+existing server in the same registry.
+
+- **Comparison:** the whole name, ignoring letter case, folded the way the
+  deny lists, the namespace allowlist and a Virtual's
+  [hosted-shadows-remote](#virtual-repositories) rule fold it. Server names
+  are ASCII, so this is plain `A`-`Z` to `a`-`z`.
+- **Per registry:** only names in the same registry count. The same name
+  publishes into another registry.
+- **Existing names are kept:** a stored name is never renamed, and a
+  publish of the exact stored spelling is accepted as before, also when a
+  case-only twin of it was stored before this rule: both spellings keep
+  publishing new versions. Only a new spelling is refused.
+- **Deleted names still count:** "already holds" means recorded in the
+  [tombstone ledger](#tombstones), so a name whose versions were all
+  soft-deleted or purged still blocks its case twins. The look-alike is the
+  risk whether or not the original is still served, and the original's
+  publisher can come back to it. The one exception is the ledger's own: a
+  name whose only version failed package resolution (never served) and was
+  released is no longer recorded.
+- **Concurrency:** the check runs inside the publish transaction under an
+  advisory lock on the lowercased name, so two concurrent publishes of
+  `io.acme/tool` and `io.Acme/tool` into an empty registry cannot both
+  succeed: one is stored, the other is `409`.
+- **Scope:** hosted publish only. An admin edit cannot change a name, a
+  Remote mirrors upstream names as they are, and a Virtual collapses twins
+  across members as described under
+  [Virtual repositories](#virtual-repositories). Promotion and peer
+  replication copy names as they are (#5435). `POST /validate` reports the conflict
+  to a repository holder (`reference: "mcp_name_case_conflict"`).
+
+Upstream context: the official registry accepts case-only twins today and
+treats that as a defect; modelcontextprotocol/registry#1805 proposes the
+same rule (refuse new case-only aliases, keep existing names exactly).
+
+**Twins stored before this rule.** The rule does not touch them. To list
+them, run this once against the database (read-only). It reads the ledger,
+so it also lists spellings whose versions were deleted; `live_names` are
+the spellings that still have a version that is not in the trash:
+
+```sql
+WITH live AS (
+    SELECT DISTINCT repository_id, name
+    FROM artifacts
+    WHERE is_deleted = false AND path LIKE 'servers/%/server.json'
+)
+SELECT r.key AS registry,
+       r.repo_type,
+       lower(t.name) AS folded_name,
+       array_agg(DISTINCT t.name ORDER BY t.name) AS stored_names,
+       array_agg(DISTINCT t.name ORDER BY t.name)
+           FILTER (WHERE l.name IS NOT NULL) AS live_names
+FROM mcp_version_tombstones t
+JOIN repositories r ON r.id = t.repository_id AND r.format = 'mcp'
+LEFT JOIN live l ON l.repository_id = t.repository_id AND l.name = t.name
+GROUP BY r.key, r.repo_type, lower(t.name)
+HAVING count(DISTINCT t.name) > 1
+ORDER BY r.key, folded_name;
+```
+
+Each row is one registry and one folded name with every stored spelling.
+Remote rows are mirrors of upstream; the rule applies to `local` and
+`staging` rows. To retire a spelling, delete its versions (the name stays
+recorded, so it cannot be republished under another case either).
+
 ### `POST /validate`
 
 `POST /mcp/<repo_key>/v0/validate` and `/v0.1/validate`. Body: a server.json
@@ -847,7 +920,9 @@ on the caller, so `/validate` reveals nothing a read would not:
   namespaces;
 - a repository holder (administrator, or `read` through a grant): also
   whether `name@version` is taken (`mcp_version_exists`; a reader could
-  otherwise learn of a held version);
+  otherwise learn of a held version) and, on a Local or Staging registry,
+  whether the name is a case-only twin of a stored one
+  (`mcp_name_case_conflict`);
 - an authenticated caller who can read every mapped backing repository: also
   package resolution. Anyone else (every anonymous caller included) gets
   `outcome: "unchecked"` per package and an `info` issue
@@ -1697,7 +1772,9 @@ the shadowing rule below.
   Names compare case-insensitively here, as deny lists and namespace
   allowlists do: a hosted `io.acme/tool` shadows a Remote's `io.Acme/tool`
   (and every other spelling of it), so an upstream entry cannot pass for
-  the internal one by letter case.
+  the internal one by letter case. Within one hosted registry a new
+  case-only twin cannot be published at all
+  ([Server names that differ only in letter case](#server-names-that-differ-only-in-letter-case)).
 - **`/servers/{name}/versions`**: the union of the serving members' servable
   versions, each version once (from the first member that serves it), in
   version-text order; `isLatest` marks the version `latest` answers.

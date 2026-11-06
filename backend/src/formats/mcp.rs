@@ -126,6 +126,9 @@ pub enum McpError {
     ServerDenied { name: String },
     /// `(name, version)` already published (409).
     VersionExists,
+    /// A new server name that differs only in letter case from `existing`,
+    /// a name this hosted repository already recorded (409, #5434).
+    NameCaseConflict { name: String, existing: String },
     /// `search` shorter than 3 characters (422, upstream parity).
     SearchTooShort,
     /// A malformed query parameter (`limit`, `cursor`, `updated_since`,
@@ -168,7 +171,7 @@ impl McpError {
             McpError::ReservedNamespace { .. }
             | McpError::NamespaceNotAllowed { .. }
             | McpError::ServerDenied { .. } => 403,
-            McpError::VersionExists => 409,
+            McpError::VersionExists | McpError::NameCaseConflict { .. } => 409,
             McpError::Misconfigured(_) | McpError::Internal(_) => 500,
         }
     }
@@ -189,6 +192,7 @@ impl McpError {
             McpError::NamespaceNotAllowed { .. } => "mcp_namespace_not_allowed",
             McpError::ServerDenied { .. } => "mcp_server_denied",
             McpError::VersionExists => "mcp_version_exists",
+            McpError::NameCaseConflict { .. } => "mcp_name_case_conflict",
             McpError::SearchTooShort => "mcp_search_too_short",
             McpError::Misconfigured(_) => "mcp_repository_misconfigured",
             McpError::Internal(_) => "mcp_internal_error",
@@ -237,6 +241,10 @@ impl McpError {
             McpError::VersionExists => {
                 "this server version already exists; publish a new version".to_string()
             }
+            McpError::NameCaseConflict { name, existing } => format!(
+                "server name '{name}' differs only in letter case from '{existing}', which \
+                 this registry already holds; publish under '{existing}' or choose another name"
+            ),
             McpError::SearchTooShort => "search must be at least 3 characters".to_string(),
             McpError::Misconfigured(_) => {
                 "this repository's MCP package settings are inconsistent; ask an administrator"
@@ -3367,6 +3375,14 @@ mod tests {
                 "mcp_namespace_not_allowed",
             ),
             (McpError::VersionExists, 409, "mcp_version_exists"),
+            (
+                McpError::NameCaseConflict {
+                    name: "io.Acme/t".into(),
+                    existing: "io.acme/t".into(),
+                },
+                409,
+                "mcp_name_case_conflict",
+            ),
             (McpError::SearchTooShort, 422, "mcp_search_too_short"),
             (
                 McpError::Misconfigured("x".into()),
