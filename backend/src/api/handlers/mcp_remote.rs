@@ -42,6 +42,8 @@ pub fn repo_router() -> Router<SharedState> {
         )
         .route("/:key/mcp/catalog/:id/:decision", post(decide))
         .route("/:key/mcp/sync", get(sync_status).post(trigger_sync))
+        .route("/:key/mcp/seed", post(start_seed))
+        .route("/:key/mcp/seed/:job_id", get(get_seed))
 }
 
 /// `GET /api/v1/mcp/pending-summary`: the instance-wide approval-queue
@@ -70,6 +72,8 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
         request_approval,
         sync_status,
         trigger_sync,
+        start_seed,
+        get_seed,
         pending_summary,
     ),
     components(schemas(
@@ -91,6 +95,11 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
         PinRequest,
         ApprovalRequestBody,
         SyncAcceptedResponse,
+        crate::services::mcp_seed::SeedRequest,
+        crate::services::mcp_seed::SeedServer,
+        crate::services::mcp_seed::SeedAccepted,
+        crate::services::mcp_seed::SeedJob,
+        crate::services::mcp_seed::SeedItem,
         PendingSummary,
         PendingRepository,
     ))
@@ -663,6 +672,81 @@ pub struct SyncAcceptedResponse {
     pub status_url: String,
 }
 
+/// The Remote `key` for an upstream-driving trigger (sync, seed): its
+/// administrator, or an API token with `trigger:sync` and write access.
+async fn triggering_repo(state: &SharedState, auth: &AuthExtension, key: &str) -> Result<RepoInfo> {
+    if auth.is_api_token && auth.has_scope("trigger:sync") {
+        let service = RepositoryService::new(state.db.clone());
+        let model = service.get_by_key(key).await?;
+        require_repo_write_access(auth, &model, &service).await?;
+        remote_info(state, key).await
+    } else {
+        administered_repo(state, auth, key).await
+    }
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "mcp_remote_start_seed",
+    path = "/{key}/mcp/seed",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(("key" = String, Path, description = "Remote MCP repository key")),
+    request_body = crate::services::mcp_seed::SeedRequest,
+    responses(
+        (status = 202, body = crate::services::mcp_seed::SeedAccepted, description = "Seed job accepted; poll `statusUrl`"),
+        (status = 400, description = "Empty or invalid list, or more than 500 entries"),
+        (status = 404, description = "Not a Remote MCP repository the caller administers"),
+        (status = 409, description = "Scheduled upstream jobs are paused, or the Remote is cache-only"),
+        (status = 502, description = "Outbound fetches are not available on this instance"),
+    )
+)]
+/// Seed named server versions without a full catalog sync (#5408).
+pub async fn start_seed(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path(key): Path<String>,
+    Json(req): Json<crate::services::mcp_seed::SeedRequest>,
+) -> Result<(
+    axum::http::StatusCode,
+    Json<crate::services::mcp_seed::SeedAccepted>,
+)> {
+    let auth = require_auth(auth)?;
+    let repo = triggering_repo(&state, &auth, &key).await?;
+    let accepted =
+        crate::services::mcp_seed::start(&state, repo, &req.servers, req.reason, auth.user_id)
+            .await?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(accepted)))
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "mcp_remote_get_seed",
+    path = "/{key}/mcp/seed/{job_id}",
+    context_path = "/api/v1/repositories",
+    tag = "mcp",
+    params(
+        ("key" = String, Path, description = "Remote MCP repository key"),
+        ("job_id" = Uuid, Path, description = "Seed job id"),
+    ),
+    responses(
+        (status = 200, body = crate::services::mcp_seed::SeedJob),
+        (status = 404, description = "Repository or job not found"),
+    )
+)]
+/// A seed job and its per-item outcome (#5408).
+pub async fn get_seed(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, job_id)): Path<(String, Uuid)>,
+) -> Result<Json<crate::services::mcp_seed::SeedJob>> {
+    let auth = require_auth(auth)?;
+    let repo = readable_repo(&state, &auth, &key).await?;
+    Ok(Json(
+        crate::services::mcp_seed::load(&state.db, &repo, job_id).await?,
+    ))
+}
+
 /// Map a sync refusal onto the API's errors.
 pub fn sync_error(e: SyncError) -> AppError {
     match e {
@@ -692,14 +776,7 @@ pub async fn trigger_sync(
     Path(key): Path<String>,
 ) -> Result<(StatusCode, Json<SyncAcceptedResponse>)> {
     let auth = require_auth(auth)?;
-    let repo = if auth.is_api_token && auth.has_scope("trigger:sync") {
-        let service = RepositoryService::new(state.db.clone());
-        let model = service.get_by_key(&key).await?;
-        require_repo_write_access(&auth, &model, &service).await?;
-        remote_info(&state, &key).await?
-    } else {
-        administered_repo(&state, &auth, &key).await?
-    };
+    let repo = triggering_repo(&state, &auth, &key).await?;
     let key = repo.key.clone();
     mcp_remote::start_sync(&state, repo)
         .await
@@ -1993,6 +2070,166 @@ mod tests {
             let err = env.create_remote(extra.clone()).await.expect_err("refused");
             assert!(matches!(err, AppError::Validation(_)), "{extra}: {err:?}");
         }
+        env.teardown().await;
+    }
+
+    /// The seed job `job_id` once it ended.
+    async fn settled_seed(env: &Env, status_url: &str) -> serde_json::Value {
+        let uri = status_url.replace("/api/v1/repositories", "/r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (s, job) = env.call(Some(env.admin.clone()), "GET", &uri, None).await;
+            assert_eq!(s, StatusCode::OK, "{job}");
+            if job["status"] == "completed" || job["status"] == "failed" {
+                return job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seed still running: {job}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// #5408: a seed pins a named version the catalog has never seen, from
+    /// the upstream's version list alone (no listing page), refuses a
+    /// version upstream does not list and a denied name, and a second seed
+    /// of the same version answers `already_pinned` with no upstream contact.
+    #[tokio::test]
+    async fn seed_pins_named_versions_without_a_catalog_sync() {
+        let Some(env) = Env::new().await else { return };
+        env.config("mcp_server_deny", r#"["io.evil/*"]"#).await;
+        let name = "io.github.daedalus/mcp-sqlite3";
+        let v110 = entry(server(name, "1.1.0", serde_json::json!({})), T2);
+        env.serve_versions(
+            name,
+            vec![
+                entry(server(name, "1.0.0", serde_json::json!({})), T1),
+                v110.clone(),
+            ],
+        )
+        .await;
+        // The pin's ingest reads the version document itself.
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v0.1/servers/{}/versions/1.1.0",
+                urlencoding::encode(name)
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(v110))
+            .mount(&env.upstream)
+            .await;
+        let body = serde_json::json!({"servers": [
+            {"name": name, "version": "1.1.0"},
+            {"name": name, "version": "9.9.9"},
+            {"name": "io.evil/x", "version": "1.0.0"},
+            {"name": name, "version": "1.1.0"},
+        ], "reason": "air-gap seed"});
+        let (s, b) = env.admin("POST", "/seed", Some(body.clone())).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        assert_eq!(b["total"], 3, "duplicates dropped: {b}");
+        let job = settled_seed(&env, b["statusUrl"].as_str().unwrap()).await;
+        assert_eq!(job["status"], "completed", "{job}");
+        let states: Vec<&str> = job["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, ["pinned", "refused", "refused"], "{job}");
+        assert!(job["items"][1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("9.9.9"));
+        assert!(job["items"][2]["reason"].as_str().unwrap().contains("deny"));
+        assert!(env.listed().await.contains(&format!("{name}@1.1.0")));
+        let item = env.item(name).await;
+        assert_eq!(item["id"], job["items"][0]["catalogId"], "{item}");
+        let requests = || async {
+            env.upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        };
+        let seen = requests().await;
+        assert!(
+            !seen.iter().any(|p| p == "/v0.1/servers"),
+            "a seed paged the catalog: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|p| p.contains("io.evil")),
+            "a denied name was fetched: {seen:?}"
+        );
+
+        let (s, b) = env
+            .admin(
+                "POST",
+                "/seed",
+                Some(serde_json::json!({"servers": [{"name": name, "version": "1.1.0"}]})),
+            )
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let job = settled_seed(&env, b["statusUrl"].as_str().unwrap()).await;
+        assert_eq!(job["items"][0]["state"], "already_pinned", "{job}");
+        assert_eq!(
+            requests().await.len(),
+            seen.len(),
+            "a re-seed contacted upstream"
+        );
+        env.teardown().await;
+    }
+
+    /// #5408: a seed contacts the upstream, so it is refused (`409`, no job,
+    /// no request) on a cache-only Remote and while scheduled upstream jobs
+    /// are paused; a bad list is `400`.
+    #[tokio::test]
+    async fn seed_refusals() {
+        let Some(env) = Env::new().await else { return };
+        env.serve(Mock::given(method("GET")), vec![]).await;
+        let one = serde_json::json!({"servers": [{"name": "io.github.a/x", "version": "1.0.0"}]});
+        for bad in [
+            serde_json::json!({"servers": []}),
+            serde_json::json!({"servers": [{"name": "io.github.a/x", "version": "latest"}]}),
+        ] {
+            let (s, b) = env.admin("POST", "/seed", Some(bad)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        }
+        crate::services::upstream_pause::set_env_default(true);
+        let (paused, _) = env.admin("POST", "/seed", Some(one.clone())).await;
+        crate::services::upstream_pause::set_env_default(false);
+        assert_eq!(paused, StatusCode::CONFLICT);
+        crate::services::upstream_mode::save_upstream_mode(
+            &env.fx.pool,
+            env.fx.repo_id,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly,
+        )
+        .await
+        .unwrap();
+        let (s, b) = env.admin("POST", "/seed", Some(one)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cache-only"),
+            "{b}"
+        );
+        let jobs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mcp_remote_seed_jobs WHERE repository_id = $1",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(jobs, 0);
+        assert!(env
+            .upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty());
         env.teardown().await;
     }
 }

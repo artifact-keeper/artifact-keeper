@@ -1554,6 +1554,45 @@ async fn apply_page(
     Ok(())
 }
 
+/// What a targeted fetch of one name found (#5408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameFetch {
+    /// `mcp_server_deny` matches the name: nothing was fetched or recorded.
+    Denied,
+    /// The upstream's version list of the name was recorded in the catalog
+    /// as a sync page would record it; the versions it lists.
+    Recorded(Vec<String>),
+}
+
+/// Fetch one name's version list (`GET {upstream}/v0.1/servers/{name}/versions`)
+/// through the sync's outbound path (SSRF guard, upstream credentials,
+/// egress proxy, the upstream gate and its cache-only refusal, the
+/// `UPSTREAM_FETCHED` audit) and record it in the catalog exactly as a sync
+/// page carrying those entries would (#5408): a new name row with the
+/// lookalike check and `mcp_auto_approve_namespaces`, the cached summary,
+/// and the ingest of versions that are already approved. A later sync
+/// therefore finds the name known.
+pub async fn record_name_from_upstream(
+    state: &SharedState,
+    repo: &RepoInfo,
+    name: &str,
+) -> Result<NameFetch, String> {
+    let mut run = RunCtx::load(state, repo).await.map_err(|e| e.to_string())?;
+    if run.denied(name) {
+        return Ok(NameFetch::Denied);
+    }
+    let bytes = run.fetch(&versions_path(name)).await?;
+    let mut page = parse_page(&bytes)?;
+    page.entries.retain(|e| e.name == name);
+    page.next_cursor = None;
+    let versions = page.entries.iter().map(|e| e.version.clone()).collect();
+    if !page.entries.is_empty() {
+        let mut summary = SyncSummary::default();
+        apply_page(&mut run, &page, &mut summary).await?;
+    }
+    Ok(NameFetch::Recorded(versions))
+}
+
 /// Move the PENDING name row `target` to review, flagged as a lookalike of
 /// `similar_to`; whether it moved.
 async fn flag_pending_lookalike(

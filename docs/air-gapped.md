@@ -280,6 +280,16 @@ manifest exists in this release: the typed manifests (`pypi-requirements`,
 `npm-lockfile`, `oci-images`, `hf-models`) and seeding a Virtual repository
 answer `400`. See [Seeding a Remote's proxy cache](cache-seed.md).
 
+An MCP Remote has its own list form: `POST /api/v1/repositories/{key}/mcp/seed`
+with `{"servers": [{"name": "...", "version": "..."}]}` fetches each named
+server version from the upstream registry and pins it, without syncing the
+whole registry first (#5408). It runs in the background like a cache seed,
+answers `202` with a `statusUrl`, and reports each item as `pinned`,
+`already_pinned`, `refused` or `failed`. The item's packages are pinned
+through the Remote's own backing repositories, so seed those (npm, PyPI, OCI
+Remotes) too. See
+[MCP registry: Seeding named servers](mcp-registry.md#seeding-named-servers).
+
 ### Cache-only mode
 
 Once a Remote is seeded, declare it cache-only. It then serves what it holds
