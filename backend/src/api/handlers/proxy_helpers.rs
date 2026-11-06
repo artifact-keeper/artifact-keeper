@@ -1561,6 +1561,23 @@ pub async fn proxy_fetch_streaming_with_format(
     })
 }
 
+/// [`proxy_fetch_streaming_with_disposition`] without the response building,
+/// for callers that must see `content_length` before serving (a `Range` needs
+/// it). Same streaming and cache semantics; the caller builds the response.
+pub async fn proxy_fetch_streaming_result(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    proxy_service
+        .fetch_artifact_streaming(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
 /// Streaming sibling of [`proxy_fetch`] that also forwards a
 /// `Content-Disposition: attachment; filename="…"` header on the
 /// outbound response.
@@ -1994,6 +2011,83 @@ pub(crate) async fn proxy_cache_fresh_redirect(
         /* cache_is_fresh = */ true,
     )
     .await)
+}
+
+/// [`stream_fetch_result`] that honours a client `Range` header.
+///
+/// Deliberately a sibling rather than an extra parameter on
+/// [`stream_fetch_result`]: that helper has 38 call sites, and only the alpine
+/// `.apk` download has a client that ranges. Every other caller keeps the
+/// existing full-body behaviour until a format needs it.
+#[allow(clippy::result_large_err)]
+pub fn stream_fetch_result_ranged(
+    result: crate::services::proxy_service::StreamingFetchResult,
+    default_content_type: &str,
+    filename: Option<&str>,
+    range_header: Option<&str>,
+) -> std::result::Result<Response, Response> {
+    // No length means no `total` to resolve against; an encoding means offsets
+    // would address coded bytes while the client counts decoded ones.
+    let rangeable = result.content_length.is_some() && result.content_encoding.is_none();
+    let total = match (range_header, result.content_length, rangeable) {
+        (Some(_), Some(total), true) => total,
+        // Advertise the capability even with no Range on this request, or a
+        // client that probes Accept-Ranges first concludes we cannot range.
+        _ => {
+            let mut resp = stream_fetch_result(result, default_content_type, filename)?;
+            if rangeable {
+                resp.headers_mut().insert(
+                    axum::http::header::ACCEPT_RANGES,
+                    axum::http::HeaderValue::from_static("bytes"),
+                );
+            }
+            return Ok(resp);
+        }
+    };
+
+    // ranged_stream_response owns content-length; the guard above ruled out encoding.
+    let mut base_headers: Vec<(axum::http::header::HeaderName, String)> = vec![(
+        axum::http::header::CONTENT_TYPE,
+        result
+            .content_type
+            .clone()
+            .unwrap_or_else(|| default_content_type.to_string()),
+    )];
+    if let Some(etag) = result.etag.clone() {
+        base_headers.push((axum::http::header::ETAG, etag));
+    }
+    if let Some(sha) = result.commit_sha.clone() {
+        if axum::http::HeaderValue::from_str(&sha).is_ok() {
+            base_headers.push((
+                axum::http::header::HeaderName::from_static(
+                    crate::services::proxy_service::UPSTREAM_COMMIT_HEADER,
+                ),
+                sha,
+            ));
+        }
+    }
+    if let Some(fname) = filename {
+        base_headers.push((
+            axum::http::header::CONTENT_DISPOSITION,
+            content_disposition_attachment(fname),
+        ));
+    }
+    // #4581: a ranged stale-if-error serve is marked like a whole one.
+    if let Some(since) = result.stale_since {
+        base_headers.push((axum::http::header::WARNING, STALE_WARNING.to_string()));
+        base_headers.push((
+            axum::http::header::HeaderName::from_static(STALE_SINCE_HEADER),
+            since.to_rfc3339(),
+        ));
+    }
+
+    crate::api::handlers::repositories::ranged_stream_response(
+        Some(range_header.unwrap_or_default()),
+        total,
+        result.body,
+        base_headers,
+    )
+    .map_err(|e| e.into_response())
 }
 
 /// Fetch from upstream via the proxy service, returning a presigned redirect
@@ -13107,6 +13201,181 @@ mod tests {
         ));
     }
 
+    // ── ranged proxy serves (rules_apko) ──
+
+    fn fetch_result(
+        bytes: &'static [u8],
+        content_length: Option<u64>,
+        content_encoding: Option<&str>,
+    ) -> crate::services::proxy_service::StreamingFetchResult {
+        use futures::StreamExt as _;
+        crate::services::proxy_service::StreamingFetchResult {
+            body: futures::stream::once(async move { Ok(Bytes::from_static(bytes)) }).boxed(),
+            content_type: Some("application/octet-stream".to_string()),
+            content_length,
+            artifact_id: None,
+            etag: None,
+            content_encoding: content_encoding.map(str::to_string),
+            commit_sha: None,
+            stale_since: None,
+        }
+    }
+
+    /// rules_apko asks for the signature span and checksums exactly those bytes.
+    #[test]
+    fn a_range_over_a_known_length_is_answered_206() {
+        let resp = stream_fetch_result_ranged(
+            fetch_result(b"0123456789", Some(10), None),
+            "application/octet-stream",
+            None,
+            Some("bytes=0-3"),
+        )
+        .expect("ranged serve");
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes 0-3/10"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "4"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes"
+        );
+    }
+
+    /// No length means no `total`, so serve it all rather than invent one.
+    #[test]
+    fn a_range_without_a_content_length_serves_the_whole_body() {
+        let resp = stream_fetch_result_ranged(
+            fetch_result(b"0123456789", None, None),
+            "application/octet-stream",
+            None,
+            Some("bytes=0-3"),
+        )
+        .expect("full serve");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .is_none());
+    }
+
+    /// Offsets would address coded bytes; a gzip slice is silent corruption.
+    #[test]
+    fn a_range_over_a_content_coded_body_serves_the_whole_body() {
+        let resp = stream_fetch_result_ranged(
+            fetch_result(b"0123456789", Some(10), Some("gzip")),
+            "application/octet-stream",
+            None,
+            Some("bytes=0-3"),
+        )
+        .expect("full serve");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .is_none());
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_ENCODING)
+                .unwrap(),
+            "gzip",
+            "the encoding must still be declared on the full serve"
+        );
+    }
+
+    /// A client that probes Accept-Ranges before ranging must see it, even though
+    /// this request carried no Range.
+    #[test]
+    fn an_unranged_200_still_advertises_accept_ranges() {
+        let resp = stream_fetch_result_ranged(
+            fetch_result(b"0123456789", Some(10), None),
+            "application/octet-stream",
+            None,
+            None,
+        )
+        .expect("full serve");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes"
+        );
+    }
+
+    /// A body we cannot range must NOT claim it can, or a client retries a
+    /// resume that silently returns the whole object.
+    #[test]
+    fn an_unrangeable_body_does_not_advertise_accept_ranges() {
+        for (len, enc) in [(None, None), (Some(10), Some("gzip"))] {
+            let resp = stream_fetch_result_ranged(
+                fetch_result(b"0123456789", len, enc),
+                "application/octet-stream",
+                None,
+                None,
+            )
+            .expect("full serve");
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::ACCEPT_RANGES)
+                    .is_none(),
+                "len={len:?} enc={enc:?}"
+            );
+        }
+    }
+
+    /// No Range must stay exactly as before, or every ordinary apk client regresses.
+    #[test]
+    fn no_range_header_is_an_ordinary_200() {
+        let resp = stream_fetch_result_ranged(
+            fetch_result(b"0123456789", Some(10), None),
+            "application/octet-stream",
+            None,
+            None,
+        )
+        .expect("full serve");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "10"
+        );
+        assert!(resp
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .is_none());
+    }
+
+    /// 416, not a silent 200: a bad offset has to be visible to the client.
+    #[test]
+    fn a_range_past_the_end_is_416() {
+        let resp = stream_fetch_result_ranged(
+            fetch_result(b"0123456789", Some(10), None),
+            "application/octet-stream",
+            None,
+            Some("bytes=99-120"),
+        )
+        .expect("unsatisfiable serve");
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes */10"
+        );
+    }
+
     /// Scanner applicability and archive extraction are driven by the
     /// FILENAME, so a rescan that derives the wrong one does not fail — it
     /// silently catalogs nothing and records a clean verdict. Every shape a
@@ -19890,6 +20159,15 @@ mod tests {
     /// the format-less streaming helper must fail the pin.
     const FORMAT_STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming_with_format(";
 
+    /// The response-less streaming sibling: same streaming/tee semantics as
+    /// `proxy_fetch_streaming`, but it hands the caller the fetch result
+    /// instead of a built response, so the caller can read `content_length`
+    /// and slice the body for a `Range` request. The alpine `.apk` download
+    /// moved to this helper when it started honouring `Range`, so its pin
+    /// asserts this token. A revert to the buffered `proxy_fetch` must still
+    /// fail the pin.
+    const RANGED_STREAMING_CALL_TOKEN: &str = "proxy_helpers::proxy_fetch_streaming_result(";
+
     /// One pin test per handler. Kept as separate `#[test]` functions
     /// (rather than a single loop) so a CI failure points directly at
     /// the regressing handler. The macro keeps the surface area small
@@ -19940,7 +20218,7 @@ mod tests {
     streaming_pin_test!(
         test_alpine_remote_fetch_uses_streaming_helper_1183,
         "alpine.rs",
-        STREAMING_CALL_TOKEN,
+        RANGED_STREAMING_CALL_TOKEN,
         "the remote `.apk` download"
     );
     streaming_pin_test!(
@@ -25864,6 +26142,11 @@ mod proxy_download_recording_tests {
         "proxy_fetch_streaming_with_cache_key(",
         "proxy_fetch_streaming_with_cache_key_verified(",
         "proxy_fetch_streaming_response_with_cache_key(",
+        // Stops at the StreamingFetchResult so a caller can range it. Listed
+        // here because it is a serve primitive like the rest: without it the
+        // apk arm that moved onto it would have dropped out of this gate
+        // entirely, which is the #3459 failure the pins below exist to catch.
+        "proxy_fetch_streaming_result(",
         "try_upstream_fetch_with_accept(",
         // #4341: npm's direct-Remote tarball arm streams through the
         // `ProxyService` method itself (the digest-flexible SRI gate has no
@@ -26138,6 +26421,10 @@ mod proxy_download_recording_tests {
                 "npm.rs",
                 "fetch_artifact_streaming_with_cache_path_gated_digest(",
             ),
+            // Moved off `proxy_fetch_streaming(` when the apk download learned
+            // to answer Range, which is the same rename that dropped maven and
+            // sbt out of this gate.
+            ("alpine.rs", "proxy_fetch_streaming_result("),
         ] {
             let (_, src) = SERVE_SOURCES
                 .iter()

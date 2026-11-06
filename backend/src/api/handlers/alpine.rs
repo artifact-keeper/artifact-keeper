@@ -21,6 +21,7 @@ use base64::Engine as _;
 use bytes::Bytes;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::StreamExt as _;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
@@ -1335,8 +1336,15 @@ async fn download_package(
         String,
         String,
     )>,
+    headers: HeaderMap,
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
+    // rules_apko fetches an .apk's three sections as separate ranged GETs and
+    // checksums each; ignoring Range answered 200 and failed all three.
+    let range_header = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
@@ -1395,6 +1403,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
+                    range_header.as_deref(),
                 )
                 .await?
                 {
@@ -1428,10 +1437,11 @@ async fn download_package(
                 )
                 .await?;
 
-                return proxy_helpers::stream_fetch_result(
+                return proxy_helpers::stream_fetch_result_ranged(
                     result,
                     "application/vnd.alpine.package",
                     None,
+                    range_header.as_deref(),
                 );
             }
 
@@ -1452,17 +1462,13 @@ async fn download_package(
             // Record download
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.alpine.package")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
-                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from_stream(stream))
-                .unwrap())
+            serve_ranged_apk(
+                range_header.as_deref(),
+                artifact.size_bytes.max(0) as u64,
+                stream,
+                &filename,
+                &artifact.checksum_sha256,
+            )
         }
         Err(crate::error::AppError::NotFound(_)) if repo.repo_type != RepositoryType::Remote => {
             // Hosted artifact: file absent from storage. Serialise concurrent
@@ -1478,17 +1484,14 @@ async fn download_package(
 
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/vnd.alpine.package")
-                .header(
-                    "Content-Disposition",
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(CONTENT_LENGTH, content.len().to_string())
-                .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-                .body(Body::from(content))
-                .unwrap())
+            let total = content.len() as u64;
+            serve_ranged_apk(
+                range_header.as_deref(),
+                total,
+                futures::stream::once(async move { Ok(content) }).boxed(),
+                &filename,
+                &artifact.checksum_sha256,
+            )
         }
         Err(e) => {
             // Storage retrieval failed. For remote repos, the DB record may
@@ -1523,6 +1526,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
+                    range_header.as_deref(),
                 )
                 .await?
                 {
@@ -1536,6 +1540,38 @@ async fn download_package(
                 .into_response())
         }
     }
+}
+
+/// Serve a stored `.apk` with a single `Range`, so all three local serve sites
+/// answer 206/416 identically.
+#[allow(clippy::result_large_err)]
+fn serve_ranged_apk(
+    range_header: Option<&str>,
+    total: u64,
+    body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    filename: &str,
+    checksum_sha256: &str,
+) -> Result<Response, Response> {
+    // X-Checksum-SHA256 covers the whole object, which is what a client
+    // assembling ranges verifies at the end, so keep it on a 206.
+    let base_headers = vec![
+        (CONTENT_TYPE, APK_CONTENT_TYPE.to_string()),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        ),
+        (
+            axum::http::header::HeaderName::from_static("x-checksum-sha256"),
+            checksum_sha256.to_string(),
+        ),
+    ];
+    crate::api::handlers::repositories::ranged_stream_response(
+        range_header,
+        total,
+        body,
+        base_headers,
+    )
+    .map_err(|e| e.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,6 +1748,7 @@ async fn try_proxy_apk(
     arch: &str,
     filename: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+    range_header: Option<&str>,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -1721,13 +1758,14 @@ async fn try_proxy_apk(
     // #895: stream large .apk bodies (a few MiB to ~100 MiB for LLVM-class
     // packages). Default Content-Type matches the buffered handler's
     // prior fallback.
-    let response = proxy_helpers::proxy_fetch_streaming(
+    // The proxy still caches the whole object; the range applies only to what we
+    // serve. Forwarding it upstream would cache a partial under the full key.
+    let result = proxy_helpers::proxy_fetch_streaming_result(
         proxy,
         repo.id,
         repo_key,
         upstream_url,
         &upstream_path,
-        "application/octet-stream",
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -1738,7 +1776,13 @@ async fn try_proxy_apk(
     // lines up with the catalog row the artifact listing renders. `ctx` is
     // threaded in from `download_package` for exactly this call.
     proxy_helpers::record_proxy_download(state, repo.id, repo_key, &upstream_path, ctx).await;
-    Ok(Some(response))
+    proxy_helpers::stream_fetch_result_ranged(
+        result,
+        "application/octet-stream",
+        None,
+        range_header,
+    )
+    .map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -2387,6 +2431,69 @@ mod tests {
 
     fn marker_apk_info() -> ApkPackageInfo {
         parse_apk_package(MARKER_APK).expect("marker .apk should parse")
+    }
+
+    /// The stored-bytes serve path must answer the same 206 the proxy path
+    /// does. An apk client that fetches an archive as three ranged spans hits
+    /// this arm for every span after the first, so a 200 here fails its
+    /// per-span checksum exactly as a cold 200 does.
+    #[test]
+    fn a_stored_apk_honours_range_and_keeps_the_whole_object_checksum() {
+        use futures::StreamExt as _;
+        let body =
+            || futures::stream::once(async { Ok(Bytes::from_static(b"0123456789")) }).boxed();
+
+        let partial = serve_ranged_apk(Some("bytes=2-5"), 10, body(), "pkg-1.0-r0.apk", "deadbeef")
+            .expect("ranged serve");
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            partial
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(
+            partial
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .unwrap(),
+            "4"
+        );
+        // The digest covers the whole object, which is what a client
+        // reassembling spans verifies at the end, so a 206 keeps it.
+        assert_eq!(
+            partial.headers().get("x-checksum-sha256").unwrap(),
+            "deadbeef"
+        );
+
+        let full =
+            serve_ranged_apk(None, 10, body(), "pkg-1.0-r0.apk", "deadbeef").expect("full serve");
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(
+            full.headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes",
+            "a client that probes before ranging must see the capability"
+        );
+
+        let unsatisfiable = serve_ranged_apk(
+            Some("bytes=50-60"),
+            10,
+            body(),
+            "pkg-1.0-r0.apk",
+            "deadbeef",
+        )
+        .expect("unsatisfiable serve");
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            unsatisfiable
+                .headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .unwrap(),
+            "bytes */10"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4521,6 +4628,39 @@ mod db_cov_tests {
             &body[..],
             super::MARKER_APK,
             "the advertised .apk must serve the published package bytes"
+        );
+    }
+
+    /// A ranged GET of a hosted package answers `206` with exactly the window
+    /// asked for (#5478): an apk client that fetches the sections as spans
+    /// checksums each one, so a whole-file `200` fails every span.
+    #[tokio::test]
+    async fn test_hosted_apk_download_honours_range() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let text = publish_marker_and_fetch_index(&fx).await;
+        let filename = format!(
+            "{}-{}.apk",
+            apkindex_field(&text, 'P'),
+            apkindex_field(&text, 'V')
+        );
+        let k = fx.repo_key.clone();
+        let mut req = tdh::get(format!("/{k}/v3.21/main/aarch64/{filename}"));
+        req.headers_mut().insert(
+            axum::http::header::RANGE,
+            axum::http::HeaderValue::from_static("bytes=0-9"),
+        );
+        let (status, body, headers) =
+            tdh::send_with_headers(fx.router_with_auth(super::router()), req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(status, axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&body[..], &super::MARKER_APK[..10]);
+        assert_eq!(
+            headers[axum::http::header::CONTENT_RANGE],
+            format!("bytes 0-9/{}", super::MARKER_APK.len()).as_str()
         );
     }
 
