@@ -7152,6 +7152,27 @@ pub async fn virtual_non_remote_owns_maven_gav(
     version: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    virtual_non_remote_owns_maven_gav_in(
+        db,
+        virtual_repo_id,
+        &members,
+        group_id,
+        artifact_id,
+        version,
+    )
+    .await
+}
+
+/// [`virtual_non_remote_owns_maven_gav`] over members the caller already fetched.
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_maven_gav_in(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    members: &[Repository],
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Result<bool, Response> {
     let non_remote_ids: Vec<Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
