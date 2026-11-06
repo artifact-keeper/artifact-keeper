@@ -14,7 +14,8 @@
 //!   everywhere, `hosted_only` only on Local/Staging repositories, `off`
 //!   never. Re-queued by the scheduler once the previous probe is older than
 //!   `max(ttlMs, 6 h)`, because a remote can change what it advertises
-//!   without a version bump.
+//!   without a version bump: for the server's latest version and versions
+//!   published in the last [`REPROBE_RECENT_DAYS`] days only.
 //! * `sandbox_run`: one per stdio `packages[]` entry of type `npm`, `pypi`
 //!   or `oci` that has an AK pin (`own-repos` resolved it to a backing
 //!   repository), when `mcp_sandbox_introspection = on`. Never re-queued: the
@@ -43,6 +44,14 @@ pub const MIN_REPROBE_SECS: i64 = 6 * 3600;
 pub const LEASE_SECS: i64 = 600;
 /// Jobs re-queued per scheduler tick.
 pub const REPROBE_BATCH: i64 = 100;
+/// A remote is re-probed only for its server's latest version
+/// (`registry.isLatest`) or a version published within this many days
+/// (`registry.publishedAt`, else the artifact's creation time). Older
+/// versions keep their last snapshot and can still be probed on demand
+/// (`POST .../capabilities/probe`) (#5386).
+pub const REPROBE_RECENT_DAYS: i32 = 30;
+/// Attempts of a `sandbox_run` job whose runs time out: one retry.
+pub const SANDBOX_TIMEOUT_ATTEMPTS: i32 = 2;
 /// Package types the reference sandbox runner can install from AK.
 pub const SANDBOX_REGISTRY_TYPES: &[&str] = &["npm", "pypi", "oci"];
 
@@ -224,6 +233,17 @@ pub fn is_transient(outcome: Outcome) -> bool {
         outcome,
         Outcome::RateLimited | Outcome::Timeout | Outcome::Error | Outcome::StartFailed
     )
+}
+
+/// How many attempts a job of `kind` gets when an attempt ends in `outcome`.
+/// A `sandbox_run` timeout already held a worker for the sandbox's whole wall
+/// clock (120 s), so it is retried once at most instead of up to
+/// `max_attempts` times (#5387).
+pub fn attempts_allowed(kind: JobKind, outcome: Outcome, max_attempts: i32) -> i32 {
+    match (kind, outcome) {
+        (JobKind::SandboxRun, Outcome::Timeout) => max_attempts.min(SANDBOX_TIMEOUT_ATTEMPTS),
+        _ => max_attempts,
+    }
 }
 
 /// The delay before the next attempt: the server's `Retry-After`/`ttlMs`
@@ -475,7 +495,12 @@ fn new_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-/// Claim the oldest due job of `kinds`.
+/// Claim a due job of `kinds`, fairly across repositories (#5387): the job
+/// comes from the repository with the fewest jobs claimed right now, and is
+/// that repository's oldest due job. One publisher queueing many versions
+/// therefore cannot hold every worker while other repositories' jobs wait.
+/// A single statement: `FOR UPDATE SKIP LOCKED` keeps concurrent claims from
+/// handing out one job twice.
 pub async fn claim(
     db: &PgPool,
     kinds: &[JobKind],
@@ -484,10 +509,15 @@ pub async fn claim(
     let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
     let token = new_token();
     let sql = format!(
-        "WITH next AS ( \
-           SELECT id FROM mcp_introspection_jobs \
-           WHERE status = 'pending' AND not_before <= NOW() AND kind = ANY($1) \
-           ORDER BY not_before, created_at LIMIT 1 FOR UPDATE SKIP LOCKED) \
+        "WITH busy AS ( \
+           SELECT repository_id, COUNT(*) AS claimed FROM mcp_introspection_jobs \
+           WHERE status = 'claimed' GROUP BY repository_id), \
+         next AS ( \
+           SELECT p.id FROM mcp_introspection_jobs p \
+           LEFT JOIN busy b ON b.repository_id = p.repository_id \
+           WHERE p.status = 'pending' AND p.not_before <= NOW() AND p.kind = ANY($1) \
+           ORDER BY COALESCE(b.claimed, 0), p.not_before, p.created_at \
+           LIMIT 1 FOR UPDATE OF p SKIP LOCKED) \
          UPDATE mcp_introspection_jobs j SET status = 'claimed', attempts = j.attempts + 1, \
            claimed_by = $2, claimed_at = NOW(), \
            lease_expires_at = NOW() + make_interval(secs => $3), claim_token_hash = $4, \
@@ -560,7 +590,7 @@ mod subtle_eq {
 /// End a claim: `status` is `completed`, `failed`, `cancelled` or (a retry)
 /// `pending` with `not_before`. Only the current claim can be ended.
 async fn finish(
-    db: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     job: &JobRow,
     status: &str,
     not_before: Option<DateTime<Utc>>,
@@ -605,9 +635,21 @@ pub enum Completed {
     },
     /// A transient failure: the job goes back to the queue.
     Retry { not_before: DateTime<Utc> },
+    /// The claim was no longer current when the result arrived (completed
+    /// by a concurrent or duplicate request, reaped, re-claimed): nothing was
+    /// stored. `409 mcp_claim_invalid` (#5389).
+    ClaimLost,
 }
 
-/// Record a worker result for a claimed job (token already checked).
+/// Record a worker result for a claimed job (token already checked by the
+/// caller, but the claim may end concurrently).
+///
+/// The claim check and end and the snapshot insert run in one transaction
+/// (the job row is locked with its token hash and `claimed` status), so of
+/// two completions of one claim exactly one stores a snapshot; the other, and
+/// one racing the reaper or a re-claim, gets [`Completed::ClaimLost`]. The
+/// audit, lint and drift side effects run after the commit, and only for a
+/// newly stored snapshot (#5389).
 pub async fn complete(
     db: &PgPool,
     job: &JobRow,
@@ -617,10 +659,12 @@ pub async fn complete(
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
-    if is_transient(parsed.outcome) && job.attempts < job.max_attempts {
+    if is_transient(parsed.outcome)
+        && job.attempts < attempts_allowed(kind, parsed.outcome, job.max_attempts)
+    {
         let delay = retry_delay_secs(parsed.outcome, job.attempts, result.retry_after_ms);
         let not_before = Utc::now() + chrono::Duration::seconds(delay);
-        finish(
+        let ended = finish(
             db,
             job,
             "pending",
@@ -629,7 +673,11 @@ pub async fn complete(
             Some(result.error.as_deref().unwrap_or(parsed.outcome.as_str())),
         )
         .await?;
-        return Ok(Completed::Retry { not_before });
+        return Ok(if ended {
+            Completed::Retry { not_before }
+        } else {
+            Completed::ClaimLost
+        });
     }
     let v = caps::version_ref(db, job.artifact_id)
         .await
@@ -666,21 +714,42 @@ pub async fn complete(
             .or_else(|| job.claimed_by.clone()),
         details,
     };
-    let (ins, drift_scan) = caps::store(db, &snap, &v.repository_key).await?;
     let status = if matches!(parsed.outcome, Outcome::Error | Outcome::StartFailed) {
         "failed"
     } else {
         "completed"
     };
-    finish(
-        db,
+    let mut tx = db.begin().await.map_err(db_err)?;
+    let current: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM mcp_introspection_jobs \
+         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2 FOR UPDATE",
+    )
+    .bind(job.id)
+    .bind(&job.claim_token_hash)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if current.is_none() {
+        return Ok(Completed::ClaimLost);
+    }
+    let ins = caps::insert_snapshot_in(&mut tx, &snap)
+        .await
+        .map_err(db_err)?;
+    // The row is locked and matched above, so this ends the claim.
+    if !finish(
+        &mut *tx,
         job,
         status,
         None,
         Some(ins.snapshot.id),
         result.error.as_deref(),
     )
-    .await?;
+    .await?
+    {
+        return Ok(Completed::ClaimLost);
+    }
+    tx.commit().await.map_err(db_err)?;
+    let drift_scan = caps::record_stored(db, &snap, &ins, &v.repository_key).await?;
     Ok(Completed::Stored {
         snapshot: ins.snapshot,
         drift_scan,
@@ -703,16 +772,23 @@ pub async fn reap_expired(db: &PgPool) -> crate::error::Result<u64> {
     Ok(r.rows_affected())
 }
 
-/// Queue the next probe of every remote whose last probe is due again.
+/// Queue the next probe of every remote whose last probe is due again, for
+/// the latest version of each server and versions published within
+/// [`REPROBE_RECENT_DAYS`] (#5386). The version filter is in the query, so an
+/// old version never takes a slot of the batch.
 pub async fn requeue_due_probes(db: &PgPool) -> crate::error::Result<usize> {
     let due: Vec<(Uuid, String, DateTime<Utc>, Option<i64>)> = sqlx::query_as(
         "SELECT DISTINCT ON (j.artifact_id, j.target_key) j.artifact_id, j.target_key, \
                 j.completed_at, s.ttl_ms \
          FROM mcp_introspection_jobs j \
          JOIN artifacts a ON a.id = j.artifact_id AND a.is_deleted = false \
+         JOIN artifact_metadata m ON m.artifact_id = a.id AND m.format = 'mcp' \
          LEFT JOIN mcp_capability_snapshots s ON s.id = j.snapshot_id \
          WHERE j.kind = 'remote_probe' AND j.status IN ('completed', 'failed') \
            AND j.completed_at < NOW() - make_interval(secs => $1) \
+           AND (m.metadata->'registry'->>'isLatest' = 'true' \
+                OR COALESCE((m.metadata->'registry'->>'publishedAt')::timestamptz, a.created_at) \
+                   > NOW() - make_interval(days => $3)) \
            AND NOT EXISTS (SELECT 1 FROM mcp_introspection_jobs o \
                            WHERE o.artifact_id = j.artifact_id AND o.kind = j.kind \
                              AND o.target_key = j.target_key \
@@ -721,6 +797,7 @@ pub async fn requeue_due_probes(db: &PgPool) -> crate::error::Result<usize> {
     )
     .bind(MIN_REPROBE_SECS as f64)
     .bind(REPROBE_BATCH)
+    .bind(REPROBE_RECENT_DAYS)
     .fetch_all(db)
     .await
     .map_err(db_err)?;
@@ -773,6 +850,11 @@ pub async fn scheduler_tick(db: &PgPool) {
         Ok(n) if n > 0 => tracing::info!(queued = n, "MCP remote probes re-queued"),
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "MCP re-probe scheduling failed"),
+    }
+    match caps::prune_snapshots(db).await {
+        Ok(n) if n > 0 => tracing::info!(pruned = n, "MCP capability snapshots pruned"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "MCP capability snapshot retention failed"),
     }
 }
 
@@ -913,6 +995,23 @@ mod tests {
         assert_eq!(
             job_target(JobKind::SandboxRun, "package:2", &s, &served),
             Err(Unrunnable::TargetGone)
+        );
+    }
+
+    #[test]
+    fn sandbox_timeout_is_retried_once() {
+        assert_eq!(
+            attempts_allowed(JobKind::SandboxRun, Outcome::Timeout, 3),
+            2
+        );
+        assert_eq!(
+            attempts_allowed(JobKind::SandboxRun, Outcome::Timeout, 1),
+            1
+        );
+        assert_eq!(attempts_allowed(JobKind::SandboxRun, Outcome::Error, 3), 3);
+        assert_eq!(
+            attempts_allowed(JobKind::RemoteProbe, Outcome::Timeout, 3),
+            3
         );
     }
 

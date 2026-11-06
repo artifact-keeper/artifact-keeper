@@ -54,6 +54,10 @@ const BATCH: i64 = 8;
 type PostCommit = (Vec<PackagePin>, Vec<(Uuid, Uuid)>);
 
 const FILL_JSON_MAX: usize = 8 * 1024 * 1024;
+/// One deadline over a whole fill: every format request it makes, response
+/// head and body alike (#5395). Shorter than [`CLAIM_SECS`], so a stalled
+/// fill gives its job up before another replica may claim it.
+pub const FILL_DEADLINE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Resolution at publish
@@ -828,8 +832,9 @@ fn auth_of(user: &crate::models::user::User, scope: &RequestedScope) -> AuthExte
     })
 }
 
-/// One in-process GET through a format router, as the publisher. Returns the
-/// status and (for JSON documents) the body.
+/// One in-process GET through a format router, as the publisher, finished
+/// (head and body) by `deadline`. Returns the status and (for JSON
+/// documents) the body.
 async fn route_get(
     state: &SharedState,
     format: &str,
@@ -837,6 +842,7 @@ async fn route_get(
     auth: &AuthExtension,
     bearer: Option<&str>,
     want_body: bool,
+    deadline: tokio::time::Instant,
 ) -> Result<(StatusCode, Option<bytes::Bytes>), String> {
     let router = match format {
         "npm" => crate::api::handlers::npm::router(),
@@ -872,32 +878,50 @@ async fn route_get(
     let app = router
         .with_state(state.clone())
         .layer(axum::Extension::<Option<AuthExtension>>(Some(auth.clone())));
-    let resp = tokio::time::timeout(Duration::from_secs(300), app.oneshot(req))
-        .await
-        .map_err(|_| "the backing repository did not answer within 300 s".to_string())?
-        .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let body = if want_body && status.is_success() {
-        #[allow(clippy::disallowed_methods)]
-        // STREAMING-EXEMPT: a package metadata document capped at FILL_JSON_MAX
-        // (8 MiB), not an artifact body (#1608)
-        let bytes = axum::body::to_bytes(resp.into_body(), FILL_JSON_MAX)
-            .await
-            .map_err(|e| e.to_string())?;
-        Some(bytes)
-    } else {
-        // Drain frame by frame (never buffered) so a streamed body completes
-        // and the cache commit runs.
-        use http_body_util::BodyExt as _;
-        let mut body = resp.into_body();
-        while let Some(frame) = body.frame().await {
-            if frame.is_err() {
-                break;
+    exchange(app, req, want_body, deadline).await
+}
+
+/// Send `req` through `app` and read the response body, all of it by
+/// `deadline` (#5395): the head alone is not enough, since a slow upstream
+/// can trickle a body and hold the job and its worker slot indefinitely. A
+/// miss is an `Err`, which [`fill`] records as a retryable failure.
+async fn exchange(
+    app: axum::Router,
+    req: Request<Body>,
+    want_body: bool,
+    deadline: tokio::time::Instant,
+) -> Result<(StatusCode, Option<bytes::Bytes>), String> {
+    let run = async {
+        let resp = app.oneshot(req).await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let body = if want_body && status.is_success() {
+            #[allow(clippy::disallowed_methods)]
+            // STREAMING-EXEMPT: a package metadata document capped at FILL_JSON_MAX
+            // (8 MiB), not an artifact body (#1608)
+            let bytes = axum::body::to_bytes(resp.into_body(), FILL_JSON_MAX)
+                .await
+                .map_err(|e| e.to_string())?;
+            Some(bytes)
+        } else {
+            // Drain frame by frame (never buffered) so a streamed body completes
+            // and the cache commit runs.
+            use http_body_util::BodyExt as _;
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                if frame.is_err() {
+                    break;
+                }
             }
-        }
-        None
+            None
+        };
+        Ok((status, body))
     };
-    Ok((status, body))
+    tokio::time::timeout_at(deadline, run).await.map_err(|_| {
+        format!(
+            "the backing repository did not finish the fill within its deadline ({} s)",
+            FILL_DEADLINE.as_secs()
+        )
+    })?
 }
 
 /// Fill `p` through its Remote as `user`.
@@ -912,6 +936,8 @@ pub async fn fill(
         None => format!("{} {}", p.registry_type, p.identifier),
     };
     let auth = auth_of(user, scope);
+    // One deadline for every request of this fill, head and body (#5395).
+    let deadline = tokio::time::Instant::now() + FILL_DEADLINE;
     // The fill runs as the publisher, who must be able to read the Remote
     // (the format routes run without the visibility middleware here).
     match mcp_packages::caller_may_map(&state.db, &auth, p.fill_repository_id).await {
@@ -933,12 +959,12 @@ pub async fn fill(
         p.registry_type.as_str()
     };
     let result = if p.registry_type == "oci" {
-        fill_oci(state, p, user, &auth).await
+        fill_oci(state, p, user, &auth, deadline).await
     } else if p.registry_type == "pypi" {
-        fill_pypi(state, p, &auth).await
+        fill_pypi(state, p, &auth, deadline).await
     } else {
         match fill_path(p, None) {
-            Some(path) => route_get(state, route_format, &path, &auth, None, false)
+            Some(path) => route_get(state, route_format, &path, &auth, None, false, deadline)
                 .await
                 .map(|(s, _)| s),
             None => {
@@ -956,11 +982,12 @@ async fn fill_pypi(
     state: &SharedState,
     p: &Pending,
     auth: &AuthExtension,
+    deadline: tokio::time::Instant,
 ) -> Result<StatusCode, String> {
     let name = mcp_packages::lookup_name("pypi", &p.identifier);
     let version = p.version.as_deref().unwrap_or_default();
     let json_path = format!("/{}/pypi/{name}/{version}/json", p.fill_repository);
-    let (status, body) = route_get(state, "pypi", &json_path, auth, None, true).await?;
+    let (status, body) = route_get(state, "pypi", &json_path, auth, None, true, deadline).await?;
     if !status.is_success() {
         return Ok(status);
     }
@@ -970,7 +997,9 @@ async fn fill_pypi(
         return Ok(StatusCode::NOT_FOUND);
     };
     let path = fill_path(p, Some(&file)).ok_or("no PyPI fill path")?;
-    Ok(route_get(state, "pypi", &path, auth, None, false).await?.0)
+    Ok(route_get(state, "pypi", &path, auth, None, false, deadline)
+        .await?
+        .0)
 }
 
 /// OCI: a manifest pull by the submitted tag or digest, authenticated with a
@@ -981,6 +1010,7 @@ async fn fill_oci(
     p: &Pending,
     user: &crate::models::user::User,
     auth: &AuthExtension,
+    deadline: tokio::time::Instant,
 ) -> Result<StatusCode, String> {
     let r = fmt::parse_oci_identifier(&p.identifier).map_err(|_| "invalid OCI identifier")?;
     let reference = r
@@ -995,9 +1025,11 @@ async fn fill_oci(
     .generate_scan_token(user, &p.fill_repository, 300)
     .map_err(|e| e.to_string())?;
     let path = format!("/{}/{}/manifests/{reference}", p.fill_repository, r.path);
-    Ok(route_get(state, "oci", &path, auth, Some(&token), false)
-        .await?
-        .0)
+    Ok(
+        route_get(state, "oci", &path, auth, Some(&token), false, deadline)
+            .await?
+            .0,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,16 +1211,35 @@ async fn resolve_pending(
             index: Some(p.index),
         });
     };
-    let remote = mcp_packages::repos_by_key(&state.db, std::slice::from_ref(&p.fill_repository))
-        .await
-        .map_err(|e| Step::Retry(e.detail()))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Step::Failed {
-            code: "mcp_package_not_found",
-            detail: format!("repository '{}' no longer exists", p.fill_repository),
-            index: Some(p.index),
-        })?;
+    // The fill target is recomputed from the current mapping and must be the
+    // repository recorded at publish: a pin is never assembled from the
+    // mapping of one moment and the Remote of another.
+    let remote = match fill_target(&state.db, mapped).await {
+        Ok(Some(remote)) if remote.id == p.fill_repository_id => remote,
+        Ok(_) => {
+            return Err(Step::Failed {
+                code: "mcp_package_not_found",
+                detail: format!(
+                    "registryType '{}' no longer fills through repository '{}'; publish again",
+                    p.registry_type, p.fill_repository
+                ),
+                index: Some(p.index),
+            })
+        }
+        Err(McpError::Internal(m)) | Err(McpError::Misconfigured(m)) => return Err(Step::Retry(m)),
+        Err(e) => return Err(Step::Retry(e.detail())),
+    };
+    // Fill through the repository as it is now (its key may have changed).
+    let current;
+    let p = if remote.key == p.fill_repository {
+        p
+    } else {
+        current = Pending {
+            fill_repository: remote.key.clone(),
+            ..p.clone()
+        };
+        &current
+    };
     let look = || async {
         if p.registry_type == "oci" {
             match mcp_packages::resolve_one(state, settings, p.index, &pkg, base).await {
@@ -1470,5 +1521,44 @@ mod tests {
         let blind = none.apply(account);
         assert!(!blind.can_access_repo(allowed));
         assert!(!blind.has_scope("read:artifacts"));
+    }
+
+    /// A router whose `/stall` answers `200` at once with one chunk, then a
+    /// body that never ends: a slow upstream trickling a fill.
+    fn stalling_router() -> axum::Router {
+        axum::Router::new().route(
+            "/stall",
+            axum::routing::get(|| async {
+                let chunk = futures::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{"))
+                });
+                Body::from_stream(futures::StreamExt::chain(chunk, futures::stream::pending()))
+            }),
+        )
+    }
+
+    /// #5395: the fill deadline covers the body, not only the head. A body
+    /// that stalls after a prompt `200` ends the exchange with an error (a
+    /// retryable fill failure) at the deadline, whether the body is read as
+    /// a JSON document or drained.
+    #[tokio::test]
+    async fn a_body_stalled_after_the_head_ends_at_the_fill_deadline() {
+        for want_body in [true, false] {
+            let req = Request::builder()
+                .uri("/stall")
+                .body(Body::empty())
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+            let out = tokio::time::timeout(
+                Duration::from_secs(10),
+                exchange(stalling_router(), req, want_body, deadline),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("want_body={want_body}: the stalled body outlived the fill deadline")
+            });
+            let err = out.expect_err("a stalled body is not a served fill");
+            assert!(err.contains("deadline"), "{err}");
+        }
     }
 }

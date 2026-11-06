@@ -220,6 +220,37 @@ pub async fn package_download_counts(
     Ok(rows.into_iter().collect())
 }
 
+/// [`package_download_counts`] of one package over only the live versions in
+/// `versions` (#5253: the MCP versions a caller may list). `None` when none of
+/// them is live, or none is tracked, as for a package with no counted version.
+pub async fn package_download_count_over_versions(
+    db: &PgPool,
+    package_id: Uuid,
+    versions: &[String],
+) -> sqlx::Result<Option<i64>> {
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let sql = format!(
+        r#"
+        SELECT SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = $1
+          AND pv.version = ANY($2)
+          AND {live}
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_id)
+        .bind(versions)
+        .fetch_one(db)
+        .await
+}
+
 /// Rows removed by [`prune_catalog_for_purged_artifact`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogPrune {

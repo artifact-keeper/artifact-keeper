@@ -145,6 +145,11 @@ pub async fn get_quarantine_status(
         "Artifact not found",
     )
     .await?;
+    // #5253: an MCP server version readers are not served is missing for a
+    // caller who does not hold the registry. A holder (the reason gate below)
+    // passes, as on the registry surface.
+    let caller = Some(auth_ext.clone());
+    crate::api::handlers::artifacts::require_mcp_servable(&state, &caller, artifact_id).await?;
 
     let now = chrono::Utc::now();
     let is_blocked = quarantine_service::check_download_allowed(

@@ -3592,14 +3592,26 @@ async fn apply_npm_scope_policy_config(
 /// administrator (only they may set the `*_locked` settings or change a
 /// locked one), and whether they administer the repository. Other formats:
 /// both absent.
+///
+/// A caller who does not administer the registry gets none of its MCP
+/// settings except the package policy (#5398): the backing repository keys
+/// in `mcp_package_repos` can name repositories the caller may not see, and
+/// the name globs (deny list, namespace allowlist, auto-approve) and the
+/// remaining knobs are policy only an administrator edits.
 fn with_mcp_caller(
     mut response: RepositoryResponse,
     instance_admin: bool,
     repo_admin: bool,
 ) -> RepositoryResponse {
     let mcp = response.format == "mcp";
+    let admin = instance_admin || repo_admin;
     response.mcp_caller_can_lock = mcp.then_some(instance_admin);
-    response.mcp_caller_is_repo_admin = mcp.then_some(instance_admin || repo_admin);
+    response.mcp_caller_is_repo_admin = mcp.then_some(admin);
+    if !admin {
+        response.mcp_package_repos = None;
+        response.mcp_namespace_allow = None;
+        response.mcp_settings = Default::default();
+    }
     response
 }
 
@@ -5219,9 +5231,16 @@ pub async fn get_repository(
     // `require_visible` above proves nothing about token scope when `repo` is
     // public — it early-returns before `can_access_repo` — so the member
     // filter re-derives BOTH halves from the principal.
-    let storage_used = service
+    let mut storage_used = service
         .get_display_storage_usage(&repo, &member_read_visibility(auth.as_ref()))
         .await?;
+    // MCP registries (#5253): a caller who does not hold the registry is
+    // shown the bytes of the versions it is served only.
+    if repo.repo_type != RepositoryType::Virtual {
+        if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+            storage_used.own_bytes = reader_storage_figures(&served).0;
+        }
+    }
     let auth_type =
         crate::services::upstream_auth::get_upstream_auth_type(&state.db, repo.id).await?;
 
@@ -5446,6 +5465,34 @@ pub async fn get_repository_storage(
         None
     };
 
+    // MCP registries (#5253): a caller who does not hold the registry gets
+    // the figures of the versions it is served, with the rollup's formula
+    // (per repository, nothing shared: such a caller is never an admin, so
+    // the dedup breakdown is withheld on cloud scope anyway).
+    if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+        let (logical, physical, blobs) = reader_storage_figures(&served);
+        let dedup_scope = match &row {
+            Some(r) => r.dedup_scope.clone(),
+            None => crate::services::storage_stats_service::DedupScope::from_backend(
+                &state.config.storage_backend,
+            )
+            .as_str()
+            .to_string(),
+        };
+        return Ok(Json(RepositoryStorageStatsResponse::assemble(
+            repo.key,
+            logical,
+            physical,
+            physical,
+            0,
+            blobs,
+            dedup_scope,
+            is_admin,
+            instance_unique_bytes,
+            row.map(|r| r.computed_at),
+        )));
+    }
+
     let response = match row {
         Some(r) => RepositoryStorageStatsResponse::assemble(
             repo.key,
@@ -5611,44 +5658,26 @@ pub async fn get_repository_storage_tree(
     // MCP registries (#5253): the materialized rollups include every stored
     // version, so a caller who does not hold the registry gets the tree
     // rebuilt from the rows it is served, with the same per-node formula.
-    if repo.format == RepositoryFormat::Mcp {
-        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
-        if !gate.holds_all(&[repo.id]).await {
-            // The rows are live; `computed_at` keeps the rollup's own mark.
-            let computed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-                "SELECT computed_at FROM repository_path_storage_stats \
-                 WHERE repository_id = $1 AND prefix = ''",
-            )
-            .bind(repo.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            let rows: Vec<(String, String, i64)> = sqlx::query_as(
-                "SELECT path, storage_key, size_bytes FROM artifacts \
-                 WHERE repository_id = $1 AND is_deleted = false \
-                   AND storage_key NOT LIKE 'proxy-cache/%'",
-            )
-            .bind(repo.id)
-            .fetch_all(&state.db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
-            let mut served = Vec::with_capacity(rows.len());
-            for row in rows {
-                if gate.visible_listed(repo.id, &row.0).await {
-                    served.push(row);
-                }
-            }
-            let tree = reader_storage_tree(&served, &prefix, levels, limit);
-            return Ok(Json(RepositoryStorageTreeResponse {
-                repository_key: key,
-                node: tree.node,
-                unattributed_bytes: (root_depth == 0).then_some(0),
-                children: tree.children,
-                truncated: tree.truncated,
-                max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
-                computed_at,
-            }));
-        }
+    if let Some(served) = mcp_reader_storage_rows(&state, auth.as_ref(), &repo).await? {
+        // The rows are live; `computed_at` keeps the rollup's own mark.
+        let computed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT computed_at FROM repository_path_storage_stats \
+             WHERE repository_id = $1 AND prefix = ''",
+        )
+        .bind(repo.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        let tree = reader_storage_tree(&served, &prefix, levels, limit);
+        return Ok(Json(RepositoryStorageTreeResponse {
+            repository_key: key,
+            node: tree.node,
+            unattributed_bytes: (root_depth == 0).then_some(0),
+            children: tree.children,
+            truncated: tree.truncated,
+            max_materialized_depth: MAX_MATERIALIZED_PATH_DEPTH,
+            computed_at,
+        }));
     }
 
     // The rooted node's own rollup (with the root-only unattributed figure).
@@ -8009,6 +8038,55 @@ pub async fn list_artifacts(
         has_more: Some(has_more),
         total_is_exact: Some(total_is_exact),
     }))
+}
+
+/// For an MCP registry `repo` that `auth` does not hold (#5253), the
+/// `(path, storage_key, size_bytes)` of the stored rows the caller is served
+/// (the generic listing decision), which the storage figures it is shown are
+/// computed from. `None` for any other repository or caller (the
+/// materialized figures apply). Proxy-cache entries are not counted.
+async fn mcp_reader_storage_rows(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo: &crate::models::repository::Repository,
+) -> Result<Option<Vec<(String, String, i64)>>> {
+    if repo.format != RepositoryFormat::Mcp {
+        return Ok(None);
+    }
+    let mut gate = super::mcp::GenericArtifactGate::new(state, auth);
+    if gate.holds_all(&[repo.id]).await {
+        return Ok(None);
+    }
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT path, storage_key, size_bytes FROM artifacts \
+         WHERE repository_id = $1 AND is_deleted = false \
+           AND storage_key NOT LIKE 'proxy-cache/%'",
+    )
+    .bind(repo.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut served = Vec::with_capacity(rows.len());
+    for row in rows {
+        if gate.visible_listed(repo.id, &row.0).await {
+            served.push(row);
+        }
+    }
+    Ok(Some(served))
+}
+
+/// `(logical_bytes, physical_bytes, blob_count)` of `rows` with the
+/// materialized rollup's formula: every row counts toward the logical total,
+/// each `storage_key` once toward the physical one.
+fn reader_storage_figures(rows: &[(String, String, i64)]) -> (i64, i64, i64) {
+    let mut blobs: std::collections::HashMap<&str, i64> = Default::default();
+    let mut logical = 0i64;
+    for (_, key, size) in rows {
+        logical += size;
+        let b = blobs.entry(key.as_str()).or_insert(0);
+        *b = (*b).max(*size);
+    }
+    (logical, blobs.values().sum(), blobs.len() as i64)
 }
 
 struct ReaderStorageTree {
@@ -11439,9 +11517,10 @@ pub(crate) async fn materialize_staged_for_repo<'a>(
 /// route, which validates the document, applies the namespace policy and
 /// pins its packages. A generic write of `servers/<name>/<version>/...` would
 /// skip all of that (and squat the version), so the generic upload entry
-/// points refuse an MCP repository. A trusted peer replication (admin or
-/// service account) still lands, so MCP repositories replicate like any
-/// other.
+/// points refuse an MCP repository. A peer replication under an instance
+/// administrator's token still lands ([`mcp_replication_trusted`]; a
+/// service account does not qualify, #5368), so MCP repositories replicate
+/// like any other.
 #[allow(clippy::result_large_err)]
 pub(crate) fn reject_generic_write_to_mcp(
     format: &RepositoryFormat,
@@ -11463,7 +11542,9 @@ const MCP_GENERIC_WRITE_REFUSED: &str =
 /// recomputes `isLatest` and audits `MCP_SERVER_DELETED`. The generic route
 /// knows none of that, so a plain repository writer could delete another
 /// namespace's server.json through it: it refuses MCP repositories, admins
-/// included, except a trusted peer replication (as for generic writes).
+/// included, except a peer replication under an administrator's token (as
+/// for generic writes). A version's pins are released through the admin
+/// purge (`POST .../versions/{version}/purge`, #5368).
 pub(crate) const MCP_GENERIC_DELETE_REFUSED: &str =
     "MCP registries delete server versions only through \
      DELETE /mcp/{repository}/v0.1/servers/{serverName}/versions/{version}";
@@ -11515,23 +11596,38 @@ fn generic_artifact_not_found(repo: &crate::models::repository::Repository) -> A
 }
 
 /// `400` for a generic write or delete into an MCP repository unless the/// `400` for a generic write or delete into an MCP repository unless the
-/// caller is a trusted peer replication (admin or service account with the
-/// replication header).
+/// caller is a peer replication under an instance administrator's
+/// credential ([`mcp_replication_trusted`]).
 pub(crate) fn mcp_generic_mutation_refusal(
     format: &RepositoryFormat,
     auth: &AuthExtension,
     headers: &HeaderMap,
     message: &str,
 ) -> Result<()> {
-    let trusted = replication_exemption_trusted(
-        super::is_replication_request(headers),
-        auth.is_admin,
-        auth.is_service_account,
-    );
+    let trusted = mcp_replication_trusted(super::is_replication_request(headers), auth.is_admin);
     if format == &RepositoryFormat::Mcp && !trusted {
         return Err(AppError::Validation(message.to_string()));
     }
     Ok(())
+}
+
+/// Whether a generic write or delete into an MCP repository is a peer
+/// replication that may skip the MCP routes (#5368).
+///
+/// Narrower than [`replication_exemption_trusted`]: a service account does
+/// not qualify. The replication header is client-set, and nothing binds an
+/// inbound credential to a registered peer (`peer_instances.api_key` is the
+/// key this instance presents to that peer, not the one the peer presents
+/// here), so "a service account plus the header" let any CI account with
+/// `write` store a `name@version` in another team's namespace with an
+/// unvalidated document, unpinned (the tombstone guard of migration 328
+/// still refused a recorded version), or trash another namespace's
+/// server.json. Peer links carry an instance administrator's token (the
+/// documented peer setup), and an administrator can already edit, delete
+/// and purge any version, so the exemption keeps replication of MCP
+/// repositories working without trusting any lesser identity.
+pub(crate) fn mcp_replication_trusted(is_replication: bool, is_admin: bool) -> bool {
+    is_replication && is_admin
 }
 
 pub(crate) async fn authorize_generic_upload(
@@ -23700,6 +23796,9 @@ mod tests {
         let user = tdh::make_auth(user_id, &username);
         let mut admin = user.clone();
         admin.is_admin = true;
+        // #5368: a service account is not a peer; the header is client-set.
+        let mut service_account = user.clone();
+        service_account.is_service_account = true;
         let mut replication = HeaderMap::new();
         replication.insert(
             "x-artifact-keeper-replication",
@@ -23708,6 +23807,7 @@ mod tests {
         for (who, headers) in [
             (user.clone(), HeaderMap::new()),
             (user.clone(), replication.clone()),
+            (service_account.clone(), replication.clone()),
             (admin.clone(), HeaderMap::new()),
         ] {
             let refused = delete_artifact(
@@ -23740,6 +23840,91 @@ mod tests {
         .await;
         assert!(replicated.is_ok(), "{replicated:?}");
         let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #5368: a generic `PUT` of a server.json into an MCP registry with the
+    /// replication header is refused for a service account holding `write`
+    /// (it would store an unvalidated, unpinned version in any namespace)
+    /// and stores nothing; a peer replication under an administrator's
+    /// token still lands.
+    #[tokio::test]
+    async fn generic_put_into_an_mcp_registry_needs_an_admin_peer_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let state = || {
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            ))
+        };
+        let mut service_account = tdh::make_auth(user_id, &username);
+        service_account.is_service_account = true;
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let mut replication = HeaderMap::new();
+        replication.insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let doc = |name: &str| {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "name": name, "version": "1.0.0", "description": "squat",
+                }))
+                .unwrap(),
+            )
+        };
+        let squat = "servers/com.other/echo/1.0.0/server.json".to_string();
+        let refused = upload_artifact(
+            state(),
+            Extension(Some(service_account)),
+            Path((key.clone(), squat.clone())),
+            replication.clone(),
+            doc("com.other/echo"),
+        )
+        .await;
+        match refused {
+            Err(r) => assert_eq!(r.status(), StatusCode::BAD_REQUEST),
+            Ok(r) => panic!(
+                "a service account with the replication header must be refused, got {}",
+                r.status()
+            ),
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "the refused write stored nothing");
+        let replicated = upload_artifact(
+            state(),
+            Extension(Some(admin)),
+            Path((key.clone(), squat.clone())),
+            replication,
+            doc("com.other/echo"),
+        )
+        .await;
+        match replicated {
+            Ok(r) => assert!(r.status().is_success(), "{}", r.status()),
+            Err(r) => panic!("an admin peer replication must land, got {}", r.status()),
+        }
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM mcp_version_tombstones WHERE repository_id = $1")
             .bind(repo_id)
             .execute(&pool)
             .await;
@@ -24887,6 +25072,92 @@ mod tests {
         tdh::cleanup(&pool, repo_id, owner_id).await;
         tdh::cleanup_user(&pool, dev_id).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DB-backed (#5398): `GET /api/v1/repositories/{key}` of a public MCP
+    /// registry carries its backing repository keys, deny list and other MCP
+    /// settings only for a caller who administers it (a `repository-owner`
+    /// member or an instance administrator). An anonymous reader and a plain
+    /// grantee get them absent; the package policy stays visible to all.
+    #[tokio::test]
+    async fn mcp_settings_shown_only_to_repo_admins_5398_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (owner_id, owner_name) = tdh::create_user(&pool).await;
+        let (reader_id, reader_name) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "mcp").await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        tdh::publish_repo(&pool, repo_id).await;
+        tdh::grant_repo_role(&pool, repo_id, owner_id, "repository-owner").await;
+        tdh::grant_repo_access(&pool, repo_id, reader_id).await;
+        let repos = serde_json::json!({ "npm": npm_key }).to_string();
+        for (k, v) in [
+            ("mcp_package_repos", repos.as_str()),
+            ("mcp_namespace_allow", r#"["com.acme"]"#),
+            ("mcp_server_deny", r#"["com.evil/*"]"#),
+            ("mcp_require_namespace_grant", "true"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+            )
+            .bind(repo_id)
+            .bind(k)
+            .bind(v)
+            .execute(&pool)
+            .await
+            .expect("insert mcp setting");
+        }
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let mut admin = tdh::make_auth(reader_id, &reader_name);
+        admin.is_admin = true;
+        let hidden = [
+            "mcp_package_repos",
+            "mcp_namespace_allow",
+            "mcp_server_deny",
+            "mcp_require_namespace_grant",
+            "mcp_probe_remotes",
+            "mcp_require_oci_label",
+        ];
+        for (who, auth, sees) in [
+            ("anonymous", None, false),
+            (
+                "plain grantee",
+                Some(tdh::make_auth(reader_id, &reader_name)),
+                false,
+            ),
+            (
+                "repository owner",
+                Some(tdh::make_auth(owner_id, &owner_name)),
+                true,
+            ),
+            ("instance admin", Some(admin), true),
+        ] {
+            let Json(got) =
+                get_repository(State(state.clone()), Extension(auth), Path(key.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("{who}: get: {e:?}"));
+            let json = serde_json::to_value(&got).unwrap();
+            assert_eq!(json["mcp_package_policy"], "own-repos", "{who}");
+            if sees {
+                assert_eq!(json["mcp_package_repos"]["npm"], npm_key.as_str(), "{who}");
+                assert_eq!(json["mcp_namespace_allow"][0], "com.acme", "{who}");
+                assert_eq!(json["mcp_server_deny"][0], "com.evil/*", "{who}");
+                assert_eq!(json["mcp_require_namespace_grant"], true, "{who}");
+            } else {
+                for k in hidden {
+                    assert!(
+                        json.get(k).is_none_or(serde_json::Value::is_null),
+                        "{who} must not see {k}: {json}"
+                    );
+                }
+            }
+        }
+        tdh::cleanup(&pool, repo_id, owner_id).await;
+        tdh::cleanup(&pool, npm_id, reader_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&npm_dir);
     }
 
     /// DB-backed (#4834): every repository-administration handler that still

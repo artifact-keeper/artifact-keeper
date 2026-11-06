@@ -19,7 +19,7 @@ variables, the 120 s wall clock) is in
 | The sandbox host kernel | A guest runs arbitrary code (`npm install` scripts, the server). | gVisor `runsc` (user-space kernel) or a microVM runtime (`kata-fc`); a plain runc container is refused unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`. Read-only root, `/tmp` tmpfs, uid 65532, `--cap-drop=ALL`, `no-new-privileges`, pids/memory/CPU limits. |
 | The container engine | Whoever drives the engine can start privileged containers. A rootful Docker or Podman socket is root on the host. | The worker drives **rootless** Podman as a dedicated user, on a host or VM used for nothing else. No socket is mounted into any container. On Kubernetes the worker has no engine at all: it creates guest pods through the API, limited by RBAC to one namespace. |
 | The internal network, cloud metadata | A guest that can open connections can scan and pivot, or send data out. | npm and PyPI guests join `ak-mcp-sandbox`, an internal network with no route out and no DNS for outside names. Its only member is a TCP forwarder that answers on the AK hostname and forwards to AK's address. On Kubernetes, a NetworkPolicy allows TCP 443 to AK only, and guest pods get no DNS server. OCI guests run with `--network=none`. |
-| Artifact Keeper credentials | The worker holds an `mcp:introspect` token. | The token can only claim jobs and post results. Guests never see it: the worker passes them only placeholder secrets (`AK_PLACEHOLDER_<NAME>`). Guests install anonymously, so map public, read-only repositories for packages that should be introspected. |
+| Artifact Keeper credentials | The worker holds an `mcp:introspect` token. In Option A the worker, rootless Podman and the gVisor sentry all run as `ak-sbx`, so a guest that escapes the sentry runs as the worker's user. | The token can only claim jobs and post results. Guests never see it: the worker passes them only placeholder secrets (`AK_PLACEHOLDER_<NAME>`). It is never in the environment: systemd opens the root-only `/etc/ak-mcp-introspector/token` and hands it over as standard input (`--token-file -`), and the worker makes itself non-dumpable (`PR_SET_DUMPABLE=0`), so another `ak-sbx` process can read neither a file holding the token nor the worker's `/proc/<pid>/environ` or memory. Guests install anonymously, so map public, read-only repositories for packages that should be introspected. |
 | Other jobs | A guest could persist between jobs. | A fresh container per attempt, removed after the run; jobs run one at a time, and the guest is killed at the wall clock. |
 
 What this deployment does not cover: a guest can still talk to the AK
@@ -35,11 +35,13 @@ the host supports nested virtualisation.
   kernel is much harder to reach from the guest. If the guest escapes the
   sentry, it runs on the host as the user that runs the worker (`ak-sbx` in
   Option A), with that user's files and processes. In Option A that
-  includes the worker, so a sentry escape can read the worker's
-  `mcp:introspect` token from `/proc/<pid>/environ`
-  ([#5390](https://github.com/artifact-keeper/artifact-keeper/issues/5390)).
-  The token can only claim jobs and post results, but it can post false
-  snapshots.
+  includes the worker process, but not its token
+  ([#5390](https://github.com/artifact-keeper/artifact-keeper/issues/5390)):
+  the token is in no file and no environment that user can open (systemd
+  passes the root-only token file as the worker's standard input), and the
+  worker is non-dumpable, so its `/proc/<pid>/environ` and memory are
+  root-owned. The escaped guest can still use that user's rootless Podman
+  and disturb or kill the worker, so keep the host dedicated to it.
 - **Without gVisor (plain `runc` or `crun`).** The guest is an ordinary
   container: namespaces, a seccomp filter and dropped capabilities, sharing
   the host kernel. Any kernel bug the guest can reach through the allowed
@@ -111,9 +113,16 @@ either on the grounds that the worker already points the installer at AK.
    digest, and pull them once as `ak-sbx`. Guests run with `--pull=missing`.
 5. **Service.** Install `systemd/ak-mcp-introspector.service` and
    `systemd/ak-mcp-introspector.env.example` (as
-   `/etc/ak-mcp-introspector.env`, mode 0600, the `mcp:introspect` token in
-   it). The unit runs as `ak-sbx` with `AK_MCP_SANDBOX_ENGINE=podman`,
-   `AK_MCP_SANDBOX_RUNTIME=runsc` and `AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox`.
+   `/etc/ak-mcp-introspector.env`; it holds no secret). Put the
+   `mcp:introspect` token in `/etc/ak-mcp-introspector/token`, mode 0600,
+   owner root (`install -d -m 0700 /etc/ak-mcp-introspector`). The unit runs
+   as `ak-sbx` with `AK_MCP_SANDBOX_ENGINE=podman`,
+   `AK_MCP_SANDBOX_RUNTIME=runsc` and `AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox`;
+   systemd opens the token file before it drops to `ak-sbx` and passes it as
+   standard input (`StandardInput=file:`, `--token-file -`), so the token is
+   in no file and no environment that `ak-sbx` can read. Do not set
+   `AK_MCP_INTROSPECTOR_TOKEN`: an environment value stays readable in
+   `/proc/<pid>/environ` (the worker warns when it gets one).
 6. **Egress of the worker itself** (remote probes). Allow the AK host and
    public addresses only: drop RFC 1918, CGNAT, link-local (cloud metadata),
    loopback and the IPv6 equivalents at the host firewall. The worker's own

@@ -218,6 +218,7 @@ impl AuditAction {
             | AuditAction::McpNamespaceProofVerified
             | AuditAction::McpServerEdited
             | AuditAction::McpServerDeleted
+            | AuditAction::McpServerPurged
             | AuditAction::McpMirrorSynced => Outcome::Success,
             // #5286: the recorder overrides to `Failure` for a request that
             // failed (`not_found`, `error`, `timeout`).

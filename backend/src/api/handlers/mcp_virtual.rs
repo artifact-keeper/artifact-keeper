@@ -17,15 +17,17 @@
 //!   the dependency-confusion rule.
 //! - **Listing**: each `(name, version)` once, from the member a detail read
 //!   would answer it from, member by member in serving order, each member's
-//!   rows in its own `name, version` keyset order. The cursor is
-//!   `base64url("m:{member_key}:{member_cursor}")`.
+//!   rows in its own `name, version` keyset order. The cursor is opaque: the
+//!   member key and its keyset position, sealed ([`fmt::CursorSeal`]).
+//! - **Deny lists**: the Virtual's own `mcp_server_deny` hides a name
+//!   everywhere; a nested Virtual's hides it from the members reached
+//!   through that nested Virtual (the union along each member's path).
 //! - **Writes**: `405 mcp_read_only`; publish to a hosted member.
 
 use std::collections::{HashMap, HashSet};
 
 use axum::http::StatusCode;
 use axum::response::Response;
-use base64::Engine as _;
 use uuid::Uuid;
 
 use super::mcp::{self, CandidateWalk, ListQuery, VersionRow};
@@ -52,39 +54,53 @@ pub fn serving_order<T>(members: Vec<T>, is_hosted: impl Fn(&T) -> bool) -> Vec<
     hosted
 }
 
-/// `base64url("m:{member_key}:{member_cursor}")`; an empty member cursor
-/// resumes at the start of that member.
-pub fn encode_member_cursor(member_key: &str, member_cursor: Option<&str>) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(format!("m:{member_key}:{}", member_cursor.unwrap_or("")))
+/// A member's keyset position: `(name, version)`, `None` = its first row.
+pub type MemberPosition = (String, Option<(String, String)>);
+
+/// The Virtual `scope`'s cursor resuming member `member_key` after `after`
+/// (`None`: at the start of that member), sealed: opaque to a client, and
+/// a cursor nobody issued is refused.
+pub fn encode_member_cursor(
+    seal: &fmt::CursorSeal,
+    scope: Uuid,
+    member_key: &str,
+    after: Option<&(String, String)>,
+) -> String {
+    let (name, version) = after
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .unwrap_or(("", ""));
+    seal.seal(
+        scope,
+        &[fmt::cursor_kind::VIRTUAL, member_key, name, version],
+    )
 }
 
-/// Inverse of [`encode_member_cursor`]: the member key and its own cursor
-/// (`None` = start of that member). Anything else is the listing's `400`.
-pub fn decode_member_cursor(cursor: &str) -> Result<(String, Option<String>), McpError> {
+/// Inverse of [`encode_member_cursor`]: the member key and its keyset
+/// position. Anything else is the listing's `400`.
+pub fn decode_member_cursor(
+    seal: &fmt::CursorSeal,
+    scope: Uuid,
+    cursor: &str,
+) -> Result<MemberPosition, McpError> {
     let bad = || McpError::invalid_query("cursor", "invalid cursor");
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor.trim_end_matches('='))
-        .map_err(|_| bad())?;
-    let text = String::from_utf8(raw).map_err(|_| bad())?;
-    let rest = text.strip_prefix("m:").ok_or_else(bad)?;
-    // A member cursor is base64url (no `:`), so the last `:` separates it.
-    let (key, inner) = rest.rsplit_once(':').ok_or_else(bad)?;
-    if key.is_empty() {
+    let [kind, key, name, version] =
+        <[String; 4]>::try_from(seal.open(scope, cursor)?).map_err(|_| bad())?;
+    if kind != fmt::cursor_kind::VIRTUAL || key.is_empty() {
         return Err(bad());
     }
-    Ok((
-        key.to_string(),
-        (!inner.is_empty()).then(|| inner.to_string()),
-    ))
+    match (name.is_empty(), version.is_empty()) {
+        (true, true) => Ok((key, None)),
+        (false, false) => Ok((key, Some((name, version)))),
+        _ => Err(bad()),
+    }
 }
 
 /// Where a listing starts: the member index and that member's keyset
-/// position. An unknown member key (a member removed between pages, or a
-/// forged cursor) is the listing's `400`.
+/// position. An unknown member key (a member removed between pages) is the
+/// listing's `400`.
 pub fn start_position(
     keys: &[&str],
-    cursor: Option<(String, Option<String>)>,
+    cursor: Option<MemberPosition>,
 ) -> Result<(usize, Option<(String, String)>), McpError> {
     let Some((key, inner)) = cursor else {
         return Ok((0, None));
@@ -93,7 +109,6 @@ pub fn start_position(
         .iter()
         .position(|k| *k == key)
         .ok_or_else(|| McpError::invalid_query("cursor", "invalid cursor"))?;
-    let inner = inner.map(|c| fmt::decode_cursor(&c)).transpose()?;
     Ok((idx, inner))
 }
 
@@ -150,6 +165,13 @@ pub(crate) struct Members {
     pub(crate) hosted_all: Vec<Uuid>,
     /// The Virtual's own `mcp_server_deny`.
     pub(crate) deny: Vec<String>,
+    /// Parallel to `order`: the union of the `mcp_server_deny` lists of the
+    /// nested Virtuals on the member's path (empty for a direct member). A
+    /// name one of them denies is not served from that member.
+    pub(crate) path_deny: Vec<Vec<String>>,
+    /// The Virtual's id: the scope of its cursors.
+    pub(crate) virtual_id: Uuid,
+    pub(crate) seal: fmt::CursorSeal,
 }
 
 fn is_hosted_type(t: &RepositoryType) -> bool {
@@ -161,11 +183,18 @@ pub(crate) async fn load_members(
     auth: Option<&AuthExtension>,
     virtual_repo: &RepoInfo,
 ) -> Result<Members, Response> {
-    let all: Vec<_> = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo.id)
+    let expansion = proxy_helpers::fetch_virtual_expansion(&state.db, virtual_repo.id)
         .await
-        .map_err(mcp::reproblem)?
+        .map_err(mcp::reproblem)?;
+    let mut via: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let all: Vec<_> = expansion
+        .members
         .into_iter()
-        .filter(|m| m.format == RepositoryFormat::Mcp)
+        .filter(|m| m.repo.format == RepositoryFormat::Mcp)
+        .map(|m| {
+            via.insert(m.repo.id, m.via);
+            m.repo
+        })
         .collect();
     let hosted_all = all
         .iter()
@@ -177,6 +206,24 @@ pub(crate) async fn load_members(
             .await
             .map_err(mcp::reproblem)?;
     let readable = serving_order(readable, |m| is_hosted_type(&m.repo_type));
+    let load_deny = |id: Uuid| async move {
+        crate::services::mcp_settings::load(&state.db, id, "virtual")
+            .await
+            .map_err(|e| mcp::internal(e.to_string()))
+            .map(|s| s.mcp_server_deny.unwrap_or_default())
+    };
+    let mut nested_deny: HashMap<Uuid, Vec<String>> = HashMap::new();
+    let mut path_deny = Vec::with_capacity(readable.len());
+    for m in &readable {
+        let mut union = Vec::new();
+        for v in via.get(&m.id).map(Vec::as_slice).unwrap_or_default() {
+            if !nested_deny.contains_key(v) {
+                nested_deny.insert(*v, load_deny(*v).await?);
+            }
+            union.extend(nested_deny[v].iter().cloned());
+        }
+        path_deny.push(union);
+    }
     let hosted = readable
         .iter()
         .map(|m| is_hosted_type(&m.repo_type))
@@ -185,16 +232,15 @@ pub(crate) async fn load_members(
         .iter()
         .map(proxy_helpers::repo_info_from_member)
         .collect();
-    let deny = crate::services::mcp_settings::load(&state.db, virtual_repo.id, "virtual")
-        .await
-        .map_err(|e| mcp::internal(e.to_string()))?
-        .mcp_server_deny
-        .unwrap_or_default();
+    let deny = load_deny(virtual_repo.id).await?;
     Ok(Members {
         order,
         hosted,
         hosted_all,
         deny,
+        path_deny,
+        virtual_id: virtual_repo.id,
+        seal: mcp::cursor_seal(state),
     })
 }
 
@@ -203,31 +249,69 @@ impl Members {
         crate::services::mcp_settings::any_glob_matches(&self.deny, name)
     }
 
+    /// Whether a nested Virtual on member `idx`'s path denies `name`.
+    fn path_denies(&self, idx: usize, name: &str) -> bool {
+        crate::services::mcp_settings::any_glob_matches(&self.path_deny[idx], name)
+    }
+
+    /// The members that may answer `name` ([`owner_indices`]), less those
+    /// reached through a nested Virtual that denies it.
+    fn owners(&self, hosted_owns_name: bool, name: &str) -> Vec<usize> {
+        owner_indices(&self.hosted, hosted_owns_name)
+            .into_iter()
+            .filter(|&i| !self.path_denies(i, name))
+            .collect()
+    }
+
     fn keys(&self) -> Vec<&str> {
         self.order.iter().map(|m| m.key.as_str()).collect()
     }
 }
 
-/// The names among `names` some hosted member holds (any live row).
+/// The server names some hosted member holds, compared case-insensitively
+/// (#5394), as the deny lists and namespace allowlists compare them: a
+/// hosted `io.acme/tool` shadows a Remote's `io.Acme/tool`.
+#[derive(Debug, Default)]
+pub(crate) struct OwnedNames(HashSet<String>);
+
+impl OwnedNames {
+    /// The comparison key of a server name.
+    pub(crate) fn key(name: &str) -> String {
+        name.to_lowercase()
+    }
+
+    pub(crate) fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self(names.into_iter().map(Self::key).collect())
+    }
+
+    /// Whether a hosted member holds `name` in any letter case.
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        self.0.contains(&Self::key(name))
+    }
+}
+
+/// The names among `names` some hosted member holds (any live row, any
+/// letter case).
 async fn hosted_owned_names(
     state: &SharedState,
     members: &Members,
     names: &[String],
-) -> Result<HashSet<String>, Response> {
+) -> Result<OwnedNames, Response> {
     if members.hosted_all.is_empty() || names.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(OwnedNames::default());
     }
+    let keys: Vec<String> = names.iter().map(|n| OwnedNames::key(n)).collect();
     let owned: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT a.name FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
-         WHERE a.repository_id = ANY($1) AND a.name = ANY($2) AND a.is_deleted = false \
+         WHERE a.repository_id = ANY($1) AND lower(a.name) = ANY($2) AND a.is_deleted = false \
            AND m.format = 'mcp'",
     )
     .bind(&members.hosted_all)
-    .bind(names)
+    .bind(&keys)
     .fetch_all(&state.db)
     .await
     .map_err(mcp::internal)?;
-    Ok(owned.into_iter().collect())
+    Ok(OwnedNames::from_names(owned.iter().map(String::as_str)))
 }
 
 async fn owners_of(
@@ -236,12 +320,13 @@ async fn owners_of(
     name: &str,
 ) -> Result<Vec<usize>, Response> {
     let owned = hosted_owned_names(state, members, &[name.to_string()]).await?;
-    Ok(owner_indices(&members.hosted, owned.contains(name)))
+    Ok(members.owners(owned.owns(name), name))
 }
 
 /// The member and row `latest` answers for `name` through the Virtual: the
 /// first owning member with a servable newest version (reader-only gate),
-/// and how many members were evaluated.
+/// and how many members were evaluated. A member whose gate cannot be
+/// evaluated ends the walk with no answer: never a lower-priority member's.
 async fn virtual_latest(
     state: &SharedState,
     members: &Members,
@@ -258,9 +343,13 @@ async fn virtual_latest(
             continue;
         }
         let policy = mcp::current_policy(&state.db, m.id).await;
-        if let (Some(row), _) = mcp::newest_servable(ctx, m.id, rows, &HashSet::new(), policy).await
+        match mcp::newest_servable(ctx, m.id, rows, &HashSet::new(), policy)
+            .await
+            .0
         {
-            return Ok((Some((idx, row)), walked));
+            Ok(Some(row)) => return Ok((Some((idx, row)), walked)),
+            Ok(None) => {}
+            Err(_) => return Ok((None, walked)),
         }
     }
     Ok((None, walked))
@@ -384,24 +473,36 @@ pub(crate) async fn list_versions(
     let owners = owners_of(state, &members, name).await?;
     let mut seen: HashSet<String> = HashSet::new();
     let mut picked: Vec<(usize, VersionRow)> = Vec::new();
-    let mut latest: Option<Uuid> = None;
     for &idx in &owners {
-        let served =
-            mcp::servable_versions(state, &members.order[idx], name, include_deleted).await?;
-        if latest.is_none() {
-            latest = mcp::latest_candidates(served.clone())
-                .first()
-                .map(|r| r.artifact_id);
-        }
-        for row in served {
-            if seen.insert(row.version.clone()) {
-                picked.push((idx, row));
+        let m = &members.order[idx];
+        match mcp::servable_versions(state, m, name, include_deleted).await? {
+            Ok(served) => {
+                for row in served {
+                    if seen.insert(row.version.clone()) {
+                        picked.push((idx, row));
+                    }
+                }
+            }
+            // A gate of this member cannot be evaluated: the versions it
+            // stores are left out, never answered from a lower-priority
+            // member (a detail read answers 503 for them).
+            Err(_) => {
+                for row in mcp::versions_of(&state.db, m.id, name).await? {
+                    if include_deleted || row.stored.registry.status != ServerStatus::Deleted {
+                        seen.insert(row.version);
+                    }
+                }
             }
         }
     }
     if picked.is_empty() {
         return Err(mcp::not_found());
     }
+    // `isLatest` marks what `latest` answers through the Virtual.
+    let latest = virtual_latest(state, &members, &owners, name)
+        .await?
+        .0
+        .map(|(_, r)| r.artifact_id);
     picked.sort_by(|a, b| a.1.version.cmp(&b.1.version));
     let entries = picked
         .iter()
@@ -428,13 +529,17 @@ pub(crate) async fn list_servers(
     // The composite cursor is the Virtual's own; the rest of the query is
     // parsed with the hosted rules.
     let mut rest = query.clone();
+    let seal = mcp::cursor_seal(state);
     let cursor = rest
         .remove("cursor")
         .filter(|c| !c.is_empty())
-        .map(|c| decode_member_cursor(&c))
+        .map(|c| decode_member_cursor(&seal, virtual_repo.id, &c))
         .transpose()
         .map_err(mcp::mcp_error)?;
-    let q = mcp::parse_list_query(&rest).map_err(mcp::mcp_error)?;
+    let q = mcp::parse_list_query(&rest, |_| {
+        Err(McpError::invalid_query("cursor", "invalid cursor"))
+    })
+    .map_err(mcp::mcp_error)?;
     let members = load_members(state, auth, virtual_repo).await?;
     let start = start_position(&members.keys(), cursor).map_err(mcp::mcp_error)?;
     let page = if q.version.as_deref() == Some("latest") {
@@ -469,8 +574,12 @@ struct Page {
 
 /// Where the next page resumes: a member and its own cursor.
 fn resume_cursor(members: &Members, idx: usize, after: Option<&(String, String)>) -> String {
-    let inner = after.map(|(n, v)| fmt::encode_cursor(n, v));
-    encode_member_cursor(&members.order[idx].key, inner.as_deref())
+    encode_member_cursor(
+        &members.seal,
+        members.virtual_id,
+        &members.order[idx].key,
+        after,
+    )
 }
 
 /// The artifact ids among `rows` that are their server's latest through
@@ -493,7 +602,7 @@ async fn page_latest_ids(
     let owned = hosted_owned_names(state, members, &names).await?;
     let mut out = HashSet::new();
     for name in &names {
-        let owners = owner_indices(&members.hosted, owned.contains(name));
+        let owners = members.owners(owned.owns(name), name);
         if let (Some((_, row)), _) = virtual_latest(state, members, &owners, name).await? {
             out.insert(row.artifact_id);
         }
@@ -531,8 +640,10 @@ async fn rows_matching(
 
 /// Drop the rows of member `idx` a detail read would answer from another
 /// member: a name a hosted member holds (for a Remote member), and a
-/// `(name, version)` an earlier member of the same kind serves. Names the
-/// Virtual denies go too.
+/// `(name, version)` an earlier member of the same kind serves (or whose
+/// gate cannot be evaluated there: the pair is left out, never answered
+/// from this lower-priority member). Names the Virtual denies, or a nested
+/// Virtual on this member's path denies, go too.
 async fn drop_shadowed(
     state: &SharedState,
     members: &Members,
@@ -542,7 +653,7 @@ async fn drop_shadowed(
 ) -> Result<Vec<VersionRow>, Response> {
     let mut rows: Vec<VersionRow> = rows
         .into_iter()
-        .filter(|r| !members.denies(&r.name))
+        .filter(|r| !members.denies(&r.name) && !members.path_denies(idx, &r.name))
         .collect();
     if rows.is_empty() {
         return Ok(rows);
@@ -551,28 +662,38 @@ async fn drop_shadowed(
     if !hosted {
         let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
         let owned = hosted_owned_names(state, members, &names).await?;
-        rows.retain(|r| !owned.contains(&r.name));
+        rows.retain(|r| !owned.owns(&r.name));
     }
     let ctx = GateCtx::of(state, false);
     for earlier in (0..idx).filter(|&j| members.hosted[j] == hosted) {
         if rows.is_empty() {
             break;
         }
+        // A name a nested Virtual on the earlier member's path denies is not
+        // served from it, so it shadows nothing.
         let pairs: Vec<(String, String)> = rows
             .iter()
+            .filter(|r| !members.path_denies(earlier, &r.name))
             .map(|r| (r.name.clone(), r.version.clone()))
             .collect();
+        if pairs.is_empty() {
+            continue;
+        }
         let m = &members.order[earlier];
         let theirs = rows_matching(state, m.id, &pairs, include_deleted).await?;
         if theirs.is_empty() {
             continue;
         }
         let policy = mcp::current_policy(&state.db, m.id).await;
-        let served: HashSet<(String, String)> = mcp::servable(ctx, m.id, theirs, policy)
-            .await
-            .into_iter()
-            .map(|r| (r.name, r.version))
+        let all_theirs: HashSet<(String, String)> = theirs
+            .iter()
+            .map(|r| (r.name.clone(), r.version.clone()))
             .collect();
+        let served: HashSet<(String, String)> =
+            match mcp::servable_checked(ctx, m.id, theirs, policy).await {
+                Ok(served) => served.into_iter().map(|r| (r.name, r.version)).collect(),
+                Err(_) => all_theirs,
+            };
         rows.retain(|r| !served.contains(&(r.name.clone(), r.version.clone())));
     }
     Ok(rows)
@@ -681,7 +802,7 @@ async fn list_latest(
                     break 'members;
                 }
                 if !members.denies(&name) {
-                    let owners = owner_indices(&members.hosted, owned.contains(&name));
+                    let owners = members.owners(owned.owns(&name), &name);
                     let (picked, walked) = virtual_latest(state, members, &owners, &name).await?;
                     budget = budget.saturating_sub(walked.max(1));
                     if let Some((owner, row)) = picked.filter(|(owner, r)| {
@@ -710,6 +831,7 @@ async fn list_latest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn serving_order_puts_hosted_first_and_keeps_priority() {
@@ -721,29 +843,48 @@ mod tests {
         assert_eq!(ordered, vec!["l1", "l2", "r1", "r2"]);
     }
 
+    fn test_seal() -> fmt::CursorSeal {
+        fmt::CursorSeal::from_secret("mcp-virtual-tests-secret-0123456789abcdef")
+    }
+
     #[test]
     fn member_cursor_round_trips_and_rejects_garbage() {
-        let inner = fmt::encode_cursor("com.acme/x", "1.0.0");
-        let c = encode_member_cursor("mcp-local", Some(&inner));
+        let seal = test_seal();
+        let scope = Uuid::new_v4();
+        let at = ("com.acme/x".to_string(), "1.0.0".to_string());
+        let c = encode_member_cursor(&seal, scope, "mcp-local", Some(&at));
         assert_eq!(
-            decode_member_cursor(&c).unwrap(),
-            ("mcp-local".to_string(), Some(inner.clone()))
+            decode_member_cursor(&seal, scope, &c).unwrap(),
+            ("mcp-local".to_string(), Some(at.clone()))
         );
-        let start = encode_member_cursor("mcp-remote", None);
+        let start = encode_member_cursor(&seal, scope, "mcp-remote", None);
         assert_eq!(
-            decode_member_cursor(&start).unwrap(),
+            decode_member_cursor(&seal, scope, &start).unwrap(),
             ("mcp-remote".to_string(), None)
         );
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        // The pre-seal format, which a client could build by hand.
+        let hand_made = b64(&format!("m:mcp-local:{}", b64("com.acme/x:1.0.0")));
+        let other_scope = encode_member_cursor(&seal, Uuid::new_v4(), "mcp-local", None);
+        let hosted = seal.encode_position(scope, fmt::cursor_kind::SERVERS, "a/b", "1");
+        let no_key = seal.seal(scope, &[fmt::cursor_kind::VIRTUAL, "", "", ""]);
+        let half = seal.seal(scope, &[fmt::cursor_kind::VIRTUAL, "k", "a/b", ""]);
         for garbage in [
             "!!!",
             "bm90LWEtY3Vyc29y",
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("m::abc"),
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("m:nokey"),
-            &inner,
+            &b64("m::abc"),
+            &b64("m:nokey"),
+            &hand_made,
+            &other_scope,
+            &hosted,
+            &no_key,
+            &half,
         ] {
             // D4: a malformed composite cursor is a query error.
             assert_eq!(
-                decode_member_cursor(garbage).unwrap_err().code(),
+                decode_member_cursor(&seal, scope, garbage)
+                    .unwrap_err()
+                    .code(),
                 "mcp_invalid_query",
                 "{garbage}"
             );
@@ -754,10 +895,10 @@ mod tests {
     fn start_position_finds_the_member_and_its_keyset() {
         let keys = ["a", "b"];
         assert_eq!(start_position(&keys, None).unwrap(), (0, None));
-        let inner = fmt::encode_cursor("n/x", "2");
+        let at = ("n/x".to_string(), "2".to_string());
         assert_eq!(
-            start_position(&keys, Some(("b".into(), Some(inner)))).unwrap(),
-            (1, Some(("n/x".to_string(), "2".to_string())))
+            start_position(&keys, Some(("b".into(), Some(at.clone())))).unwrap(),
+            (1, Some(at))
         );
         assert_eq!(
             start_position(&keys, Some(("b".into(), None))).unwrap(),
@@ -769,7 +910,6 @@ mod tests {
                 .code(),
             "mcp_invalid_query"
         );
-        assert!(start_position(&keys, Some(("a".into(), Some("%%".into())))).is_err());
     }
 
     #[test]
@@ -835,6 +975,18 @@ mod tests {
         /// A member of `repo_type` at `priority`, readable by the fixture
         /// user when `readable`, with the `open` package policy.
         async fn member(&mut self, repo_type: &str, priority: i32, readable: bool) -> usize {
+            let root = self.fx.repo_id;
+            self.member_of(root, repo_type, priority, readable).await
+        }
+
+        /// [`Self::member`] of the (nested) Virtual `parent`.
+        async fn member_of(
+            &mut self,
+            parent: Uuid,
+            repo_type: &str,
+            priority: i32,
+            readable: bool,
+        ) -> usize {
             let pool = &self.fx.pool;
             let (id, key, dir) = tdh::create_repo(pool, repo_type, "mcp").await;
             sqlx::query(
@@ -848,7 +1000,7 @@ mod tests {
             if readable {
                 tdh::grant_repo_access(pool, id, self.fx.user_id).await;
             }
-            tdh::link_virtual_member(pool, self.fx.repo_id, id, priority).await;
+            tdh::link_virtual_member(pool, parent, id, priority).await;
             self.members.push((id, key, dir));
             self.members.len() - 1
         }
@@ -953,6 +1105,12 @@ mod tests {
         }
 
         async fn teardown(self) {
+            for (id, _, _) in &self.members {
+                let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                    .bind(id)
+                    .execute(&self.fx.pool)
+                    .await;
+            }
             for (id, _, dir) in &self.members {
                 let _ = sqlx::query("DELETE FROM packages WHERE repository_id = $1")
                     .bind(id)
@@ -1104,7 +1262,8 @@ mod tests {
             seen.extend(descriptions(&b));
             match b["metadata"]["nextCursor"].as_str() {
                 Some(c) => {
-                    let (key, _) = decode_member_cursor(c).unwrap();
+                    let seal = super::super::mcp::cursor_seal(&env.fx.state);
+                    let (key, _) = decode_member_cursor(&seal, env.fx.repo_id, c).unwrap();
                     assert!(env.members.iter().any(|m| m.1 == key));
                     cursor = Some(c.to_string());
                 }
@@ -1126,11 +1285,41 @@ mod tests {
             (s, b["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("mcp_invalid_query"))
         );
-        let gone = encode_member_cursor("not-a-member", None);
+        let seal = super::super::mcp::cursor_seal(&env.fx.state);
+        let gone = encode_member_cursor(&seal, env.fx.repo_id, "not-a-member", None);
         assert_eq!(
             env.get(&format!("/servers?cursor={gone}")).await.0,
             StatusCode::BAD_REQUEST
         );
+        // Finding 4: the cursor is opaque (it names neither the member nor a
+        // row) and one built by hand is refused, so a client can neither
+        // read a held row out of a cursor nor probe with a made-up one.
+        let (_, b) = env.get("/servers?limit=1").await;
+        let issued = b["metadata"]["nextCursor"].as_str().unwrap().to_string();
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&issued)
+            .unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            !text.contains("com.acme") && !text.contains(&env.members[l1].1),
+            "{text}"
+        );
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        for hand_made in [
+            b64(&format!("m:{}:", env.members[l2].1)),
+            b64(&format!(
+                "m:{}:{}",
+                env.members[l1].1,
+                b64("com.acme/a:1.0.0")
+            )),
+        ] {
+            let (s, b) = env.get(&format!("/servers?cursor={hand_made}")).await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("mcp_invalid_query")),
+                "{hand_made}"
+            );
+        }
         env.teardown().await;
     }
 
@@ -1190,5 +1379,192 @@ mod tests {
             assert_eq!(env.get(tail).await.0, StatusCode::OK, "{tail}");
         }
         env.teardown().await;
+    }
+
+    /// Finding 3: a nested Virtual's `mcp_server_deny` applies to the
+    /// members reached through it when its parent is read, as the union of
+    /// the deny lists along the member's path. A member outside the nested
+    /// Virtual still serves the name.
+    #[tokio::test]
+    async fn nested_virtual_deny_applies_along_the_path() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let nested = env.member("virtual", 1, true).await;
+        let nested_id = env.members[nested].0;
+        let inner = env.member_of(nested_id, "local", 1, true).await;
+        let direct = env.member("local", 2, true).await;
+        env.store(inner, "com.evil/x", "1.0.0", "inner").await;
+        env.store(inner, "com.acme/ok", "1.0.0", "inner").await;
+        env.store(inner, "com.evil/y", "1.0.0", "inner").await;
+        env.store(direct, "com.evil/y", "1.0.0", "direct").await;
+        let (_, b) = env.get("/servers").await;
+        assert_eq!(
+            descriptions(&b),
+            vec![
+                "com.acme/ok@1.0.0=inner",
+                "com.evil/x@1.0.0=inner",
+                "com.evil/y@1.0.0=inner"
+            ],
+            "before the deny"
+        );
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'mcp_server_deny', '[\"com.evil/*\"]')",
+        )
+        .bind(nested_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+
+        let (s, b) = env.get("/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            descriptions(&b),
+            vec!["com.acme/ok@1.0.0=inner", "com.evil/y@1.0.0=direct"]
+        );
+        let (_, b) = env.get("/servers?version=latest").await;
+        assert_eq!(
+            descriptions(&b),
+            vec!["com.acme/ok@1.0.0=inner", "com.evil/y@1.0.0=direct"]
+        );
+        for tail in [
+            "/servers/com.evil%2Fx/versions/1.0.0",
+            "/servers/com.evil%2Fx/versions/latest",
+            "/servers/com.evil%2Fx/versions",
+        ] {
+            assert_eq!(
+                env.get(tail).await,
+                (StatusCode::NOT_FOUND, fmt::not_found_value()),
+                "{tail}"
+            );
+        }
+        for tail in [
+            "/servers/com.evil%2Fy/versions/1.0.0",
+            "/servers/com.evil%2Fy/versions/latest",
+        ] {
+            let (s, b) = env.get(tail).await;
+            assert_eq!(
+                (s, b["server"]["description"].as_str()),
+                (StatusCode::OK, Some("direct")),
+                "{tail}"
+            );
+        }
+        let (_, b) = env.get("/servers/com.evil%2Fy/versions").await;
+        assert_eq!(descriptions(&b), vec!["com.evil/y@1.0.0=direct"]);
+        assert_eq!(
+            b["servers"][0]["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"],
+            true
+        );
+        env.teardown().await;
+    }
+
+    /// Finding 14: a `(name, version)` whose gate cannot be evaluated on the
+    /// member that would answer it is left out of the listings, never
+    /// listed from a lower-priority member, and a `latest` that cannot be
+    /// decided there is not taken from the next member.
+    #[tokio::test]
+    async fn listings_do_not_fall_past_an_unevaluable_gate() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let r1 = env.member("remote", 1, true).await;
+        let r2 = env.member("remote", 2, true).await;
+        env.store(r1, "io.public/y", "1.0.0", "r1").await;
+        env.store(r2, "io.public/y", "1.0.0", "r2").await;
+        env.store(r2, "io.public/y", "2.0.0", "r2").await;
+        env.store(r2, "io.public/z", "1.0.0", "r2").await;
+        let (_, b) = env.get("/servers").await;
+        assert_eq!(
+            descriptions(&b),
+            vec![
+                "io.public/y@1.0.0=r1",
+                "io.public/y@2.0.0=r2",
+                "io.public/z@1.0.0=r2"
+            ]
+        );
+        // r1's gate cannot be evaluated: an age gate it cannot enforce
+        // (MCP has no upstream publish time) fails closed.
+        sqlx::query("UPDATE repositories SET age_gate_enabled = true WHERE id = $1")
+            .bind(env.members[r1].0)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        for tail in [
+            "/servers/io.public%2Fy/versions/1.0.0",
+            "/servers/io.public%2Fy/versions/latest",
+        ] {
+            assert_eq!(
+                env.get(tail).await.0,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{tail}"
+            );
+        }
+        let (s, b) = env.get("/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            descriptions(&b),
+            vec!["io.public/y@2.0.0=r2", "io.public/z@1.0.0=r2"]
+        );
+        let (_, b) = env.get("/servers?version=latest").await;
+        assert_eq!(descriptions(&b), vec!["io.public/z@1.0.0=r2"]);
+        let (s, b) = env.get("/servers/io.public%2Fy/versions").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(descriptions(&b), vec!["io.public/y@2.0.0=r2"]);
+        assert_eq!(
+            b["servers"][0]["_meta"][fmt::OFFICIAL_META_KEY]["isLatest"],
+            false
+        );
+        env.teardown().await;
+    }
+
+    /// #5394: hosted shadows remote whatever the letter case. A hosted
+    /// `io.acme/tool` hides a Remote's `io.Acme/tool` from every read
+    /// through the Virtual, as the deny lists (case-insensitive) would.
+    #[tokio::test]
+    async fn hosted_shadows_remote_whatever_the_letter_case() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let r1 = env.member("remote", 1, true).await;
+        let l1 = env.member("local", 2, true).await;
+        env.store(r1, "io.Acme/tool", "9.0.0", "upstream").await;
+        env.store(r1, "io.public/y", "1.0.0", "upstream").await;
+        env.store(l1, "io.acme/tool", "1.0.0", "internal").await;
+        for tail in ["/servers", "/servers?version=latest"] {
+            let (s, b) = env.get(tail).await;
+            assert_eq!(s, StatusCode::OK, "{tail}");
+            assert_eq!(
+                descriptions(&b),
+                vec!["io.acme/tool@1.0.0=internal", "io.public/y@1.0.0=upstream"],
+                "{tail}"
+            );
+        }
+        for tail in [
+            "/servers/io.Acme%2Ftool/versions/9.0.0",
+            "/servers/io.Acme%2Ftool/versions/latest",
+            "/servers/io.Acme%2Ftool/versions",
+        ] {
+            assert_eq!(
+                env.get(tail).await,
+                (StatusCode::NOT_FOUND, fmt::not_found_value()),
+                "{tail}"
+            );
+        }
+        let (s, b) = env.get("/servers/io.acme%2Ftool/versions/latest").await;
+        assert_eq!(
+            (s, b["server"]["description"].as_str()),
+            (StatusCode::OK, Some("internal"))
+        );
+        env.teardown().await;
+    }
+
+    #[test]
+    fn owned_names_compare_case_insensitively() {
+        let owned = OwnedNames::from_names(["io.acme/tool"]);
+        assert!(owned.owns("io.Acme/tool"));
+        assert!(owned.owns("IO.ACME/TOOL"));
+        assert!(!owned.owns("io.acme/tools"));
+        assert!(!OwnedNames::default().owns("io.acme/tool"));
     }
 }

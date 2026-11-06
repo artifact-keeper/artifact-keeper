@@ -486,7 +486,14 @@ async fn get_package_analysis(
     // content under a trusted origin.
     let auth =
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
-    check_artifact_visibility(&Some(auth), id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, id, &state.db, "read").await?;
+    // #5253: a held MCP server version answers as an artifact never analyzed.
+    if !super::artifacts::mcp_servable(&state, auth.as_ref(), id).await? {
+        return Err(AppError::NotFound(
+            "No package analysis recorded for this artifact".to_string(),
+        ));
+    }
 
     let db = &state.db;
 
