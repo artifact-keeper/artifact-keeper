@@ -1,0 +1,5 @@
+---
+section: Changed
+issues: [#5291]
+---
+- **Hosted Hugging Face uploads stream to storage instead of being held in memory** (#5291). `POST /huggingface/{repo}/api/models/{id}/upload/{rev}` took the whole body as one in-memory buffer, hashed it, and only then wrote it, so a 5 GB GGUF needed 5 GB of backend heap per concurrent upload and one large upload could OOM a pod sized for normal traffic. The body now streams through the shared staging path the Git LFS, agent-plugin and Maven uploads use (local scratch, or the repository's own object store when it streams natively), with SHA-256 computed as it arrives, and is then written to its final key. A body over `MAX_UPLOAD_SIZE` is refused with 413, up front from `Content-Length` or as soon as the limit is crossed, and leaves no artifact row, stored object or staging file. A re-publish to a path that already holds a file is now refused with 409 before its body is received. Status codes, the stored artifact, catalog registration, push replication, the scan-on-upload hook and the response are otherwise unchanged.

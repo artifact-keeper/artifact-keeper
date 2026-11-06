@@ -582,6 +582,29 @@ fn primary_package_entry(primary: &str) -> String {
         .join("\n")
 }
 
+/// `html` with every PEP 700 `data-upload-time="..."` value replaced by `*`.
+///
+/// The simple index renders each file's upload time (the row's `created_at`)
+/// at one-second precision, so two uploads that straddle a second boundary
+/// render different pages for the same package (#5365). The time is when the
+/// bytes arrived, not something the upload route derives from the package.
+fn without_upload_time(html: &str) -> String {
+    const ATTR: &str = "data-upload-time=\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find(ATTR) {
+        let value_start = at + ATTR.len();
+        out.push_str(&rest[..value_start]);
+        out.push('*');
+        let value_len = rest[value_start..]
+            .find('"')
+            .expect("a closed data-upload-time attribute");
+        rest = &rest[value_start + value_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
 // ===========================================================================
 // Alpine
 // ===========================================================================
@@ -1028,7 +1051,7 @@ async fn generic_put_npm_tarball_naming_another_package_is_refused() {
 /// A wheel PUT through the generic endpoint at
 /// `{project}/{version}/{file}` matches the native twine upload of the same
 /// wheel: row identity, `pypi` document, catalog entry and the simple index
-/// (file link and `data-requires-python`).
+/// (file link and `data-requires-python`; upload time aside).
 ///
 /// The upload form carries the fields the native route reads; extra twine
 /// form fields are recorded by the native route as `upload_metadata`, which
@@ -1089,7 +1112,9 @@ async fn generic_put_wheel_matches_native_pypi_upload() {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "simple index in {}", repo.key);
-        indexes.push(without_key(&text(&body), &repo.key));
+        let html = text(&body);
+        assert!(html.contains("data-upload-time=\""), "{html}");
+        indexes.push(without_key(&without_upload_time(&html), &repo.key));
     }
     let (native_html, generic_html) = (&indexes[0], &indexes[1]);
     assert!(generic_html.contains(&file), "{generic_html}");

@@ -334,11 +334,30 @@ async fn require_existing_visible_artifact(
 /// (or a bundle of one) that readers are not served now is "Artifact not
 /// found" for a caller who does not hold the repository, as on the registry
 /// surface ([`super::mcp::GenericArtifactGate`]). Other formats pass.
-async fn require_mcp_servable(
+pub(crate) async fn require_mcp_servable(
     state: &SharedState,
     auth: &Option<AuthExtension>,
     id: Uuid,
 ) -> Result<()> {
+    if mcp_servable(state, auth.as_ref(), id).await? {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("Artifact not found".to_string()))
+    }
+}
+
+/// Whether artifact `id` passes the MCP serve decision for `auth`
+/// ([`require_mcp_servable`]): `true` for any artifact outside an MCP
+/// registry (and for an id that names no artifact, which the caller answers
+/// as missing itself), and for a repository holder. The routes that answer a
+/// missing artifact with their own body (a `404` with another message, or an
+/// empty listing) give that same answer when this is `false`, so a held
+/// version cannot be told from a missing one.
+pub(crate) async fn mcp_servable(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    id: Uuid,
+) -> Result<bool> {
     let row: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT a.repository_id, a.path FROM artifacts a \
          JOIN repositories r ON r.id = a.repository_id \
@@ -349,16 +368,11 @@ async fn require_mcp_servable(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
     let Some((repo_id, path)) = row else {
-        return Ok(());
+        return Ok(true);
     };
-    if super::mcp::GenericArtifactGate::new(state, auth.as_ref())
+    Ok(super::mcp::GenericArtifactGate::new(state, auth)
         .visible(repo_id, &path)
-        .await
-    {
-        Ok(())
-    } else {
-        Err(AppError::NotFound("Artifact not found".to_string()))
-    }
+        .await)
 }
 
 /// Get artifact metadata by artifact ID

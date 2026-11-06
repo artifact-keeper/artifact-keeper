@@ -225,6 +225,7 @@ impl<K: ArchiveKind> proxy_helpers::ScannedProxyFile for ScannedArchive<'_, K> {
             req.source_path,
             req.cache_path,
             req.format.clone(),
+            req.is_head(),
         )
         .await?;
         proxy_helpers::stream_fetch_result(result, K::CONTENT_TYPE, self.disposition)

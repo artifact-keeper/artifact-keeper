@@ -117,6 +117,140 @@ pub fn live_package_version_predicate() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Catalog download counts (#5346)
+// ---------------------------------------------------------------------------
+//
+// The `packages.download_count` / `package_versions.download_count` columns
+// (migration 019) were never written, so every package reported 0. The counts
+// are computed at read time from the download history the serve paths already
+// record instead: `download_statistics` (hosted, one row per served body,
+// written off the hot path by the batched download-event dispatcher, #2522)
+// and `proxy_download_statistics` (Remote pull-through serves, #2270/#4539).
+// Nothing is added to the download path, and the counts cannot drift from the
+// artifact download stats because they are the same rows.
+//
+// The stored columns stay (a 1.11 pod in a rolling upgrade still selects
+// them) but are no longer read.
+
+/// SQL expression for one `package_versions` row's download count (#5346).
+/// Expects `pv`, `p` and `r` in scope.
+///
+/// Hosted serves: the `download_statistics` rows of the version's artifacts in
+/// the package's repository, i.e. the artifact carrying the version's
+/// representative checksum (the catalog's liveness join, #3660) plus every
+/// artifact recorded under the package's name and the version (the other
+/// files of a multi-file version, such as a Hugging Face model revision). It is
+/// the sum of the download counts the artifact pages show for those files.
+///
+/// Remote serves: the `proxy_download_statistics` rows of the repository that
+/// carry the version's digest (#4542), plus older rows with no digest of their
+/// own that still link to a cached object with it (the same two arms the
+/// blast-radius report reads).
+///
+/// `NULL` means "not tracked": a Remote version cataloged without a digest
+/// (a streamed Maven pull-through, whose checksum is unknown when the row is
+/// written) cannot be tied to any recorded serve, which is different from a
+/// real 0. Every lookup is indexed: `idx_artifacts_checksum` /
+/// `idx_artifacts_repo_name_version`, `idx_download_stats_artifact`,
+/// `idx_proxy_dl_stats_checksum`, `idx_proxy_cache_repo_checksum` and
+/// `idx_proxy_dl_stats_cache`.
+pub fn version_download_count_sql() -> &'static str {
+    r#"(CASE
+    WHEN r.repo_type = 'remote' AND COALESCE(pv.checksum_sha256, '') = '' THEN NULL
+    ELSE (
+        SELECT COUNT(*)
+        FROM download_statistics ds_pkg
+        WHERE ds_pkg.artifact_id IN (
+            SELECT a_dl.id
+            FROM artifacts a_dl
+            WHERE a_dl.repository_id = p.repository_id
+              AND (
+                    (pv.checksum_sha256 <> '' AND a_dl.checksum_sha256 = pv.checksum_sha256)
+                    OR (a_dl.name = p.name AND a_dl.version = pv.version)
+              )
+        )
+    ) + (
+        CASE WHEN r.repo_type = 'remote' THEN (
+            SELECT COUNT(*)
+            FROM proxy_download_statistics pd_pkg
+            WHERE pd_pkg.repository_id = p.repository_id
+              AND pd_pkg.checksum_sha256 = pv.checksum_sha256
+        ) + (
+            SELECT COUNT(*)
+            FROM proxy_download_statistics pd_pkg
+            JOIN proxy_cache_artifacts pc_pkg ON pc_pkg.id = pd_pkg.proxy_cache_id
+            WHERE pc_pkg.repository_id = p.repository_id
+              AND pc_pkg.checksum_sha256 = pv.checksum_sha256
+              AND pd_pkg.checksum_sha256 IS NULL
+        ) ELSE 0 END
+    )
+END)"#
+}
+
+/// Download counts of the packages in `package_ids` (#5346): the sum of their
+/// live versions' counts ([`version_download_count_sql`]), so a package
+/// reports the total of the versions its version list shows. One statement
+/// for a whole listing page. A package missing from the map, or mapped to
+/// `None`, is not tracked (a Remote package with no version digest).
+pub async fn package_download_counts(
+    db: &PgPool,
+    package_ids: &[Uuid],
+) -> sqlx::Result<std::collections::HashMap<Uuid, Option<i64>>> {
+    if package_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT p.id, SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = ANY($1)
+          AND {live}
+        GROUP BY p.id
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    let rows: Vec<(Uuid, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_ids)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// [`package_download_counts`] of one package over only the live versions in
+/// `versions` (#5253: the MCP versions a caller may list). `None` when none of
+/// them is live, or none is tracked, as for a package with no counted version.
+pub async fn package_download_count_over_versions(
+    db: &PgPool,
+    package_id: Uuid,
+    versions: &[String],
+) -> sqlx::Result<Option<i64>> {
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let sql = format!(
+        r#"
+        SELECT SUM({count})::BIGINT
+        FROM packages p
+        JOIN repositories r ON r.id = p.repository_id
+        JOIN package_versions pv ON pv.package_id = p.id
+        WHERE p.id = $1
+          AND pv.version = ANY($2)
+          AND {live}
+        "#,
+        count = version_download_count_sql(),
+        live = live_package_version_predicate(),
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(&*sql))
+        .bind(package_id)
+        .bind(versions)
+        .fetch_one(db)
+        .await
+}
+
 /// Rows removed by [`prune_catalog_for_purged_artifact`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogPrune {

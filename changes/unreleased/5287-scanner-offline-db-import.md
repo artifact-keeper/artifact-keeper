@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5287]
+---
+- **The scanner-adapter runs offline and imports a trivy vulnerability DB over HTTP, with no restart** (#5287). On a disconnected install the adapter tried to download the trivy DB at startup and stayed not-ready, and the only way to seed its cache was shell access to the volume. `SCANNER_OFFLINE=true` now skips every DB and Java-DB download and scans with `--offline-scan`. `PUT /api/v1/vulndb` takes the `db.tar.gz` that `oras pull ghcr.io/aquasecurity/trivy-db:2` produces, checks that it holds exactly `trivy.db` and `metadata.json` with the expected schema version, refuses a DB older than the installed one unless `?force=true`, swaps it in atomically without disturbing in-flight scans, and makes the adapter ready. `GET /api/v1/vulndb` reports the installed DB's build date and age. Both routes require the new `SCANNER_ADAPTER_TOKEN` bearer token and are off without it. Connected installs behave as before, except that `SCANNER_TRIVY_SKIP_DB_UPDATE` now also applies to filesystem scans. `docker-compose.yml` gains commented air-gapped settings for the adapter and the trivy server. Scanner-adapter 1.7.0.

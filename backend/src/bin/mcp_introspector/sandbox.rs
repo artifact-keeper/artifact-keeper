@@ -14,7 +14,10 @@
 //!   a default, and every `{template}` value becomes `AK_PLACEHOLDER_<NAME>`;
 //! * the guest's network is the operator's AK-only network for installs,
 //!   and `none` for an OCI image (already pulled by the engine);
-//! * 120 s wall clock, enforced by the worker around the whole run.
+//! * 120 s wall clock, enforced by the worker around the whole run; when
+//!   the run ends the guest is removed through the engine (killing the
+//!   engine client alone leaves the container running), and leftovers of a
+//!   crashed worker are reaped at startup.
 //!
 //! Runners render a spec into a process whose stdin/stdout is the guest's:
 //! [`OciRunner`] (docker/podman with gVisor `runsc` by default, Kata or any
@@ -28,6 +31,64 @@ use serde_json::Value;
 
 pub const WALL_CLOCK: Duration = Duration::from_secs(120);
 pub const PLACEHOLDER_PREFIX: &str = "AK_PLACEHOLDER_";
+/// The label every guest container carries (value: the job id).
+pub const SANDBOX_LABEL: &str = "com.artifactkeeper.mcp-sandbox";
+/// The label naming the worker that started a guest (value: the worker id);
+/// startup reaping removes only this worker's leftovers.
+pub const OWNER_LABEL: &str = "com.artifactkeeper.mcp-sandbox.owner";
+/// How long the engine client or launcher gets after `SIGTERM`, and each
+/// cleanup command in total, before it is killed.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Engine exit codes that mean the engine (not the guest) failed: `125`
+/// the engine itself (runtime or network missing, pull failed, name in
+/// use), `126` the command could not be invoked, `127` not found. Docker and
+/// Podman both use them; an external launcher should too.
+pub const ENGINE_FAILURE_CODES: &[i32] = &[125, 126, 127];
+/// Bytes of the engine's stderr kept for the error of a start failure.
+const STDERR_KEEP: usize = 2048;
+
+/// The worker's environment variables the engine client or external
+/// launcher inherits; everything else (the `mcp:introspect` token above
+/// all) is cleared. `AK_MCP_SANDBOX_*` (launcher configuration) and the
+/// names in `AK_MCP_SANDBOX_PASS_ENV` (comma separated) pass too.
+pub const ENGINE_ENV_ALLOW: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "CONTAINER_HOST",
+    "CONTAINER_CONNECTION",
+    "CONTAINERS_CONF",
+    "CONTAINERS_STORAGE_CONF",
+    "CONTAINERS_REGISTRIES_CONF",
+    "REGISTRY_AUTH_FILE",
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+    "DOCKER_CERT_PATH",
+    "DOCKER_TLS_VERIFY",
+    "KUBECONFIG",
+    "KUBERNETES_SERVICE_HOST",
+    "KUBERNETES_SERVICE_PORT",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+/// Never passed to the engine, whatever `AK_MCP_SANDBOX_PASS_ENV` says.
+pub const ENGINE_ENV_NEVER: &[&str] = &["AK_MCP_INTROSPECTOR_TOKEN", "AK_TOKEN"];
 
 /// Environment the guest always gets (and the publisher may not override).
 pub const BASE_ENV: &[(&str, &str)] = &[
@@ -79,19 +140,35 @@ impl std::fmt::Display for SandboxError {
     }
 }
 
-/// Runner images (the operator should mirror them through AK too).
+/// Runner images (the operator should mirror them through AK too). The
+/// defaults are pinned by digest: a tag is mutable, and whoever can move it
+/// chooses what every npm and PyPI guest runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Images {
     pub node: String,
     pub python: String,
 }
 
+pub const DEFAULT_NODE_IMAGE: &str = "docker.io/library/node:22-alpine@sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914";
+pub const DEFAULT_PYTHON_IMAGE: &str =
+    "ghcr.io/astral-sh/uv:python3.12-alpine@sha256:aef1a1327a732e74892765e22fa528499eca3f828140a66ed46b2f8df51bd0dc";
+
 impl Default for Images {
     fn default() -> Self {
         Self {
-            node: "docker.io/library/node:22-alpine".into(),
-            python: "ghcr.io/astral-sh/uv:python3.12-alpine".into(),
+            node: DEFAULT_NODE_IMAGE.into(),
+            python: DEFAULT_PYTHON_IMAGE.into(),
         }
+    }
+}
+
+impl Images {
+    /// The configured runner images that are not pinned by digest.
+    pub fn unpinned(&self) -> Vec<&str> {
+        [self.node.as_str(), self.python.as_str()]
+            .into_iter()
+            .filter(|i| !i.contains("@sha256:"))
+            .collect()
     }
 }
 
@@ -110,6 +187,9 @@ pub struct GuestSpec {
     pub ak_base_url: String,
     pub wall_clock_ms: u64,
     pub notes: Vec<String>,
+    /// The image is the job's own package (an OCI server), pulled for this
+    /// job only: remove it after the run. Runner images are kept.
+    pub prune_image: bool,
 }
 
 fn placeholder(name: &str) -> String {
@@ -310,22 +390,88 @@ pub fn guest_spec(
         ak_base_url: ak.to_string(),
         wall_clock_ms: WALL_CLOCK.as_millis() as u64,
         notes,
+        prune_image: kind == "oci",
     })
 }
 
-/// A process to start: its stdin/stdout are the guest's.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunPlan {
+/// One command: a program and its arguments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cmd {
     pub program: String,
     pub args: Vec<String>,
 }
 
+impl Cmd {
+    fn new(program: &str, args: &[&str]) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+}
+
+/// A process to start: its stdin/stdout are the guest's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunPlan {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Run after the guest, whatever the outcome: remove the container
+    /// (the engine client exiting does not stop it) and prune the job's
+    /// own image.
+    pub cleanup: Vec<Cmd>,
+}
+
+/// Leftover guests of this worker: `list` prints one container id per
+/// line, `remove` (with the ids appended) removes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reap {
+    pub list: Cmd,
+    pub remove: Cmd,
+}
+
 /// The pluggable sandbox interface. A runner renders a [`GuestSpec`] into
 /// the command that starts the throwaway guest; the worker spawns it, speaks
-/// MCP over its stdio, and kills it after the wall clock.
+/// MCP over its stdio, stops it after the wall clock and runs the plan's
+/// cleanup.
 pub trait SandboxRunner: Send + Sync {
     fn name(&self) -> &str;
     fn plan(&self, spec: &GuestSpec) -> Result<RunPlan, SandboxError>;
+    /// How to find and remove guests a previous run of this worker left
+    /// behind (it crashed or was killed mid-job). `None`: the runner keeps
+    /// no state between jobs.
+    fn reap(&self) -> Option<Reap> {
+        None
+    }
+}
+
+/// Whether `runtime` (a name or a path) is a sandbox runtime: gVisor
+/// (`runsc`, `io.containerd.runsc.v1`, ...) or Kata (`kata-fc`,
+/// `kata-qemu`, `io.containerd.kata.v2`, ...). `runc`, `crun`, `youki`
+/// and anything else are plain containers.
+pub fn is_sandbox_runtime(runtime: &str) -> bool {
+    let base = runtime.rsplit('/').next().unwrap_or(runtime);
+    base.split('.')
+        .any(|seg| seg.starts_with("runsc") || seg.starts_with("kata"))
+}
+
+/// `s` restricted to what a container name or label value may hold.
+fn name_part(s: &str, max: usize) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(max)
+        .collect();
+    if out.is_empty() {
+        "job".into()
+    } else {
+        out
+    }
 }
 
 /// docker/podman with an OCI runtime (gVisor `runsc` by default).
@@ -334,7 +480,8 @@ pub struct OciRunner {
     /// `podman`, `docker`, or a path (`AK_MCP_SANDBOX_ENGINE`).
     pub engine: String,
     /// `runsc` (default), `kata-fc`, ...; empty = the engine's default
-    /// (`AK_MCP_SANDBOX_RUNTIME`; refused unless `allow_default_runtime`).
+    /// (`AK_MCP_SANDBOX_RUNTIME`). Anything but gVisor or Kata is refused
+    /// unless `allow_default_runtime`.
     pub runtime: String,
     /// The pre-created network that reaches only AK (`AK_MCP_SANDBOX_NETWORK`).
     pub ak_network: String,
@@ -343,6 +490,8 @@ pub struct OciRunner {
     pub pids_limit: u32,
     pub tmpfs_size: String,
     pub allow_default_runtime: bool,
+    /// The worker id, as the [`OWNER_LABEL`] of every guest it starts.
+    pub owner: String,
 }
 
 impl Default for OciRunner {
@@ -356,7 +505,22 @@ impl Default for OciRunner {
             pids_limit: 256,
             tmpfs_size: "512m".into(),
             allow_default_runtime: false,
+            owner: "ak-mcp-introspector".into(),
         }
+    }
+}
+
+impl OciRunner {
+    /// Podman takes flags Docker does not (`--timeout`, `--http-proxy`).
+    fn is_podman(&self) -> bool {
+        self.engine
+            .rsplit('/')
+            .next()
+            .is_some_and(|b| b.starts_with("podman"))
+    }
+
+    fn owner_filter(&self) -> String {
+        format!("label={OWNER_LABEL}={}", name_part(&self.owner, 128))
     }
 }
 
@@ -366,23 +530,39 @@ impl SandboxRunner for OciRunner {
     }
 
     fn plan(&self, spec: &GuestSpec) -> Result<RunPlan, SandboxError> {
-        if self.runtime.is_empty() && !self.allow_default_runtime {
-            return Err(SandboxError::Unsupported(
-                "no sandbox runtime configured (AK_MCP_SANDBOX_RUNTIME, e.g. runsc); a plain \
-                 container is not an isolation boundary for attacker-chosen install scripts"
-                    .into(),
-            ));
+        if !self.allow_default_runtime && !is_sandbox_runtime(&self.runtime) {
+            let what = if self.runtime.is_empty() {
+                "no sandbox runtime configured (AK_MCP_SANDBOX_RUNTIME, e.g. runsc)".to_string()
+            } else {
+                format!(
+                    "runtime `{}` is not a sandbox runtime (gVisor runsc or Kata)",
+                    self.runtime
+                )
+            };
+            return Err(SandboxError::Unsupported(format!(
+                "{what}; a plain container is not an isolation boundary for \
+                 attacker-chosen install scripts (AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true \
+                 runs it anyway)"
+            )));
         }
         let network = match spec.network.as_str() {
             "none" => "none".to_string(),
             _ => self.ak_network.clone(),
         };
+        // A fresh name per attempt: a retry never collides with a guest of
+        // an earlier attempt that is still being removed.
+        let job = name_part(&spec.job_id, 64);
+        let name = format!(
+            "ak-mcp-sbx-{job}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
             "-i".into(),
-            format!("--name=ak-mcp-sbx-{}", spec.job_id),
-            format!("--label=com.artifactkeeper.mcp-sandbox={}", spec.job_id),
+            format!("--name={name}"),
+            format!("--label={SANDBOX_LABEL}={job}"),
+            format!("--label={OWNER_LABEL}={}", name_part(&self.owner, 128)),
         ];
         if !self.runtime.is_empty() {
             args.push(format!("--runtime={}", self.runtime));
@@ -399,23 +579,50 @@ impl SandboxRunner for OciRunner {
             format!("--cpus={}", self.cpus),
             "--pull=missing".into(),
             "--stop-timeout=1".into(),
+            // stdout is read over the attach stream; a log driver would
+            // only copy everything the guest prints to the host's disk.
+            "--log-driver=none".into(),
             "--workdir=/tmp".into(),
         ]);
+        if self.is_podman() {
+            // conmon kills the guest itself, should the worker die before
+            // its cleanup; and the worker's proxy variables stay out.
+            args.push(format!("--timeout={}", spec.wall_clock_ms / 1000 + 10));
+            args.push("--http-proxy=false".into());
+        }
         for (k, v) in &spec.env {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
         }
         args.push(spec.image.clone());
         args.extend(spec.argv.iter().cloned());
+        let mut cleanup = vec![Cmd::new(&self.engine, &["rm", "-f", &name])];
+        if spec.prune_image {
+            cleanup.push(Cmd::new(&self.engine, &["rmi", &spec.image]));
+        }
         Ok(RunPlan {
             program: self.engine.clone(),
             args,
+            cleanup,
+        })
+    }
+
+    fn reap(&self) -> Option<Reap> {
+        Some(Reap {
+            list: Cmd::new(
+                &self.engine,
+                &["ps", "-a", "-q", "--filter", &self.owner_filter()],
+            ),
+            remove: Cmd::new(&self.engine, &["rm", "-f"]),
         })
     }
 }
 
 /// An operator-supplied launcher (microVM, Kubernetes job, ...): started as
-/// `<command> <spec JSON>`; its stdin/stdout must be the guest's.
+/// `<command> <spec JSON>`; its stdin/stdout must be the guest's. When the
+/// run ends it gets `SIGTERM` (then, after [`STOP_GRACE`], `SIGKILL`) and
+/// must remove its guest; an exit code in [`ENGINE_FAILURE_CODES`] says the
+/// launcher, not the guest, failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalRunner {
     pub command: String,
@@ -432,14 +639,19 @@ impl SandboxRunner for ExternalRunner {
             args: vec![
                 serde_json::to_string(spec).map_err(|e| SandboxError::Invalid(e.to_string()))?
             ],
+            cleanup: Vec::new(),
         })
     }
 }
 
 /// The runner the environment configures: `AK_MCP_SANDBOX_COMMAND` selects
 /// an [`ExternalRunner`], otherwise an [`OciRunner`] from
-/// `AK_MCP_SANDBOX_ENGINE` / `_RUNTIME` / `_NETWORK` / `_MEMORY` / `_CPUS`.
-pub fn runner_from_env(get: impl Fn(&str) -> Option<String>) -> Box<dyn SandboxRunner> {
+/// `AK_MCP_SANDBOX_ENGINE` / `_RUNTIME` / `_NETWORK` / `_MEMORY` / `_CPUS`,
+/// labelling its guests with `owner` (the worker id).
+pub fn runner_from_env(
+    get: impl Fn(&str) -> Option<String>,
+    owner: &str,
+) -> Box<dyn SandboxRunner> {
     if let Some(command) = get("AK_MCP_SANDBOX_COMMAND").filter(|c| !c.is_empty()) {
         return Box::new(ExternalRunner { command });
     }
@@ -452,6 +664,7 @@ pub fn runner_from_env(get: impl Fn(&str) -> Option<String>) -> Box<dyn SandboxR
         cpus: get("AK_MCP_SANDBOX_CPUS").unwrap_or(d.cpus),
         allow_default_runtime: get("AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME").as_deref()
             == Some("true"),
+        owner: owner.to_string(),
         ..d
     })
 }
@@ -464,20 +677,146 @@ pub fn images_from_env(get: impl Fn(&str) -> Option<String>) -> Images {
     }
 }
 
+/// The part of the worker's environment the engine client or launcher
+/// gets: [`ENGINE_ENV_ALLOW`], `AK_MCP_SANDBOX_*` and the names listed in
+/// `pass` (comma separated), never [`ENGINE_ENV_NEVER`].
+pub fn engine_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+    pass: Option<&str>,
+) -> Vec<(String, String)> {
+    let extra: Vec<&str> = pass
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    vars.into_iter()
+        .filter(|(k, _)| {
+            !ENGINE_ENV_NEVER.contains(&k.as_str())
+                && (ENGINE_ENV_ALLOW.contains(&k.as_str())
+                    || k.starts_with("AK_MCP_SANDBOX_")
+                    || extra.contains(&k.as_str()))
+        })
+        .collect()
+}
+
+/// A command with the worker's environment cleared down to [`engine_env`].
+fn command(program: &str, args: &[String]) -> tokio::process::Command {
+    let mut c = tokio::process::Command::new(program);
+    c.args(args)
+        .env_clear()
+        .envs(engine_env(
+            std::env::vars(),
+            std::env::var("AK_MCP_SANDBOX_PASS_ENV").ok().as_deref(),
+        ))
+        .kill_on_drop(true);
+    c
+}
+
+/// Run a short engine command (cleanup, listing) to completion within
+/// `limit`; its stdout when it ran.
+async fn run_cmd(cmd: &Cmd, limit: Duration) -> Option<(std::process::ExitStatus, String)> {
+    let child = command(&cmd.program, &cmd.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let out = tokio::time::timeout(limit, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    Some((
+        out.status,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+/// Remove the guests a previous run of this worker left behind. The number
+/// removed, or why that could not be checked.
+pub async fn reap_leftovers(runner: &dyn SandboxRunner) -> Result<usize, String> {
+    let Some(reap) = runner.reap() else {
+        return Ok(0);
+    };
+    let (status, out) = run_cmd(&reap.list, CLEANUP_TIMEOUT)
+        .await
+        .ok_or_else(|| format!("`{}` could not be run", reap.list.program))?;
+    if !status.success() {
+        return Err(format!("listing leftover guests failed ({status})"));
+    }
+    let ids: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut remove = reap.remove.clone();
+    remove.args.extend(ids.iter().cloned());
+    match run_cmd(&remove, CLEANUP_TIMEOUT).await {
+        Some((s, _)) if s.success() => Ok(ids.len()),
+        _ => Err(format!("removing {} leftover guest(s) failed", ids.len())),
+    }
+}
+
+/// Stop the engine client or launcher: `SIGTERM`, then `SIGKILL` after
+/// [`STOP_GRACE`].
+async fn stop(child: &mut tokio::process::Child) {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child.id().and_then(|p| i32::try_from(p).ok()) {
+        // SAFETY: kill(2) on the pid of our own, not yet reaped, child.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    if tokio::time::timeout(STOP_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+}
+
 /// Run a plan and probe the guest over its stdio, bounded by the wall
-/// clock. The guest is killed when the probe ends, whatever the outcome.
+/// clock. Whatever the outcome, the guest is stopped and the plan's cleanup
+/// (removing the container) runs before this returns.
 pub async fn run_and_probe(
     plan: &RunPlan,
     max_items: usize,
     max_bytes: usize,
 ) -> crate::protocol::ProbeReport {
+    run_and_probe_within(plan, max_items, max_bytes, WALL_CLOCK).await
+}
+
+pub async fn run_and_probe_within(
+    plan: &RunPlan,
+    max_items: usize,
+    max_bytes: usize,
+    wall_clock: Duration,
+) -> crate::protocol::ProbeReport {
+    let report = probe_child(plan, max_items, max_bytes, wall_clock).await;
+    for cmd in &plan.cleanup {
+        if run_cmd(cmd, CLEANUP_TIMEOUT).await.is_none() {
+            tracing::warn!(program = %cmd.program, args = ?cmd.args, "sandbox cleanup did not run");
+        }
+    }
+    report
+}
+
+async fn probe_child(
+    plan: &RunPlan,
+    max_items: usize,
+    max_bytes: usize,
+    wall_clock: Duration,
+) -> crate::protocol::ProbeReport {
     use crate::protocol::ProbeReport;
-    let mut child = match tokio::process::Command::new(&plan.program)
-        .args(&plan.args)
+    use tokio::io::AsyncReadExt;
+    let mut child = match command(&plan.program, &plan.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .stderr(std::process::Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
@@ -490,8 +829,24 @@ pub async fn run_and_probe(
             }
         }
     };
+    // The engine's (and the guest's) stderr: drained so neither blocks on
+    // a full pipe, the first bytes kept for a start failure's error.
+    let stderr = child.stderr.take().map(|mut e| {
+        tokio::spawn(async move {
+            let mut kept = Vec::new();
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = e.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                let room = STDERR_KEEP.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+            String::from_utf8_lossy(&kept).trim().to_string()
+        })
+    });
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        let _ = child.kill().await;
+        stop(&mut child).await;
         return ProbeReport {
             outcome: "start_failed".into(),
             auth_state: "none".into(),
@@ -501,26 +856,55 @@ pub async fn run_and_probe(
     };
     // Installs on first run are slow: one message may take most of the
     // wall clock, the whole run may not exceed it.
-    let mut t = crate::stdio::StdioTransport::new(stdout, stdin, WALL_CLOCK, max_bytes);
-    let report =
-        match tokio::time::timeout(WALL_CLOCK, crate::protocol::probe(&mut t, max_items)).await {
-            Ok(mut r) => {
-                if r.outcome == "start_failed" {
-                    // The guest exited before answering: typically a server that
-                    // refuses to start without configuration.
-                    r.outcome = "needs_config".into();
-                }
-                r
-            }
-            Err(_) => ProbeReport {
-                outcome: "timeout".into(),
-                auth_state: "none".into(),
-                error: Some("sandbox wall clock (120 s) exceeded".into()),
-                ..Default::default()
-            },
-        };
+    let mut t = crate::stdio::StdioTransport::new(stdout, stdin, wall_clock, max_bytes);
+    let probed = tokio::time::timeout(wall_clock, crate::protocol::probe(&mut t, max_items)).await;
     drop(t);
-    let _ = child.kill().await;
+    let report = match probed {
+        Ok(mut r) => {
+            if r.outcome == "start_failed" {
+                // The guest's stdout closed before it answered. Either the
+                // engine failed to start it (its exit code says so) or the
+                // server would not start without configuration.
+                let code = match tokio::time::timeout(STOP_GRACE, child.wait()).await {
+                    Ok(Ok(status)) => status.code(),
+                    _ => None,
+                };
+                if let Some(c) = code {
+                    r.details.insert("exitCode".into(), serde_json::json!(c));
+                }
+                if code.is_some_and(|c| ENGINE_FAILURE_CODES.contains(&c)) {
+                    let msg = match stderr {
+                        Some(h) => tokio::time::timeout(Duration::from_secs(2), h)
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    r.error = Some(format!(
+                        "the sandbox engine failed to start the guest (exit {}){}{}",
+                        code.unwrap_or_default(),
+                        if msg.is_empty() { "" } else { ": " },
+                        msg
+                    ));
+                    stop(&mut child).await;
+                    return r;
+                }
+                r.outcome = "needs_config".into();
+            }
+            r
+        }
+        Err(_) => ProbeReport {
+            outcome: "timeout".into(),
+            auth_state: "none".into(),
+            error: Some(format!(
+                "sandbox wall clock ({} s) exceeded",
+                wall_clock.as_secs()
+            )),
+            ..Default::default()
+        },
+    };
+    stop(&mut child).await;
     report
 }
 
@@ -681,6 +1065,11 @@ mod tests {
             "--pids-limit=256",
             "--memory=1g",
             "--cpus=1",
+            "--log-driver=none",
+            "--timeout=130",
+            "--http-proxy=false",
+            "--label=com.artifactkeeper.mcp-sandbox=j1",
+            "--label=com.artifactkeeper.mcp-sandbox.owner=ak-mcp-introspector",
         ] {
             assert!(
                 plan.args.iter().any(|a| a == want),
@@ -697,12 +1086,45 @@ mod tests {
         assert!(plan.args[..img]
             .iter()
             .any(|a| a == "API_KEY=AK_PLACEHOLDER_API_KEY"));
+        // The container is removed after the run under the name it got, a
+        // fresh one per attempt; a runner image is not pruned.
+        let name = plan
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("--name="))
+            .unwrap()
+            .to_string();
+        assert!(name.starts_with("ak-mcp-sbx-j1-"), "{name}");
+        assert_eq!(
+            plan.cleanup,
+            [Cmd::new("podman", &["rm", "-f", &name])],
+            "{:?}",
+            plan.cleanup
+        );
+        let again = OciRunner::default().plan(&spec).unwrap();
+        assert!(!again.args.iter().any(|a| *a == format!("--name={name}")));
+        // Docker has no --timeout / --http-proxy.
+        let docker = OciRunner {
+            engine: "/usr/bin/docker".into(),
+            ..Default::default()
+        }
+        .plan(&spec)
+        .unwrap();
+        assert!(docker.args.iter().any(|a| a == "--log-driver=none"));
+        assert!(!docker
+            .args
+            .iter()
+            .any(|a| a.starts_with("--timeout") || a.starts_with("--http-proxy")));
+        assert_eq!(docker.cleanup[0].program, "/usr/bin/docker");
         // An OCI guest gets no network at all.
         let t = json!({"package": {"registryType": "oci",
             "identifier": "ak.example.test/oci/acme/mcp@sha256:abc"}});
         let spec = guest_spec("j3", &t, AK, &Images::default()).unwrap();
         let plan = OciRunner::default().plan(&spec).unwrap();
         assert!(plan.args.iter().any(|a| a == "--network=none"));
+        // The job's own image is pruned after the container is removed.
+        assert_eq!(plan.cleanup.len(), 2);
+        assert_eq!(plan.cleanup[1], Cmd::new("podman", &["rmi", &spec.image]));
         // No runtime: refused unless the operator explicitly allows it.
         let r = OciRunner {
             runtime: String::new(),
@@ -743,17 +1165,24 @@ mod tests {
             }
         };
         assert_eq!(
-            runner_from_env(env(&[("AK_MCP_SANDBOX_COMMAND", "/x")])).name(),
+            runner_from_env(env(&[("AK_MCP_SANDBOX_COMMAND", "/x")]), "w").name(),
             "external"
         );
-        let r = runner_from_env(env(&[
-            ("AK_MCP_SANDBOX_ENGINE", "docker"),
-            ("AK_MCP_SANDBOX_RUNTIME", "kata-fc"),
-        ]));
+        let r = runner_from_env(
+            env(&[
+                ("AK_MCP_SANDBOX_ENGINE", "docker"),
+                ("AK_MCP_SANDBOX_RUNTIME", "kata-fc"),
+            ]),
+            "host-1",
+        );
         assert_eq!(r.name(), "oci");
         let p = r.plan(&spec).unwrap();
         assert_eq!(p.program, "docker");
         assert!(p.args.iter().any(|a| a == "--runtime=kata-fc"));
+        assert!(p
+            .args
+            .iter()
+            .any(|a| a == "--label=com.artifactkeeper.mcp-sandbox.owner=host-1"));
         assert_eq!(
             images_from_env(env(&[("AK_MCP_SANDBOX_NODE_IMAGE", "ak/node")])).node,
             "ak/node"
@@ -762,18 +1191,211 @@ mod tests {
         assert!(SandboxError::Invalid("x".into()).to_string() == "x");
     }
 
+    #[test]
+    fn only_sandbox_runtimes_pass_without_the_allow_flag() {
+        let spec = guest_spec("j1", &npm_target(), AK, &Images::default()).unwrap();
+        for ok in [
+            "runsc",
+            "/usr/local/bin/runsc",
+            "runsc-debug",
+            "kata-fc",
+            "kata-qemu",
+            "io.containerd.kata.v2",
+            "io.containerd.runsc.v1",
+        ] {
+            assert!(is_sandbox_runtime(ok), "{ok}");
+            let r = OciRunner {
+                runtime: ok.into(),
+                ..Default::default()
+            };
+            assert!(r.plan(&spec).is_ok(), "{ok}");
+        }
+        for plain in [
+            "",
+            "runc",
+            "crun",
+            "/usr/bin/crun",
+            "youki",
+            "io.containerd.runc.v2",
+        ] {
+            assert!(!is_sandbox_runtime(plain), "{plain}");
+            let r = OciRunner {
+                runtime: plain.into(),
+                ..Default::default()
+            };
+            let Err(SandboxError::Unsupported(m)) = r.plan(&spec) else {
+                panic!("{plain} must be refused");
+            };
+            assert!(m.contains("AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME"), "{m}");
+            let r = OciRunner {
+                runtime: plain.into(),
+                allow_default_runtime: true,
+                ..Default::default()
+            };
+            assert!(r.plan(&spec).is_ok(), "{plain} with the allow flag");
+        }
+    }
+
+    #[test]
+    fn default_images_are_pinned_by_digest() {
+        assert!(Images::default().unpinned().is_empty());
+        let i = Images {
+            node: "docker.io/library/node:22-alpine".into(),
+            ..Default::default()
+        };
+        assert_eq!(i.unpinned(), ["docker.io/library/node:22-alpine"]);
+    }
+
+    /// The engine never sees the worker's token, only what it needs.
+    #[test]
+    fn the_engine_gets_a_cleared_environment() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("XDG_RUNTIME_DIR", "/run/user/1500"),
+            ("AK_MCP_INTROSPECTOR_TOKEN", "secret"),
+            ("AK_TOKEN", "secret"),
+            ("AK_URL", "https://ak"),
+            ("DATABASE_URL", "postgres://x"),
+            ("AK_MCP_SANDBOX_NAMESPACE", "sbx"),
+            ("EXTRA_ONE", "1"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        let names = |pass| {
+            engine_env(vars.clone(), pass)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(None),
+            ["PATH", "XDG_RUNTIME_DIR", "AK_MCP_SANDBOX_NAMESPACE"]
+        );
+        assert_eq!(
+            names(Some("EXTRA_ONE, AK_MCP_INTROSPECTOR_TOKEN,AK_TOKEN")),
+            [
+                "PATH",
+                "XDG_RUNTIME_DIR",
+                "AK_MCP_SANDBOX_NAMESPACE",
+                "EXTRA_ONE"
+            ]
+        );
+    }
+
+    fn sh(script: &str) -> RunPlan {
+        RunPlan {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cleanup: Vec::new(),
+        }
+    }
+
+    fn scratch() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ak-sbx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
     #[tokio::test]
     async fn run_and_probe_reports_start_failures() {
         let plan = RunPlan {
             program: "/nonexistent/ak-sandbox".into(),
-            args: vec![],
+            ..Default::default()
         };
         assert_eq!(run_and_probe(&plan, 10, 1024).await.outcome, "start_failed");
         // A guest that exits at once: the server would not start unconfigured.
-        let plan = RunPlan {
-            program: "true".into(),
-            args: vec![],
+        assert_eq!(
+            run_and_probe(&sh("exit 0"), 10, 1024).await.outcome,
+            "needs_config"
+        );
+        assert_eq!(
+            run_and_probe(&sh("exit 3"), 10, 1024).await.outcome,
+            "needs_config"
+        );
+    }
+
+    /// The engine failing (exit 125: name in use, runtime or network
+    /// missing, pull failed; 126/127) is the sandbox's failure, retried, not
+    /// the server's `needs_config`; the engine's message is the error.
+    #[tokio::test]
+    async fn engine_failures_are_start_failed_not_needs_config() {
+        for code in [125, 126, 127] {
+            let r = run_and_probe(
+                &sh(&format!(
+                    "echo 'Error: the container name \"ak-mcp-sbx-j\" is already in use' >&2; exit {code}"
+                )),
+                10,
+                1024,
+            )
+            .await;
+            assert_eq!(r.outcome, "start_failed", "exit {code}: {r:?}");
+            let e = r.error.unwrap();
+            assert!(e.contains(&format!("exit {code}")), "{e}");
+            assert!(e.contains("already in use"), "{e}");
+            assert_eq!(r.details["exitCode"], code);
+        }
+    }
+
+    /// A guest that ignores SIGTERM and never answers: the wall clock ends
+    /// the run, and the plan's cleanup (what removes the container) runs
+    /// after it, also after a timeout.
+    #[tokio::test]
+    async fn cleanup_runs_after_every_run_including_timeouts() {
+        let dir = scratch();
+        let marker = dir.join("removed");
+        let mut plan = sh("trap '' TERM; read _; exec sleep 60");
+        plan.cleanup = vec![Cmd::new(
+            "sh",
+            &["-c", &format!("echo gone > {}", marker.display())],
+        )];
+        let started = std::time::Instant::now();
+        let r = run_and_probe_within(&plan, 10, 1024, Duration::from_secs(1)).await;
+        assert_eq!(r.outcome, "timeout", "{r:?}");
+        assert!(marker.exists(), "cleanup ran after the timeout");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        std::fs::remove_file(&marker).unwrap();
+        let mut plan = sh("exit 0");
+        plan.cleanup = vec![Cmd::new(
+            "sh",
+            &["-c", &format!("echo gone > {}", marker.display())],
+        )];
+        run_and_probe(&plan, 10, 1024).await;
+        assert!(marker.exists(), "cleanup ran after an early exit");
+    }
+
+    /// Startup reaping lists this worker's guests by its owner label and
+    /// removes them.
+    #[tokio::test]
+    async fn leftover_guests_are_reaped() {
+        let dir = scratch();
+        let log = dir.join("calls");
+        let engine = dir.join("engine");
+        std::fs::write(
+            &engine,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \"$1\" in ps) printf 'c1\\nc2\\n';; esac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = OciRunner {
+            engine: engine.to_string_lossy().into_owned(),
+            owner: "host-1".into(),
+            ..Default::default()
         };
-        assert_eq!(run_and_probe(&plan, 10, 1024).await.outcome, "needs_config");
+        assert_eq!(reap_leftovers(&r).await, Ok(2));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls,
+            "ps -a -q --filter label=com.artifactkeeper.mcp-sandbox.owner=host-1\nrm -f c1 c2\n"
+        );
+        assert_eq!(
+            reap_leftovers(&ExternalRunner {
+                command: "/x".into()
+            })
+            .await,
+            Ok(0)
+        );
     }
 }

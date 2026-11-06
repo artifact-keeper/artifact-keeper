@@ -2821,6 +2821,7 @@ async fn enforce_pypi_download_age_gate(
         &lkg_filename,
         &index_path,
         RepositoryFormat::Pypi,
+        ctx.is_some_and(|c| c.is_head),
     )
     .await?;
     // #3649: and so is the cold fetch that substituted it.
@@ -3022,6 +3023,7 @@ async fn serve_file(
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
+                        ctx.is_head,
                     )
                     .await?;
 
@@ -3347,6 +3349,7 @@ async fn serve_file(
                                 filename,
                                 &member_index_path,
                                 member.format.clone(),
+                                ctx.is_head,
                             )
                             .await
                             {
@@ -3443,6 +3446,9 @@ async fn serve_file(
                         filename,
                         &index_path,
                         RepositoryFormat::Pypi,
+                        // A body fetch even for a HEAD: this refetch is
+                        // written back to the stored object it replaces.
+                        false,
                     )
                     .await
                 },
@@ -4041,6 +4047,10 @@ async fn pypi_proxy_cache_redirect(
 /// (CUDA / ML packages routinely exceed 400 MiB) previously OOM-killed
 /// memory-constrained pods when several `pip install` runs downloaded
 /// concurrently through the buffered path.
+///
+/// `is_head` (#5343): the client sent `HEAD`, so a cache miss is answered from
+/// an upstream `HEAD` of the package file (the simple index is still resolved,
+/// to find it) instead of a body download the HEAD response would drop.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_from_pypi_remote_streaming(
     proxy: &crate::services::proxy_service::ProxyService,
@@ -4051,6 +4061,7 @@ async fn fetch_from_pypi_remote_streaming(
     filename: &str,
     index_path: &str,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     let target = resolve_pypi_remote_fetch_target(
         proxy,
@@ -4075,6 +4086,7 @@ async fn fetch_from_pypi_remote_streaming(
         &target.cache_path,
         target.expected_sha256,
         format,
+        is_head,
     )
     .await
 }
@@ -4304,6 +4316,7 @@ impl proxy_helpers::ScannedProxyFile for PypiScannedFile<'_> {
             req.filename,
             self.index_path,
             RepositoryFormat::Pypi,
+            req.is_head(),
         )
         .await?;
         Ok(build_streaming_file_response(req.filename, result))
@@ -15103,6 +15116,7 @@ mod tests {
             "numpy-2.0.0-py3-none-any.whl",
             "simple",
             RepositoryFormat::Pypi,
+            false,
         )
         .await
         .expect("streaming fetch via fallback path must succeed");
@@ -15287,6 +15301,45 @@ mod tests {
             metadata,
             "served metadata must be the wheel's METADATA bytes"
         );
+    }
+
+    /// #5343: pip and uv may `HEAD` a wheel before they download it. A cold
+    /// `HEAD` of a Remote package file is answered from an upstream `HEAD` of
+    /// the file the simple index points at, so the wheel leaves the upstream
+    /// once across HEAD, GET and a warm GET, and the HEAD keeps the
+    /// attachment name.
+    #[tokio::test]
+    async fn test_remote_pypi_cold_head_downloads_the_wheel_once_5343() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let (upstream, _ssrf_allowlist) = non_loopback_upstream().await;
+        let wheel = "headprobe-2.0-py3-none-any.whl";
+        Mock::given(method("GET"))
+            .and(path("/simple/headprobe/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pep658_index_html(wheel)))
+            .mount(&upstream)
+            .await;
+        let body: Vec<u8> = (0..4096u32).map(|i| (i % 233) as u8).collect();
+        let uri = format!("/{}/simple/headprobe/{wheel}", fx.repo_key);
+        let head = tdh::assert_cold_head_fetches_body_once(
+            fx,
+            upstream,
+            super::router,
+            true,
+            &format!("/packages/{wheel}"),
+            &uri,
+            &[("content-type", "application/octet-stream")],
+            &body,
+        )
+        .await;
+        let disposition =
+            tdh::header_str(&head, axum::http::header::CONTENT_DISPOSITION).unwrap_or_default();
+        assert!(disposition.contains(wheel), "{disposition}");
     }
 
     // -----------------------------------------------------------------------

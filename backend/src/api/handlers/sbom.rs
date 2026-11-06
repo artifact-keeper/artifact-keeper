@@ -871,7 +871,7 @@ async fn list_sboms(
     // also enforces access (callers cannot list a repo's SBOMs without
     // having access to that repo).
     if let Some(artifact_id) = query.artifact_id {
-        ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
+        ensure_artifact_served(&state, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     }
     // #3174: this branch used to gate on `auth.can_access_repo(repo_id)` alone.
     // That is the caller's TOKEN SCOPE, not repository visibility: it resolves
@@ -1025,7 +1025,7 @@ async fn get_sbom_by_artifact(
     Path(artifact_id): Path<Uuid>,
     Query(query): Query<ListSbomsQuery>,
 ) -> Result<Json<SbomContentResponse>> {
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
+    ensure_artifact_served(&state, &auth, artifact_id, SBOM_NOT_AVAILABLE_MSG).await?;
     let service = SbomService::new(state.db.clone());
     let format = query
         .format
@@ -1359,13 +1359,8 @@ async fn get_cve_history(
 
     match classify_cve_history_path(&id) {
         CveHistoryPath::Artifact(artifact_id) => {
-            ensure_artifact_repo_access(
-                &state.db,
-                &auth,
-                artifact_id,
-                CVE_HISTORY_NOT_AVAILABLE_MSG,
-            )
-            .await?;
+            ensure_artifact_served(&state, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
+                .await?;
             let entries = service.get_cve_history(artifact_id).await?;
             Ok(Json(entries))
         }
@@ -1406,8 +1401,7 @@ async fn get_cve_history_by_artifact(
     Path(artifact_id): Path<Uuid>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
     let service = SbomService::new(state.db.clone());
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG)
-        .await?;
+    ensure_artifact_served(&state, &auth, artifact_id, CVE_HISTORY_NOT_AVAILABLE_MSG).await?;
     let entries = service.get_cve_history(artifact_id).await?;
     Ok(Json(entries))
 }
@@ -2265,6 +2259,24 @@ async fn ensure_repo_visibility(
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
     require_repo_visibility(db, auth, repo, "Repository not found").await
+}
+
+/// [`ensure_artifact_repo_access`] for a read, plus the MCP serve decision
+/// (#5253): an MCP server version readers are not served answers
+/// `missing_msg`, as a missing artifact does, for a caller who does not hold
+/// the registry.
+async fn ensure_artifact_served(
+    state: &SharedState,
+    auth: &AuthExtension,
+    artifact_id: Uuid,
+    missing_msg: &'static str,
+) -> Result<()> {
+    ensure_artifact_repo_access(&state.db, auth, artifact_id, missing_msg).await?;
+    if crate::api::handlers::artifacts::mcp_servable(state, Some(auth), artifact_id).await? {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(missing_msg.into()))
+    }
 }
 
 /// Resolve `artifact_id → (repository_id, visibility)` and apply

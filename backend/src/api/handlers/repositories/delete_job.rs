@@ -436,28 +436,14 @@ pub(crate) async fn run_claimable(state: &SharedState, job_id: Option<Uuid>) -> 
         return Ok(false);
     };
     let job_id = job.row.id;
-    let (renewal, lost) = {
-        let db = state.db.clone();
-        let token = job.token;
-        crate::services::cluster_work::spawn_renewal_loop_with_cancellation(
-            format!("repository delete job {job_id}"),
-            CLAIM_TTL_SECS,
-            move || {
-                let db = db.clone();
-                async move {
-                    crate::services::cluster_work::renew_row_claim(
-                        &db,
-                        RENEW_SQL,
-                        job_id,
-                        token,
-                        CLAIM_TTL_SECS,
-                    )
-                    .await
-                    .map_err(|e| e.to_string())
-                }
-            },
-        )
-    };
+    let (renewal, lost) = crate::services::cluster_work::spawn_row_claim_renewal(
+        state.db.clone(),
+        format!("repository delete job {job_id}"),
+        RENEW_SQL,
+        job_id,
+        job.token,
+        CLAIM_TTL_SECS,
+    );
     let outcome = run(state, &job, &lost).await;
     drop(renewal);
     match outcome {

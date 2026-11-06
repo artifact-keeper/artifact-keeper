@@ -1105,16 +1105,38 @@ async fn maven_remote_stream(
             upstream_url,
             RepositoryFormat::Maven,
         );
-        // #4573: the cached `.sha1` is read alongside the content open, not
-        // after it (the #3982/#4289 rule), and from the cache only.
-        let (result, sha1) = tokio::join!(
-            proxy.fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+        // #5343: a HEAD's cache miss is answered from an upstream HEAD, not a
+        // body download its dropped body would leave uncached. The sidecar
+        // digest still rides along for the fall-back GET of an upstream that
+        // refuses HEAD. `Either` keeps the GET arm's future inline.
+        let algorithm = crate::services::proxy_service::CommitDigestAlgorithm::Sha1;
+        let content = if is_head {
+            futures::future::Either::Left(proxy.head_artifact_streaming_with_cache_path(
                 &gated_repo,
                 path,
                 path,
-                crate::services::proxy_service::CommitDigestAlgorithm::Sha1,
-                digest,
-            ),
+                Some(
+                    crate::services::proxy_service::ExpectedCommitDigest::Deferred {
+                        algorithm,
+                        digest,
+                    },
+                ),
+            ))
+        } else {
+            futures::future::Either::Right(
+                proxy.fetch_artifact_streaming_with_cache_path_gated_deferred_digest(
+                    &gated_repo,
+                    path,
+                    path,
+                    algorithm,
+                    digest,
+                ),
+            )
+        };
+        // #4573: the cached `.sha1` is read alongside the content open, not
+        // after it (the #3982/#4289 rule), and from the cache only.
+        let (result, sha1) = tokio::join!(
+            content,
             maven_remote_sha1(proxy, repo_id, repo_key, upstream_url, path, is_head),
         );
         let result = result.map_err(IntoResponse::into_response)?;
@@ -1139,6 +1161,7 @@ async fn maven_remote_stream(
         path,
         content_type_for_path(path),
         RepositoryFormat::Maven,
+        is_head,
     )
     .await
 }
@@ -11065,6 +11088,49 @@ mod tests {
         );
     }
 
+    /// #5343: Maven Resolver and Gradle probe a jar with `HEAD` before they
+    /// download it. A cold `HEAD` of a Remote jar is answered from an upstream
+    /// `HEAD`, so the jar leaves the upstream once across HEAD, GET and a warm
+    /// GET; before, the HEAD opened a body download whose dropped stream cached
+    /// nothing and the GET downloaded the jar again. The HEAD still carries the
+    /// `.sha1` checksum header the GET does (#4963).
+    #[tokio::test]
+    async fn test_remote_cold_head_downloads_the_jar_once_5343() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "maven").await else {
+            return;
+        };
+        const JAR: &str = "com/example/lib/5.3/lib-5.3.jar";
+        let jar: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let sha1_hex = hex::encode(sha1::Sha1::digest(&jar));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{JAR}.sha1")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sha1_hex.clone()))
+            .mount(&server)
+            .await;
+        let uri = format!("/{}/{JAR}", fx.repo_key);
+        let head = tdh::assert_cold_head_fetches_body_once(
+            fx,
+            server,
+            super::router,
+            true,
+            &format!("/{JAR}"),
+            &uri,
+            &[("content-type", "application/java-archive")],
+            &jar,
+        )
+        .await;
+        assert_eq!(
+            head.get(MAVEN_CHECKSUM_SHA1_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(sha1_hex.as_str())
+        );
+    }
+
     /// #4573: a Remote repository's jar download carries `X-Checksum-SHA1`
     /// once the `.sha1` is cached, so Maven Resolver skips its separate
     /// `.sha1` request. Before, only the hosted route sent it; a proxied jar
@@ -13219,6 +13285,65 @@ mod upstream_filter_virtual_tests {
         assert!(
             fringe_hits_admitted >= 1,
             "an admitted path still reaches the fringe upstream"
+        );
+    }
+
+    /// #5282: a cache-only first member is skipped for a path it does not hold
+    /// exactly like a filtered one: its upstream receives nothing and the
+    /// second member answers.
+    #[tokio::test]
+    async fn virtual_resolves_a_miss_from_the_next_member_when_the_first_is_cache_only_5282() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "maven").await else {
+            return;
+        };
+        let offline = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"offline-jar".to_vec()))
+            .expect(0)
+            .mount(&offline)
+            .await;
+        let online = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"\.jar$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"online-jar".to_vec()))
+            .mount(&online)
+            .await;
+        let (offline_id, _, offline_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &offline.uri(), 1).await;
+        let (online_id, _, online_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "maven", &online.uri(), 2).await;
+        crate::services::upstream_mode::save_upstream_mode(
+            &fx.pool,
+            offline_id,
+            crate::services::upstream_mode::UpstreamMode::CacheOnly,
+        )
+        .await
+        .expect("store cache_only");
+
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy);
+        let app = tdh::router_with_auth(
+            super::router(),
+            state,
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let (status, body) = tdh::send(
+            app,
+            tdh::get(format!("/{}/org/acme/lib/1.0/lib-1.0.jar", fx.repo_key)),
+        )
+        .await;
+        let offline_hits = hits(&offline, "/").await;
+
+        tdh::cleanup_member_repo(&fx.pool, offline_id, &offline_dir).await;
+        tdh::cleanup_member_repo(&fx.pool, online_id, &online_dir).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..], b"online-jar");
+        assert_eq!(
+            offline_hits, 0,
+            "the cache-only member's upstream is never contacted"
         );
     }
 }

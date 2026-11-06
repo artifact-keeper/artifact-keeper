@@ -9,6 +9,7 @@ use crate::services::guest_access_policy::{
 use crate::services::hidden_nav_items;
 use crate::services::token_expiry_policy::{self, ApiTokenExpiryPolicy, TokenPolicySource};
 use crate::services::totp_policy::{self, check_policy_activation, TotpPolicy, TotpPolicySource};
+use crate::services::upstream_pause::{self, UpstreamPauseSource, UpstreamPauseState};
 use axum::{
     extract::{Extension, Path, Query, State},
     routing::{get, post},
@@ -565,7 +566,8 @@ pub async fn execute_backup(
     let archive_storage =
         StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
-    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage)
+        .with_storage_registry(state.storage_registry.clone());
 
     // `execute_run`, not `execute`: a run that ends FAILED has already recorded
     // its own terminal state and the message naming what went wrong, and that
@@ -663,7 +665,8 @@ pub async fn restore_backup(
     let archive_storage =
         StorageService::backup_archive_from_config(&state.config, &archive_root).await?;
     let source = Arc::new(StorageService::artifact_source_from_config(&state.config).await?);
-    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage);
+    let service = BackupService::with_archive_storage(state.db.clone(), source, archive_storage)
+        .with_storage_registry(state.storage_registry.clone());
 
     let options = RestoreOptions {
         restore_database: payload.restore_database.unwrap_or(true),
@@ -1114,6 +1117,17 @@ pub struct RuntimeSettingsResponse {
     /// a hidden page stays reachable by URL and keeps its permission checks.
     /// Empty (the default) means every entry is shown.
     pub hidden_nav_items: Vec<String>,
+    /// Whether every scheduled job that contacts an upstream on its own is
+    /// paused (#5288): curation sync, environment re-evaluation, the npm
+    /// replication feed, peer replication transfers and scheduled `mirror`
+    /// passes (#5342).
+    pub upstream_jobs_paused: bool,
+    /// Where that value comes from: `environment` (`UPSTREAM_JOBS_PAUSED=true`
+    /// pins it on), `database` (set through this API), `default` (neither) or
+    /// `unavailable`.
+    pub upstream_jobs_paused_source: UpstreamPauseSource,
+    /// The value stored through this API, if any.
+    pub upstream_jobs_paused_stored: Option<bool>,
 }
 
 /// Request body for `PATCH /admin/settings/system`. Omitted fields are left
@@ -1129,12 +1143,17 @@ pub struct UpdateRuntimeSettingsRequest {
     /// letters, digits, `/`, `-`, `_` or `.`, at most 200 entries. An empty
     /// list shows every entry again.
     pub hidden_nav_items: Option<Vec<String>>,
+    /// Pause (`true`) or resume (`false`) every scheduled job that contacts an
+    /// upstream (#5288). Takes effect on each job's next tick. While
+    /// `UPSTREAM_JOBS_PAUSED=true` the jobs stay paused whatever is stored.
+    pub upstream_jobs_paused: Option<bool>,
 }
 
 fn runtime_settings_response(
     resolved: ResolvedGuestAccess,
     pinned: bool,
     hidden_nav_items: Vec<String>,
+    upstream: UpstreamPauseState,
 ) -> RuntimeSettingsResponse {
     RuntimeSettingsResponse {
         guest_access_enabled: resolved.enabled,
@@ -1142,7 +1161,36 @@ fn runtime_settings_response(
         guest_access_stored: resolved.stored,
         guest_access_editable: !pinned,
         hidden_nav_items,
+        upstream_jobs_paused: upstream.paused,
+        upstream_jobs_paused_source: upstream.source,
+        upstream_jobs_paused_stored: upstream.stored,
     }
+}
+
+/// Fresh read of the #5288 switch for the admin endpoints; a read error is a
+/// 503, as for [`read_hidden_nav_items`].
+async fn read_upstream_pause(db: &sqlx::PgPool) -> Result<UpstreamPauseState> {
+    upstream_pause::try_state(db).await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to read the upstream_jobs_paused setting");
+        AppError::ServiceUnavailable(
+            "the upstream_jobs_paused setting could not be read; retry shortly".to_string(),
+        )
+    })
+}
+
+/// Audit `details` for an `upstream_jobs_paused` write (#5288).
+fn upstream_pause_audit_details(
+    before: UpstreamPauseState,
+    after: UpstreamPauseState,
+) -> serde_json::Value {
+    serde_json::json!({
+        "setting": upstream_pause::UPSTREAM_JOBS_PAUSED_SETTING,
+        "from": before.paused,
+        "to": after.paused,
+        "stored_from": before.stored,
+        "stored_to": after.stored,
+        "source": after.source,
+    })
 }
 
 /// Write a `SETTING_CHANGED` audit entry for a runtime setting. The resource
@@ -1240,10 +1288,12 @@ pub async fn get_runtime_settings(
     // answer, not a cached or fallback one -- a read failure is a 503.
     let resolved = read_guest_access(policy).await?;
     let hidden = read_hidden_nav_items(&state.db).await?;
+    let upstream = read_upstream_pause(&state.db).await?;
     Ok(Json(runtime_settings_response(
         resolved,
         policy.is_env_pinned(),
         hidden,
+        upstream,
     )))
 }
 
@@ -1277,9 +1327,13 @@ pub async fn update_runtime_settings(
     Extension(auth): Extension<AuthExtension>,
     Json(payload): Json<UpdateRuntimeSettingsRequest>,
 ) -> Result<Json<RuntimeSettingsResponse>> {
-    if payload.guest_access_enabled.is_none() && payload.hidden_nav_items.is_none() {
+    if payload.guest_access_enabled.is_none()
+        && payload.hidden_nav_items.is_none()
+        && payload.upstream_jobs_paused.is_none()
+    {
         return Err(AppError::Validation(
-            "no setting to update; supported fields: guest_access_enabled, hidden_nav_items"
+            "no setting to update; supported fields: guest_access_enabled, hidden_nav_items, \
+             upstream_jobs_paused"
                 .to_string(),
         ));
     }
@@ -1294,6 +1348,7 @@ pub async fn update_runtime_settings(
     // setting written and the request reported as failed.
     let before = read_guest_access(policy).await?;
     let hidden_before = read_hidden_nav_items(&state.db).await?;
+    let upstream_before = read_upstream_pause(&state.db).await?;
 
     let guest = match payload.guest_access_enabled {
         Some(enabled) => {
@@ -1327,10 +1382,29 @@ pub async fn update_runtime_settings(
         None => hidden_before,
     };
 
+    let upstream = match payload.upstream_jobs_paused {
+        Some(paused) => {
+            upstream_pause::store(&state.db, paused, auth.user_id)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            let after = read_upstream_pause(&state.db).await?;
+            audit_setting_changed(
+                &state,
+                &auth,
+                upstream_pause::UPSTREAM_JOBS_PAUSED_SETTING,
+                upstream_pause_audit_details(upstream_before, after),
+            )
+            .await;
+            after
+        }
+        None => upstream_before,
+    };
+
     Ok(Json(runtime_settings_response(
         guest,
         policy.is_env_pinned(),
         hidden,
+        upstream,
     )))
 }
 
@@ -2800,6 +2874,7 @@ pub async fn delete_proxy_scan_verdicts(
         RuntimeSettingsResponse,
         UpdateRuntimeSettingsRequest,
         GuestAccessSource,
+        UpstreamPauseSource,
         SystemStats,
         ListDownloadsQuery,
         DownloaderFilter,
@@ -5208,6 +5283,7 @@ mod tests {
             resolved(false, GuestAccessSource::Environment, Some(true)),
             true,
             vec!["/peers".to_string()],
+            upstream_pause::resolve(true, Ok(None)),
         );
         assert!(!r.guest_access_enabled);
         assert_eq!(r.guest_access_source, GuestAccessSource::Environment);
@@ -5217,6 +5293,7 @@ mod tests {
             resolved(true, GuestAccessSource::Default, None),
             false,
             Vec::new(),
+            upstream_pause::resolve(false, Ok(None)),
         ))
         .unwrap();
         assert_eq!(json["guest_access_source"], "default");
@@ -5224,6 +5301,28 @@ mod tests {
         assert!(json["guest_access_stored"].is_null());
         assert_eq!(json["hidden_nav_items"], serde_json::json!([]));
         assert_eq!(r.hidden_nav_items, vec!["/peers".to_string()]);
+        assert!(r.upstream_jobs_paused);
+        assert_eq!(
+            r.upstream_jobs_paused_source,
+            UpstreamPauseSource::Environment
+        );
+        assert_eq!(json["upstream_jobs_paused"], false);
+        assert_eq!(json["upstream_jobs_paused_source"], "default");
+        assert!(json["upstream_jobs_paused_stored"].is_null());
+    }
+
+    #[test]
+    fn test_upstream_pause_audit_details_record_the_change() {
+        let d = upstream_pause_audit_details(
+            upstream_pause::resolve(false, Ok(None)),
+            upstream_pause::resolve(false, Ok(Some(&serde_json::json!(true)))),
+        );
+        assert_eq!(d["setting"], "upstream_jobs_paused");
+        assert_eq!(d["from"], false);
+        assert_eq!(d["to"], true);
+        assert!(d["stored_from"].is_null());
+        assert_eq!(d["stored_to"], true);
+        assert_eq!(d["source"], "database");
     }
 
     #[test]
@@ -5264,6 +5363,7 @@ mod tests {
                 Json(UpdateRuntimeSettingsRequest {
                     guest_access_enabled: None,
                     hidden_nav_items: Some(items.into_iter().map(String::from).collect()),
+                    upstream_jobs_paused: None,
                 }),
             )
         };
@@ -5303,6 +5403,72 @@ mod tests {
         assert_eq!(set.guest_access_enabled, initial.guest_access_enabled);
         assert_eq!(set.guest_access_source, initial.guest_access_source);
         assert_eq!(audited, 2, "each navigation write must be audited");
+    }
+
+    /// #5288: an admin PATCH pauses and resumes the scheduled upstream jobs
+    /// with no restart, GET reports it, each write is audited, and the other
+    /// runtime settings are left alone.
+    #[tokio::test]
+    async fn test_runtime_upstream_jobs_paused_round_trip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // The test compares `hidden_nav_items` across two reads, so a
+        // concurrent hidden-nav test writing that shared row between them
+        // made it flaky (#5431). Hold the same lock those tests take.
+        let _guard = tdh::hidden_nav_items_serial_lock().await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-upstream-pause");
+        let auth = admin_auth(user_id, &username);
+        let before = upstream_pause::try_state(&pool).await.expect("read");
+        let patch = |paused: bool| {
+            update_runtime_settings(
+                State(state.clone()),
+                Extension(auth.clone()),
+                Json(UpdateRuntimeSettingsRequest {
+                    guest_access_enabled: None,
+                    hidden_nav_items: None,
+                    upstream_jobs_paused: Some(paused),
+                }),
+            )
+        };
+
+        let Json(on) = patch(true).await.expect("pause");
+        let paused_now = upstream_pause::upstream_jobs_paused(&pool).await;
+        let Json(read) = get_runtime_settings(State(state.clone())).await.unwrap();
+        let Json(off) = patch(false).await.expect("resume");
+        let resumed_now = upstream_pause::upstream_jobs_paused(&pool).await;
+        let audited = tdh::audit_count_eventually(&pool, user_id, "SETTING_CHANGED", 2).await;
+
+        match before.stored {
+            Some(v) => upstream_pause::store(&pool, v, user_id)
+                .await
+                .expect("restore setting"),
+            None => {
+                sqlx::query("DELETE FROM system_settings WHERE key = $1")
+                    .bind(upstream_pause::UPSTREAM_JOBS_PAUSED_SETTING)
+                    .execute(&pool)
+                    .await
+                    .expect("cleanup setting");
+            }
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert!(on.upstream_jobs_paused && read.upstream_jobs_paused && paused_now);
+        assert_eq!(
+            on.upstream_jobs_paused_source,
+            UpstreamPauseSource::Database
+        );
+        assert_eq!(read.upstream_jobs_paused_stored, Some(true));
+        assert!(!off.upstream_jobs_paused && !resumed_now);
+        assert_eq!(off.upstream_jobs_paused_stored, Some(false));
+        assert_eq!(on.hidden_nav_items, read.hidden_nav_items);
+        assert_eq!(
+            audited, 2,
+            "each upstream_jobs_paused write must be audited"
+        );
     }
 
     #[test]
@@ -5390,6 +5556,7 @@ mod tests {
                 Json(UpdateRuntimeSettingsRequest {
                     guest_access_enabled: v,
                     hidden_nav_items: None,
+                    upstream_jobs_paused: None,
                 }),
             )
         };
@@ -5419,6 +5586,7 @@ mod tests {
             Json(UpdateRuntimeSettingsRequest {
                 guest_access_enabled: Some(false),
                 hidden_nav_items: None,
+                upstream_jobs_paused: None,
             }),
         )
         .await
@@ -5454,6 +5622,7 @@ mod tests {
             Json(UpdateRuntimeSettingsRequest {
                 guest_access_enabled: Some(false),
                 hidden_nav_items: None,
+                upstream_jobs_paused: None,
             }),
         )
         .await

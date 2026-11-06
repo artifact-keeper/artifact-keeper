@@ -47,11 +47,15 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> StdioTransport<R
     }
 
     async fn read_reply(&mut self, id: &Value) -> Result<Value, TransportError> {
+        use tokio::io::AsyncReadExt;
         loop {
-            let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
+            // Bound the read itself, not only what was read: a line with no
+            // newline must not grow past the cap before it is checked.
+            let remaining = self.max_bytes.saturating_sub(self.read_total);
+            let mut line = Vec::new();
+            let n = (&mut self.reader)
+                .take(remaining as u64 + 1)
+                .read_until(b'\n', &mut line)
                 .await
                 .map_err(|e| TransportError::Io(e.to_string()))?;
             if n == 0 {
@@ -61,7 +65,7 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> StdioTransport<R
             if self.read_total > self.max_bytes {
                 return Err(TransportError::TooLarge);
             }
-            let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+            let Ok(msg) = serde_json::from_slice::<Value>(line.trim_ascii()) else {
                 continue;
             };
             let is_request = msg.get("method").is_some() && msg.get("id").is_some();
@@ -197,6 +201,55 @@ mod tests {
         assert_eq!(
             t.send("x", None, json!({"id": 1})).await,
             Err(TransportError::TooLarge)
+        );
+    }
+
+    /// A line with no newline is cut off at the cap, not buffered until it
+    /// ends: 8 MiB of `a` and then silence is `TooLarge` at once, having
+    /// read at most the cap plus one byte (and never a timeout after
+    /// buffering all of it).
+    #[tokio::test]
+    async fn an_endless_line_is_cut_at_the_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// Counts the bytes the transport pulled from the guest.
+        struct Counting<R>(R, Arc<AtomicUsize>);
+        impl<R: AsyncRead + Unpin> AsyncRead for Counting<R> {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let before = buf.filled().len();
+                let r = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
+                self.1
+                    .fetch_add(buf.filled().len() - before, Ordering::Relaxed);
+                r
+            }
+        }
+
+        use tokio::io::AsyncReadExt;
+        // The pipe stays open (and silent) after the flood.
+        let (_keep, silent) = duplex(8);
+        let flood = tokio::io::repeat(b'a').take(8 << 20).chain(silent);
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let cap = 64 * 1024;
+        let mut t = StdioTransport::new(
+            Counting(flood, pulled.clone()),
+            tokio::io::sink(),
+            Duration::from_secs(5),
+            cap,
+        );
+        assert_eq!(
+            t.send("tools/list", None, json!({"id": 1})).await,
+            Err(TransportError::TooLarge)
+        );
+        // BufReader reads ahead by at most its buffer (8 KiB).
+        assert!(
+            pulled.load(Ordering::Relaxed) <= cap + 1 + 8 * 1024,
+            "read {} bytes for a {cap} byte cap",
+            pulled.load(Ordering::Relaxed)
         );
     }
 }

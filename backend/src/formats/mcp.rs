@@ -126,6 +126,9 @@ pub enum McpError {
     ServerDenied { name: String },
     /// `(name, version)` already published (409).
     VersionExists,
+    /// A new server name that differs only in letter case from `existing`,
+    /// a name this hosted repository already recorded (409, #5434).
+    NameCaseConflict { name: String, existing: String },
     /// `search` shorter than 3 characters (422, upstream parity).
     SearchTooShort,
     /// A malformed query parameter (`limit`, `cursor`, `updated_since`,
@@ -168,7 +171,7 @@ impl McpError {
             McpError::ReservedNamespace { .. }
             | McpError::NamespaceNotAllowed { .. }
             | McpError::ServerDenied { .. } => 403,
-            McpError::VersionExists => 409,
+            McpError::VersionExists | McpError::NameCaseConflict { .. } => 409,
             McpError::Misconfigured(_) | McpError::Internal(_) => 500,
         }
     }
@@ -189,6 +192,7 @@ impl McpError {
             McpError::NamespaceNotAllowed { .. } => "mcp_namespace_not_allowed",
             McpError::ServerDenied { .. } => "mcp_server_denied",
             McpError::VersionExists => "mcp_version_exists",
+            McpError::NameCaseConflict { .. } => "mcp_name_case_conflict",
             McpError::SearchTooShort => "mcp_search_too_short",
             McpError::Misconfigured(_) => "mcp_repository_misconfigured",
             McpError::Internal(_) => "mcp_internal_error",
@@ -237,6 +241,10 @@ impl McpError {
             McpError::VersionExists => {
                 "this server version already exists; publish a new version".to_string()
             }
+            McpError::NameCaseConflict { name, existing } => format!(
+                "server name '{name}' differs only in letter case from '{existing}', which \
+                 this registry already holds; publish under '{existing}' or choose another name"
+            ),
             McpError::SearchTooShort => "search must be at least 3 characters".to_string(),
             McpError::Misconfigured(_) => {
                 "this repository's MCP package settings are inconsistent; ask an administrator"
@@ -1176,21 +1184,134 @@ pub fn parse_storage_path(path: &str) -> Option<(String, String)> {
     }
 }
 
-pub fn encode_cursor(name: &str, version: &str) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{name}:{version}"))
+/// Listing cursors are sealed: AES-256-GCM under a key derived from the
+/// instance's `jwt_secret`, bound to the repository that issued them and to
+/// the listing kind. A client cannot read the position a cursor names (it
+/// may name a held row: a listing resumes after the last row it read, not
+/// the last one it served) and cannot make one up. The MCP Registry API
+/// treats `cursor` as an opaque string, so the format is free to change.
+///
+/// Wire form: `base64url(0x01 || nonce(12) || ciphertext+tag)`, no padding;
+/// the plaintext is a JSON array of strings, the first the listing kind.
+#[derive(Clone)]
+pub struct CursorSeal {
+    key: [u8; 32],
 }
 
-pub fn decode_cursor(cursor: &str) -> std::result::Result<(String, String), McpError> {
-    let bad = || McpError::invalid_query("cursor", "invalid cursor");
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor.trim_end_matches('='))
-        .map_err(|_| bad())?;
-    let text = String::from_utf8(raw).map_err(|_| bad())?;
-    let (name, version) = text.split_once(':').ok_or_else(bad)?;
-    if name.is_empty() || version.is_empty() {
-        return Err(bad());
+/// The listing a cursor belongs to (the first plaintext element).
+pub mod cursor_kind {
+    /// `GET /servers` of a hosted or Remote repository.
+    pub const SERVERS: &str = "s";
+    /// `GET /x/com.artifactkeeper/holds`.
+    pub const HOLDS: &str = "h";
+    /// `GET /servers` of a Virtual repository (member key, then position).
+    pub const VIRTUAL: &str = "m";
+}
+
+const CURSOR_SEAL_VERSION: u8 = 1;
+/// A cursor longer than this is refused before it is decoded.
+const MAX_CURSOR_LEN: usize = 4096;
+
+impl std::fmt::Debug for CursorSeal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CursorSeal(..)")
     }
-    Ok((name.to_string(), version.to_string()))
+}
+
+impl CursorSeal {
+    /// The seal of an instance whose `jwt_secret` is `secret`
+    /// (HMAC-SHA256 key derivation with a label of its own, so the key is
+    /// unrelated to the token-signing key).
+    pub fn from_secret(secret: &str) -> Self {
+        use hmac::{Hmac, Mac};
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(b"artifact-keeper/mcp-listing-cursor/aes-256-gcm/v1");
+        Self {
+            key: mac.finalize().into_bytes().into(),
+        }
+    }
+
+    fn aad(scope: Uuid) -> Vec<u8> {
+        let mut aad = b"ak-mcp-cursor/v1:".to_vec();
+        aad.extend_from_slice(scope.as_bytes());
+        aad
+    }
+
+    /// Seal `parts` for the listing of repository `scope`.
+    pub fn seal(&self, scope: Uuid, parts: &[&str]) -> String {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
+        let nonce: [u8; 12] = rand::random();
+        let plain = serde_json::to_vec(parts).expect("strings serialize");
+        let aad = Self::aad(scope);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &aad,
+                },
+            )
+            .expect("AES-256-GCM encryption does not fail");
+        let mut out = Vec::with_capacity(1 + nonce.len() + ct.len());
+        out.push(CURSOR_SEAL_VERSION);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(out)
+    }
+
+    /// The parts of a cursor this instance sealed for `scope`; anything else
+    /// (made up, altered, issued by another repository or under another
+    /// secret) is the listing's `400 invalid cursor`.
+    pub fn open(&self, scope: Uuid, cursor: &str) -> std::result::Result<Vec<String>, McpError> {
+        use aes_gcm::aead::{Aead, KeyInit, Payload};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        let bad = || McpError::invalid_query("cursor", "invalid cursor");
+        if cursor.len() > MAX_CURSOR_LEN {
+            return Err(bad());
+        }
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor.trim_end_matches('='))
+            .map_err(|_| bad())?;
+        if raw.len() < 1 + 12 + 16 || raw[0] != CURSOR_SEAL_VERSION {
+            return Err(bad());
+        }
+        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
+        let aad = Self::aad(scope);
+        let plain = cipher
+            .decrypt(
+                Nonce::from_slice(&raw[1..13]),
+                Payload {
+                    msg: &raw[13..],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| bad())?;
+        serde_json::from_slice(&plain).map_err(|_| bad())
+    }
+
+    /// A `name, version` keyset position of listing `kind` of `scope`.
+    pub fn encode_position(&self, scope: Uuid, kind: &str, name: &str, version: &str) -> String {
+        self.seal(scope, &[kind, name, version])
+    }
+
+    /// Inverse of [`Self::encode_position`].
+    pub fn decode_position(
+        &self,
+        scope: Uuid,
+        kind: &str,
+        cursor: &str,
+    ) -> std::result::Result<(String, String), McpError> {
+        let bad = || McpError::invalid_query("cursor", "invalid cursor");
+        match <[String; 3]>::try_from(self.open(scope, cursor)?) {
+            Ok([k, name, version]) if k == kind && !name.is_empty() && !version.is_empty() => {
+                Ok((name, version))
+            }
+            _ => Err(bad()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2947,14 +3068,72 @@ mod tests {
         );
         assert_eq!(parse_storage_path("servers/w/1.0/server.json"), None);
         assert_eq!(parse_storage_path("other/a/b/c/server.json"), None);
-        let c = encode_cursor("com.acme/w", "1.0.0");
+    }
+
+    /// Finding 4: a listing cursor is opaque and sealed. It round-trips for
+    /// the repository and listing that issued it, names nothing a client can
+    /// read, and a made-up, altered, replayed (other repository, other
+    /// listing) or foreign-secret cursor is the `400 invalid cursor`.
+    #[test]
+    fn cursors_are_sealed_and_bound() {
+        use base64::Engine as _;
+        let seal = CursorSeal::from_secret("a-test-secret-of-some-length-0123456789");
+        let (repo, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let c = seal.encode_position(repo, cursor_kind::SERVERS, "com.acme/w", "1.0.0");
         assert_eq!(
-            decode_cursor(&c).unwrap(),
+            seal.decode_position(repo, cursor_kind::SERVERS, &c)
+                .unwrap(),
             ("com.acme/w".into(), "1.0.0".into())
         );
-        for bad in ["!!!", "bm9jb2xvbg", "", "Ondo", "dzo"] {
-            assert!(decode_cursor(bad).is_err(), "{bad}");
+        assert!(c
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&c)
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("com.acme"),
+            "the position is not readable"
+        );
+        // Two cursors for one position differ (random nonce).
+        assert_ne!(
+            c,
+            seal.encode_position(repo, cursor_kind::SERVERS, "com.acme/w", "1.0.0")
+        );
+        let mut tampered = raw.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered);
+        let plain = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("com.acme/w:1.0.0");
+        let foreign = CursorSeal::from_secret("another-secret-of-some-length-0123456789")
+            .encode_position(repo, cursor_kind::SERVERS, "com.acme/w", "1.0.0");
+        let long = "A".repeat(5000);
+        for bad in [
+            "!!!",
+            "bm9jb2xvbg",
+            "",
+            "Ondo",
+            plain.as_str(),
+            tampered.as_str(),
+            foreign.as_str(),
+            long.as_str(),
+        ] {
+            assert_eq!(
+                seal.decode_position(repo, cursor_kind::SERVERS, bad)
+                    .unwrap_err()
+                    .code(),
+                "mcp_invalid_query",
+                "{bad}"
+            );
         }
+        assert!(seal
+            .decode_position(other, cursor_kind::SERVERS, &c)
+            .is_err());
+        assert!(seal.decode_position(repo, cursor_kind::HOLDS, &c).is_err());
+        let virt = seal.seal(repo, &[cursor_kind::VIRTUAL, "m1", "", ""]);
+        assert_eq!(seal.open(repo, &virt).unwrap(), vec!["m", "m1", "", ""]);
+        assert!(seal
+            .decode_position(repo, cursor_kind::SERVERS, &virt)
+            .is_err());
     }
 
     #[test]
@@ -3196,6 +3375,14 @@ mod tests {
                 "mcp_namespace_not_allowed",
             ),
             (McpError::VersionExists, 409, "mcp_version_exists"),
+            (
+                McpError::NameCaseConflict {
+                    name: "io.Acme/t".into(),
+                    existing: "io.acme/t".into(),
+                },
+                409,
+                "mcp_name_case_conflict",
+            ),
             (McpError::SearchTooShort, 422, "mcp_search_too_short"),
             (
                 McpError::Misconfigured("x".into()),

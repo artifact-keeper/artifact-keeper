@@ -3419,7 +3419,8 @@ fn sanitize_metadata_urls(value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Extract and record the safetensors header summary of a freshly stored
-/// Mlmodel upload (#2382) in `artifact_metadata` under format `mlmodel`.
+/// Mlmodel or Huggingface upload (#2382, #5285) in `artifact_metadata`, under
+/// the format of the artifact's repository.
 ///
 /// Shared by the service-layer finalize path (generic `PUT` / multipart) and
 /// the chunked-upload commit, so every way a `.safetensors` file reaches an
@@ -3457,7 +3458,9 @@ pub(crate) async fn record_safetensors_metadata(
     let metadata = sanitize_metadata_urls(mlmodel::safetensors_artifact_metadata(result));
     let stored = sqlx::query(
         "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
-         VALUES ($1, 'mlmodel', $2) \
+         SELECT a.id, r.format::text, $2::jsonb \
+         FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+         WHERE a.id = $1 \
          ON CONFLICT (artifact_id) DO UPDATE SET \
              format = EXCLUDED.format, metadata = EXCLUDED.metadata",
     )

@@ -776,6 +776,19 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
+    // #5293: `pull` replication was accepted (and the default) but never
+    // replicated anything; it is refused now. Name the rows written before
+    // that once per boot, leaving them unchanged.
+    {
+        let db_pool = db_pool.clone();
+        tokio::spawn(async move {
+            artifact_keeper_backend::services::peer_instance_service::warn_inactive_pull_replication(
+                &db_pool,
+            )
+            .await;
+        });
+    }
+
     // #4461: lifecycle regexes run in PostgreSQL. Policies stored before they
     // were compiled by PostgreSQL at create/update time can carry a pattern
     // that fails every run or (`\b`) protects nothing; name them once per
@@ -978,7 +991,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         Ok(storage_svc) => {
             let proxy_service = Arc::new(
                 ProxyService::new(db_pool.clone(), Arc::new(storage_svc), proxy_cache_scope)
-                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs),
+                    .with_stale_if_error_grace_secs(config.proxy_stale_if_error_grace_secs)
+                    .with_upstream_settings(config.proxy_upstream)
+                    .with_upstream_fetch_audit(config.audit_upstream_fetches),
             );
             app_state.set_proxy_service(proxy_service);
             tracing::info!(
@@ -1190,6 +1205,17 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     )
     .await;
 
+    // #5288: install UPSTREAM_JOBS_PAUSED before the first scheduled upstream
+    // job can tick, and say once which jobs the switch holds off.
+    {
+        use artifact_keeper_backend::services::upstream_pause;
+        upstream_pause::set_env_default(config.upstream_jobs_paused);
+        let pause_state = upstream_pause::state(&db_pool).await;
+        if let Some(message) = upstream_pause::startup_message(&pause_state) {
+            tracing::warn!(event = "upstream_jobs_paused", "{message}");
+        }
+    }
+
     // #2249: proactive packument invalidation from npm's replication feed.
     // Opt-in (NPM_UPSTREAM_FEED_ENABLED); one replica consumes cluster-wide
     // via an advisory lock. Detached deliberately: lifecycle is governed by
@@ -1215,6 +1241,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     // #4311: resume repository delete jobs that are pending or whose replica
     // died mid-delete (their claim lapsed).
     artifact_keeper_backend::api::handlers::repositories::spawn_repository_delete_resumer(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
+    // #5284: resume proxy-cache seed jobs that are pending or whose replica
+    // died or restarted mid-seed (their claim lapsed).
+    artifact_keeper_backend::api::handlers::repositories::spawn_cache_seed_resumer(
         state.clone(),
         runtime_shutdown_token.clone(),
     );

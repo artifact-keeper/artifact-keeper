@@ -10,7 +10,7 @@ healthy from monitoring while every request was a cache miss (#4319).
 | Metric | Type | Labels | Moves when |
 |---|---|---|---|
 | `ak_proxy_cache_publish_failures_total` | counter | `backend`, `class` | a proxy cache write is abandoned because a storage step failed |
-| `ak_proxy_cache_lookups_total` | counter | `repository`, `result` | a cache lookup ends (`hit`, `miss_*`, `error`) |
+| `ak_proxy_cache_lookups_total` | counter | `repository`, `result` | a cache lookup ends (`hit`, `miss`, `miss_*`, `negative_hit`, `error`); see below |
 | `ak_proxy_cache_checksum_mismatch_total` | counter | `repository` | a body did not match the checksum its path promises and was not cached |
 | `ak_proxy_cache_quota_exceeded_total` | counter | `repository` | an object larger than the repository quota was served without a cache write |
 
@@ -27,6 +27,28 @@ healthy from monitoring while every request was a cache miss (#4319).
 A body abandoned for a reason that is not the backend's, such as an upstream
 connection that broke mid-body, an object over the repository's single-object
 ceiling, or a client that disconnected, is not counted here.
+
+## What `ak_proxy_cache_lookups_total` counts
+
+One increment per proxied request that consults the cache, for `GET` and
+`HEAD` alike, on both fetch paths:
+
+| Path | Serves | `result` values |
+|---|---|---|
+| streaming | package files, blobs, Hugging Face files, every proxied `HEAD` | `hit`, `miss`, `negative_hit` |
+| buffered | metadata documents (indexes, packuments, `model_info`) | `hit`, `miss_no_metadata`, `miss_expired`, `miss_no_content`, `miss_checksum_mismatch`, `error` |
+
+`miss` means the streaming lookup found no entry it could serve (absent,
+evicted, or stale and not revalidated) and the request went upstream. A
+handler that probes the cache before fetching counts that request once.
+Until #5322 the streaming path did not count at all, so the hit
+ratio described metadata documents only.
+
+```promql
+# Proxy cache hit ratio per repository, all request methods and both paths.
+sum by (repository) (rate(ak_proxy_cache_lookups_total{result="hit"}[5m]))
+  / sum by (repository) (rate(ak_proxy_cache_lookups_total[5m]))
+```
 
 ## Example alert
 

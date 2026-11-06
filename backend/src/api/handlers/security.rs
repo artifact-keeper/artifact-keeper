@@ -283,10 +283,11 @@ pub struct ListScansQuery {
 ///
 /// Kept in sync with the constraint by hand — the constraint is the authority
 /// and is re-stated in whichever migration last touched it (`022`, `032`,
-/// `034`, `060`, `220` for `external`, and `326` for `mcp_lint`). Used only to reject a typo'd
-/// filter: an unknown value must be a `400`, because an unfiltered response to
-/// a misspelled engine name reads as "no scans from that engine", which is the
-/// wrong direction for a security view (#3410).
+/// `034`, `060`, `220` for `external`, `327` for `mcp_lint`, `331` for
+/// `model`). Used only to reject a typo'd filter: an unknown value must be a
+/// `400`, because an unfiltered response to a misspelled engine name reads as
+/// "no scans from that engine", which is the wrong direction for a security
+/// view (#3410).
 pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
     "dependency",
     "image",
@@ -298,6 +299,7 @@ pub(crate) const KNOWN_SCAN_TYPES: &[&str] = &[
     "incus",
     EXTERNAL_SCAN_TYPE,
     crate::services::mcp_lint::MCP_LINT_SCAN_TYPE,
+    crate::services::model_file_scanner::MODEL_SCAN_TYPE,
 ];
 
 /// Canonical severity vocabulary for the findings filter, matching
@@ -1595,21 +1597,21 @@ async fn list_scans(
     }
 
     let filters = query.validated_filters()?;
-    let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
-    let (scans, total) = svc
-        .list_scans(
-            query.repository_id,
-            query.artifact_id,
-            query.status.as_deref(),
-            filters.scan_type,
-            offset,
-            per_page,
-        )
-        .await?;
+    let (scans, total) = list_scans_served(
+        &state,
+        auth.as_ref(),
+        query.repository_id,
+        query.artifact_id,
+        query.status.as_deref(),
+        filters.scan_type,
+        offset,
+        per_page,
+    )
+    .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
     // muted summary row before returning. `total` is left as the raw DB row
@@ -1642,7 +1644,7 @@ async fn get_scan(
     let s = svc.get_scan(id).await?;
 
     // Cross-repo authorization (#2439): see `scan_visible_to`.
-    let s = scan_visible_to(&state.db, &auth, s, None).await?;
+    let s = scan_visible_to(&state, &auth, s, None).await?;
 
     let mut items = enrich_scans(&state.db, vec![s]).await?;
     Ok(Json(items.remove(0)))
@@ -1661,29 +1663,29 @@ async fn get_scan(
 /// caller gets their copy (#5153). The no-access 404 body is normalized to the one
 /// an absent id produces, so this is not an existence oracle.
 async fn scan_visible_to(
-    db: &PgPool,
+    state: &SharedState,
     auth: &AuthExtension,
     scan: ScanResult,
     artifact_id: Option<Uuid>,
 ) -> Result<ScanResult> {
     let caller = Some(auth.clone());
-    let svc = ScanResultService::new(db.clone());
+    let svc = ScanResultService::new(state.db.clone());
     if let Some(artifact_id) = artifact_id {
         let row = svc
             .scan_for_artifact(scan.id, artifact_id)
             .await?
             .ok_or_else(|| AppError::NotFound(SCAN_NOT_FOUND_MSG.to_string()))?;
-        check_artifact_visibility(&caller, row.artifact_id, db, "read")
+        scan_artifact_readable(state, &caller, row.artifact_id)
             .await
             .map_err(unify_scan_not_found)?;
         return Ok(row);
     }
-    let refusal = match check_artifact_visibility(&caller, scan.artifact_id, db, "read").await {
+    let refusal = match scan_artifact_readable(state, &caller, scan.artifact_id).await {
         Ok(_) => return Ok(scan),
         Err(refusal) => refusal,
     };
     for copy in svc.copies_of_scan(scan.id).await? {
-        if check_artifact_visibility(&caller, copy.artifact_id, db, "read")
+        if scan_artifact_readable(state, &caller, copy.artifact_id)
             .await
             .is_ok()
         {
@@ -1691,6 +1693,66 @@ async fn scan_visible_to(
         }
     }
     Err(unify_scan_not_found(refusal))
+}
+
+/// The read gate on a scan's artifact: [`check_artifact_visibility`], plus
+/// the MCP serve decision (#5253), so the scan of an MCP server version
+/// readers are not served is missing for a caller who does not hold the
+/// registry.
+async fn scan_artifact_readable(
+    state: &SharedState,
+    caller: &Option<AuthExtension>,
+    artifact_id: Uuid,
+) -> Result<()> {
+    check_artifact_visibility(caller, artifact_id, &state.db, "read").await?;
+    crate::api::handlers::artifacts::require_mcp_servable(state, caller, artifact_id).await
+}
+
+/// One page of scan rows for a listing, and their total, as `auth` may see
+/// them (#5253): the scans of an MCP server version the caller is not served
+/// are left out in SQL (an artifact-scoped listing of such a version is
+/// empty, as for a missing artifact), so `total` counts only what is listed.
+#[allow(clippy::too_many_arguments)]
+async fn list_scans_served(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repository_id: Option<Uuid>,
+    artifact_id: Option<Uuid>,
+    status: Option<&str>,
+    scan_type: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<(Vec<ScanResult>, i64)> {
+    if let Some(artifact_id) = artifact_id {
+        if !crate::api::handlers::artifacts::mcp_servable(state, auth, artifact_id).await? {
+            return Ok((Vec::new(), 0));
+        }
+    }
+    let svc = ScanResultService::new(state.db.clone());
+    let served_only = match repository_id {
+        Some(repo) => {
+            crate::api::handlers::search::mcp_served_only_fresh(state, auth, Some(&[repo])).await?
+        }
+        None => None,
+    };
+    match served_only {
+        Some(served_only) => {
+            svc.list_scans_served_only(
+                repository_id,
+                artifact_id,
+                status,
+                scan_type,
+                &served_only,
+                offset,
+                limit,
+            )
+            .await
+        }
+        None => {
+            svc.list_scans(repository_id, artifact_id, status, scan_type, offset, limit)
+                .await
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1724,7 +1786,7 @@ async fn list_findings(
     let scan = svc.get_scan(scan_id).await?;
 
     // Cross-repo authorization (#2439): see `scan_visible_to`.
-    let scan = scan_visible_to(&state.db, &auth, scan, query.artifact_id).await?;
+    let scan = scan_visible_to(&state, &auth, scan, query.artifact_id).await?;
 
     let filters = query.validated_filters()?;
     let page = query.page.unwrap_or(1);
@@ -2647,6 +2709,7 @@ fn scan_config_change_audit(
                 allow_public_with_upstream_credentials: None,
                 upstream_auth_change: None,
                 age_gate_change: None,
+                upstream_mode_change: None,
             }),
     )
 }
@@ -2675,24 +2738,25 @@ async fn list_artifact_scans(
 ) -> Result<Json<ScanListResponse>> {
     // Cross-repo authorization (#2439): apply the canonical artifact-visibility
     // gate (existence-hiding 404) before listing any scan for this artifact.
-    check_artifact_visibility(&Some(auth), artifact_id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, artifact_id, &state.db, "read").await?;
 
     let filters = query.validated_filters()?;
-    let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
-    let (scans, total) = svc
-        .list_scans(
-            None,
-            Some(artifact_id),
-            query.status.as_deref(),
-            filters.scan_type,
-            offset,
-            per_page,
-        )
-        .await?;
+    let (scans, total) = list_scans_served(
+        &state,
+        auth.as_ref(),
+        None,
+        Some(artifact_id),
+        query.status.as_deref(),
+        filters.scan_type,
+        offset,
+        per_page,
+    )
+    .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
     // muted summary row before returning. `total` is left as the raw DB row
@@ -2730,25 +2794,26 @@ async fn list_repo_scans(
     // to avoid leaking a private repo's scan list to a non-member.
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_visible(&repo, &Some(auth), &repo_service).await?;
+    let auth = Some(auth);
+    require_visible(&repo, &auth, &repo_service).await?;
     let repo = repo.id;
 
     let filters = query.validated_filters()?;
-    let svc = ScanResultService::new(state.db.clone());
     let page = query.page.unwrap_or(1);
     let per_page = query.per_page.unwrap_or(20).min(100);
     let offset = (page - 1) * per_page;
 
-    let (scans, total) = svc
-        .list_scans(
-            Some(repo),
-            None,
-            query.status.as_deref(),
-            filters.scan_type,
-            offset,
-            per_page,
-        )
-        .await?;
+    let (scans, total) = list_scans_served(
+        &state,
+        auth.as_ref(),
+        Some(repo),
+        None,
+        query.status.as_deref(),
+        filters.scan_type,
+        offset,
+        per_page,
+    )
+    .await?;
 
     // #2471: fold redundant per-artifact `not_applicable` rows into a single
     // muted summary row before returning. `total` is left as the raw DB row

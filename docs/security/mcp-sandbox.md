@@ -18,14 +18,47 @@ variables, the 120 s wall clock) is in
 | --- | --- | --- |
 | The sandbox host kernel | A guest runs arbitrary code (`npm install` scripts, the server). | gVisor `runsc` (user-space kernel) or a microVM runtime (`kata-fc`); a plain runc container is refused unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`. Read-only root, `/tmp` tmpfs, uid 65532, `--cap-drop=ALL`, `no-new-privileges`, pids/memory/CPU limits. |
 | The container engine | Whoever drives the engine can start privileged containers. A rootful Docker or Podman socket is root on the host. | The worker drives **rootless** Podman as a dedicated user, on a host or VM used for nothing else. No socket is mounted into any container. On Kubernetes the worker has no engine at all: it creates guest pods through the API, limited by RBAC to one namespace. |
-| The internal network, cloud metadata | A guest that can open connections can scan and pivot. | npm and PyPI guests join `ak-mcp-sandbox`, an internal network with no route out. Its only member is a TCP forwarder that answers on the AK hostname and forwards to AK. OCI guests run with `--network=none`. |
-| Artifact Keeper credentials | The worker holds an `mcp:introspect` token. | The token can only claim jobs and post results. Guests never see it: the worker passes them only placeholder secrets (`AK_PLACEHOLDER_<NAME>`). Guests install anonymously, so map public, read-only repositories for packages that should be introspected. |
-| Other jobs | A guest could persist between jobs. | `--rm`, a fresh name per job, jobs run one at a time, and the guest is killed at the wall clock. |
+| The internal network, cloud metadata | A guest that can open connections can scan and pivot, or send data out. | npm and PyPI guests join `ak-mcp-sandbox`, an internal network with no route out and no DNS for outside names. Its only member is a TCP forwarder that answers on the AK hostname and forwards to AK's address. On Kubernetes, a NetworkPolicy allows TCP 443 to AK only, and guest pods get no DNS server. OCI guests run with `--network=none`. |
+| Artifact Keeper credentials | The worker holds an `mcp:introspect` token. In Option A the worker, rootless Podman and the gVisor sentry all run as `ak-sbx`, so a guest that escapes the sentry runs as the worker's user. | The token can only claim jobs and post results. Guests never see it: the worker passes them only placeholder secrets (`AK_PLACEHOLDER_<NAME>`). It is never in the environment: systemd opens the root-only `/etc/ak-mcp-introspector/token` and hands it over as standard input (`--token-file -`), and the worker makes itself non-dumpable (`PR_SET_DUMPABLE=0`), so another `ak-sbx` process can read neither a file holding the token nor the worker's `/proc/<pid>/environ` or memory. Guests install anonymously, so map public, read-only repositories for packages that should be introspected. |
+| Other jobs | A guest could persist between jobs. | A fresh container per attempt, removed after the run; jobs run one at a time, and the guest is killed at the wall clock. |
 
 What this deployment does not cover: a guest can still talk to the AK
 instance it installs from (it needs to), and gVisor reduces but does not
 remove kernel attack surface. A microVM runtime is the stronger choice where
 the host supports nested virtualisation.
+
+### What isolation holds
+
+- **With gVisor (`runsc`).** The guest's system calls go to gVisor's
+  user-space kernel (the sentry), not to the host kernel. The sentry itself
+  uses a small, filtered set of host system calls, so a bug in the Linux
+  kernel is much harder to reach from the guest. If the guest escapes the
+  sentry, it runs on the host as the user that runs the worker (`ak-sbx` in
+  Option A), with that user's files and processes. In Option A that
+  includes the worker process, but not its token
+  ([#5390](https://github.com/artifact-keeper/artifact-keeper/issues/5390)):
+  the token is in no file and no environment that user can open (systemd
+  passes the root-only token file as the worker's standard input), and the
+  worker is non-dumpable, so its `/proc/<pid>/environ` and memory are
+  root-owned. The escaped guest can still use that user's rootless Podman
+  and disturb or kill the worker, so keep the host dedicated to it.
+- **Without gVisor (plain `runc` or `crun`).** The guest is an ordinary
+  container: namespaces, a seccomp filter and dropped capabilities, sharing
+  the host kernel. Any kernel bug the guest can reach through the allowed
+  system calls is a host compromise. This is why the worker refuses to run
+  a guest without a runtime unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`.
+  Do not set it outside a test.
+
+### "Install only from AK" is a network control
+
+The worker passes `--registry` (npm) and `--default-index` (PyPI) with AK's
+URL and drops variables that would re-route the package manager. That
+decides where a well-behaved installer fetches from. It does not stop
+anything else: the install scripts and the server are attacker code, and
+they can open a connection to any host they like. Only the network stops
+them: the internal `ak-mcp-sandbox` network and its gateway (Option A), or
+the NetworkPolicy and the missing DNS server (Option B). Do not loosen
+either on the grounds that the worker already points the installer at AK.
 
 ## Option A: a dedicated host with rootless Podman (recommended)
 
@@ -43,24 +76,53 @@ the host supports nested virtualisation.
    runsc = ["/usr/local/bin/runsc"]
    ```
 
-   Rootless gVisor needs `runsc --ignore-cgroups` on hosts without delegated
-   cgroups v2. Check with `podman --runtime=runsc run --rm alpine dmesg`; the
-   first line names gVisor.
-3. **Network.** As `ak-sbx`, edit `AK_HOST` in
-   `deploy/mcp-introspector/compose.sandbox-network.yaml` and
-   `nginx-ak-gateway.conf`, then run `podman-compose -f
+   Rootless gVisor needs delegated cgroups v2. Without them it runs only
+   with `runsc --ignore-cgroups`, and **that flag removes the memory, pids
+   and CPU limits**: `--memory`, `--pids-limit` and `--cpus` are accepted
+   but no longer enforced, so one guest can exhaust the host. Delegate
+   cgroups to the user instead. On systemd hosts, add a drop-in for
+   `user@.service` (for example
+   `/etc/systemd/system/user@.service.d/delegate.conf`):
+
+   ```ini
+   [Service]
+   Delegate=cpu cpuset io memory pids
+   ```
+
+   then `systemctl daemon-reload` and restart the user's session (or reboot).
+   Check as `ak-sbx` with `podman info`: `cgroupManager` should be
+   `systemd`, `cgroupVersion` `v2`, and `cgroupControllers` should list
+   `memory`, `pids` and `cpu`. Then check gVisor with `podman --runtime=runsc
+   run --rm alpine dmesg`; the first line names gVisor.
+3. **Network.** As `ak-sbx`, edit
+   `deploy/mcp-introspector/compose.sandbox-network.yaml`: replace
+   `ak.example.com` (the network alias) with the host of `AK_URL`, and
+   `203.0.113.10` (the `ak-upstream` entry in `extra_hosts`) with the
+   address that host resolves to. Then run `podman-compose -f
    compose.sandbox-network.yaml up -d`. This creates the internal network
    `ak-mcp-sandbox` and the forwarder `ak-gateway`. The forwarder joins
-   that network under the AK hostname as an alias and forwards TCP 443 (and
-   80) to the real AK. TLS stays end to end and the certificate stays AK's.
+   that network under the AK hostname as an alias, so a guest's lookup of
+   the AK host returns the forwarder, and forwards TCP 443 (and 80) to
+   `ak-upstream`, the real AK. TLS stays end to end and the certificate
+   stays AK's. `nginx-ak-gateway.conf` must not name the AK hostname as its
+   upstream: inside the forwarder that name is its own alias, so it would
+   forward every connection back to itself. If AK's address changes, update
+   `extra_hosts` and recreate the forwarder.
 4. **Images.** Mirror the guest images (`AK_MCP_SANDBOX_NODE_IMAGE`,
    `AK_MCP_SANDBOX_PYTHON_IMAGE`) through an AK OCI repository, pin them by
    digest, and pull them once as `ak-sbx`. Guests run with `--pull=missing`.
 5. **Service.** Install `systemd/ak-mcp-introspector.service` and
    `systemd/ak-mcp-introspector.env.example` (as
-   `/etc/ak-mcp-introspector.env`, mode 0600, the `mcp:introspect` token in
-   it). The unit runs as `ak-sbx` with `AK_MCP_SANDBOX_ENGINE=podman`,
-   `AK_MCP_SANDBOX_RUNTIME=runsc` and `AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox`.
+   `/etc/ak-mcp-introspector.env`; it holds no secret). Put the
+   `mcp:introspect` token in `/etc/ak-mcp-introspector/token`, mode 0600,
+   owner root (`install -d -m 0700 /etc/ak-mcp-introspector`). The unit runs
+   as `ak-sbx` with `AK_MCP_SANDBOX_ENGINE=podman`,
+   `AK_MCP_SANDBOX_RUNTIME=runsc` and `AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox`;
+   systemd opens the token file before it drops to `ak-sbx` and passes it as
+   standard input (`StandardInput=file:`, `--token-file -`), so the token is
+   in no file and no environment that `ak-sbx` can read. Do not set
+   `AK_MCP_INTROSPECTOR_TOKEN`: an environment value stays readable in
+   `/proc/<pid>/environ` (the worker warns when it gets one).
 6. **Egress of the worker itself** (remote probes). Allow the AK host and
    public addresses only: drop RFC 1918, CGNAT, link-local (cloud metadata),
    loopback and the IPv6 equivalents at the host firewall. The worker's own
@@ -88,15 +150,30 @@ socket exists anywhere. The manifests are in `deploy/mcp-introspector/k8s/`:
 | `namespace.yaml` | `ak-mcp-introspector` (the worker) and `ak-mcp-sandbox` (guests), with Pod Security `restricted`. |
 | `runtimeclass-gvisor.yaml` | `RuntimeClass gvisor` (handler `runsc`). The nodes need gVisor's containerd shim; GKE Sandbox provides it as `gvisor`. |
 | `rbac.yaml` | A service account that may create, get, delete and attach to pods in `ak-mcp-sandbox`, and nothing else. |
-| `networkpolicy.yaml` | Guests: no ingress, egress only to the AK service (and DNS). Worker: egress to the API server, AK and public addresses, never to private ranges or metadata. |
+| `networkpolicy.yaml` | Guests: no ingress, egress only to AK on TCP 443, no DNS. Worker: egress to the API server, AK and public addresses, never to private ranges or metadata. |
 | `launcher-configmap.yaml` | `k8s-launcher.sh`: guest spec JSON in, `kubectl run --attach` with the restricted security context, runtime class and wall clock out. |
 | `deployment.yaml` | One worker replica (jobs run one at a time per worker), token from a Secret, the launcher mounted. Build the image from the binary and `kubectl`. |
 
 The launcher labels each guest pod `ak-mcp-sandbox/network: ak-only` (npm,
 PyPI) or `none` (OCI). The default-deny policy blocks all traffic, and only
-`ak-only` pods get egress to AK and DNS. Edit the placeholder addresses in
-`networkpolicy.yaml` first: the AK ingress and the API server. The policies
-are IPv4 only, so on a dual-stack cluster add the IPv6 ranges as well.
+`ak-only` pods get egress, to AK on TCP 443.
+
+Guests get no DNS either. kube-dns resolves names outside the cluster by
+forwarding them, so a guest that may query it can send data out encoded in
+the names it looks up. Instead the launcher gives each guest pod
+`dnsPolicy: None` with a loopback nameserver, and a `hostAliases` entry
+that maps `AK_MCP_SANDBOX_AK_HOST` (the host of `AK_URL`) to
+`AK_MCP_SANDBOX_AK_IP` (the address of the AK ingress or load balancer the
+guest should reach). Set both in `deployment.yaml`. Use a stable address:
+an ingress whose address changes needs the variable and the policy updated
+together.
+
+Edit the placeholder addresses in `networkpolicy.yaml` first: the AK
+ingress (the same address as `AK_MCP_SANDBOX_AK_IP`) and the API server.
+The policies are IPv4 only, so on a dual-stack cluster add the IPv6 ranges
+as well. Check that your CNI enforces a policy from a pod's first packet:
+with kind's default CNI (kindnet), a new pod's connections in its first
+few seconds were let through before the policy applied.
 
 To check the deployment, mount `sandbox-check/job.example.json` as
 `/opt/ak/job.json` (see `deployment.yaml`), edit it for an image you pushed,

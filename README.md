@@ -302,6 +302,7 @@ Get running in 5 minutes with Docker Compose: **[Quickstart Guide](https://artif
 - **[MCP registry](docs/mcp-registry.md)** — Host an MCP server catalog for VS Code, Copilot and `mcp-publisher`; every package a server runs resolves to an Artifact Keeper repository and is gated like any other artifact
 - **[Hugging Face proxy](docs/huggingface.md)** — Proxy and cache huggingface.co for `huggingface_hub` / `hf download` via `HF_ENDPOINT`
 - **[Bazel module registries](docs/bazel.md)** — `--registry=` setup, and how a hosted module name hides the upstream versions in a virtual repository
+- **[Air-gapped deployments](docs/air-gapped.md)**: Seed-then-disconnect, low-side/high-side peer replication, offline Remote and scanner settings, the background jobs that reach out, and a verification checklist
 - **[Proxy cache freshness](docs/proxy-cache-freshness.md)** — How mutable metadata and immutable artifacts expire on different schedules, and why an upstream yank surfaces as a resolution failure while the artifact still serves
 
 ## Project Structure

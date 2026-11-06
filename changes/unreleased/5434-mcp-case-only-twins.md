@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5434, #5394]
+---
+- **MCP registry: a hosted registry refuses a case-only twin of an existing server name** (#5434). A Local or Staging MCP registry no longer accepts a publish whose server name differs only in letter case from a name it already holds (`io.Acme/tool` next to `io.acme/tool`): it answers `409 mcp_name_case_conflict` and names the stored spelling. A name whose versions were deleted or purged still counts. Stored names are never renamed, and a publish of an exact stored name is accepted as before, also when a case-only twin of it already exists. The check runs in the publish transaction under a lock on the lowercased name, so two concurrent publishes of twins cannot both succeed. `POST /validate` reports the conflict to a repository holder. Remote mirroring and Virtual resolution are unchanged (#5394 already makes a hosted name shadow a Remote's twin). Migration 336 adds an index for the lookup. `docs/mcp-registry.md` has a query that lists the twins already stored. See modelcontextprotocol/registry#1805 for the upstream discussion.

@@ -3143,6 +3143,7 @@ async fn dists_proxy_catchall(
             &upstream_path,
             DEBIAN_BINARY_CONTENT_TYPE,
             RepositoryFormat::Debian,
+            ctx.is_head,
         )
         .await?;
         // #3446: count the proxied package. `upstream_path` is also the
@@ -3690,6 +3691,7 @@ async fn flat_remote(
                 &path,
                 expected,
                 RepositoryFormat::Debian,
+                ctx.is_head,
             )
             .await?;
             proxy_helpers::record_proxy_download(state, repo.id, repo_key, &path, ctx).await;
@@ -3960,6 +3962,7 @@ async fn pool_download(
                         &upstream_path,
                         expected_checksum,
                         RepositoryFormat::Debian,
+                        ctx.is_head,
                     )
                     .await?;
                     // #3446: count the proxied `.deb`. `upstream_path` is also

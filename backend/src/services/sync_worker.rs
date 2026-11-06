@@ -10,6 +10,7 @@
 //! when syncing large Docker images, ML models, etc.
 
 use crate::services::cluster_work::{Claimed, WorkerIdentity};
+use crate::services::upstream_pause::{self, UpstreamPauseGate};
 use crate::storage::{StorageLocation, StorageRegistry};
 use chrono::{NaiveTime, Timelike, Utc};
 use sqlx::PgPool;
@@ -165,6 +166,85 @@ pub(crate) fn should_run_stale_check(tick_count: u64, interval_ticks: u64) -> bo
     interval_ticks > 0 && tick_count.is_multiple_of(interval_ticks)
 }
 
+/// What one sync-worker tick does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerTickPlan {
+    pub heartbeat: bool,
+    pub stale_check: bool,
+    /// Dispatch pending peer transfers (push / mirror sync tasks).
+    pub dispatch: bool,
+    /// Run the scheduled `mirror` passes that are due (#5342).
+    pub mirror_schedule: bool,
+}
+
+impl PeerTickPlan {
+    /// `heartbeat_interval_ticks` is `None` when probes are disabled. While
+    /// scheduled upstream jobs are paused (#5288) no transfer is dispatched:
+    /// pending tasks stay queued and resume on the first tick after the
+    /// switch is turned off. Heartbeat probes and stale-peer detection are
+    /// liveness, unaffected (`PEER_HEARTBEAT_ENABLED=false` stops probes).
+    /// The scheduled `mirror` passes (#5342) are peer replication too: they
+    /// do not run while paused, so a due schedule neither queues work nor
+    /// advances `last_replicated_at`, and fires on the first check after the
+    /// switch is turned off.
+    pub(crate) fn for_tick(
+        tick_count: u64,
+        heartbeat_interval_ticks: Option<u64>,
+        stale_interval_ticks: u64,
+        upstream_jobs_paused: bool,
+    ) -> Self {
+        Self {
+            heartbeat: heartbeat_interval_ticks
+                .is_some_and(|every| should_run_peer_heartbeat_probe(tick_count, every)),
+            stale_check: should_run_stale_check(tick_count, stale_interval_ticks),
+            dispatch: !upstream_jobs_paused,
+            mirror_schedule: !upstream_jobs_paused && should_run_mirror_schedule(tick_count),
+        }
+    }
+}
+
+/// Ticks between checks of the `mirror` replication schedules (#5342): one
+/// minute, the resolution of a 5-field cron expression.
+const MIRROR_SCHEDULE_INTERVAL_TICKS: u64 = 6;
+
+/// Whether this tick checks the `mirror` schedules: the first tick after
+/// startup and every [`MIRROR_SCHEDULE_INTERVAL_TICKS`] after that.
+pub(crate) fn should_run_mirror_schedule(tick_count: u64) -> bool {
+    tick_count == 1 || (tick_count > 0 && tick_count.is_multiple_of(MIRROR_SCHEDULE_INTERVAL_TICKS))
+}
+
+/// The scheduled `mirror` step of one worker tick (#5342): when the plan says
+/// so, queue a whole-repository pass for every `mirror` subscription whose
+/// `replication_schedule` is due at `now`. Returns `None` when the step did
+/// not run (not a schedule tick, or upstream jobs paused).
+pub(crate) async fn run_mirror_schedule(
+    db: &PgPool,
+    plan: PeerTickPlan,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<crate::services::peer_instance_service::MirrorPassSummary> {
+    if !plan.mirror_schedule {
+        return None;
+    }
+    let service = crate::services::peer_instance_service::PeerInstanceService::new(db.clone());
+    match service.run_due_mirror_passes(now).await {
+        Ok(summary) => {
+            if summary.passes > 0 || summary.failed > 0 {
+                tracing::info!(
+                    passes = summary.passes,
+                    tasks_queued = summary.tasks_queued,
+                    failed = summary.failed,
+                    "Scheduled mirror replication"
+                );
+            }
+            Some(summary)
+        }
+        Err(e) => {
+            tracing::error!("Scheduled mirror replication failed: {e}");
+            None
+        }
+    }
+}
+
 /// Check whether the current tick should trigger an active peer heartbeat probe.
 pub(crate) fn should_run_peer_heartbeat_probe(tick_count: u64, interval_ticks: u64) -> bool {
     tick_count > 0
@@ -262,13 +342,19 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
             retry_policy.backoff_max_secs,
         );
 
+        let mut pause = UpstreamPauseGate::new(upstream_pause::PEER_SYNC_JOB);
+
         loop {
             tick.tick().await;
             tick_count += 1;
+            let plan = PeerTickPlan::for_tick(
+                tick_count,
+                peer_heartbeat_enabled.then_some(peer_heartbeat_interval_ticks),
+                stale_interval_ticks,
+                pause.skip_tick(&db).await,
+            );
 
-            if peer_heartbeat_enabled
-                && should_run_peer_heartbeat_probe(tick_count, peer_heartbeat_interval_ticks)
-            {
+            if plan.heartbeat {
                 run_peer_heartbeat_probes(
                     &db,
                     &client,
@@ -278,14 +364,21 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
             }
 
             // Periodically check for stale peers and mark them offline.
-            if should_run_stale_check(tick_count, stale_interval_ticks) {
+            if plan.stale_check {
                 run_stale_peer_detection(&db, stale_threshold_min).await;
             }
 
-            if let Err(e) =
-                process_pending_tasks(&db, &client, storage_registry.clone(), retry_policy).await
-            {
-                tracing::error!("Sync worker error: {e}");
+            // Queue due `mirror` passes before dispatch so their tasks go
+            // out on this same tick (#5342).
+            run_mirror_schedule(&db, plan, Utc::now()).await;
+
+            if plan.dispatch {
+                if let Err(e) =
+                    process_pending_tasks(&db, &client, storage_registry.clone(), retry_policy)
+                        .await
+                {
+                    tracing::error!("Sync worker error: {e}");
+                }
             }
         }
     });
@@ -4216,6 +4309,33 @@ mod tests {
         assert!(!should_run_peer_heartbeat_probe(0, 6));
     }
 
+    /// #5288: a paused tick dispatches no peer transfer, and only that changes.
+    #[test]
+    fn test_peer_tick_plan_dispatches_nothing_while_upstream_jobs_paused() {
+        for tick in 1..=12 {
+            for heartbeat in [None, Some(6)] {
+                let running = PeerTickPlan::for_tick(tick, heartbeat, 6, false);
+                let paused = PeerTickPlan::for_tick(tick, heartbeat, 6, true);
+                assert!(running.dispatch && !paused.dispatch, "tick {tick}");
+                assert!(
+                    !paused.mirror_schedule,
+                    "tick {tick}: paused runs no mirror pass"
+                );
+                assert_eq!(running.mirror_schedule, should_run_mirror_schedule(tick));
+                assert_eq!(
+                    (running.heartbeat, running.stale_check),
+                    (paused.heartbeat, paused.stale_check),
+                    "tick {tick}: liveness must not depend on the switch"
+                );
+                assert_eq!(
+                    running.heartbeat,
+                    heartbeat.is_some() && (tick == 1 || tick.is_multiple_of(6))
+                );
+                assert_eq!(running.stale_check, tick.is_multiple_of(6));
+            }
+        }
+    }
+
     #[test]
     fn test_peer_heartbeat_probe_interval_zero_never_fires() {
         assert!(!should_run_peer_heartbeat_probe(1, 0));
@@ -5961,5 +6081,211 @@ mod tests {
         );
 
         teardown_claim_fixture(&f).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduled `mirror` passes (#5342; Tier-2: no-op without DATABASE_URL)
+    // -----------------------------------------------------------------------
+
+    fn utc(s: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .expect("rfc3339")
+            .with_timezone(&Utc)
+    }
+
+    /// #5342: the worker tick, driven directly, queues a `mirror`
+    /// subscription's missing artifacts when its cron schedule is due, with
+    /// no call to the run-now `sync` route; does nothing when it is not due,
+    /// on a non-schedule tick or while upstream jobs are paused; and
+    /// advances `last_replicated_at` exactly when a pass completes.
+    #[tokio::test]
+    async fn mirror_schedule_tick_queues_due_passes_and_stamps_completion() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _path) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "mirror-sched", "t").await;
+        let svc = PeerInstanceService::new(pool.clone());
+        let tag = Uuid::new_v4();
+        let add_artifact = |i: usize| {
+            let pool = pool.clone();
+            async move {
+                crate::api::handlers::proxy_helpers::insert_artifact(
+                    &pool,
+                    crate::api::handlers::proxy_helpers::NewArtifact {
+                        repository_id: repo_id,
+                        path: &format!("mirror-sched/{tag}/{i}.bin"),
+                        name: &format!("mirror-sched-{tag}-{i}"),
+                        version: "1.0.0",
+                        size_bytes: 3,
+                        checksum_sha256: "mirror-sched",
+                        content_type: "application/octet-stream",
+                        storage_key: &format!("mirror-sched/{tag}/{i}"),
+                        uploaded_by: user_id,
+                    },
+                )
+                .await
+                .unwrap_or_else(|_| panic!("insert artifact {i}"))
+            }
+        };
+        let a1 = add_artifact(1).await;
+        let a2 = add_artifact(2).await;
+
+        // Daily at 03:00 UTC; the last pass ran at 03:00 on Jan 1.
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            true,
+            Some(ReplicationMode::Mirror),
+            Some("0 3 * * *".to_string()),
+            None,
+        )
+        .await
+        .expect("assign mirror subscription");
+        let t0 = utc("2026-01-01T03:00:00Z");
+        sqlx::query(
+            "UPDATE peer_repo_subscriptions SET last_replicated_at = $3 \
+             WHERE peer_instance_id = $1 AND repository_id = $2",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .bind(t0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let queued = || {
+            let pool = pool.clone();
+            async move {
+                let mut ids: Vec<Uuid> = sqlx::query_scalar(
+                    "SELECT artifact_id FROM sync_tasks WHERE peer_instance_id = $1 \
+                     AND task_type = 'push' AND status = 'pending'",
+                )
+                .bind(peer_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                ids.sort();
+                ids
+            }
+        };
+        let last = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+                    "SELECT last_replicated_at FROM peer_repo_subscriptions \
+                     WHERE peer_instance_id = $1 AND repository_id = $2",
+                )
+                .bind(peer_id)
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let schedule_tick = PeerTickPlan::for_tick(6, None, 6, false);
+        assert!(schedule_tick.mirror_schedule);
+
+        // Not due: the next occurrence (Jan 2 03:00) is still ahead.
+        let ran = run_mirror_schedule(&pool, schedule_tick, utc("2026-01-01T12:00:00Z")).await;
+        assert!(ran.is_some(), "a schedule tick runs the mirror step");
+        assert!(
+            queued().await.is_empty(),
+            "a not-due schedule queues nothing"
+        );
+        assert_eq!(
+            last().await,
+            Some(t0),
+            "a not-due schedule leaves the stamp"
+        );
+
+        // Due, but upstream jobs are paused (#5288): nothing, stamp kept.
+        let due_at = utc("2026-01-02T04:00:00Z");
+        let paused = PeerTickPlan::for_tick(6, None, 6, true);
+        assert!(run_mirror_schedule(&pool, paused, due_at).await.is_none());
+        // Due, but not a schedule tick: nothing either.
+        let off_tick = PeerTickPlan::for_tick(2, None, 6, false);
+        assert!(run_mirror_schedule(&pool, off_tick, due_at).await.is_none());
+        assert!(queued().await.is_empty());
+        assert_eq!(last().await, Some(t0));
+
+        // Due on a schedule tick: every artifact is queued, no `sync` call,
+        // and the stamp moves to the tick's instant.
+        let ran = run_mirror_schedule(&pool, schedule_tick, due_at)
+            .await
+            .expect("mirror step ran");
+        assert!(ran.passes >= 1 && ran.tasks_queued >= 2, "{ran:?}");
+        let mut both = vec![a1, a2];
+        both.sort();
+        assert_eq!(queued().await, both, "a due schedule queues the repository");
+        assert_eq!(
+            last().await,
+            Some(due_at),
+            "a completed pass stamps its time"
+        );
+
+        // A new artifact lands (and is not queued by an upload hook here).
+        // Later the same day the schedule is not due again: no new task.
+        let a3 = add_artifact(3).await;
+        run_mirror_schedule(&pool, schedule_tick, utc("2026-01-02T23:59:00Z")).await;
+        assert_eq!(queued().await, both);
+        assert_eq!(last().await, Some(due_at));
+
+        // A pass decided on a stale read (another replica or run-now got
+        // there first) neither queues nor moves the stamp.
+        let stale = svc
+            .run_mirror_pass(peer_id, repo_id, Some(t0), utc("2026-01-03T03:00:00Z"))
+            .await
+            .expect("stale pass");
+        assert_eq!(stale, None);
+        assert_eq!(queued().await, both);
+        assert_eq!(last().await, Some(due_at));
+
+        // The next occurrence queues only what the peer is missing.
+        let next = utc("2026-01-03T03:00:30Z");
+        run_mirror_schedule(&pool, schedule_tick, next).await;
+        let mut all = vec![a1, a2, a3];
+        all.sort();
+        assert_eq!(queued().await, all);
+        assert_eq!(last().await, Some(next));
+
+        // A disabled mirror subscription is never scheduled.
+        svc.assign_repository(
+            peer_id,
+            repo_id,
+            false,
+            Some(ReplicationMode::Mirror),
+            Some("0 3 * * *".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        run_mirror_schedule(&pool, schedule_tick, utc("2026-01-09T03:00:00Z")).await;
+        assert_eq!(
+            last().await,
+            Some(next),
+            "a disabled subscription is skipped"
+        );
+
+        let _ = sqlx::query("DELETE FROM sync_tasks WHERE peer_instance_id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[test]
+    fn mirror_schedule_runs_on_the_first_tick_and_every_minute() {
+        let fired: Vec<u64> = (0..=13)
+            .filter(|t| should_run_mirror_schedule(*t))
+            .collect();
+        assert_eq!(fired, vec![1, 6, 12]);
     }
 }

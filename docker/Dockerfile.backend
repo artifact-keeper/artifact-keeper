@@ -55,8 +55,8 @@ ENV SQLX_OFFLINE=true
 # ak-docker-runners / ak-e2e-runners pools this build runs inside the pod's
 # DinD daemon, where cargo sees all of the host's CPUs (88 on rocky) rather
 # than the pod's share and, unbounded, blows the DinD container's memory
-# limit. The workflows pass the value explicitly (CARGO_BUILD_JOBS=8 on the
-# pools, 4 -- the core count -- on the GitHub-hosted arm64 leg); the default
+# limit. The workflows pass the value explicitly (docker-publish.yml: 4, the
+# core count of its GitHub-hosted runners; e2e.yml: 8 on its pool); the default
 # covers `docker compose --build` in the E2E suites, which passes no build
 # args. Declared per stage because an ARG does not cross a FROM.
 ARG CARGO_BUILD_JOBS=8

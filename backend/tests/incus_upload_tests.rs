@@ -104,6 +104,7 @@ fn test_config(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         device_auth: Default::default(),
+        proxy_upstream: Default::default(),
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
@@ -169,6 +170,7 @@ fn test_config(storage_path: &str) -> Config {
         proxy_singleflight_lock_wait_timeout_secs: 65,
         proxy_stale_if_error_grace_secs:
             artifact_keeper_backend::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+        audit_upstream_fetches: Default::default(),
         oci_virtual_negative_cache_ttl_ms:
             artifact_keeper_backend::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         npm_virtual_negative_cache_ttl_ms:
@@ -193,6 +195,7 @@ fn test_config(storage_path: &str) -> Config {
         npm_attestation_negative_cache_enabled: true,
         npm_attestation_negative_cache_ttl_secs: 86_400,
         npm_upstream_feed_enabled: false,
+        upstream_jobs_paused: false,
         npm_upstream_feed_url:
             artifact_keeper_backend::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .to_string(),
