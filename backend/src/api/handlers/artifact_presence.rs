@@ -274,11 +274,25 @@ pub async fn missing_artifacts(
 
     let items = validate_items(&req.items)?;
     let checked = items.len();
-    let live = if items.is_empty() {
+    let mut live = if items.is_empty() {
         HashMap::new()
     } else {
         live_checksums(&state.db, repo.id, &distinct_paths(&items)).await?
     };
+    // MCP registries (#5253): a path the caller is not served (a held server
+    // version, or a bundle of one) is absent, as on every other read route.
+    if repo.format == crate::models::repository::RepositoryFormat::Mcp && !live.is_empty() {
+        let mut gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
+        if !gate.holds_all(&[repo.id]).await {
+            let mut served = HashMap::with_capacity(live.len());
+            for (path, sums) in live {
+                if gate.visible(repo.id, &path).await {
+                    served.insert(path, sums);
+                }
+            }
+            live = served;
+        }
+    }
     Ok(Json(MissingArtifactsResponse {
         checked,
         missing: classify_missing(items, &live),
@@ -336,6 +350,14 @@ pub(crate) async fn already_present_for_session(
         declared.total_size,
         declared.version,
     ) {
+        return None;
+    }
+    // #5253: never report a held MCP server version as present.
+    if repo.format == crate::models::repository::RepositoryFormat::Mcp
+        && !super::mcp::GenericArtifactGate::new(state, Some(auth))
+            .visible(repo.id, declared.path)
+            .await
+    {
         return None;
     }
     // The row alone is not enough: the object must still be in storage, or a

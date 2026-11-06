@@ -3,8 +3,9 @@ name: MCP Sandbox
 # A real sandboxed MCP probe under gVisor (#5253). `ak-mcp-introspector
 # sandbox-probe` starts a guest with the OCI runner and `--runtime=runsc`,
 # speaks MCP over its stdio and lists its tools; this job passes only when
-# that guest answered from inside gVisor. It also checks that the runner
-# refuses to start a guest without a sandbox runtime, that an internal
+# that guest answered from inside gVisor and its container was removed. It
+# also checks that the runner refuses to start a guest without a sandbox
+# runtime (none, or runc), that an internal
 # network like `ak-mcp-sandbox` has no way out, and that the reference
 # deployment files (deploy/mcp-introspector) parse.
 # docs/security/mcp-sandbox.md, "Continuous integration".
@@ -124,6 +125,8 @@ jobs:
           kernel="$(jq -r '.tools[] | select(.name == "echo") | .description' "$RUNNER_TEMP/out.json")"
           echo "guest reported: $kernel; runner kernel: $(uname -sr)"
           test "$kernel" != "kernel: $(uname -sr)"
+          # The guest container is removed after the run, not only its client.
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
 
       - name: No sandbox runtime, no guest
         env:
@@ -136,6 +139,19 @@ jobs:
           fi
           cat "$RUNNER_TEMP/plain.json"
           jq -e '.outcome == "unsupported"' "$RUNNER_TEMP/plain.json"
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+
+      - name: A plain runtime (runc) is not a sandbox runtime
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runc
+        run: |
+          set -u
+          if ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/job.json" > "$RUNNER_TEMP/runc.json"; then
+            echo "a probe with runc must be refused"; exit 1
+          fi
+          cat "$RUNNER_TEMP/runc.json"
+          jq -e '.outcome == "unsupported"' "$RUNNER_TEMP/runc.json"
           test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
 
       - name: An internal sandbox network has no way out

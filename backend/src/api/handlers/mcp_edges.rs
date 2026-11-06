@@ -111,7 +111,12 @@ async fn holds(
     {
         return Err(mcp::not_found());
     }
-    let q = mcp::parse_list_query(&query).map_err(mcp::mcp_error)?;
+    let seal = mcp::cursor_seal(&state);
+    let q = mcp::parse_list_query(&query, |c| {
+        seal.decode_position(repo.id, fmt::cursor_kind::HOLDS, c)
+    })
+    .map_err(mcp::mcp_error)?;
+    let encode = |n: &str, v: &str| seal.encode_position(repo.id, fmt::cursor_kind::HOLDS, n, v);
     let want = q.limit as usize;
     let policy = mcp::current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(&state, false);
@@ -143,12 +148,12 @@ async fn holds(
             break;
         }
         if read >= mcp::MAX_LISTING_ROWS {
-            resume = after.as_ref().map(|(n, v)| fmt::encode_cursor(n, v));
+            resume = after.as_ref().map(|(n, v)| encode(n, v));
             break;
         }
     }
     let next = if out.len() > want {
-        Some(fmt::encode_cursor(&out[want - 1].0, &out[want - 1].1))
+        Some(encode(&out[want - 1].0, &out[want - 1].1))
     } else {
         resume
     };

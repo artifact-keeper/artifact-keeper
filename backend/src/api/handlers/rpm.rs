@@ -463,6 +463,7 @@ async fn try_proxy_repodata(
         upstream_path,
         expected_checksum,
         RepositoryFormat::Rpm,
+        false,
     )
     .await?;
 
@@ -3021,6 +3022,7 @@ async fn upstream_proxy(
         "application/x-rpm",
         Some(filename),
         RepositoryFormat::Rpm,
+        ctx.is_head,
     )
     .await?;
     // #3649: count the proxied serve. The streaming helper answers a warm

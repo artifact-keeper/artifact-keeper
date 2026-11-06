@@ -9,7 +9,7 @@
 //!
 //! Subcommands:
 //!
-//! * `run` — the job loop (`AK_URL`, `AK_MCP_INTROSPECTOR_TOKEN`;
+//! * `run` — the job loop (`AK_URL`, `--token-file` / `AK_MCP_INTROSPECTOR_TOKEN_FILE`;
 //!   `--sandbox` to also take `sandbox_run` jobs);
 //! * `probe <url>` — probe one remote and print the result (no backend);
 //! * `convert --from <inventory> <file>` — a Docker MCP Gateway / ToolHive
@@ -50,8 +50,15 @@ enum Command {
     Run {
         #[arg(long, env = "AK_URL")]
         ak_url: String,
+        /// The `mcp:introspect` token. Prefer `--token-file`: a value in the
+        /// environment stays readable in `/proc/<pid>/environ`.
         #[arg(long, env = "AK_MCP_INTROSPECTOR_TOKEN", hide_env_values = true)]
-        token: String,
+        token: Option<String>,
+        /// Read the token from this file, or from standard input with `-`
+        /// (systemd `StandardInput=file:`, so the file can stay root-only
+        /// and nothing the worker's user can open holds the token).
+        #[arg(long, env = "AK_MCP_INTROSPECTOR_TOKEN_FILE", conflicts_with = "token")]
+        token_file: Option<String>,
         #[arg(
             long,
             env = "AK_MCP_INTROSPECTOR_ID",
@@ -104,6 +111,11 @@ fn env(k: &str) -> Option<String> {
     std::env::var(k).ok()
 }
 
+/// The worker id outside `run` (`render-sandbox`, `sandbox-probe`).
+fn default_owner() -> String {
+    env("AK_MCP_INTROSPECTOR_ID").unwrap_or_else(|| "ak-mcp-introspector".into())
+}
+
 /// Refuse to probe with an override that would admit private addresses.
 fn ensure_public_only() -> Result<(), String> {
     match http::private_override_set(env) {
@@ -112,6 +124,58 @@ fn ensure_public_only() -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// Make this process non-dumpable: its `/proc/<pid>/environ`, `mem` and
+/// `maps` become root-owned and `ptrace` by the same user is refused, so a
+/// process of the worker's user (a guest that escaped the sandbox runtime
+/// lands there in the single-user deployment) cannot read the token out of
+/// the worker. Children (the engine client) are reset on `execve`.
+fn harden_process() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes no pointers.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+}
+
+/// The worker token: `--token-file` (a path, or `-` for standard input),
+/// else `--token` / `AK_MCP_INTROSPECTOR_TOKEN` (with a warning).
+fn resolve_token(
+    token: Option<String>,
+    token_file: Option<&str>,
+    stdin: impl std::io::Read,
+) -> Result<String, String> {
+    let raw = match (token_file, token) {
+        (Some(f), _) => {
+            let mut text = String::new();
+            let read = if f == "-" {
+                let mut stdin = stdin;
+                stdin.read_to_string(&mut text).map(|_| ())
+            } else {
+                std::fs::File::open(f)
+                    .and_then(|mut h| std::io::Read::read_to_string(&mut h, &mut text).map(|_| ()))
+            };
+            read.map_err(|e| format!("token file {f}: {e}"))?;
+            text
+        }
+        (None, Some(t)) => {
+            tracing::warn!(
+                "the worker token came from the command line or environment; \
+                 use --token-file (AK_MCP_INTROSPECTOR_TOKEN_FILE) so it is not \
+                 readable in /proc/<pid>/environ"
+            );
+            t
+        }
+        (None, None) => {
+            return Err("no worker token: set --token-file (AK_MCP_INTROSPECTOR_TOKEN_FILE)".into())
+        }
+    };
+    let t = raw.trim().to_string();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return Err("the worker token is empty or malformed".into());
+    }
+    Ok(t)
 }
 
 fn read_json(file: &str) -> Result<Value, String> {
@@ -128,7 +192,7 @@ fn convert_file(from: &str, file: &str) -> Result<Value, String> {
 
 /// The guest spec and runner command for a claimed job document.
 fn render_sandbox(job: &Value) -> Result<Value, String> {
-    let runner = sandbox::runner_from_env(env);
+    let runner = sandbox::runner_from_env(env, &default_owner());
     let ak = job["akBaseUrl"].as_str().ok_or("job has no akBaseUrl")?;
     let spec = sandbox::guest_spec(
         job["jobId"].as_str().unwrap_or("job"),
@@ -148,20 +212,36 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Run {
             ak_url,
             token,
+            token_file,
             worker_id,
             sandbox,
             poll_secs,
             once,
         } => {
             ensure_public_only()?;
+            harden_process();
+            let token = resolve_token(token, token_file.as_deref(), std::io::stdin())?;
             let w = worker::Worker {
                 backend: worker::Backend::new(&ak_url, &token),
+                runner: sandbox.then(|| sandbox::runner_from_env(env, &worker_id)),
                 worker_id,
-                runner: sandbox.then(|| sandbox::runner_from_env(env)),
                 images: sandbox::images_from_env(env),
                 http: http::guarded_client(),
             };
             tracing::info!(kinds = ?w.kinds(), "ak-mcp-introspector started");
+            if let Some(runner) = &w.runner {
+                // Guests a crashed or killed earlier run left behind.
+                match sandbox::reap_leftovers(runner.as_ref()).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::warn!(removed = n, "removed leftover sandbox guests"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not check for leftover sandbox guests")
+                    }
+                }
+                for image in w.images.unpinned() {
+                    tracing::warn!(%image, "sandbox runner image is not pinned by digest");
+                }
+            }
             if once {
                 w.once().await.map(|_| ())
             } else {
@@ -211,8 +291,11 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::SandboxProbe { job } => {
-            let out = sandbox_probe_job(sandbox::runner_from_env(env).as_ref(), &read_json(&job)?)
-                .await?;
+            let out = sandbox_probe_job(
+                sandbox::runner_from_env(env, &default_owner()).as_ref(),
+                &read_json(&job)?,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
             if out["outcome"] == "ok" {
                 Ok(())
@@ -386,5 +469,75 @@ mod tests {
         .unwrap();
         assert!(dispatch(c).await.is_err());
         assert!(ensure_public_only().is_ok() || env("AK_SSRF_ALLOW_PRIVATE_CIDRS").is_some());
+    }
+
+    /// The token comes from a file or standard input (never needing the
+    /// environment), trimmed; empty or ambiguous input is refused.
+    #[test]
+    fn token_from_file_or_stdin() {
+        let f = tmp("token", "ak_tok_123\n");
+        assert_eq!(
+            resolve_token(None, Some(&f), std::io::empty()).unwrap(),
+            "ak_tok_123"
+        );
+        assert_eq!(
+            resolve_token(None, Some("-"), &b"  ak_tok_456\n"[..]).unwrap(),
+            "ak_tok_456"
+        );
+        // The file wins over a stray environment value.
+        assert_eq!(
+            resolve_token(Some("from-env".into()), Some(&f), std::io::empty()).unwrap(),
+            "ak_tok_123"
+        );
+        assert_eq!(
+            resolve_token(Some("legacy".into()), None, std::io::empty()).unwrap(),
+            "legacy"
+        );
+        assert!(resolve_token(None, None, std::io::empty()).is_err());
+        assert!(resolve_token(None, Some("-"), &b"\n"[..]).is_err());
+        assert!(resolve_token(None, Some("-"), &b"a b"[..]).is_err());
+        assert!(resolve_token(None, Some("/nonexistent/token"), std::io::empty()).is_err());
+        let c = Cli::try_parse_from([
+            "x",
+            "run",
+            "--ak-url",
+            "http://ak",
+            "--token-file",
+            "-",
+            "--once",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.command,
+            Command::Run {
+                token_file: Some(_),
+                token: None,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "x",
+            "run",
+            "--ak-url",
+            "http://ak",
+            "--token",
+            "t",
+            "--token-file",
+            "-",
+        ])
+        .is_err());
+    }
+
+    /// The worker makes itself non-dumpable, so its environment and memory
+    /// are not readable by other processes of its user.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_is_not_dumpable() {
+        harden_process();
+        // SAFETY: prctl(PR_GET_DUMPABLE) takes no pointers.
+        assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+        let me = std::fs::metadata("/proc/self/environ").unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(me.uid(), 0, "/proc/self/environ is root-owned");
     }
 }

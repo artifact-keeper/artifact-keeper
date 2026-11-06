@@ -29,6 +29,24 @@ rescan that clears the findings, an acknowledgement (see
 policy or finding. A Maven checksum (`.sha1`, `.md5`, `.sha256`, `.sha512`)
 of a refused artifact answers `404`.
 
+## Turning on the upload-time quarantine period
+
+A repository's quarantine period is set with `quarantine_enabled` and
+`quarantine_duration_minutes` (minutes, non-negative). Both
+`POST /api/v1/repositories` and `PATCH /api/v1/repositories/{key}` accept
+them, so a repository created with `quarantine_enabled: true` holds its very
+first upload; the create response, like `GET`, reports the stored values.
+Enabling it on a Virtual repository is refused with `400` on both: a virtual
+has no content of its own, so set it on the member repositories. Before the
+fix for #5324, create accepted the two fields and stored neither, leaving the
+repository unheld until a `PATCH`.
+
+Create also refuses (`400`, naming the field) the update-only settings it
+does not apply, rather than ignoring them: a non-empty
+`release_repository_key`, `curation_enabled: true`, and any
+`curation_default_action` other than `allow`. Set those with `PATCH` after
+creating the repository.
+
 ## Where a hold came from
 
 `artifacts.quarantine_source` (migration 299) records the origin of a hosted

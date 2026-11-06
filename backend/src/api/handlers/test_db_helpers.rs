@@ -296,7 +296,7 @@ pub async fn token_policy_serial_lock() -> TokenPolicySerialGuard {
 const HIDDEN_NAV_ITEMS_TEST_LOCK_KEY: i64 = 0x4e56_4574; // "NV" + issue #4574
 
 /// Cross-process serialization guard for the DB-backed tests that write the
-/// `ui.hidden_nav_items` row (#4574). It is ONE row in `system_settings`
+/// `ui.hidden_nav_items` row (#4574), or that compare it across reads (#5431). It is ONE row in `system_settings`
 /// shared by the whole database, so two tests writing it under `cargo
 /// nextest` process-per-test parallelism would read each other's values.
 /// Mirrors [`token_policy_serial_lock`].
@@ -680,6 +680,7 @@ fn cfg(storage_path: &str) -> Config {
         sso_disable_admin_break_glass: false,
         oidc_silent_sso_enabled: true,
         device_auth: Default::default(),
+        proxy_upstream: Default::default(),
         totp_policy: None,
         api_token_expiry_policy: None,
         max_upload_size_bytes: 10_737_418_240,
@@ -746,6 +747,7 @@ fn cfg(storage_path: &str) -> Config {
         proxy_singleflight_lock_wait_timeout_secs: 65,
         proxy_stale_if_error_grace_secs:
             crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+        audit_upstream_fetches: Default::default(),
         oci_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         npm_virtual_negative_cache_ttl_ms: crate::config::DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
         oci_virtual_negative_cache_max_entries:
@@ -768,6 +770,7 @@ fn cfg(storage_path: &str) -> Config {
         npm_attestation_negative_cache_enabled: true,
         npm_attestation_negative_cache_ttl_secs: 86_400,
         npm_upstream_feed_enabled: false,
+        upstream_jobs_paused: false,
         npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
             .into(),
         scan_token_ttl_seconds: 300,
@@ -1561,6 +1564,135 @@ pub async fn wait_for_cache_commit(dir: &std::path::Path, min_size: u64) {
 pub async fn drop_mock_server(server: wiremock::MockServer) {
     tokio::task::yield_now().await;
     drop(server);
+}
+
+/// #5322: mount a counting upstream for `path` on `server`. A `HEAD` is
+/// answered with `headers` and a `Content-Length` of `body` (no body), a `GET`
+/// with `headers` and `body`. Each mock expects exactly ONE request, verified
+/// when `server` is dropped, so a test that sends a HEAD and two GETs proves
+/// the body left the upstream once and the HEAD was answered by a HEAD.
+pub async fn mount_head_and_get_once(
+    server: &wiremock::MockServer,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) {
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mut head =
+        ResponseTemplate::new(200).insert_header("content-length", body.len().to_string().as_str());
+    let mut get = ResponseTemplate::new(200).set_body_bytes(body.to_vec());
+    for (name, value) in headers {
+        head = head.insert_header(*name, *value);
+        get = get.insert_header(*name, *value);
+    }
+    Mock::given(method("HEAD"))
+        .and(wm_path(path))
+        .respond_with(head)
+        .expect(1)
+        .named("upstream HEAD")
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path(path))
+        .respond_with(get)
+        .expect(1)
+        .named("upstream GET of the body")
+        .mount(server)
+        .await;
+}
+
+/// #5322: the `hf_hub_download` request shape against a cold Remote: `HEAD
+/// uri`, then `GET uri`, then (once the proxy cache has committed the body)
+/// `GET uri` again. Returns the three `(status, body, headers)` answers.
+/// `app` builds a fresh router per request, as `oneshot` consumes it.
+pub async fn cold_head_then_two_gets(
+    app: impl Fn() -> Router,
+    uri: &str,
+    cache_dir: &std::path::Path,
+    body_len: u64,
+) -> [(StatusCode, Bytes, axum::http::HeaderMap); 3] {
+    let head_answer = send_with_headers(app(), head(uri.to_string())).await;
+    let cold_get = send_with_headers(app(), get(uri.to_string())).await;
+    wait_for_cache_commit(cache_dir, body_len).await;
+    let warm_get = send_with_headers(app(), get(uri.to_string())).await;
+    [head_answer, cold_get, warm_get]
+}
+
+/// #5343: the cold-`HEAD` contract for a format handler that streams a Remote
+/// download itself rather than through `try_remote_or_virtual_download`.
+///
+/// `server` must already carry the format's own upstream documents (an index,
+/// a packument, a checksum sidecar: whatever the handler resolves first),
+/// unconstrained. This mounts the counting pair for `upstream_path` (one
+/// `HEAD`, one body `GET`, see [`mount_head_and_get_once`]), points the
+/// fixture's Remote at `server`, and sends `HEAD uri`, `GET uri` and, once the
+/// cache has committed, `GET uri` again through `router` (with the fixture
+/// user's auth when `with_auth`).
+///
+/// Asserts the HEAD is a 200 with no body that advertises the GET's
+/// `Content-Length`, that both GETs serve `body`, and (the claim under test)
+/// that the upstream saw exactly one `HEAD` and one `GET` of the body.
+/// Returns the HEAD's headers for the format's own header assertions.
+#[allow(clippy::too_many_arguments)]
+pub async fn assert_cold_head_fetches_body_once(
+    fx: Fixture,
+    server: wiremock::MockServer,
+    router: fn() -> Router<SharedState>,
+    with_auth: bool,
+    upstream_path: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> axum::http::HeaderMap {
+    mount_head_and_get_once(&server, upstream_path, headers, body).await;
+    let (state, cache) = rewire_remote_proxy(&fx, &server.uri()).await;
+    let auth = make_auth(fx.user_id, &fx.username);
+    let app = || {
+        if with_auth {
+            router_with_auth(router(), state.clone(), auth.clone())
+        } else {
+            router_anon(router(), state.clone())
+        }
+    };
+    let [head_answer, cold, warm] =
+        cold_head_then_two_gets(app, uri, cache.path(), body.len() as u64).await;
+    fx.teardown().await;
+
+    assert_eq!(head_answer.0, StatusCode::OK, "HEAD {uri}");
+    assert!(head_answer.1.is_empty(), "HEAD {uri} must have no body");
+    let size = body.len().to_string();
+    assert_eq!(
+        head_answer
+            .2
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(size.as_str()),
+        "HEAD {uri} must advertise the GET's Content-Length"
+    );
+    for (which, answer) in [("cold", &cold), ("warm", &warm)] {
+        assert_eq!(answer.0, StatusCode::OK, "{which} GET {uri}");
+        assert!(answer.1[..] == body[..], "{which} GET {uri} body");
+    }
+    // The upstream request log, for a readable failure: before #5343 a cold
+    // HEAD opened a body GET whose dropped stream cached nothing, so the
+    // upstream saw no HEAD and two GETs of the body.
+    let seen: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == upstream_path)
+        .map(|r| r.method.to_string())
+        .collect();
+    assert_eq!(
+        seen,
+        ["HEAD", "GET"],
+        "cold HEAD then GET of {uri} must reach the upstream as one HEAD and one body GET"
+    );
+    drop_mock_server(server).await;
+    head_answer.2
 }
 
 /// Floor for "this proxy-cache entry was written as IMMUTABLE".

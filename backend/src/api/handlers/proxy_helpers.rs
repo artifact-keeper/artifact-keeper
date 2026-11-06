@@ -796,7 +796,10 @@ fn map_proxy_error_classified(
             let mut response =
                 (StatusCode::BAD_GATEWAY, "Failed to fetch from upstream").into_response();
             if let Some(status) = crate::services::proxy_service::upstream_refusal_status(&e) {
-                response.extensions_mut().insert(UpstreamRefusal(status));
+                let hub_code = crate::services::proxy_service::upstream_hub_error_code(&e);
+                response
+                    .extensions_mut()
+                    .insert(UpstreamRefusal(status, hub_code));
             }
             response
         }
@@ -821,13 +824,24 @@ pub(crate) fn is_upstream_auth_failure(response: &Response) -> bool {
 /// "Failed to fetch from upstream" 502, so a format handler that knows the
 /// resource is OPTIONAL (a compressed conda repodata candidate, a `.sig`) can
 /// no longer tell an absent key from a real failure. This extension preserves
-/// only the status classification, never the upstream URL or body.
+/// only the status classification, never the upstream URL or body, plus the
+/// Hugging Face Hub's `X-Error-Code` when it named a known one (#5323).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UpstreamRefusal(pub(crate) StatusCode);
+pub(crate) struct UpstreamRefusal(pub(crate) StatusCode, pub(crate) Option<&'static str>);
 
 /// The upstream `401`/`403` behind a proxy error `Response`, if any.
 pub(crate) fn upstream_refusal_status(response: &Response) -> Option<StatusCode> {
     response.extensions().get::<UpstreamRefusal>().map(|r| r.0)
+}
+
+/// The Hub's `X-Error-Code` (one of
+/// [`crate::services::proxy_service::HUB_ERROR_CODES`]) behind an upstream
+/// `401`/`403` proxy error `Response`, if it sent one (#5323).
+pub(crate) fn upstream_hub_error_code(response: &Response) -> Option<&'static str> {
+    response
+        .extensions()
+        .get::<UpstreamRefusal>()
+        .and_then(|r| r.1)
 }
 
 /// Shared scaffolding for the trivial `proxy_fetch*` wrappers.
@@ -1483,6 +1497,16 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept_budgeted(
 /// specific defaults inside each handler; this parameter preserves that
 /// behaviour without requiring callers to construct the response builder
 /// themselves.
+///
+/// `is_head` (#5343): the caller is answering a client `HEAD` (axum runs a
+/// `get(..)` route's handler for it and drops the body unread). It is then
+/// answered by [`ProxyService::head_artifact_streaming`]: a cache hit as
+/// before, a miss from an upstream `HEAD` rather than a body download that
+/// would cache nothing and make the following GET download the object again.
+/// Pass the request's own [`DownloadContext::is_head`], never a flag for a
+/// caller that reads the body itself.
+///
+/// [`DownloadContext::is_head`]: crate::api::middleware::download_telemetry::DownloadContext::is_head
 pub async fn proxy_fetch_streaming(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1490,6 +1514,7 @@ pub async fn proxy_fetch_streaming(
     upstream_url: &str,
     path: &str,
     default_content_type: &str,
+    is_head: bool,
 ) -> Result<Response, Response> {
     proxy_fetch_streaming_with_disposition(
         proxy_service,
@@ -1499,6 +1524,7 @@ pub async fn proxy_fetch_streaming(
         path,
         default_content_type,
         None,
+        is_head,
     )
     .await
 }
@@ -1524,6 +1550,9 @@ pub async fn proxy_fetch_streaming(
 /// metadata documents that classify mutable under every arm.
 ///
 /// Same class as #2312/#3206, which fixed it for the OCI blob/manifest arms.
+///
+/// `is_head`: as for [`proxy_fetch_streaming`] (#5343).
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_with_format(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1532,19 +1561,20 @@ pub async fn proxy_fetch_streaming_with_format(
     path: &str,
     default_content_type: &str,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<Response, Response> {
-    let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    let result = proxy_service
-        .fetch_artifact_streaming(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))?;
-    build_streaming_response_with_disposition(result, default_content_type, None).map_err(|e| {
-        map_proxy_error(
-            repo_key,
-            path,
-            crate::error::AppError::Internal(e.to_string()),
-        )
-    })
+    proxy_fetch_streaming_with_disposition_and_format(
+        proxy_service,
+        repo_id,
+        repo_key,
+        upstream_url,
+        path,
+        default_content_type,
+        None,
+        format,
+        is_head,
+    )
+    .await
 }
 
 /// Streaming sibling of [`proxy_fetch`] that also forwards a
@@ -1556,6 +1586,9 @@ pub async fn proxy_fetch_streaming_with_format(
 /// so format handlers that previously buffered via `proxy_fetch` +
 /// `build_download_response` keep the attachment filename on the
 /// streaming code path (#1215).
+///
+/// `is_head`: as for [`proxy_fetch_streaming`] (#5343).
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_with_disposition(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -1564,6 +1597,7 @@ pub async fn proxy_fetch_streaming_with_disposition(
     path: &str,
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
+    is_head: bool,
 ) -> Result<Response, Response> {
     proxy_fetch_streaming_with_disposition_and_format(
         proxy_service,
@@ -1574,6 +1608,7 @@ pub async fn proxy_fetch_streaming_with_disposition(
         default_content_type,
         content_disposition_filename,
         RepositoryFormat::Generic,
+        is_head,
     )
     .await
 }
@@ -1592,6 +1627,13 @@ pub async fn proxy_fetch_streaming_with_disposition(
 /// The same asymmetry warning as [`proxy_fetch_capped_with_format`] applies:
 /// pass a real format only where `path` is the format-relative coordinate the
 /// classifier's rules assume.
+///
+/// `is_head` (#5322, #5343): a client HEAD is answered by
+/// [`ProxyService::head_artifact_streaming`], which answers a cache miss from
+/// an upstream `HEAD` instead of starting a body download the HEAD response
+/// would drop, with the same response headers. That future is boxed, so the
+/// handler futures that reach here (they sit at the compiler's layout
+/// query-depth limit) gain no state-machine level.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_with_disposition_and_format(
     proxy_service: &ProxyService,
@@ -1602,12 +1644,36 @@ pub async fn proxy_fetch_streaming_with_disposition_and_format(
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<Response, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    let result = proxy_service
-        .fetch_artifact_streaming(&repo, path)
-        .await
-        .map_err(|e| map_proxy_error(repo_key, path, e))?;
+    let fetched = if is_head {
+        proxy_service.head_artifact_streaming(&repo, path).await
+    } else {
+        proxy_service.fetch_artifact_streaming(&repo, path).await
+    };
+    streaming_fetch_response(
+        fetched,
+        repo_key,
+        path,
+        default_content_type,
+        content_disposition_filename,
+    )
+}
+
+/// Map a streaming fetch outcome to the [`Response`] the streaming helpers
+/// answer: the result through [`build_streaming_response_with_disposition`],
+/// a fetch error (or the rare malformed-header error) through
+/// [`map_proxy_error`]. A plain `fn`, so callers gain no future layer.
+#[allow(clippy::result_large_err)]
+fn streaming_fetch_response(
+    fetched: crate::error::Result<crate::services::proxy_service::StreamingFetchResult>,
+    repo_key: &str,
+    path: &str,
+    default_content_type: &str,
+    content_disposition_filename: Option<&str>,
+) -> Result<Response, Response> {
+    let result = fetched.map_err(|e| map_proxy_error(repo_key, path, e))?;
     build_streaming_response_with_disposition(
         result,
         default_content_type,
@@ -1629,29 +1695,31 @@ pub async fn proxy_fetch_streaming_with_disposition_and_format(
 /// [`Response`] exactly as [`proxy_fetch_streaming_with_disposition`] does, so
 /// the streaming virtual-download path can detect a quarantine block via
 /// [`is_member_policy_block_response`].
+///
+/// `is_head` (#5322): a client HEAD is answered by
+/// [`ProxyService::head_artifact_streaming`], so a member's cache miss sends a
+/// `HEAD` upstream instead of a body download the HEAD response would drop.
+/// That future is boxed, so this function's layout grows by a pointer only.
 async fn proxy_fetch_streaming_member(
     proxy_service: &ProxyService,
     member: &Repository,
     path: &str,
     default_content_type: &str,
     content_disposition_filename: Option<&str>,
+    is_head: bool,
 ) -> Result<Response, Response> {
-    let result = proxy_service
-        .fetch_artifact_streaming(member, path)
-        .await
-        .map_err(|e| map_proxy_error(&member.key, path, e))?;
-    build_streaming_response_with_disposition(
-        result,
+    let fetched = if is_head {
+        proxy_service.head_artifact_streaming(member, path).await
+    } else {
+        proxy_service.fetch_artifact_streaming(member, path).await
+    };
+    streaming_fetch_response(
+        fetched,
+        &member.key,
+        path,
         default_content_type,
         content_disposition_filename,
     )
-    .map_err(|e| {
-        map_proxy_error(
-            &member.key,
-            path,
-            crate::error::AppError::Internal(e.to_string()),
-        )
-    })
 }
 
 /// #1555 presigned-redirect fast path for a single virtual member: when the
@@ -1684,7 +1752,10 @@ async fn try_member_cache_redirect(
     // running the GET handler. Declining routes the HEAD onto the streaming
     // cache probe, which answers with the cached entry's real
     // `Content-Type`/`Content-Length`; a HEAD response's body is dropped
-    // unpolled, so no bytes are transferred.
+    // unpolled, so no bytes are transferred. That holds for a cached entry
+    // only: on a miss the dropped body was an upstream download that cached
+    // nothing, which is why a HEAD's member fetch goes through
+    // `ProxyService::head_artifact_streaming` instead (#5322).
     if ctx.is_head {
         return None;
     }
@@ -2558,6 +2629,10 @@ pub async fn proxy_fetch_capped_with_cache_key_and_accept_encoded(
 /// artifact path). Fetches `fetch_path` from the upstream but keys the proxy
 /// cache on `cache_path`, returning the body as a [`StreamingFetchResult`]
 /// that the caller tees to the client without buffering.
+///
+/// `is_head`: as for [`proxy_fetch_streaming`] (#5343). The HEAD answer of a
+/// cache miss carries an empty body and the upstream `HEAD`'s headers.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_with_cache_key(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -2566,6 +2641,7 @@ pub async fn proxy_fetch_streaming_with_cache_key(
     fetch_path: &str,
     cache_path: &str,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     proxy_fetch_streaming_with_cache_key_verified(
         proxy_service,
@@ -2576,6 +2652,7 @@ pub async fn proxy_fetch_streaming_with_cache_key(
         cache_path,
         None,
         format,
+        is_head,
     )
     .await
 }
@@ -2586,6 +2663,10 @@ pub async fn proxy_fetch_streaming_with_cache_key(
 /// is served to the client but NOT persisted, so a digest-addressed upstream
 /// answering with wrong bytes cannot poison the cache. The OCI virtual-repo
 /// blob fallback passes the requested blob digest here.
+///
+/// `is_head`: as for [`proxy_fetch_streaming`] (#5343), through
+/// [`ProxyService::head_artifact_streaming_with_cache_path`] with the same
+/// paths and digest.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_with_cache_key_verified(
     proxy_service: &ProxyService,
@@ -2596,17 +2677,27 @@ pub async fn proxy_fetch_streaming_with_cache_key_verified(
     cache_path: &str,
     expected_checksum: Option<String>,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<crate::services::proxy_service::StreamingFetchResult, Response> {
     let repo = build_remote_repo_with_format(repo_id, repo_key, upstream_url, format);
-    proxy_service
-        .fetch_artifact_streaming_with_cache_path_gated(
-            &repo,
-            fetch_path,
-            cache_path,
-            expected_checksum,
-        )
-        .await
-        .map_err(|e| map_proxy_error(repo_key, fetch_path, e))
+    let fetched = if is_head {
+        use crate::services::proxy_service::{CacheCommitDigest, ExpectedCommitDigest};
+        let expected = expected_checksum
+            .map(|hex| ExpectedCommitDigest::Resolved(CacheCommitDigest::Sha256Hex(hex)));
+        proxy_service
+            .head_artifact_streaming_with_cache_path(&repo, fetch_path, cache_path, expected)
+            .await
+    } else {
+        proxy_service
+            .fetch_artifact_streaming_with_cache_path_gated(
+                &repo,
+                fetch_path,
+                cache_path,
+                expected_checksum,
+            )
+            .await
+    };
+    fetched.map_err(|e| map_proxy_error(repo_key, fetch_path, e))
 }
 
 /// Response-producing sibling of [`proxy_fetch_streaming_with_cache_key`]:
@@ -2617,6 +2708,8 @@ pub async fn proxy_fetch_streaming_with_cache_key_verified(
 /// OpenTofu network-mirror archive downloads, where the registry-provided
 /// `download_url` is an absolute URL and `https://` trips the cache path's
 /// empty-segment guard — use this instead of `proxy_fetch_streaming` (#1998).
+///
+/// `is_head`: as for [`proxy_fetch_streaming`] (#5343).
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_fetch_streaming_response_with_cache_key(
     proxy_service: &ProxyService,
@@ -2627,6 +2720,7 @@ pub async fn proxy_fetch_streaming_response_with_cache_key(
     cache_path: &str,
     default_content_type: &str,
     format: RepositoryFormat,
+    is_head: bool,
 ) -> Result<Response, Response> {
     let result = proxy_fetch_streaming_with_cache_key(
         proxy_service,
@@ -2636,6 +2730,7 @@ pub async fn proxy_fetch_streaming_response_with_cache_key(
         fetch_path,
         cache_path,
         format,
+        is_head,
     )
     .await?;
 
@@ -3875,6 +3970,7 @@ where
                             path,
                             default_content_type,
                             content_disposition_filename,
+                            ctx.is_head,
                         )
                         .await,
                     )
@@ -4783,6 +4879,9 @@ const VIRTUAL_MEMBER_EDGES_SQL: &str = r#"
 pub(crate) struct ExpandedMember {
     pub repo: Repository,
     pub priority_path: Vec<i32>,
+    /// The nested virtual repositories on that same path, outermost first
+    /// (the root itself excluded): empty for a direct member.
+    pub via: Vec<Uuid>,
 }
 
 /// Result of recursively expanding a virtual repository's membership; see
@@ -4860,7 +4959,7 @@ pub(crate) async fn expand_virtual_members(
     // sibling virtual's subtree. Each event carries the priority path from
     // the root to the node it names.
     enum Event {
-        Enter(Uuid, usize, Vec<i32>),
+        Enter(Uuid, usize, Vec<i32>, Vec<Uuid>),
         // Boxed: `Repository` is ~300 bytes against `Enter`'s 24, and the
         // enum would size every event to the largest variant.
         Emit(Box<ExpandedMember>),
@@ -4876,7 +4975,7 @@ pub(crate) async fn expand_virtual_members(
         std::collections::HashSet::from([virtual_repo_id]);
     let mut cycle_edge_skipped = false;
     let mut depth_limit_reached = false;
-    let mut stack = vec![Event::Enter(virtual_repo_id, 0, Vec::new())];
+    let mut stack = vec![Event::Enter(virtual_repo_id, 0, Vec::new(), Vec::new())];
 
     while let Some(event) = stack.pop() {
         match event {
@@ -4888,7 +4987,7 @@ pub(crate) async fn expand_virtual_members(
                     members.push(*child);
                 }
             }
-            Event::Enter(id, depth, path) => {
+            Event::Enter(id, depth, path, via) => {
                 // The depth cap is applied BEFORE the node is marked expanded:
                 // a virtual first reached too deep (down the long side of a
                 // diamond) must still expand when a later, shallower path
@@ -4919,13 +5018,16 @@ pub(crate) async fn expand_virtual_members(
                     child_path.extend_from_slice(&path);
                     child_path.push(*priority);
                     if child.repo_type == RepositoryType::Virtual {
-                        stack.push(Event::Enter(child.id, depth + 1, child_path));
+                        let mut child_via = via.clone();
+                        child_via.push(child.id);
+                        stack.push(Event::Enter(child.id, depth + 1, child_path, child_via));
                     } else if depth + 1 > MAX_DEPTH {
                         depth_limit_reached = true;
                     } else {
                         stack.push(Event::Emit(Box::new(ExpandedMember {
                             repo: child.clone(),
                             priority_path: child_path,
+                            via: via.clone(),
                         })));
                     }
                 }
@@ -7336,6 +7438,24 @@ pub(crate) async fn record_proxy_download_via_deferred(
     });
 }
 
+/// The format the Remote arm of [`try_remote_or_virtual_download`] hands the
+/// cache classifier (#5283).
+///
+/// The arm used to synthesize a `Generic` repository for every caller, so a
+/// format with a classifier arm never reached it: a Hugging Face file
+/// fetched by commit sha (`{id}/resolve/<sha>/...`, immutable) was
+/// revalidated against the Hub every five minutes. A format is listed here
+/// only once its `upstream_path` is known to be the coordinate its
+/// classifier arm was written against (see [`proxy_fetch_capped_with_format`]
+/// for why the wrong direction is dangerous); every other caller keeps
+/// `Generic` and its existing caching.
+pub(crate) fn remote_download_classifier_format(format: &str) -> RepositoryFormat {
+    match format {
+        "huggingface" => RepositoryFormat::Huggingface,
+        _ => RepositoryFormat::Generic,
+    }
+}
+
 /// `auth` is the CALLER (#3178). Only the Virtual arm consults it, to narrow
 /// the member set to what this caller may read; the Remote arm is the URL repo
 /// itself, already authorized by `repo_visibility_middleware`.
@@ -7359,7 +7479,13 @@ pub async fn try_remote_or_virtual_download(
         // last large-body caller for rpm / rubygems / puppet / hex /
         // huggingface / cran / ansible downloads; routing through
         // `proxy_helpers::proxy_fetch_streaming(` removes that buffering.
-        let response = proxy_fetch_streaming_with_disposition(
+        //
+        // #5322: a HEAD (axum runs this GET handler for it) is answered from an
+        // upstream HEAD on a cache miss, so it no longer downloads the whole
+        // body only to drop it unread, which cached nothing and made the GET
+        // that follows download the object a second time. Keep both arms on
+        // the same synthesized repository format (#5283).
+        let response = proxy_fetch_streaming_with_disposition_and_format(
             proxy,
             repo.id,
             &repo.key,
@@ -7367,6 +7493,8 @@ pub async fn try_remote_or_virtual_download(
             opts.upstream_path,
             opts.default_content_type,
             opts.content_disposition_filename,
+            remote_download_classifier_format(&repo.format),
+            ctx.is_head,
         )
         .await?;
         // #2270/#2260: count the proxy serve now that the catalog gives the
@@ -11098,6 +11226,15 @@ pub(crate) struct ScannedProxyRequest<'a> {
     pub severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
     /// `None` skips download recording (a caller with no telemetry context).
     pub ctx: Option<&'a crate::api::middleware::download_telemetry::DownloadContext>,
+}
+
+impl ScannedProxyRequest<'_> {
+    /// Whether the client sent `HEAD` (#5343), for a fall-back stream that
+    /// must answer a cold `HEAD` without downloading the body. `false` without
+    /// a telemetry context.
+    pub(crate) fn is_head(&self) -> bool {
+        self.ctx.is_some_and(|ctx| ctx.is_head)
+    }
 }
 
 /// The buffered bytes that passed the gate, with what the upstream declared
@@ -18085,6 +18222,7 @@ mod tests {
                 sso_disable_admin_break_glass: false,
                 oidc_silent_sso_enabled: true,
                 device_auth: Default::default(),
+                proxy_upstream: Default::default(),
                 totp_policy: None,
                 api_token_expiry_policy: None,
                 max_upload_size_bytes: 10_737_418_240,
@@ -18151,6 +18289,7 @@ mod tests {
                 proxy_singleflight_lock_wait_timeout_secs: 65,
                 proxy_stale_if_error_grace_secs:
                     crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+                audit_upstream_fetches: Default::default(),
                 oci_virtual_negative_cache_ttl_ms:
                     crate::config::DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
                 npm_virtual_negative_cache_ttl_ms:
@@ -18175,6 +18314,7 @@ mod tests {
                 npm_attestation_negative_cache_enabled: true,
                 npm_attestation_negative_cache_ttl_secs: 86_400,
                 npm_upstream_feed_enabled: false,
+                upstream_jobs_paused: false,
                 npm_upstream_feed_url:
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into(),
                 scan_token_ttl_seconds: 300,
@@ -19730,6 +19870,7 @@ mod tests {
             cache_path,
             "application/zip",
             RepositoryFormat::Terraform,
+            false,
         )
         .await
         .expect("streaming response must succeed for a split fetch/cache path");
@@ -20210,6 +20351,33 @@ mod tests {
         &src[start..start + rel_end]
     }
 
+    /// #5283: only Hugging Face is handed to the classifier with its real
+    /// format, and the Remote arm uses it; every other caller keeps
+    /// `Generic`, so no other format's caching changes.
+    #[test]
+    fn remote_download_classifier_format_threads_only_huggingface() {
+        assert_eq!(
+            remote_download_classifier_format("huggingface"),
+            RepositoryFormat::Huggingface
+        );
+        for other in [
+            "rpm", "rubygems", "puppet", "hex", "cran", "ansible", "bazel", "generic",
+        ] {
+            assert_eq!(
+                remote_download_classifier_format(other),
+                RepositoryFormat::Generic,
+                "{other}"
+            );
+        }
+        let src = include_str!("proxy_helpers.rs");
+        let fn_start = src
+            .find("pub async fn try_remote_or_virtual_download(")
+            .expect("try_remote_or_virtual_download must exist");
+        assert!(
+            item_body(src, fn_start).contains("remote_download_classifier_format(&repo.format)")
+        );
+    }
+
     #[test]
     fn test_try_remote_or_virtual_download_remote_uses_streaming_helper_1215() {
         let src = include_str!("proxy_helpers.rs");
@@ -20220,9 +20388,10 @@ mod tests {
         // in the file cannot satisfy the assertion vacuously.
         let window = item_body(src, fn_start);
         assert!(
-            window.contains("proxy_fetch_streaming_with_disposition("),
+            window.contains("proxy_fetch_streaming_with_disposition_and_format("),
             "`try_remote_or_virtual_download`'s Remote arm MUST call \
-             `proxy_fetch_streaming_with_disposition(` (#1215). A revert \
+             `proxy_fetch_streaming_with_disposition_and_format(` (#1215, \
+             #5283: the format-carrying sibling). A revert \
              to `proxy_fetch(` would re-introduce the OOM regression \
              closed by #895/#1215 across rpm/rubygems/puppet/hex/\
              huggingface/cran/ansible."

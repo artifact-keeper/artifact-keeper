@@ -218,7 +218,7 @@ pub enum Actor {
 
 /// One write-side MCP audit row (fire-and-forget): `MCP_SERVER_PUBLISHED`,
 /// `MCP_SERVER_STATUS_CHANGED`, `MCP_SERVER_EDITED`, `MCP_SERVER_DELETED`,
-/// `MCP_BUNDLE_SIGNATURE_REJECTED`. `details` gains `repository`, `server`
+/// `MCP_SERVER_PURGED`, `MCP_BUNDLE_SIGNATURE_REJECTED`. `details` gains `repository`, `server`
 /// and `version`.
 #[allow(clippy::too_many_arguments)]
 pub fn audit(

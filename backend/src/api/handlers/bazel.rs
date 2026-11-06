@@ -498,6 +498,7 @@ async fn proxy_remote(
         content_type_for(&rel),
         None,
         RepositoryFormat::Bazel,
+        ctx.is_head,
     )
     .await?;
     if matches!(request, BazelRequest::ModuleFile { .. }) {

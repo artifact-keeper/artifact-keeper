@@ -581,6 +581,127 @@ impl DeviceAuthConfig {
     }
 }
 
+/// How a Remote repository's upstream fetches are bounded (#5220).
+///
+/// The connect and read timeouts apply to every upstream request the proxy
+/// makes, streamed or buffered.
+///
+/// A cold buffered fetch runs on its own task, so a client that gives up does
+/// not cancel it: its retry joins the fill or reads the filled cache. Nothing
+/// else ends such a fill, so it carries its own bounds:
+///
+/// * The fetch deadline bounds the upstream fetch from the first byte sent to
+///   the last byte read. The read timeout restarts on every chunk, so without
+///   it an upstream that trickles bytes, or a connection that stalled after
+///   its headers, holds the fill for as long as the socket stays open. A
+///   fetch that hits the deadline is a transient failure, so stale-if-error
+///   still applies. The trade-off: a buffered object that cannot be fetched
+///   within the deadline (128 MiB at under ~220 KB/s with the 600-second
+///   default) is never cached, where an unbounded fetch would eventually
+///   finish. Raise it for slow upstreams with large buffered objects.
+/// * The cache write and bookkeeping after the fetch get a fixed extra
+///   allowance; past it the fill is abandoned, so a stalled storage or
+///   database write cannot hold the single-flight slot (and the cross-replica
+///   lock) forever.
+/// * At most `max_detached_fills` fills run detached at once. Past that, a
+///   fill runs in the request as before and ends if its client goes away, so
+///   clients that open many cold paths and disconnect cannot pile up buffered
+///   bodies and lock connections.
+///
+/// A streamed download is not bounded by the deadline, because its length is
+/// not bounded either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxyUpstreamSettings {
+    /// TCP and TLS connect timeout, in seconds. Env:
+    /// `PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS`, clamped to 1..=300. Default 10.
+    pub connect_secs: u64,
+    /// Longest wait for the response headers or for the next body chunk, in
+    /// seconds. Env: `PROXY_UPSTREAM_READ_TIMEOUT_SECS`, clamped to 1..=3600.
+    /// Default 60.
+    pub read_secs: u64,
+    /// Deadline of one buffered upstream fetch, in seconds. Env:
+    /// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, clamped to 1..=86400. Default
+    /// 600.
+    pub fetch_deadline_secs: u64,
+    /// Most buffered fills allowed to run detached from their request at once.
+    /// Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to 0..=1024. Default
+    /// 16. Zero keeps every fill in its request.
+    pub max_detached_fills: usize,
+}
+
+impl Default for ProxyUpstreamSettings {
+    fn default() -> Self {
+        Self {
+            connect_secs: 10,
+            read_secs: 60,
+            fetch_deadline_secs: 600,
+            max_detached_fills: 16,
+        }
+    }
+}
+
+impl ProxyUpstreamSettings {
+    fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            connect_secs: env_parse("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", d.connect_secs)
+                .clamp(1, 300),
+            read_secs: env_parse("PROXY_UPSTREAM_READ_TIMEOUT_SECS", d.read_secs).clamp(1, 3600),
+            fetch_deadline_secs: env_parse(
+                "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+                d.fetch_deadline_secs,
+            )
+            .clamp(1, 86_400),
+            max_detached_fills: env_parse(
+                "PROXY_UPSTREAM_MAX_DETACHED_FILLS",
+                d.max_detached_fills,
+            )
+            .clamp(0, 1024),
+        }
+    }
+
+    /// The connect timeout as a [`std::time::Duration`].
+    pub fn connect(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.connect_secs)
+    }
+
+    /// The read timeout as a [`std::time::Duration`].
+    pub fn read(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.read_secs)
+    }
+
+    /// The buffered fetch deadline as a [`std::time::Duration`].
+    pub fn fetch_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.fetch_deadline_secs)
+    }
+}
+
+/// Which upstream requests write an `UPSTREAM_FETCHED` audit row (#5286).
+/// Env `AUDIT_UPSTREAM_FETCHES`: `off` (the default), `errors` (failed
+/// requests only: `not_found`, `error`, `timeout`) or `all` (every request,
+/// what an air-gapped deployment sets to inventory its seed window). An
+/// unrecognised value falls back to `off`, like the other knobs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UpstreamFetchAuditMode {
+    #[default]
+    Off,
+    Errors,
+    All,
+}
+
+impl std::str::FromStr for UpstreamFetchAuditMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, ()> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "errors" => Ok(Self::Errors),
+            "all" => Ok(Self::All),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Clone)]
 pub struct Config {
@@ -1021,6 +1142,10 @@ pub struct Config {
     /// Device Authorization Grant (RFC 8628) settings (#3461). Off unless
     /// `DEVICE_AUTH_ENABLED=true`; see [`DeviceAuthConfig`].
     pub device_auth: DeviceAuthConfig,
+
+    /// Upstream timeouts and detached-fill limits of the proxy (#5220); see
+    /// [`ProxyUpstreamSettings`].
+    pub proxy_upstream: ProxyUpstreamSettings,
 
     /// Optional pin for the system-wide TOTP (2FA) enforcement policy (#2805).
     ///
@@ -1482,6 +1607,12 @@ pub struct Config {
     /// 3600.
     pub proxy_stale_if_error_grace_secs: i64,
 
+    // -- upstream contact audit (#5286) --
+    /// Which upstream requests the proxy records as `UPSTREAM_FETCHED` audit
+    /// rows. Env `AUDIT_UPSTREAM_FETCHES`, default `off`; see
+    /// [`UpstreamFetchAuditMode`].
+    pub audit_upstream_fetches: UpstreamFetchAuditMode,
+
     // -- OCI virtual-resolution negative cache (#1424) --
     /// Freshness window in milliseconds for negative OCI virtual-resolution
     /// cache entries. Env `OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS`, default 5000,
@@ -1608,6 +1739,12 @@ pub struct Config {
     /// Endpoint of the npm replication feed. Env `NPM_UPSTREAM_FEED_URL`,
     /// default `https://replicate.npmjs.com/_changes`.
     pub npm_upstream_feed_url: String,
+
+    /// Pause every scheduled job that contacts an upstream on its own
+    /// (#5288; see `services::upstream_pause`). Env `UPSTREAM_JOBS_PAUSED`,
+    /// default `false`. `true` pins the switch on; otherwise the
+    /// `upstream_jobs_paused` runtime setting decides.
+    pub upstream_jobs_paused: bool,
 }
 
 redacted_debug!(Config {
@@ -1682,6 +1819,7 @@ redacted_debug!(Config {
     show sso_disable_admin_break_glass,
     show oidc_silent_sso_enabled,
     show device_auth,
+    show proxy_upstream,
     show totp_policy,
     show api_token_expiry_policy,
     show metrics_port,
@@ -1741,6 +1879,7 @@ redacted_debug!(Config {
     show proxy_singleflight_lock_poll_interval_ms,
     show proxy_singleflight_lock_wait_timeout_secs,
     show proxy_stale_if_error_grace_secs,
+    show audit_upstream_fetches,
     show oci_virtual_negative_cache_ttl_ms,
     show oci_virtual_negative_cache_max_entries,
     show npm_virtual_negative_cache_ttl_ms,
@@ -1761,6 +1900,7 @@ redacted_debug!(Config {
     show npm_attestation_negative_cache_ttl_secs,
     show npm_upstream_feed_enabled,
     redact npm_upstream_feed_url,
+    show upstream_jobs_paused,
 });
 
 impl Default for Config {
@@ -1843,6 +1983,7 @@ impl Default for Config {
             sso_disable_admin_break_glass: false,
             oidc_silent_sso_enabled: true,
             device_auth: DeviceAuthConfig::default(),
+            proxy_upstream: ProxyUpstreamSettings::default(),
             totp_policy: None,
             api_token_expiry_policy: None,
             metrics_port: None,
@@ -1907,6 +2048,7 @@ impl Default for Config {
             proxy_singleflight_lock_wait_timeout_secs: 65,
             proxy_stale_if_error_grace_secs:
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_SECS,
+            audit_upstream_fetches: UpstreamFetchAuditMode::Off,
             oci_virtual_negative_cache_ttl_ms: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
             oci_virtual_negative_cache_max_entries: DEFAULT_OCI_VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES,
             npm_virtual_negative_cache_ttl_ms: DEFAULT_NPM_VIRTUAL_NEGATIVE_CACHE_TTL_MS,
@@ -1932,6 +2074,7 @@ impl Default for Config {
             npm_upstream_feed_enabled: false,
             npm_upstream_feed_url: crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL
                 .into(),
+            upstream_jobs_paused: false,
         }
     }
 }
@@ -2197,6 +2340,7 @@ impl Config {
                 Ok("false" | "0")
             ),
             device_auth: DeviceAuthConfig::from_env(),
+            proxy_upstream: ProxyUpstreamSettings::from_env(),
             totp_policy: parse_totp_policy_env(
                 env::var(crate::services::totp_policy::TOTP_POLICY_ENV_VAR)
                     .ok()
@@ -2385,6 +2529,10 @@ impl Config {
                 0,
                 crate::services::cache_classifier::STALE_IF_ERROR_GRACE_MAX_SECS,
             ),
+            audit_upstream_fetches: env_parse(
+                "AUDIT_UPSTREAM_FETCHES",
+                UpstreamFetchAuditMode::Off,
+            ),
             // Clamped like the other operator knobs (cf. `blob_gc_sweep_grace_secs`
             // above) so a fat-fingered enormous value can't pin a 404 on a
             // freshly published tag -- the resolver consults this cache ahead of
@@ -2489,6 +2637,10 @@ impl Config {
                 .unwrap_or_else(|| {
                     crate::services::upstream_feed::NPM_REPLICATION_FEED_DEFAULT_URL.into()
                 }),
+            // Off by default; only an explicit `true`/`1` pauses (#5288).
+            upstream_jobs_paused: parse_opt_in_flag(
+                env::var("UPSTREAM_JOBS_PAUSED").ok().as_deref(),
+            ),
         };
 
         config.validate_jwt_secret()?;
@@ -2958,6 +3110,33 @@ mod tests {
             !disabled_config.incus_scanner_enabled,
             "INCUS_SCANNER_ENABLED=false must disable Incus scanner construction"
         );
+    }
+
+    /// #5288: `UPSTREAM_JOBS_PAUSED` is opt-in; only `true`/`1` pauses the
+    /// scheduled upstream jobs, so defaults are unchanged.
+    #[test]
+    fn test_config_upstream_jobs_paused_is_opt_in() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> =
+            ["DATABASE_URL", "JWT_SECRET", "UPSTREAM_JOBS_PAUSED"]
+                .into_iter()
+                .map(|k| (k, env::var(k).ok()))
+                .collect();
+        env::set_var("DATABASE_URL", "postgresql://127.0.0.1:1/testdb");
+        env::set_var("JWT_SECRET", STRONG_SECRET);
+        let mut observed = Vec::new();
+        for value in [None, Some("false"), Some("yes"), Some("TRUE"), Some("1")] {
+            match value {
+                Some(v) => env::set_var("UPSTREAM_JOBS_PAUSED", v),
+                None => env::remove_var("UPSTREAM_JOBS_PAUSED"),
+            }
+            observed.push(Config::from_env().expect("config").upstream_jobs_paused);
+        }
+        for (key, value) in saved {
+            restore_env(key, value);
+        }
+        assert_eq!(observed, vec![false, false, false, true, true]);
+        assert!(!Config::default().upstream_jobs_paused);
     }
 
     #[test]
@@ -4717,6 +4896,62 @@ mod tests {
         assert_eq!(config.max_failed_attempts_per_user, 100);
         assert_eq!(config.max_failed_attempts_per_ip, 1);
         assert_eq!(config.failed_attempt_window_secs, 60);
+
+        for (key, value) in KEYS.iter().zip(saved) {
+            restore_env(key, value);
+        }
+    }
+
+    #[test]
+    fn test_proxy_upstream_settings_defaults_parse_and_clamp() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        const KEYS: &[&str] = &[
+            "PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS",
+            "PROXY_UPSTREAM_READ_TIMEOUT_SECS",
+            "PROXY_UPSTREAM_FETCH_DEADLINE_SECS",
+            "PROXY_UPSTREAM_MAX_DETACHED_FILLS",
+        ];
+        let saved: Vec<Option<String>> = KEYS.iter().map(|k| env::var(k).ok()).collect();
+
+        for key in KEYS {
+            env::remove_var(key);
+        }
+        let defaults = ProxyUpstreamSettings::from_env();
+        assert_eq!(defaults, ProxyUpstreamSettings::default());
+        assert_eq!(defaults.connect(), std::time::Duration::from_secs(10));
+        assert_eq!(defaults.read(), std::time::Duration::from_secs(60));
+        assert_eq!(
+            defaults.fetch_deadline(),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(defaults.max_detached_fills, 16);
+
+        env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "5");
+        env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "30");
+        env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "45");
+        env::set_var("PROXY_UPSTREAM_MAX_DETACHED_FILLS", "0");
+        let set = ProxyUpstreamSettings::from_env();
+        assert_eq!(
+            (
+                set.connect_secs,
+                set.read_secs,
+                set.fetch_deadline_secs,
+                set.max_detached_fills
+            ),
+            (5, 30, 45, 0)
+        );
+
+        // Zero would disable a timeout outright and a huge value would pin a
+        // stalled connection; both are clamped. Garbage keeps the default.
+        env::set_var("PROXY_UPSTREAM_CONNECT_TIMEOUT_SECS", "0");
+        env::set_var("PROXY_UPSTREAM_READ_TIMEOUT_SECS", "999999");
+        env::set_var("PROXY_UPSTREAM_FETCH_DEADLINE_SECS", "soon");
+        env::set_var("PROXY_UPSTREAM_MAX_DETACHED_FILLS", "100000");
+        let clamped = ProxyUpstreamSettings::from_env();
+        assert_eq!(clamped.connect_secs, 1);
+        assert_eq!(clamped.read_secs, 3600);
+        assert_eq!(clamped.fetch_deadline_secs, 600);
+        assert_eq!(clamped.max_detached_fills, 1024);
 
         for (key, value) in KEYS.iter().zip(saved) {
             restore_env(key, value);

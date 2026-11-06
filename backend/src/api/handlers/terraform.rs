@@ -1190,6 +1190,11 @@ fn check_upstream_archive_url(
 }
 
 /// Fetch an upstream module archive through the proxy cache.
+///
+/// Always a body fetch (`is_head = false` below, #5343): both callers read
+/// the archive's first bytes, the sniff to learn its type and `/archive` to
+/// name the type in `Content-Type` and the attachment file name, so an
+/// upstream `HEAD` could not answer either.
 async fn fetch_upstream_module_archive(
     remote: &RemoteModuleUpstream<'_>,
     coords: &ModuleCoords<'_>,
@@ -1204,6 +1209,7 @@ async fn fetch_upstream_module_archive(
         fetch_url,
         &coords.archive_cache_path(),
         RepositoryFormat::Terraform,
+        false,
     )
     .await
 }
@@ -1957,6 +1963,7 @@ async fn download_provider(
                         upstream_url,
                         &upstream_path,
                         "application/octet-stream",
+                        ctx.is_head,
                     )
                     .await?;
                     // #3649: count the proxied serve. The streaming helper answers a warm
@@ -3514,6 +3521,7 @@ async fn serve_mirror_archive(
                 cache_path,
                 "application/zip",
                 RepositoryFormat::Terraform,
+                ctx.is_head,
             )
             .await?
         }

@@ -54,6 +54,7 @@ use crate::services::mcp_curation::{
 };
 use crate::services::mcp_packages::{self, BackingRepo, McpSettings};
 use crate::services::mcp_settings::{self, McpRepoSettings};
+use crate::services::upstream_pause::{self, UpstreamPauseGate};
 
 /// Advisory-lock class of the per-repository sync lock (`ClusterLock`).
 pub const SYNC_LOCK_CLASS: i32 = 0x5253;
@@ -74,6 +75,11 @@ pub const WATERMARK_OVERLAP_SECS: i64 = 600;
 pub const DEFAULT_SYNC_INTERVAL_SECS: i64 = 3600;
 /// How often the scheduler looks for repositories that are due.
 pub const SCHEDULER_TICK_SECS: u64 = 300;
+/// A Remote never synced is not due until it is this old (#5402): its
+/// create stores the settings that govern upstream contact (upstream mode,
+/// egress proxy, `mcp_remote_sync_paused`) right after the row, and a
+/// scheduler tick between the two must not start a pass without them.
+pub const FIRST_SYNC_GRACE_SECS: i64 = 60;
 const SCHEDULER_LEASE: &str = "mcp_remote_sync";
 const SCHEDULER_LEASE_TTL_SECS: f64 = 330.0;
 
@@ -515,6 +521,9 @@ pub enum SyncError {
     /// The first upstream page could not be read.
     Upstream(String),
     Database(String),
+    /// Scheduled upstream jobs are paused on this instance (#5288): a manual
+    /// trigger starts no pass either (#5404).
+    Paused,
 }
 
 impl std::fmt::Display for SyncError {
@@ -525,6 +534,11 @@ impl std::fmt::Display for SyncError {
             SyncError::NoProxy => write!(f, "outbound fetches are not available"),
             SyncError::Upstream(e) => write!(f, "upstream: {e}"),
             SyncError::Database(e) => write!(f, "database: {e}"),
+            SyncError::Paused => write!(
+                f,
+                "scheduled upstream jobs are paused on this instance (upstream_jobs_paused); \
+                 no sync starts until the switch is off"
+            ),
         }
     }
 }
@@ -1540,6 +1554,45 @@ async fn apply_page(
     Ok(())
 }
 
+/// What a targeted fetch of one name found (#5408).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameFetch {
+    /// `mcp_server_deny` matches the name: nothing was fetched or recorded.
+    Denied,
+    /// The upstream's version list of the name was recorded in the catalog
+    /// as a sync page would record it; the versions it lists.
+    Recorded(Vec<String>),
+}
+
+/// Fetch one name's version list (`GET {upstream}/v0.1/servers/{name}/versions`)
+/// through the sync's outbound path (SSRF guard, upstream credentials,
+/// egress proxy, the upstream gate and its cache-only refusal, the
+/// `UPSTREAM_FETCHED` audit) and record it in the catalog exactly as a sync
+/// page carrying those entries would (#5408): a new name row with the
+/// lookalike check and `mcp_auto_approve_namespaces`, the cached summary,
+/// and the ingest of versions that are already approved. A later sync
+/// therefore finds the name known.
+pub async fn record_name_from_upstream(
+    state: &SharedState,
+    repo: &RepoInfo,
+    name: &str,
+) -> Result<NameFetch, String> {
+    let mut run = RunCtx::load(state, repo).await.map_err(|e| e.to_string())?;
+    if run.denied(name) {
+        return Ok(NameFetch::Denied);
+    }
+    let bytes = run.fetch(&versions_path(name)).await?;
+    let mut page = parse_page(&bytes)?;
+    page.entries.retain(|e| e.name == name);
+    page.next_cursor = None;
+    let versions = page.entries.iter().map(|e| e.version.clone()).collect();
+    if !page.entries.is_empty() {
+        let mut summary = SyncSummary::default();
+        apply_page(&mut run, &page, &mut summary).await?;
+    }
+    Ok(NameFetch::Recorded(versions))
+}
+
 /// Move the PENDING name row `target` to review, flagged as a lookalike of
 /// `similar_to`; whether it moved.
 async fn flag_pending_lookalike(
@@ -1812,20 +1865,105 @@ async fn save_state(db: &PgPool, repo_id: Uuid, s: &SyncState, ok: bool) -> Resu
     Ok(())
 }
 
+/// The advisory-lock object id of a repository's sync lock.
+fn lock_object_id(repo_id: Uuid) -> i32 {
+    crate::services::cluster_lock::lease_object_id(&format!("mcp-remote-sync/{repo_id}"))
+}
+
 /// Hold the per-repository sync lock (cluster-wide) for the rest of the run.
 async fn lock_repo(
     db: &PgPool,
     repo_id: Uuid,
 ) -> Result<crate::services::cluster_lock::ClusterLease, SyncError> {
-    use crate::services::cluster_lock::{lease_object_id, ClusterLock, PgAdvisoryLock};
+    use crate::services::cluster_lock::{ClusterLock, PgAdvisoryLock};
     PgAdvisoryLock::new(db.clone())
-        .try_acquire(
-            SYNC_LOCK_CLASS,
-            lease_object_id(&format!("mcp-remote-sync/{repo_id}")),
-        )
+        .try_acquire(SYNC_LOCK_CLASS, lock_object_id(repo_id))
         .await
         .map_err(|e| SyncError::Database(e.to_string()))?
         .ok_or(SyncError::Busy)
+}
+
+/// Whether any replica runs a sync of the repository right now: its sync
+/// lock is held (read from `pg_locks`, so the check never takes the lock and
+/// cannot make a starting pass answer [`SyncError::Busy`]).
+pub async fn sync_running(db: &PgPool, repo_id: Uuid) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+             AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 2 AND granted)",
+    )
+    .bind(i64::from(SYNC_LOCK_CLASS))
+    .bind(i64::from(lock_object_id(repo_id) as u32))
+    .fetch_one(db)
+    .await
+    .map_err(db_err)
+}
+
+/// Record a background pass that ended before it stored its own outcome
+/// (a database error, or the repository changed under it), so its poller
+/// sees it end instead of an unchanged state. An unreadable first page is
+/// already stored by the pass itself.
+async fn record_failure(db: &PgPool, repo_id: Uuid, e: &SyncError) {
+    if matches!(e, SyncError::Upstream(_)) {
+        return;
+    }
+    let stored = sqlx::query(
+        "INSERT INTO mcp_remote_sync_state (repository_id, last_started_at, last_finished_at, last_error) \
+         VALUES ($1, now(), now(), $2) \
+         ON CONFLICT (repository_id) DO UPDATE SET \
+             last_started_at = COALESCE(mcp_remote_sync_state.last_started_at, now()), \
+             last_finished_at = now(), last_error = $2",
+    )
+    .bind(repo_id)
+    .bind(e.to_string())
+    .execute(db)
+    .await;
+    if let Err(err) = stored {
+        tracing::warn!(repository_id = %repo_id, error = %err, "MCP remote sync failure not recorded");
+    }
+}
+
+/// Start a sync of `repo` in the background (the manual trigger, #5404).
+///
+/// Everything that can refuse the run is checked before this returns: no
+/// proxy service, scheduled upstream jobs paused (#5288, the switch the
+/// scheduled pass obeys), not a Remote MCP repository, and the repository's
+/// sync lock, which is taken here ([`SyncError::Busy`] when another run holds
+/// it) and handed to the spawned pass. The pass is the scheduler's
+/// ([`run_locked`]), on a task of its own, so it does not end with the
+/// request that started it; its outcome is the stored [`SyncState`].
+pub async fn start_sync(state: &SharedState, repo: RepoInfo) -> Result<(), SyncError> {
+    if state.proxy_service.is_none() {
+        return Err(SyncError::NoProxy);
+    }
+    if upstream_pause::upstream_jobs_paused(&state.db).await {
+        return Err(SyncError::Paused);
+    }
+    RunCtx::load(state, &repo).await?;
+    let lease = lock_repo(&state.db, repo.id).await?;
+    let state = state.clone();
+    tokio::spawn(async move {
+        let result = match RunCtx::load(&state, &repo).await {
+            Ok(mut run) => run_locked(&mut run).await,
+            Err(e) => Err(e),
+        };
+        lease.release().await;
+        if let Err(e) = &result {
+            record_failure(&state.db, repo.id, e).await;
+        }
+        match result {
+            Ok(s) => tracing::info!(
+                repository = %repo.key,
+                pages = s.pages,
+                ingested = s.ingested,
+                complete = s.complete,
+                "MCP remote manual sync finished"
+            ),
+            Err(e) => {
+                tracing::warn!(repository = %repo.key, error = %e, "MCP remote manual sync failed")
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Run one sync of `repo` (manual trigger or scheduler). Holds the
@@ -1977,21 +2115,27 @@ pub fn sync_interval_secs(raw: Option<&str>) -> i64 {
         .unwrap_or(DEFAULT_SYNC_INTERVAL_SECS)
 }
 
-/// Remote MCP repositories due for a sync: never synced, past the
-/// interval, or with an unfinished pass to resume.
+/// Remote MCP repositories due for a sync: never synced (and older than
+/// [`FIRST_SYNC_GRACE_SECS`]), past the interval, or with an unfinished pass
+/// to resume. A Remote with `mcp_remote_sync_paused` is never due (#5402).
 pub async fn due_repositories(db: &PgPool, interval_secs: i64) -> Result<Vec<String>, String> {
     sqlx::query_scalar(
         "SELECT r.key FROM repositories r \
          LEFT JOIN mcp_remote_sync_state s ON s.repository_id = r.id \
          WHERE r.format = 'mcp' AND r.repo_type = 'remote' AND r.upstream_url IS NOT NULL \
            AND r.key NOT LIKE '~deleting~%' \
-           AND (s.last_started_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM repository_config c WHERE c.repository_id = r.id \
+                           AND c.key = $2 AND c.value = 'true') \
+           AND ((s.last_started_at IS NULL \
+                 AND r.created_at < now() - make_interval(secs => $3)) \
                 OR s.last_started_at < now() - make_interval(secs => $1) \
                 OR (s.resume_cursor IS NOT NULL \
                     AND s.last_started_at < now() - make_interval(secs => 300))) \
          ORDER BY s.last_started_at NULLS FIRST",
     )
     .bind(interval_secs as f64)
+    .bind(mcp_settings::REMOTE_SYNC_PAUSED_KEY)
+    .bind(FIRST_SYNC_GRACE_SECS as f64)
     .fetch_all(db)
     .await
     .map_err(db_err)
@@ -2059,27 +2203,47 @@ pub fn spawn(state: SharedState, shutdown: tokio_util::sync::CancellationToken) 
         }
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_TICK_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // #5288: the instance-wide switch for scheduled upstream jobs. A paused
+        // tick is skipped before the lease; the per-repository cursor is kept,
+        // so the sync resumes from it when the switch goes off.
+        let mut pause = UpstreamPauseGate::new(upstream_pause::MCP_REMOTE_SYNC_JOB);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
             }
-            let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
-                &state.db,
-                SCHEDULER_LEASE,
-                SCHEDULER_LEASE_TTL_SECS,
-            )
-            .await
-            else {
-                continue;
-            };
-            let (renewal, lost) =
-                lease.spawn_renewal_with_cancellation(state.db.clone(), SCHEDULER_LEASE_TTL_SECS);
-            run_due(&state, interval_secs, &lost).await;
-            drop(renewal);
-            lease.release(&state.db).await;
+            scheduler_tick(&state, interval_secs, &mut pause).await;
         }
     });
+}
+
+/// One tick of the scheduled sync: skipped, before the lease and any
+/// network work, while scheduled upstream jobs are paused; otherwise the due
+/// repositories are synced under the scheduler lease. `false` when the tick
+/// was skipped (paused, or another replica holds the lease).
+pub async fn scheduler_tick(
+    state: &SharedState,
+    interval_secs: i64,
+    pause: &mut UpstreamPauseGate,
+) -> bool {
+    if pause.skip_tick(&state.db).await {
+        return false;
+    }
+    let Some(lease) = crate::services::cluster_work::try_acquire_scheduler_lease_quiet(
+        &state.db,
+        SCHEDULER_LEASE,
+        SCHEDULER_LEASE_TTL_SECS,
+    )
+    .await
+    else {
+        return false;
+    };
+    let (renewal, lost) =
+        lease.spawn_renewal_with_cancellation(state.db.clone(), SCHEDULER_LEASE_TTL_SECS);
+    run_due(state, interval_secs, &lost).await;
+    drop(renewal);
+    lease.release(&state.db).await;
+    true
 }
 
 #[cfg(ak_test_shard = "services-1")]
@@ -2561,6 +2725,7 @@ mod tests {
             (SyncError::NoProxy, "outbound"),
             (SyncError::Upstream("x".into()), "upstream"),
             (SyncError::Database("x".into()), "database"),
+            (SyncError::Paused, "paused"),
         ] {
             assert!(e.to_string().contains(needle));
         }

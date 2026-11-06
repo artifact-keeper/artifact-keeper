@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artifactkeeper.com/schemas/config-document.v1.json",
+  "title": "Artifact Keeper config document, schema_version 1",
+  "description": "Repositories and their per-repository settings, as written by GET /api/v1/admin/config/export and read by POST /api/v1/admin/config/import (#5292). See docs/config-as-code.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "exported_at": { "type": "string", "format": "date-time" },
+    "producer": { "type": "string" },
+    "repositories": { "type": "array", "items": { "$ref": "#/$defs/repository" } }
+  },
+  "$defs": {
+    "secret_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secret_ref"],
+      "properties": {
+        "secret_ref": { "type": "string", "pattern": "^(upstream_auth|upstream_url|egress_proxy)/.+$" }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "name", "format", "repo_type", "visibility"],
+      "properties": {
+        "key": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "format": { "type": "string" },
+        "format_key": { "type": "string" },
+        "repo_type": { "enum": ["local", "remote", "virtual", "staging"] },
+        "visibility": { "enum": ["public", "internal", "private"] },
+        "upstream_url": { "type": "string" },
+        "upstream_url_credentials": { "$ref": "#/$defs/secret_ref" },
+        "allow_public_with_upstream_credentials": { "type": "boolean" },
+        "quota_bytes": { "type": "integer" },
+        "promotion_only": { "type": "boolean" },
+        "versioning_enabled": { "type": "boolean" },
+        "custom_user_agent": { "type": "string" },
+        "curation_enabled": { "type": "boolean" },
+        "curation_default_action": { "enum": ["allow", "review"] },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "priority"],
+            "properties": { "key": { "type": "string" }, "priority": { "type": "integer" } }
+          }
+        },
+        "upstream_mode": {
+          "enum": ["online", "cache_only"],
+          "description": "Remote repositories. Absent means online (the default); only cache_only is exported."
+        },
+        "cache_ttl_seconds": { "type": "integer", "minimum": 1 },
+        "on_upstream_not_found": { "enum": ["keep", "delete"] },
+        "stale_if_error_grace_seconds": { "type": "integer", "minimum": 0 },
+        "upstream_filter": {
+          "type": "object",
+          "properties": {
+            "include_patterns": { "type": "array", "items": { "type": "string" } },
+            "exclude_patterns": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "routing_rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path_pattern", "rewrite_to"],
+            "properties": { "path_pattern": { "type": "string" }, "rewrite_to": { "type": "string" } }
+          }
+        },
+        "egress_proxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["direct", "explicit"] },
+            "proxy_url": { "type": "string" },
+            "proxy_credentials": { "$ref": "#/$defs/secret_ref" },
+            "no_proxy": { "type": "string" }
+          }
+        },
+        "upstream_auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["auth_type"],
+          "properties": {
+            "auth_type": { "type": "string" },
+            "username": { "type": "string" },
+            "password": { "$ref": "#/$defs/secret_ref" },
+            "aws": {
+              "type": "object",
+              "required": ["region"],
+              "properties": {
+                "region": { "type": "string" },
+                "registry_id": { "type": "string" },
+                "domain": { "type": "string" },
+                "domain_owner": { "type": "string" },
+                "duration_seconds": { "type": "integer" }
+              }
+            }
+          }
+        },
+        "npm_scope_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_scopes", "allow_unscoped"],
+          "properties": {
+            "allowed_scopes": { "type": "array", "items": { "type": "string" } },
+            "allow_unscoped": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  }
+}

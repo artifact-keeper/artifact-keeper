@@ -260,6 +260,14 @@ pub enum AuditAction {
     /// per minute so a CI loop retrying a blocked pull writes at most two
     /// rows a minute per replica; see [`record_proxy_scan_blocked`].
     ProxyScanBlocked,
+    /// A proxy-cache seed job of a Remote repository finished (#5284): one
+    /// summary row per job with its inventory counts.
+    CacheSeeded,
+    /// The proxy sent a request to an upstream (#5286): one row per request
+    /// actually sent, never for a cache hit. Off unless
+    /// `AUDIT_UPSTREAM_FETCHES` is `errors` or `all`; see
+    /// [`crate::services::upstream_fetch_audit`].
+    UpstreamFetched,
     /// An administrator accepted a finding: a decision about an advisory in a
     /// component of specific bytes (#5153).
     FindingAcknowledged,
@@ -312,10 +320,17 @@ pub enum AuditAction {
     McpServerEdited,
     /// A server version was soft-deleted (DELETE), leaving a tombstone. (#5253).
     McpServerDeleted,
+    /// An administrator purged a deleted server version: its server.json and
+    /// bundles went to the trash, releasing its pins; the tombstone stays. (#5368).
+    McpServerPurged,
     /// A Remote MCP registry finished an upstream sync run. (#5253).
     McpMirrorSynced,
     /// An MCPB bundle's signature did not verify and the upload was refused. (#5253).
     McpBundleSignatureRejected,
+    /// An administrator applied a config-as-code document (#5292). One
+    /// summary row per `mode=apply`; each write it made also records its own
+    /// per-repository row.
+    ConfigImported,
 }
 
 impl AuditAction {
@@ -447,8 +462,12 @@ impl AuditAction {
             AuditAction::McpNamespaceProofFailed => "MCP_NAMESPACE_PROOF_FAILED",
             AuditAction::McpServerEdited => "MCP_SERVER_EDITED",
             AuditAction::McpServerDeleted => "MCP_SERVER_DELETED",
+            AuditAction::McpServerPurged => "MCP_SERVER_PURGED",
             AuditAction::McpMirrorSynced => "MCP_MIRROR_SYNCED",
             AuditAction::McpBundleSignatureRejected => "MCP_BUNDLE_SIGNATURE_REJECTED",
+            AuditAction::CacheSeeded => "CACHE_SEEDED",
+            AuditAction::UpstreamFetched => "UPSTREAM_FETCHED",
+            AuditAction::ConfigImported => "CONFIG_IMPORTED",
         }
     }
 }
@@ -1607,15 +1626,18 @@ pub struct ProxyScanBlockEvent {
 /// username the auth middleware recorded (`None` for an anonymous pull) and
 /// the authorization-grade client IP. Captured before any detached task,
 /// which would not inherit the request's task-locals.
+///
+/// Shared with the `UPSTREAM_FETCHED` recorder (#5286), which attributes an
+/// upstream request to the client request that caused it the same way.
 #[derive(Debug, Clone)]
-struct BlockPrincipal {
-    username: Option<String>,
-    ip: Option<IpAddr>,
-    correlation_id: Option<String>,
+pub(crate) struct BlockPrincipal {
+    pub(crate) username: Option<String>,
+    pub(crate) ip: Option<IpAddr>,
+    pub(crate) correlation_id: Option<String>,
 }
 
 impl BlockPrincipal {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         Self {
             username: crate::api::middleware::request_span::recorded_user(),
             ip: crate::api::middleware::client_ip::current_verified_client_ip(),
@@ -1901,6 +1923,8 @@ mod proxy_scan_blocked_4777_tests {
     fn action_string_is_stable() {
         assert_eq!(AuditAction::ProxyScanBlocked.as_str(), "PROXY_SCAN_BLOCKED");
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
+        assert_eq!(AuditAction::UpstreamFetched.as_str(), "UPSTREAM_FETCHED");
+        assert_eq!(AuditAction::ConfigImported.as_str(), "CONFIG_IMPORTED");
     }
 
     /// #5253: the MCP registry vocabulary is a published contract
@@ -1997,6 +2021,11 @@ mod proxy_scan_blocked_4777_tests {
             (
                 AuditAction::McpServerDeleted,
                 "MCP_SERVER_DELETED",
+                Outcome::Success,
+            ),
+            (
+                AuditAction::McpServerPurged,
+                "MCP_SERVER_PURGED",
                 Outcome::Success,
             ),
             (
@@ -2236,6 +2265,7 @@ mod tests {
                 "QUARANTINE_RELEASED",
                 Outcome::Success,
             ),
+            (AuditAction::CacheSeeded, "CACHE_SEEDED", Outcome::Success),
             (
                 AuditAction::QuarantineRejected,
                 "QUARANTINE_REJECTED",

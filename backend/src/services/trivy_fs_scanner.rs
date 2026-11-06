@@ -423,6 +423,7 @@ mod tests {
             manifest_body: None,
             expected_component: Some(&pin),
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         let err = scanner

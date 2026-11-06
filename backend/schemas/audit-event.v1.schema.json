@@ -197,6 +197,16 @@
             "actor_tier": { "type": "string", "enum": ["instance_admin", "repository_admin"] },
             "relaxed": { "type": "boolean" }
           }
+        },
+        "upstream_mode_change": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["previous_upstream_mode", "upstream_mode"],
+          "description": "Present when PUT /api/v1/repositories/{key}/upstream-mode changed a Remote's upstream mode (#5282).",
+          "properties": {
+            "previous_upstream_mode": { "type": "string", "enum": ["online", "cache_only"] },
+            "upstream_mode": { "type": "string", "enum": ["online", "cache_only"] }
+          }
         }
       }
     },

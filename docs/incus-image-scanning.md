@@ -40,3 +40,13 @@ write `security.*` extended attributes. The scanner needs neither:
   device node only; every other `tar` error fails. The Alpine image extracts
   with busybox `tar`, where any error fails the scan.
 - An extraction that leaves no regular file in the tree fails the scan.
+
+## Disconnected installs
+
+Through the scanner-adapter, set `SCANNER_OFFLINE=true` on the adapter so
+Trivy never contacts a DB registry, and load a vulnerability DB carried
+across the gap with `PUT /api/v1/vulndb`; `GET /api/v1/vulndb` reports its
+build date and age (#5287). See "Offline use and vulnerability-DB import" in
+[`docker/scanner-adapter/README.md`](../docker/scanner-adapter/README.md).
+The stock `trivy` server takes `--skip-db-update` instead (commented in
+`docker-compose.yml`).

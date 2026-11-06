@@ -1489,6 +1489,48 @@ pub(crate) mod test_scan_job_suffix {
     }
 }
 
+/// Test-only sync points for the two pieces of work a cancelled scan leaves
+/// running after its future is dropped: the blocking archive extractor and
+/// the guard's workspace-removal thread (#5348). A test arms them on its own
+/// thread before polling the scan; the next [`ScanWorkspace::extract_archive`]
+/// and the next armed [`WorkspaceGuard`] drop on that thread take the sender
+/// and drop it when their work has returned, which resolves the receiver.
+/// Not compiled outside tests.
+#[cfg(test)]
+pub(crate) mod test_blocking_exit {
+    use std::cell::RefCell;
+    use tokio::sync::oneshot;
+
+    thread_local! {
+        static EXTRACTION: RefCell<Option<oneshot::Sender<()>>> = const { RefCell::new(None) };
+        static CLEANUP: RefCell<Option<oneshot::Sender<()>>> = const { RefCell::new(None) };
+    }
+
+    /// Resolves once the next blocking extraction started on this thread has
+    /// returned, however it ended.
+    pub(crate) fn on_extraction_exit() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        EXTRACTION.with(|s| *s.borrow_mut() = Some(tx));
+        rx
+    }
+
+    /// Resolves once the removal started by the next armed guard dropped on
+    /// this thread has finished.
+    pub(crate) fn on_cleanup_exit() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        CLEANUP.with(|s| *s.borrow_mut() = Some(tx));
+        rx
+    }
+
+    pub(super) fn take_extraction() -> Option<oneshot::Sender<()>> {
+        EXTRACTION.with(|s| s.borrow_mut().take())
+    }
+
+    pub(super) fn take_cleanup() -> Option<oneshot::Sender<()>> {
+        CLEANUP.with(|s| s.borrow_mut().take())
+    }
+}
+
 /// One extraction job handed to a [`WorkspaceExtractor`] by
 /// [`ScanWorkspace::prepare_with`] (#1429).
 pub(crate) struct WorkspaceExtraction<'a> {
@@ -2363,9 +2405,16 @@ impl ScanWorkspace {
                 return Ok(());
             };
 
-        tokio::task::spawn_blocking(move || extract_archive_blocking(kind, &src, &dst, &cancel))
-            .await
-            .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
+        #[cfg(test)]
+        let exit_signal = test_blocking_exit::take_extraction();
+        tokio::task::spawn_blocking(move || {
+            let result = extract_archive_blocking(kind, &src, &dst, &cancel);
+            #[cfg(test)]
+            drop(exit_signal);
+            result
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Extraction task panicked: {}", e)))?
     }
 }
 
@@ -2498,17 +2547,27 @@ impl Drop for WorkspaceGuard {
         // during an unwind aborts the process). One thread per cancelled
         // scan, bounded in practice by the extraction concurrency limit; if
         // the OS refuses it, remove inline rather than not at all.
+        #[cfg(test)]
+        let done_signal = std::sync::Arc::new(test_blocking_exit::take_cleanup());
         let spawned = {
             let path = path.clone();
             let sidecars = sidecars.clone();
+            #[cfg(test)]
+            let done_signal = std::sync::Arc::clone(&done_signal);
             std::thread::Builder::new()
                 .name("scan-ws-cleanup".to_string())
-                .spawn(move || remove_workspace_blocking(&path, &sidecars))
+                .spawn(move || {
+                    remove_workspace_blocking(&path, &sidecars);
+                    #[cfg(test)]
+                    drop(done_signal);
+                })
                 .is_ok()
         };
         if !spawned {
             remove_workspace_blocking(&path, &sidecars);
         }
+        #[cfg(test)]
+        drop(done_signal);
     }
 }
 
@@ -5034,6 +5093,11 @@ pub struct ScanTarget<'a> {
     /// `false` (hosted upload scans, inline file formats, unit tests) keeps
     /// prior behavior exactly.
     pub require_nonempty_catalog: bool,
+    /// The owning repository's format (`repositories.format`, e.g.
+    /// `huggingface`), when the caller knows it. Hosted upload scans set it;
+    /// `None` (inline proxy scans, unit tests) makes format-gated scanners
+    /// such as the model-file scanner (#5285) not applicable.
+    pub repository_format: Option<&'a str>,
 }
 
 /// The package ecosystem an [`ExpectedComponent`] belongs to. Selects both the
@@ -9114,7 +9178,13 @@ mod construction {
             // wheel contains libwebp 1.3.2" into a CVE finding (#4043).
             let dep_scanner: Arc<dyn Scanner> =
                 Arc::new(DependencyScanner::new(advisory_client).with_db(db.clone()));
-            let mut scanners: Vec<Arc<dyn Scanner>> = vec![dep_scanner];
+            // #5285: the model-file scanner is in-process and needs no engine,
+            // so it is always registered; it applies only to model files in
+            // huggingface and mlmodel repositories.
+            let mut scanners: Vec<Arc<dyn Scanner>> = vec![
+                dep_scanner,
+                Arc::new(crate::services::model_file_scanner::ModelFileScanner::new()),
+            ];
             let incus_capability = IncusScannerCapability::from_config(incus_scanner_enabled);
 
             // Container *image* scanner: Harbor scanner-adapter (#2088). Registered
@@ -9445,6 +9515,7 @@ impl ScannerService {
             manifest_body: None,
             expected_component: expected,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -9473,6 +9544,7 @@ impl ScannerService {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         };
         run_inline_proxy_scanners_target(&self.scanners, &target, content).await
     }
@@ -9717,6 +9789,8 @@ impl ScannerService {
             // `None` for every format that is not pinned.
             expected_component: upload_pin.as_ref(),
             require_nonempty_catalog: false,
+            // #5285: the model-file scanner applies by repository format.
+            repository_format: Some(repository_format.as_str()),
         };
         let mut catalog_set = CatalogSetTally::default();
         let expects_catalog = upload_expects_catalog(
@@ -11930,6 +12004,7 @@ mod tests {
             manifest_body: Some(&manifest),
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         };
 
         for (mode, trivy_url, trivy_adapter_url) in [
@@ -11992,6 +12067,7 @@ mod tests {
             manifest_body: Some(&manifest),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         for (mode, trivy_url, trivy_adapter_url) in [
@@ -12855,6 +12931,11 @@ mod tests {
         test_scan_job_suffix::fix("cancelled-job");
         let path = ScanWorkspace::job_workspace_dir(base.to_str().unwrap(), None, &artifact);
 
+        // Armed before the first poll, so the extraction and the guard drop
+        // below (both on this thread) pick them up.
+        let extraction_exited = test_blocking_exit::on_extraction_exit();
+        let cleanup_finished = test_blocking_exit::on_cleanup_exit();
+
         let mut prepare = Box::pin(ScanWorkspace::prepare_pinned(
             base.to_str().unwrap(),
             None,
@@ -12876,14 +12957,39 @@ mod tests {
         }
         drop(prepare);
 
-        // Long enough for the blocking extractor to unpack the remaining
-        // ~19,900 entries if nothing stopped it.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // #5348: wait for the two things the dropped future leaves running
+        // rather than sleeping a fixed interval. The blocking extractor keeps
+        // going until it sees the flag (or, if cancellation were broken,
+        // until it has unpacked every remaining entry), and the guard removes
+        // the tree on its own thread. Once both have returned nothing else
+        // writes under `path`. The deadlines are generous bounds for a loaded
+        // runner, not expected durations: a timeout here is a hang, not a
+        // slow pass.
+        tokio::time::timeout(Duration::from_secs(120), extraction_exited)
+            .await
+            .expect("the blocking extractor never returned after cancellation")
+            .ok();
+        tokio::time::timeout(Duration::from_secs(120), cleanup_finished)
+            .await
+            .expect("the guard's workspace removal never finished")
+            .ok();
+
+        // The extractor checks the flag once per entry and the removal does
+        // not synchronise with it, so the documented bound is one entry
+        // landing after the removal (see `remove_workspace_blocking`). An
+        // extractor that ignored the flag leaves the remaining ~19,900.
+        let left = count_files(&path);
         assert!(
-            !path.exists(),
-            "a cancelled extraction must not rebuild the workspace: {} files left at {}",
-            count_files(&path),
+            left <= 1,
+            "a cancelled extraction must not rebuild the workspace: {left} files left at {}",
             path.display()
+        );
+        // And nothing is still writing: the count does not grow afterwards.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            count_files(&path),
+            left,
+            "the workspace changed after the extractor and its removal had both returned"
         );
     }
 
@@ -14328,6 +14434,7 @@ mod tests {
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(oci_target_is_scannable_image(&target));
     }
@@ -14348,6 +14455,7 @@ mod tests {
             manifest_body: Some(HELM_OCI_MANIFEST_BODY),
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
         assert!(!oci_target_is_scannable_image(&target));
     }
@@ -19836,6 +19944,7 @@ tonic-build = "0.12"
                 manifest_body: None,
                 expected_component: Some(&pin),
                 require_nonempty_catalog: false,
+                repository_format: None,
             };
 
             let out = scanner
@@ -19930,6 +20039,7 @@ tonic-build = "0.12"
                 manifest_body: None,
                 expected_component: Some(&pin),
                 require_nonempty_catalog: false,
+                repository_format: None,
             };
             let out = scanner
                 .scan_target(&target, None, &content)
@@ -27055,6 +27165,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         }
     }
 
@@ -27106,6 +27217,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: Some(expected),
             require_nonempty_catalog: false,
+            repository_format: None,
         }
     }
 
@@ -27543,6 +27655,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: true,
+            repository_format: None,
         }
     }
 
@@ -28420,6 +28533,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));
@@ -28446,6 +28560,7 @@ tonic-build = "0.12"
             manifest_body: None,
             expected_component: None,
             require_nonempty_catalog: false,
+            repository_format: None,
         };
 
         assert!(scanner.is_applicable_for_target(&target));

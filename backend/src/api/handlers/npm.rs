@@ -766,16 +766,19 @@ async fn maybe_evict_missing_packument(
 ) {
     if scope.virtual_repo.is_none() {
         if let Some(proxy_service) = state.proxy_service.as_ref() {
+            // #5282: a cache-only Remote's 404 is a cache miss, not a statement
+            // from upstream, so it never evicts the packument it computed.
             if proxy_service
                 .on_upstream_not_found_by_key(&scope.repo_key)
                 .await
                 .keeps()
+                || proxy_service.is_cache_only_by_key(&scope.repo_key).await
             {
                 tracing::info!(
                     repository = %scope.repo_key,
                     package = %scope.package,
-                    "upstream 404/410 with on_upstream_not_found=keep; keeping the cached \
-                     packument (#4640)"
+                    "404/410 on a Remote that keeps (on_upstream_not_found=keep) or is \
+                     cache-only; keeping the cached packument (#4640, #5282)"
                 );
                 return;
             }
@@ -2540,6 +2543,15 @@ async fn attestation_cached_meta_fetch(
 ///   This is the correct behaviour for proxy/group repos: the upstream already
 ///   handles these endpoints correctly, so AK acts as a pass-through.
 ///
+///   When the upstream cannot answer, the response names the cause (#5345):
+///   - refused without contact by the shared upstream gate (#840 upstream
+///     filter, #5282 cache-only mode) → `404` with the gate's reason, unless
+///     a cached attestation answer exists, which is served instead;
+///   - upstream unreachable → `503 upstream unreachable`.
+///
+///   `/-/ping` and `/-/whoami` on an unreachable upstream (and on a Virtual
+///   whose members cannot answer) are still answered locally, as before.
+///
 /// - **Local / Staging repos** — the registry is self-contained; no upstream
 ///   to forward to. Minimal built-in responses:
 ///   - `/-/ping` → `200 {}` (standard liveness probe)
@@ -2558,44 +2570,54 @@ async fn npm_meta_get(
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, &repo_key).await?;
     let query = raw_query.0;
+    let endpoint = rest.trim_start_matches('/');
 
     // Remote: proxy the whole request to upstream, filtered by this repo's own
     // scope policy (#2424) so search cannot list out-of-scope packages.
     if repo.repo_type == RepositoryType::Remote {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            // #840: the Remote's upstream filter applies to the meta
-            // namespace too; a refused path is a 404 without upstream contact,
-            // as on every other proxied path.
-            if !npm_meta_upstream_allowed(
-                &state,
-                repo.id,
-                &repo_key,
-                upstream_url,
-                &rest,
-                query.as_deref(),
-            )
-            .await?
-            {
-                return Err(npm_meta_filtered_response());
+        let Some(ref upstream_url) = repo.upstream_url else {
+            if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
+                return resp;
             }
-            let policy = fetch_npm_scope_policy(&state.db, repo.id)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            if let Some(resp) = proxy_npm_meta_get_cached(
-                &state,
-                &repo_key,
-                repo.id,
-                upstream_url,
-                &rest,
-                query.as_deref(),
-                &policy,
-            )
-            .await
-            {
-                return Ok(resp);
+            return Err(npm_meta_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "/-/{endpoint} could not be forwarded: remote repository '{repo_key}' \
+                     has no upstream URL configured"
+                ),
+            ));
+        };
+        match remote_meta_answer(
+            &state,
+            &repo_key,
+            repo.id,
+            &repo_key,
+            upstream_url,
+            &rest,
+            query.as_deref(),
+        )
+        .await?
+        {
+            MetaUpstreamOutcome::Answered(resp) => return Ok(resp),
+            // #840 / #5282: a refused path is a 404 without upstream contact,
+            // as on every other proxied path, carrying the gate's own reason
+            // (upstream filter or cache-only), never a "not implemented".
+            MetaUpstreamOutcome::Refused(reason) => {
+                return Err(npm_meta_error(StatusCode::NOT_FOUND, reason));
+            }
+            MetaUpstreamOutcome::Unreachable => {
+                if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
+                    return resp;
+                }
+                return Err(npm_meta_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "upstream unreachable: /-/{endpoint} could not be fetched from the \
+                         upstream of remote repository '{repo_key}'"
+                    ),
+                ));
             }
         }
-        // Upstream misconfigured or unreachable — fall through to local stub.
     }
 
     // Virtual: try the first Remote member whose upstream is reachable, applying
@@ -2608,6 +2630,9 @@ async fn npm_meta_get(
         // handler already bound `auth`; it just never used it.
         let members =
             proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id).await?;
+        let mut tried_remote = false;
+        let mut any_unreachable = false;
+        let mut refusals: Vec<String> = Vec::new();
         for member in &members {
             if member.repo_type != RepositoryType::Remote {
                 continue;
@@ -2615,10 +2640,15 @@ async fn npm_meta_get(
             let Some(ref upstream_url) = member.upstream_url else {
                 continue;
             };
-            // #840: a member whose upstream filter refuses the path is
-            // skipped without being contacted.
-            if !npm_meta_upstream_allowed(
+            tried_remote = true;
+            // Keyed on the member that answers, not the virtual repo: the
+            // member set is the caller-authorized one, so keying on the
+            // virtual would let a caller be served an answer fetched for a
+            // member they may not reach. The metric is labelled with the
+            // requested repo, which is what an operator charts.
+            match remote_meta_answer(
                 &state,
+                &repo_key,
                 member.id,
                 &member.key,
                 upstream_url,
@@ -2627,43 +2657,60 @@ async fn npm_meta_get(
             )
             .await?
             {
-                continue;
-            }
-            let policy = fetch_npm_scope_policy(&state.db, member.id)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            // Keyed on the member that answers, not the virtual repo: the
-            // member set is the caller-authorized one, so keying on the
-            // virtual would let a caller be served an answer fetched for a
-            // member they may not reach. The metric is labelled with the
-            // requested repo, which is what an operator charts.
-            if let Some(resp) = proxy_npm_meta_get_cached(
-                &state,
-                &repo_key,
-                member.id,
-                upstream_url,
-                &rest,
-                query.as_deref(),
-                &policy,
-            )
-            .await
-            {
-                return Ok(resp);
+                MetaUpstreamOutcome::Answered(resp) => return Ok(resp),
+                // #840 / #5282: a refused member is skipped without contact.
+                MetaUpstreamOutcome::Refused(reason) => refusals.push(reason),
+                MetaUpstreamOutcome::Unreachable => any_unreachable = true,
             }
         }
-        // No reachable Remote member — fall through to local stub.
+        if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
+            return resp;
+        }
+        if tried_remote {
+            return Err(virtual_meta_failure(
+                &repo_key,
+                endpoint,
+                any_unreachable,
+                &refusals,
+            ));
+        }
+        // No Remote member: nothing could answer this endpoint.
+        return Err(npm_meta_error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "/-/{endpoint} is not implemented for virtual repository '{repo_key}': \
+                 it has no Remote member to forward it to"
+            ),
+        ));
     }
 
-    // Local / Staging (or Remote/Virtual without a reachable upstream):
-    // serve minimal built-in responses for the standard meta endpoints.
-    let endpoint = rest.trim_start_matches('/');
-
-    if endpoint == "ping" {
-        return Ok(build_json_metadata_response("{}".to_string()));
+    // Local / Staging: serve minimal built-in responses for the standard meta
+    // endpoints.
+    if let Some(resp) = npm_meta_local_stub(endpoint, auth.as_ref()) {
+        return resp;
     }
 
-    if endpoint == "whoami" {
-        return match auth {
+    // All other /-/ endpoints are not implemented for local repos.
+    Err(npm_meta_error(
+        StatusCode::NOT_IMPLEMENTED,
+        format!("/-/{endpoint} is not implemented for local repositories"),
+    ))
+}
+
+/// The `{"error": ...}` body every `/-/` meta failure answers with.
+fn npm_meta_error(status: StatusCode, message: String) -> Response {
+    (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+/// The built-in answers for `/-/ping` and `/-/whoami`, which need no upstream.
+/// `None` for every other endpoint.
+fn npm_meta_local_stub(
+    endpoint: &str,
+    auth: Option<&AuthExtension>,
+) -> Option<Result<Response, Response>> {
+    match endpoint {
+        "ping" => Some(Ok(build_json_metadata_response("{}".to_string()))),
+        "whoami" => Some(match auth {
             Some(a) => Ok(build_json_metadata_response(
                 serde_json::json!({"username": a.username}).to_string(),
             )),
@@ -2672,17 +2719,119 @@ async fn npm_meta_get(
                 axum::Json(serde_json::json!({"error": "unauthenticated"})),
             )
                 .into_response()),
-        };
+        }),
+        _ => None,
     }
+}
 
-    // All other /-/ endpoints are not implemented for local repos.
-    Err((
-        StatusCode::NOT_IMPLEMENTED,
-        axum::Json(
-            serde_json::json!({"error": format!("/-/{} is not implemented for local repositories", endpoint)}),
-        ),
+/// The answer of a Virtual repository none of whose Remote members could
+/// answer a `/-/` request (#5345): `503` when at least one member's upstream
+/// was unreachable (a retry may succeed), otherwise `404` carrying each
+/// member's refusal reason (upstream filter or cache-only).
+fn virtual_meta_failure(
+    repo_key: &str,
+    endpoint: &str,
+    any_unreachable: bool,
+    refusals: &[String],
+) -> Response {
+    let mut message = if any_unreachable {
+        format!(
+            "upstream unreachable: no Remote member of virtual repository '{repo_key}' \
+             could answer /-/{endpoint}"
+        )
+    } else {
+        format!(
+            "no Remote member of virtual repository '{repo_key}' may contact its upstream \
+             for /-/{endpoint}"
+        )
+    };
+    if !refusals.is_empty() {
+        message.push_str(": ");
+        message.push_str(&refusals.join("; "));
+    }
+    let status = if any_unreachable {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    npm_meta_error(status, message)
+}
+
+/// How one Remote answered a `/-/` meta request.
+enum MetaUpstreamOutcome {
+    /// The upstream's answer (status relayed verbatim), or a cached one.
+    Answered(Response),
+    /// The shared upstream gate refused contact (#840 upstream filter,
+    /// #5282 cache-only) and nothing was cached; carries the gate's reason.
+    Refused(String),
+    /// The upstream was contacted but could not be reached or read.
+    Unreachable,
+}
+
+/// Ask Remote `member_id` (key `member_key`) for the `/-/` meta path
+/// `meta_path` (#5345).
+///
+/// The shared upstream gate runs first, so a refused path never reaches the
+/// upstream. A refused attestation lookup is still answered from the
+/// attestation cache when it holds a live entry for this member: reading the
+/// cache contacts nothing, and a cache-only Remote exists to serve what it
+/// holds. An unreadable filter or mode is an error, never an admission.
+/// `metric_repo_key` labels the attestation cache metric with the requested
+/// repository.
+async fn remote_meta_answer(
+    state: &SharedState,
+    metric_repo_key: &str,
+    member_id: uuid::Uuid,
+    member_key: &str,
+    upstream_url: &str,
+    meta_path: &str,
+    query: Option<&str>,
+) -> Result<MetaUpstreamOutcome, Response> {
+    let gate = crate::services::upstream_filter::ensure_upstream_allowed(
+        &state.db,
+        member_id,
+        member_key,
+        upstream_url,
+        &npm_meta_fetch_path(meta_path, query),
     )
-        .into_response())
+    .await;
+    let refusal = match gate {
+        Ok(()) => None,
+        Err(AppError::NotFound(reason)) => Some(reason),
+        Err(e) => return Err(e.into_response()),
+    };
+    let policy = fetch_npm_scope_policy(&state.db, member_id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    if let Some(reason) = refusal {
+        if let Some((cache, key)) =
+            attestation_cache_target(state, member_id, upstream_url, meta_path, query, &policy)
+        {
+            if let Some(entry) = cache.lookup(&key).await {
+                metrics_service::record_npm_attestation_cache_lookup(metric_repo_key, "hit");
+                return Ok(MetaUpstreamOutcome::Answered(meta_response_from_cache(
+                    &entry,
+                )));
+            }
+        }
+        return Ok(MetaUpstreamOutcome::Refused(reason));
+    }
+    Ok(
+        match proxy_npm_meta_get_cached(
+            state,
+            metric_repo_key,
+            member_id,
+            upstream_url,
+            meta_path,
+            query,
+            &policy,
+        )
+        .await
+        {
+            Some(resp) => MetaUpstreamOutcome::Answered(resp),
+            None => MetaUpstreamOutcome::Unreachable,
+        },
+    )
 }
 
 /// The upstream-relative wire path of a `/-/` meta request, as
@@ -2693,39 +2842,6 @@ fn npm_meta_fetch_path(meta_path: &str, query: Option<&str>) -> String {
         Some(q) if !q.is_empty() => format!("{path}?{q}"),
         _ => path,
     }
-}
-
-/// Whether the upstream filter of Remote `repo_id` admits a `/-/` meta
-/// request (#840). An unreadable filter is a 500, never an admission.
-async fn npm_meta_upstream_allowed(
-    state: &SharedState,
-    repo_id: uuid::Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    meta_path: &str,
-    query: Option<&str>,
-) -> Result<bool, Response> {
-    crate::services::upstream_filter::upstream_allows(
-        &state.db,
-        repo_id,
-        repo_key,
-        upstream_url,
-        &npm_meta_fetch_path(meta_path, query),
-    )
-    .await
-    .map_err(IntoResponse::into_response)
-}
-
-/// The 404 a Remote answers for a `/-/` path its upstream filter refuses,
-/// the same answer as for any other refused path (#840).
-fn npm_meta_filtered_response() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        axum::Json(serde_json::json!({
-            "error": "path excluded by the repository's upstream filter"
-        })),
-    )
-        .into_response()
 }
 
 /// Whether the upstream filter of a Remote admits an npm audit POST to
@@ -2939,8 +3055,19 @@ async fn get_scoped_version_metadata(
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((repo_key, scope, package, version)): Path<(String, String, String, String)>,
     base_url: RequestBaseUrl,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
+    // A tarball request whose scope separator is percent-encoded
+    // (`@scope%2fname/-/name-1.0.0.tgz`, which yarn sends for some scoped
+    // packages) is one segment shorter than the scoped tarball route, so it
+    // lands here with `package == "-"` and the filename in `version`. Serve it
+    // as the tarball it is instead of rejecting `@scope/name/-` as a name.
+    if let Some((scope_part, name_part)) = encoded_scoped_tarball_parts(&scope, &package) {
+        let full_name = build_scoped_package_name(scope_part, name_part);
+        validate_package_name(&full_name)?;
+        return serve_tarball(&state, auth.as_ref(), &repo_key, &full_name, &version, &ctx).await;
+    }
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
@@ -5018,15 +5145,32 @@ async fn serve_tarball(
                         upstream_url,
                         RepositoryFormat::Npm,
                     );
-                    proxy
-                        .fetch_artifact_streaming_with_cache_path_gated_digest(
-                            &gated_repo,
-                            &source_path,
-                            &fetch_path,
-                            tarball_upstream.integrity,
-                        )
-                        .await
-                        .map_err(IntoResponse::into_response)?
+                    // #5343: a HEAD's miss is answered from an upstream HEAD
+                    // of the tarball, so the GET that follows downloads it
+                    // once; the integrity gate rides along for the fall-back
+                    // GET of an upstream that refuses HEAD.
+                    let fetched = if ctx.is_head {
+                        proxy
+                            .head_artifact_streaming_with_cache_path(
+                                &gated_repo,
+                                &source_path,
+                                &fetch_path,
+                                tarball_upstream.integrity.map(
+                                    crate::services::proxy_service::ExpectedCommitDigest::Resolved,
+                                ),
+                            )
+                            .await
+                    } else {
+                        proxy
+                            .fetch_artifact_streaming_with_cache_path_gated_digest(
+                                &gated_repo,
+                                &source_path,
+                                &fetch_path,
+                                tarball_upstream.integrity,
+                            )
+                            .await
+                    };
+                    fetched.map_err(IntoResponse::into_response)?
                 }
             };
 
@@ -5227,6 +5371,7 @@ async fn serve_tarball(
                             &lkg_path,
                             &lkg_path,
                             member.format.clone(),
+                            ctx.is_head,
                         )
                         .await?;
                         correct_cached_tarball_content_type(&state.db, member.id, &lkg_path).await;
@@ -5885,6 +6030,7 @@ impl proxy_helpers::ScannedProxyFile for NpmScannedTarball<'_> {
             req.source_path,
             req.cache_path,
             RepositoryFormat::Npm,
+            req.is_head(),
         )
         .await?;
         correct_cached_tarball_content_type(&state.db, req.repo_id, req.cache_path).await;
@@ -7195,6 +7341,23 @@ fn build_npm_storage_key(
 /// Build a scoped package name from scope and package.
 fn build_scoped_package_name(scope: &str, package: &str) -> String {
     format!("@{}/{}", scope, package)
+}
+
+/// Split the decoded scope of an encoded scoped tarball request.
+///
+/// `GET /{repo}/@scope%2fname/-/{file}` matches the scoped version route with
+/// the decoded scope `scope/name` and the literal `-` as the package. Returns
+/// `(scope, name)` for that shape, `None` for every other request (including a
+/// version lookup of a package literally named `@scope/-`, whose scope has no
+/// `/`).
+fn encoded_scoped_tarball_parts<'a>(
+    decoded_scope: &'a str,
+    package: &str,
+) -> Option<(&'a str, &'a str)> {
+    if package != "-" {
+        return None;
+    }
+    decoded_scope.split_once('/')
 }
 
 /// Build the npm tarball URL for metadata responses.
@@ -10508,6 +10671,85 @@ mod tests {
             tgz,
             "the advertised dist.tarball must serve the published tarball bytes"
         );
+    }
+
+    #[test]
+    fn test_encoded_scoped_tarball_parts() {
+        assert_eq!(
+            encoded_scoped_tarball_parts("webassemblyjs/helper-api-error", "-"),
+            Some(("webassemblyjs", "helper-api-error"))
+        );
+        // A real version lookup (`@scope/pkg/1.0.0`) is not a tarball.
+        assert_eq!(encoded_scoped_tarball_parts("webassemblyjs", "-"), None);
+        assert_eq!(
+            encoded_scoped_tarball_parts("webassemblyjs/helper-api-error", "1.0.0"),
+            None
+        );
+    }
+
+    /// yarn requests some scoped tarballs with the scope separator encoded
+    /// (`@scope%2fname/-/file.tgz`). That path is one segment shorter than the
+    /// scoped tarball route, so it used to land on the scoped version route and
+    /// 400 on the name `@scope/name/-`. Both spellings must serve the tarball.
+    #[tokio::test]
+    async fn test_scoped_tarball_with_encoded_slash_is_served() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+
+        let package = "@acme/widget";
+        let version = "1.0.0";
+        let filename = "widget-1.0.0.tgz";
+        let tgz: &[u8] = b"npm-tgz-bytes-for-encoded-scoped-tarball";
+        let repo = fx.repo_info("local", None);
+        let path = format!("{package}/{version}/{filename}");
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("npm/{path}"),
+            &path,
+            package,
+            version,
+            "application/gzip",
+            Bytes::from_static(tgz),
+            fx.user_id,
+        )
+        .await;
+
+        let mut results = Vec::new();
+        for encoded in [
+            format!("@acme/widget/-/{filename}"),
+            format!("@acme%2fwidget/-/{filename}"),
+            format!("@acme%2Fwidget/-/{filename}"),
+        ] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+                tdh::get(format!("/npm/{}/{encoded}", fx.repo_key)),
+            )
+            .await;
+            results.push((encoded, status, body));
+        }
+        // A misspelled encoded name still fails validation rather than
+        // resolving to something else.
+        let (bad_status, _) = tdh::send(
+            tdh::router_anon(npm_mounted_router(), fx.state.clone()),
+            tdh::get(format!(
+                "/npm/{}/@acme%2fwidget%2fx/-/{filename}",
+                fx.repo_key
+            )),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        for (encoded, status, body) in results {
+            assert_eq!(status, StatusCode::OK, "GET {encoded}");
+            assert_eq!(&body[..], tgz, "GET {encoded} body");
+        }
+        assert_eq!(bad_status, StatusCode::BAD_REQUEST);
     }
 
     // -----------------------------------------------------------------------
@@ -19434,6 +19676,34 @@ mod content_encoding_forwarding_tests {
         );
     }
 
+    /// #5343: a cold `HEAD` of a Remote tarball (the direct-Remote
+    /// `serve_tarball` arm) is answered from an upstream `HEAD`, so the
+    /// tarball leaves the upstream once across HEAD, GET and a warm GET, and
+    /// the HEAD keeps the tarball's forced `Content-Type`.
+    #[tokio::test]
+    async fn test_remote_npm_cold_head_downloads_the_tarball_once_5343() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball: Vec<u8> = (0..4096u32).map(|i| (i % 239) as u8).collect();
+        let uri = format!("/{}/head-pkg/-/head-pkg-1.0.0.tgz", fx.repo_key);
+        let head = tdh::assert_cold_head_fetches_body_once(
+            fx,
+            wiremock::MockServer::start().await,
+            super::router,
+            true,
+            "/head-pkg/-/head-pkg-1.0.0.tgz",
+            &uri,
+            &[("content-type", "application/octet-stream")],
+            &tarball,
+        )
+        .await;
+        assert_eq!(
+            tdh::header_str(&head, CONTENT_TYPE).as_deref(),
+            Some(NPM_TARBALL_CONTENT_TYPE)
+        );
+    }
+
     /// REMOTE arm (`serve_tarball` -> direct-remote streaming fetch).
     #[tokio::test]
     async fn test_remote_npm_tarball_forwards_upstream_content_encoding() {
@@ -21184,5 +21454,188 @@ mod age_gate_member_miss_5150_tests {
             Ok(r) | Err(r) => r.status(),
         };
         assert_eq!(status.as_u16(), 451);
+    }
+}
+
+/// #5345: a `/-/` meta request that a Remote's upstream cannot answer (the
+/// upstream is unreachable, the upstream filter refuses the path, or the
+/// repository is cache-only) answers with a status and message naming that
+/// cause. Before, every such request fell through to the Local stub and
+/// answered `501 "... is not implemented for local repositories"`.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod meta_upstream_failure_5345_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::services::upstream_mode::{save_upstream_mode, UpstreamMode};
+
+    const ATTESTATION: &str = "npm/v1/attestations/lodash@4.17.21";
+    /// Nothing listens here, so a request fails at once with a connect error.
+    const DEAD_UPSTREAM: &str = "http://127.0.0.1:1";
+    const LOCAL_STUB: &str = "not implemented for local repositories";
+
+    async fn point_upstream(fx: &tdh::Fixture, url: &str) {
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(url)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("update upstream_url");
+    }
+
+    /// GET `/-/<meta>` through the router; the status and the `error` text.
+    async fn get_meta(app: axum::Router, repo_key: &str, meta: &str) -> (StatusCode, String) {
+        let (status, body) = tdh::send(app, tdh::get(format!("/{repo_key}/-/{meta}"))).await;
+        let error = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+        (status, error)
+    }
+
+    #[tokio::test]
+    async fn remote_with_unreachable_upstream_answers_503_naming_it() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        point_upstream(&fx, DEAD_UPSTREAM).await;
+        let app = fx.router_anon(super::router());
+        let (status, error) = get_meta(app.clone(), &fx.repo_key, ATTESTATION).await;
+        let (search_status, search_error) =
+            get_meta(app.clone(), &fx.repo_key, "v1/search?text=x").await;
+        // ping is still answered locally, as before.
+        let (ping_status, _) = get_meta(app, &fx.repo_key, "ping").await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert!(error.contains("upstream unreachable"), "{error}");
+        assert!(error.contains(&fx.repo_key), "{error}");
+        assert!(!error.contains(LOCAL_STUB), "{error}");
+        assert_eq!(
+            search_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{search_error}"
+        );
+        assert!(!search_error.contains(LOCAL_STUB), "{search_error}");
+        assert_eq!(ping_status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn remote_filter_refusal_answers_404_naming_the_filter() {
+        use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        point_upstream(&fx, DEAD_UPSTREAM).await;
+        save_upstream_filter(
+            &fx.pool,
+            fx.repo_id,
+            &UpstreamFilter {
+                include_patterns: vec![],
+                exclude_patterns: vec!["^-/npm/v1/attestations/".to_string()],
+            },
+        )
+        .await
+        .expect("save filter");
+        crate::services::upstream_filter::invalidate_cached_filter(fx.repo_id).await;
+        let app = fx.router_anon(super::router());
+        let (status, error) = get_meta(app, &fx.repo_key, ATTESTATION).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(error.contains("upstream filter"), "{error}");
+        assert!(!error.contains(LOCAL_STUB), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cache_only_remote_answers_404_naming_the_mode_or_serves_the_cache() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        point_upstream(&fx, DEAD_UPSTREAM).await;
+        save_upstream_mode(&fx.pool, fx.repo_id, UpstreamMode::CacheOnly)
+            .await
+            .expect("store cache_only");
+        let state = tdh::build_state_with(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), |c| {
+            c.npm_attestation_negative_cache_enabled = true;
+            c.npm_attestation_negative_cache_ttl_secs = 3_600;
+        });
+        // A cached attestation answer for another version, held before the
+        // repository went cache-only.
+        let cached = "npm/v1/attestations/lodash@4.17.20";
+        let cache = state.npm_attestation_cache.clone().expect("cache enabled");
+        cache
+            .store(
+                attestation_cache::cache_key(fx.repo_id, DEAD_UPSTREAM, cached).expect("key"),
+                CachedMetaResponse::new(
+                    StatusCode::NOT_FOUND,
+                    "application/json",
+                    Bytes::from_static(br#"{"error":"no attestation (cached)"}"#),
+                ),
+            )
+            .await;
+        let app = tdh::router_anon(super::router(), state);
+        let (status, error) = get_meta(app.clone(), &fx.repo_key, ATTESTATION).await;
+        let (cached_status, cached_error) = get_meta(app, &fx.repo_key, cached).await;
+        let _ = save_upstream_mode(&fx.pool, fx.repo_id, UpstreamMode::Online).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{error}");
+        assert!(error.contains("is cache-only"), "{error}");
+        assert!(!error.contains("upstream filter"), "{error}");
+        assert!(!error.contains(LOCAL_STUB), "{error}");
+        assert_eq!(cached_status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            cached_error, "no attestation (cached)",
+            "a cache-only Remote serves the cached attestation answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_with_unreachable_member_answers_503() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let (member, _, member_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", DEAD_UPSTREAM, 1).await;
+        let app = fx.router_with_auth(super::router());
+        let (status, error) = get_meta(app, &fx.repo_key, ATTESTATION).await;
+        for sql in [
+            "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+            "DELETE FROM repositories WHERE id = $1",
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(member)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert!(error.contains("upstream unreachable"), "{error}");
+        assert!(!error.contains(LOCAL_STUB), "{error}");
+    }
+
+    #[tokio::test]
+    async fn local_repository_keeps_its_501() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let app = fx.router_anon(super::router());
+        let (status, error) = get_meta(app, &fx.repo_key, ATTESTATION).await;
+        fx.teardown().await;
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{error}");
+        assert!(error.contains(LOCAL_STUB), "{error}");
+    }
+
+    #[test]
+    fn virtual_failure_prefers_503_when_any_member_was_unreachable() {
+        let refusals = vec!["not in cache; repository 'm' is cache-only".to_string()];
+        let resp = virtual_meta_failure("v", "v1/search", true, &refusals);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = virtual_meta_failure("v", "v1/search", false, &refusals);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

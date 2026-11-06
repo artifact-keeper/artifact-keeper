@@ -186,8 +186,13 @@ async fn list_labels(
 ) -> Result<Json<ArtifactLabelsListResponse>> {
     let auth = authorize_label_read(auth)?;
 
-    check_artifact_visibility(&Some(auth), id, &state.db, "read").await?;
+    let auth = Some(auth);
+    check_artifact_visibility(&auth, id, &state.db, "read").await?;
     live_artifact_repository_id(&state.db, id).await?;
+    // #5253: a held MCP server version answers as a missing artifact.
+    if !super::artifacts::mcp_servable(&state, auth.as_ref(), id).await? {
+        return Err(AppError::NotFound(format!("Artifact {id} not found")));
+    }
 
     let label_service = ArtifactLabelService::new(state.db.clone());
     let labels = label_service.get_labels(id).await?;

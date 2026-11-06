@@ -1,5 +1,6 @@
 //! MCP registry write path, Phase 2/3 (#5253): `POST /validate`, the admin
-//! edit (`PUT .../versions/{v}`) and soft delete (`DELETE .../versions/{v}`),
+//! edit (`PUT .../versions/{v}`), soft delete (`DELETE .../versions/{v}`) and
+//! admin purge of a deleted version (`POST .../versions/{v}/purge`, #5368),
 //! MCPB bundle upload and download (`.../versions/{v}/bundles/{file}`), and
 //! the publish-side helpers `handlers::mcp` calls (tombstones, staged
 //! bundles, audits, the `202` answer of a resolving publish, ticketed bundle
@@ -71,6 +72,14 @@ pub fn document_routes(api: &str) -> Router<SharedState> {
         .route(
             &p("/servers/:ns/:name/versions/:version"),
             put(edit_split).delete(delete_split),
+        )
+        .route(
+            &p("/servers/:ns/versions/:version/purge"),
+            post(purge_encoded),
+        )
+        .route(
+            &p("/servers/:ns/:name/versions/:version/purge"),
+            post(purge_split),
         )
 }
 
@@ -367,9 +376,9 @@ fn issue(e: &McpError) -> serde_json::Value {
         | McpError::BundleSignatureRequired { index, .. }
         | McpError::PackageVersionUnpinned { index }
         | McpError::OciNotAnImage { index } => ("semantic", format!("packages[{index}]")),
-        McpError::ReservedNamespace { .. } | McpError::NamespaceNotAllowed { .. } => {
-            ("semantic", "name".to_string())
-        }
+        McpError::ReservedNamespace { .. }
+        | McpError::NamespaceNotAllowed { .. }
+        | McpError::NameCaseConflict { .. } => ("semantic", "name".to_string()),
         McpError::VersionExists => ("semantic", "version".to_string()),
         _ => ("semantic", String::new()),
     };
@@ -531,6 +540,21 @@ async fn validate(
                 .map_err(|e| McpError::Internal(e.to_string()))?
         {
             return Err(McpError::VersionExists);
+        }
+        // A hosted registry refuses a case-only twin of a recorded name
+        // (#5434); a holder learns of it here as the publish would answer.
+        if scope.version_taken
+            && super::proxy_helpers::reject_write_if_not_hosted(&repo.repo_type).is_ok()
+        {
+            let twin = surface::case_twin_of(&state.db, repo.id, &server.name)
+                .await
+                .map_err(|e| McpError::Internal(e.to_string()))?;
+            if let Some(existing) = twin {
+                return Err(McpError::NameCaseConflict {
+                    name: server.name.clone(),
+                    existing,
+                });
+            }
         }
         if !scope.packages {
             fmt::check_installable(&server)?;
@@ -1074,6 +1098,192 @@ async fn delete_impl(
     Ok(surface::json_ok(
         StatusCode::OK,
         &served_entry(&row, &repo, base.as_str(), false),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// POST .../versions/{v}/purge (admin purge of a deleted version, #5368)
+// ---------------------------------------------------------------------------
+
+async fn purge_encoded(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, version)): Path<(String, String, String)>,
+) -> HandlerResult {
+    let name = server_name(&ns, None);
+    let at = Coordinates {
+        repo_key: &repo_key,
+        name: &name,
+        version: &version,
+    };
+    purge_impl(&state, auth, at).await
+}
+
+async fn purge_split(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((repo_key, ns, name, version)): Path<(String, String, String, String)>,
+) -> HandlerResult {
+    let name = server_name(&ns, Some(&name));
+    let at = Coordinates {
+        repo_key: &repo_key,
+        name: &name,
+        version: &version,
+    };
+    purge_impl(&state, auth, at).await
+}
+
+/// The OCI pins of a stored version (index and gated child digests), as
+/// the purge audit lists them.
+fn oci_pin_digests(row: &VersionRow) -> Vec<(Uuid, String, String)> {
+    let mut out = Vec::new();
+    for pin in &row.stored.pins {
+        let r = &pin.resolved;
+        let Some(image) = r.name.as_deref() else {
+            continue;
+        };
+        for digest in [r.digest.as_deref(), r.gate_digest.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let entry = (r.repository_id, image.to_string(), digest.to_string());
+            if !out.contains(&entry) {
+                out.push(entry);
+            }
+        }
+    }
+    out
+}
+
+/// Admin purge of a soft-deleted version: its server.json artifact and its
+/// bundles go to the trash, as the generic artifact delete does, which
+/// releases what the version pins (an OCI digest is pinned only while the
+/// server.json row is outside the trash,
+/// [`writes::digest_pinned_by_mcp`]). The tombstone stays, so the version
+/// can never be published again. Instance administrators only; a version
+/// that is not `deleted` is refused (`409 mcp_version_not_deleted`), so a
+/// purge is always the second, deliberate step after the audited,
+/// namespace-gated soft delete. Audited `MCP_SERVER_PURGED`.
+async fn purge_impl(
+    state: &SharedState,
+    auth: Option<AuthExtension>,
+    at: Coordinates<'_>,
+) -> HandlerResult {
+    let Coordinates {
+        repo_key,
+        name,
+        version,
+    } = at;
+    let (ext, repo) = writable_repo(state, auth, repo_key).await?;
+    if !ext.is_admin {
+        return Err(problem(
+            403,
+            "mcp_forbidden",
+            "Purging a server version needs an instance administrator",
+            serde_json::json!({}),
+        ));
+    }
+    repo.reject_if_promotion_only(false).map_err(reproblem)?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(internal)?;
+    let artifacts = state.create_artifact_service(storage);
+    let mut tx = state.db.begin().await.map_err(internal)?;
+    surface::lock_server(&mut tx, repo.id, name)
+        .await
+        .map_err(internal)?;
+    let row = versions_of(&mut *tx, repo.id, name)
+        .await?
+        .into_iter()
+        .find(|r| r.version == version)
+        .ok_or_else(not_found)?;
+    if row.stored.registry.status != ServerStatus::Deleted {
+        return Err(problem(
+            409,
+            "mcp_version_not_deleted",
+            "Only a deleted server version can be purged: delete it first with \
+             DELETE .../servers/{serverName}/versions/{version}",
+            serde_json::json!({ "status": row.stored.registry.status.as_str() }),
+        ));
+    }
+    let bundle_prefix = format!("servers/{name}/{version}/bundles/");
+    let bundles: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false \
+         AND left(path, length($2)) = $2 ORDER BY path",
+    )
+    .bind(repo.id)
+    .bind(&bundle_prefix)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let mut trashed = Vec::with_capacity(bundles.len() + 1);
+    for id in std::iter::once(row.artifact_id).chain(bundles) {
+        let artifact = artifacts.prepare_delete(id).await.map_err(internal)?;
+        artifacts
+            .commit_delete_in_tx(&mut tx, id)
+            .await
+            .map_err(internal)?;
+        trashed.push(artifact);
+    }
+    // The trigger recorded the tombstone at insert; the soft delete wrote it
+    // again. Kept here as well, so a purge never frees the version number.
+    sqlx::query(
+        "INSERT INTO mcp_version_tombstones (repository_id, name, version, first_artifact_id) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+    )
+    .bind(repo.id)
+    .bind(name)
+    .bind(version)
+    .bind(row.artifact_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    surface::recompute_latest_in(&mut tx, repo.id, name)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    for artifact in &trashed {
+        artifacts.finish_delete(artifact, true).await;
+    }
+    let mut released = Vec::new();
+    for (repository_id, image, digest) in oci_pin_digests(&row) {
+        // Another live version may pin the same digest: the OCI delete
+        // guard then still refuses it.
+        let still_pinned = writes::digest_pinned_by_mcp(&state.db, repository_id, &image, &digest)
+            .await
+            .unwrap_or(true);
+        released.push(serde_json::json!({
+            "repository_id": repository_id,
+            "image": image,
+            "digest": digest,
+            "still_pinned": still_pinned,
+        }));
+    }
+    let trashed_paths: Vec<&str> = trashed.iter().map(|a| a.path.as_str()).collect();
+    writes::audit(
+        &state.db,
+        AuditAction::McpServerPurged,
+        Actor::User(ext.user_id),
+        &repo.key,
+        Some(row.artifact_id),
+        name,
+        version,
+        serde_json::json!({
+            "repository_id": repo.id,
+            "released_digests": released,
+            "pins": row.stored.pins.len(),
+            "trashed": trashed_paths,
+        }),
+    );
+    Ok(surface::json_ok(
+        StatusCode::OK,
+        &serde_json::json!({
+            "server": name,
+            "version": version,
+            "purged": true,
+            "trashed": trashed_paths,
+            "releasedDigests": released,
+        }),
     ))
 }
 
@@ -3172,6 +3382,170 @@ mod tests {
         env.teardown().await;
     }
 
+    /// The rows of `repo_id` stored under exactly `name`.
+    async fn rows_named(pool: &PgPool, repo_id: Uuid, name: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name = $2")
+            .bind(repo_id)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// #5434: a hosted publish of a case-only twin of a recorded name is
+    /// `409 mcp_name_case_conflict` naming the stored name, and stores
+    /// nothing; `/validate` reports it to a holder; the same name publishes
+    /// into another registry; a name recorded only in the ledger (deleted
+    /// and purged) still blocks its twins.
+    #[tokio::test]
+    async fn case_only_twin_of_a_recorded_name_is_refused() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let first = doc("io.acme/tool", "1.0.0", serde_json::json!([]));
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&first))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        for twin in ["io.Acme/tool", "IO.ACME/TOOL", "io.acme/Tool"] {
+            let d = doc(twin, "2.0.0", serde_json::json!([]));
+            let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (StatusCode::CONFLICT, Some("mcp_name_case_conflict")),
+                "{twin}: {b}"
+            );
+            let detail = b["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("'io.acme/tool'"), "{twin}: {b}");
+            assert_eq!(rows_named(&env.fx.pool, env.fx.repo_id, twin).await, 0);
+            let (s, b) = env.json(env.admin(), "POST", "/validate", Some(&d)).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            assert_eq!(b["valid"], false, "{twin}: {b}");
+            assert_eq!(b["issues"][0]["reference"], "mcp_name_case_conflict", "{b}");
+        }
+        // Another registry holds no `io.acme/tool`: the twin is a new name there.
+        let (other_id, other_key) = env.repo("local", "mcp").await;
+        tdh::grant_repo_access(&env.fx.pool, other_id, env.fx.user_id).await;
+        let twin = doc("io.Acme/tool", "1.0.0", serde_json::json!([]));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{other_key}/v0.1/publish"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&twin).unwrap()))
+            .unwrap();
+        let (s, b) = tdh::send(env.member(), req).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert_eq!(rows_named(&env.fx.pool, other_id, "io.Acme/tool").await, 1);
+        // A name only the ledger remembers (its versions purged) still
+        // blocks its look-alikes.
+        sqlx::query(
+            "INSERT INTO mcp_version_tombstones (repository_id, name, version) \
+             VALUES ($1, 'io.gone/tool', '1.0.0')",
+        )
+        .bind(env.fx.repo_id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let d = doc("io.Gone/tool", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_name_case_conflict")),
+            "{b}"
+        );
+        assert!(b["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'io.gone/tool'"));
+        env.teardown().await;
+    }
+
+    /// #5434: a stored name keeps publishing even when a case-only twin of
+    /// it was stored before the rule (seeded directly: publish now refuses
+    /// it). Neither stored spelling is renamed; a third spelling is refused.
+    #[tokio::test]
+    async fn stored_case_twins_keep_publishing_new_versions() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let d = doc("io.acme/kept", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let path = fmt::storage_path("io.Acme/kept", "1.0.0");
+        super::super::proxy_helpers::insert_artifact(
+            &env.fx.pool,
+            super::super::proxy_helpers::NewArtifact {
+                repository_id: env.fx.repo_id,
+                path: &path,
+                name: "io.Acme/kept",
+                version: "1.0.0",
+                size_bytes: 2,
+                checksum_sha256: &"e".repeat(64),
+                content_type: "application/json",
+                storage_key: &path,
+                uploaded_by: env.fx.user_id,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seed the stored twin"));
+        for name in ["io.Acme/kept", "io.acme/kept"] {
+            let d = doc(name, "1.1.0", serde_json::json!([]));
+            let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+            assert_eq!(s, StatusCode::OK, "{name}: {b}");
+            assert_eq!(rows_named(&env.fx.pool, env.fx.repo_id, name).await, 2);
+        }
+        let d = doc("io.ACME/kept", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_name_case_conflict")),
+            "{b}"
+        );
+        env.teardown().await;
+    }
+
+    /// #5434: two concurrent publishes of case-only twins into an empty
+    /// registry serialise on the case-insensitive name lock: exactly one is
+    /// stored, the other is `409 mcp_name_case_conflict`.
+    #[tokio::test]
+    async fn concurrent_case_twins_publish_exactly_one() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        for round in 0..4 {
+            let lower = format!("io.race{round}/tool");
+            let upper = format!("io.Race{round}/tool");
+            let (a, b) = (
+                doc(&lower, "1.0.0", serde_json::json!([])),
+                doc(&upper, "1.0.0", serde_json::json!([])),
+            );
+            let ((sa, ba), (sb, bb)) = tokio::join!(
+                env.json(env.member(), "POST", "/publish", Some(&a)),
+                env.json(env.member(), "POST", "/publish", Some(&b)),
+            );
+            let mut statuses = [sa, sb];
+            statuses.sort();
+            assert_eq!(
+                statuses,
+                [StatusCode::OK, StatusCode::CONFLICT],
+                "round {round}: {ba} / {bb}"
+            );
+            let loser = if sa == StatusCode::CONFLICT { &ba } else { &bb };
+            assert_eq!(loser["error"], "mcp_name_case_conflict", "{loser}");
+            let stored: i64 = sqlx::query_scalar(
+                "SELECT COUNT(DISTINCT name) FROM mcp_version_tombstones \
+                 WHERE repository_id = $1 AND lower(name) = $2",
+            )
+            .bind(env.fx.repo_id)
+            .bind(&lower)
+            .fetch_one(&env.fx.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, 1, "round {round}");
+        }
+        env.teardown().await;
+    }
+
     /// E6 (#5253 e2e): with a Local OCI backing repository, an image named on
     /// a host that is not this instance is `422 mcp_external_registry`,
     /// whether or not `oci` is mapped.
@@ -3256,6 +3630,150 @@ mod tests {
         assert_eq!(cache_key("oci", "x", "1"), None);
     }
 
+    /// #5368: the admin purge of a deleted version trashes its server.json
+    /// and bundles, which releases its OCI pins; the tombstone stays (a
+    /// republish is still `409`), and it is audited `MCP_SERVER_PURGED` with
+    /// the released digests. A member, and a version that is not deleted,
+    /// are refused.
+    #[tokio::test]
+    async fn admin_purge_of_a_deleted_version_releases_its_pins() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (oci_id, _) = env.repo("local", "docker").await;
+        let bundle_tail = "/servers/com.acme/p/versions/1.0.0/bundles/echo.mcpb";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(env.url(bundle_tail))
+            .body(Body::from(UNSIGNED))
+            .unwrap();
+        let (s, b) = tdh::send(env.member(), req).await;
+        assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&b));
+        let d = doc("com.acme/p", "1.0.0", serde_json::json!([]));
+        let (s, b) = env.json(env.member(), "POST", "/publish", Some(&d)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let id = env.artifact("com.acme/p", "1.0.0").await;
+        let bundle = tdh::artifact_id_at(
+            &env.fx.pool,
+            env.fx.repo_id,
+            &resolver::bundle_path("com.acme/p", "1.0.0", "echo.mcpb"),
+        )
+        .await;
+        let tail = "/servers/com.acme/p/versions/1.0.0";
+        let purge = "/servers/com.acme%2Fp/versions/1.0.0/purge";
+
+        // A member may not purge; an active version is not purged.
+        let (s, b) = env.json(env.member(), "POST", purge, None).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("mcp_forbidden"))
+        );
+        let (s, b) = env.json(env.admin(), "POST", purge, None).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_version_not_deleted"))
+        );
+
+        // Soft delete, then pin an image digest (index and gated child).
+        assert_eq!(
+            env.json(env.member(), "DELETE", tail, None).await.0,
+            StatusCode::OK
+        );
+        let pin = serde_json::json!([{
+            "index": 9, "registryType": "oci",
+            "submitted": {"identifier": "ak.test/oci/acme/mcp:1"},
+            "resolved": {"repository": "oci", "repositoryId": oci_id, "name": "acme/mcp",
+                         "digest": "sha256:aa", "gateDigest": "sha256:bb",
+                         "resolvedAt": "2026-01-01T00:00:00Z"},
+        }]);
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{packages}', \
+             COALESCE(metadata->'packages', '[]'::jsonb) || $2) WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .bind(&pin)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let pinned = |digest: &'static str| {
+            let pool = env.fx.pool.clone();
+            async move {
+                writes::digest_pinned_by_mcp(&pool, oci_id, "acme/mcp", digest)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert!(pinned("sha256:aa").await && pinned("sha256:bb").await);
+        assert_eq!(
+            env.json(env.member(), "POST", purge, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+
+        // The admin purge (split spelling).
+        let (s, b) = env
+            .json(env.admin(), "POST", &format!("{tail}/purge"), None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let digests: Vec<&str> = b["releasedDigests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["digest"].as_str())
+            .collect();
+        assert_eq!(digests, ["sha256:aa", "sha256:bb"], "{b}");
+        assert!(!pinned("sha256:aa").await && !pinned("sha256:bb").await);
+        let trashed: Vec<bool> =
+            sqlx::query_scalar("SELECT is_deleted FROM artifacts WHERE id = ANY($1)")
+                .bind(vec![id, bundle])
+                .fetch_all(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(trashed, [true, true], "server.json and bundle are trashed");
+        let row = tdh::audit_row_eventually(&env.fx.pool, id, "MCP_SERVER_PURGED").await;
+        assert_eq!(row.user_id, Some(env.fx.user_id));
+        assert_eq!(row.details["server"], "com.acme/p");
+        assert_eq!(
+            row.details["released_digests"].as_array().map(Vec::len),
+            Some(2),
+            "{}",
+            row.details
+        );
+        assert_eq!(row.details["trashed"].as_array().map(Vec::len), Some(2));
+
+        // The tombstone stays: the version can never be published again.
+        assert!(
+            writes::version_tombstoned(&env.fx.pool, env.fx.repo_id, "com.acme/p", "1.0.0")
+                .await
+                .unwrap()
+        );
+        let mut other = d.clone();
+        other["description"] = "Different bytes".into();
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&other))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_version_exists"))
+        );
+        // Gone from the registry, and a second purge finds nothing.
+        assert_eq!(
+            env.json(
+                env.anon(),
+                "GET",
+                &format!("{tail}?include_deleted=true"),
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            env.json(env.admin(), "POST", purge, None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        env.teardown().await;
+    }
+
     #[tokio::test]
     async fn pinned_digest_is_found_by_the_delete_guard() {
         let Some(mut env) = Env::new().await else {
@@ -3300,6 +3818,68 @@ mod tests {
             !writes::digest_pinned_by_mcp(&env.fx.pool, oci_id, "acme/mcp", "sha256:aa")
                 .await
                 .unwrap()
+        );
+        env.teardown().await;
+    }
+
+    /// Finding 15: the asynchronous fill recomputes its target from the
+    /// current mapping and fails unless it is the Remote recorded at publish,
+    /// rather than pinning the package as "the mapped repository" with the
+    /// id of a Remote the mapping no longer names.
+    #[tokio::test]
+    async fn async_fill_fails_when_the_fill_target_changed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@acme/echo/-/echo-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz-1.0.0".to_vec()))
+            .mount(&upstream)
+            .await;
+        let mut remotes = Vec::new();
+        for _ in 0..2 {
+            let (id, key) = env.repo("remote", "npm").await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(upstream.uri())
+                .bind(id)
+                .execute(&env.fx.pool)
+                .await
+                .unwrap();
+            tdh::grant_repo_access(&env.fx.pool, id, env.fx.user_id).await;
+            remotes.push(key);
+        }
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remotes[0]}).to_string(),
+        )
+        .await;
+        let (s, b) = env
+            .json(
+                env.member(),
+                "POST",
+                "/publish",
+                Some(&doc("com.acme/moved", "1.0.0", npm("1.0.0"))),
+            )
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let id = env.artifact("com.acme/moved", "1.0.0").await;
+        // The mapping moves to another Remote before the job runs.
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remotes[1]}).to_string(),
+        )
+        .await;
+        let res = resolve_until_settled(&env, id).await;
+        assert_eq!(res["state"], "failed", "{res}");
+        assert_eq!(res["error"]["error"], "mcp_package_not_found", "{res}");
+        assert!(
+            res["error"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("no longer fills through")),
+            "{res}"
         );
         env.teardown().await;
     }

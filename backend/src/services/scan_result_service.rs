@@ -2146,6 +2146,62 @@ impl ScanResultService {
         Ok((results, total))
     }
 
+    /// [`Self::list_scans`] showing a scan of one of `served_only.repos` (MCP
+    /// registries the caller does not hold, #5253) only when its artifact is
+    /// in `served_only.served`, so the scans of a version the caller is not
+    /// served, and of a row the served set does not name, are left out in
+    /// SQL (fail closed) and `total` and the page count only the rest.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_scans_served_only(
+        &self,
+        repository_id: Option<Uuid>,
+        artifact_id: Option<Uuid>,
+        status: Option<&str>,
+        scan_type: Option<&str>,
+        served_only: &crate::services::search_service::McpServedOnly,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<ScanResult>, i64)> {
+        const FILTER: &str = "($1::uuid IS NULL OR repository_id = $1) \
+              AND ($2::uuid IS NULL OR artifact_id = $2) \
+              AND ($3::text IS NULL OR status = $3) \
+              AND ($4::text IS NULL OR scan_type = $4) \
+              AND (repository_id <> ALL($5) OR artifact_id = ANY($6))";
+        let page_sql = format!(
+            "SELECT id, artifact_id, repository_id, scan_type, status, \
+                    findings_count, critical_count, high_count, medium_count, low_count, \
+                    info_count, scanner_version, error_message, started_at, completed_at, \
+                    created_at, is_reused, source_scan_id, scan_completeness, \
+                    scan_completeness_reason, vuln_db_version, vuln_db_published_at \
+             FROM scan_results WHERE {FILTER} \
+             ORDER BY created_at DESC LIMIT $7 OFFSET $8"
+        );
+        let results = sqlx::query_as::<_, ScanResult>(sqlx::AssertSqlSafe(page_sql))
+            .bind(repository_id)
+            .bind(artifact_id)
+            .bind(status)
+            .bind(scan_type)
+            .bind(&served_only.repos)
+            .bind(&served_only.served)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let count_sql = format!("SELECT COUNT(*) FROM scan_results WHERE {FILTER}");
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
+            .bind(repository_id)
+            .bind(artifact_id)
+            .bind(status)
+            .bind(scan_type)
+            .bind(&served_only.repos)
+            .bind(&served_only.served)
+            .fetch_one(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok((results, total))
+    }
+
     // -----------------------------------------------------------------------
     // Findings
     // -----------------------------------------------------------------------

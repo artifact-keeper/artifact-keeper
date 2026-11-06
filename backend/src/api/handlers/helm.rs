@@ -721,6 +721,7 @@ async fn fetch_chart_via_index(
         &fetch_url,
         &cache_path,
         RepositoryFormat::Helm,
+        ctx.is_head,
     )
     .await?;
     // #3446: count the proxied chart (or its `.prov`). `cache_path` is the

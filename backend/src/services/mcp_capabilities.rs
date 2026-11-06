@@ -45,6 +45,12 @@ pub const MAX_LABEL_LEN: usize = 200;
 /// The scanner name drift findings are recorded under.
 pub const DRIFT_SCANNER: &str = "ak-mcp-capabilities";
 pub const DRIFT_FINDING_SOURCE: &str = "mcp-capabilities";
+/// Snapshots kept per (version, source, origin) by the retention pass
+/// ([`prune_snapshots`], #5386), newest first. Rows still referenced are kept
+/// on top of these.
+pub const SNAPSHOT_KEEP: i64 = 20;
+/// Snapshots deleted per retention pass at most.
+pub const SNAPSHOT_PRUNE_BATCH: i64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Vocabulary
@@ -261,6 +267,13 @@ impl CapabilitySet {
     /// Parse the `{tools, resources, prompts, instructions}` members of
     /// `doc` (each optional). Items must be objects with a non-empty string
     /// key (`name`, or `uri` for resources), unique per kind.
+    ///
+    /// Identifiers (the key, a resource's `name`, a prompt argument's
+    /// `name`) with control, bidirectional, zero-width or tag characters
+    /// are refused, as the publish path refuses them in a declared block
+    /// (`formats::mcp::has_forbidden_chars`). Free text (titles,
+    /// descriptions, `instructions`) is not refused here: the lint flags it
+    /// (`mcp_lint::lint_capabilities`, `hidden_text`).
     pub fn from_doc(doc: &Value) -> Result<Self, CapError> {
         let Some(obj) = doc.as_object() else {
             return Err(CapError::new("", "must be a JSON object"));
@@ -339,11 +352,44 @@ fn validate_items(kind: Kind, items: &[Value]) -> Result<(), CapError> {
                 ))
             }
         };
+        check_identifiers(kind, obj, &path)?;
         if !seen.insert(key.clone()) {
             return Err(CapError::new(
                 format!("{path}.{field}"),
                 format!("duplicate {field} `{key}`"),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse hidden characters in an item's identifiers (#5388): its key, a
+/// resource's `name`, a prompt argument's `name`.
+fn check_identifiers(kind: Kind, obj: &Map<String, Value>, path: &str) -> Result<(), CapError> {
+    let refuse = |at: String| {
+        Err(CapError::new(
+            at,
+            "control, bidirectional or zero-width characters are not allowed",
+        ))
+    };
+    let hidden = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .is_some_and(crate::formats::mcp::has_forbidden_chars)
+    };
+    let field = kind.key_field();
+    if hidden(obj.get(field)) {
+        return refuse(format!("{path}.{field}"));
+    }
+    if kind == Kind::Resources && hidden(obj.get("name")) {
+        return refuse(format!("{path}.name"));
+    }
+    if kind == Kind::Prompts {
+        if let Some(args) = obj.get("arguments").and_then(Value::as_array) {
+            for (j, arg) in args.iter().enumerate() {
+                if hidden(arg.get("name")) {
+                    return refuse(format!("{path}.arguments[{j}].name"));
+                }
+            }
         }
     }
     Ok(())
@@ -798,12 +844,15 @@ pub struct SnapshotRow {
     pub worker_version: Option<String>,
     pub details: Value,
     pub created_at: DateTime<Utc>,
+    /// The latest time this content was seen again (a deduplicated repeat,
+    /// #5386); `None` until it is.
+    pub last_seen_at: Option<DateTime<Utc>>,
 }
 
 const SNAPSHOT_COLUMNS: &str = "id, repository_id, artifact_id, server_name, server_version, \
      source, provenance, origin, reported_by, auth_state, outcome, protocol_version, observed_at, \
      ttl_ms, cache_scope, tools, resources, prompts, instructions, tools_hash, content_hash, \
-     worker_version, details, created_at";
+     worker_version, details, created_at, last_seen_at";
 
 fn arr(v: &Value) -> Vec<Value> {
     v.as_array().cloned().unwrap_or_default()
@@ -836,6 +885,7 @@ impl SnapshotRow {
             "outcome": self.outcome,
             "protocolVersion": self.protocol_version,
             "observedAt": self.observed_at,
+            "lastSeenAt": self.last_seen_at.unwrap_or(self.observed_at),
             "ttlMs": self.ttl_ms,
             "cacheScope": self.cache_scope,
             "counts": {
@@ -872,7 +922,10 @@ pub struct Inserted {
     /// The previous successful snapshot of the same source (and, for a
     /// declaration, the same origin).
     pub previous: Option<SnapshotRow>,
-    /// `false` when an identical declaration already existed (idempotent).
+    /// `false` when nothing new was stored: an identical declaration already
+    /// existed (idempotent), or the newest snapshot of the same (version,
+    /// source, origin) has the same content, outcome and auth state and only
+    /// its `last_seen_at` was bumped (#5386). No audit, lint or drift then.
     pub created: bool,
 }
 
@@ -892,7 +945,7 @@ impl Inserted {
 /// The newest successful snapshot of `source` for `artifact_id` (for a
 /// declaration, of the same `origin`), excluding `except`.
 async fn previous_ok(
-    db: &PgPool,
+    db: &mut sqlx::PgConnection,
     artifact_id: Uuid,
     source: Source,
     origin: Option<&str>,
@@ -914,10 +967,86 @@ async fn previous_ok(
         .await
 }
 
+/// Store a snapshot in its own transaction. See [`insert_snapshot_in`].
 pub async fn insert_snapshot(db: &PgPool, s: &NewSnapshot) -> sqlx::Result<Inserted> {
+    let mut tx = db.begin().await?;
+    let ins = insert_snapshot_in(&mut tx, s).await?;
+    tx.commit().await?;
+    Ok(ins)
+}
+
+/// The newest snapshot of (version, source, origin) when it already records
+/// what `s` saw: same `content_hash`, `outcome` and `auth_state` (#5386).
+async fn repeat_of_latest(
+    db: &mut sqlx::PgConnection,
+    s: &NewSnapshot,
+    origin: Option<&str>,
+) -> sqlx::Result<Option<SnapshotRow>> {
+    let sql = format!(
+        "SELECT {SNAPSHOT_COLUMNS} FROM mcp_capability_snapshots \
+         WHERE artifact_id = $1 AND source = $2 AND origin IS NOT DISTINCT FROM $3 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    let latest: Option<SnapshotRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(s.artifact_id)
+        .bind(s.source.as_str())
+        .bind(origin)
+        .fetch_optional(db)
+        .await?;
+    Ok(latest.filter(|l| {
+        l.content_hash == s.set.content_hash()
+            && l.outcome == s.outcome.as_str()
+            && l.auth_state == s.auth_state.as_str()
+    }))
+}
+
+/// Store a snapshot on `db` (a transaction: the caller commits).
+///
+/// A reported or observed snapshot that repeats the newest one of the same
+/// (version, source, origin) is not stored again: that row's `last_seen_at`
+/// (and `ttl_ms`, the latest re-probe hint) is bumped and it is returned with
+/// `created: false` (#5386). The check runs under a transaction-scoped
+/// advisory lock on the (version, source, origin), so two concurrent repeats
+/// cannot both insert. A declaration stays idempotent through its unique
+/// index.
+pub async fn insert_snapshot_in(
+    db: &mut sqlx::PgConnection,
+    s: &NewSnapshot,
+) -> sqlx::Result<Inserted> {
+    let origin = s.origin.as_deref().map(|o| truncate(o, MAX_URI_LEN));
+    if s.source != Source::PublisherDeclared {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "mcp-snapshot/{}/{}/{}",
+                s.artifact_id,
+                s.source.as_str(),
+                origin.as_deref().unwrap_or("")
+            ))
+            .execute(&mut *db)
+            .await?;
+        if let Some(latest) = repeat_of_latest(&mut *db, s, origin.as_deref()).await? {
+            let sql = format!(
+                "UPDATE mcp_capability_snapshots SET \
+                   last_seen_at = GREATEST(COALESCE(last_seen_at, observed_at), $2), \
+                   ttl_ms = $3 \
+                 WHERE id = $1 RETURNING {SNAPSHOT_COLUMNS}"
+            );
+            let snapshot: SnapshotRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(latest.id)
+                .bind(s.observed_at)
+                .bind(s.ttl_ms)
+                .fetch_one(&mut *db)
+                .await?;
+            return Ok(Inserted {
+                snapshot,
+                previous: None,
+                created: false,
+            });
+        }
+    }
     let origin_scope =
         (s.source == Source::PublisherDeclared).then(|| s.origin.as_deref().unwrap_or(""));
-    let previous = previous_ok(db, s.artifact_id, s.source, origin_scope, None).await?;
+    let previous = previous_ok(&mut *db, s.artifact_id, s.source, origin_scope, None).await?;
     let sql = format!(
         "INSERT INTO mcp_capability_snapshots (repository_id, artifact_id, server_name, \
            server_version, source, provenance, origin, reported_by, auth_state, outcome, \
@@ -933,7 +1062,7 @@ pub async fn insert_snapshot(db: &PgPool, s: &NewSnapshot) -> sqlx::Result<Inser
         .bind(&s.server_version)
         .bind(s.source.as_str())
         .bind(truncate(&s.provenance, MAX_LABEL_LEN))
-        .bind(s.origin.as_deref().map(|o| truncate(o, MAX_URI_LEN)))
+        .bind(&origin)
         .bind(s.reported_by)
         .bind(s.auth_state.as_str())
         .bind(s.outcome.as_str())
@@ -949,7 +1078,7 @@ pub async fn insert_snapshot(db: &PgPool, s: &NewSnapshot) -> sqlx::Result<Inser
         .bind(s.set.content_hash())
         .bind(s.worker_version.as_deref().map(|w| truncate(w, 128)))
         .bind(&s.details)
-        .fetch_optional(db)
+        .fetch_optional(&mut *db)
         .await?;
     match row {
         Some(snapshot) => Ok(Inserted {
@@ -968,7 +1097,7 @@ pub async fn insert_snapshot(db: &PgPool, s: &NewSnapshot) -> sqlx::Result<Inser
                 .bind(s.artifact_id)
                 .bind(&s.origin)
                 .bind(s.set.content_hash())
-                .fetch_one(db)
+                .fetch_one(&mut *db)
                 .await?;
             Ok(Inserted {
                 snapshot,
@@ -1016,6 +1145,56 @@ pub async fn list_snapshots(
         .bind(limit)
         .fetch_all(db)
         .await
+}
+
+/// Delete snapshot history beyond the newest [`SNAPSHOT_KEEP`] of each
+/// (version, source, origin), at most [`SNAPSHOT_PRUNE_BATCH`] rows (#5386).
+/// Run by the introspection scheduler pass; idempotent.
+///
+/// Never deleted, whatever its rank:
+/// * the newest successful snapshot of each (version, source, origin): the
+///   current view ([`pick_current`]) and the baseline the next snapshot is
+///   compared against for drift;
+/// * a snapshot a `tool_drift` finding names (its description carries both
+///   snapshot ids, which the diff link uses);
+/// * a snapshot an open job, or the newest job of its target, points at (the
+///   re-probe schedule reads that snapshot's `ttlMs`). An older job's
+///   `snapshot_id` is cleared by the foreign key (`ON DELETE SET NULL`);
+///   the job row itself keeps its status and timestamps.
+pub async fn prune_snapshots(db: &PgPool) -> sqlx::Result<u64> {
+    let r = sqlx::query(
+        "WITH ranked AS ( \
+           SELECT id, artifact_id, outcome, \
+             row_number() OVER (PARTITION BY artifact_id, source, COALESCE(origin, '') \
+                                ORDER BY created_at DESC, id DESC) AS rn, \
+             row_number() OVER (PARTITION BY artifact_id, source, COALESCE(origin, ''), \
+                                  outcome = 'ok' \
+                                ORDER BY created_at DESC, id DESC) AS rn_outcome \
+           FROM mcp_capability_snapshots), \
+         victims AS ( \
+           SELECT r.id FROM ranked r \
+           WHERE r.rn > $1 \
+             AND NOT (r.outcome = 'ok' AND r.rn_outcome = 1) \
+             AND NOT EXISTS (SELECT 1 FROM scan_findings f \
+                             WHERE f.artifact_id = r.artifact_id AND f.source = $3 \
+                               AND strpos(f.description, r.id::text) > 0) \
+             AND NOT EXISTS (SELECT 1 FROM mcp_introspection_jobs j \
+                             WHERE j.snapshot_id = r.id \
+                               AND (j.status IN ('pending', 'claimed') \
+                                    OR NOT EXISTS (SELECT 1 FROM mcp_introspection_jobs n \
+                                                   WHERE n.artifact_id = j.artifact_id \
+                                                     AND n.kind = j.kind \
+                                                     AND n.target_key = j.target_key \
+                                                     AND n.created_at > j.created_at))) \
+           LIMIT $2) \
+         DELETE FROM mcp_capability_snapshots s USING victims v WHERE s.id = v.id",
+    )
+    .bind(SNAPSHOT_KEEP)
+    .bind(SNAPSHOT_PRUNE_BATCH)
+    .bind(DRIFT_FINDING_SOURCE)
+    .execute(db)
+    .await?;
+    Ok(r.rows_affected())
 }
 
 /// The current snapshot: the newest successful one of the source with the
@@ -1194,16 +1373,29 @@ pub async fn store(
     let ins = insert_snapshot(db, s)
         .await
         .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let drift = record_stored(db, s, &ins, repo_key).await?;
+    Ok((ins, drift))
+}
+
+/// The side effects of a stored snapshot, run after its transaction
+/// committed: audit `MCP_CAPABILITIES_INGESTED`, lint the tools and raise
+/// `tool_drift`. Nothing when `ins.created` is false (an idempotent
+/// declaration or a deduplicated repeat). Returns the drift scan id.
+pub async fn record_stored(
+    db: &PgPool,
+    s: &NewSnapshot,
+    ins: &Inserted,
+    repo_key: &str,
+) -> crate::error::Result<Option<Uuid>> {
     if ins.created {
         audit_ingested(db, s.reported_by, &ins.snapshot, repo_key);
         if let Some(source) = lint_source(s) {
-            let findings = crate::services::mcp_lint::lint_tools(s.set.items(Kind::Tools));
+            let findings = crate::services::mcp_lint::lint_capabilities(&s.set);
             crate::services::mcp_lint::record_after_write(db, s.artifact_id, &findings, &source)
                 .await;
         }
     }
-    let drift = record_drift_if_any(db, &ins, repo_key).await?;
-    Ok((ins, drift))
+    record_drift_if_any(db, ins, repo_key).await
 }
 
 /// The lint source (`capabilities:<source>`) a stored snapshot's tools are
@@ -1313,6 +1505,45 @@ mod tests {
         assert_eq!(Source::RemoteProbe.drift_severity(), Severity::High);
         assert_eq!(Source::CiReported.drift_severity(), Severity::Medium);
         assert_eq!(Source::PublisherDeclared.drift_severity(), Severity::Low);
+    }
+
+    /// #5388: hidden characters in identifiers are refused (as at publish);
+    /// in free text they are accepted here and left to the lint.
+    #[test]
+    fn from_doc_refuses_hidden_chars_in_identifiers_only() {
+        let bad = [
+            (
+                json!({"tools": [{"name": "read\u{200B}file"}]}),
+                "tools[0].name",
+            ),
+            (
+                json!({"prompts": [{"name": "p\u{202E}"}]}),
+                "prompts[0].name",
+            ),
+            (
+                json!({"resources": [{"uri": "file:///x\u{2066}"}]}),
+                "resources[0].uri",
+            ),
+            (
+                json!({"resources": [{"uri": "file:///x", "name": "doc\u{FEFF}"}]}),
+                "resources[0].name",
+            ),
+            (
+                json!({"prompts": [{"name": "p", "arguments": [{"name": "a"}, {"name": "b\u{E0041}"}]}]}),
+                "prompts[0].arguments[1].name",
+            ),
+        ];
+        for (doc, path) in bad {
+            let e = CapabilitySet::from_doc(&doc).unwrap_err();
+            assert_eq!(e.path, path, "{doc}");
+            assert!(e.message.contains("zero-width"), "{e}");
+        }
+        let text = CapabilitySet::from_doc(&json!({
+            "resources": [{"uri": "file:///x", "description": "a\u{202E}b"}],
+            "prompts": [{"name": "p", "arguments": [{"name": "a", "description": "z\u{200B}w"}]}],
+            "instructions": "hi\u{200D}",
+        }));
+        assert!(text.is_ok(), "{text:?}");
     }
 
     #[test]
@@ -1519,6 +1750,7 @@ mod tests {
             worker_version: None,
             details: json!({}),
             created_at: t,
+            last_seen_at: None,
         }
     }
 
@@ -1686,10 +1918,14 @@ mod db_tests {
         )
         .await
         .unwrap();
+        // A repeat of the newest probe is deduplicated (#5386): the same row
+        // comes back with only `last_seen_at` bumped, nothing is stored and
+        // no drift is recorded.
         assert!(
-            same.previous.is_some() && d1.is_none(),
-            "same content: no drift"
+            !same.created && same.snapshot.id == a.snapshot.id && d1.is_none(),
+            "same content: deduplicated, no drift"
         );
+        assert!(same.snapshot.last_seen_at.is_some(), "last_seen_at bumped");
         let (b, d2) = store(
             &fx.pool,
             &snap(
@@ -1714,12 +1950,13 @@ mod db_tests {
         assert_eq!(severity, "high");
         assert_eq!(class, "policy");
 
+        // Two declarations and two stored probes: the repeat was not stored.
         let all = list_snapshots(&fx.pool, id, None, 50).await.unwrap();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 4);
         let probes = list_snapshots(&fx.pool, id, Some(Source::RemoteProbe), 50)
             .await
             .unwrap();
-        assert_eq!(probes.len(), 3);
+        assert_eq!(probes.len(), 2);
         assert_eq!(pick_current(&all, None).unwrap().id, b.snapshot.id);
         let got = get_snapshot(&fx.pool, b.snapshot.id)
             .await
