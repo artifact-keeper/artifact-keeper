@@ -463,8 +463,10 @@ fn copy_part_ranges(size: u64, part_size: u64) -> Vec<(u64, u64)> {
 /// copy failed with `NoSuchKey` while a small object's single-request
 /// `CopyObject` succeeded.
 fn s3_copy_source_value(bucket: &str, full_key: &str) -> String {
+    // A raw header, not an `ObjectPath`, so an empty segment would reach S3
     let encoded: Vec<String> = stored_key_form(full_key)
         .split('/')
+        .filter(|segment| !segment.is_empty())
         .map(|segment| urlencoding::encode(segment).into_owned())
         .collect();
     format!("{}/{}", bucket, encoded.join("/"))
@@ -901,7 +903,10 @@ impl S3Config {
         let endpoint = std::env::var("S3_ENDPOINT").ok();
         let public_endpoint =
             public_endpoint_from_env("S3_PUBLIC_ENDPOINT", EndpointPath::Forbidden)?;
-        let prefix = std::env::var("S3_PREFIX").ok();
+        // An empty or slash-only `S3_PREFIX` means no prefix
+        let prefix = std::env::var("S3_PREFIX")
+            .ok()
+            .filter(|p| !p.trim_matches('/').is_empty());
         if let Some(p) = prefix.as_deref() {
             if s3_prefix_collides_with_reserved_namespace(p) {
                 tracing::warn!(
@@ -4571,6 +4576,61 @@ mod tests {
     }
 
     // --- S3Config from_env tests ---
+
+    /// `S3_PREFIX=""` must not put a leading slash into the raw
+    /// `x-amz-copy-source` header. Reads and writes survive `Some("")` because
+    /// `ObjectPath::from` normalizes the key, the copy header does not, so a
+    /// server-side copy asked for `bucket//ab/cd/ef` and got `NoSuchKey`.
+    #[test]
+    fn copy_source_value_survives_an_empty_but_present_prefix() {
+        assert_eq!(
+            s3_copy_source_value("artifacts", &make_full_key(Some(""), "ab/cd/ef")),
+            "artifacts/ab/cd/ef",
+            "an empty prefix must not become a leading slash in the copy source"
+        );
+        assert_eq!(
+            s3_copy_source_value("artifacts", &make_full_key(None, "ab/cd/ef")),
+            "artifacts/ab/cd/ef"
+        );
+        assert_eq!(
+            s3_copy_source_value("artifacts", &make_full_key(Some("team-a"), "ab/cd/ef")),
+            "artifacts/team-a/ab/cd/ef"
+        );
+    }
+
+    /// `S3_PREFIX=""` means "no prefix", so it must not reach the backend as
+    /// `Some("")` at all.
+    #[test]
+    fn an_empty_s3_prefix_env_var_reads_as_no_prefix() {
+        let orig_bucket = std::env::var("S3_BUCKET").ok();
+        let orig_prefix = std::env::var("S3_PREFIX").ok();
+        std::env::set_var("S3_BUCKET", "empty-prefix-bucket");
+
+        for raw in ["", "/", "//"] {
+            std::env::set_var("S3_PREFIX", raw);
+            let config = S3Config::from_env().expect("from_env succeeds");
+            assert_eq!(
+                config.prefix, None,
+                "S3_PREFIX={raw:?} must be treated as unset, not as Some(\"\")"
+            );
+        }
+
+        std::env::set_var("S3_PREFIX", "team-a");
+        assert_eq!(
+            S3Config::from_env().expect("from_env succeeds").prefix,
+            Some("team-a".to_string()),
+            "a real prefix must still survive"
+        );
+
+        match orig_prefix {
+            Some(v) => std::env::set_var("S3_PREFIX", v),
+            None => std::env::remove_var("S3_PREFIX"),
+        }
+        match orig_bucket {
+            Some(v) => std::env::set_var("S3_BUCKET", v),
+            None => std::env::remove_var("S3_BUCKET"),
+        }
+    }
 
     #[test]
     fn test_s3_config_from_env_missing_bucket() {
