@@ -7275,6 +7275,32 @@ pub(crate) async fn record_proxy_download(
     record_proxy_download_via(&state.db, proxy, repo_id, repo_key, path, ctx).await;
 }
 
+/// `None` once [`MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS`] INLINE recordings are
+/// already running.
+///
+/// The sibling of #3778's limiter, over the same ceiling but a separate
+/// semaphore, because the two paths bound different things: that one bounds
+/// spawned tasks, this one bounds how many serve futures are inside a pool
+/// acquire at once. Without it, a proxy storm puts one recording connection
+/// demand per concurrent serve into a pool sized for request handling, and the
+/// serves queue behind their own telemetry.
+///
+/// Deliberately `try_acquire`, not `acquire`: waiting would park the serve
+/// behind a statistic, which is the failure this exists to prevent. Where the
+/// deferred recorder degrades to recording inline, an inline recorder has
+/// nowhere below it to degrade to, so an over-cap request drops its download
+/// count and keeps its bytes. That is the right way round, and it only happens
+/// once the pool is already the bottleneck.
+fn proxy_record_permit() -> Option<OwnedSemaphorePermit> {
+    static INLINE_RECORD_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(
+        INLINE_RECORD_LIMITER
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS))),
+    )
+    .try_acquire_owned()
+    .ok()
+}
+
 /// Body of [`record_proxy_download`] against an explicit [`ProxyService`]
 /// (#3844): the virtual resolvers record a Remote member's winning serve under
 /// the proxy they resolved it through. Same HEAD guard and best-effort posture.
@@ -7295,6 +7321,16 @@ pub(crate) async fn record_proxy_download_via(
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
     let Some((storage_key, metadata_key)) = proxy_record_keys(proxy, repo_key, path) else {
+        return;
+    };
+    // Bounded so a proxy storm cannot turn one statistic into unbounded pool
+    // pressure; past the cap the count is dropped, never queued.
+    let Some(_permit) = proxy_record_permit() else {
+        tracing::debug!(
+            repo_id = %repo_id,
+            path = %path,
+            "skipping proxy download record: recorder at its concurrency cap"
+        );
         return;
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
@@ -7334,11 +7370,12 @@ pub(crate) async fn record_proxy_download_via(
     }
 }
 
-/// Max concurrent fire-and-forget proxy-download record tasks
-/// ([`record_proxy_download_deferred`]). Small relative to
+/// Max concurrent proxy-download recordings, applied once to the
+/// fire-and-forget tasks ([`record_proxy_download_deferred`]) and once to the
+/// inline recordings ([`proxy_record_permit`]). Small relative to
 /// `DATABASE_MAX_CONNECTIONS` (default 50) — the same slice-of-the-pool
 /// reasoning as `ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS` — so
-/// background telemetry can never starve real request handlers.
+/// telemetry can never starve real request handlers.
 const MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS: usize = 8;
 
 static PROXY_DOWNLOAD_RECORD_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
@@ -13145,6 +13182,40 @@ mod tests {
             Some(("clean", Some(5))),
             &vulnerable
         ));
+    }
+
+    /// The recorder must be bounded and must DEGRADE, not queue: an over-cap
+    /// call returns immediately with no permit (so the serve is unaffected and
+    /// only the statistic is lost), and permits come back when the recordings
+    /// in flight finish. Unbounded here, a proxy storm turns best-effort
+    /// telemetry into main-pool exhaustion on the request path.
+    ///
+    /// The limiter is a process-global static, so this relies on nextest
+    /// running each test in its own process.
+    #[test]
+    fn the_proxy_record_limiter_refuses_past_its_cap_instead_of_queueing() {
+        let mut held = Vec::new();
+        while let Some(permit) = proxy_record_permit() {
+            held.push(permit);
+            if held.len() > MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS {
+                break;
+            }
+        }
+        assert!(
+            held.len() <= MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS,
+            "the recorder handed out {} permits against a cap of \
+             {MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS}",
+            held.len()
+        );
+        assert!(
+            proxy_record_permit().is_none(),
+            "at the cap the recording must be skipped, not queued behind a permit"
+        );
+        drop(held);
+        assert!(
+            proxy_record_permit().is_some(),
+            "permits must return once the recordings in flight finish"
+        );
     }
 
     /// Scanner applicability and archive extraction are driven by the
