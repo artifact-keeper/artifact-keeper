@@ -23455,7 +23455,7 @@ mod tests {
     /// `virtual_non_remote_owns_maven_gav_in` answers from the member list the
     /// caller already fetched: a hosted member holding the G:A:V owns it, a
     /// remote member holding it does not, and a list without hosted members
-    /// short-circuits to false
+    /// short-circuits to false. The fetching wrapper gives the same answers
     #[tokio::test]
     async fn virtual_non_remote_owns_maven_gav_in_checks_only_hosted_members() {
         let Some(pool) = db_helpers::try_pool().await else {
@@ -23510,6 +23510,20 @@ mod tests {
         let remote_cached = owns(members.clone(), "cached").await;
         let nobody = owns(members.clone(), "missing").await;
         let no_hosted_member = owns(remote_only, "cached").await;
+        let mut via_wrapper = Vec::new();
+        for artifact in ["owned", "cached"] {
+            via_wrapper.push(
+                virtual_non_remote_owns_maven_gav(
+                    &pool,
+                    virtual_id,
+                    "com.example",
+                    artifact,
+                    "1.0",
+                )
+                .await
+                .expect("ownership query"),
+            );
+        }
 
         cleanup_member_graph(
             &pool,
@@ -23527,6 +23541,7 @@ mod tests {
             !no_hosted_member,
             "a member list without hosted members is never an owner"
         );
+        assert_eq!(via_wrapper, vec![true, false], "the wrapper agrees");
     }
 
     // ── #968: deployment target of a virtual repository ──────────────────
