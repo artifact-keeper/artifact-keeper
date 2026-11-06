@@ -1801,4 +1801,198 @@ mod tests {
         );
         env.teardown().await;
     }
+
+    impl Env {
+        /// Create a Remote MCP repository of this test's upstream through
+        /// `POST /api/v1/repositories` with the extra create-body fields.
+        async fn create_remote(&mut self, extra: serde_json::Value) -> Result<(Uuid, String)> {
+            let key = format!("mcp-born-{}", Uuid::new_v4().simple());
+            let mut body = serde_json::json!({
+                "key": key, "name": key, "format": "mcp", "repo_type": "remote",
+                "upstream_url": self.upstream.uri(),
+            });
+            if let (Some(b), serde_json::Value::Object(e)) = (body.as_object_mut(), extra) {
+                b.extend(e);
+            }
+            let created = crate::api::handlers::repositories::create_repository(
+                State(self.state.clone()),
+                Extension(Some(self.admin.clone())),
+                serde_json::to_vec(&body).unwrap().into(),
+            )
+            .await;
+            let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+                .bind(&key)
+                .fetch_one(&self.fx.pool)
+                .await
+                .unwrap();
+            let repo = match created {
+                Ok(r) => r.0,
+                Err(e) => {
+                    assert_eq!(n, 0, "a refused create left a repository behind");
+                    return Err(e);
+                }
+            };
+            let dir = std::path::PathBuf::from(&self.state.config.storage_path).join(&key);
+            self.extra.push((repo.id, dir));
+            Ok((repo.id, key))
+        }
+
+        /// Age the repositories past the first-sync grace.
+        async fn age(&self, ids: &[Uuid]) {
+            sqlx::query(
+                "UPDATE repositories SET created_at = now() - interval '10 minutes' \
+                 WHERE id = ANY($1)",
+            )
+            .bind(ids)
+            .execute(&self.fx.pool)
+            .await
+            .unwrap();
+        }
+
+        async fn upstream_requests(&self) -> usize {
+            self.upstream
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .len()
+        }
+    }
+
+    /// #5402: a Remote created `cache_only`, or with `mcp_remote_sync_paused`,
+    /// makes no upstream request on its scheduled sync, and a new Remote is
+    /// not due before its create had time to store its settings.
+    #[tokio::test]
+    async fn remote_born_offline_never_contacts_its_upstream() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        env.serve(Mock::given(method("GET")), vec![]).await;
+        let (cache_only, cache_only_key) = env
+            .create_remote(serde_json::json!({
+                "upstream_mode": "cache_only",
+                "egress_proxy": {"mode": "direct"},
+            }))
+            .await
+            .expect("create cache_only");
+        let (paused, paused_key) = env
+            .create_remote(serde_json::json!({"mcp_remote_sync_paused": true}))
+            .await
+            .expect("create sync-paused");
+        let (online, online_key) = env
+            .create_remote(serde_json::json!({}))
+            .await
+            .expect("create online");
+
+        assert_eq!(
+            crate::services::upstream_mode::stored_upstream_mode(&env.fx.pool, cache_only)
+                .await
+                .unwrap(),
+            crate::services::upstream_mode::UpstreamMode::CacheOnly
+        );
+        assert_eq!(
+            crate::services::egress_proxy::load_egress_proxy(&env.fx.pool, cache_only)
+                .await
+                .unwrap()
+                .mode
+                .as_str(),
+            "direct"
+        );
+        let mine = |due: Vec<String>| -> Vec<String> {
+            due.into_iter()
+                .filter(|k| [&cache_only_key, &paused_key, &online_key].contains(&k))
+                .collect()
+        };
+        // Just created: not due yet, whatever its settings.
+        let due = mcp_remote_due(&env).await;
+        assert!(mine(due).is_empty(), "a new Remote is due at once");
+
+        env.age(&[cache_only, paused, online]).await;
+        let due = mine(mcp_remote_due(&env).await);
+        assert!(due.contains(&cache_only_key), "{due:?}");
+        assert!(due.contains(&online_key), "{due:?}");
+        assert!(
+            !due.contains(&paused_key),
+            "a sync-paused Remote is due: {due:?}"
+        );
+
+        // The scheduler's pass over the due cache-only Remote: the upstream
+        // gate refuses its first page before any request.
+        crate::services::mcp_remote::sync_each(
+            &env.state,
+            std::slice::from_ref(&cache_only_key),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            env.upstream_requests().await,
+            0,
+            "a cache-only Remote contacted upstream"
+        );
+        let st = crate::services::mcp_remote::load_state(&env.fx.pool, cache_only)
+            .await
+            .unwrap();
+        assert!(
+            st.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("upstream"),
+            "{st:?}"
+        );
+
+        // Positive control: the online Remote's pass does reach the upstream.
+        crate::services::mcp_remote::sync_each(
+            &env.state,
+            std::slice::from_ref(&online_key),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            env.upstream_requests().await > 0,
+            "the online Remote did not sync"
+        );
+        env.teardown().await;
+    }
+
+    async fn mcp_remote_due(env: &Env) -> Vec<String> {
+        crate::services::mcp_remote::due_repositories(&env.fx.pool, 3600)
+            .await
+            .unwrap()
+    }
+
+    /// #5402: while scheduled upstream jobs are paused (#5288), a scheduler
+    /// tick contacts no upstream, so a Remote created then waits; and the
+    /// create-time Remote settings are refused on other repository types.
+    #[tokio::test]
+    async fn paused_instance_and_create_time_refusals() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        env.serve(Mock::given(method("GET")), vec![]).await;
+        let (id, _) = env
+            .create_remote(serde_json::json!({}))
+            .await
+            .expect("create");
+        env.age(&[id]).await;
+        // Process-wide; nextest runs each test in its own process.
+        crate::services::upstream_pause::set_env_default(true);
+        let mut gate = crate::services::upstream_pause::UpstreamPauseGate::new(
+            crate::services::upstream_pause::MCP_REMOTE_SYNC_JOB,
+        );
+        let ran = crate::services::mcp_remote::scheduler_tick(&env.state, 3600, &mut gate).await;
+        crate::services::upstream_pause::set_env_default(false);
+        assert!(!ran, "a paused tick ran");
+        assert_eq!(env.upstream_requests().await, 0);
+
+        for extra in [
+            serde_json::json!({"repo_type": "local", "upstream_url": null, "upstream_mode": "cache_only"}),
+            serde_json::json!({"repo_type": "local", "upstream_url": null, "egress_proxy": {"mode": "direct"}}),
+            serde_json::json!({"egress_proxy": {"mode": "explicit"}}),
+            serde_json::json!({"egress_proxy": {"mode": "sideways"}}),
+            serde_json::json!({"repo_type": "local", "upstream_url": null, "mcp_remote_sync_paused": true}),
+        ] {
+            let err = env.create_remote(extra.clone()).await.expect_err("refused");
+            assert!(matches!(err, AppError::Validation(_)), "{extra}: {err:?}");
+        }
+        env.teardown().await;
+    }
 }

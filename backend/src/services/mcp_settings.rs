@@ -35,6 +35,7 @@ pub const REQUIRE_NAMESPACE_GRANT_KEY: &str = "mcp_require_namespace_grant";
 pub const REMOTE_MODE_KEY: &str = "mcp_remote_mode";
 pub const SANDBOX_KEY: &str = "mcp_sandbox_introspection";
 pub const REQUIRE_BUNDLE_SIGNATURE_KEY: &str = "mcp_require_bundle_signature";
+pub const REMOTE_SYNC_PAUSED_KEY: &str = "mcp_remote_sync_paused";
 
 /// Every key this module owns, for one `repository_config` read.
 pub const ALL_KEYS: &[&str] = &[
@@ -50,6 +51,7 @@ pub const ALL_KEYS: &[&str] = &[
     REMOTE_MODE_KEY,
     SANDBOX_KEY,
     REQUIRE_BUNDLE_SIGNATURE_KEY,
+    REMOTE_SYNC_PAUSED_KEY,
 ];
 
 /// Remote posture: `approval_required` (default) serves only approved names;
@@ -122,6 +124,11 @@ pub struct McpRepoSettings {
     /// signature that is present but invalid is always refused).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_require_bundle_signature: Option<bool>,
+    /// Remote only: the scheduled sync skips this repository (default
+    /// `false`, #5402). Set it on create to configure the Remote before its
+    /// first sync; a manual `POST .../mcp/sync` still runs a pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_remote_sync_paused: Option<bool>,
 }
 
 impl McpRepoSettings {
@@ -260,6 +267,9 @@ fn remote_only(s: &McpRepoSettings) -> Vec<&'static str> {
     if s.mcp_remote_mode.is_some() {
         v.push(REMOTE_MODE_KEY);
     }
+    if s.mcp_remote_sync_paused.is_some() {
+        v.push(REMOTE_SYNC_PAUSED_KEY);
+    }
     v
 }
 
@@ -367,6 +377,7 @@ pub fn to_store(
         (REQUIRE_OCI_LABEL_KEY, s.mcp_require_oci_label),
         (REQUIRE_NAMESPACE_GRANT_KEY, s.mcp_require_namespace_grant),
         (REQUIRE_BUNDLE_SIGNATURE_KEY, s.mcp_require_bundle_signature),
+        (REMOTE_SYNC_PAUSED_KEY, s.mcp_remote_sync_paused),
     ] {
         if let Some(b) = v {
             out.push((key, b.to_string()));
@@ -447,6 +458,7 @@ pub fn effective(rows: &[(String, Option<String>)], repo_type: &str) -> McpRepoS
         mcp_require_bundle_signature: (!virtual_)
             .then(|| flag(REQUIRE_BUNDLE_SIGNATURE_KEY))
             .flatten(),
+        mcp_remote_sync_paused: remote.then(|| flag(REMOTE_SYNC_PAUSED_KEY)).flatten(),
     }
 }
 
@@ -565,10 +577,12 @@ mod tests {
             mcp_remote_mode: Some("mirror".into()),
             mcp_oci_floating_tag_policy: Some("hide".into()),
             mcp_auto_approve_namespaces: Some(vec!["com.acme/*".into()]),
+            mcp_remote_sync_paused: Some(true),
             ..Default::default()
         };
         let rows = to_store(&all, &mcp(), "remote", false, Locks::default()).unwrap();
-        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.len(), 9);
+        assert!(rows.contains(&(REMOTE_SYNC_PAUSED_KEY, "true".to_string())));
         assert!(rows.contains(&(SERVER_DENY_KEY, "[\"com.evil/*\"]".to_string())));
     }
 
@@ -677,8 +691,10 @@ mod tests {
         assert_eq!(r.mcp_remote_mode.as_deref(), Some("allowlist"));
         assert_eq!(r.mcp_oci_floating_tag_policy.as_deref(), Some("pin"));
         assert_eq!(r.mcp_probe_remotes_locked, Some(true));
+        assert_eq!(r.mcp_remote_sync_paused, Some(false));
         let l = effective(&rows, "local");
         assert_eq!(l.mcp_remote_posture, None);
+        assert_eq!(l.mcp_remote_sync_paused, None);
         assert_eq!(l.mcp_probe_remotes.as_deref(), Some("off"));
         let v = effective(&[], "virtual");
         assert_eq!(v.mcp_probe_remotes, None);

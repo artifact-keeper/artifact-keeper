@@ -202,10 +202,43 @@ impl Harness {
         )
     }
 
+    /// Start a manual sync (`202`, #5404) and return the summary of that
+    /// pass once it has ended.
     async fn sync(&self) -> serde_json::Value {
+        let (s, before) = self.admin_json("GET", "/sync", None).await;
+        assert_eq!(s, StatusCode::OK, "{before}");
         let (s, b) = self.admin_json("POST", "/sync", None).await;
-        assert_eq!(s, StatusCode::OK, "{b}");
-        b["summary"].clone()
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        self.finished_after(&before).await["lastSummary"].clone()
+    }
+
+    /// The sync state once the pass started after `before` was read has
+    /// ended: its lock is released (`running: false`), it recorded a start
+    /// other than `before`'s and a finish no earlier than that start. Polls
+    /// the stored state, not the clock; times out with the state shown.
+    async fn finished_after(&self, before: &serde_json::Value) -> serde_json::Value {
+        let ts = |v: &serde_json::Value| {
+            v.as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (s, st) = self.admin_json("GET", "/sync", None).await;
+            assert_eq!(s, StatusCode::OK, "{st}");
+            let started = ts(&st["lastStartedAt"]);
+            if st["running"] == false
+                && started.is_some()
+                && st["lastStartedAt"] != before["lastStartedAt"]
+                && ts(&st["lastFinishedAt"]) >= started
+            {
+                return st;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass did not end: {st}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     async fn item(&self, name: &str) -> serde_json::Value {

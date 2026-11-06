@@ -388,7 +388,7 @@ mod tests {
                 include_str!("mcp_remote.rs"),
                 "MCP_REMOTE_SYNC_JOB",
                 ".skip_tick(",
-                "run_due(&state",
+                "run_due(state, interval_secs",
             ),
         ];
         let gate_ctor = format!("{}::new(", "UpstreamPauseGate");
