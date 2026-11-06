@@ -16,7 +16,10 @@ use crate::api::SharedState;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::curation_service::version_compare;
-use crate::services::package_service::{live_package_predicate, live_package_version_predicate};
+use crate::services::package_service::{
+    live_package_predicate, live_package_version_predicate, package_download_counts,
+    version_download_count_sql,
+};
 use crate::services::repository_service::{
     build_visibility_clause_for, RepoVisibility, VisibilityBind,
 };
@@ -194,7 +197,11 @@ pub struct PackageRow {
     pub format: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of the package's versions, from the same download history
+    /// the artifact download stats read (#5346). `null` when the repository
+    /// cannot attribute downloads to this package (a Remote package cataloged
+    /// without a digest), so a client can tell "not tracked" from a real 0.
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Object)]
@@ -210,7 +217,11 @@ pub struct PackageResponse {
     pub format: String,
     pub description: Option<String>,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of the package's versions, from the same download history
+    /// the artifact download stats read (#5346). `null` when the repository
+    /// cannot attribute downloads to this package (a Remote package cataloged
+    /// without a digest), so a client can tell "not tracked" from a real 0.
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     #[schema(value_type = Object)]
@@ -309,7 +320,7 @@ pub async fn list_packages(
     let page_sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
-               p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
+               p.description, p.size_bytes, NULL::BIGINT AS download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
@@ -339,6 +350,7 @@ pub async fn list_packages(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
     let (packages, hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    let packages = with_download_counts(&state.db, packages).await?;
 
     let count_sql = format!(
         r#"
@@ -447,7 +459,7 @@ pub async fn get_package(
     let sql = format!(
         r#"
         SELECT p.id, r.key as repository_key, p.name, p.version, r.format::text as format,
-               p.description, p.size_bytes, p.download_count, p.created_at, p.updated_at,
+               p.description, p.size_bytes, NULL::BIGINT AS download_count, p.created_at, p.updated_at,
                p.metadata
         FROM packages p
         JOIN repositories r ON r.id = p.repository_id
@@ -470,9 +482,13 @@ pub async fn get_package(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
-    let mut package = apply_mcp_catalog_views(&state, auth.as_ref(), vec![package])
+    let package = apply_mcp_catalog_views(&state, auth.as_ref(), vec![package])
         .await
         .0
+        .pop()
+        .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
+    let mut package = with_download_counts(&state.db, vec![package])
+        .await?
         .pop()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
 
@@ -490,7 +506,9 @@ pub async fn get_package(
 pub struct PackageVersionRow {
     pub version: String,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of this version (#5346); `null` when not tracked, as on
+    /// [`PackageResponse::download_count`].
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
 }
@@ -499,7 +517,9 @@ pub struct PackageVersionRow {
 pub struct PackageVersionResponse {
     pub version: String,
     pub size_bytes: i64,
-    pub download_count: i64,
+    /// Downloads of this version (#5346); `null` when not tracked, as on
+    /// [`PackageResponse::download_count`].
+    pub download_count: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub checksum_sha256: String,
 }
@@ -602,9 +622,11 @@ pub async fn get_package_versions(
     // soft-deleted version disappears from the list and comes back on restore
     // without any catalog write.
     let live_versions = live_package_version_predicate();
+    let download_count = version_download_count_sql();
     let versions_sql = format!(
         r#"
-        SELECT pv.version, pv.size_bytes, pv.download_count, pv.created_at, pv.checksum_sha256
+        SELECT pv.version, pv.size_bytes, {download_count} AS download_count,
+               pv.created_at, pv.checksum_sha256
         FROM package_versions pv
         JOIN packages p ON p.id = pv.package_id
         JOIN repositories r ON r.id = p.repository_id
@@ -634,6 +656,22 @@ pub async fn get_package_versions(
             .map(PackageVersionResponse::from)
             .collect(),
     }))
+}
+
+/// Fill each row's `download_count` from the recorded download history
+/// (#5346), one batched query for the whole page rather than one per row.
+async fn with_download_counts(
+    db: &sqlx::PgPool,
+    mut rows: Vec<PackageRow>,
+) -> Result<Vec<PackageRow>> {
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let counts = package_download_counts(db, &ids)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    for row in &mut rows {
+        row.download_count = counts.get(&row.id).copied().flatten();
+    }
+    Ok(rows)
 }
 
 /// The MCP rows of `rows` as `auth` may see them (#5253): a row whose
@@ -743,7 +781,7 @@ mod tests {
             format: "npm".to_string(),
             description: Some("A test package".to_string()),
             size_bytes: 1024,
-            download_count: 42,
+            download_count: Some(42),
             created_at: now,
             updated_at: now,
             metadata: Some(serde_json::json!({"license": "MIT"})),
@@ -831,7 +869,7 @@ mod tests {
         PackageVersionRow {
             version: "2.0.0".to_string(),
             size_bytes: 2048,
-            download_count: 10,
+            download_count: Some(10),
             created_at: Utc::now(),
             checksum_sha256: "abc123def456".to_string(),
         }
@@ -853,7 +891,7 @@ mod tests {
         assert_eq!(resp.format, "npm");
         assert_eq!(resp.description.as_deref(), Some("A test package"));
         assert_eq!(resp.size_bytes, 1024);
-        assert_eq!(resp.download_count, 42);
+        assert_eq!(resp.download_count, Some(42));
         assert!(resp.metadata.is_some());
     }
 
@@ -884,9 +922,9 @@ mod tests {
     #[test]
     fn test_package_row_to_response_zero_downloads() {
         let mut row = make_package_row();
-        row.download_count = 0;
+        row.download_count = Some(0);
         let resp = PackageResponse::from(row);
-        assert_eq!(resp.download_count, 0);
+        assert_eq!(resp.download_count, Some(0));
     }
 
     // -----------------------------------------------------------------------
@@ -899,7 +937,7 @@ mod tests {
         let resp = PackageVersionResponse::from(row);
         assert_eq!(resp.version, "2.0.0");
         assert_eq!(resp.size_bytes, 2048);
-        assert_eq!(resp.download_count, 10);
+        assert_eq!(resp.download_count, Some(10));
         assert_eq!(resp.checksum_sha256, "abc123def456");
     }
 
@@ -2031,6 +2069,246 @@ mod tests {
             let total = listed_total(&f).await;
             f.teardown().await;
             assert_eq!(total, 1, "proxy-cached catalog rows must stay listed");
+        }
+    }
+
+    /// An untracked count serializes as an explicit `null` (#5346), so a
+    /// client can tell "not tracked" from a real 0.
+    #[test]
+    fn test_untracked_download_count_serializes_as_null() {
+        let mut row = make_package_row();
+        row.download_count = None;
+        let json = serde_json::to_value(PackageResponse::from(row)).unwrap();
+        assert!(json.as_object().unwrap().contains_key("download_count"));
+        assert!(json["download_count"].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // #5346: package and version download counts come from the recorded
+    // download history (`download_statistics`, `proxy_download_statistics`),
+    // not from the never-written `download_count` columns.
+    // -----------------------------------------------------------------------
+    mod download_counts_db {
+        use super::catalog_liveness_db::seed_backed_package;
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        fn app(f: &tdh::Fixture) -> axum::Router {
+            tdh::router_with_auth(router(), f.state.clone(), make_auth(f.user_id, false, None))
+        }
+
+        async fn get_json(f: &tdh::Fixture, path: String) -> serde_json::Value {
+            let (status, body) = tdh::send(app(f), tdh::get(path)).await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice(&body).expect("json body")
+        }
+
+        async fn package_count(f: &tdh::Fixture, pkg: Uuid) -> serde_json::Value {
+            get_json(f, format!("/{pkg}")).await["download_count"].clone()
+        }
+
+        async fn listed_count(f: &tdh::Fixture, name: &str) -> serde_json::Value {
+            let json = get_json(f, format!("/?repository_key={}", f.repo_key)).await;
+            json["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .find(|i| i["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed"))["download_count"]
+                .clone()
+        }
+
+        async fn version_counts(
+            f: &tdh::Fixture,
+            pkg: Uuid,
+        ) -> std::collections::HashMap<String, serde_json::Value> {
+            get_json(f, format!("/{pkg}/versions")).await["versions"]
+                .as_array()
+                .expect("versions")
+                .iter()
+                .map(|v| {
+                    (
+                        v["version"].as_str().unwrap().to_string(),
+                        v["download_count"].clone(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn artifact_id(pool: &sqlx::PgPool, repo_id: Uuid, checksum: &str) -> Uuid {
+            sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2",
+            )
+            .bind(repo_id)
+            .bind(checksum)
+            .fetch_one(pool)
+            .await
+            .expect("artifact id")
+        }
+
+        /// What `record_download`'s batch flush writes: one row per served body.
+        async fn record_downloads(pool: &sqlx::PgPool, artifact_id: Uuid, n: usize) {
+            for _ in 0..n {
+                sqlx::query("INSERT INTO download_statistics (artifact_id) VALUES ($1)")
+                    .bind(artifact_id)
+                    .execute(pool)
+                    .await
+                    .expect("record download");
+            }
+        }
+
+        /// One proxy serve as `proxy_catalog::record_proxy_download` writes it.
+        async fn record_proxy_download(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            path: &str,
+            checksum: Option<&str>,
+            proxy_cache_id: Option<Uuid>,
+        ) {
+            sqlx::query(
+                "INSERT INTO proxy_download_statistics \
+                 (proxy_cache_id, repository_id, path, checksum_sha256) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(proxy_cache_id)
+            .bind(repo_id)
+            .bind(path)
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("record proxy download");
+        }
+
+        async fn seed_remote_version(
+            pool: &sqlx::PgPool,
+            repo_id: Uuid,
+            name: &str,
+            version: &str,
+            checksum: &str,
+        ) -> Uuid {
+            let pkg: Uuid = sqlx::query_scalar(
+                "INSERT INTO packages (repository_id, name, version, size_bytes) \
+                 VALUES ($1, $2, $3, 1) \
+                 ON CONFLICT (repository_id, name) DO UPDATE SET version = EXCLUDED.version \
+                 RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(name)
+            .bind(version)
+            .fetch_one(pool)
+            .await
+            .expect("seed remote package");
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 1, $3)",
+            )
+            .bind(pkg)
+            .bind(version)
+            .bind(checksum)
+            .execute(pool)
+            .await
+            .expect("seed remote version");
+            pkg
+        }
+
+        /// After N downloads of a hosted package version, the version list,
+        /// the package detail and the listing all report them. A version's
+        /// count includes every file of that version (here a second asset
+        /// recorded under the same name and version), and a package with no
+        /// downloads reports a real 0, not `null`.
+        #[tokio::test]
+        async fn hosted_package_and_versions_report_recorded_downloads() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, v1) = seed_backed_package(&f.pool, f.repo_id, "dl-chart", "1.0.0").await;
+            let (_, v2) = seed_backed_package(&f.pool, f.repo_id, "dl-chart", "2.0.0").await;
+            let (quiet, _) = seed_backed_package(&f.pool, f.repo_id, "quiet-chart", "1.0.0").await;
+            let extra: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, 'dl-chart/1.0.0/extra.bin', 'dl-chart', '1.0.0', 1, $2, \
+                 'application/octet-stream', 'dl-chart/1.0.0/extra.bin') RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind("e".repeat(64))
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed second asset");
+
+            record_downloads(&f.pool, artifact_id(&f.pool, f.repo_id, &v1).await, 3).await;
+            record_downloads(&f.pool, extra, 1).await;
+            record_downloads(&f.pool, artifact_id(&f.pool, f.repo_id, &v2).await, 2).await;
+
+            let versions = version_counts(&f, pkg).await;
+            let detail = package_count(&f, pkg).await;
+            let listed = listed_count(&f, "dl-chart").await;
+            let quiet_detail = package_count(&f, quiet).await;
+            let quiet_listed = listed_count(&f, "quiet-chart").await;
+            f.teardown().await;
+
+            assert_eq!(versions["1.0.0"], 4, "1.0.0: 3 + 1 downloads of its files");
+            assert_eq!(versions["2.0.0"], 2);
+            assert_eq!(detail, 6, "package detail sums its versions");
+            assert_eq!(listed, 6, "listing reports the same count");
+            assert_eq!(quiet_detail, 0, "no downloads is a real 0");
+            assert_eq!(quiet_listed, 0);
+        }
+
+        /// A Remote package reports its pull-through serves from
+        /// `proxy_download_statistics`: rows that carry the version's digest,
+        /// and older rows with no digest that link to a cached object with it.
+        /// A version cataloged without a digest cannot be attributed and is
+        /// `null`, as is a package with only such versions.
+        #[tokio::test]
+        async fn remote_package_reports_proxy_downloads_or_null() {
+            let Some(f) = tdh::Fixture::setup("remote", "maven").await else {
+                return;
+            };
+            let digest = "a".repeat(64);
+            let pkg =
+                seed_remote_version(&f.pool, f.repo_id, "com.example:proxied", "1.0.0", &digest)
+                    .await;
+            seed_remote_version(&f.pool, f.repo_id, "com.example:proxied", "0.9.0", "").await;
+            let untracked =
+                seed_remote_version(&f.pool, f.repo_id, "com.example:streamed", "1.0.0", "").await;
+
+            let path = "com/example/proxied/1.0.0/proxied-1.0.0.jar";
+            let cache_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO proxy_cache_artifacts \
+                 (repository_id, path, storage_key, metadata_key, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, $2, $2, 1, $3) RETURNING id",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .bind(&digest)
+            .fetch_one(&f.pool)
+            .await
+            .expect("seed proxy cache row");
+            record_proxy_download(&f.pool, f.repo_id, path, Some(&digest), Some(cache_id)).await;
+            record_proxy_download(&f.pool, f.repo_id, path, Some(&digest), None).await;
+            // Recorded before the digest column existed (#4542).
+            record_proxy_download(&f.pool, f.repo_id, path, None, Some(cache_id)).await;
+            // Another object's serve.
+            record_proxy_download(&f.pool, f.repo_id, "other.jar", Some(&"b".repeat(64)), None)
+                .await;
+
+            let versions = version_counts(&f, pkg).await;
+            let detail = package_count(&f, pkg).await;
+            let listed = listed_count(&f, "com.example:proxied").await;
+            let untracked_detail = package_count(&f, untracked).await;
+            let untracked_listed = listed_count(&f, "com.example:streamed").await;
+            f.teardown().await;
+
+            assert_eq!(versions["1.0.0"], 3, "three serves of the version's digest");
+            assert!(versions["0.9.0"].is_null(), "no digest: not tracked");
+            assert_eq!(detail, 3);
+            assert_eq!(listed, 3);
+            assert!(
+                untracked_detail.is_null(),
+                "untracked package is null, not 0"
+            );
+            assert!(untracked_listed.is_null());
         }
     }
 }
