@@ -23452,6 +23452,83 @@ mod tests {
         );
     }
 
+    /// `virtual_non_remote_owns_maven_gav_in` answers from the member list the
+    /// caller already fetched: a hosted member holding the G:A:V owns it, a
+    /// remote member holding it does not, and a list without hosted members
+    /// short-circuits to false
+    #[tokio::test]
+    async fn virtual_non_remote_owns_maven_gav_in_checks_only_hosted_members() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (virtual_id, _vk, vd) = db_helpers::create_repo(&pool, "virtual", "maven").await;
+        let (hosted_id, _hk, hd) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (remote_id, _rk, rd) = db_helpers::create_repo(&pool, "remote", "maven").await;
+        db_helpers::link_member(&pool, virtual_id, hosted_id, 1).await;
+        db_helpers::link_member(&pool, virtual_id, remote_id, 2).await;
+        for (repo_id, artifact) in [(hosted_id, "owned"), (remote_id, "cached")] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, 1, $4, 'application/java-archive', $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("com/example/{artifact}/1.0/{artifact}-1.0.jar"))
+            .bind(artifact)
+            .bind("0".repeat(64))
+            .bind(format!("maven/{repo_id}/{artifact}"))
+            .execute(&pool)
+            .await
+            .expect("insert artifact");
+        }
+
+        let members = fetch_virtual_members(&pool, virtual_id)
+            .await
+            .expect("fetch");
+        let remote_only: Vec<Repository> = members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+            .cloned()
+            .collect();
+        let owns = |members: Vec<Repository>, artifact: &'static str| {
+            let pool = pool.clone();
+            async move {
+                virtual_non_remote_owns_maven_gav_in(
+                    &pool,
+                    virtual_id,
+                    &members,
+                    "com.example",
+                    artifact,
+                    "1.0",
+                )
+                .await
+                .expect("ownership query")
+            }
+        };
+        let hosted_owned = owns(members.clone(), "owned").await;
+        let remote_cached = owns(members.clone(), "cached").await;
+        let nobody = owns(members.clone(), "missing").await;
+        let no_hosted_member = owns(remote_only, "cached").await;
+
+        cleanup_member_graph(
+            &pool,
+            &[virtual_id, hosted_id, remote_id],
+            user_id,
+            &[vd, hd, rd],
+        )
+        .await;
+
+        assert_eq!(members.len(), 2, "both members are listed");
+        assert!(hosted_owned, "a hosted member holding the G:A:V owns it");
+        assert!(!remote_cached, "a remote member holding it does not");
+        assert!(!nobody, "no member holding it is not ownership");
+        assert!(
+            !no_hosted_member,
+            "a member list without hosted members is never an owner"
+        );
+    }
+
     // ── #968: deployment target of a virtual repository ──────────────────
 
     /// The deployment target is the first WRITABLE hosted member in
