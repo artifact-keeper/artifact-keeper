@@ -13,6 +13,7 @@
 //! without leaking a lock back into the pool. An in-memory implementation backs
 //! the unit tests so the coordinator is exercisable without a live database.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -178,11 +179,41 @@ fn is_wait_expiry_code(code: &str) -> bool {
 #[derive(Clone)]
 pub struct PgAdvisoryLock {
     pool: PgPool,
+    /// Bounds how many lock connections exist outside `pool` at once: the
+    /// detached leader connection and the dedicated wait session (#4552).
+    /// Neither counts against `pool`, which keeps opening its own, so without
+    /// this one lock per in-flight hydration can open an unbounded number of
+    /// server connections.
+    detached: Arc<tokio::sync::Semaphore>,
 }
+
+/// Default cap on detached lock connections per [`PgAdvisoryLock`], for the
+/// background-job call sites that build one per operation. The proxy hydration
+/// coordinator keeps a long-lived shared lock instead and derives its own cap
+/// from `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`, which is the only path where a
+/// request storm can produce many concurrent leases.
+pub const DEFAULT_LOCK_MAX_CONNECTIONS: usize = 16;
 
 impl PgAdvisoryLock {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_max_connections(pool, DEFAULT_LOCK_MAX_CONNECTIONS)
+    }
+
+    pub fn with_max_connections(pool: PgPool, max: usize) -> Self {
+        Self {
+            pool,
+            detached: Arc::new(tokio::sync::Semaphore::new(max.max(1))),
+        }
+    }
+
+    /// A full cap is an error, which every caller degrades to per-process
+    /// single-flight rather than opening another connection.
+    fn detach_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.detached.clone().try_acquire_owned().map_err(|_| {
+            crate::error::AppError::ServiceUnavailable(
+                "advisory lock connection cap reached".to_string(),
+            )
+        })
     }
 
     /// Open the dedicated session a blocking wait runs on (#4552): the pool's
@@ -238,12 +269,24 @@ impl ClusterLock for PgAdvisoryLock {
         // connection we own outright. On the happy path `release` unlocks and
         // drops it; on panic/cancel/pod-kill the guard drops, the detached
         // connection CLOSES, and Postgres releases the session lock (crash-safe).
+        let permit = match self.detach_permit() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = sqlx::query("SELECT pg_advisory_unlock($1, $2)")
+                    .bind(class)
+                    .bind(obj)
+                    .execute(&mut *conn)
+                    .await;
+                return Err(e);
+            }
+        };
         let mut detached = conn.detach();
         arm_dead_peer_keepalives(&mut detached).await;
         Ok(Some(ClusterLease::Postgres(PgAdvisoryLease {
             conn: Some(detached),
             class,
             obj,
+            _permit: permit,
         })))
     }
 
@@ -268,6 +311,7 @@ impl ClusterLock for PgAdvisoryLock {
         // to take as long as the leader's fill; at sqlx's default 1 s
         // threshold every follower logged a "slow statement" WARN per cold
         // object. The outcome is logged once at DEBUG instead.
+        let permit = self.detach_permit()?;
         let mut conn = self.connect_wait_session().await?;
         sqlx::query("SELECT set_config('lock_timeout', $1, false)")
             .bind(lock_timeout_setting(timeout))
@@ -305,6 +349,7 @@ impl ClusterLock for PgAdvisoryLock {
                     conn: Some(conn),
                     class,
                     obj,
+                    _permit: permit,
                 })))
             }
             // The holder is still working after `timeout`: not an error, the
@@ -333,6 +378,7 @@ pub struct PgAdvisoryLease {
     conn: Option<sqlx::PgConnection>,
     class: i32,
     obj: i32,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl PgAdvisoryLease {
@@ -441,6 +487,53 @@ impl Drop for InMemoryLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The connection cap itself, without a database: a detached connection no
+    /// longer counts against the pool, so if this were unbounded every
+    /// in-flight lock would open one more server connection. At the cap the
+    /// lock must refuse (degrading the caller to per-process single-flight)
+    /// rather than queue or detach another, and permits must return on drop.
+    #[tokio::test]
+    async fn detached_lock_connections_are_capped_and_return_on_drop() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let lock = PgAdvisoryLock::with_max_connections(pool, 2);
+        let held: Vec<_> = (0..2)
+            .map(|i| {
+                lock.detach_permit()
+                    .unwrap_or_else(|e| panic!("permit {i}: {e}"))
+            })
+            .collect();
+        assert!(
+            matches!(
+                lock.detach_permit(),
+                Err(crate::error::AppError::ServiceUnavailable(_))
+            ),
+            "at the cap the lock must refuse, not detach another connection"
+        );
+        drop(held);
+        assert!(
+            lock.detach_permit().is_ok(),
+            "permits return when a lease drops"
+        );
+    }
+
+    /// A cap of zero would make the lock permanently unusable, so it floors at
+    /// one: a misconfigured env var degrades to serial locking, never to a
+    /// coordinator that can never acquire.
+    #[tokio::test]
+    async fn a_zero_cap_floors_at_one_connection() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let lock = PgAdvisoryLock::with_max_connections(pool, 0);
+        let held = lock
+            .detach_permit()
+            .expect("one permit is always available");
+        assert!(lock.detach_permit().is_err());
+        drop(held);
+    }
 
     #[test]
     fn lease_object_id_is_deterministic_and_key_sensitive() {
@@ -1014,5 +1107,44 @@ mod tests {
         );
         reelected.release().await;
         drop(leader); // its connection is already dead
+    }
+
+    /// At the cap, the lock must refuse rather than detach another connection,
+    /// and the refused key must not be left locked on the server.
+    #[tokio::test]
+    async fn pg_advisory_lock_detached_connections_are_capped() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let lock = PgAdvisoryLock::with_max_connections(pool, 1);
+        let key = |k: &str| lease_object_id(&format!("cap-{k}-{}", uuid::Uuid::new_v4()));
+        let held = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, key("a"))
+            .await
+            .expect("query ok")
+            .expect("acquired");
+        let b = key("b");
+        assert!(
+            lock.try_acquire(PROXY_HYDRATION_LOCK_CLASS, b)
+                .await
+                .is_err(),
+            "a full cap must error, not detach another connection"
+        );
+        assert!(lock
+            .acquire_blocking(
+                PROXY_HYDRATION_LOCK_CLASS,
+                key("c"),
+                Duration::from_millis(50)
+            )
+            .await
+            .is_err());
+        held.release().await;
+        let again = lock
+            .try_acquire(PROXY_HYDRATION_LOCK_CLASS, b)
+            .await
+            .expect("query ok")
+            .expect("the refused key was not left locked");
+        again.release().await;
     }
 }
