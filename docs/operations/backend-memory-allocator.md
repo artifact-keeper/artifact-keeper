@@ -53,14 +53,20 @@ instead of the historical high-water mark.
 
 `docker/Dockerfile.backend` builds the backend with `CARGO_FEATURES=jemalloc`
 in both compiling stages, and `.github/workflows/docker-publish.yml` passes
-the same value explicitly for the published image. This is a Linux-only
-allocator; the feature is ignored on Windows, where the system allocator is
-used.
+the same value explicitly for the published image. The image is Linux; the
+feature is unavailable on Windows, where the system allocator is used.
 
 Other images and builds:
 
 * **Compose builds from this repository** use `docker/Dockerfile.backend` and
   inherit the default.
+* **Linux release tarballs.** `.github/workflows/release.yml` and
+  `publish-binaries.yml` build the Linux binaries with
+  `--features vendored-openssl,jemalloc`, and `release-cli-caches.yml` warms
+  the same feature set. The aarch64 leg is cross-compiled on a 4 KiB-page
+  runner, so it sets `JEMALLOC_SYS_WITH_LG_PAGE=16`; the tarball starts on
+  both 4 KiB and 64 KiB-page kernels. The macOS and Windows tarballs keep
+  their platform allocator.
 * **Source builds** (`cargo build --release`) use the system allocator unless
   you ask for jemalloc:
   ```sh

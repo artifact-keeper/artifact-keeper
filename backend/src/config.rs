@@ -3860,6 +3860,72 @@ mod tests {
         );
     }
 
+    /// #5130: the published container is not the only way the backend is
+    /// deployed. The Linux binaries attached to a release are built from the
+    /// same tree and used to keep glibc's malloc, so a tarball deployment
+    /// still had the retaining allocator. Pin the release workflows too:
+    /// `release.yml` builds the assets, `publish-binaries.yml` replaces them
+    /// when a release is cut without the normal gate, and
+    /// `release-cli-caches.yml` must warm the same feature set or the tag
+    /// build compiles jemalloc cold.
+    #[test]
+    fn release_binaries_build_with_jemalloc_5130() {
+        for (name, workflow) in [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            (
+                "publish-binaries.yml",
+                include_str!("../../.github/workflows/publish-binaries.yml"),
+            ),
+            (
+                "release-cli-caches.yml",
+                include_str!("../../.github/workflows/release-cli-caches.yml"),
+            ),
+        ] {
+            let features: Vec<&str> = workflow
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("features:"))
+                .collect();
+            assert_eq!(
+                features
+                    .iter()
+                    .filter(|line| **line == "features: vendored-openssl,jemalloc")
+                    .count(),
+                2,
+                "{name} must build both Linux release targets with jemalloc \
+                 (#5130); found {features:?}"
+            );
+            assert_eq!(
+                features
+                    .iter()
+                    .filter(|line| **line == "features: vendored-openssl")
+                    .count(),
+                3,
+                "{name} must leave the macOS and Windows release targets on \
+                 their platform allocator (#5130); found {features:?}"
+            );
+            assert!(
+                workflow.contains("--features ${{ matrix.features }}"),
+                "{name} declares per-target features but no longer passes them \
+                 to cargo, so the Linux tarball would ship glibc malloc again \
+                 (#5130)"
+            );
+            assert!(
+                workflow.contains("JEMALLOC_SYS_WITH_LG_PAGE=16"),
+                "{name} must build the aarch64 Linux jemalloc for 64 KiB pages, \
+                 or the tarball aborts on a 64 KiB-page kernel (#5130)"
+            );
+            assert!(
+                workflow.contains("CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"),
+                "{name} must set the aarch64 C compiler for the cross-built \
+                 jemalloc (#5130)"
+            );
+        }
+    }
+
     #[test]
     fn secret_env_present_checks_both_forms() {
         env::remove_var("TEST_SECRET_4142");
