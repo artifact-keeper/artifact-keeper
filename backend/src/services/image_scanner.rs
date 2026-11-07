@@ -456,10 +456,10 @@ async fn adapter_visible_registry_url(adapter_url: &str) -> Option<String> {
 pub struct ImageScanner {
     /// Base URL of the Harbor scanner adapter, e.g. `http://trivy:8090`.
     adapter_url: String,
-    http: reqwest::Client,
+    http: crate::services::http_client::Client,
     /// Dedicated client with redirects disabled so a `302 Found` "report not
     /// ready" response from the adapter is observed rather than followed.
-    poll_http: reqwest::Client,
+    poll_http: crate::services::http_client::Client,
     /// Optional token minter for private-repo pulls. When both an
     /// `AuthService` and a system scan identity are wired, each scan request
     /// carries a short-lived scoped JWT as `registry.authorization` so the
@@ -485,12 +485,12 @@ impl ImageScanner {
             http: crate::services::http_client::internal_service_client_builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             poll_http: crate::services::http_client::internal_service_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             auth: None,
             scan_identity: None,
             scan_token_ttl_seconds: 300,

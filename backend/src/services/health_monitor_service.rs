@@ -3,8 +3,8 @@
 //! Monitors service health, tracks state transitions, fires webhook alerts,
 //! and manages alert suppression to prevent spam during extended outages.
 
+use crate::services::http_client::Client;
 use chrono::{DateTime, Utc};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -160,7 +160,7 @@ impl HealthMonitorService {
         let http_client = crate::services::http_client::internal_service_client_builder()
             .timeout(Duration::from_secs(config.check_timeout_secs))
             .build()
-            .unwrap_or_default();
+            .expect("build service health HTTP client");
 
         Self {
             db,
@@ -1009,7 +1009,7 @@ mod tests {
         });
 
         // Plain client: no SSRF resolver. Only testing header attachment.
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_client::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()

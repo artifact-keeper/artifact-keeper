@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use crate::services::http_client::Client;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use reqwest::Client;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -331,7 +331,7 @@ mod tests {
             .await;
 
         let cache = UpstreamMetadataCache::new();
-        let client = reqwest::Client::new();
+        let client = crate::services::http_client::Client::new();
         let repo_id = Uuid::new_v4();
         let first = cache
             .fetch_pypi_publish_times(&client, repo_id, &server.uri(), "demo")

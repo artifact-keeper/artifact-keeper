@@ -1,14 +1,13 @@
 //! Shared HTTP client builder with custom CA certificate support.
 //!
-//! All code that creates a `reqwest::Client` should call [`default_client`] for
+//! All code that creates a `Client` should call [`default_client`] for
 //! a ready-to-use client, or [`base_client_builder`] when extra configuration
 //! (timeouts, user-agent, etc.) is needed before building. This ensures that
 //! custom CA certificates (configured via `CUSTOM_CA_CERT_PATH`) are loaded
 //! consistently across the application.
 
+pub use super::http_client_reload::{Client, ClientBuilder};
 use reqwest::redirect::Policy;
-use reqwest::tls::Certificate;
-use reqwest::ClientBuilder;
 use std::time::Duration;
 
 /// Maximum number of redirects we will follow even if every hop passes
@@ -21,14 +20,14 @@ const MAX_REDIRECTS: usize = 10;
 /// it makes this backend's traffic identifiable in upstream logs.
 pub const DEFAULT_USER_AGENT: &str = concat!("artifact-keeper/", env!("CARGO_PKG_VERSION"));
 
-/// A bare [`ClientBuilder`] that already sends [`DEFAULT_USER_AGENT`].
+/// A bare [`reqwest::ClientBuilder`] that already sends [`DEFAULT_USER_AGENT`].
 ///
 /// The builders in this module start from it. Code that must not use the SSRF
 /// resolver (cloud metadata endpoints, presigned storage URLs, the AWS control
 /// plane) starts from it too, instead of `reqwest::Client::builder()`, so no
 /// outbound client goes without a User-Agent. A per-request `User-Agent`
 /// header, such as a repository's custom one, still takes precedence.
-pub fn plain_client_builder() -> ClientBuilder {
+pub fn plain_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().user_agent(DEFAULT_USER_AGENT)
 }
 
@@ -84,14 +83,14 @@ fn log_proxy_env() {
 pub fn base_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
+    ClientBuilder::new(plain_client_builder)
         .redirect(ssrf_redirect_policy())
         .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver())
         // This crate's own `Cargo.toml` requests only `["json", "stream",
         // "form"]`, but Cargo unifies features for a single resolved
         // `reqwest` version across the whole build: the `opensearch` crate
         // (full-text search) pulls in `reqwest` with its `gzip` feature
-        // enabled, which silently switches EVERY `reqwest::Client` in this
+        // enabled, which silently switches EVERY `Client` in this
         // binary — including this one — into auto content-negotiation mode.
         // That makes the client add `Accept-Encoding: gzip` to outbound
         // upstream requests and, on any response upstream compresses,
@@ -140,9 +139,7 @@ pub fn base_client_builder() -> ClientBuilder {
                 reqwest::header::HeaderValue::from_static("identity"),
             );
             headers
-        });
-
-    apply_custom_ca_cert(builder)
+        })
 }
 
 /// Return a [`ClientBuilder`] for **operator-configured, trusted
@@ -162,11 +159,9 @@ pub fn base_client_builder() -> ClientBuilder {
 pub fn internal_service_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
+    ClientBuilder::new(plain_client_builder)
         .redirect(ssrf_internal_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_internal());
-
-    apply_custom_ca_cert(builder)
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_internal())
 }
 
 /// Return a [`ClientBuilder`] for **webhook delivery** requests. Mirrors
@@ -182,18 +177,16 @@ pub fn internal_service_client_builder() -> ClientBuilder {
 pub fn webhook_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
+    ClientBuilder::new(plain_client_builder)
         .redirect(ssrf_webhook_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_webhook());
-
-    apply_custom_ca_cert(builder)
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_webhook())
 }
 
 /// Build and return a ready-to-use webhook-delivery client (see
 /// [`webhook_client_builder`]).
 ///
 /// Panics if the client cannot be built (should not happen in practice).
-pub fn webhook_client() -> reqwest::Client {
+pub fn webhook_client() -> Client {
     webhook_client_builder()
         .build()
         .expect("failed to build webhook HTTP client")
@@ -217,11 +210,9 @@ pub fn webhook_client() -> reqwest::Client {
 pub fn sso_client_builder() -> ClientBuilder {
     log_proxy_env();
 
-    let builder = plain_client_builder()
+    ClientBuilder::new(plain_client_builder)
         .redirect(ssrf_sso_redirect_policy())
-        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_sso());
-
-    apply_custom_ca_cert(builder)
+        .dns_resolver(crate::services::ssrf_dns::ssrf_guard_resolver_sso())
 }
 
 /// The `User-Agent` the SSO/OIDC-fetch client sends (#5036).
@@ -231,7 +222,7 @@ pub const SSO_USER_AGENT: &str = DEFAULT_USER_AGENT;
 /// [`sso_client_builder`]).
 ///
 /// Panics if the client cannot be built (should not happen in practice).
-pub fn sso_client() -> reqwest::Client {
+pub fn sso_client() -> Client {
     sso_client_builder()
         .build()
         .expect("failed to build SSO HTTP client")
@@ -385,47 +376,6 @@ pub async fn read_idp_token_response(
     }
 }
 
-/// Load operator-provided custom CA certificate(s) (`CUSTOM_CA_CERT_PATH`)
-/// into the builder when configured. Shared by every client builder so the
-/// private-CA handling is identical and lives in one place.
-fn apply_custom_ca_cert(mut builder: ClientBuilder) -> ClientBuilder {
-    // apply_custom_ca_cert runs on every client build (many per request, e.g.
-    // /health's Trivy sub-check), so logging the result per build floods the
-    // logs. Log once for the process lifetime instead, mirroring log_proxy_env.
-    // Applies to the warn arms too: a misconfigured path is the louder flood.
-    use std::sync::Once;
-    static LOG_ONCE: Once = Once::new();
-    if let Ok(ca_path) = std::env::var("CUSTOM_CA_CERT_PATH") {
-        match std::fs::read(&ca_path) {
-            Ok(pem_bytes) => match Certificate::from_pem_bundle(&pem_bytes) {
-                Ok(certs) => {
-                    let count = certs.len();
-                    for cert in certs {
-                        builder = builder.add_root_certificate(cert);
-                    }
-                    // count == 0 (a valid-but-empty bundle) still logs, so the
-                    // "loaded nothing" case stays visible at info.
-                    LOG_ONCE.call_once(|| {
-                        tracing::info!(path = %ca_path, count, "Loaded custom CA certificate(s)");
-                    });
-                }
-                Err(e) => {
-                    LOG_ONCE.call_once(|| {
-                        tracing::warn!(path = %ca_path, error = %e, "Failed to parse CA certificate(s)");
-                    });
-                }
-            },
-            Err(e) => {
-                LOG_ONCE.call_once(|| {
-                    tracing::warn!(path = %ca_path, error = %e, "Failed to read custom CA certificate file");
-                });
-            }
-        }
-    }
-
-    builder
-}
-
 /// Return a client builder suitable for large storage data-plane transfers.
 ///
 /// This intentionally avoids [`ClientBuilder::timeout`], which is a total
@@ -457,11 +407,11 @@ pub fn server_side_copy_client_builder(allow_http: bool) -> ClientBuilder {
         .https_only(!allow_http)
 }
 
-/// Build and return a ready-to-use [`reqwest::Client`] with custom CA
+/// Build and return a ready-to-use [`Client`] with custom CA
 /// certificates and proxy support.
 ///
 /// Panics if the client cannot be built (should not happen in practice).
-pub fn default_client() -> reqwest::Client {
+pub fn default_client() -> Client {
     base_client_builder()
         .build()
         .expect("failed to build default HTTP client")
@@ -473,7 +423,7 @@ const DEFAULT_PROXY_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// client.
 const DEFAULT_PROXY_READ_TIMEOUT_SECS: u64 = 30;
 
-/// Build a [`reqwest::Client`] for the **remote-instance management proxy**
+/// Build a [`Client`] for the **remote-instance management proxy**
 /// (`/api/v1/instances/:id/proxy/*`).
 ///
 /// Same SSRF trust class, redirect policy and plaintext/HTTP semantics as
@@ -484,7 +434,7 @@ const DEFAULT_PROXY_READ_TIMEOUT_SECS: u64 = 30;
 /// while reading the upstream response, so a slow-loris / endless upstream
 /// cannot pin a worker task indefinitely. Both are env-tunable via
 /// `REMOTE_PROXY_CONNECT_TIMEOUT_SECS` and `REMOTE_PROXY_READ_TIMEOUT_SECS`.
-pub fn proxy_client() -> reqwest::Client {
+pub fn proxy_client() -> Client {
     let connect_secs = std::env::var("REMOTE_PROXY_CONNECT_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -591,7 +541,8 @@ fn ssrf_redirect_policy_with(
 mod tests {
     use super::{
         base_client_builder, default_client, internal_service_client_builder,
-        large_object_client_builder, sso_client_builder, webhook_client_builder,
+        large_object_client_builder, sso_client_builder, webhook_client_builder, Client,
+        ClientBuilder,
     };
     use std::io::Write;
     use std::time::Duration;
@@ -612,8 +563,8 @@ mod tests {
     ///
     /// This is only correct because every user targets a listener the test
     /// itself started. A test that exercises proxy routing must NOT use it.
-    fn loopback_test_client() -> reqwest::Client {
-        loopback_client_from(reqwest::Client::builder())
+    fn loopback_test_client() -> Client {
+        loopback_client_from(Client::builder())
     }
 
     /// The proxy-clearing step of [`loopback_test_client`], split out so it can
@@ -622,7 +573,7 @@ mod tests {
     /// both clears the proxies configured so far and turns off reqwest's
     /// system/environment proxy detection, which is what makes the result
     /// independent of whatever a concurrent test has put in the process env.
-    fn loopback_client_from(builder: reqwest::ClientBuilder) -> reqwest::Client {
+    fn loopback_client_from(builder: ClientBuilder) -> Client {
         builder
             .no_proxy()
             .build()
@@ -645,9 +596,7 @@ mod tests {
     /// The closure must construct the builder AND build it: the exempt-set is
     /// read when the BUILDER is constructed, not at `.build()`. It runs under a
     /// synchronous `std` mutex, so it must not `.await`.
-    fn build_client_outside_proxy_env_window(
-        build: impl FnOnce() -> reqwest::Client,
-    ) -> reqwest::Client {
+    fn build_client_outside_proxy_env_window(build: impl FnOnce() -> Client) -> Client {
         let _proxy_env_guard = PROXY_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -672,6 +621,78 @@ mod tests {
                  reached this test's own listener (a process-wide HTTP_PROXY leaked from \
                  a concurrent test is the usual cause -- see #3377)"
             ),
+        }
+    }
+
+    /// #5193: rebuilding every shared HTTP trust class retains its resolver
+    /// and per-hop redirect policy, rather than falling back to a bare client.
+    #[tokio::test]
+    async fn test_ca_rotation_preserves_ssrf_policies() {
+        use tokio::net::TcpListener;
+        let pem = include_str!("../../tests/fixtures/test-ca.pem");
+        for make in [
+            base_client_builder as fn() -> ClientBuilder,
+            internal_service_client_builder,
+            webhook_client_builder,
+            sso_client_builder,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ca.pem");
+            std::fs::write(&path, pem).unwrap();
+            let client = build_client_outside_proxy_env_window(|| {
+                make()
+                    .no_proxy()
+                    .timeout(Duration::from_millis(500))
+                    .build_with_ca_path_for_test(path.clone())
+                    .unwrap()
+            });
+            let dns_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let redirect_addr = redirect_listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = redirect_listener.accept().await.unwrap();
+                    let mut bytes = [0; 2048];
+                    let _ = socket.read(&mut bytes).await;
+                    let _ = socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                }
+            });
+            for rotate in [false, true] {
+                if rotate {
+                    let mut update = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+                    writeln!(update, "{pem}").unwrap();
+                    update.persist(&path).unwrap();
+                    assert!(client.refresh_custom_ca_for_test());
+                }
+                let err = client
+                    .get(format!(
+                        "http://localhost:{}/",
+                        dns_listener.local_addr().unwrap().port()
+                    ))
+                    .send()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    !err.is_timeout(),
+                    "resolver must refuse before a connection timeout: {err}"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), dns_listener.accept())
+                        .await
+                        .is_err(),
+                    "the DNS guard must not connect to the loopback listener"
+                );
+                let err = client
+                    .get(format!("http://{redirect_addr}/"))
+                    .send()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.is_redirect(),
+                    "metadata redirect must be refused: {err}"
+                );
+            }
+            join_loopback_server(server).await;
         }
     }
 
@@ -740,7 +761,7 @@ mod tests {
 
     /// Regression test for the SSRF redirect-follow bypass: any redirect
     /// hop pointing at a blocked address must abort the request, not
-    /// silently follow. A bare `reqwest::Client` would tolerate such a
+    /// silently follow. A bare `Client` would tolerate such a
     /// redirect; the policy installed by `base_client_builder` must not.
     #[tokio::test]
     async fn test_redirect_to_blocked_ip_is_refused() {
@@ -857,7 +878,7 @@ mod tests {
             }
         });
 
-        let client = loopback_client_from(reqwest::Client::builder().redirect(
+        let client = loopback_client_from(Client::builder().redirect(
             super::ssrf_redirect_policy_with(|_| None, "test redirect", "upstream"),
         ));
         let response = client
@@ -1025,8 +1046,8 @@ mod tests {
         // is parsed from the process env at construction (#2570/#3377), so
         // building the pair up front would put them right back in the race.
         for make_builder in [
-            webhook_client_builder as fn() -> reqwest::ClientBuilder,
-            sso_client_builder as fn() -> reqwest::ClientBuilder,
+            webhook_client_builder as fn() -> ClientBuilder,
+            sso_client_builder as fn() -> ClientBuilder,
         ] {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -1303,7 +1324,7 @@ mod tests {
         // EMPTY exempt-set (the pre-#2570 fail-closed behavior). No env mutation.
         let empty_exempt_resolver: Arc<dyn reqwest::dns::Resolve> =
             Arc::new(crate::services::ssrf_dns::SsrfGuardResolver::default());
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             .proxy(reqwest::Proxy::all(format!("http://localhost:{port}")).expect("proxy url"))
             .dns_resolver(empty_exempt_resolver)
             .timeout(Duration::from_secs(2))
@@ -1559,10 +1580,8 @@ mod tests {
             }
         });
 
-        let proxied_builder = || {
-            reqwest::Client::builder()
-                .proxy(reqwest::Proxy::all(&blackhole_url).expect("proxy url"))
-        };
+        let proxied_builder =
+            || Client::builder().proxy(reqwest::Proxy::all(&blackhole_url).expect("proxy url"));
 
         // Negative control: without the helper the proxy DOES capture the
         // request, so the black hole is real and the positive case below is not
@@ -1609,7 +1628,7 @@ mod tests {
             .expect("the tests module must exist");
         let window = &src[tests_start..];
 
-        let bare_client = format!("{}{}", "reqwest::Client::", "new()");
+        let bare_client = format!("{}{}", "Client::", "new()");
         assert!(
             !window.contains(&bare_client),
             "a test in this module builds its HTTP client with the bare constructor, \
@@ -1704,7 +1723,7 @@ mod tests {
             ("internal", internal_service_client_builder()),
             ("webhook", webhook_client_builder()),
             ("sso", sso_client_builder()),
-            ("plain", super::plain_client_builder()),
+            ("plain", ClientBuilder::new(super::plain_client_builder)),
             ("large_object", super::large_object_client_builder(true)),
             (
                 "server_side_copy",
@@ -1746,7 +1765,7 @@ mod tests {
     /// The clients that cannot use the SSRF-guarded builders (cloud metadata,
     /// presigned storage URLs, AWS control plane) start from
     /// [`super::plain_client_builder`]. A bare `reqwest::Client::builder()` or
-    /// `Client::new()` in production code sends no User-Agent, so fail when one
+    /// the bare client constructor in production code sends no User-Agent, so fail when one
     /// is added outside the tests of its file (#5110).
     ///
     /// The needles are assembled at runtime so this test does not match itself.

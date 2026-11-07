@@ -184,10 +184,10 @@ struct FsScanSubmitResponse {
 /// the error-mapping contract.
 pub(crate) struct ScannerAdapterFsClient {
     adapter_url: String,
-    http: reqwest::Client,
+    http: crate::services::http_client::Client,
     /// Redirects disabled so a `302 Found` "report not ready" is observed
     /// rather than followed.
-    poll_http: reqwest::Client,
+    poll_http: crate::services::http_client::Client,
 }
 
 impl ScannerAdapterFsClient {
@@ -211,12 +211,12 @@ impl ScannerAdapterFsClient {
                 // for an incus rootfs.
                 .timeout(std::time::Duration::from_secs(900))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
             poll_http: crate::services::http_client::internal_service_client_builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("build scanner HTTP client with its configured policies"),
         }
     }
 
