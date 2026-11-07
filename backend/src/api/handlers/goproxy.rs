@@ -1442,8 +1442,8 @@ async fn download_zip(
                 // format-specific filtering, so a member this caller could not
                 // read directly can never reach the byte resolver.
                 let members =
-                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
-                        .await;
+                    proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await?;
                 let mut allowed = Vec::with_capacity(members.len());
                 let mut blocked_response = None;
                 for member in members {

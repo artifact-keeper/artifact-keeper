@@ -25842,6 +25842,65 @@ mod proxy_download_recording_tests {
         ("vscode.rs", include_str!("vscode.rs")),
     ];
 
+    /// A virtual repository's member set must be authorized through the
+    /// FALLIBLE helper everywhere the result is turned into an answer for a
+    /// client.
+    ///
+    /// [`super::authorize_virtual_members`] flattens a failed visibility query
+    /// into the EMPTY set. Both directions fail closed, but the walking callers
+    /// then answer a definitive `404` and the aggregating ones answer an empty
+    /// listing -- for an artifact that exists and a caller who may read it.
+    /// Package clients cache that miss, so a transient database blip becomes a
+    /// sticky "not found". The fallible form surfaces it as a retryable server
+    /// error instead (#4308).
+    ///
+    /// Reuses `SERVE_SOURCES` because it is already the complete list of
+    /// handlers that answer a client with bytes or a listing, which is exactly
+    /// the set this gate has to cover.
+    #[test]
+    fn virtual_member_authorization_is_fallible_on_every_client_facing_path() {
+        // Call sites that may still flatten, each with the reason. `oci_v2`'s
+        // blob/manifest walk reaches the helper through its own
+        // `authorized_virtual_members`, whose `Option` return already means
+        // "stop the walk" and whose `None` is load-bearing for the virtual
+        // negative cache; making the authorization failure distinguishable
+        // there is a signature change across both resolvers and their handlers.
+        const EXEMPT: &[&str] = &["oci_v2.rs"];
+        const FLATTENING_CALL: &str = "proxy_helpers::authorize_virtual_members(";
+
+        let mut flattening: Vec<&str> = Vec::new();
+        for (file, src) in SERVE_SOURCES {
+            if EXEMPT.contains(file) {
+                continue;
+            }
+            if src.contains(FLATTENING_CALL) {
+                flattening.push(file);
+            }
+        }
+        assert!(
+            flattening.is_empty(),
+            "#4308: {flattening:?} authorize a virtual repository's members through the \
+             infallible `authorize_virtual_members`, so a failed visibility query is \
+             flattened into the empty set and answered as a definitive 404 (or an \
+             empty listing). Use `try_authorize_virtual_members` and let the caller \
+             answer a retryable server error."
+        );
+
+        // The gate is worthless if the token stops matching anything, so pin
+        // that the fallible form is genuinely in use on these paths.
+        for file in ["cargo.rs", "conda.rs", "debian.rs", "npm.rs", "pypi.rs"] {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| *n == file)
+                .unwrap_or_else(|| panic!("{file} is scanned"));
+            assert!(
+                src.contains("try_authorize_virtual_members("),
+                "#4308: {file} has a virtual download path and must authorize its \
+                 members through the fallible helper"
+            );
+        }
+    }
+
     /// The primitives that put UPSTREAM bytes in front of a client.
     ///
     /// The streaming family is the artifact-serving family by construction: a

@@ -2646,6 +2646,9 @@ async fn download(
             // skipped; if no other member answers, its 451 is the answer.
             let mut age_refusal: Option<Response> = None;
 
+            // A member that ERRORED rather than missed makes "not found"
+            // unknowable, so the walk must tell the client to retry.
+            let mut member_failed = false;
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
                     if let Some(refusal) = maven_member_age_gate(&state, member, &path).await? {
@@ -2658,27 +2661,32 @@ async fn download(
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
-                        if let Ok((content, _, _budget_permit)) =
-                            proxy_helpers::proxy_fetch_capped_budgeted(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &path,
-                                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                                // #3459: the member's OWN format, so a released
-                                // coordinate's `.sha1`/`.md5` sidecar classifies
-                                // immutable instead of falling to the 5-minute
-                                // mutable default a `Generic` stand-in produces.
-                                member.format.clone(),
-                            )
-                            .await
+                        match proxy_helpers::proxy_fetch_capped_budgeted(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            &path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                            // #3459: the member's OWN format, so a released
+                            // coordinate's `.sha1`/`.md5` sidecar classifies
+                            // immutable instead of falling to the 5-minute
+                            // mutable default a `Generic` stand-in produces.
+                            member.format.clone(),
+                        )
+                        .await
                         {
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, "text/plain")
-                                .body(Body::from(content))
-                                .unwrap());
+                            Ok((content, _, _budget_permit)) => {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/plain")
+                                    .body(Body::from(content))
+                                    .unwrap());
+                            }
+                            Err(resp) if resp.status() != StatusCode::NOT_FOUND => {
+                                member_failed = true;
+                            }
+                            Err(_) => {}
                         }
                     }
                 } else if member.repo_type.is_hosted() {
@@ -2704,8 +2712,16 @@ async fn download(
                     }
                 }
             }
+            // A member's age refusal is a definitive answer and keeps
+            // precedence (#4702); only a walk that would 404 becomes a 503.
             if let Some(refusal) = age_refusal {
                 return Err(refusal);
+            }
+            if member_failed {
+                return Err(AppError::ServiceUnavailable(
+                    "A repository member is temporarily unavailable, retry shortly".to_string(),
+                )
+                .into_response());
             }
         }
 
@@ -10374,6 +10390,80 @@ mod tests {
             StatusCode::OK,
             "an unavailable member must not produce a partial-union 200"
         );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_checksum_503s_when_a_member_errors_but_404s_on_a_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/com/boom/.*\.sha1$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/com/miss/.*\.sha1$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![remote_id, virtual_id])
+            .execute(&pool)
+            .await
+            .expect("publish repos");
+
+        let dir = std::env::temp_dir().join(format!("csum503-{}", virtual_id));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let get = |p: &str| {
+            let state = state.clone();
+            let key = virtual_key.clone();
+            let p = p.to_string();
+            async move {
+                download(
+                    axum::extract::State(state),
+                    axum::Extension(None),
+                    axum::extract::Path((key, p)),
+                    axum::http::HeaderMap::new(),
+                    Default::default(),
+                )
+                .await
+                .unwrap_or_else(|r| r)
+                .status()
+            }
+        };
+        let errored = get("com/boom/lib/1.0/lib-1.0.jar.sha1").await;
+        let missed = get("com/miss/lib/1.0/lib-1.0.jar.sha1").await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            errored,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an erroring member must not read as a miss"
+        );
+        assert_eq!(missed, StatusCode::NOT_FOUND, "a genuine miss stays 404");
     }
 
     #[tokio::test]
