@@ -1963,13 +1963,71 @@ async fn execute_due_backup_schedules(
     Ok(())
 }
 
-/// Normalize a cron expression: if 5-field, prepend "0 " for the seconds field.
+/// Normalize a cron expression for the `cron` crate. A 5-field expression is
+/// standard cron: prepend "0 " for the seconds field and spell the weekdays as
+/// names, because the crate numbers weekdays 1-7 from Sunday while standard
+/// cron numbers them 0-7 with 0 and 7 both Sunday. Other shapes pass through.
 pub(crate) fn normalize_cron_expression(cron_expr: &str) -> String {
-    if cron_expr.split_whitespace().count() == 5 {
-        format!("0 {}", cron_expr)
-    } else {
-        cron_expr.to_string()
+    let fields: Vec<&str> = cron_expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return cron_expr.to_string();
     }
+    format!(
+        "0 {} {}",
+        fields[..4].join(" "),
+        standard_cron_weekdays(fields[4])
+    )
+}
+
+/// Rewrite a standard-cron day-of-week field as day names (`1-5` becomes
+/// `MON,TUE,WED,THU,FRI`). A field it cannot read is returned unchanged, so the
+/// `cron` crate still rejects it with its own error.
+fn standard_cron_weekdays(field: &str) -> String {
+    const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    // `as_upper` maps a SUN upper bound to 7, so `MON-SUN` means Monday to Sunday.
+    let bound = |t: &str, as_upper: bool| -> Option<usize> {
+        if let Ok(n) = t.parse::<usize>() {
+            return (n <= 7).then_some(n);
+        }
+        let day = NAMES.iter().position(|d| d.eq_ignore_ascii_case(t))?;
+        Some(if as_upper && day == 0 { 7 } else { day })
+    };
+    let mut days = [false; 7];
+    for item in field.split(',') {
+        let (range, step) = match item.split_once('/') {
+            Some((range, step)) => match step.parse::<usize>() {
+                Ok(step) if step > 0 => (range, step),
+                _ => return field.to_string(),
+            },
+            None => (item, 1),
+        };
+        let (lo, hi) = match range {
+            "*" | "?" => (0, 6),
+            _ => match range.split_once('-') {
+                Some((a, b)) => match (bound(a, false), bound(b, true)) {
+                    (Some(a), Some(b)) if a <= b => (a, b),
+                    _ => return field.to_string(),
+                },
+                None => match bound(range, false) {
+                    Some(a) if step > 1 => (a, 6),
+                    Some(a) => (a, a),
+                    None => return field.to_string(),
+                },
+            },
+        };
+        for day in (lo..=hi).step_by(step) {
+            days[day % 7] = true;
+        }
+    }
+    if days.iter().all(|d| *d) {
+        return "*".to_string();
+    }
+    NAMES
+        .iter()
+        .zip(days)
+        .filter_map(|(name, on)| on.then_some(*name))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Parse a (possibly already normalized) cron expression into a Schedule.
@@ -3860,6 +3918,38 @@ mod tests {
     #[test]
     fn test_normalize_cron_5_field() {
         assert_eq!(normalize_cron_expression("0 0 * * *"), "0 0 0 * * *");
+    }
+
+    #[test]
+    fn test_normalize_cron_standard_weekdays() {
+        for (input, want) in [
+            ("30 3 * * 0", "0 30 3 * * SUN"),
+            ("30 3 * * 7", "0 30 3 * * SUN"),
+            ("30 3 * * 1", "0 30 3 * * MON"),
+            ("0 0 * * 1-5", "0 0 0 * * MON,TUE,WED,THU,FRI"),
+            ("0 0 * * 1-7", "0 0 0 * * *"),
+            ("0 0 * * 0,6", "0 0 0 * * SUN,SAT"),
+            ("0 0 * * */2", "0 0 0 * * SUN,TUE,THU,SAT"),
+            ("0 0 * * 1-5/2", "0 0 0 * * MON,WED,FRI"),
+            ("0 0 * * MON-SUN", "0 0 0 * * *"),
+            ("0 0 * * fri", "0 0 0 * * FRI"),
+            ("0 0 * * 8", "0 0 0 * * 8"),
+        ] {
+            assert_eq!(normalize_cron_expression(input), want, "{input}");
+        }
+    }
+
+    /// The crate reads a bare `1` as Sunday. Standard cron means Monday, and
+    /// every 5-field schedule goes through this normalization.
+    #[test]
+    fn test_standard_cron_monday_fires_on_monday() {
+        use chrono::Datelike;
+        let schedule = parse_cron_schedule(&normalize_cron_expression("0 3 * * 1"))
+            .expect("a valid weekday schedule");
+        for next in schedule.upcoming(chrono::Utc).take(3) {
+            assert_eq!(next.weekday(), chrono::Weekday::Mon);
+        }
+        assert!(parse_cron_schedule(&normalize_cron_expression("0 3 * * 0")).is_some());
     }
 
     #[test]
