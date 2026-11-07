@@ -188,6 +188,123 @@ pub struct RuleResponse {
     pub created_by: Option<Uuid>,
     pub created_at: String,
     pub updated_at: String,
+    /// Notes about the rule as written that do not stop it from being saved.
+    /// Only create and update return them, and the field is omitted when
+    /// empty. Today the only warning is that part of a typed rule does
+    /// nothing on Remote and Virtual downloads (#5159): a `publisher_trust`
+    /// rule, or the `min_downloads` threshold of a `popularity` rule, when
+    /// the rule is global or attached to a Remote or Virtual repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// Where a curation rule applies, as far as the proxy-download warning is
+/// concerned (#5159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleReach {
+    /// `scope = 'global'`: the staging sync AND every curated Remote/Virtual.
+    Global,
+    /// Attached to a Remote or Virtual repository: downloads only.
+    ProxyRepo,
+    /// Attached to any other repository (a staging repository's sync).
+    OtherRepo,
+}
+
+/// The part of a typed rule that Remote and Virtual downloads never
+/// evaluate, or `None` when the whole rule runs there (#5159).
+///
+/// The proxy path runs `pattern` rules and the name checks of `popularity`
+/// rules. A `publisher_trust` rule needs the registry metadata (and for
+/// attestations a Rekor round-trip), and the `min_downloads` threshold
+/// needs a download-count lookup, so both run only in the staging sync.
+/// `min_downloads` is read the way the evaluator reads it: anything but a
+/// positive integer leaves the threshold off.
+fn proxy_inert_part(rule_type: &str, config: &serde_json::Value) -> Option<&'static str> {
+    match rule_type {
+        "publisher_trust" => {
+            Some("publisher_trust rules are not evaluated on Remote or Virtual downloads")
+        }
+        "popularity"
+            if config
+                .get("min_downloads")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|n| n > 0) =>
+        {
+            Some(
+                "the min_downloads threshold of a popularity rule is not evaluated on Remote or \
+                 Virtual downloads; only its typo-squat, homoglyph and affix name checks run there",
+            )
+        }
+        _ => None,
+    }
+}
+
+/// The create/update warning for a rule that is partly inert on downloads,
+/// worded for where the rule applies. A disabled rule, a rule for another
+/// repository type, and a rule that runs fully on downloads get none.
+fn proxy_inert_warning(
+    rule_type: &str,
+    config: &serde_json::Value,
+    enabled: bool,
+    reach: RuleReach,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let part = proxy_inert_part(rule_type, config)?;
+    let consequence = match reach {
+        RuleReach::Global => {
+            "as a global rule it is enforced only by the staging-repository curation sync"
+        }
+        RuleReach::ProxyRepo => {
+            "this rule is attached to a Remote or Virtual repository, so that part has no effect"
+        }
+        RuleReach::OtherRepo => return None,
+    };
+    Some(format!("{part}; {consequence} (#5159)"))
+}
+
+/// Compute the [`proxy_inert_warning`] for a saved rule and log it, so an
+/// operator who scripts the API without reading responses still sees it.
+///
+/// The repository type is looked up only when the rule could warn, and a
+/// lookup failure yields no warning: the warning is advice, so it never
+/// fails the request.
+async fn inert_rule_warnings(
+    state: &SharedState,
+    rule: &crate::models::curation::CurationRule,
+) -> Vec<String> {
+    if !rule.enabled || proxy_inert_part(&rule.rule_type, &rule.config).is_none() {
+        return Vec::new();
+    }
+    let reach = match rule.staging_repo_id {
+        None => RuleReach::Global,
+        Some(repo_id) => match RepositoryService::new(state.db.clone())
+            .get_by_id(repo_id)
+            .await
+        {
+            Ok(repo) => match repo.repo_type {
+                crate::models::repository::RepositoryType::Remote
+                | crate::models::repository::RepositoryType::Virtual => RuleReach::ProxyRepo,
+                _ => RuleReach::OtherRepo,
+            },
+            Err(err) => {
+                tracing::debug!(rule_id = %rule.id, %repo_id, error = %err, "curation rule repository lookup failed; no warning");
+                RuleReach::OtherRepo
+            }
+        },
+    };
+    let warning = proxy_inert_warning(&rule.rule_type, &rule.config, rule.enabled, reach);
+    if let Some(warning) = &warning {
+        tracing::warn!(
+            rule_id = %rule.id,
+            rule_type = %rule.rule_type,
+            scope = %rule.scope,
+            staging_repo_id = ?rule.staging_repo_id,
+            "{warning}"
+        );
+    }
+    warning.into_iter().collect()
 }
 
 /// Validate the #2947 typed-rule fields shared by create/update.
@@ -463,7 +580,14 @@ async fn create_rule(
             auth.user_id,
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(rule_to_response(rule))))
+    let warnings = inert_rule_warnings(&state, &rule).await;
+    Ok((
+        StatusCode::CREATED,
+        Json(RuleResponse {
+            warnings,
+            ..rule_to_response(rule)
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -535,7 +659,11 @@ async fn update_rule(
             &req.config,
         )
         .await?;
-    Ok(Json(rule_to_response(rule)))
+    let warnings = inert_rule_warnings(&state, &rule).await;
+    Ok(Json(RuleResponse {
+        warnings,
+        ..rule_to_response(rule)
+    }))
 }
 
 #[utoipa::path(
@@ -1218,6 +1346,7 @@ fn rule_to_response(rule: crate::models::curation::CurationRule) -> RuleResponse
         created_by: rule.created_by,
         created_at: rule.created_at.to_rfc3339(),
         updated_at: rule.updated_at.to_rfc3339(),
+        warnings: Vec::new(),
     }
 }
 
@@ -1635,12 +1764,230 @@ mod tests {
     fn test_openapi_curation_rule_response_has_typed_fields() {
         let spec = curation_spec_json();
         let props = &spec["components"]["schemas"]["RuleResponse"]["properties"];
-        for field in ["rule_type", "config", "scope"] {
+        for field in ["rule_type", "config", "scope", "warnings"] {
             assert!(
                 props.get(field).is_some(),
                 "RuleResponse must document {field}"
             );
         }
+        // #5159: omitted when empty, so it must not be listed as required.
+        let required = spec["components"]["schemas"]["RuleResponse"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !required.iter().any(|f| f == "warnings"),
+            "warnings is optional: {required:?}"
+        );
+    }
+
+    // -- proxy-download warnings (#5159) ------------------------------------
+
+    #[test]
+    fn test_proxy_inert_part_matches_what_downloads_skip() {
+        assert!(proxy_inert_part("publisher_trust", &serde_json::json!({})).is_some());
+        assert!(
+            proxy_inert_part("popularity", &serde_json::json!({"min_downloads": 500})).is_some()
+        );
+        // Name checks only (or a threshold the evaluator reads as off): the
+        // whole rule runs on downloads.
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"min_downloads": 0, "block_typosquat": true}),
+            serde_json::json!({"min_downloads": "500"}),
+        ] {
+            assert!(
+                proxy_inert_part("popularity", &config).is_none(),
+                "{config}"
+            );
+        }
+        assert!(proxy_inert_part("pattern", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn test_proxy_inert_warning_by_reach_and_enabled() {
+        let pt = serde_json::json!({"trusted_publishers": ["acme"]});
+        let global = proxy_inert_warning("publisher_trust", &pt, true, RuleReach::Global)
+            .expect("a global publisher_trust rule warns");
+        assert!(global.contains("publisher_trust"), "{global}");
+        assert!(
+            global.contains("staging-repository curation sync"),
+            "{global}"
+        );
+        assert!(global.contains("#5159"), "{global}");
+
+        let threshold = serde_json::json!({"min_downloads": 500});
+        let proxy = proxy_inert_warning("popularity", &threshold, true, RuleReach::ProxyRepo)
+            .expect("a threshold on a Remote/Virtual rule warns");
+        assert!(proxy.contains("min_downloads"), "{proxy}");
+        assert!(proxy.contains("has no effect"), "{proxy}");
+
+        assert_eq!(
+            proxy_inert_warning("popularity", &threshold, true, RuleReach::OtherRepo),
+            None,
+            "a staging repository's rule runs in full on its sync"
+        );
+        assert_eq!(
+            proxy_inert_warning("publisher_trust", &pt, false, RuleReach::Global),
+            None,
+            "a disabled rule does nothing anywhere"
+        );
+        assert_eq!(
+            proxy_inert_warning(
+                "popularity",
+                &serde_json::json!({"block_typosquat": true}),
+                true,
+                RuleReach::ProxyRepo
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rule_response_omits_empty_warnings() {
+        let rule = crate::models::curation::CurationRule {
+            id: Uuid::new_v4(),
+            staging_repo_id: None,
+            package_pattern: "*".to_string(),
+            version_constraint: "*".to_string(),
+            architecture: "*".to_string(),
+            action: "allow".to_string(),
+            priority: 1,
+            reason: "r".to_string(),
+            enabled: true,
+            rule_type: "pattern".to_string(),
+            config: serde_json::json!({}),
+            scope: "global".to_string(),
+            created_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let plain = serde_json::to_value(rule_to_response(rule.clone())).unwrap();
+        assert!(plain.get("warnings").is_none(), "{plain}");
+        let warned = serde_json::to_value(RuleResponse {
+            warnings: vec!["w".to_string()],
+            ..rule_to_response(rule)
+        })
+        .unwrap();
+        assert_eq!(warned["warnings"], serde_json::json!(["w"]));
+    }
+
+    // #5159 through the HANDLERS: create and update return the warning for a
+    // rule whose download-side part is inert, and nothing otherwise.
+    #[tokio::test]
+    async fn test_create_update_rule_warn_when_inert_on_downloads_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // One case below creates a global rule: hold the global-rule lock so
+        // it cannot decide a peer test's evaluation.
+        let _guard = tdh::curation_global_serial_lock().await;
+        let (admin, aname) = tdh::create_user(&pool).await;
+        let (remote, _rk, _rd) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (staging, _sk, _sd) = tdh::create_repo(&pool, "staging", "npm").await;
+        let state = tdh::build_state(pool.clone(), "/tmp");
+        let reason = format!("qa5159-{}", Uuid::new_v4());
+
+        let create = |repo: Option<Uuid>, rule_type: &str, config: serde_json::Value| {
+            let state = state.clone();
+            let auth = tdh::admin_auth(admin, &aname);
+            let req = CreateRuleRequest {
+                staging_repo_id: repo,
+                package_pattern: "*".to_string(),
+                version_constraint: "*".to_string(),
+                architecture: "*".to_string(),
+                action: "block".to_string(),
+                priority: 42,
+                reason: reason.clone(),
+                rule_type: rule_type.to_string(),
+                config,
+                scope: None,
+            };
+            async move {
+                super::create_rule(State(state), Extension(auth), Json(req))
+                    .await
+                    .expect("create succeeds; a warning never rejects")
+                    .1
+                     .0
+            }
+        };
+        let threshold = serde_json::json!({"min_downloads": 500});
+        let name_only = serde_json::json!({"block_typosquat": true});
+
+        let on_remote = create(Some(remote), "popularity", threshold.clone()).await;
+        let name_checks = create(Some(remote), "popularity", name_only.clone()).await;
+        let on_staging = create(Some(staging), "popularity", threshold.clone()).await;
+        let global_pt = create(
+            None,
+            "publisher_trust",
+            serde_json::json!({"trusted_publishers": ["acme"], "action": "flag"}),
+        )
+        .await;
+        // Delete the global rule straight away; only its response matters.
+        CurationService::new(pool.clone())
+            .delete_rule(global_pt.id)
+            .await
+            .expect("delete global rule");
+
+        assert_eq!(on_remote.warnings.len(), 1, "{:?}", on_remote.warnings);
+        assert!(on_remote.warnings[0].contains("min_downloads"));
+        assert!(
+            name_checks.warnings.is_empty(),
+            "{:?}",
+            name_checks.warnings
+        );
+        assert!(on_staging.warnings.is_empty(), "{:?}", on_staging.warnings);
+        assert_eq!(global_pt.warnings.len(), 1, "{:?}", global_pt.warnings);
+        assert!(global_pt.warnings[0].contains("publisher_trust"));
+
+        // Update: adding a threshold to the name-only rule warns; disabling
+        // the rule clears it.
+        let update = |enabled: bool, config: serde_json::Value| UpdateRuleRequest {
+            package_pattern: "*".to_string(),
+            version_constraint: "*".to_string(),
+            architecture: "*".to_string(),
+            action: "block".to_string(),
+            priority: 42,
+            reason: reason.clone(),
+            enabled,
+            rule_type: "popularity".to_string(),
+            config,
+        };
+        let updated = super::update_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Path(name_checks.id),
+            Json(update(true, threshold.clone())),
+        )
+        .await
+        .expect("update succeeds")
+        .0;
+        assert_eq!(updated.warnings.len(), 1, "{:?}", updated.warnings);
+        let disabled = super::update_rule(
+            State(state.clone()),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Path(name_checks.id),
+            Json(update(false, threshold)),
+        )
+        .await
+        .expect("update succeeds")
+        .0;
+        assert!(disabled.warnings.is_empty(), "{:?}", disabled.warnings);
+
+        // A read never carries warnings.
+        let read = super::get_rule(
+            State(state),
+            Extension(tdh::admin_auth(admin, &aname)),
+            Path(on_remote.id),
+        )
+        .await
+        .expect("get rule")
+        .0;
+        assert!(read.warnings.is_empty());
+
+        tdh::cleanup(&pool, remote, admin).await;
+        tdh::cleanup(&pool, staging, admin).await;
     }
 
     // #2947 DB round-trip through the HANDLERS: an admin creates a global

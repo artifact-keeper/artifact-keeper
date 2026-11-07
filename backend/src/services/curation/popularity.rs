@@ -50,6 +50,14 @@
 //!
 //! When both the threshold and the typo-squat signal fire, the strongest
 //! outcome wins (Block > Flag) and the reasons are combined.
+//!
+//! Remote and Virtual downloads (#5159) run only the lexical half, through
+//! [`evaluate_name_only`]: no download-count lookup happens on that path.
+//! There, `block_typosquat` blocks only homoglyph and mixed-script matches.
+//! Edit-distance and affix matches only flag, because a download has no
+//! review step to absorb their false positives: edit distance 2 from the
+//! seed list reaches real packages such as npm `preact`, `vite`, `chai` and
+//! `vuex`, and PyPI `numba`, `httpie`, `attr` and `pipx`.
 
 use crate::models::curation::CurationDecision;
 
@@ -139,62 +147,7 @@ pub async fn evaluate(
     let Some(ecosystem) = ecosystem_for_format(format) else {
         return CurationDecision::NotApplicable;
     };
-
-    let min_downloads = config
-        .get("min_downloads")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let typosquat_check = config
-        .get("typosquat_check")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let max_distance = config
-        .get("max_distance")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_MAX_DISTANCE)
-        .clamp(1, MAX_DISTANCE_CEILING) as usize;
-    let block_action = config
-        .get("action")
-        .and_then(serde_json::Value::as_str)
-        .map(|a| a.eq_ignore_ascii_case("block"))
-        .unwrap_or(false);
-    // Opt-in hardening flags; both default false (see doc comment).
-    let block_unknown = config
-        .get("block_unknown")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let block_typosquat = config
-        .get("block_typosquat")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    // #2956 sub-toggles, both under the typosquat_check master toggle.
-    let homoglyph_check = config
-        .get("homoglyph_check")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let affix_check = config
-        .get("affix_check")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let affix_max_downloads = config
-        .get("affix_max_downloads")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_AFFIX_MAX_DOWNLOADS);
-
-    let popular: Vec<String> = match config
-        .get("popular_packages")
-        .and_then(serde_json::Value::as_array)
-    {
-        Some(list) => list
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::to_string)
-            .collect(),
-        None => default_popular_packages(ecosystem)
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    };
+    let cfg = PopularityConfig::parse(config, ecosystem);
 
     let downloads = source.downloads(format, name).await;
 
@@ -202,11 +155,12 @@ pub async fn evaluate(
     let mut flag_reasons: Vec<String> = Vec::new();
 
     match downloads {
-        PopularityResult::Known(d) if min_downloads > 0 && d < min_downloads => {
+        PopularityResult::Known(d) if cfg.min_downloads > 0 && d < cfg.min_downloads => {
             let reason = format!(
-                "package '{name}' has {d} recent downloads, below the configured minimum of {min_downloads}"
+                "package '{name}' has {d} recent downloads, below the configured minimum of {}",
+                cfg.min_downloads
             );
-            if block_action {
+            if cfg.block_action {
                 block_reasons.push(reason);
             } else {
                 flag_reasons.push(reason);
@@ -217,7 +171,7 @@ pub async fn evaluate(
             let reason = format!(
                 "popularity unknown for package '{name}' (download-count source unavailable or package not listed)"
             );
-            if block_action && block_unknown {
+            if cfg.block_action && cfg.block_unknown {
                 // Opt-in fail-closed: a brand-new package with no download
                 // history must not evade a block rule just because the count
                 // is Unknown.
@@ -231,51 +185,25 @@ pub async fn evaluate(
         }
     }
 
-    if typosquat_check {
+    if cfg.typosquat_check {
         // All lexical signals share the block_typosquat escalation: opt-in
         // enforcement where the operator accepts the false-positive rate of
         // lexical matching in exchange for hard-blocking fresh squats that
         // have no download history to trip on. Default: advisory only.
-        let mut lexical_reasons: Vec<String> = Vec::new();
+        let mut lexical_reasons: Vec<String> = cfg.distance_reason(name).into_iter().collect();
+        lexical_reasons.extend(cfg.homoglyph_reasons(name));
 
-        if let Some(target) = is_typosquat(name, &popular, max_distance) {
-            lexical_reasons.push(format!(
-                "name '{name}' is within edit distance {max_distance} of popular package '{target}' (possible typo-squat)"
-            ));
-        }
-
-        if homoglyph_check {
-            if let Some(target) = is_homoglyph_squat(name, &popular) {
-                lexical_reasons.push(format!(
-                    "name '{name}' is a Unicode-confusable (homoglyph) lookalike of popular package '{target}'"
-                ));
-            }
-            // Mixed script alone is NOT impersonation (internationalized
-            // names legitimately mix scripts); it only signals when the name
-            // ALSO sits near a popular package in confusable-skeleton space
-            // (collision = distance 0, or within max_distance edits).
-            if is_mixed_script(name) {
-                if let Some((target, distance)) = nearest_popular_skeleton(name, &popular) {
-                    if distance <= max_distance {
-                        lexical_reasons.push(format!(
-                            "name '{name}' mixes Unicode scripts and visually resembles popular package '{target}' (homoglyph-impersonation indicator)"
-                        ));
-                    }
-                }
-            }
-        }
-
-        if affix_check {
+        if cfg.affix_check {
             // Reputation-riding requires the candidate itself to be
             // unpopular: a legitimately popular affixed name (e.g.
             // `python-dateutil`, were it missing from the popular list) is
             // not riding anyone's reputation.
             let candidate_low_popularity = match downloads {
-                PopularityResult::Known(d) => d < affix_max_downloads,
+                PopularityResult::Known(d) => d < cfg.affix_max_downloads,
                 PopularityResult::Unknown => true,
             };
             if candidate_low_popularity {
-                if let Some(target) = is_affix_squat(name, &popular) {
+                if let Some(target) = is_affix_squat(name, &cfg.popular) {
                     lexical_reasons.push(format!(
                         "name '{name}' is popular package '{target}' plus an ecosystem affix, and '{name}' itself has low/unknown downloads (possible reputation-riding)"
                     ));
@@ -283,7 +211,7 @@ pub async fn evaluate(
             }
         }
 
-        if block_typosquat {
+        if cfg.block_typosquat {
             block_reasons.extend(lexical_reasons);
         } else {
             flag_reasons.extend(lexical_reasons);
@@ -297,6 +225,177 @@ pub async fn evaluate(
         CurationDecision::Flag(flag_reasons.join("; "))
     } else {
         CurationDecision::Allow
+    }
+}
+
+/// The name-only half of [`evaluate`], for the proxy download path (#5159).
+///
+/// A Remote or Virtual download cannot afford a download-count lookup, so
+/// this runs only the lexical checks, which compare the name against the
+/// popular list locally: edit-distance typo-squat, homoglyph and
+/// mixed-script, and affix. It takes no [`PopularitySource`] and is not
+/// `async`, so it cannot reach pypistats or the npm downloads API.
+///
+/// The download-count half is NOT evaluated, so the result differs from
+/// [`evaluate`] in three ways:
+///
+/// * `min_downloads`, `action`, `block_unknown` and `window` have no effect,
+///   and no "popularity unknown" flag is raised for every package.
+/// * `block_typosquat` escalates to `Block` only on a homoglyph or
+///   mixed-script match, the signals with essentially no legitimate cause.
+///   Edit-distance and affix matches are only ever a `Flag` here. On the
+///   staging sync a false positive lands in review; on a download it would
+///   refuse a real package outright, and both signals have known ones:
+///   - Edit distance is up to 2 against short seed names, which reaches
+///     popular real packages: npm `preact`, `vite`, `chai` and `vuex`, and
+///     PyPI `numba`, `httpie`, `attr` and `pipx`.
+///   - The affix signal relies on the candidate's own download count (below
+///     `affix_max_downloads`) to spare popular affixed names such as
+///     `eslint-plugin-react` or `pytest-django`, and there is no count here.
+/// * A name with no lexical signal is `NotApplicable`, never `Allow`. This
+///   evaluation has not checked the download-count threshold, so it cannot
+///   vouch for the package, and a lower-priority rule still decides.
+///
+/// When a blocking and a flagging signal both fire, the `Block` carries
+/// every reason.
+pub fn evaluate_name_only(
+    config: &serde_json::Value,
+    format: &str,
+    name: &str,
+) -> CurationDecision {
+    let Some(ecosystem) = ecosystem_for_format(format) else {
+        return CurationDecision::NotApplicable;
+    };
+    let cfg = PopularityConfig::parse(config, ecosystem);
+    if !cfg.typosquat_check {
+        return CurationDecision::NotApplicable;
+    }
+
+    let homoglyph = cfg.homoglyph_reasons(name);
+    let escalate = cfg.block_typosquat && !homoglyph.is_empty();
+    // Same order as `evaluate`: distance, homoglyph, affix.
+    let mut reasons: Vec<String> = cfg.distance_reason(name).into_iter().collect();
+    reasons.extend(homoglyph);
+    if cfg.affix_check {
+        if let Some(target) = is_affix_squat(name, &cfg.popular) {
+            reasons.push(format!(
+                "name '{name}' is popular package '{target}' plus an ecosystem affix (possible reputation-riding; its download count is not checked on downloads)"
+            ));
+        }
+    }
+
+    if reasons.is_empty() {
+        CurationDecision::NotApplicable
+    } else if escalate {
+        CurationDecision::Block(reasons.join("; "))
+    } else {
+        CurationDecision::Flag(reasons.join("; "))
+    }
+}
+
+/// A `popularity` rule's config with every default applied (see
+/// [`evaluate`] for the keys and their meaning).
+struct PopularityConfig {
+    min_downloads: u64,
+    typosquat_check: bool,
+    max_distance: usize,
+    block_action: bool,
+    block_unknown: bool,
+    block_typosquat: bool,
+    homoglyph_check: bool,
+    affix_check: bool,
+    affix_max_downloads: u64,
+    popular: Vec<String>,
+}
+
+impl PopularityConfig {
+    fn parse(config: &serde_json::Value, ecosystem: &str) -> Self {
+        let flag = |key: &str, default: bool| {
+            config
+                .get(key)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default)
+        };
+        let popular = match config
+            .get("popular_packages")
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(list) => list
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            None => default_popular_packages(ecosystem)
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        Self {
+            min_downloads: config
+                .get("min_downloads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            typosquat_check: flag("typosquat_check", true),
+            max_distance: config
+                .get("max_distance")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(DEFAULT_MAX_DISTANCE)
+                .clamp(1, MAX_DISTANCE_CEILING) as usize,
+            block_action: config
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .map(|a| a.eq_ignore_ascii_case("block"))
+                .unwrap_or(false),
+            // Opt-in hardening flags; both default false (see `evaluate`).
+            block_unknown: flag("block_unknown", false),
+            block_typosquat: flag("block_typosquat", false),
+            // #2956 sub-toggles, both under the typosquat_check master toggle.
+            homoglyph_check: flag("homoglyph_check", true),
+            affix_check: flag("affix_check", true),
+            affix_max_downloads: config
+                .get("affix_max_downloads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(DEFAULT_AFFIX_MAX_DOWNLOADS),
+            popular,
+        }
+    }
+
+    /// The edit-distance typo-squat signal, which needs no download count.
+    /// The caller checks `typosquat_check`.
+    fn distance_reason(&self, name: &str) -> Option<String> {
+        is_typosquat(name, &self.popular, self.max_distance).map(|target| {
+            format!(
+                "name '{name}' is within edit distance {} of popular package '{target}' (possible typo-squat)",
+                self.max_distance
+            )
+        })
+    }
+
+    /// The homoglyph and mixed-script signals (under `homoglyph_check`),
+    /// which need no download count. The caller checks `typosquat_check`.
+    fn homoglyph_reasons(&self, name: &str) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.homoglyph_check {
+            if let Some(target) = is_homoglyph_squat(name, &self.popular) {
+                reasons.push(format!(
+                    "name '{name}' is a Unicode-confusable (homoglyph) lookalike of popular package '{target}'"
+                ));
+            }
+            // Mixed script alone is NOT impersonation (internationalized
+            // names legitimately mix scripts); it only signals when the name
+            // ALSO sits near a popular package in confusable-skeleton space
+            // (collision = distance 0, or within max_distance edits).
+            if is_mixed_script(name) {
+                if let Some((target, distance)) = nearest_popular_skeleton(name, &self.popular) {
+                    if distance <= self.max_distance {
+                        reasons.push(format!(
+                            "name '{name}' mixes Unicode scripts and visually resembles popular package '{target}' (homoglyph-impersonation indicator)"
+                        ));
+                    }
+                }
+            }
+        }
+        reasons
     }
 }
 
@@ -786,5 +885,211 @@ mod tests {
             evaluate(&cfg, "pypi", "reqzzzts", "1.0.0", &source).await,
             CurationDecision::Allow
         );
+    }
+
+    // -- evaluate_name_only: the proxy download path (#5159) ------------------
+
+    /// Cyrillic `о` (U+043E) for the first `o` of `lodash`: pixel-identical,
+    /// one edit away, and mixed-script.
+    const LODASH_HOMOGLYPH: &str = "l\u{043e}dash";
+
+    #[test]
+    fn name_only_blocks_homoglyph_with_block_typosquat() {
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        match evaluate_name_only(&cfg, "npm", LODASH_HOMOGLYPH) {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("homoglyph"), "{reason}");
+                assert!(reason.contains("'lodash'"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_only_flags_typosquat_by_default() {
+        let cfg = config(serde_json::json!({}));
+        match evaluate_name_only(&cfg, "pypi", "reqeusts") {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("typo-squat"), "{reason}");
+                assert!(reason.contains("'requests'"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_only_has_no_opinion_on_a_clean_or_seed_name() {
+        // The seed package itself and an unrelated name carry no lexical
+        // signal. The result is NotApplicable, not Allow: the threshold half
+        // was not evaluated, so a lower-priority rule must still decide.
+        let cfg = config(serde_json::json!({"block_typosquat": true, "min_downloads": 500}));
+        for (format, name) in [
+            ("npm", "lodash"),
+            ("npm", "left-pad-of-my-own"),
+            ("pypi", "requests"),
+        ] {
+            assert_eq!(
+                evaluate_name_only(&cfg, format, name),
+                CurationDecision::NotApplicable,
+                "{format}/{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_only_ignores_the_download_count_settings() {
+        // min_downloads/action/block_unknown would Block an unknown count on
+        // the staging path; here they are not evaluated at all, so a name
+        // with no lexical signal raises no "popularity unknown" flag.
+        let cfg = config(serde_json::json!({
+            "min_downloads": 1_000_000,
+            "action": "block",
+            "block_unknown": true
+        }));
+        assert_eq!(
+            evaluate_name_only(&cfg, "npm", "brand-new-pkg"),
+            CurationDecision::NotApplicable
+        );
+    }
+
+    #[test]
+    fn name_only_affix_match_only_flags() {
+        // Without a download count the affix popularity gate cannot run, so
+        // an affix match stays a Flag even with block_typosquat: blocking
+        // would refuse legitimately popular affixed names.
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        match evaluate_name_only(&cfg, "npm", "eslint-plugin-react") {
+            CurationDecision::Flag(reason) => {
+                assert!(reason.contains("reputation-riding"), "{reason}");
+                assert!(reason.contains("not checked on downloads"), "{reason}");
+            }
+            other => panic!("expected Flag, got {other:?}"),
+        }
+        // affix_check off: no signal at all.
+        let cfg = config(serde_json::json!({"block_typosquat": true, "affix_check": false}));
+        assert_eq!(
+            evaluate_name_only(&cfg, "npm", "eslint-plugin-react"),
+            CurationDecision::NotApplicable
+        );
+    }
+
+    #[test]
+    fn name_only_affix_reason_rides_along_with_an_escalated_block() {
+        // A homoglyph `lodash` plus an affix: three edits from `lodash`, so
+        // the escalating signal is the mixed-script one, and the affix reason
+        // joins the Block instead of being dropped.
+        let name = "l\u{043e}dash-x";
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        match evaluate_name_only(&cfg, "npm", name) {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("mixes Unicode scripts"), "{reason}");
+                assert!(reason.contains("reputation-riding"), "{reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_only_respects_toggles_custom_list_and_format() {
+        let off = config(serde_json::json!({"typosquat_check": false, "block_typosquat": true}));
+        assert_eq!(
+            evaluate_name_only(&off, "npm", LODASH_HOMOGLYPH),
+            CurationDecision::NotApplicable,
+            "typosquat_check is the master toggle"
+        );
+        let custom = config(serde_json::json!({
+            "block_typosquat": true,
+            "popular_packages": ["express"]
+        }));
+        assert_eq!(
+            evaluate_name_only(&custom, "npm", LODASH_HOMOGLYPH),
+            CurationDecision::NotApplicable,
+            "a custom popular list replaces the seed list"
+        );
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        for format in ["maven", "docker", "cargo", "generic"] {
+            assert_eq!(
+                evaluate_name_only(&cfg, format, LODASH_HOMOGLYPH),
+                CurationDecision::NotApplicable,
+                "{format} has no popularity ecosystem"
+            );
+        }
+        // Registry-compatible aliases share the npm seed list.
+        assert!(matches!(
+            evaluate_name_only(&cfg, "yarn", LODASH_HOMOGLYPH),
+            CurationDecision::Block(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn name_only_matches_the_full_evaluator_on_lexical_signals() {
+        // The refactor shares one implementation: for a name the threshold
+        // check passes, the two evaluators fire the same signals with the
+        // same reasons. With block_typosquat they differ only in verdict on
+        // an edit-distance match (Block on staging, Flag on downloads).
+        let flag_cfg = config(serde_json::json!({"min_downloads": 10}));
+        let block_cfg = config(serde_json::json!({"block_typosquat": true, "min_downloads": 10}));
+        let source = FakePopularitySource::new()
+            .with("npm", LODASH_HOMOGLYPH, 50)
+            .with("npm", "preact", 5_000);
+        for name in [LODASH_HOMOGLYPH, "preact"] {
+            assert_eq!(
+                evaluate(&flag_cfg, "npm", name, "1.0.0", &source).await,
+                evaluate_name_only(&flag_cfg, "npm", name),
+                "{name}: same signals, same reasons"
+            );
+        }
+        // A homoglyph blocks on both paths.
+        assert_eq!(
+            evaluate(&block_cfg, "npm", LODASH_HOMOGLYPH, "1.0.0", &source).await,
+            evaluate_name_only(&block_cfg, "npm", LODASH_HOMOGLYPH)
+        );
+        // An edit-distance match: the same reason, Block on staging, Flag on
+        // downloads.
+        let staging = evaluate(&block_cfg, "npm", "preact", "1.0.0", &source).await;
+        let download = evaluate_name_only(&block_cfg, "npm", "preact");
+        match (staging, download) {
+            (CurationDecision::Block(s), CurationDecision::Flag(d)) => assert_eq!(s, d),
+            other => panic!("expected (Block, Flag), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn name_only_edit_distance_only_flags_real_short_names() {
+        // Edit distance <= 2 from short seed names reaches popular real
+        // packages; on a download a block would refuse them outright.
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        for (format, name) in [
+            ("npm", "preact"),
+            ("npm", "vite"),
+            ("npm", "chai"),
+            ("npm", "vuex"),
+            ("pypi", "numba"),
+            ("pypi", "httpie"),
+            ("pypi", "attr"),
+            ("pypi", "pipx"),
+        ] {
+            match evaluate_name_only(&cfg, format, name) {
+                CurationDecision::Flag(reason) => {
+                    assert!(reason.contains("typo-squat"), "{format}/{name}: {reason}")
+                }
+                other => panic!("{format}/{name}: expected Flag, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn name_only_ascii_confusable_still_blocks() {
+        // `c1ick`: digit `1` is a UTS #39 confusable of `l`, so the skeleton
+        // collides with `click`. ASCII survives PEP 503 normalization, so a
+        // PyPI download can still be refused on a homoglyph.
+        let cfg = config(serde_json::json!({"block_typosquat": true}));
+        match evaluate_name_only(&cfg, "pypi", "c1ick") {
+            CurationDecision::Block(reason) => {
+                assert!(reason.contains("homoglyph"), "{reason}");
+                assert!(reason.contains("typo-squat"), "all reasons kept: {reason}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
     }
 }
