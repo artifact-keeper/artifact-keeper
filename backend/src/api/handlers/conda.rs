@@ -5162,7 +5162,9 @@ enum ShardField<'a> {
 }
 
 /// A repodata record in CEP-16 shard form: every field as in `repodata.json`
-/// except the digests, which become `bin`. A digest field that is not valid
+/// except `fn` (the enclosing map already supplies the filename) and the
+/// digests, which become `bin`. Conda 26.7 supplies `fn` itself when creating
+/// a PackageRecord and rejects a second value from the shard. A digest field that is not valid
 /// hex of the right length (an empty `md5` on a row with no extracted
 /// metadata) is omitted rather than sent as a string a reader would reject.
 struct ShardRecord<'a>(&'a serde_json::Map<String, serde_json::Value>);
@@ -5174,6 +5176,9 @@ impl serde::Serialize for ShardRecord<'_> {
             .0
             .iter()
             .filter_map(|(key, value)| {
+                if key == "fn" {
+                    return None;
+                }
                 match SHARD_DIGEST_KEYS.iter().find(|(k, _)| *k == key.as_str()) {
                     Some((_, len)) => value
                         .as_str()
@@ -14106,6 +14111,43 @@ mod tests {
             hex::encode(record.md5.expect("md5 present")),
             "cd".repeat(16)
         );
+    }
+
+    #[test]
+    fn shard_wire_records_do_not_duplicate_the_filename() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            packages: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>>,
+            #[serde(rename = "packages.conda")]
+            packages_conda: BTreeMap<String, BTreeMap<String, serde::de::IgnoredAny>>,
+        }
+
+        for (section, filename) in [
+            ("packages", "pkg-1.0-0.tar.bz2"),
+            ("packages.conda", "pkg-1.0-0.conda"),
+        ] {
+            // Also models records synthesized from a remote repodata.json:
+            // normalization belongs at the shared wire boundary.
+            let record = serde_json::json!({
+                "name": "pkg", "version": "1.0", "fn": filename,
+                "sha256": "ab".repeat(32), "vendor_metadata": "preserved"
+            });
+            let mut shard = serde_json::json!({"packages": {}, "packages.conda": {}});
+            shard[section][filename] = record;
+            let encoded = encode_shard(&shard).unwrap();
+            let decoded: Decoded =
+                rmp_serde::from_slice(&zstd::decode_all(&encoded[..]).unwrap()).unwrap();
+            let records = if section == "packages" {
+                decoded.packages
+            } else {
+                decoded.packages_conda
+            };
+            let record = &records[filename];
+            assert!(!record.contains_key("fn"));
+            assert!(record.contains_key("sha256"));
+            assert!(record.contains_key("vendor_metadata"));
+            assert_eq!(shard[section][filename]["fn"], filename);
+        }
     }
 
     #[test]
