@@ -1248,9 +1248,18 @@ impl HydrationCoordinator {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(DEFAULT_PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS);
+        // Detached lock connections sit outside the pool, so they need their own
+        // ceiling or a hydration storm opens one server connection per waiter
+        // with nothing bounding the total. It defaults ABOVE the waiter cap (one
+        // per blocking waiter plus the leader), or this would silently become
+        // the smaller of the two knobs and cap `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS`.
+        let max_connections = std::env::var("PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(max_lock_waiters.saturating_add(1));
         HydrationCoordinator::Advisory(
             AdvisoryLockCoordinator::new(
-                Arc::new(PgAdvisoryLock::new(pool)),
+                Arc::new(PgAdvisoryLock::with_max_connections(pool, max_connections)),
                 poll_interval,
                 wait_timeout,
             )
