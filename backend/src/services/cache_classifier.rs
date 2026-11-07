@@ -298,6 +298,16 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // packages are version-pinned — both immutable.
         RepositoryFormat::Rpm => classify_rpm(&lower),
 
+        // -- NuGet family ---------------------------------------------------
+        // nuget.org never accepts a second push of an id + version, even
+        // after a delete, so the files of one version (the flat-container `.nupkg`
+        // and `.nuspec`, the V2 package download) are immutable. The service
+        // index, version lists, registrations, search and OData queries
+        // change with every publish.
+        RepositoryFormat::Nuget | RepositoryFormat::Chocolatey | RepositoryFormat::Powershell => {
+            classify_nuget(&lower)
+        }
+
         // The VS Code gateway owns this version- and target-platform-qualified
         // cache layout. It is the only Vscode cache path safe to retain
         // forever; hosted and future metadata paths stay mutable by default.
@@ -787,6 +797,50 @@ fn classify_rpm(lower: &str) -> Mutability {
     }
     // Unknown path: revalidate.
     Mutability::mutable_default()
+}
+
+/// NuGet: only the proxy-cache keys of one exact package version are
+/// immutable.
+///
+/// - `v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg` and
+///   `v3/flatcontainer/{id}/{version}/{id}.nuspec`, the PackageBaseAddress
+///   files, whose segments the protocol defines as lowercase. The `.nuspec`
+///   is the manifest inside that `.nupkg`. A private feed that lets a
+///   version be overwritten breaks that rule; `cache/invalidate` evicts such
+///   an entry.
+/// - `v2/package/{id}/{version}/package.nupkg`, the key a V2 upstream's
+///   `package/{id}/{version}` download is cached under.
+///
+/// Everything else stays mutable: `v3/index.json`,
+/// `v3/flatcontainer/{id}/index.json` (the version list),
+/// `v3/registration/...`, search, autocomplete and the V2 OData queries. So
+/// does any other file under a version directory, such as a symbols package.
+/// The hosted artifact path (`{id}/{version}/{file}`) does not match either
+/// shape: `classify` also drives the hosted delete guard, which this leaves
+/// unchanged.
+fn classify_nuget(lower: &str) -> Mutability {
+    let package_file = if let Some(rest) = lower.strip_prefix("v3/flatcontainer/") {
+        match rest.split('/').collect::<Vec<_>>().as_slice() {
+            [id, version, file] => {
+                !id.is_empty()
+                    && !version.is_empty()
+                    && (*file == format!("{id}.{version}.nupkg") || *file == format!("{id}.nuspec"))
+            }
+            _ => false,
+        }
+    } else if let Some(rest) = lower.strip_prefix("v2/package/") {
+        matches!(
+            rest.split('/').collect::<Vec<_>>().as_slice(),
+            [id, version, "package.nupkg"] if !id.is_empty() && !version.is_empty()
+        )
+    } else {
+        false
+    };
+    if package_file {
+        Mutability::Immutable
+    } else {
+        Mutability::mutable_default()
+    }
 }
 
 /// Open VSX gallery assets are immutable only for the two exact AK-owned
@@ -1482,6 +1536,71 @@ mod tests {
             (Debian, "amd64/kubectl_1.34.0-1.1_amd64.deb", true),
             (Debian, "foo_1.0_all.deb", true),
             (Debian, "by-hash/SHA256/abc123def456", true),
+            // NuGet: the files of one package version are immutable; the
+            // service index, version lists, registrations and queries are not.
+            (
+                Nuget,
+                "v3/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
+                true,
+            ),
+            (
+                Nuget,
+                "v3/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.nuspec",
+                true,
+            ),
+            (
+                Nuget,
+                "/v3/flatcontainer/Newtonsoft.Json/13.0.3/Newtonsoft.Json.13.0.3.nupkg",
+                true,
+            ),
+            (
+                Nuget,
+                "v3/flatcontainer/serilog/4.0.0-dev-02108/serilog.4.0.0-dev-02108.nupkg",
+                true,
+            ),
+            (Nuget, "v2/package/newtonsoft.json/13.0.3/package.nupkg", true),
+            (Chocolatey, "v2/package/chocolatey/2.2.2/package.nupkg", true),
+            (
+                Powershell,
+                "v3/flatcontainer/pester/5.6.1/pester.5.6.1.nupkg",
+                true,
+            ),
+            (Nuget, "v3/index.json", false),
+            (Nuget, "v3/flatcontainer/newtonsoft.json/index.json", false),
+            (Nuget, "v3/registration/newtonsoft.json/index.json", false),
+            (
+                Nuget,
+                "v3/registration/newtonsoft.json/page/13.0.1/13.0.3.json",
+                false,
+            ),
+            (Nuget, "v3/search/0f1e2d3c", false),
+            (Nuget, "v3/autocomplete/0f1e2d3c", false),
+            (Nuget, "v2/FindPackagesById__id_newtonsoft.json_", false),
+            (Nuget, "v2/continuation/0f1e2d3c", false),
+            // Not the file of that version, or not a flat-container shape.
+            (
+                Nuget,
+                "v3/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.2.nupkg",
+                false,
+            ),
+            (
+                Nuget,
+                "v3/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.snupkg",
+                false,
+            ),
+            (
+                Nuget,
+                "v3/flatcontainer/newtonsoft.json/13.0.3/extra/newtonsoft.json.13.0.3.nupkg",
+                false,
+            ),
+            (Nuget, "v3/flatcontainer//13.0.3/.13.0.3.nupkg", false),
+            (Nuget, "v2/package/newtonsoft.json/13.0.3", false),
+            // The hosted artifact path keeps its current (mutable) class.
+            (
+                Nuget,
+                "newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
+                false,
+            ),
             // GitHub-shaped paths must not change generic write permissions.
             (
                 Generic,
