@@ -1832,11 +1832,12 @@ pub async fn repository_download_auth_middleware(
     // read this repository, so a reactive client sends its credential on the
     // retry. The handler's `require_visible` still runs for the pass-through
     // case; this only decides whether to challenge first.
-    if no_credential
-        && auth_ext.is_none()
-        && !download_anonymously_readable(&vis_state.db, &repo_key).await
-    {
-        return unauthorized_response_for(request.headers());
+    if no_credential && auth_ext.is_none() {
+        match download_anonymously_readable(&vis_state.db, &repo_key).await {
+            Some(true) => {}
+            Some(false) => return unauthorized_response_for(request.headers()),
+            None => return service_unavailable_response(),
+        }
     }
 
     record_request_user(auth_ext.as_ref());
@@ -1852,18 +1853,23 @@ pub async fn repository_download_auth_middleware(
 /// admits this request's client IP. A key that names no repository, and a
 /// lookup error, both answer `false`: fail closed, and byte-identical to the
 /// private case so the resulting 401 is not an existence oracle (#1808).
-async fn download_anonymously_readable(db: &sqlx::PgPool, repo_key: &str) -> bool {
+/// `None` means the database could not answer: a retryable 503, not a 401
+/// that Bazel and cargo treat as fatal.
+async fn download_anonymously_readable(db: &sqlx::PgPool, repo_key: &str) -> Option<bool> {
     let repo_service = crate::services::repository_service::RepositoryService::new(db.clone());
-    let Ok(repo) = repo_service.get_by_key(repo_key).await else {
-        return false;
+    let repo = match repo_service.get_by_key(repo_key).await {
+        Ok(repo) => repo,
+        Err(e) if e.is_db_unavailable() => return None,
+        Err(_) => return Some(false),
     };
     if repo.visibility.allows_anonymous_read() {
-        return true;
+        return Some(true);
     }
-    repo_service
-        .anonymous_can_read_repo(repo.id)
-        .await
-        .unwrap_or(false)
+    match repo_service.anonymous_can_read_repo(repo.id).await {
+        Ok(readable) => Some(readable),
+        Err(e) if e.is_db_unavailable() => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// Admin-only middleware - requires authenticated admin user
@@ -2732,9 +2738,13 @@ pub async fn repo_visibility_middleware(
             // A query ERROR is not evidence that the key names no repository,
             // so it must not be negative-cached (#3750): otherwise one
             // database blip would pin a real repository out of sight for a
-            // whole TTL. `.ok().flatten()` keeps the pre-existing answer for
-            // this request (an error falls into the no-repo branch below);
-            // only a genuine `Ok(None)` earns a tombstone.
+            // whole TTL. Only a genuine `Ok(None)` earns a tombstone.
+            // An unavailable database answers a retryable 503 once the sweep
+            // below has run: the no-repo branch turned a pool timeout into a
+            // 401 for anonymous pulls, which Bazel treats as fatal.
+            let db_unavailable = row
+                .as_ref()
+                .is_err_and(|e| AppError::Database(e.to_string()).is_db_unavailable());
             let query_succeeded = row.is_ok();
             let row = row.ok().flatten();
 
@@ -2799,6 +2809,9 @@ pub async fn repo_visibility_middleware(
                     if query_succeeded {
                         miss_cache.insert(repo_key.to_string(), Instant::now());
                     }
+                }
+                if db_unavailable {
+                    return service_unavailable_response();
                 }
                 None
             }
@@ -8243,6 +8256,72 @@ mod tests {
         app.oneshot(request).await.unwrap()
     }
 
+    /// A pool timeout or a closed pool while resolving the repository row
+    /// is an outage, not "no such repository": an anonymous pull must get a
+    /// retryable 503, not the 401 that Bazel and cargo treat as fatal.
+    #[tokio::test]
+    async fn format_route_db_outage_answers_503_not_401() {
+        let state = make_vis_state(None).await;
+        state.db.close().await;
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/pypi/some-repo/simple/requests/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = run_through_visibility(state, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// Same outage on the generic download route
+    /// (`/repositories/{key}/download/*path`).
+    #[tokio::test]
+    async fn download_route_db_outage_answers_503_not_401() {
+        use axum::{middleware, routing::get, Router};
+        use tower::ServiceExt;
+
+        let state = make_vis_state(None).await;
+        state.db.close().await;
+        let app: Router = Router::new()
+            .route(
+                "/repositories/:key/download/*path",
+                get(|| async { (StatusCode::OK, "handler-reached") }),
+            )
+            .layer(middleware::from_fn_with_state(
+                state,
+                repository_download_auth_middleware,
+            ));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/repositories/some-repo/download/a/b.tar.gz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn genuine_miss_with_a_reachable_db_still_answers_401_and_is_tombstoned() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let mut state = make_vis_state(None).await;
+        state.db = pool;
+        let key = format!("db-outage-miss-{}", Uuid::new_v4());
+        let (status, _) =
+            anon_get_status_and_body(state.clone(), &format!("/pypi/{key}/simple/")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            state.repo_miss_cache.read().await.contains_key(&key),
+            "a query that found no row must still earn a tombstone"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // GHSA-2mfv-xg68-gq4p: a download ticket carries the repository
     // restriction of the credential that minted it, and a valid ticket
@@ -8994,9 +9073,16 @@ mod tests {
         let (private_status, private_body) =
             anon_get_status_and_body(private_state, "/pypi/acme-internal-core/simple/").await;
 
-        // NONEXISTENT repo: nothing in the cache; the cache-miss DB lookup
-        // against the lazy pool finds no row, exercising the no-repo branch.
+        // NONEXISTENT repo: a tombstone takes the same no-repo branch as a
+        // lookup that finds no row, without a database (the lazy pool is
+        // unreachable, and an unreachable database answers 503)
         let missing_state = make_vis_state(None).await;
+        seed_repo_miss(
+            &missing_state,
+            "zzz-nonexistent-repo-9",
+            std::time::Instant::now(),
+        )
+        .await;
         let (missing_status, missing_body) =
             anon_get_status_and_body(missing_state, "/pypi/zzz-nonexistent-repo-9/simple/").await;
 
@@ -9050,22 +9136,31 @@ mod tests {
         let (cached_status, cached_body) =
             anon_get_status_and_body(tombstoned, "/pypi/nope/simple/").await;
 
+        let private = make_vis_state(Some((
+            "nope".to_string(),
+            make_cached_repo(/* is_public */ false),
+        )))
+        .await;
+        let (private_status, private_body) =
+            anon_get_status_and_body(private, "/pypi/nope/simple/").await;
+
         let uncached = make_vis_state(None).await;
-        let (fresh_status, fresh_body) =
-            anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
+        let (fresh_status, _) = anon_get_status_and_body(uncached, "/pypi/nope/simple/").await;
 
         assert_eq!(
             cached_status,
             StatusCode::UNAUTHORIZED,
-            "a negative-cached key must answer with the same 401 challenge as a fresh miss"
+            "a negative-cached key must answer with the 401 challenge of a miss"
         );
         assert_eq!(
-            cached_status, fresh_status,
-            "the negative-cache path must not change the status of a miss"
+            (cached_status, cached_body),
+            (private_status, private_body),
+            "a negative-cached key must answer exactly like an existing private repo"
         );
         assert_eq!(
-            cached_body, fresh_body,
-            "the negative-cache path must not change the body of a miss"
+            fresh_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "without the tombstone the lookup hits the unreachable pool, so the 401 above made no query"
         );
     }
 
@@ -9075,7 +9170,8 @@ mod tests {
         // to the lookup, and the stale entry is dropped by the `retain` sweep
         // on the write that follows. The lazy pool makes the lookup fail, so
         // nothing is re-inserted (an error is not evidence the key is free) —
-        // which is exactly what leaves the map empty to assert on.
+        // which is exactly what leaves the map empty to assert on. The failed
+        // lookup answers 503, which also shows the tombstone was not used.
         let state = make_vis_state(None).await;
         let expired_at =
             std::time::Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
@@ -9084,8 +9180,8 @@ mod tests {
         let resp = run_through_visibility(state.clone(), empty_get("/pypi/stale/simple/")).await;
         assert_eq!(
             resp.status(),
-            StatusCode::UNAUTHORIZED,
-            "an expired tombstone must not change the answer for an anonymous caller"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an expired tombstone must be ignored, so the lookup runs and hits the unreachable pool"
         );
         assert!(
             !state.repo_miss_cache.read().await.contains_key("stale"),
@@ -9439,7 +9535,8 @@ mod tests {
     /// `test_extract_repo_key_conda_t_route_is_not_a_token_channel`), so it is
     /// answered by the no-repo branch with the #1808 401 challenge rather than
     /// by the empty-key branch. Either way the body is never read, which is
-    /// what the third column pins.
+    /// what the third column pins. Both tests seed its tombstone, so the
+    /// no-repo branch is reached without a database.
     const EMPTY_REPO_KEY_PROBES: &[(Method, &str, StatusCode)] = &[
         (Method::PUT, "/npm//pkg", StatusCode::NOT_FOUND),
         (
@@ -9552,6 +9649,13 @@ mod tests {
         (Method::GET, "/general//x", StatusCode::NOT_FOUND),
     ];
 
+    async fn seed_probe_miss(state: &RepoVisibilityState, uri: &str) {
+        let key = extract_repo_key(uri);
+        if !key.is_empty() {
+            seed_repo_miss(state, &key, std::time::Instant::now()).await;
+        }
+    }
+
     /// A request body that records whether anything ever polled it.
     ///
     /// The generator does not run until the stream is first polled, so the flag
@@ -9607,6 +9711,7 @@ mod tests {
         // handler — and its strict extractor — never runs.
         for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let state = make_vis_state(None).await;
+            seed_probe_miss(&state, uri).await;
             let req = axum::http::Request::builder()
                 .method(method.clone())
                 .uri(*uri)
@@ -9647,6 +9752,7 @@ mod tests {
         for (method, uri, expected) in EMPTY_REPO_KEY_PROBES {
             let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let state = make_vis_state(None).await;
+            seed_probe_miss(&state, uri).await;
             let req = axum::http::Request::builder()
                 .method(method.clone())
                 .uri(*uri)
