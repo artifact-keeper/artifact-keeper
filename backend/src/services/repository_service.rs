@@ -2990,13 +2990,14 @@ impl RepositoryService {
     /// which was exact but O(repository rows) per upload and serialized every
     /// same-repo upload behind that scan (#2516 F1). This function does NOT
     /// charge the ledger itself: migration 182's row-level triggers on the
-    /// source tables apply the delta when the caller performs its artifact
-    /// INSERT, inside this same transaction. Because the caller's INSERT runs
-    /// while the `FOR UPDATE` lock taken here is still held, commit applies
-    /// the trigger's charge together with the artifact row and rollback
-    /// discards both — a subsequent admission that waited on the lock always
-    /// observes the charge. Callers must therefore keep the INSERT in the
-    /// same transaction as this admission check.
+    /// source tables queue the delta when the caller performs its artifact
+    /// INSERT, and migration 332 applies it once at COMMIT, in repository-id
+    /// order (#5084). The caller's INSERT and the COMMIT both happen while the
+    /// `FOR UPDATE` lock taken here is still held, so the charge lands with
+    /// the artifact row and rollback discards both — a subsequent admission
+    /// that waited on the lock always observes the charge. Callers must
+    /// therefore keep the INSERT in the same transaction as this admission
+    /// check.
     ///
     /// Counter coverage / freshness contract: the ledger tracks all three
     /// usage components (hosted, proxy-cache, OCI blobs), so nothing is
@@ -3097,7 +3098,18 @@ impl RepositoryService {
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
                 Some(match locked {
-                    Some(row) => row.hosted_bytes + row.proxy_bytes + row.oci_bytes,
+                    Some(row) => {
+                        row.hosted_bytes
+                            + row.proxy_bytes
+                            + row.oci_bytes
+                            // #5084: deltas queued by this transaction are
+                            // applied to the ledger at COMMIT, so a second
+                            // admission in the same transaction (helm chart
+                            // + .prov, a multi-file publish) must add them
+                            // to see the rows it already wrote. A committed
+                            // peer's charge is already in the locked row.
+                            + Self::pending_ledger_delta_in_tx(tx, repo_id).await?
+                    }
                     // Pre-ledger repository (no row yet): lazy-create it
                     // seeded from the authoritative live sums, NOT from
                     // column defaults — a zero-seeded row would admit
@@ -3156,8 +3168,9 @@ impl RepositoryService {
         );
         // No manual charge here: the caller's artifact INSERT (same
         // transaction, made while the row locks taken above are still held)
-        // fires migration 182's trigger, which applies the exact delta to
-        // `hosted_bytes` before the transaction commits.
+        // fires migration 182's trigger, which queues the exact delta;
+        // migration 332 applies it to `hosted_bytes` at commit, before the
+        // admission's row lock is released (#5084).
         Ok(QuotaAdmission {
             allowed: denied_by.is_none(),
             denied_by,
@@ -3195,6 +3208,33 @@ impl RepositoryService {
         Ok((row.ledger_bytes, row.unseeded))
     }
 
+    /// Sum of this transaction's still-queued ledger deltas for `repo_id`,
+    /// zero when nothing is queued (#5084).
+    ///
+    /// The row triggers queue every delta in `repository_usage_ledger_pending`
+    /// and migration 332 applies it at COMMIT. Admission still has to see the
+    /// rows an earlier statement of the *same* transaction wrote, so it adds
+    /// the queued delta to the locked ledger counters (a primary-key lookup on
+    /// `(backend_pid, repository_id)`, still O(1)). Other transactions' deltas
+    /// are invisible here; they serialize on the ledger row lock and are
+    /// observed after their COMMIT applies them.
+    async fn pending_ledger_delta_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: Uuid,
+    ) -> Result<i64> {
+        let delta: i64 = sqlx::query_scalar(
+            "SELECT (hosted_delta + proxy_delta + oci_delta)::BIGINT \
+               FROM repository_usage_ledger_pending \
+              WHERE backend_pid = pg_backend_pid() AND repository_id = $1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .unwrap_or(0);
+        Ok(delta)
+    }
+
     /// Aggregate ledger usage of every repository assigned to `project_id`,
     /// read inside the admission transaction (#2474). The caller must already
     /// hold the project row's `FOR UPDATE` lock. Sibling repositories that
@@ -3211,7 +3251,24 @@ impl RepositoryService {
             let (hosted, proxy, oci) = Self::reconcile_usage_ledger_in_tx(tx, repo_id).await?;
             total += hosted + proxy + oci;
         }
-        Ok(total)
+        // #5084: ledger rows only carry committed deltas; add this
+        // transaction's queued deltas for the project's repositories so a
+        // later admission sees the siblings this transaction already wrote.
+        // Reconciling an unseeded sibling above cleared its queued delta,
+        // whose bytes are already in the absolute sum returned there.
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(p.hosted_delta + p.proxy_delta + p.oci_delta), 0)::BIGINT \
+               FROM repository_usage_ledger_pending p \
+               JOIN repositories r ON r.id = p.repository_id \
+              WHERE p.backend_pid = pg_backend_pid() \
+                AND r.project_id = $1 \
+                AND r.repo_type <> 'virtual'",
+        )
+        .bind(project_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(total + pending)
     }
 
     /// Recompute one repository's usage-ledger components from the
@@ -3290,6 +3347,20 @@ impl RepositoryService {
             proxy,
             oci
         )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // #5084: ledger deltas are queued per transaction and applied at
+        // commit. This function is an ABSOLUTE recompute, and the live sums
+        // above already include every row this transaction wrote, so a delta
+        // still queued for the same repository must not be applied on top of
+        // it at commit.
+        sqlx::query(
+            "DELETE FROM repository_usage_ledger_pending \
+              WHERE backend_pid = pg_backend_pid() AND repository_id = $1",
+        )
+        .bind(repo_id)
         .execute(&mut **tx)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -7644,7 +7715,10 @@ mod tests {
         // INSERT/UPDATE/DELETE on artifacts / proxy_cache_artifacts /
         // oci_blobs must charge or decrement the matching ledger component
         // inside the mutating statement's own transaction, with no
-        // application code involved.
+        // application code involved. #5084: the delta is queued by the
+        // trigger and applied once at COMMIT, in repository-id order, so
+        // opposite-order multi-repository writes cannot deadlock on the
+        // ledger rows.
         // =================================================================
 
         async fn ledger_row(pool: &PgPool, repo: Uuid) -> (i64, i64, i64) {
@@ -7659,9 +7733,33 @@ mod tests {
             .unwrap_or((0, 0, 0))
         }
 
+        async fn insert_artifact_in_tx(
+            conn: &mut sqlx::PgConnection,
+            repo: Uuid,
+            path: &str,
+            size: i64,
+        ) -> std::result::Result<(), sqlx::Error> {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
+                    content_type, storage_key, is_deleted) \
+                 VALUES ($1, $2, $3, $3, $4, repeat('a', 64), \
+                         'application/octet-stream', $5, false)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(path)
+            .bind(size)
+            .bind(format!("keys/{path}"))
+            .execute(conn)
+            .await
+            .map(|_| ())
+        }
+
         /// F1 (#2992): a raw `INSERT INTO artifacts` — the shape every format
         /// handler that bypasses the enforced admission path uses — must
-        /// charge `hosted_bytes` immediately (trigger, same tx), and the next
+        /// charge `hosted_bytes` by the end of its transaction's commit
+        /// (trigger-queued, then applied at COMMIT since #5084), and the next
         /// enforced admission must observe the real usage. On pre-183 code
         /// the ledger stays 0 here until the background reconciler runs.
         #[tokio::test]
@@ -7794,9 +7892,11 @@ mod tests {
             cleanup_repo(&pool, repo.id).await;
         }
 
-        /// #2992: the charge lives in the mutation's own transaction, so a
-        /// rolled-back INSERT leaves the ledger unchanged (inside the tx the
-        /// charge is visible; after ROLLBACK it is gone).
+        /// #2992 / #5084: the charge belongs to the mutation's transaction, so
+        /// a rolled-back INSERT leaves the ledger unchanged. Since #5084 the
+        /// delta is queued by the row trigger and applied at COMMIT, so the
+        /// ledger row keeps its prior value for the rest of the transaction;
+        /// COMMIT applies the charge, ROLLBACK discards it.
         #[tokio::test]
         async fn test_usage_ledger_trigger_rollback_uncharges() {
             let _serial = tdh::usage_ledger_serial_lock().await;
@@ -7814,18 +7914,9 @@ mod tests {
             assert_eq!(ledger_row(&pool, repo.id).await.0, 300);
 
             let mut tx = pool.begin().await.expect("begin");
-            sqlx::query(
-                "INSERT INTO artifacts \
-                   (id, repository_id, path, name, size_bytes, checksum_sha256, \
-                    content_type, storage_key, is_deleted) \
-                 VALUES ($1, $2, 'rb/tx', 'rb/tx', 900, repeat('a', 64), \
-                         'application/octet-stream', 'cas/rb/tx', false)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(repo.id)
-            .execute(&mut *tx)
-            .await
-            .expect("insert inside tx");
+            insert_artifact_in_tx(&mut tx, repo.id, "rb/rollback", 900)
+                .await
+                .expect("insert inside tx");
             let in_tx: i64 = sqlx::query_scalar::<_, i64>(
                 "SELECT hosted_bytes FROM repository_usage_ledger WHERE repository_id = $1",
             )
@@ -7833,16 +7924,118 @@ mod tests {
             .fetch_one(&mut *tx)
             .await
             .expect("ledger inside tx");
-            assert_eq!(in_tx, 1_200, "charge is visible inside the transaction");
+            assert_eq!(
+                in_tx, 300,
+                "the delta is queued until COMMIT, not applied at INSERT"
+            );
             tx.rollback().await.expect("rollback");
 
             assert_eq!(
                 ledger_row(&pool, repo.id).await.0,
                 300,
-                "ROLLBACK must un-charge the aborted insert"
+                "ROLLBACK must discard the queued charge"
+            );
+
+            // The same insert committed (not rolled back) applies the delta.
+            let mut tx = pool.begin().await.expect("begin commit");
+            insert_artifact_in_tx(&mut tx, repo.id, "rb/commit", 900)
+                .await
+                .expect("insert before commit");
+            tx.commit().await.expect("commit");
+
+            assert_eq!(
+                ledger_row(&pool, repo.id).await.0,
+                1_200,
+                "COMMIT must apply the queued charge"
             );
 
             cleanup_repo(&pool, repo.id).await;
+        }
+
+        /// #5084: two transactions that write the same two repositories in
+        /// opposite order must not deadlock on the ledger rows.
+        ///
+        /// Migration 182's trigger applied each delta immediately, so the
+        /// first insert in each transaction locked one ledger row and the
+        /// second inserts then requested the row the other transaction held:
+        /// one writer got `40P01`. The deferred, repository-id-ordered apply
+        /// makes both commits request the two rows in the same order; one may
+        /// wait for the other, but neither can form a cycle.
+        #[tokio::test]
+        async fn test_usage_ledger_opposite_repository_order_does_not_deadlock_5084() {
+            let _serial = tdh::usage_ledger_serial_lock().await;
+            let Some(pool) = crate::testing::try_pool_with(4).await else {
+                return;
+            };
+            let service = RepositoryService::new(pool.clone());
+            let suffix = format!("{}", uuid::Uuid::new_v4().simple());
+            let repo_a = service
+                .create(make_create_req(
+                    &format!("{suffix}a"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create repository A");
+            let repo_b = service
+                .create(make_create_req(
+                    &format!("{suffix}b"),
+                    RepositoryFormat::Generic,
+                ))
+                .await
+                .expect("create repository B");
+
+            // A writes repository A first; B writes repository B first. Each
+            // transaction then crosses to the other repository.
+            let mut tx_a = pool.begin().await.expect("begin A");
+            let mut tx_b = pool.begin().await.expect("begin B");
+            insert_artifact_in_tx(&mut tx_a, repo_a.id, "deadlock-5084/a-first", 100)
+                .await
+                .expect("A: first insert");
+            insert_artifact_in_tx(&mut tx_b, repo_b.id, "deadlock-5084/b-first", 100)
+                .await
+                .expect("B: first insert");
+
+            // Cross and commit concurrently. With immediate apply one of these
+            // returns 40P01; with ordered deferred apply both succeed.
+            let a = async {
+                match insert_artifact_in_tx(&mut tx_a, repo_b.id, "deadlock-5084/a-second", 100)
+                    .await
+                {
+                    Ok(()) => tx_a.commit().await.map_err(|e| e.to_string()),
+                    Err(e) => {
+                        let _ = tx_a.rollback().await;
+                        Err(e.to_string())
+                    }
+                }
+            };
+            let b = async {
+                match insert_artifact_in_tx(&mut tx_b, repo_a.id, "deadlock-5084/b-second", 100)
+                    .await
+                {
+                    Ok(()) => tx_b.commit().await.map_err(|e| e.to_string()),
+                    Err(e) => {
+                        let _ = tx_b.rollback().await;
+                        Err(e.to_string())
+                    }
+                }
+            };
+            let (a, b) = tokio::join!(a, b);
+            assert!(a.is_ok(), "transaction A failed: {:?}", a.err());
+            assert!(b.is_ok(), "transaction B failed: {:?}", b.err());
+
+            assert_eq!(
+                ledger_row(&pool, repo_a.id).await.0,
+                200,
+                "both inserts into repository A must be charged"
+            );
+            assert_eq!(
+                ledger_row(&pool, repo_b.id).await.0,
+                200,
+                "both inserts into repository B must be charged"
+            );
+
+            cleanup_repo(&pool, repo_a.id).await;
+            cleanup_repo(&pool, repo_b.id).await;
         }
 
         /// #2992: in-place overwrites (the `ON CONFLICT (repository_id, path)

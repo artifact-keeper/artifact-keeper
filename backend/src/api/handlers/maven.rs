@@ -4944,8 +4944,8 @@ async fn upload(
 
         // Store the file while holding only this key's publish lock. The
         // repository-wide locks this transaction takes next (the quota
-        // admission's ledger and project rows, and the usage-ledger row the
-        // `artifacts` insert trigger updates) are acquired after the write,
+        // admission's ledger and project rows, and the usage-ledger rows the
+        // commit-time apply updates since #5084) are acquired after the write,
         // so a slow object write never stalls other uploads into the same
         // repository or project. The bytes are streamed from the staged
         // scratch file, not a heap buffer (#2517), or copied server-side from
@@ -8420,8 +8420,8 @@ mod tests {
 
     /// #4892 review: the storage write runs inside the publish transaction, so
     /// it must come before the repository-wide row locks that transaction
-    /// takes (the usage-ledger row the `artifacts` insert trigger updates, and
-    /// the quota admission's ledger and project rows). Otherwise every hosted
+    /// takes (the usage-ledger rows the commit-time apply updates since #5084,
+    /// and the quota admission's ledger and project rows). Otherwise every hosted
     /// Maven upload into one repository waits for any other one's object
     /// write, holding a pool connection while it waits. The test holds the
     /// repository's ledger row lock and requires the upload to store its
