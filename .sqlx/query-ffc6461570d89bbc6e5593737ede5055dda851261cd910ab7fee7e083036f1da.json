@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                visibility, quota_bytes, promotion_only, versioning_enabled,\n                project_id\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled,\n                project_id, created_at, updated_at\n            ",
+  "query": "\n            INSERT INTO repositories (\n                key, name, description, format, repo_type,\n                storage_backend, storage_path, upstream_url,\n                visibility, quota_bytes, promotion_only, versioning_enabled,\n                project_id, allow_overwrite\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::repository_visibility, $10, $11, $12, $13, $14)\n            RETURNING\n                id, key, name, description,\n                format as \"format: RepositoryFormat\",\n                repo_type as \"repo_type: RepositoryType\",\n                storage_backend, storage_path, upstream_url,\n                visibility as \"visibility: RepositoryVisibility\",\n                is_public, quota_bytes, promotion_only,\n                replication_priority as \"replication_priority: ReplicationPriority\",\n                curation_enabled, curation_source_repo_id, curation_target_repo_id,\n                curation_default_action, curation_sync_interval_secs, curation_auto_fetch,\n                age_gate_enabled, age_gate_min_age_days, versioning_enabled, allow_overwrite,\n                project_id, created_at, updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -358,6 +358,17 @@
       },
       {
         "ordinal": 23,
+        "name": "allow_overwrite",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repositories",
+            "name": "allow_overwrite"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
         "name": "project_id",
         "type_info": "Uuid",
         "origin": {
@@ -368,7 +379,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 25,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -379,7 +390,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 26,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -492,7 +503,8 @@
         "Int8",
         "Bool",
         "Bool",
-        "Uuid"
+        "Uuid",
+        "Bool"
       ]
     },
     "nullable": [
@@ -519,10 +531,11 @@
       false,
       false,
       false,
+      false,
       true,
       false,
       false
     ]
   },
-  "hash": "26c7077119286dc5e5d71e5eac6d8d5c1f3923a142514ac8f769b5067aaf0d5b"
+  "hash": "ffc6461570d89bbc6e5593737ede5055dda851261cd910ab7fee7e083036f1da"
 }

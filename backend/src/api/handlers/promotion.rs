@@ -2904,6 +2904,7 @@ mod tests {
     ) -> crate::models::repository::Repository {
         crate::models::repository::Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repo".to_string(),

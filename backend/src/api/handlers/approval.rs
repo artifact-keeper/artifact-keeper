@@ -1917,6 +1917,7 @@ mod tests {
         use crate::models::repository::*;
         let source = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::nil(),
             key: "staging-maven".to_string(),
             name: "Staging Maven".to_string(),
@@ -1945,6 +1946,7 @@ mod tests {
         };
         let target = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::nil(),
             key: "release-maven".to_string(),
             name: "Release Maven".to_string(),
@@ -1983,6 +1985,7 @@ mod tests {
         use crate::models::repository::*;
         let source = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::nil(),
             key: "remote-maven".to_string(),
             name: "Remote Maven".to_string(),
@@ -2011,6 +2014,7 @@ mod tests {
         };
         let target = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::nil(),
             key: "release-maven".to_string(),
             name: "Release Maven".to_string(),
@@ -2048,6 +2052,7 @@ mod tests {
         use crate::models::repository::*;
         let source = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::nil(),
             key: "staging-maven".to_string(),
             name: "Staging Maven".to_string(),
@@ -2076,6 +2081,7 @@ mod tests {
         };
         let target = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::nil(),
             key: "release-npm".to_string(),
             name: "Release NPM".to_string(),

@@ -1920,7 +1920,21 @@ async fn store_apk(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
+        if !repo.allow_overwrite {
+            return Err((StatusCode::CONFLICT, "Package already exists").into_response());
+        }
+        // Mutable repo (#5188): drop the live row so the INSERT below replaces
+        // it instead of colliding on UNIQUE(repository_id, path). The APK
+        // storage key is path-addressed, so the stored bytes are overwritten in
+        // place by the `storage.put` below — no orphan to collect.
+        sqlx::query(
+            "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        )
+        .bind(repo.id)
+        .bind(&artifact_path)
+        .execute(&state.db)
+        .await
+        .map_err(crate::api::handlers::db_err)?;
     }
 
     // Refuse an over-quota upload before a soft-deleted row at this path is
@@ -4902,6 +4916,82 @@ mod db_cov_tests {
         );
 
         fx.teardown().await;
+    }
+
+    /// #5188: re-uploading an occupied .apk path is a 409 by default, and once
+    /// the repository is mutable the re-upload replaces the stored package.
+    /// The path-addressed APK key means the bytes are overwritten in place and
+    /// the superseded row is dropped, so exactly one live row remains.
+    #[tokio::test]
+    async fn test_apk_reupload_conflicts_unless_repo_allows_overwrite() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let path = format!("/{k}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk");
+        let put = |bytes: &'static [u8]| {
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(path.clone(), bytes::Bytes::from_static(bytes)),
+            )
+        };
+
+        // Non-parsing bytes are still stored (uploads are not gated on parsing);
+        // using them first lets the replacement be observed as a byte change.
+        let (first, _) = put(&[0u8; 4096]).await;
+        assert_eq!(first, axum::http::StatusCode::CREATED);
+        let first_id: uuid::Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("first row");
+
+        // Default repository stays write-once.
+        let (immutable, _) = put(super::MARKER_APK).await;
+        assert_eq!(
+            immutable,
+            axum::http::StatusCode::CONFLICT,
+            "default repo must reject a re-upload to an occupied path"
+        );
+
+        // Flip the repo to mutable and re-upload: now it replaces.
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set allow_overwrite");
+        let (mutable, body) = put(super::MARKER_APK).await;
+        assert!(
+            mutable.is_success(),
+            "mutable repo must accept the re-upload: {} {:?}",
+            mutable,
+            String::from_utf8_lossy(&body[..])
+        );
+
+        // Exactly one live row survives, and it is a fresh row (the superseded
+        // one was deleted, not left behind to collide on UNIQUE(path)).
+        let live: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("live rows");
+        assert_eq!(live.len(), 1, "a mutable overwrite must leave one live row");
+        assert_ne!(live[0], first_id, "the superseded row must have been removed");
+
+        // The stored bytes are the replacement.
+        let stored = tokio::fs::read(stored_package_path(&fx).await)
+            .await
+            .expect("read stored bytes");
+        fx.teardown().await;
+        assert_eq!(
+            stored,
+            super::MARKER_APK,
+            "the stored package must be the replacement, not the original"
+        );
     }
 }
 

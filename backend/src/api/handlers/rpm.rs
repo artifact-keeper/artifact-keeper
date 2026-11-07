@@ -3491,11 +3491,12 @@ async fn store_rpm(
         )
     };
 
-    proxy_helpers::ensure_unique_artifact_path(
+    proxy_helpers::ensure_unique_artifact_path_mutable(
         &state.db,
         repo.id,
         &artifact_path,
         "Package already exists",
+        repo.allow_overwrite,
     )
     .await?;
 

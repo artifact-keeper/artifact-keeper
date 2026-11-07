@@ -749,11 +749,12 @@ async fn store_package(
     }
 
     let artifact_path = package_artifact_path(&info.arch, filename);
-    proxy_helpers::ensure_unique_artifact_path(
+    proxy_helpers::ensure_unique_artifact_path_mutable(
         &state.db,
         repo.id,
         &artifact_path,
         "Package already exists",
+        repo.allow_overwrite,
     )
     .await?;
 
@@ -1389,6 +1390,54 @@ mod db_tests {
             get(&fx, &format!("x86_64/{MARKER_FILE}")).await.0,
             StatusCode::NOT_FOUND
         );
+
+        fx.teardown().await;
+    }
+
+    /// #5188: a hosted pacman repo rejects a re-upload to an occupied path by
+    /// default, and once made mutable the re-upload replaces the stored bytes.
+    /// The pacman storage key is path-addressed, so the bytes are overwritten
+    /// in place and exactly one row survives.
+    #[tokio::test]
+    async fn mutable_repo_overwrites_package() {
+        let Some(fx) = tdh::Fixture::setup("local", "pacman").await else {
+            return;
+        };
+
+        // Two packages at the SAME coordinate (filename) with different bytes.
+        let (filename, first) = build_package_with("ak-ovr", "1.0-1", "x86_64", "usr/bin/one");
+        let (_, second) = build_package_with("ak-ovr", "1.0-1", "x86_64", "usr/bin/two");
+        assert_ne!(first, second, "fixtures must differ to prove replacement");
+
+        assert_eq!(put(&fx, &filename, first.clone()).await, StatusCode::CREATED);
+        // Default repo: a second upload to the same path is a 409.
+        assert_eq!(put(&fx, &filename, second.clone()).await, StatusCode::CONFLICT);
+
+        // Flip the repo to mutable.
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set allow_overwrite");
+        assert_eq!(
+            put(&fx, &filename, second.clone()).await,
+            StatusCode::CREATED,
+            "mutable repo must accept the re-upload"
+        );
+
+        // Exactly one live row, and the served bytes are the replacement.
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count live rows");
+        assert_eq!(live, 1, "a mutable overwrite must leave one live row");
+
+        let (status, body) = get(&fx, &format!("x86_64/{filename}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], &second[..], "the served package must be the replacement");
 
         fx.teardown().await;
     }

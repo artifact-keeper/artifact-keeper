@@ -6596,9 +6596,12 @@ async fn upload(
         }
     }
 
-    // Check for duplicate
+    // Check for duplicate. `Some(allow_overwrite)` when the file exists; a
+    // mutable repository (#5188) lets the upload below replace it.
     let existing = sqlx::query_scalar!(
-        "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+        "SELECT r.allow_overwrite FROM repositories r \
+         WHERE r.id = $1 AND EXISTS (SELECT 1 FROM artifacts a \
+             WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false)",
         repo.id,
         format!("{}/{}/{}", normalized, pkg_version, filename)
     )
@@ -6606,7 +6609,7 @@ async fn upload(
     .await
     .map_err(map_db_err)?;
 
-    if existing.is_some() {
+    if existing == Some(false) {
         return Err(AppError::Conflict("File already exists".to_string()).into_response());
     }
 
@@ -13051,6 +13054,62 @@ mod tests {
             StatusCode::OK,
             "upload to a normal repo must still succeed; body: {}",
             String::from_utf8_lossy(&allowed_body)
+        );
+    }
+
+    /// #5188: re-uploading an existing filename (what `twine upload` does on
+    /// every snapshot build) is a 409 by default and replaces the file once
+    /// the repository allows overwrite.
+    #[tokio::test]
+    async fn test_reupload_conflicts_unless_repo_allows_overwrite() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let (project, version) = ("ak-pypi-overwrite", "0.1.0");
+        let filename = "ak_pypi_overwrite-0.1.0-py3-none-any.whl";
+        let upload = |bytes: &'static [u8]| {
+            let (content_type, body) =
+                pypi_upload_multipart(project, version, filename, bytes, "overwrite", ">=3.8");
+            let app = fx.router_with_auth(super::router());
+            tdh::send(
+                app,
+                tdh::post(format!("/{}/", fx.repo_key), &content_type, body),
+            )
+        };
+
+        let (first, _) = upload(b"build-1").await;
+        let (immutable, _) = upload(b"build-2").await;
+        sqlx::query("UPDATE repositories SET allow_overwrite = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set allow_overwrite");
+        let (mutable, mutable_body) = upload(b"build-2").await;
+        let stored: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("{project}/{version}/{filename}"))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("artifact row");
+
+        fx.teardown().await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(immutable, StatusCode::CONFLICT, "default stays write-once");
+        assert_eq!(
+            mutable,
+            StatusCode::OK,
+            "mutable repo must accept the re-upload; body: {}",
+            String::from_utf8_lossy(&mutable_body)
+        );
+        assert_eq!(
+            stored.trim(),
+            crate::services::artifact_service::ArtifactService::calculate_sha256(b"build-2"),
+            "the stored file must be the replacement"
         );
     }
 
