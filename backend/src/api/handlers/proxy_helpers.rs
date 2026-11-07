@@ -7177,6 +7177,27 @@ pub async fn virtual_non_remote_owns_maven_gav(
     version: &str,
 ) -> Result<bool, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
+    virtual_non_remote_owns_maven_gav_in(
+        db,
+        virtual_repo_id,
+        &members,
+        group_id,
+        artifact_id,
+        version,
+    )
+    .await
+}
+
+/// [`virtual_non_remote_owns_maven_gav`] over members the caller already fetched.
+#[allow(clippy::result_large_err)]
+pub async fn virtual_non_remote_owns_maven_gav_in(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    members: &[Repository],
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Result<bool, Response> {
     let non_remote_ids: Vec<Uuid> = members
         .iter()
         .filter(|m| m.repo_type != RepositoryType::Remote)
@@ -7275,6 +7296,32 @@ pub(crate) async fn record_proxy_download(
     record_proxy_download_via(&state.db, proxy, repo_id, repo_key, path, ctx).await;
 }
 
+/// `None` once [`MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS`] INLINE recordings are
+/// already running.
+///
+/// The sibling of #3778's limiter, over the same ceiling but a separate
+/// semaphore, because the two paths bound different things: that one bounds
+/// spawned tasks, this one bounds how many serve futures are inside a pool
+/// acquire at once. Without it, a proxy storm puts one recording connection
+/// demand per concurrent serve into a pool sized for request handling, and the
+/// serves queue behind their own telemetry.
+///
+/// Deliberately `try_acquire`, not `acquire`: waiting would park the serve
+/// behind a statistic, which is the failure this exists to prevent. Where the
+/// deferred recorder degrades to recording inline, an inline recorder has
+/// nowhere below it to degrade to, so an over-cap request drops its download
+/// count and keeps its bytes. That is the right way round, and it only happens
+/// once the pool is already the bottleneck.
+fn proxy_record_permit() -> Option<OwnedSemaphorePermit> {
+    static INLINE_RECORD_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(
+        INLINE_RECORD_LIMITER
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS))),
+    )
+    .try_acquire_owned()
+    .ok()
+}
+
 /// Body of [`record_proxy_download`] against an explicit [`ProxyService`]
 /// (#3844): the virtual resolvers record a Remote member's winning serve under
 /// the proxy they resolved it through. Same HEAD guard and best-effort posture.
@@ -7295,6 +7342,16 @@ pub(crate) async fn record_proxy_download_via(
     // A path whose key exceeds the object-store limit can never be cached, so
     // there is nothing to count — skip.
     let Some((storage_key, metadata_key)) = proxy_record_keys(proxy, repo_key, path) else {
+        return;
+    };
+    // Bounded so a proxy storm cannot turn one statistic into unbounded pool
+    // pressure; past the cap the count is dropped, never queued.
+    let Some(_permit) = proxy_record_permit() else {
+        tracing::debug!(
+            repo_id = %repo_id,
+            path = %path,
+            "skipping proxy download record: recorder at its concurrency cap"
+        );
         return;
     };
     let ip = ctx.client_ip.map(|i| i.to_string());
@@ -7334,11 +7391,12 @@ pub(crate) async fn record_proxy_download_via(
     }
 }
 
-/// Max concurrent fire-and-forget proxy-download record tasks
-/// ([`record_proxy_download_deferred`]). Small relative to
+/// Max concurrent proxy-download recordings, applied once to the
+/// fire-and-forget tasks ([`record_proxy_download_deferred`]) and once to the
+/// inline recordings ([`proxy_record_permit`]). Small relative to
 /// `DATABASE_MAX_CONNECTIONS` (default 50) — the same slice-of-the-pool
 /// reasoning as `ProxyService::MAX_CONCURRENT_CATALOG_BACKFILLS` — so
-/// background telemetry can never starve real request handlers.
+/// telemetry can never starve real request handlers.
 const MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS: usize = 8;
 
 static PROXY_DOWNLOAD_RECORD_LIMITER: std::sync::LazyLock<Arc<Semaphore>> =
@@ -10882,7 +10940,15 @@ fn scan_inline_serve_decision(
         }
         Ok(_) => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         // Inconclusive under fail-closed => 423, never unscanned bytes.
-        Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
+        // Logged because all three reasons render as the same 423 "retry shortly",
+        // but only BudgetExceeded resolves on its own.
+        Err(why) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest, reason = ?why,
+                "withholding proxy pull: scan not conclusive yet (fail-closed)"
+            );
+            ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename))
+        }
     }
 }
 
@@ -13147,6 +13213,40 @@ mod tests {
         ));
     }
 
+    /// The recorder must be bounded and must DEGRADE, not queue: an over-cap
+    /// call returns immediately with no permit (so the serve is unaffected and
+    /// only the statistic is lost), and permits come back when the recordings
+    /// in flight finish. Unbounded here, a proxy storm turns best-effort
+    /// telemetry into main-pool exhaustion on the request path.
+    ///
+    /// The limiter is a process-global static, so this relies on nextest
+    /// running each test in its own process.
+    #[test]
+    fn the_proxy_record_limiter_refuses_past_its_cap_instead_of_queueing() {
+        let mut held = Vec::new();
+        while let Some(permit) = proxy_record_permit() {
+            held.push(permit);
+            if held.len() > MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS {
+                break;
+            }
+        }
+        assert!(
+            held.len() <= MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS,
+            "the recorder handed out {} permits against a cap of \
+             {MAX_CONCURRENT_PROXY_DOWNLOAD_RECORDS}",
+            held.len()
+        );
+        assert!(
+            proxy_record_permit().is_none(),
+            "at the cap the recording must be skipped, not queued behind a permit"
+        );
+        drop(held);
+        assert!(
+            proxy_record_permit().is_some(),
+            "permits must return once the recordings in flight finish"
+        );
+    }
+
     /// Scanner applicability and archive extraction are driven by the
     /// FILENAME, so a rescan that derives the wrong one does not fail — it
     /// silently catalogs nothing and records a clean verdict. Every shape a
@@ -13961,6 +14061,37 @@ mod tests {
             ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve on a budget-exceeded scan")
             }
+        }
+    }
+
+    /// Every inconclusive reason answers the same 423, so the reason must be
+    /// in the log (#5473): only `BudgetExceeded` resolves on a retry.
+    #[test]
+    fn inline_gate_inconclusive_deny_logs_the_reason() {
+        use crate::api::handlers::test_db_helpers::LogCapture;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        for (why, reason) in [
+            (ProxyScanInconclusive::NoScanner, "NoScanner"),
+            (ProxyScanInconclusive::ScanFailed, "ScanFailed"),
+            (ProxyScanInconclusive::BudgetExceeded, "BudgetExceeded"),
+        ] {
+            let capture = LogCapture::default();
+            let outcome = {
+                let _guard = capture.install(tracing::Level::WARN);
+                scan_inline_serve_decision(
+                    Err(why),
+                    ProxySeverityGate::BlockOnAny,
+                    Uuid::new_v4(),
+                    "pkg-1.0.tgz",
+                    "deadbeef",
+                )
+            };
+            assert!(matches!(outcome, ProxyScanServeOutcome::Deny(_)));
+            let text = capture.text();
+            assert!(
+                text.contains("scan not conclusive") && text.contains(reason),
+                "the 423 must log its reason {reason}: {text}"
+            );
         }
     }
 
@@ -23501,6 +23632,98 @@ mod tests {
         );
     }
 
+    /// `virtual_non_remote_owns_maven_gav_in` answers from the member list the
+    /// caller already fetched: a hosted member holding the G:A:V owns it, a
+    /// remote member holding it does not, and a list without hosted members
+    /// short-circuits to false. The fetching wrapper gives the same answers
+    #[tokio::test]
+    async fn virtual_non_remote_owns_maven_gav_in_checks_only_hosted_members() {
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let user_id = db_helpers::create_user(&pool).await;
+        let (virtual_id, _vk, vd) = db_helpers::create_repo(&pool, "virtual", "maven").await;
+        let (hosted_id, _hk, hd) = db_helpers::create_repo(&pool, "local", "maven").await;
+        let (remote_id, _rk, rd) = db_helpers::create_repo(&pool, "remote", "maven").await;
+        db_helpers::link_member(&pool, virtual_id, hosted_id, 1).await;
+        db_helpers::link_member(&pool, virtual_id, remote_id, 2).await;
+        for (repo_id, artifact) in [(hosted_id, "owned"), (remote_id, "cached")] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, 1, $4, 'application/java-archive', $5)",
+            )
+            .bind(repo_id)
+            .bind(format!("com/example/{artifact}/1.0/{artifact}-1.0.jar"))
+            .bind(artifact)
+            .bind("0".repeat(64))
+            .bind(format!("maven/{repo_id}/{artifact}"))
+            .execute(&pool)
+            .await
+            .expect("insert artifact");
+        }
+
+        let members = fetch_virtual_members(&pool, virtual_id)
+            .await
+            .expect("fetch");
+        let remote_only: Vec<Repository> = members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+            .cloned()
+            .collect();
+        let owns = |members: Vec<Repository>, artifact: &'static str| {
+            let pool = pool.clone();
+            async move {
+                virtual_non_remote_owns_maven_gav_in(
+                    &pool,
+                    virtual_id,
+                    &members,
+                    "com.example",
+                    artifact,
+                    "1.0",
+                )
+                .await
+                .expect("ownership query")
+            }
+        };
+        let hosted_owned = owns(members.clone(), "owned").await;
+        let remote_cached = owns(members.clone(), "cached").await;
+        let nobody = owns(members.clone(), "missing").await;
+        let no_hosted_member = owns(remote_only, "cached").await;
+        let mut via_wrapper = Vec::new();
+        for artifact in ["owned", "cached"] {
+            via_wrapper.push(
+                virtual_non_remote_owns_maven_gav(
+                    &pool,
+                    virtual_id,
+                    "com.example",
+                    artifact,
+                    "1.0",
+                )
+                .await
+                .expect("ownership query"),
+            );
+        }
+
+        cleanup_member_graph(
+            &pool,
+            &[virtual_id, hosted_id, remote_id],
+            user_id,
+            &[vd, hd, rd],
+        )
+        .await;
+
+        assert_eq!(members.len(), 2, "both members are listed");
+        assert!(hosted_owned, "a hosted member holding the G:A:V owns it");
+        assert!(!remote_cached, "a remote member holding it does not");
+        assert!(!nobody, "no member holding it is not ownership");
+        assert!(
+            !no_hosted_member,
+            "a member list without hosted members is never an owner"
+        );
+        assert_eq!(via_wrapper, vec![true, false], "the wrapper agrees");
+    }
+
     // ── #968: deployment target of a virtual repository ──────────────────
 
     /// The deployment target is the first WRITABLE hosted member in
@@ -25911,6 +26134,65 @@ mod proxy_download_recording_tests {
         ("terraform.rs", include_str!("terraform.rs")),
         ("vscode.rs", include_str!("vscode.rs")),
     ];
+
+    /// A virtual repository's member set must be authorized through the
+    /// FALLIBLE helper everywhere the result is turned into an answer for a
+    /// client.
+    ///
+    /// [`super::authorize_virtual_members`] flattens a failed visibility query
+    /// into the EMPTY set. Both directions fail closed, but the walking callers
+    /// then answer a definitive `404` and the aggregating ones answer an empty
+    /// listing -- for an artifact that exists and a caller who may read it.
+    /// Package clients cache that miss, so a transient database blip becomes a
+    /// sticky "not found". The fallible form surfaces it as a retryable server
+    /// error instead (#4308).
+    ///
+    /// Reuses `SERVE_SOURCES` because it is already the complete list of
+    /// handlers that answer a client with bytes or a listing, which is exactly
+    /// the set this gate has to cover.
+    #[test]
+    fn virtual_member_authorization_is_fallible_on_every_client_facing_path() {
+        // Call sites that may still flatten, each with the reason. `oci_v2`'s
+        // blob/manifest walk reaches the helper through its own
+        // `authorized_virtual_members`, whose `Option` return already means
+        // "stop the walk" and whose `None` is load-bearing for the virtual
+        // negative cache; making the authorization failure distinguishable
+        // there is a signature change across both resolvers and their handlers.
+        const EXEMPT: &[&str] = &["oci_v2.rs"];
+        const FLATTENING_CALL: &str = "proxy_helpers::authorize_virtual_members(";
+
+        let mut flattening: Vec<&str> = Vec::new();
+        for (file, src) in SERVE_SOURCES {
+            if EXEMPT.contains(file) {
+                continue;
+            }
+            if src.contains(FLATTENING_CALL) {
+                flattening.push(file);
+            }
+        }
+        assert!(
+            flattening.is_empty(),
+            "#4308: {flattening:?} authorize a virtual repository's members through the \
+             infallible `authorize_virtual_members`, so a failed visibility query is \
+             flattened into the empty set and answered as a definitive 404 (or an \
+             empty listing). Use `try_authorize_virtual_members` and let the caller \
+             answer a retryable server error."
+        );
+
+        // The gate is worthless if the token stops matching anything, so pin
+        // that the fallible form is genuinely in use on these paths.
+        for file in ["cargo.rs", "conda.rs", "debian.rs", "npm.rs", "pypi.rs"] {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| *n == file)
+                .unwrap_or_else(|| panic!("{file} is scanned"));
+            assert!(
+                src.contains("try_authorize_virtual_members("),
+                "#4308: {file} has a virtual download path and must authorize its \
+                 members through the fallible helper"
+            );
+        }
+    }
 
     /// The primitives that put UPSTREAM bytes in front of a client.
     ///

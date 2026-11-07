@@ -2669,6 +2669,9 @@ async fn download(
             // skipped; if no other member answers, its 451 is the answer.
             let mut age_refusal: Option<Response> = None;
 
+            // A member that ERRORED rather than missed makes "not found"
+            // unknowable, so the walk must tell the client to retry.
+            let mut member_failed = false;
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
                     if let Some(refusal) = maven_member_age_gate(&state, member, &path).await? {
@@ -2681,27 +2684,32 @@ async fn download(
                     if let (Some(ref upstream_url), Some(ref proxy)) =
                         (&member.upstream_url, &state.proxy_service)
                     {
-                        if let Ok((content, _, _budget_permit)) =
-                            proxy_helpers::proxy_fetch_capped_budgeted(
-                                proxy,
-                                member.id,
-                                &member.key,
-                                upstream_url,
-                                &path,
-                                proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
-                                // #3459: the member's OWN format, so a released
-                                // coordinate's `.sha1`/`.md5` sidecar classifies
-                                // immutable instead of falling to the 5-minute
-                                // mutable default a `Generic` stand-in produces.
-                                member.format.clone(),
-                            )
-                            .await
+                        match proxy_helpers::proxy_fetch_capped_budgeted(
+                            proxy,
+                            member.id,
+                            &member.key,
+                            upstream_url,
+                            &path,
+                            proxy_helpers::DEFAULT_METADATA_MAX_BYTES,
+                            // #3459: the member's OWN format, so a released
+                            // coordinate's `.sha1`/`.md5` sidecar classifies
+                            // immutable instead of falling to the 5-minute
+                            // mutable default a `Generic` stand-in produces.
+                            member.format.clone(),
+                        )
+                        .await
                         {
-                            return Ok(Response::builder()
-                                .status(StatusCode::OK)
-                                .header(CONTENT_TYPE, "text/plain")
-                                .body(Body::from(content))
-                                .unwrap());
+                            Ok((content, _, _budget_permit)) => {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/plain")
+                                    .body(Body::from(content))
+                                    .unwrap());
+                            }
+                            Err(resp) if resp.status() != StatusCode::NOT_FOUND => {
+                                member_failed = true;
+                            }
+                            Err(_) => {}
                         }
                     }
                 } else if member.repo_type.is_hosted() {
@@ -2727,8 +2735,16 @@ async fn download(
                     }
                 }
             }
+            // A member's age refusal is a definitive answer and keeps
+            // precedence (#4702); only a walk that would 404 becomes a 503.
             if let Some(refusal) = age_refusal {
                 return Err(refusal);
+            }
+            if member_failed {
+                return Err(AppError::ServiceUnavailable(
+                    "A repository member is temporarily unavailable, retry shortly".to_string(),
+                )
+                .into_response());
             }
         }
 
@@ -3667,16 +3683,21 @@ async fn serve_artifact(
     auth: Option<&AuthExtension>,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
-    // Remote (proxy) repos never persist rows in the `artifacts` table: the
-    // proxy cache writes to the package catalog + filesystem only (guarded by
-    // `test_cache_artifact_does_not_insert_into_artifacts_table`, #1278). So the
-    // exact-path lookup and SNAPSHOT resolution below always miss for them.
-    // Skip those 1-2 DB acquires and fall straight through to the upstream
-    // proxy fetch, cutting the per-request DB pressure on the remote
-    // artifact-GET hot path. Hosted/Virtual repos are unaffected.
-    let artifact = if repo.repo_type == RepositoryType::Remote {
-        None
-    } else {
+    // Only a HOSTED repo owns rows in the `artifacts` table. Remote (proxy)
+    // repos never persist them: the proxy cache writes to the package catalog +
+    // filesystem only (guarded by
+    // `test_cache_artifact_does_not_insert_into_artifacts_table`, #1278).
+    // Virtual repos own no bytes at all -- every write seam refuses them
+    // (`reject_write_if_not_hosted`) and promotion refuses them as a target --
+    // and they serve through the member walk below. So for both, the exact-path
+    // lookup and the SNAPSHOT resolution under it can only miss. Skipping those
+    // 1-2 DB acquires is what takes the per-request pool pressure off the
+    // proxied and aggregated artifact-GET hot paths. Same rule, and the same
+    // two repo types, that `checksum_compute_eligible` (#1599) already applies
+    // to the `.md5`/`.sha1` route for exactly this reason.
+    let artifact = if repo.repo_type == RepositoryType::Local
+        || repo.repo_type == RepositoryType::Staging
+    {
         // NOTE: the SQL string keeps its original 8-space indentation (not the
         // block's) so the compile-time-checked query text matches the committed
         // .sqlx offline cache key byte-for-byte.
@@ -3751,6 +3772,8 @@ async fn serve_artifact(
             }
             None => None,
         }
+    } else {
+        None
     };
 
     // If artifact not found locally, try proxy for remote repos
@@ -3846,11 +3869,39 @@ async fn serve_artifact(
                 // (eg. dynamic metadata.xml requests reach this branch
                 // from earlier fall-through), skip the guard rather
                 // than block the request.
+                // The shadowing guard and the serve walk need the SAME member
+                // set, one narrowed and one not, so it is read once here rather
+                // than once per consumer.
+                let all_members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+                // #1804: authorize each member against the caller before any of
+                // its bytes can be served. A public virtual repo must not turn
+                // into a confused deputy that streams its PRIVATE members'
+                // artifacts to anonymous / unprivileged callers. Members the
+                // caller could not read directly are dropped, so a denied
+                // member behaves exactly as if it did not contain the artifact
+                // (404), never leaking its existence.
+                //
+                // The fallible form, as sbt uses: a failed visibility query is
+                // a retryable server error, not a definitive 404 (#3321).
+                let members = proxy_helpers::try_authorize_virtual_members(
+                    &state.db,
+                    auth,
+                    repo.id,
+                    all_members.clone(),
+                )
+                .await?;
+
+                // UNFILTERED-ENFORCEMENT: the dependency-confusion guard must
+                // see every member, narrowed or not. A caller who cannot read
+                // the member that owns this G:A:V would otherwise escape the
+                // guard and be served the remote's answer for it.
                 let local_owns = match MavenHandler::parse_coordinates(path) {
                     Ok(coords) => {
-                        proxy_helpers::virtual_non_remote_owns_maven_gav(
+                        proxy_helpers::virtual_non_remote_owns_maven_gav_in(
                             &state.db,
                             repo.id,
+                            &all_members,
                             &coords.group_id,
                             &coords.artifact_id,
                             &coords.version,
@@ -3865,18 +3916,6 @@ async fn serve_artifact(
                     state.proxy_service.as_deref()
                 };
 
-                // #1804: authorize each member against the caller before any of
-                // its bytes can be served. A public virtual repo must not turn
-                // into a confused deputy that streams its PRIVATE members'
-                // artifacts to anonymous / unprivileged callers. Members the
-                // caller could not read directly are dropped, so a denied
-                // member behaves exactly as if it did not contain the artifact
-                // (404), never leaking its existence.
-                //
-                // The fallible form, as sbt uses: a failed visibility query is
-                // a retryable server error, not a definitive 404 (#3321).
-                let members =
-                    proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
                 // #4702: Remote members whose age gate withholds this version
                 // never serve it; when no other member has it, the client gets
                 // that gate's 451. A locally owned GAV disables every Remote
@@ -5349,6 +5388,74 @@ async fn publish_plugin_prefix_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body of `serve_artifact`, for the structural pins below. Scoped to
+    /// the function so an unrelated helper elsewhere in the file cannot satisfy
+    /// (or trip) them.
+    fn serve_artifact_body() -> &'static str {
+        let src = include_str!("maven.rs");
+        let start = src
+            .find("async fn serve_artifact(")
+            .expect("serve_artifact must exist");
+        let end = src[start + 1..]
+            .find("\nasync fn ")
+            .map(|p| start + 1 + p)
+            .unwrap_or(src.len());
+        &src[start..end]
+    }
+
+    /// A virtual Maven GET must read its member list ONCE.
+    ///
+    /// The dependency-confusion guard and the serve walk both need it. Each
+    /// used to fetch its own copy, so every request to a virtual repository
+    /// paid two identical `virtual_repo_members` round trips, on the hottest
+    /// route in the handler. Both `virtual_non_remote_owns_maven_gav` and
+    /// `authorized_virtual_members` fetch internally, so naming either of them
+    /// here reintroduces the second query; the `_in` / `try_authorize_` forms
+    /// take the list the caller already has.
+    #[test]
+    fn serve_artifact_reads_virtual_members_once_per_request() {
+        let body = serve_artifact_body();
+        assert_eq!(
+            body.matches("fetch_virtual_members(").count(),
+            1,
+            "serve_artifact must read the member list exactly once per request"
+        );
+        assert!(
+            !body.contains("virtual_non_remote_owns_maven_gav("),
+            "the shadowing guard must take the already-fetched members, not fetch its own"
+        );
+        assert!(
+            !body.contains("authorized_virtual_members("),
+            "the serve walk must authorize the already-fetched members, not fetch them again"
+        );
+    }
+
+    /// A Remote or Virtual repository must not pay the `artifacts` lookup.
+    ///
+    /// Neither owns rows in that table (a proxy caches into the package
+    /// catalog, a virtual owns no bytes at all), so the exact-path query and
+    /// the SNAPSHOT resolution under it can only ever miss. Gating them on the
+    /// two hosted types is what keeps those 1-2 pool acquires off the proxied
+    /// and aggregated download paths; widening the gate back out puts them
+    /// straight back on.
+    #[test]
+    fn serve_artifact_skips_the_artifacts_lookup_unless_the_repo_is_hosted() {
+        let body = serve_artifact_body();
+        let gate = body
+            .find("let artifact = if repo.repo_type == RepositoryType::Local")
+            .expect("the artifacts lookup must be gated on the hosted repo types");
+        let query = body
+            .find("FROM artifacts")
+            .expect("serve_artifact must still have an artifacts lookup");
+        assert!(
+            gate < query,
+            "the hosted-only gate must come BEFORE the artifacts query"
+        );
+        // The same two types `checksum_compute_eligible` admits, and no others.
+        assert!(!checksum_compute_eligible(RepositoryType::Remote.as_str()));
+        assert!(!checksum_compute_eligible(RepositoryType::Virtual.as_str()));
+    }
 
     // -----------------------------------------------------------------------
     // checksum_compute_eligible (#1599): which repo types do a DB checksum
@@ -10397,6 +10504,80 @@ mod tests {
             StatusCode::OK,
             "an unavailable member must not produce a partial-union 200"
         );
+    }
+
+    #[tokio::test]
+    async fn test_virtual_checksum_503s_when_a_member_errors_but_404s_on_a_miss() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/com/boom/.*\.sha1$"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/com/miss/.*\.sha1$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![remote_id, virtual_id])
+            .execute(&pool)
+            .await
+            .expect("publish repos");
+
+        let dir = std::env::temp_dir().join(format!("csum503-{}", virtual_id));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+        let get = |p: &str| {
+            let state = state.clone();
+            let key = virtual_key.clone();
+            let p = p.to_string();
+            async move {
+                download(
+                    axum::extract::State(state),
+                    axum::Extension(None),
+                    axum::extract::Path((key, p)),
+                    axum::http::HeaderMap::new(),
+                    Default::default(),
+                )
+                .await
+                .unwrap_or_else(|r| r)
+                .status()
+            }
+        };
+        let errored = get("com/boom/lib/1.0/lib-1.0.jar.sha1").await;
+        let missed = get("com/miss/lib/1.0/lib-1.0.jar.sha1").await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            errored,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an erroring member must not read as a miss"
+        );
+        assert_eq!(missed, StatusCode::NOT_FOUND, "a genuine miss stays 404");
     }
 
     #[tokio::test]

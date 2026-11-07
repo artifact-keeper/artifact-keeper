@@ -1565,7 +1565,9 @@ pub struct Config {
     /// `.sha1`, #1606). Opt-in HA feature (like `presigned_downloads_enabled`):
     /// default `false` keeps the unchanged per-process single-flight for
     /// single-replica installs. Multi-replica deployments should set
-    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`.
+    /// `PROXY_SINGLEFLIGHT_ADVISORY_LOCKS_ENABLED=true`. A held lock connection is
+    /// detached, so it sits outside the pool; `PROXY_SINGLEFLIGHT_LOCK_MAX_CONNECTIONS`
+    /// caps how many exist at once (default `PROXY_SINGLEFLIGHT_MAX_LOCK_WAITERS` + 1).
     pub proxy_singleflight_advisory_locks_enabled: bool,
 
     /// Follower poll cadence (milliseconds) for the BUFFERED proxy path while

@@ -36,6 +36,10 @@ const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
 
 /// Fan out a `delete` sync task to every eligible peer subscribed to the
 /// artifact's repository in push/mirror mode.
+///
+/// Not filtered on `pi.status`: the sync worker already skips offline peers when it claims
+/// tasks, so filtering here dropped the delete instead of deferring it, and the peer kept the
+/// artifact once it came back.
 const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                 INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
                 SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
@@ -43,7 +47,6 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                 JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
                 JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
                 WHERE pi.is_local = false
-                  AND pi.status IN ('online', 'syncing')
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
                 ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
@@ -5236,6 +5239,71 @@ mod tests {
         assert!(sql.contains("is_local = false"));
         assert!(sql.contains("ON CONFLICT"));
         assert!(sql.contains("WHERE sync_tasks.status <> 'in_progress'"));
+        // Gating on peer status here is what dropped every delete made while a
+        // peer was offline; the worker already gates delivery.
+        assert!(!sql.contains("pi.status"));
+    }
+
+    #[tokio::test]
+    async fn delete_enqueue_queues_for_offline_peer() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::peer_instance_service::{PeerInstanceService, ReplicationMode};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _) = tdh::create_user(&pool).await;
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let peer_id = tdh::register_test_peer(&pool, "delete-offline", "t").await;
+        PeerInstanceService::new(pool.clone())
+            .assign_repository(
+                peer_id,
+                repo_id,
+                true,
+                Some(ReplicationMode::Push),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE peer_instances SET status = 'offline' WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, is_deleted) \
+             VALUES ($1, 'a/b/offline.bin', 'offline.bin', 1, $2, 'application/octet-stream', $2, true) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{:064x}", 2))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(ENQUEUE_DELETE_SYNC_TASKS_SQL)
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status::TEXT FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = 'delete'",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status.as_deref(), Some("pending"));
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

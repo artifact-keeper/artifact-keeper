@@ -3999,13 +3999,13 @@ async fn pool_download(
                 // #3178: authorize the member set against the CALLER before any
                 // format-specific filtering, so a member this caller could not
                 // read directly can never reach the byte resolver.
-                let members = proxy_helpers::authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
                     repo.id,
                     members,
                 )
-                .await;
+                .await?;
                 let mut allowed_members = Vec::with_capacity(members.len());
                 for member in members {
                     match remote_member_upstream(&member) {

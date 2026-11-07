@@ -1937,7 +1937,8 @@ async fn serve_virtual_metadata(
     }
 
     let members =
-        proxy_helpers::authorize_virtual_members(&state.db, auth, virtual_repo.id, members).await;
+        proxy_helpers::try_authorize_virtual_members(&state.db, auth, virtual_repo.id, members)
+            .await?;
     // #3452: a fully-filtered member set must answer the SAME body the
     // genuinely-empty set above answers, or the pair is an existence oracle
     // over the private members this virtual aggregates.
@@ -3066,8 +3067,8 @@ async fn serve_file(
                 // is never leaked. Routes through the SAME helper the Maven
                 // download path uses.
                 let members =
-                    proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members)
-                        .await;
+                    proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members)
+                        .await?;
                 // #3452: a fully-filtered member set must answer the SAME body
                 // the genuinely-empty set above answers, or the pair is an
                 // existence oracle over the private members this virtual

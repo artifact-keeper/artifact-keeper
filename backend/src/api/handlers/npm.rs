@@ -5272,7 +5272,7 @@ async fn serve_tarball(
         // format-specific filtering, so a member this caller could not read
         // directly can never reach the byte resolver.
         let members =
-            proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+            proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
         let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
         let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
             .await

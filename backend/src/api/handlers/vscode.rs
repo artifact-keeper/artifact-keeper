@@ -3703,7 +3703,11 @@ async fn virtual_gallery_page(
     body: &Bytes,
 ) -> Result<serde_json::Value, Response> {
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
-    let members = proxy_helpers::authorize_virtual_members(&state.db, auth, repo.id, members).await;
+    // Fallible (#4308): this AGGREGATES the filtered set into one page, so the
+    // flattened empty set would render as "this gallery has no extensions"
+    // whenever the visibility query fails. A failed query is a server error.
+    let members =
+        proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
     let request = serde_json::from_slice::<GalleryQueryRequest>(body).ok();
     let flags = request
         .as_ref()
