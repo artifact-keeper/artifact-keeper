@@ -52,7 +52,7 @@ use crate::services::signing_service::{openpgp_public_keyring, SigningService};
 #[cfg(test)]
 mod depth_tests;
 
-#[cfg(ak_test_shard = "router")]
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod precomputed_tests;
 

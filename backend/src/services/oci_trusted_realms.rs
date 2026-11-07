@@ -211,6 +211,7 @@ pub async fn save_trusted_realms(db: &PgPool, repo_id: Uuid, normalized: &[Strin
     Ok(())
 }
 
+#[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

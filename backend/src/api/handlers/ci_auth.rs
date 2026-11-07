@@ -609,7 +609,7 @@ fn extract_bearer_jwt(headers: &HeaderMap) -> Result<&str> {
 )]
 pub struct CiAuthApiDoc;
 
-#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
     use super::{

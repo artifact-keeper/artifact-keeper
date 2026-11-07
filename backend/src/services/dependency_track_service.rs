@@ -67,6 +67,8 @@ use utoipa::ToSchema;
 
 use crate::error::{AppError, Result};
 
+mod maven;
+
 const DT_PAGE_SIZE: u32 = 500;
 const DT_MAX_PAGES: u32 = 200; // safety cap: 200 * 500 = 100,000 items
 
@@ -190,6 +192,10 @@ pub struct DependencyTrackConfig {
     pub api_key_file: Option<String>,
     /// Whether integration is enabled
     pub enabled: bool,
+    /// Organize Maven versions into collections (opt-in).
+    pub auto_collections: bool,
+    /// Normalized once at startup, never applied to local scanners.
+    pub maven_excluded_classifiers: std::collections::HashSet<String>,
 }
 
 impl DependencyTrackConfig {
@@ -241,7 +247,19 @@ impl DependencyTrackConfig {
             api_key,
             api_key_file,
             enabled,
+            auto_collections: std::env::var("DEPENDENCY_TRACK_AUTO_COLLECTIONS")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1")),
+            maven_excluded_classifiers: Self::parse_excluded_classifiers(
+                &std::env::var("DEPENDENCY_TRACK_MAVEN_EXCLUDED_CLASSIFIERS").unwrap_or_default(),
+            ),
         })
+    }
+
+    pub fn parse_excluded_classifiers(csv: &str) -> std::collections::HashSet<String> {
+        csv.split(',')
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| !v.is_empty())
+            .collect()
     }
 }
 
@@ -310,6 +328,9 @@ pub struct DependencyTrackService {
     /// Cache for a file-sourced API key; unused when the key is provided
     /// directly via `DEPENDENCY_TRACK_API_KEY`.
     cached_file_key: std::sync::Mutex<CachedFileKey>,
+    /// Serializes this client's Maven provisioning; PostgreSQL advisory locks
+    /// cover independent AK replicas, and HTTP 409s trigger exact lookups.
+    maven_provisioning: tokio::sync::Mutex<()>,
 }
 
 /// Dependency-Track project representation
@@ -323,6 +344,19 @@ pub struct DtProject {
     pub last_bom_import: Option<i64>,
     #[serde(rename = "lastBomImportFormat")]
     pub last_bom_import_format: Option<String>,
+    pub group: Option<String>,
+    pub purl: Option<String>,
+    pub parent: Option<DtProjectParent>,
+    #[serde(rename = "collectionLogic")]
+    pub collection_logic: Option<String>,
+    pub active: Option<bool>,
+    #[serde(rename = "isLatest")]
+    pub is_latest: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DtProjectParent {
+    pub uuid: String,
 }
 
 /// Request to create a new project
@@ -331,6 +365,14 @@ struct CreateProjectRequest {
     name: String,
     version: Option<String>,
     description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purl: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<DtProjectParent>,
+    #[serde(rename = "collectionLogic", skip_serializing_if = "Option::is_none")]
+    collection_logic: Option<String>,
 }
 
 /// BOM upload response
@@ -735,6 +777,7 @@ impl DependencyTrackService {
             config,
             page_size: DT_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
+            maven_provisioning: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -926,6 +969,10 @@ impl DependencyTrackService {
             name: name.to_string(),
             version: version.map(String::from),
             description: description.map(String::from),
+            group: None,
+            purl: None,
+            parent: None,
+            collection_logic: None,
         };
 
         let response: reqwest::Response = self
@@ -2124,6 +2171,8 @@ mod tests {
             api_key: Some("test-api-key".to_string()),
             api_key_file: None,
             enabled: true,
+            auto_collections: false,
+            maven_excluded_classifiers: Default::default(),
         };
         assert_eq!(config.base_url, "http://localhost:8092");
         assert!(config.enabled);
@@ -2136,6 +2185,8 @@ mod tests {
             api_key: Some("key-123".to_string()),
             api_key_file: None,
             enabled: false,
+            auto_collections: false,
+            maven_excluded_classifiers: Default::default(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.base_url, "http://dt.example.com");
@@ -2423,9 +2474,12 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 api_key_file: None,
                 enabled: true,
+                auto_collections: false,
+                maven_excluded_classifiers: Default::default(),
             },
             page_size: TEST_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
+            maven_provisioning: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -2439,9 +2493,12 @@ mod tests {
                 api_key: None,
                 api_key_file: key_file,
                 enabled: true,
+                auto_collections: false,
+                maven_excluded_classifiers: Default::default(),
             },
             page_size: TEST_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
+            maven_provisioning: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -3181,9 +3238,12 @@ mod tests {
                 api_key: Some("direct-key".to_string()),
                 api_key_file: Some(f.path().to_string_lossy().into_owned()),
                 enabled: true,
+                auto_collections: false,
+                maven_excluded_classifiers: Default::default(),
             },
             page_size: TEST_PAGE_SIZE,
             cached_file_key: std::sync::Mutex::new(CachedFileKey::default()),
+            maven_provisioning: tokio::sync::Mutex::new(()),
         };
         assert_eq!(svc.api_key().unwrap(), "direct-key");
         assert_eq!(svc.api_key().unwrap(), "direct-key");

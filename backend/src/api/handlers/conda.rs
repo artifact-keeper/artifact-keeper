@@ -21244,7 +21244,6 @@ mod scan_on_upload_tests {
     }
 }
 
-#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_channel_tests {
     //! Virtual conda channel merge semantics: hosted members own their names
@@ -23920,7 +23919,7 @@ mod rattler_token_layout_tests {
     }
 }
 
-#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod scan_on_proxy_tests {
     //! #4585: the scan-on-proxy gate on conda Remote and Virtual package
@@ -27085,6 +27084,7 @@ mod package_gate_router_tests {
 /// Archives with two entries at one path (see `services::archive_entry_paths`):
 /// the format's reader takes the first copy and the scan extractor keeps the
 /// last, so the gate establishes no identity for them.
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod duplicate_entry_tests {
     use super::*;
