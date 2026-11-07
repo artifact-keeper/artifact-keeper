@@ -628,10 +628,16 @@ jobs:
           no-cache-filters: rootfs-builder,grype-bin,buildkit-bin,grype-db-seed,runtime
           sbom: true
           provenance: mode=max
+          # #5130: glibc's malloc retains freed proxy-download buffers in
+          # per-thread arenas, so the published UBI image OOM'd at 4 GiB under
+          # Maven bursts. Passed explicitly as well as defaulted in
+          # docker/Dockerfile.backend: a published image must not silently
+          # fall back to the system allocator if that default is edited.
           build-args: |
             GIT_SHA=${{ github.sha }}
             APP_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
             CARGO_BUILD_JOBS=${{ matrix.cargo-build-jobs }}
+            CARGO_FEATURES=jemalloc
 
       - name: Export digest
         run: |

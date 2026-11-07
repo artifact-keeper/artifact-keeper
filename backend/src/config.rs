@@ -3787,6 +3787,145 @@ mod tests {
         }
     }
 
+    /// #5130: the shipped backend image runs on UBI 9/glibc, whose malloc
+    /// keeps freed memory in per-thread arenas. A proxy-only mirror serving
+    /// bursts of concurrent Maven downloads grew RSS from 77 MiB to 3919 MiB,
+    /// stayed flat while idle, and was OOM-killed at its 4 GiB limit. The
+    /// image therefore builds the backend with jemalloc, whose decay returns
+    /// freed pages instead of holding every arena warm.
+    ///
+    /// Both compiling stages declare `ARG CARGO_FEATURES`, and the cook and
+    /// the build must agree or the cooked dependencies are not reused. Pin
+    /// every declaration, and pin the workflow's explicit build arg: its
+    /// value overrides the Dockerfile default, so dropping it would ship the
+    /// system allocator again while the Dockerfile still looked fixed.
+    #[test]
+    fn backend_image_builds_with_jemalloc_5130() {
+        let dockerfile = include_str!("../../docker/Dockerfile.backend");
+        let values: Vec<&str> = dockerfile
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("ARG CARGO_FEATURES="))
+            .map(|value| value.trim_matches('"'))
+            .collect();
+        assert_eq!(
+            values.len(),
+            2,
+            "docker/Dockerfile.backend must declare ARG CARGO_FEATURES in \
+             both the deps and builder stages, found {values:?}"
+        );
+        assert!(
+            values.iter().all(|features| *features == "jemalloc"),
+            "docker/Dockerfile.backend must build with jemalloc (#5130); \
+             found CARGO_FEATURES={values:?}. glibc's malloc retains freed \
+             proxy-download buffers per thread, so bursts against a Maven \
+             remote grow RSS until the container is OOM-killed and do not \
+             release it while idle. See \
+             docs/operations/backend-memory-allocator.md."
+        );
+        assert!(
+            dockerfile
+                .matches(r#"--features "$CARGO_FEATURES""#)
+                .count()
+                >= 2,
+            "docker/Dockerfile.backend declares CARGO_FEATURES but no longer \
+             passes it to both cargo invocations; the jemalloc feature would \
+             not reach the binary (#5130)"
+        );
+        // jemalloc takes its page size from the build host and refuses to
+        // start on a kernel with larger pages, so the arm64 image, built on
+        // 4 KiB-page runners, must build it for 64 KiB pages in both stages.
+        assert_eq!(
+            dockerfile
+                .matches(r#"if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi"#)
+                .count(),
+            2,
+            "docker/Dockerfile.backend must build jemalloc for 64 KiB pages on \
+             aarch64 in both the deps and builder stages, or the arm64 image \
+             aborts at startup on a 64 KiB-page kernel (#5130)"
+        );
+
+        let workflow = include_str!("../../.github/workflows/docker-publish.yml");
+        let backend_job = workflow
+            .split_once("\n  build-backend:\n")
+            .and_then(|(_, rest)| rest.split_once("\n  build-openscap:\n"))
+            .map(|(backend, _)| backend)
+            .expect("docker-publish.yml must define build-backend before build-openscap");
+        assert!(
+            backend_job.contains("CARGO_FEATURES=jemalloc"),
+            "docker-publish.yml's build-backend job must pass \
+             CARGO_FEATURES=jemalloc (#5130). Its build args override the \
+             Dockerfile default, so omitting it publishes a glibc-malloc \
+             image that retains freed proxy-download memory."
+        );
+    }
+
+    /// #5130: the published container is not the only way the backend is
+    /// deployed. The Linux binaries attached to a release are built from the
+    /// same tree and used to keep glibc's malloc, so a tarball deployment
+    /// still had the retaining allocator. Pin the release workflows too:
+    /// `release.yml` builds the assets, `publish-binaries.yml` replaces them
+    /// when a release is cut without the normal gate, and
+    /// `release-cli-caches.yml` must warm the same feature set or the tag
+    /// build compiles jemalloc cold.
+    #[test]
+    fn release_binaries_build_with_jemalloc_5130() {
+        for (name, workflow) in [
+            (
+                "release.yml",
+                include_str!("../../.github/workflows/release.yml"),
+            ),
+            (
+                "publish-binaries.yml",
+                include_str!("../../.github/workflows/publish-binaries.yml"),
+            ),
+            (
+                "release-cli-caches.yml",
+                include_str!("../../.github/workflows/release-cli-caches.yml"),
+            ),
+        ] {
+            let features: Vec<&str> = workflow
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("features:"))
+                .collect();
+            assert_eq!(
+                features
+                    .iter()
+                    .filter(|line| **line == "features: vendored-openssl,jemalloc")
+                    .count(),
+                2,
+                "{name} must build both Linux release targets with jemalloc \
+                 (#5130); found {features:?}"
+            );
+            assert_eq!(
+                features
+                    .iter()
+                    .filter(|line| **line == "features: vendored-openssl")
+                    .count(),
+                3,
+                "{name} must leave the macOS and Windows release targets on \
+                 their platform allocator (#5130); found {features:?}"
+            );
+            assert!(
+                workflow.contains("--features ${{ matrix.features }}"),
+                "{name} declares per-target features but no longer passes them \
+                 to cargo, so the Linux tarball would ship glibc malloc again \
+                 (#5130)"
+            );
+            assert!(
+                workflow.contains("JEMALLOC_SYS_WITH_LG_PAGE=16"),
+                "{name} must build the aarch64 Linux jemalloc for 64 KiB pages, \
+                 or the tarball aborts on a 64 KiB-page kernel (#5130)"
+            );
+            assert!(
+                workflow.contains("CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"),
+                "{name} must set the aarch64 C compiler for the cross-built \
+                 jemalloc (#5130)"
+            );
+        }
+    }
+
     #[test]
     fn secret_env_present_checks_both_forms() {
         env::remove_var("TEST_SECRET_4142");
