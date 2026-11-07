@@ -13350,7 +13350,20 @@ pub async fn download_artifact(
                             &dl_ctx,
                         )
                         .await;
-                        Ok(response.into_response())
+                        // The proxied serve is a complete `200`; cut the
+                        // client's `Range` from it as the Hugging Face resolve
+                        // route does (#5145). Without this a ranged GET of a
+                        // proxied object got every byte, which breaks clients
+                        // that fetch byte windows and check each against its
+                        // own digest (apk segment fetches).
+                        Ok(
+                            crate::api::handlers::huggingface::apply_range_to_streamed_serve(
+                                response.into_response(),
+                                request.headers(),
+                                dl_ctx.is_head,
+                            )
+                            .unwrap_or_else(|r| r),
+                        )
                     }
                     Err(e) => Ok(e.into_response()),
                 }
@@ -17478,6 +17491,79 @@ mod tests {
             .await
             .concat();
         assert_eq!(collected, b"defg");
+    }
+
+    fn proxied_200(body: &'static [u8], content_length: Option<usize>) -> Response {
+        let mut b = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("x-checksum-sha256", "abc");
+        if let Some(len) = content_length {
+            b = b.header(header::CONTENT_LENGTH, len.to_string());
+        }
+        b.body(Body::from(body)).unwrap()
+    }
+
+    /// The remote arm of the generic download route applies the client's
+    /// `Range` to the proxied serve through this helper.
+    fn apply_range_to_proxy_response(resp: Response, range: Option<&str>) -> Response {
+        let mut headers = HeaderMap::new();
+        if let Some(range) = range {
+            headers.insert(header::RANGE, range.parse().unwrap());
+        }
+        crate::api::handlers::huggingface::apply_range_to_streamed_serve(resp, &headers, false)
+            .unwrap_or_else(|r| r)
+    }
+
+    #[tokio::test]
+    async fn proxy_response_honours_range() {
+        let resp =
+            apply_range_to_proxy_response(proxied_200(b"0123456789", Some(10)), Some("bytes=2-4"));
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+        assert_eq!(resp.headers()[header::CONTENT_LENGTH], "3");
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(resp.headers()["x-checksum-sha256"], "abc");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"234");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_without_range_is_unchanged() {
+        let resp = apply_range_to_proxy_response(proxied_200(b"0123456789", Some(10)), None);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_without_length_ignores_range() {
+        // No Content-Length means no total for Content-Range, so the whole
+        // body is served as before.
+        let resp =
+            apply_range_to_proxy_response(proxied_200(b"0123456789", None), Some("bytes=2-4"));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_out_of_bounds_range_is_416() {
+        let resp = apply_range_to_proxy_response(
+            proxied_200(b"0123456789", Some(10)),
+            Some("bytes=20-30"),
+        );
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers()[header::CONTENT_RANGE], "bytes */10");
     }
 
     // -----------------------------------------------------------------------

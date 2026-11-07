@@ -1584,8 +1584,10 @@ fn effective_range<'a>(
 /// Left as it is: anything but a `200` (a presigned redirect's target answers
 /// `Range` itself), a content-coded body (a client's offsets describe the
 /// decoded file) and a body of unknown length.
+///
+/// The generic download route's Remote arm uses it for the same reason.
 #[allow(clippy::result_large_err)]
-fn apply_range_to_streamed_serve(
+pub(crate) fn apply_range_to_streamed_serve(
     resp: Response,
     headers: &HeaderMap,
     is_head: bool,
