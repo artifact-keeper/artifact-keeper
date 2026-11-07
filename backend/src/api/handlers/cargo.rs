@@ -2276,13 +2276,13 @@ async fn download(
                 // it.
                 let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
                 let had_members = !members.is_empty();
-                let members = proxy_helpers::authorize_virtual_members(
+                let members = proxy_helpers::try_authorize_virtual_members(
                     &state.db,
                     auth.as_ref(),
                     repo.id,
                     members,
                 )
-                .await;
+                .await?;
                 if had_members && members.is_empty() {
                     // Same existence-oracle guard as `resolve_virtual_download`,
                     // and it must answer with the SAME response that helper
