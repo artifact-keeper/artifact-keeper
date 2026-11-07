@@ -10882,7 +10882,15 @@ fn scan_inline_serve_decision(
         }
         Ok(_) => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         // Inconclusive under fail-closed => 423, never unscanned bytes.
-        Err(_) => ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename)),
+        // Logged because all three reasons render as the same 423 "retry shortly",
+        // but only BudgetExceeded resolves on its own.
+        Err(why) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest, reason = ?why,
+                "withholding proxy pull: scan not conclusive yet (fail-closed)"
+            );
+            ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename))
+        }
     }
 }
 
@@ -13961,6 +13969,37 @@ mod tests {
             ProxyScanServeOutcome::Serve(_) => {
                 panic!("fail-closed must never serve on a budget-exceeded scan")
             }
+        }
+    }
+
+    /// Every inconclusive reason answers the same 423, so the reason must be
+    /// in the log (#5473): only `BudgetExceeded` resolves on a retry.
+    #[test]
+    fn inline_gate_inconclusive_deny_logs_the_reason() {
+        use crate::api::handlers::test_db_helpers::LogCapture;
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        for (why, reason) in [
+            (ProxyScanInconclusive::NoScanner, "NoScanner"),
+            (ProxyScanInconclusive::ScanFailed, "ScanFailed"),
+            (ProxyScanInconclusive::BudgetExceeded, "BudgetExceeded"),
+        ] {
+            let capture = LogCapture::default();
+            let outcome = {
+                let _guard = capture.install(tracing::Level::WARN);
+                scan_inline_serve_decision(
+                    Err(why),
+                    ProxySeverityGate::BlockOnAny,
+                    Uuid::new_v4(),
+                    "pkg-1.0.tgz",
+                    "deadbeef",
+                )
+            };
+            assert!(matches!(outcome, ProxyScanServeOutcome::Deny(_)));
+            let text = capture.text();
+            assert!(
+                text.contains("scan not conclusive") && text.contains(reason),
+                "the 423 must log its reason {reason}: {text}"
+            );
         }
     }
 
