@@ -6,7 +6,8 @@ name: MCP Sandbox
 # that guest answered from inside gVisor and its container was removed. It
 # also checks that the runner refuses to start a guest without a sandbox
 # runtime (none, or runc), that an internal
-# network like `ak-mcp-sandbox` has no way out, and that the reference
+# guest network has no way out, that a guest on its own network reaches the
+# forwarder but not another guest (#5447), and that the reference
 # deployment files (deploy/mcp-introspector) parse.
 # docs/security/mcp-sandbox.md, "Continuous integration".
 #
@@ -163,3 +164,13 @@ jobs:
             echo "a guest on the internal network reached the internet"; exit 1
           fi
           docker network rm ak-mcp-sandbox-ci
+
+      - name: Guests cannot reach each other, only the forwarder (#5447)
+        run: |
+          set -u
+          ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh
+          # The policy-removed control: with the attacker on the victim's
+          # network (the old shared bridge), the same check must fail.
+          if SHARED=1 ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh; then
+            echo "the isolation check passed on a shared network"; exit 1
+          fi

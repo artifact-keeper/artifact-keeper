@@ -18,9 +18,10 @@ variables, the 120 s wall clock) is in
 | --- | --- | --- |
 | The sandbox host kernel | A guest runs arbitrary code (`npm install` scripts, the server). | gVisor `runsc` (user-space kernel) or a microVM runtime (`kata-fc`); a plain runc container is refused unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`. Read-only root, `/tmp` tmpfs, uid 65532, `--cap-drop=ALL`, `no-new-privileges`, pids/memory/CPU limits. |
 | The container engine | Whoever drives the engine can start privileged containers. A rootful Docker or Podman socket is root on the host. | The worker drives **rootless** Podman as a dedicated user, on a host or VM used for nothing else. No socket is mounted into any container. On Kubernetes the worker has no engine at all: it creates guest pods through the API, limited by RBAC to one namespace. |
-| The internal network, cloud metadata | A guest that can open connections can scan and pivot, or send data out. | npm and PyPI guests join `ak-mcp-sandbox`, an internal network with no route out and no DNS for outside names. Its only member is a TCP forwarder that answers on the AK hostname and forwards to AK's address. On Kubernetes, a NetworkPolicy allows TCP 443 to AK only, and guest pods get no DNS server. OCI guests run with `--network=none`. |
+| The internal network, cloud metadata | A guest that can open connections can scan and pivot, or send data out. | Each npm or PyPI guest gets an internal network of its own, created by the worker for that run and removed after it: no route out, no DNS for outside names, and no member but the guest and a TCP forwarder that answers on the AK hostname and forwards to AK's address. On Kubernetes, a NetworkPolicy allows TCP 443 to AK only, and guest pods get no DNS server. OCI guests run with `--network=none`. |
+| Other guests | A guest that can reach another guest can attack the server running in it, or tamper with its install ([#5447](https://github.com/artifact-keeper/artifact-keeper/issues/5447)). | No two guests share a network (see [Guest networks](#guest-networks-option-a)). Membership of a shared bridge is not a boundary: containers on one bridge reach each other. On Kubernetes, the default-deny policy gives guest pods no ingress. |
 | Artifact Keeper credentials | The worker holds an `mcp:introspect` token. In Option A the worker, rootless Podman and the gVisor sentry all run as `ak-sbx`, so a guest that escapes the sentry runs as the worker's user. | The token can only claim jobs and post results. Guests never see it: the worker passes them only placeholder secrets (`AK_PLACEHOLDER_<NAME>`). It is never in the environment: systemd opens the root-only `/etc/ak-mcp-introspector/token` and hands it over as standard input (`--token-file -`), and the worker makes itself non-dumpable (`PR_SET_DUMPABLE=0`), so another `ak-sbx` process can read neither a file holding the token nor the worker's `/proc/<pid>/environ` or memory. Guests install anonymously, so map public, read-only repositories for packages that should be introspected. |
-| Other jobs | A guest could persist between jobs. | A fresh container per attempt, removed after the run; jobs run one at a time, and the guest is killed at the wall clock. |
+| Other jobs | A guest could persist between jobs. | A fresh container and a fresh network per attempt, both removed after the run; jobs run one at a time per worker, and the guest is killed at the wall clock. |
 
 What this deployment does not cover: a guest can still talk to the AK
 instance it installs from (it needs to), and gVisor reduces but does not
@@ -56,9 +57,73 @@ URL and drops variables that would re-route the package manager. That
 decides where a well-behaved installer fetches from. It does not stop
 anything else: the install scripts and the server are attacker code, and
 they can open a connection to any host they like. Only the network stops
-them: the internal `ak-mcp-sandbox` network and its gateway (Option A), or
+them: the guest's own internal network and the forwarder (Option A), or
 the NetworkPolicy and the missing DNS server (Option B). Do not loosen
 either on the grounds that the worker already points the installer at AK.
+
+### Guest networks (Option A)
+
+Every guest on one bridge network can connect to every other: a bridge is a
+switch, and neither rootless Podman nor Docker filters traffic between
+members of the same network. Earlier releases put every npm and PyPI guest
+on one internal network, `ak-mcp-sandbox`, and an install script in one
+guest could connect to the server in another
+([#5447](https://github.com/artifact-keeper/artifact-keeper/issues/5447)).
+
+The worker now gives each npm or PyPI guest a network of its own. For every
+attempt it runs, with the guest's fresh name `ak-mcp-sbx-<job>-<random>`:
+
+1. `<engine> network create --internal --label=... <name>`: a bridge with
+   no route out. A guest on it has a route to its own subnet only, and the
+   engine's DNS answers only for the members of that network.
+2. `<engine> network connect --alias <AK host> <name> ak-gateway`: the
+   forwarder joins it, under the host of `AK_URL`, so the guest's lookup of
+   the AK host returns the forwarder's address on this network.
+3. `<engine> run --network=<name> ...`: the guest, whose only peer is the
+   forwarder.
+4. After the run, whatever the outcome: `<engine> rm -f <name>`,
+   `<engine> network disconnect -f <name> ak-gateway`, `<engine> network rm
+   <name>`. At startup the worker also removes guest networks a crashed
+   run left behind (by their owner label), after their containers.
+
+If step 1 or 2 fails (the engine cannot create the network, the forwarder
+is not running, the alias is refused), the guest is not started: the job
+is `start_failed` with the engine's message and is retried. A guest never
+runs on a network the worker did not just create for it.
+
+What holds, and what it rests on:
+
+- **Guest to guest: no.** Two guests are never on one network. A guest has
+  no route to another guest's subnet, and it cannot add one: it has no
+  capabilities (`--cap-drop=ALL`), so no raw sockets and no route changes.
+- **Guest to forwarder: TCP 80 and 443 only**, the ports nginx listens on.
+  The forwarder forwards only to `ak-upstream` (AK's address) and does not
+  route between its networks: IP forwarding is off in its network
+  namespace (the default; do not enable it), and it has no capabilities
+  but the four nginx needs.
+- **Guest to the forwarder's other networks: no.** The forwarder joins the
+  networks of all guests running at the same time, but a guest reaches it
+  only on the address of its own network; it has no route to the others.
+- **Guest to anything else: no.** An internal network has no default
+  route and no forwarding of outside DNS names. The bridge address itself
+  (the engine's DNS server) answers only names of that network.
+- **OCI guests** have no network (`--network=none`), and no network is
+  created for them.
+
+`AK_MCP_SANDBOX_NETWORK`, which named the shared network, is retired: a
+worker that still has it set refuses every sandbox job with an error that
+says so, rather than leave the operator believing a shared network is in
+use. `AK_MCP_SANDBOX_GATEWAY` names the forwarder's container (default
+`ak-gateway`). `AK_URL` must use a host name, not an IP address: the guest
+reaches AK only through the forwarder's alias, and a guest told to connect
+to an IP address would find no route to it.
+
+This was checked with rootless Podman 6.1 (netavark, crun): a guest on its
+own network reached the forwarder under the alias, and failed to reach a
+second guest, the forwarder's address on the second guest's network, and
+the internet; with both guests on one network, the second guest was
+reachable. Check your own host with `sandbox-check/guest-isolation-check.sh`
+(step 7 below).
 
 ## Option A: a dedicated host with rootless Podman (recommended)
 
@@ -94,20 +159,25 @@ either on the grounds that the worker already points the installer at AK.
    `systemd`, `cgroupVersion` `v2`, and `cgroupControllers` should list
    `memory`, `pids` and `cpu`. Then check gVisor with `podman --runtime=runsc
    run --rm alpine dmesg`; the first line names gVisor.
-3. **Network.** As `ak-sbx`, edit
+3. **Forwarder.** As `ak-sbx`, edit
    `deploy/mcp-introspector/compose.sandbox-network.yaml`: replace
-   `ak.example.com` (the network alias) with the host of `AK_URL`, and
    `203.0.113.10` (the `ak-upstream` entry in `extra_hosts`) with the
-   address that host resolves to. Then run `podman-compose -f
-   compose.sandbox-network.yaml up -d`. This creates the internal network
-   `ak-mcp-sandbox` and the forwarder `ak-gateway`. The forwarder joins
-   that network under the AK hostname as an alias, so a guest's lookup of
-   the AK host returns the forwarder, and forwards TCP 443 (and 80) to
-   `ak-upstream`, the real AK. TLS stays end to end and the certificate
-   stays AK's. `nginx-ak-gateway.conf` must not name the AK hostname as its
-   upstream: inside the forwarder that name is its own alias, so it would
-   forward every connection back to itself. If AK's address changes, update
-   `extra_hosts` and recreate the forwarder.
+   address the host of `AK_URL` resolves to. Then run `podman-compose -f
+   compose.sandbox-network.yaml up -d`. This starts the forwarder
+   `ak-gateway` on its own way out, `ak-mcp-sandbox-egress`, which no guest
+   joins. There is no shared guest network: the worker attaches the
+   forwarder to each guest's own network for the length of a run, under the
+   AK hostname as an alias ([Guest networks](#guest-networks-option-a)).
+   The forwarder sends TCP 443 (and 80) on to `ak-upstream`, the real AK.
+   TLS stays end to end and the certificate stays AK's.
+   `nginx-ak-gateway.conf` must not name the AK hostname as its upstream:
+   inside the forwarder that name is its own alias, so it would forward
+   every connection back to itself. If AK's address changes, update
+   `extra_hosts` and recreate the forwarder. The forwarder must be running
+   for npm and PyPI jobs: while it is not, they fail with `start_failed`
+   and are retried. If you upgrade from a release with the shared network,
+   remove it (`podman network rm ak-mcp-sandbox`) and unset
+   `AK_MCP_SANDBOX_NETWORK`.
 4. **Images.** Mirror the guest images (`AK_MCP_SANDBOX_NODE_IMAGE`,
    `AK_MCP_SANDBOX_PYTHON_IMAGE`) through an AK OCI repository, pin them by
    digest, and pull them once as `ak-sbx`. Guests run with `--pull=missing`.
@@ -117,7 +187,7 @@ either on the grounds that the worker already points the installer at AK.
    `mcp:introspect` token in `/etc/ak-mcp-introspector/token`, mode 0600,
    owner root (`install -d -m 0700 /etc/ak-mcp-introspector`). The unit runs
    as `ak-sbx` with `AK_MCP_SANDBOX_ENGINE=podman`,
-   `AK_MCP_SANDBOX_RUNTIME=runsc` and `AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox`;
+   `AK_MCP_SANDBOX_RUNTIME=runsc` and `AK_MCP_SANDBOX_GATEWAY=ak-gateway`;
    systemd opens the token file before it drops to `ak-sbx` and passes it as
    standard input (`StandardInput=file:`, `--token-file -`), so the token is
    in no file and no environment that `ak-sbx` can read. Do not set
@@ -134,7 +204,22 @@ either on the grounds that the worker already points the installer at AK.
      ak-mcp-introspector sandbox-probe deploy/mcp-introspector/sandbox-check/job.example.json
    ```
 
-   It exits `0` only when the guest answered (`"outcome": "ok"`). Then set
+   It exits `0` only when the guest answered (`"outcome": "ok"`). Then
+   check that guests cannot reach each other, with the same engine and
+   runtime:
+
+   ```sh
+   sudo -u ak-sbx env ENGINE=podman RUNTIME=runsc \
+     sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh
+   ```
+
+   It builds the per-guest topology with throwaway names and passes only
+   if a guest reaches the forwarder but not a second guest, the forwarder's
+   address on the second guest's network or the internet, a guest sharing
+   the second guest's network does reach it (so a probe that cannot
+   connect at all does not pass), and the second guest recorded exactly
+   that one connection. `SHARED=1` puts both guests on one network, the
+   old layout: the check must then fail. Then set
    `mcp_sandbox_introspection: on` on the repositories that should use it.
 
 ## Option B: Kubernetes with a gVisor RuntimeClass
@@ -199,11 +284,17 @@ and on demand. On a GitHub-hosted Ubuntu runner it does the following:
    `ok`, the tool `echo` was listed, and the kernel the guest reports is not
    the runner's (gVisor implements its own).
 4. It checks that the same probe is refused without a runtime.
-5. It checks that a container on an internal network like `ak-mcp-sandbox`
-   cannot reach the internet.
-6. It validates the compose file and the Kubernetes manifests.
+5. It checks that a container on an internal network cannot reach the
+   internet.
+6. It runs `sandbox-check/guest-isolation-check.sh` under `runsc`: a guest
+   on its own network reaches the forwarder and nothing else, and the same
+   check fails with both guests on one network.
+7. It validates the compose file and the Kubernetes manifests.
 
 The workflow does not cover npm or PyPI guests, which need a running AK to
 install from, or the Kubernetes launcher, which needs a cluster with a gVisor
-RuntimeClass. Those are deployment checks: run `sandbox-probe` against your
+RuntimeClass. The isolation check exercises the topology the worker builds,
+with Docker; the worker's own commands for it are pinned by unit tests.
+Malicious npm and PyPI guests against an independent second-guest recorder
+on rootless Podman are covered by artifact-keeper-test. Those are deployment checks: run `sandbox-probe` against your
 own AK with a job document for a published server.

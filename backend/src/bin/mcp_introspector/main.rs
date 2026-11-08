@@ -17,7 +17,8 @@
 //! * `push --from <inventory> --repo --server --version <file>` — convert
 //!   and post it (`AK_URL`, `AK_TOKEN` with `write:artifacts`);
 //! * `render-sandbox <job.json>` — print the guest spec and the runner
-//!   command a claimed sandbox job would use, without running it.
+//!   commands (network setup, guest, cleanup) a claimed sandbox job would
+//!   use, without running them.
 //!
 //! Deployment: `docs/mcp-registry.md`, "Capabilities and introspection".
 
@@ -202,9 +203,19 @@ fn render_sandbox(job: &Value) -> Result<Value, String> {
     )
     .map_err(|e| e.to_string())?;
     let plan = runner.plan(&spec).map_err(|e| e.to_string())?;
+    let argv = |c: &sandbox::Cmd| {
+        let mut v = vec![c.program.clone()];
+        v.extend(c.args.iter().cloned());
+        v
+    };
+    let setup: Vec<Vec<String>> = plan.setup.iter().map(argv).collect();
+    let cleanup: Vec<Vec<String>> = plan.cleanup.iter().map(argv).collect();
     let mut command = vec![plan.program];
     command.extend(plan.args);
-    Ok(json!({"runner": runner.name(), "spec": spec, "command": command}))
+    Ok(
+        json!({"runner": runner.name(), "spec": spec, "setup": setup,
+        "command": command, "cleanup": cleanup}),
+    )
 }
 
 async fn dispatch(cli: Cli) -> Result<(), String> {
@@ -427,6 +438,10 @@ mod tests {
         let out = render_sandbox(&job).unwrap();
         assert!(out["command"][0].as_str().is_some());
         assert_eq!(out["spec"]["network"], "ak-only");
+        // The guest's own network is created first and removed after it.
+        assert_eq!(out["setup"][0][1], "network");
+        assert_eq!(out["setup"][0][2], "create");
+        assert_eq!(out["cleanup"].as_array().unwrap().len(), 3);
         assert!(render_sandbox(&json!({})).is_err());
         let jf = tmp("job.json", &job.to_string());
         let c = Cli::try_parse_from(["x", "render-sandbox", jf.as_str()]).unwrap();

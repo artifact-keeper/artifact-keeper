@@ -2482,10 +2482,13 @@ without a default and every `{template}` value is the placeholder
 When the run ends, whatever the outcome, the engine client (or launcher)
 gets `SIGTERM`, then `SIGKILL` 5 s later, and the container is removed
 through the engine (`<engine> rm -f <name>`): killing the client alone
-leaves the container running. An OCI package's image is removed after its
+leaves the container running. An npm or PyPI guest's own network is removed
+after it (`<engine> network disconnect -f <name> <gateway>`, `<engine>
+network rm <name>`). An OCI package's image is removed after its
 run (`<engine> rmi`); the runner images are kept. At startup the worker
-removes any container labelled `com.artifactkeeper.mcp-sandbox.owner=<worker
-id>` that a crashed or killed earlier run left behind, and warns about
+removes any container, then any network, labelled
+`com.artifactkeeper.mcp-sandbox.owner=<worker id>` that a crashed or killed
+earlier run left behind, and warns about
 runner images that are not pinned by digest. A guest that exits before
 answering is reported `needs_config`, unless the engine exited `125`, `126`
 or `127` (the engine failed: runtime, network or image missing, pull failed,
@@ -2518,11 +2521,20 @@ Runners:
   `crun` or any runtime that is not gVisor (`runsc*`) or Kata (`kata*`) is
   refused unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`, because a
   plain container is not a boundary for attacker-chosen install scripts),
-  `AK_MCP_SANDBOX_NETWORK` (default `ak-mcp-sandbox`), `AK_MCP_SANDBOX_MEMORY`
-  (`1g`), `AK_MCP_SANDBOX_CPUS` (`1`). Rendered as `<engine> run --rm -i
+  `AK_MCP_SANDBOX_GATEWAY` (the AK forwarder's container, default
+  `ak-gateway`), `AK_MCP_SANDBOX_MEMORY` (`1g`), `AK_MCP_SANDBOX_CPUS`
+  (`1`). `AK_MCP_SANDBOX_NETWORK` is retired: guests that share a network
+  can reach each other (#5447), so a worker with it set refuses every
+  sandbox job. For an npm or PyPI guest the runner first creates the
+  guest's own network, `<engine> network create --internal --label=...
+  <name>`, and attaches the forwarder to it under the host of `AK_URL`,
+  `<engine> network connect --alias <AK host> <name> <gateway>`; if either
+  fails the guest is not started (`start_failed`, retried). An `AK_URL`
+  with an IP address instead of a host name is refused for npm and PyPI.
+  The guest is rendered as `<engine> run --rm -i
   --name=ak-mcp-sbx-<job>-<random> --label=com.artifactkeeper.mcp-sandbox=<job>
   --label=com.artifactkeeper.mcp-sandbox.owner=<worker id> --runtime=runsc
-  --network=<net | none> --read-only
+  --network=<its own network | none> --read-only
   --tmpfs=/tmp:rw,exec,nosuid,nodev,size=512m --user=65532:65532
   --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256
   --memory=1g --cpus=1 --pull=missing --stop-timeout=1 --log-driver=none
@@ -2561,8 +2573,8 @@ probe looks the same from the server's side:
 - remote probes send `User-Agent: ak-mcp-introspector/<version> (...;
   capability probe; never calls tools)`;
 - sandbox runs set `CI=1`, pass `AK_PLACEHOLDER_<NAME>` for every secret,
-  required or templated value, run on the sandbox network, which reaches
-  only AK, and end at the 120 s wall clock.
+  required or templated value, run on a network of their own, which
+  reaches only AK, and end at the 120 s wall clock.
 
 A server that checks any of these can show AK one tool list and its clients
 another, or behave only after the probe has gone. `remote_probe` and
@@ -2585,8 +2597,8 @@ scanned, not the tool list the probe saw.
 3. Sandbox (optional, `--sandbox`): follow the reference deployment in
    [docs/security/mcp-sandbox.md](security/mcp-sandbox.md), which covers the
    threat model, a dedicated host with rootless Podman and gVisor (no engine
-   socket in any container), the internal `ak-mcp-sandbox` network whose
-   only peer forwards to AK, and a Kubernetes variant (gVisor
+   socket in any container), an internal network per guest whose only
+   other member forwards to AK, and a Kubernetes variant (gVisor
    `RuntimeClass`, one guest pod per job through the API, RBAC and
    NetworkPolicies). The files are in `deploy/mcp-introspector/`. Check the
    deployment with `sandbox-probe` before turning the sandbox on.
