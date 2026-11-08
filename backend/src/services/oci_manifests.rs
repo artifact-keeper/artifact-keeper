@@ -124,6 +124,170 @@ where
     .await
 }
 
+// ---------------------------------------------------------------------------
+// Digest-keyed download gate (#5457)
+// ---------------------------------------------------------------------------
+//
+// A manifest's quarantine and rejection state lives on its `artifacts` rows,
+// and one stored manifest can have several: the tag-path row a push writes
+// (`v2/<name>/manifests/<tag>`, rewritten in place when the tag moves), the
+// digest-path row an MCP pin or a by-digest push writes
+// (`v2/<name>/manifests/<digest>`), and further tags. The download decision
+// for a digest is therefore taken over EVERY live alias (any refusal
+// refuses), and a tag move carries a hold on the rewritten row over to the
+// bytes it named instead of handing it to the new digest.
+
+/// The hold strength of the row aliased `$t`: rejected (3) over a permanent
+/// quarantine (2) over a timed one (1) over anything else (0).
+macro_rules! hold_rank_sql {
+    ($t:literal) => {
+        concat!(
+            "(CASE WHEN ",
+            $t,
+            ".quarantine_status = 'rejected' THEN 3 WHEN ",
+            $t,
+            ".quarantine_status = 'quarantined' AND ",
+            $t,
+            ".quarantine_until IS NULL THEN 2 WHEN ",
+            $t,
+            ".quarantine_status = 'quarantined' THEN 1 ELSE 0 END)"
+        )
+    };
+}
+
+/// The `WITH` clause `upsert_manifest_artifact` runs ahead of its upsert, so
+/// a tag move cannot leave the bytes the tag named behind a clean alias.
+///
+/// When the row at the upserted path is held (quarantined or rejected) and
+/// names other bytes than the upsert writes (the tag moved), the hold is
+/// carried to the old digest's digest-path row: created when missing (a tag
+/// push writes only the tag-path row), revived when soft-deleted, and
+/// otherwise raised to the carried hold when that is the stronger one (a
+/// weaker carried hold never downgrades the row). The upsert itself then
+/// clears the rewritten row's hold, which described the old bytes; the new
+/// bytes get their own upload hold after commit, and any hold another alias
+/// of theirs carries still refuses them through [`alias_rows`].
+///
+/// One statement with the upsert, so the carry commits or rolls back with it.
+/// The upsert must read `carried` before it writes (`WHERE (SELECT COUNT(*)
+/// FROM carried) >= 0`): that runs the carry first, so `moved` locks the row
+/// (`FOR UPDATE`, which also makes a hold committed concurrently part of what
+/// is carried) before the upsert rewrites it. Left to run after the upsert,
+/// `moved` would skip the row the same statement had already modified.
+/// Binds, shared with the upsert: `$1` repository, `$2` the upserted path,
+/// `$6` the new sha256 hex, `$11` the image name.
+macro_rules! carry_moved_hold_cte {
+    () => {
+        concat!(
+            "WITH moved AS ( \
+                 SELECT a.size_bytes, a.checksum_sha256, a.content_type, a.storage_key, \
+                        a.uploaded_by, a.quarantine_status, a.quarantine_until, \
+                        a.quarantine_reason, a.quarantine_source, \
+                        substr(a.storage_key, length('oci-manifests/') + 1) AS digest \
+                 FROM artifacts a \
+                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false \
+                   AND a.checksum_sha256 <> $6 \
+                   AND a.quarantine_status IN ('quarantined', 'rejected') \
+                   AND a.storage_key LIKE 'oci-manifests/%' \
+                 FOR UPDATE \
+             ), carried AS ( \
+                 INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                                        checksum_sha256, content_type, storage_key, uploaded_by, \
+                                        quarantine_status, quarantine_until, quarantine_reason, \
+                                        quarantine_source) \
+                 SELECT $1, 'v2/' || $11::text || '/manifests/' || m.digest, \
+                        $11::text || ':' || m.digest, m.digest, m.size_bytes, m.checksum_sha256, \
+                        m.content_type, m.storage_key, m.uploaded_by, m.quarantine_status, \
+                        m.quarantine_until, m.quarantine_reason, m.quarantine_source \
+                 FROM moved m \
+                 WHERE 'v2/' || $11::text || '/manifests/' || m.digest <> $2 \
+                 ON CONFLICT (repository_id, path) DO UPDATE SET \
+                     quarantine_status = EXCLUDED.quarantine_status, \
+                     quarantine_until = EXCLUDED.quarantine_until, \
+                     quarantine_reason = EXCLUDED.quarantine_reason, \
+                     quarantine_source = EXCLUDED.quarantine_source, \
+                     is_deleted = false, \
+                     updated_at = NOW() \
+                 WHERE artifacts.is_deleted \
+                    OR ",
+            $crate::services::oci_manifests::hold_rank_sql!("EXCLUDED"),
+            " > ",
+            $crate::services::oci_manifests::hold_rank_sql!("artifacts"),
+            " OR (",
+            $crate::services::oci_manifests::hold_rank_sql!("artifacts"),
+            " = 1 AND ",
+            $crate::services::oci_manifests::hold_rank_sql!("EXCLUDED"),
+            " = 1 AND EXCLUDED.quarantine_until > artifacts.quarantine_until) \
+                 RETURNING artifacts.id \
+             ) "
+        )
+    };
+}
+pub(crate) use carry_moved_hold_cte;
+pub(crate) use hold_rank_sql;
+
+/// One live `artifacts` row naming a manifest digest: a tag-path or a
+/// digest-path alias of the same stored manifest (#5457).
+#[derive(Debug, Clone)]
+pub(crate) struct AliasRow {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub checksum: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub quarantine_status: Option<String>,
+    pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+type AliasRowTuple = (
+    Uuid,
+    Uuid,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// Every live manifest-shaped `artifacts` row of `repo_id` carrying one of
+/// `digests`, whatever path (tag or digest) it sits at. Rejected rows sort
+/// first, then held ones, so the refusal a gate reports is the strongest.
+/// The rows the native manifest gate and the MCP backing gate both evaluate
+/// (#5457): the decision follows the stored bytes, not one alias.
+pub(crate) async fn alias_rows(
+    db: impl sqlx::PgExecutor<'_>,
+    repo_id: Uuid,
+    digests: &[&str],
+) -> Result<Vec<AliasRow>, sqlx::Error> {
+    let hexes: Vec<&str> = digests
+        .iter()
+        .map(|d| d.split_once(':').map_or(*d, |(_, hex)| hex))
+        .collect();
+    let rows: Vec<AliasRowTuple> = sqlx::query_as(concat!(
+        "SELECT a.id, a.repository_id, a.checksum_sha256::text, a.created_at, \
+                a.quarantine_status, a.quarantine_until \
+         FROM artifacts a \
+         WHERE a.repository_id = $1 AND a.is_deleted = false \
+           AND a.checksum_sha256 = ANY($2) AND ",
+        crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+        " ORDER BY CASE a.quarantine_status WHEN 'rejected' THEN 0 \
+                   WHEN 'quarantined' THEN 1 ELSE 2 END, a.path"
+    ))
+    .bind(repo_id)
+    .bind(&hexes)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|t| AliasRow {
+            id: t.0,
+            repository_id: t.1,
+            checksum: t.2,
+            created_at: t.3,
+            quarantine_status: t.4,
+            quarantine_until: t.5,
+        })
+        .collect())
+}
+
 /// Whether a manifest delete that has just removed the digest's last tag also
 /// deletes the manifest itself (and so its `oci_manifests` row).
 ///

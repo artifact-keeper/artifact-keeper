@@ -862,6 +862,22 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
     enforce_scan_policy_gate(db, artifact_id, repository_id).await
 }
 
+/// [`enforce_download_gate`] over several rows that hold the same bytes (the
+/// aliases of one OCI manifest digest, #5457): every row must pass, and the
+/// first refusal is returned with the row it came from. No rows passes, as an
+/// absent artifact does.
+pub async fn enforce_download_gate_all(
+    db: &PgPool,
+    artifact_ids: &[Uuid],
+) -> std::result::Result<(), (Uuid, AppError)> {
+    for &artifact_id in artifact_ids {
+        enforce_download_gate(db, artifact_id)
+            .await
+            .map_err(|e| (artifact_id, e))?;
+    }
+    Ok(())
+}
+
 /// Turn the quarantine 409 of an active hold into the scan-policy 403 when
 /// the hold is a scan-policy hold (#4510). Any other refusal is returned
 /// unchanged. Runs only for a refused (held) artifact, so the common
