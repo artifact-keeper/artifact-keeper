@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5040]
+---
+- **The artifact list can be sorted by size or creation time on the server** (#5040). `GET /api/v1/repositories/{key}/artifacts` takes `sort_by` (`path`, the default, `size` or `created_at`) and `sort_order` (`asc` or `desc`) and orders the whole listing before paging, so the largest or newest artifacts of a repository are on the first page, not the largest of the page the browser happened to hold. Ties break on the row id, so the `next_cursor` walk has no gaps or repeats, and a cursor is only accepted with the order that produced it. Hosted and virtual repositories sort, a virtual sorts its members' rows together after the usual higher-priority-wins de-duplication. `group_by` listings and Remote repositories list by path only and answer 400 to any other order. Migrations 345 and 346 add two partial indexes on `artifacts`, `(repository_id, size_bytes, id)` and `(repository_id, created_at, id)`, so a sorted page does not read the whole repository. Both are built `CONCURRENTLY`, uploads keep going while they build.

@@ -35,7 +35,7 @@ use crate::formats::debian::{DebianConfigPatch, DebianRepositoryConfig, DEBIAN_C
 use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
-use crate::services::artifact_service::ArtifactService;
+use crate::services::artifact_service::{ArtifactService, ArtifactSort};
 use crate::services::audit_export::details as audit_details;
 use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
@@ -7630,6 +7630,14 @@ pub struct ListArtifactsQuery {
     /// the authoritative "is there a next page" signal either way, so walk
     /// pages until it is false rather than up to a lower-bound `total_pages`.
     pub count: Option<String>,
+    /// Order of the flat listing of hosted and virtual repositories (#5040):
+    /// `path` (the default), `size` or `created_at`, ties broken by row id,
+    /// applied before paging. A `next_cursor` is only valid for the order
+    /// that produced it. Any other order answers 400 with `group_by` and on
+    /// Remote repositories, which list by path only.
+    pub sort_by: Option<String>,
+    /// `asc` (the default) or `desc`.
+    pub sort_order: Option<String>,
 }
 
 /// `?version=` selector accepted by the artifact metadata/download routes on
@@ -8034,8 +8042,25 @@ pub async fn list_artifacts(
         count_param,
         ListingCount::flat_default(query.cursor.is_some()),
     );
+    let sort = ArtifactSort::parse(query.sort_by.as_deref(), query.sort_order.as_deref())
+        .ok_or_else(|| {
+            AppError::Validation(
+                "invalid sort: `sort_by` takes path, size or created_at and `sort_order` asc or desc"
+                    .to_string(),
+            )
+        })?;
+    let path_order_only = |listing: &str| {
+        if sort == ArtifactSort::DEFAULT {
+            Ok(())
+        } else {
+            Err(AppError::Validation(format!(
+                "{listing} is listed by path only, drop `sort_by` / `sort_order`"
+            )))
+        }
+    };
 
     if want_component_grouping {
+        path_order_only("group_by=maven_component")?;
         return list_artifacts_grouped_by_maven_component(
             &artifact_service,
             &state,
@@ -8063,6 +8088,7 @@ pub async fn list_artifacts(
     let want_docker_grouping = query.group_by.as_deref() == Some("docker_tag") && is_docker_format;
 
     if want_docker_grouping {
+        path_order_only("group_by=docker_tag")?;
         return list_artifacts_grouped_by_docker_tag(
             &state,
             &repo,
@@ -8090,6 +8116,7 @@ pub async fn list_artifacts(
     // and its proxy cache holds only upstream listing pages, which are not
     // artifacts of the repository. It takes the flat listing below (#5253).
     if repo.repo_type == RepositoryType::Remote && repo.format != RepositoryFormat::Mcp {
+        path_order_only("A Remote repository")?;
         return list_remote_cached_artifacts(
             &state,
             &repo,
@@ -8114,12 +8141,18 @@ pub async fn list_artifacts(
     // never pays a whole-catalog COUNT by default.
     let keyset = decode_cursor_param(query.cursor.as_deref())?;
     let after_path = keyset.as_ref().map(|(path, _)| path.as_str());
-    let offset = if after_path.is_some() { 0 } else { offset };
+    let after_sorted = match &keyset {
+        Some(cursor) if sort != ArtifactSort::DEFAULT => {
+            Some(sorted_cursor_position(sort, cursor)?)
+        }
+        _ => None,
+    };
+    let offset = if keyset.is_some() { 0 } else { offset };
     let fetch = i64::from(per_page) + 1;
     // Where the page landed decides whether it needs the COUNT (#5255).
     let page_at = |rows: usize| ListingPage {
         offset,
-        keyset: after_path.is_some(),
+        keyset: keyset.is_some(),
         returned: rows.min(per_page as usize),
         has_more: rows > per_page as usize,
     };
@@ -8166,6 +8199,9 @@ pub async fn list_artifacts(
     // is served, on every page.
     let mut mcp_gate = super::mcp::GenericArtifactGate::new(&state, auth.as_ref());
     let mcp_reader = repo.format == RepositoryFormat::Mcp && !mcp_gate.holds_all(&scope_ids).await;
+    if mcp_reader {
+        path_order_only("This MCP registry listing")?;
+    }
 
     let (artifacts, has_more, next_cursor, total, total_is_exact) = if mcp_reader {
         let rows = artifact_service
@@ -8187,63 +8223,49 @@ pub async fn list_artifacts(
             page.exact,
         )
     } else {
-        let (mut artifacts, exact_total) = if repo.repo_type == RepositoryType::Virtual {
-            let page_rows = artifact_service
-                .list_for_repos_page(
-                    &scope_ids,
-                    query.path_prefix.as_deref(),
-                    query.q.as_deref(),
-                    after_path,
-                    offset,
-                    fetch,
-                )
-                .await?;
-            let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
-                Some(
-                    artifact_service
-                        .count_for_repos(
-                            &scope_ids,
-                            query.path_prefix.as_deref(),
-                            query.q.as_deref(),
-                        )
-                        .await?,
-                )
-            } else {
-                None
-            };
-            (page_rows, exact)
+        let is_virtual = repo.repo_type == RepositoryType::Virtual;
+        let prefix = query.path_prefix.as_deref();
+        let q = query.q.as_deref();
+        let mut artifacts = if sort != ArtifactSort::DEFAULT {
+            let after = after_sorted
+                .as_ref()
+                .map(|(value, id)| (value.as_str(), *id));
+            artifact_service
+                .list_sorted_page(&scope_ids, prefix, q, sort, after, offset, fetch)
+                .await?
+        } else if is_virtual {
+            artifact_service
+                .list_for_repos_page(&scope_ids, prefix, q, after_path, offset, fetch)
+                .await?
         } else {
-            let page_rows = artifact_service
-                .list_page(
-                    repo.id,
-                    query.path_prefix.as_deref(),
-                    query.q.as_deref(),
-                    after_path,
-                    offset,
-                    fetch,
-                )
-                .await?;
-            let exact = if page_at(page_rows.len()).needs_count(flat_count_mode) {
-                Some(
-                    artifact_service
-                        .count(repo.id, query.path_prefix.as_deref(), query.q.as_deref())
-                        .await?,
-                )
-            } else {
-                None
-            };
-            (page_rows, exact)
+            artifact_service
+                .list_page(repo.id, prefix, q, after_path, offset, fetch)
+                .await?
+        };
+        let exact_total = if !page_at(artifacts.len()).needs_count(flat_count_mode) {
+            None
+        } else if is_virtual {
+            Some(
+                artifact_service
+                    .count_for_repos(&scope_ids, prefix, q)
+                    .await?,
+            )
+        } else {
+            Some(artifact_service.count(repo.id, prefix, q).await?)
         };
         let at = page_at(artifacts.len());
         let has_more = at.has_more;
         artifacts.truncate(per_page as usize);
-        let next_cursor = if has_more {
+        let next_cursor = match artifacts.last() {
+            Some(a) if has_more && sort != ArtifactSort::DEFAULT => Some(encode_keyset_cursor(
+                &format!("{}:{}", sort.tag(), sort.cursor_value(a)),
+                &a.id.to_string(),
+            )),
             // Single-key (`path`) cursor; the shared two-part codec is reused
             // with an empty second component so all listing cursors stay one
             // opaque format (see `list_remote_cached_from_catalog`).
-            artifacts.last().map(|a| encode_keyset_cursor(&a.path, ""))
-        } else {
-            None
+            Some(a) if has_more => Some(encode_keyset_cursor(&a.path, "")),
+            _ => None,
         };
         let (total, total_is_exact) = listing_total(exact_total, at);
         (artifacts, has_more, next_cursor, total, total_is_exact)
@@ -9964,6 +9986,27 @@ fn decode_keyset_cursor(cursor: &str) -> Option<(String, String)> {
 /// Decode the optional `?cursor=` query parameter, mapping a malformed value
 /// to a 400-class validation error instead of silently restarting the walk
 /// from the beginning.
+/// The `(sort value, id)` a sorted listing continues after, from a decoded
+/// cursor whose first part is `<sort tag>:<value>` and second the row id. A
+/// cursor from another order, or one whose value the order cannot bind, is a
+/// 400 (#5040).
+fn sorted_cursor_position(sort: ArtifactSort, cursor: &(String, String)) -> Result<(String, Uuid)> {
+    let position = cursor
+        .0
+        .strip_prefix(sort.tag())
+        .and_then(|rest| rest.strip_prefix(':'))
+        .filter(|value| sort.accepts_cursor_value(value))
+        .zip(Uuid::parse_str(&cursor.1).ok());
+    match position {
+        Some((value, id)) => Ok((value.to_string(), id)),
+        None => Err(AppError::Validation(
+            "invalid `cursor` parameter for this `sort_by` / `sort_order`: pass the `next_cursor` \
+             of a previous response with the same order"
+                .to_string(),
+        )),
+    }
+}
+
 fn decode_cursor_param(cursor: Option<&str>) -> Result<Option<(String, String)>> {
     match cursor {
         None => Ok(None),
@@ -44221,5 +44264,207 @@ mod replication_peer_identity_5455_tests {
         assert_eq!(audit.details["server"], "com.peer/echo");
         assert_eq!(audit.details["version"], "1.0.0");
         assert_eq!(audit.details["replicated"], true);
+    }
+}
+
+/// #5040: the artifact list sorts the whole listing on the server before
+/// paging. Sorting used to happen in the browser over the current page only,
+/// so "largest first" showed the largest of 20 rows, not of the repository.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod artifact_sort_5040_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    async fn seed(pool: &PgPool, repo: Uuid, path: &str, size: i64, hours_ago: i32) {
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, size_bytes, checksum_sha256, \
+             content_type, storage_key, created_at) \
+             VALUES ($1, $2, $2, $3, repeat('0', 64), 'application/octet-stream', $4, \
+             NOW() - make_interval(hours => $5))",
+        )
+        .bind(repo)
+        .bind(path)
+        .bind(size)
+        .bind(format!("k/{}", Uuid::new_v4()))
+        .bind(hours_ago)
+        .execute(pool)
+        .await
+        .expect("seed artifact");
+    }
+
+    async fn list(fx: &tdh::Fixture, key: &str, query: &str) -> (StatusCode, serde_json::Value) {
+        let app = tdh::router_with_auth(
+            super::router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let (status, body) = tdh::send(app, tdh::get(format!("/{key}/artifacts?{query}"))).await;
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// Every path of a cursor walk, two rows a page.
+    async fn walk(fx: &tdh::Fixture, key: &str, sort: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let after = cursor.map(|c| format!("&cursor={c}")).unwrap_or_default();
+            let (status, page) = list(fx, key, &format!("per_page=2&{sort}{after}")).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            for item in page["items"].as_array().expect("items") {
+                paths.push(item["path"].as_str().unwrap().to_string());
+            }
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                return paths;
+            }
+        }
+        panic!("the walk never ended: {paths:?}");
+    }
+
+    /// The rows in `(key, id)` order, the order the listing must produce.
+    async fn expected(pool: &PgPool, repo: Uuid, by_size: bool, descending: bool) -> Vec<String> {
+        let mut rows: Vec<(String, i64, chrono::DateTime<chrono::Utc>, Uuid)> = sqlx::query_as(
+            "SELECT path, size_bytes, created_at, id FROM artifacts WHERE repository_id = $1",
+        )
+        .bind(repo)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        rows.sort_by(|a, b| {
+            let key = if by_size {
+                a.1.cmp(&b.1)
+            } else {
+                a.2.cmp(&b.2)
+            };
+            key.then(a.3.cmp(&b.3))
+        });
+        if descending {
+            rows.reverse();
+        }
+        rows.into_iter().map(|r| r.0).collect()
+    }
+
+    #[tokio::test]
+    async fn flat_listing_sorts_before_paging_5040() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // path order is the reverse of size order, two sizes tie
+        for (path, size, hours_ago) in [
+            ("a.bin", 50, 3),
+            ("b.bin", 40, 1),
+            ("c.bin", 30, 5),
+            ("d.bin", 30, 2),
+            ("e.bin", 10, 4),
+        ] {
+            seed(&fx.pool, fx.repo_id, path, size, hours_ago).await;
+        }
+        let key = fx.repo_key.clone();
+
+        let (_, first) = list(&fx, &key, "per_page=2&sort_by=size&sort_order=asc").await;
+        let first: Vec<&str> = first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            first[0], "e.bin",
+            "smallest of the repository, not of the page"
+        );
+
+        for (sort, by_size, descending) in [
+            ("sort_by=size&sort_order=desc", true, true),
+            ("sort_by=size", true, false),
+            ("sort_by=created_at&sort_order=desc", false, true),
+            ("sort_by=created_at", false, false),
+        ] {
+            assert_eq!(
+                walk(&fx, &key, sort).await,
+                expected(&fx.pool, fx.repo_id, by_size, descending).await,
+                "{sort}"
+            );
+        }
+        let mut by_path_desc = walk(&fx, &key, "sort_by=path&sort_order=desc").await;
+        by_path_desc.reverse();
+        assert_eq!(by_path_desc, walk(&fx, &key, "sort_by=path").await);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn virtual_listing_sorts_its_members_together_5040() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (first, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        let (second, _, _) = tdh::create_repo(&fx.pool, "local", "generic").await;
+        for (member, priority) in [(first, 1), (second, 2)] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(fx.repo_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        }
+        // path order is the reverse of the expected size order
+        seed(&fx.pool, first, "a-small.bin", 1, 1).await;
+        seed(&fx.pool, first, "b-shadowed.bin", 2, 1).await;
+        seed(&fx.pool, second, "b-shadowed.bin", 900, 1).await;
+        seed(&fx.pool, second, "c-big.bin", 100, 1).await;
+
+        assert_eq!(
+            walk(&fx, &fx.repo_key.clone(), "sort_by=size&sort_order=desc").await,
+            ["c-big.bin", "b-shadowed.bin", "a-small.bin"],
+            "the higher-priority member's copy of a path is the one sorted"
+        );
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn listings_that_cannot_sort_say_so_5040() {
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let (_, remote_key, _) = tdh::create_repo(&fx.pool, "remote", "generic").await;
+        seed(&fx.pool, fx.repo_id, "a.bin", 1, 1).await;
+        seed(&fx.pool, fx.repo_id, "b.bin", 2, 1).await;
+        seed(&fx.pool, fx.repo_id, "c.bin", 3, 1).await;
+        let key = fx.repo_key.clone();
+        let (_, by_path) = list(&fx, &key, "per_page=1").await;
+        let path_cursor = by_path["next_cursor"]
+            .as_str()
+            .expect("path cursor")
+            .to_string();
+        let (_, by_size) = list(&fx, &key, "per_page=1&sort_by=size").await;
+        let size_cursor = by_size["next_cursor"]
+            .as_str()
+            .expect("size cursor")
+            .to_string();
+
+        for (repo, query) in [
+            (key.as_str(), "sort_by=name".to_string()),
+            (key.as_str(), "sort_by=size&sort_order=up".to_string()),
+            (
+                key.as_str(),
+                "sort_by=size&group_by=maven_component".to_string(),
+            ),
+            (remote_key.as_str(), "sort_by=created_at".to_string()),
+            (key.as_str(), format!("sort_by=size&cursor={path_cursor}")),
+            (
+                key.as_str(),
+                format!("sort_by=size&sort_order=desc&cursor={size_cursor}"),
+            ),
+        ] {
+            let (status, body) = list(&fx, repo, &query).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        }
+        fx.teardown().await;
     }
 }

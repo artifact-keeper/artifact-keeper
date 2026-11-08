@@ -77,6 +77,8 @@ async fn list(
         group_by: None,
         cursor,
         count: count.map(str::to_string),
+        sort_by: None,
+        sort_order: None,
     };
     list_artifacts(
         State(state.clone()),
