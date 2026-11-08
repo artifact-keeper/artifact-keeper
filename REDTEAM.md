@@ -139,6 +139,50 @@ and never as a finding.
 | curl + jq | - | HTTP testing, JSON parsing |
 | openssl | - | TLS certificate inspection |
 
+## HTML application UI (RT-15)
+
+The suite above and `docker-compose.test.yml` start the backend only. A
+red-team rig built from them reaches the JSON API and the opt-in Swagger UI,
+and **no HTML application**. The repository, catalog, capability, curation
+and audit views are a separate component with its own releases (#2708):
+
+| | |
+| --- | --- |
+| Source | [`artifact-keeper/artifact-keeper-web`](https://github.com/artifact-keeper/artifact-keeper-web) |
+| Image | `ghcr.io/artifact-keeper/artifact-keeper-web` (`artifactkeeper/web` on Docker Hub) |
+| Deployment | the `web` service of [`docker-compose.yml`](docker-compose.yml), pinned by `ARTIFACT_KEEPER_WEB_VERSION` (#4481), behind Caddy |
+| Stored-content rendering tests | `e2e/suites/interactions/security/rt15-mcp-stored-content.spec.ts` in that repository |
+
+A raw-JSON or Swagger check therefore cannot show that stored content stays
+inert in the UI (#5472). The rendering case belongs to the web repository's
+Playwright suite. That suite stores hostile MCP content through a live
+backend: publish, CI capability reports, status changes, a Remote synced from
+a hostile upstream registry, approval requests and reasons. It then opens
+every view that renders the content in Chromium, as an administrator and as
+an unprivileged reader, with and without the web server's
+Content-Security-Policy. It fails on script execution, active nodes,
+active-scheme URLs or requests to an attacker origin. It runs in the web
+repository's `E2E Interactions` CI job against the backend `dev` image; to
+run it by hand, see that repository's `docker-compose.e2e-mcp-upstream.yml`.
+
+When a release assessment covers the UI, record the web revision and image
+digest next to the backend's, and deploy that exact image rather than a tag:
+
+```bash
+skopeo inspect --format '{{.Digest}} {{index .Labels "org.opencontainers.image.revision"}}' \
+  docker://ghcr.io/artifact-keeper/artifact-keeper-web:<version>
+# then ARTIFACT_KEEPER_WEB_VERSION=<version>@sha256:<digest> docker compose up -d web
+```
+
+Web `1.11.2` (`sha256:c17f1bff9a8bc1646efded313c107a003c383f7c03b213b389cdf789302267a5`,
+revision `6a43afc`) predates the MCP UI: it serves no MCP views and does not
+proxy `/mcp/`. The first web release with MCP views is the one cut from
+`artifact-keeper-web` `main` after `b65f961`. RT-15 was closed against that
+revision (`artifact-keeper-web:dev`,
+`sha256:e05124d427420f81fbc2656bbad1cd50a5e3333a5cfae27859a61c6f1812e5ff`)
+with backend `dev` revision `ad20810`
+(`sha256:a55b5d560c18e66efdac3107e13d4239cbae59c15fcbad4eccd88365ace27c5f`).
+
 ## When to Run
 
 - Before any release
