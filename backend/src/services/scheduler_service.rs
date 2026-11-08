@@ -1984,32 +1984,58 @@ pub(crate) fn normalize_cron_expression(cron_expr: &str) -> String {
 /// `cron` crate still rejects it with its own error.
 fn standard_cron_weekdays(field: &str) -> String {
     const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
-    // `as_upper` maps a SUN upper bound to 7, so `MON-SUN` means Monday to Sunday.
-    let bound = |t: &str, as_upper: bool| -> Option<usize> {
+    // Every day-name spelling the `cron` crate accepts, so a field that mixes
+    // names and numbers is translated whole instead of passing through with
+    // the crate's numbering for the numbers.
+    const ALIASES: [(&str, usize); 16] = [
+        ("sun", 0),
+        ("sunday", 0),
+        ("mon", 1),
+        ("monday", 1),
+        ("tue", 2),
+        ("tues", 2),
+        ("tuesday", 2),
+        ("wed", 3),
+        ("wednesday", 3),
+        ("thu", 4),
+        ("thurs", 4),
+        ("thursday", 4),
+        ("fri", 5),
+        ("friday", 5),
+        ("sat", 6),
+        ("saturday", 6),
+    ];
+    let bound = |t: &str| -> Option<usize> {
         if let Ok(n) = t.parse::<usize>() {
             return (n <= 7).then_some(n);
         }
-        let day = NAMES.iter().position(|d| d.eq_ignore_ascii_case(t))?;
-        Some(if as_upper && day == 0 { 7 } else { day })
+        ALIASES
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(t))
+            .map(|(_, day)| *day)
     };
     let mut days = [false; 7];
     for item in field.split(',') {
-        let (range, step) = match item.split_once('/') {
+        let (range, step, stepped) = match item.split_once('/') {
             Some((range, step)) => match step.parse::<usize>() {
-                Ok(step) if step > 0 => (range, step),
+                Ok(step) if step > 0 => (range, step, true),
                 _ => return field.to_string(),
             },
-            None => (item, 1),
+            None => (item, 1, false),
         };
         let (lo, hi) = match range {
             "*" | "?" => (0, 6),
             _ => match range.split_once('-') {
-                Some((a, b)) => match (bound(a, false), bound(b, true)) {
+                Some((a, b_str)) => match (bound(a), bound(b_str)) {
+                    // A Sunday name as the upper bound means 7, so `MON-SUN`
+                    // runs Monday to Sunday while `SUN-SUN` stays Sunday.
+                    (Some(a), Some(0)) if a > 0 && b_str.parse::<usize>().is_err() => (a, 7),
                     (Some(a), Some(b)) if a <= b => (a, b),
                     _ => return field.to_string(),
                 },
-                None => match bound(range, false) {
-                    Some(a) if step > 1 => (a, 6),
+                // `N/step` runs from N to the field maximum, 7 (Sunday).
+                None => match bound(range) {
+                    Some(a) if stepped => (a, 7),
                     Some(a) => (a, a),
                     None => return field.to_string(),
                 },
@@ -3933,7 +3959,16 @@ mod tests {
             ("0 0 * * 1-5/2", "0 0 0 * * MON,WED,FRI"),
             ("0 0 * * MON-SUN", "0 0 0 * * *"),
             ("0 0 * * fri", "0 0 0 * * FRI"),
+            ("0 0 * * 0-6", "0 0 0 * * *"),
+            ("0 0 * * 1/2", "0 0 0 * * SUN,MON,WED,FRI"),
+            ("0 0 * * 3/1", "0 0 0 * * SUN,WED,THU,FRI,SAT"),
+            ("0 0 * * 7/2", "0 0 0 * * SUN"),
+            ("0 0 * * SUN-SUN", "0 0 0 * * SUN"),
+            ("0 0 * * 1,Monday", "0 0 0 * * MON"),
+            ("0 0 * * Tues-THURSDAY", "0 0 0 * * TUE,WED,THU"),
             ("0 0 * * 8", "0 0 0 * * 8"),
+            ("0 0 * * */0", "0 0 0 * * */0"),
+            ("0 0 * * 1,5L", "0 0 0 * * 1,5L"),
         ] {
             assert_eq!(normalize_cron_expression(input), want, "{input}");
         }
@@ -3950,6 +3985,12 @@ mod tests {
             assert_eq!(next.weekday(), chrono::Weekday::Mon);
         }
         assert!(parse_cron_schedule(&normalize_cron_expression("0 3 * * 0")).is_some());
+        // `7/2` is Sunday only; it must not become an empty, unparseable field.
+        let sunday = parse_cron_schedule(&normalize_cron_expression("0 3 * * 7/2"))
+            .expect("7/2 is a valid weekday schedule");
+        for next in sunday.upcoming(chrono::Utc).take(3) {
+            assert_eq!(next.weekday(), chrono::Weekday::Sun);
+        }
     }
 
     #[test]
