@@ -4244,6 +4244,11 @@ impl UpstreamClient {
     /// deliberately skipped there. See
     /// [`egress_proxy::ensure_proxied_destination_allowed`] for the residual
     /// DNS-rebinding gap this cannot close.
+    ///
+    /// A repository on `Inherit` under an environment proxy needs no check
+    /// here: the shared client checks every destination it proxies itself,
+    /// in every case spelling of the proxy variables (#5459, see
+    /// `http_client::guarded_env_proxy`).
     async fn client_for(&self, repo_id: Uuid, target_url: &str) -> Result<Client> {
         self.ensure_initial_destination_allowed(target_url)?;
         let entry = match self.cached_egress_client(repo_id).await {

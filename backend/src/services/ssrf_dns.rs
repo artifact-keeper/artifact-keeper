@@ -265,9 +265,38 @@ fn filter_allowed(
         .collect()
 }
 
+/// Host of the proxy URL a guarded client hands `reqwest` in place of the
+/// environment proxy when it refuses the destination (#5459): see
+/// `http_client::guarded_env_proxy`. `.invalid` (RFC 2606) never resolves,
+/// and the resolver refuses this name before any lookup, so the request
+/// fails with the ordinary connect-time SSRF refusal and nothing is sent to
+/// the proxy or the destination.
+pub(crate) const REFUSED_DESTINATION_PROXY_HOST: &str = "ssrf-refused.artifact-keeper.invalid";
+
+/// The connect-time refusal error, worded so
+/// [`crate::services::ssrf_refusal::is_ssrf_refusal_error`] recognizes it.
+fn connect_refusal() -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "all resolved addresses {}",
+            crate::services::ssrf_refusal::CONNECT_REFUSAL_PHRASE
+        ),
+    ))
+}
+
 impl Resolve for SsrfGuardResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let mode = self.mode;
+        if name
+            .as_str()
+            .eq_ignore_ascii_case(REFUSED_DESTINATION_PROXY_HOST)
+        {
+            // A proxied destination the client refused (#5459). Counted here,
+            // once per connection attempt; the client logged the destination.
+            crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
+            return Box::pin(async { Err(connect_refusal()) });
+        }
         // Exempt the configured egress-proxy host (issue #2570): matched by
         // EXACT full-host equality BEFORE the mode-specific filter. Computed
         // here (sync, outside the future) so no reference into `self` is held.
@@ -298,14 +327,7 @@ impl Resolve for SsrfGuardResolver {
                     "SSRF DNS guard blocked all resolved addresses for host"
                 );
                 crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
-                let err: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "all resolved addresses {}",
-                        crate::services::ssrf_refusal::CONNECT_REFUSAL_PHRASE
-                    ),
-                ));
-                return Err(err);
+                return Err(connect_refusal());
             }
             let addrs: Addrs = Box::new(allowed.into_iter());
             Ok(addrs)
@@ -417,6 +439,47 @@ mod tests {
             refuse(ssrf_guard_resolver_internal()).await;
         });
         for surface in ["upstream", "webhook", "sso", "internal"] {
+            assert_eq!(
+                counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
+                1,
+                "{surface}"
+            );
+        }
+    }
+
+    /// #5459: the refused-destination proxy host is refused by every
+    /// resolver mode before any lookup, with the standard connect-time
+    /// refusal wording and an SSRF-block count, even when the exempt set
+    /// names it.
+    #[test]
+    fn refused_destination_proxy_host_is_refused_without_lookup_5459() {
+        use crate::services::metrics_service::capture_counters_async;
+        let ((), counted) = capture_counters_async(|| async {
+            for mode in [
+                ResolverMode::Upstream,
+                ResolverMode::TrustedInternal,
+                ResolverMode::Webhook,
+                ResolverMode::SsoDiscovery,
+            ] {
+                let resolver = SsrfGuardResolver {
+                    mode,
+                    exempt_proxy_hosts: exempt_set(&[REFUSED_DESTINATION_PROXY_HOST]),
+                };
+                let name: Name = REFUSED_DESTINATION_PROXY_HOST
+                    .to_ascii_uppercase()
+                    .parse()
+                    .expect("valid dns name");
+                let err = match resolver.resolve(name).await {
+                    Ok(_) => panic!("{mode:?} resolved the refused-destination host"),
+                    Err(e) => e,
+                };
+                assert!(
+                    crate::services::ssrf_refusal::is_ssrf_refusal_error(err.as_ref()),
+                    "{mode:?}: {err}"
+                );
+            }
+        });
+        for surface in ["upstream", "internal", "webhook", "sso"] {
             assert_eq!(
                 counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
                 1,

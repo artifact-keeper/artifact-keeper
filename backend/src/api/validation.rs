@@ -14,7 +14,12 @@
 //!    [`is_blocked_url`] on every redirect hop. This closes the
 //!    redirect-follow bypass — without it, an upstream returning
 //!    `302 Location: http://[::ffff:127.0.0.1]/` would defeat layer 1.
-//! 3. Egress NetworkPolicy at the cluster layer is a defense-in-depth
+//! 3. Under an environment proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+//!    either case) the guarded clients resolve and check every destination
+//!    they would hand to the proxy with the same per-trust-class check the
+//!    redirect policy uses, since the connect-time resolver never sees a
+//!    proxied destination (#5459; `http_client::guarded_env_proxy`).
+//! 4. Egress NetworkPolicy at the cluster layer is a defense-in-depth
 //!    follow-up tracked separately.
 //!
 //! # Residual gaps
@@ -23,6 +28,11 @@
 //! time and a private IP at fetch time is not caught by string-based
 //! validation. Mitigation requires a custom DNS resolver or pinning the
 //! resolved IP via `reqwest`'s `resolve_to_addrs`. Tracked as a follow-up.
+//!
+//! Proxied destinations: a proxy resolves the destination name itself, so
+//! the check in layer 3 cannot bind the proxy to the address it saw. An
+//! answer that changes between that check and the proxy's own lookup is
+//! for the proxy's destination policy to refuse.
 
 use crate::error::{AppError, Result};
 

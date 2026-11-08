@@ -343,8 +343,13 @@ loopback and link-local addresses stay blocked either way.
 
 ### Egress proxy
 
-By default (`inherit`) a Remote uses the process `HTTP_PROXY`, `HTTPS_PROXY`
-and `NO_PROXY`. Per repository you can set `direct` (never proxy) or
+By default (`inherit`) a Remote uses the process `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY` and `NO_PROXY` (either case; upper case wins). A destination that
+would go through that proxy is first resolved by the backend and refused when
+the outbound address policy refuses any of its addresses, exactly as a direct
+request would be; redirect hops are checked the same way. The proxy resolves
+the name again itself, so give it a destination policy that refuses loopback,
+link-local and internal ranges as well. Per repository you can set `direct` (never proxy) or
 `explicit` with its own `proxy_url` and `no_proxy`; an explicit setting
 replaces the environment, it does not merge with it. The proxy URL may carry
 credentials; it is encrypted at rest and redacted in responses and logs. Read

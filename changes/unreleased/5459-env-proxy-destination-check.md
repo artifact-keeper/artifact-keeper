@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5459, #5109]
+---
+- **A destination sent through an environment proxy is now checked against the outbound address policy, whatever the case of the proxy variable** (#5459, #5109). Under `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` (upper or lower case) the backend handed a Remote's host name to the proxy without checking where it resolved, because a proxied request never reaches the connect-time resolver guard; with private upstreams disabled, a repository administrator could have a sync accept loopback content fetched through the proxy. The SSRF-guarded clients (Remote fetches, webhooks, SSO discovery, internal services) now read the proxy variables with the same rules `reqwest` uses, resolve each destination they would proxy and refuse it, before anything is sent to the proxy, when the direct path would refuse it. Redirect hops get the same check, and `NO_PROXY` destinations connect directly and stay checked at connect time. The proxy still resolves the name itself, so a DNS answer that changes between the two lookups is for the proxy's own destination policy to refuse; `.env.example` and the air-gapped guide now say so.

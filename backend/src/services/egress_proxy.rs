@@ -74,7 +74,7 @@ const MAX_NO_PROXY_LEN: usize = 4096;
 ///
 /// | mode | behaviour |
 /// |------|-----------|
-/// | [`Inherit`](EgressProxyMode::Inherit) | Use the process-wide `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment, i.e. whatever the deployment already does. The default, and the state of every repository that predates this feature. |
+/// | [`Inherit`](EgressProxyMode::Inherit) | Use the process-wide `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` environment (either case), i.e. whatever the deployment already does. A destination it would proxy is resolved and checked against the outbound address policy first (#5459). The default, and the state of every repository that predates this feature. |
 /// | [`Direct`](EgressProxyMode::Direct) | Bypass the environment proxy entirely and connect straight out. Answers the other half of #2811 ("certain repos require a proxy, others do not") for a deployment whose *global* posture is proxied. |
 /// | [`Explicit`](EgressProxyMode::Explicit) | Use this repository's own proxy URL and `no_proxy` list. The environment proxy variables are **ignored**, not merged. |
 ///
