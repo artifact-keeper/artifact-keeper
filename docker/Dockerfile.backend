@@ -61,7 +61,17 @@ ENV SQLX_OFFLINE=true
 # args. Declared per stage because an ARG does not cross a FROM.
 ARG CARGO_BUILD_JOBS=8
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-ARG CARGO_FEATURES=""
+# The shipped allocator (#5130). This image is UBI 9/glibc, and glibc's malloc
+# keeps freed memory in per-thread arenas: a proxy mirror serving bursts of
+# concurrent Maven downloads grew RSS to the 4 GiB limit and was OOM-killed,
+# and the memory stayed resident while the container was idle. jemalloc returns
+# freed pages after its decay interval instead of holding every arena warm.
+# The builder stage below declares the same default: an ARG does not cross a
+# FROM, and the cook and the build must agree or the cooked dependencies are
+# not reused. Source builds get the same allocator with
+# `cargo build --features jemalloc`; see
+# docs/operations/backend-memory-allocator.md.
+ARG CARGO_FEATURES="jemalloc"
 # Cargo profile for the two compiling stages and the binary path the runtime
 # stage copies (`target/<profile>/`). `release` is what ships and is the
 # default for every build that does not say otherwise: docker-publish.yml,
@@ -72,7 +82,14 @@ ARG CARGO_FEATURES=""
 # Must name a profile whose output directory is its own name (`release` or a
 # custom one), not `dev`/`test`, which write to `target/debug/`.
 ARG CARGO_PROFILE=release
-RUN if [ -n "$CARGO_FEATURES" ]; then \
+# jemalloc fixes its page size when it is compiled, from the build host, and
+# refuses to start on a kernel with larger pages ("<jemalloc>: Unsupported
+# system page size"). The arm64 image is built on 4 KiB-page runners but must
+# also run on 64 KiB-page arm64 kernels (RHEL's kernel-64k, NVIDIA Grace), so
+# aarch64 builds jemalloc for 64 KiB pages, which also works on 4 KiB kernels.
+# The builder stage sets the same value; a mismatch rebuilds jemalloc there.
+RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
+    if [ -n "$CARGO_FEATURES" ]; then \
       cargo chef cook --profile "$CARGO_PROFILE" --features "$CARGO_FEATURES" --recipe-path recipe.json; \
     else \
       cargo chef cook --profile "$CARGO_PROFILE" --recipe-path recipe.json; \
@@ -87,7 +104,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY .sqlx ./.sqlx
 COPY backend ./backend
 ARG GIT_SHA=unknown
-ARG CARGO_FEATURES=""
+# Same allocator as the deps stage above (#5130); the two must match.
+ARG CARGO_FEATURES="jemalloc"
 ARG APP_VERSION=""
 # Same cap as the deps stage above.
 ARG CARGO_BUILD_JOBS=8
@@ -97,7 +115,9 @@ ARG CARGO_PROFILE=release
 ENV SQLX_OFFLINE=true
 ENV GIT_SHA=${GIT_SHA}
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-RUN if [ -n "${APP_VERSION}" ]; then \
+# Same jemalloc page size as the deps stage above.
+RUN if [ "$(uname -m)" = aarch64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi && \
+    if [ -n "${APP_VERSION}" ]; then \
       CLEAN_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//'); \
       sed -i "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml; \
     fi && \

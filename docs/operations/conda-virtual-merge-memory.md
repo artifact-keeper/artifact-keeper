@@ -135,7 +135,8 @@ Size the container from three parts:
 
 Then leave headroom for the allocator: freed merge memory is not always returned
 to the operating system at once, so the resident set after a burst sits above
-the steady baseline.
+the steady baseline. How glibc arenas and jemalloc's decay affect that is in
+[backend RSS and the memory allocator](backend-memory-allocator.md).
 
 ### How this adds up with the upload budget
 
