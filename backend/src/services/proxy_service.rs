@@ -4138,7 +4138,28 @@ impl UpstreamClient {
         Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send + '_>,
     > {
         let audit = UpstreamAuditTarget::for_mode(&self.db, self.audit_mode, repo_id, caller);
-        Box::pin(send_upstream_audited(request, audit))
+        Box::pin(async move {
+            let env_proxy_recheck = self.uses_env_proxy(repo_id).await;
+            send_upstream_audited(request, audit, env_proxy_recheck).await
+        })
+    }
+
+    /// Whether `repo_id`'s requests go out through the shared client, which
+    /// follows the environment proxy (`inherit`, or no repository), rather
+    /// than a per-repository `direct`/`explicit` client (#5459). Read from
+    /// the egress-client cache [`Self::client_for`] fills, falling back to
+    /// the stored configuration; an unreadable one counts as `inherit`, the
+    /// stricter reading.
+    async fn uses_env_proxy(&self, repo_id: Option<Uuid>) -> bool {
+        let Some(repo_id) = repo_id else {
+            return true;
+        };
+        match self.cached_egress_client(repo_id).await {
+            Some(entry) => entry.is_none(),
+            None => crate::services::egress_proxy::load_egress_proxy(&self.db, repo_id)
+                .await
+                .map_or(true, |config| !config.overrides_default_routing()),
+        }
     }
 
     /// Apply the upstream outbound address policy to a destination named by
@@ -4244,6 +4265,11 @@ impl UpstreamClient {
     /// deliberately skipped there. See
     /// [`egress_proxy::ensure_proxied_destination_allowed`] for the residual
     /// DNS-rebinding gap this cannot close.
+    ///
+    /// A repository on `Inherit` under an environment proxy needs no check
+    /// here: the shared client checks every destination it proxies itself,
+    /// in every case spelling of the proxy variables (#5459, see
+    /// `http_client::guarded_env_proxy`).
     async fn client_for(&self, repo_id: Uuid, target_url: &str) -> Result<Client> {
         self.ensure_initial_destination_allowed(target_url)?;
         let entry = match self.cached_egress_client(repo_id).await {

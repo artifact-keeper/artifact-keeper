@@ -357,8 +357,19 @@ loopback and link-local addresses stay blocked either way.
 
 ### Egress proxy
 
-By default (`inherit`) a Remote uses the process `HTTP_PROXY`, `HTTPS_PROXY`
-and `NO_PROXY`. Per repository you can set `direct` (never proxy) or
+By default (`inherit`) a Remote uses the process `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY` and `NO_PROXY` (either case; upper case wins). A destination that
+would go through that proxy is first resolved by the backend and refused when
+it does not resolve or the outbound address policy refuses any of its
+addresses, exactly as a direct request would be. This applies to each new
+connection, each redirect hop and each plain-HTTP Remote request. The backend
+therefore needs its own DNS for proxied hosts. The proxy resolves the name
+again itself, so a DNS answer that changes between the two lookups is only
+caught by the proxy: give it a destination policy that refuses loopback,
+link-local, metadata and internal ranges as well. Set
+`AK_UPSTREAM_ENV_PROXY=ignore` to keep Remote and other upstream fetches off
+the environment proxy entirely (webhook, SSO and internal-service requests
+still use it). Per repository you can set `direct` (never proxy) or
 `explicit` with its own `proxy_url` and `no_proxy`; an explicit setting
 replaces the environment, it does not merge with it. The proxy URL may carry
 credentials; it is encrypted at rest and redacted in responses and logs. Read
