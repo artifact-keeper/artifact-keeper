@@ -109,6 +109,27 @@ pub fn max_ingest_archive_entries() -> u64 {
     )
 }
 
+/// Reject `archive` when its central directory holds more entries than
+/// [`max_ingest_archive_entries`]. Shared by this module's ZIP readers and by
+/// readers such as MCPB's manifest lookup that do not go through
+/// [`read_metadata_from_zip`].
+pub fn check_zip_entry_count<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
+    check_zip_entry_count_limited(archive.len() as u64, max_ingest_archive_entries())
+}
+
+/// `_limited` seam for [`check_zip_entry_count`] with an explicit ceiling
+/// ([`read_metadata_from_zip_limited`] callers such as proxy identity probing
+/// raise it for their name walk).
+fn check_zip_entry_count_limited(entry_count: u64, max_entries: u64) -> Result<()> {
+    if entry_count > max_entries {
+        return Err(AppError::Validation(format!(
+            "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
+            max_entries
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency cap (#2561)
 // ---------------------------------------------------------------------------
@@ -970,12 +991,7 @@ pub fn read_metadata_from_zip_limited<R: Read + Seek>(
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| AppError::Validation(format!("Invalid ZIP archive: {}", e)))?;
 
-    if archive.len() as u64 > max_entries {
-        return Err(AppError::Validation(format!(
-            "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
-            max_entries
-        )));
-    }
+    check_zip_entry_count_limited(archive.len() as u64, max_entries)?;
 
     for i in 0..archive.len() {
         // Match on the central-directory name BEFORE opening the entry, so an
@@ -1027,13 +1043,7 @@ pub fn is_unsafe_archive_entry_name(name: &str) -> bool {
 /// so a client that later unzips the stored bytes naively is not handed a
 /// path-traversal entry (#4673).
 pub fn reject_unsafe_zip_entry_names<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Result<()> {
-    let max_entries = max_ingest_archive_entries();
-    if archive.len() as u64 > max_entries {
-        return Err(AppError::Validation(format!(
-            "ZIP archive contains too many entries (> {}); refusing suspected decompression bomb",
-            max_entries
-        )));
-    }
+    check_zip_entry_count(archive)?;
     for i in 0..archive.len() {
         if let Some(name) = archive.name_for_index(i) {
             // zip 9 decodes the name as UTF-8 or CP437 and refuses anything

@@ -258,6 +258,10 @@ fn read_manifest_from(
 ) -> Result<serde_json::Value, BundleError> {
     let mut zip =
         zip::ZipArchive::new(archive).map_err(|e| bad(format!("not a ZIP archive: {e}")))?;
+    crate::util::bounded_archive::check_zip_entry_count(&zip).map_err(|error| match error {
+        crate::error::AppError::Validation(message) => bad(message),
+        other => bad(other.to_string()),
+    })?;
     let mut entry = zip
         .by_name("manifest.json")
         .map_err(|_| bad("the bundle has no manifest.json at its root"))?;
@@ -1173,6 +1177,51 @@ mod tests {
             verify_signature(&split_signature(&garbage)).state,
             SignatureState::Invalid
         );
+    }
+
+    /// A ZIP holding `entries` entries, the last of which is a valid
+    /// root `manifest.json`, built to exercise the entry-count boundary.
+    fn zip_with_entries(entries: usize) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..entries.saturating_sub(1) {
+                z.start_file(format!("filler/{i}"), options).unwrap();
+            }
+            z.start_file("manifest.json", options).unwrap();
+            std::io::Write::write_all(&mut z, br#"{"name":"x","version":"1"}"#).unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// #5467: opening a bundle applies the shared ingest entry ceiling before
+    /// the manifest lookup, on both the in-memory and staged-file paths.
+    /// Exactly the cap is accepted; one more is refused and a valid bundle
+    /// still inspects afterwards.
+    #[test]
+    fn manifest_lookup_enforces_shared_entry_ceiling() {
+        let max = crate::util::bounded_archive::max_ingest_archive_entries() as usize;
+        assert!(read_manifest(&zip_with_entries(max)).is_ok());
+
+        let over = zip_with_entries(max + 1);
+        let err = read_manifest(&over).unwrap_err();
+        assert!(err.0.contains("too many entries"), "{err}");
+        assert_eq!(
+            inspect_with(&over, &[]).unwrap_err().0,
+            err.0,
+            "in-memory inspection must refuse the same archive"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("over.mcpb");
+        std::fs::write(&path, &over).unwrap();
+        let sha = hex::encode(Sha256::digest(&over));
+        let file_err = inspect_file_with(&path, &sha, &[]).unwrap_err();
+        assert!(file_err.0.contains("too many entries"), "{file_err}");
+
+        assert!(inspect(UNSIGNED).is_ok());
     }
 
     #[test]

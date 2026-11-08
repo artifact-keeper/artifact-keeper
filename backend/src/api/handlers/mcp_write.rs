@@ -1969,6 +1969,23 @@ mod tests {
     const SIGNED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-signed.mcpb");
     const TAMPERED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-tampered.mcpb");
 
+    /// A ZIP holding `entries` entries, the last of which is a valid root
+    /// `manifest.json`, for the upload-path entry-ceiling regression.
+    fn bundle_with_entries(entries: usize) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..entries.saturating_sub(1) {
+                z.start_file(format!("filler/{i}"), options).unwrap();
+            }
+            z.start_file("manifest.json", options).unwrap();
+            std::io::Write::write_all(&mut z, br#"{"name":"x","version":"1"}"#).unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
     struct Env {
         fx: tdh::Fixture,
         state: SharedState,
@@ -2417,6 +2434,52 @@ mod tests {
             .json(env.admin(), "POST", "/validate", Some(&plain))
             .await;
         assert_eq!(b["issues"][0]["reference"], "mcp_version_exists");
+        env.teardown().await;
+    }
+
+    /// #5467: an MCPB bundle over the shared entry ceiling is refused with the
+    /// bounded 400 before anything is stored, and a valid upload still works.
+    #[tokio::test]
+    async fn bundle_over_entry_ceiling_is_refused_without_rows() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let max = crate::util::bounded_archive::max_ingest_archive_entries() as usize;
+        let tail = "/servers/com.acme/echo/versions/1.0.0/bundles/too-many.mcpb";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(env.url(tail))
+            .body(Body::from(bundle_with_entries(max + 1)))
+            .unwrap();
+        let (status, body) = tdh::send(env.member(), req).await;
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("mcp_bundle_invalid")),
+            "{body}"
+        );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(env.fx.repo_id)
+        .bind(resolver::bundle_path(
+            "com.acme/echo",
+            "1.0.0",
+            "too-many.mcpb",
+        ))
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "a refused bundle stores no artifact");
+
+        // The refusal does not poison the next valid upload.
+        let valid = Request::builder()
+            .method("PUT")
+            .uri(env.url("/servers/com.acme/echo/versions/1.0.0/bundles/echo.mcpb"))
+            .body(Body::from(UNSIGNED))
+            .unwrap();
+        assert_eq!(tdh::send(env.member(), valid).await.0, StatusCode::CREATED);
+
         env.teardown().await;
     }
 
