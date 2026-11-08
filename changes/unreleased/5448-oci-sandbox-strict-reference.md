@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5448]
+---
+- **The MCP sandbox refuses an OCI job unless its image is a canonical, digest-pinned reference on the job's AK origin** (#5448). The worker previously accepted any identifier that started with the AK host and contained `@sha256:`, so a malformed digest, a second `@`, a traversal-like path, a host-prefix lookalike such as `ak.example.test.evil`, or trailing engine-looking text still reached the runner. `guest_spec` now parses the reference with the MCP OCI grammar, requires exactly one lower-case SHA-256 digest, a canonical repository path of at least `<repo>/<name>` on the configured AK host (including its port), and rejects the OCI legacy source fields `version`/`registryBaseUrl`/`fileSha256` and publisher `runtimeArguments`. Package arguments and environment variables remain guest data after the pinned image, so they cannot replace the validated source. Unit tests cover the malformed corpus and canonical controls, including the matching non-default-port case.

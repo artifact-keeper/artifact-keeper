@@ -2549,15 +2549,21 @@ runner-neutral guest spec:
 - pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
   `ghcr.io/astral-sh/uv:python3.12-alpine` pinned by digest), `uvx --no-config
   --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
-- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:...` itself, no
-  network.
+- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:<digest>` itself,
+  no network. The reference must be canonical and carry exactly one
+  lower-case SHA-256 digest on the job's AK origin; a bare image name,
+  another host, a SHA-512 digest, extra `@` delimiters, or a non-canonical
+  path is refused.
 
 Only what AK serves is run: a `registryBaseUrl` or OCI identifier that is not
-this AK instance is refused; publisher `runtimeArguments` are dropped;
-environment variables that steer a package manager or runtime (`NPM_CONFIG_*`,
-`UV_*`, `PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
-`HOME`, ...) are dropped. Every `isSecret` value, every required value
-without a default and every `{template}` value is the placeholder
+this AK instance is refused; an OCI package's legacy `version`,
+`registryBaseUrl` or `fileSha256` and its `runtimeArguments` are refused (the
+tag or digest belongs only in `identifier`); publisher `runtimeArguments` on
+npm and PyPI are dropped; environment variables that steer a package manager
+or runtime (`NPM_CONFIG_*`, `UV_*`, `PIP_*`, `PYTHON*`, `NODE_OPTIONS`,
+`LD_*`, proxy variables, `PATH`, `HOME`, ...) are dropped. Every `isSecret`
+value, every required value without a default and every `{template}` value is
+the placeholder
 `AK_PLACEHOLDER_<NAME>`. The whole run, install included, is capped at 120 s.
 When the run ends, whatever the outcome, the engine client (or launcher)
 gets `SIGTERM`, then `SIGKILL` 5 s later, and the container is removed
