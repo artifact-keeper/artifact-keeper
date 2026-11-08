@@ -443,12 +443,7 @@ async fn post_capabilities(
     // runs (plain write, or a matching `mcp_namespaces` grant;
     // `mcp_require_namespace_grant`).
     if !ext.can_access_repo(t.repo.id) {
-        return Err(problem(
-            403,
-            "mcp_forbidden",
-            "This token is not scoped to this repository",
-            json!({}),
-        ));
+        return Err(out_of_scope());
     }
     crate::api::handlers::mcp_edges::require_namespace_write(
         &state, &ext, t.repo.id, &p.name, "write", &headers,
@@ -694,6 +689,17 @@ pub fn is_introspector(auth: &AuthExtension) -> bool {
         .is_some_and(|s| s.iter().any(|x| x == INTROSPECT_SCOPE))
 }
 
+/// `403`: the credential's repository scope does not cover the repository a
+/// write (a capability report, a worker claim or result) is for.
+fn out_of_scope() -> Response {
+    problem(
+        403,
+        "mcp_forbidden",
+        "This token is not scoped to this repository",
+        json!({}),
+    )
+}
+
 fn require_introspector(auth: Option<AuthExtension>) -> Result<AuthExtension, Response> {
     match auth {
         None => Err(problem(
@@ -786,11 +792,13 @@ async fn claim_job(
     base: RequestBaseUrl,
     body: Bytes,
 ) -> HandlerResult {
-    require_introspector(auth)?;
+    // The token's repository scope bounds which jobs it may be handed
+    // (#5460): a token restricted to repository A never claims B's job.
+    let scope = require_introspector(auth)?.access_scope();
     let (kinds, worker) = parse_claim(&body)?;
     // A job that cannot run any more is cancelled and the next one tried.
     for _ in 0..10 {
-        let Some(claim) = jobs::claim(&state.db, &kinds, &worker)
+        let Some(claim) = jobs::claim(&state.db, &kinds, &worker, &scope)
             .await
             .map_err(app_error)?
         else {
@@ -866,7 +874,7 @@ async fn claim_payload(
         (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, drift}` or `{status: \"retry\", notBefore}`"),
         (status = 400, description = "Malformed result"),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "Not an `mcp:introspect` API token (`mcp_forbidden`)"),
+        (status = 403, description = "Not an `mcp:introspect` API token, or the token is not scoped to the job's repository (`mcp_forbidden`)"),
         (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim"),
     )
 )]
@@ -876,7 +884,7 @@ async fn complete_job(
     Path(id): Path<Uuid>,
     body: Bytes,
 ) -> HandlerResult {
-    require_introspector(auth)?;
+    let scope = require_introspector(auth)?.access_scope();
     if fmt::json_depth_exceeds(&body, INGEST_MAX_DEPTH) {
         return Err(bad_request(
             "",
@@ -899,7 +907,10 @@ async fn complete_job(
         .filter(|j| jobs::token_matches(j, &result.claim_token))
         .ok_or_else(claim_invalid)?;
     let parsed = jobs::parse_result(&result).map_err(|e| bad_request(&e.path, &e.message))?;
-    let out = match jobs::complete(&state.db, &job, &result, parsed)
+    // The claim token proves only the claim; the repository scope is
+    // re-checked against the job's repository inside the transaction that
+    // ends the claim (#5460).
+    let out = match jobs::complete(&state.db, &job, &result, parsed, &scope)
         .await
         .map_err(app_error)?
     {
@@ -919,6 +930,9 @@ async fn complete_job(
         // The claim ended between the token check and the store (a duplicate
         // or concurrent completion, the reaper): nothing was stored (#5389).
         jobs::Completed::ClaimLost => return Err(claim_invalid()),
+        // The token's scope does not cover the job's repository:
+        // nothing was stored and the claim is unchanged (#5460).
+        jobs::Completed::Forbidden => return Err(out_of_scope()),
     };
     Ok(json_resp(StatusCode::OK, &out))
 }
@@ -1085,6 +1099,7 @@ mod tests {
 mod db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::models::access_scope::AccessScope;
     use axum::body::Body;
     use axum::http::{header, Request};
 
@@ -1126,9 +1141,22 @@ mod db_tests {
             self.fx.router_anon(surface::router())
         }
         fn worker(&self, scopes: Option<Vec<String>>) -> Router {
+            self.worker_with(scopes, AccessScope::Admin)
+        }
+        /// An `mcp:introspect` service-account token restricted to `repos`,
+        /// with no broader instance privilege (#5460).
+        fn scoped_worker(&self, repos: Vec<Uuid>) -> Router {
+            self.worker_with(
+                Some(vec![INTROSPECT_SCOPE.into()]),
+                AccessScope::Restricted(repos),
+            )
+        }
+        fn worker_with(&self, scopes: Option<Vec<String>>, repos: AccessScope) -> Router {
             let mut a = tdh::make_auth(self.fx.user_id, &self.fx.username);
             a.is_api_token = true;
+            a.is_service_account = true;
             a.scopes = scopes;
+            a.allowed_repo_ids = repos;
             tdh::router_with_auth(worker_router(), self.fx.state.clone(), a)
         }
         fn url(&self, tail: &str) -> String {
@@ -1679,18 +1707,30 @@ mod db_tests {
             ..Default::default()
         };
         let r1 = ok(json!([{"name": "get_weather"}]));
-        let first = jobs::complete(&env.fx.pool, &job, &r1, jobs::parse_result(&r1).unwrap())
-            .await
-            .unwrap();
+        let first = jobs::complete(
+            &env.fx.pool,
+            &job,
+            &r1,
+            jobs::parse_result(&r1).unwrap(),
+            &AccessScope::Admin,
+        )
+        .await
+        .unwrap();
         let jobs::Completed::Stored { snapshot, .. } = &first else {
             panic!("the first completion stores: {first:?}");
         };
         // A different list, so a deduplicated repeat cannot hide a second
         // store.
         let r2 = ok(json!([{"name": "get_weather"}, {"name": "delete_city"}]));
-        let second = jobs::complete(&env.fx.pool, &job, &r2, jobs::parse_result(&r2).unwrap())
-            .await
-            .unwrap();
+        let second = jobs::complete(
+            &env.fx.pool,
+            &job,
+            &r2,
+            jobs::parse_result(&r2).unwrap(),
+            &AccessScope::Admin,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(second, jobs::Completed::ClaimLost),
             "a duplicate completion stores nothing: {second:?}"
@@ -1720,11 +1760,17 @@ mod db_tests {
             ..Default::default()
         };
         let parsed = jobs::parse_result(&timeout).unwrap();
-        let first = jobs::complete(&env.fx.pool, &job, &timeout, parsed.clone())
-            .await
-            .unwrap();
+        let first = jobs::complete(
+            &env.fx.pool,
+            &job,
+            &timeout,
+            parsed.clone(),
+            &AccessScope::Admin,
+        )
+        .await
+        .unwrap();
         assert!(matches!(first, jobs::Completed::Retry { .. }), "{first:?}");
-        let second = jobs::complete(&env.fx.pool, &job, &timeout, parsed)
+        let second = jobs::complete(&env.fx.pool, &job, &timeout, parsed, &AccessScope::Admin)
             .await
             .unwrap();
         assert!(
@@ -1732,6 +1778,243 @@ mod db_tests {
             "a duplicate retry ends nothing: {second:?}"
         );
         env.cleanup().await;
+    }
+
+    /// The job row fields a denied claim or completion must leave alone.
+    async fn job_state(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> (
+        String,
+        i32,
+        Option<String>,
+        Option<Uuid>,
+        Option<DateTime<Utc>>,
+    ) {
+        let j = jobs::get_job(pool, id).await.unwrap().unwrap();
+        (
+            j.status,
+            j.attempts,
+            j.claim_token_hash,
+            j.snapshot_id,
+            j.completed_at,
+        )
+    }
+
+    /// #5460: an `mcp:introspect` worker scoped to private repository A can
+    /// neither claim nor complete private repository B's job, whatever claim
+    /// token it holds, and a scope change between claim and completion is
+    /// honoured at completion. Same-repository work and the cross-job token
+    /// check are unaffected.
+    #[tokio::test]
+    async fn a_repository_scoped_worker_cannot_cross_repositories() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fa) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let Some(fb) = tdh::Fixture::setup("local", "mcp").await else {
+            fa.teardown().await;
+            return;
+        };
+        let (a, b) = (Env { fx: fa }, Env { fx: fb });
+        let private: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repositories WHERE id = ANY($1) AND is_public = false",
+        )
+        .bind(vec![a.fx.repo_id, b.fx.repo_id])
+        .fetch_one(&a.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(private, 2, "both repositories are private");
+        // Only B probes at first: its version gets a pending job, A's none.
+        b.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        a.publish("1.0.0").await;
+        b.publish("1.0.0").await;
+        let (art_a, art_b) = (a.artifact("1.0.0").await, b.artifact("1.0.0").await);
+        let job_b: Uuid = sqlx::query_scalar(
+            "SELECT id FROM mcp_introspection_jobs WHERE artifact_id = $1 AND status = 'pending'",
+        )
+        .bind(art_b)
+        .fetch_one(&b.fx.pool)
+        .await
+        .unwrap();
+        let worker_a = || a.scoped_worker(vec![a.fx.repo_id]);
+        let pool = &a.fx.pool;
+
+        // Claim: B's due job is never handed to the A-scoped worker.
+        let before = job_state(pool, job_b).await;
+        let (s, body) = call(worker_a(), "POST", "/jobs/claim", None).await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "B's job handed to A: {body}");
+        assert_eq!(job_state(pool, job_b).await, before, "B's job unchanged");
+        assert_eq!(before.0, "pending");
+
+        // Completion: with B's claim token in hand (here forged), the
+        // A-scoped worker still stores nothing, for a result or a retry.
+        b.claim_probe(art_b, "tok-b").await;
+        let claimed = job_state(pool, job_b).await;
+        let complete_b = format!("/jobs/{job_b}/complete");
+        for result in [
+            json!({"claimToken": "tok-b", "outcome": "ok",
+                   "tools": [{"name": "exfiltrate"}]}),
+            json!({"claimToken": "tok-b", "outcome": "timeout"}),
+        ] {
+            let (s, body) = call(worker_a(), "POST", &complete_b, Some(result)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["error"], "mcp_forbidden", "{body}");
+            assert_eq!(job_state(pool, job_b).await, claimed, "B's claim untouched");
+        }
+        assert_eq!(b.snapshots(art_b, Source::RemoteProbe).await, 0);
+        let (_, caps_b) = call(b.admin(), "GET", &b.url(""), None).await;
+        assert_eq!(caps_b["current"]["source"], "publisher_declared");
+
+        // The denials left B's claim current: its token still proves it.
+        // (Whether a worker other than the claimant may complete it is
+        // #5465's concern, so this test does not complete it as anyone.)
+        let still = jobs::get_job(pool, job_b).await.unwrap().unwrap();
+        assert!(
+            jobs::token_matches(&still, "tok-b"),
+            "B's claim stays valid"
+        );
+
+        // Benign: A's own job is claimed and completed by the A worker.
+        a.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        jobs::enqueue_for_artifact(pool, art_a, None).await.unwrap();
+        let (s, job) = call(worker_a(), "POST", "/jobs/claim", None).await;
+        assert_eq!(s, StatusCode::OK, "{job}");
+        assert_eq!(job["repository"], a.fx.repo_key.as_str());
+        let job_a = Uuid::parse_str(job["jobId"].as_str().unwrap()).unwrap();
+        let complete_a = format!("/jobs/{job_a}/complete");
+        let ok_a = json!({"claimToken": job["claimToken"], "outcome": "ok",
+                          "tools": [{"name": "get_weather"}]});
+
+        // Cross-job: another job's valid claim token (B's, still current)
+        // does not complete A's.
+        let (s, _) = call(
+            worker_a(),
+            "POST",
+            &complete_a,
+            Some(json!({"claimToken": "tok-b", "outcome": "ok"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "a token proves only its own job");
+
+        // Scope change after the claim: the credential no longer covers A
+        // (here: restricted to B), so the completion is refused. In
+        // production the change reaches `complete` once the API-token
+        // validation cache (300 s) has expired; this router carries the new
+        // scope directly.
+        let claimed = job_state(pool, job_a).await;
+        let (s, body) = call(
+            a.scoped_worker(vec![b.fx.repo_id]),
+            "POST",
+            &complete_a,
+            Some(ok_a.clone()),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(job_state(pool, job_a).await, claimed);
+        assert_eq!(a.snapshots(art_a, Source::RemoteProbe).await, 0);
+        let (s, body) = call(worker_a(), "POST", &complete_a, Some(ok_a)).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "stored");
+        let (_, caps_a) = call(a.admin(), "GET", &a.url(""), None).await;
+        assert_eq!(caps_a["current"]["source"], "remote_probe");
+
+        // Target binding: a job filed under A for B's server version is
+        // neither handed to nor completable by the A worker.
+        let forged: Uuid = sqlx::query_scalar(
+            "INSERT INTO mcp_introspection_jobs (repository_id, artifact_id, kind, target_key) \
+             VALUES ($1, $2, 'remote_probe', 'remote:forged') RETURNING id",
+        )
+        .bind(a.fx.repo_id)
+        .bind(art_b)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let (s, body) = call(worker_a(), "POST", "/jobs/claim", None).await;
+        assert_eq!(
+            s,
+            StatusCode::NO_CONTENT,
+            "mis-bound job handed out: {body}"
+        );
+        sqlx::query(
+            "UPDATE mcp_introspection_jobs SET status = 'claimed', attempts = 1, \
+               lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $2 \
+             WHERE id = $1",
+        )
+        .bind(forged)
+        .bind(caps::sha256_hex(b"tok-forged"))
+        .execute(pool)
+        .await
+        .unwrap();
+        let claimed = job_state(pool, forged).await;
+        let (s, body) = call(
+            worker_a(),
+            "POST",
+            &format!("/jobs/{forged}/complete"),
+            Some(json!({"claimToken": "tok-forged", "outcome": "ok"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(job_state(pool, forged).await, claimed);
+        assert_eq!(b.snapshots(art_b, Source::RemoteProbe).await, 0);
+
+        a.cleanup().await;
+        b.cleanup().await;
+    }
+
+    /// #5460: the repository filter sits in the claim's candidate selection,
+    /// not after it. An older out-of-scope job queued ahead of a due
+    /// in-scope one does not shadow it: the A worker gets A's job, not `204`,
+    /// and B's job is left pending.
+    #[tokio::test]
+    async fn a_scoped_worker_skips_older_out_of_scope_jobs() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fa) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let Some(fb) = tdh::Fixture::setup("local", "mcp").await else {
+            fa.teardown().await;
+            return;
+        };
+        let (a, b) = (Env { fx: fa }, Env { fx: fb });
+        a.publish("1.0.0").await;
+        b.publish("1.0.0").await;
+        let pool = &a.fx.pool;
+        // Neither repository has a claimed job, so the fair ordering ties and
+        // B's job, due decades earlier, is first in line.
+        let mut queued = Vec::new();
+        for (env, due) in [(&b, "1999-01-01"), (&a, "2000-01-01")] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO mcp_introspection_jobs (repository_id, artifact_id, kind, \
+                   target_key, not_before, created_at) \
+                 VALUES ($1, $2, 'remote_probe', 'remote:0', $3::timestamptz, $3::timestamptz) \
+                 RETURNING id",
+            )
+            .bind(env.fx.repo_id)
+            .bind(env.artifact("1.0.0").await)
+            .bind(due)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            queued.push(id);
+        }
+        let (job_b, job_a) = (queued[0], queued[1]);
+        let before = job_state(pool, job_b).await;
+        let (s, job) = call(
+            a.scoped_worker(vec![a.fx.repo_id]),
+            "POST",
+            "/jobs/claim",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{job}");
+        assert_eq!(job["jobId"], job_a.to_string());
+        assert_eq!(job_state(pool, job_b).await, before, "B's job untouched");
+        assert_eq!(before.0, "pending");
+        a.cleanup().await;
+        b.cleanup().await;
     }
 
     /// #5386: a snapshot repeating the newest one of its (version, source,
