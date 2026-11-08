@@ -2524,13 +2524,22 @@ Runners:
   `AK_MCP_SANDBOX_GATEWAY` (the AK forwarder's container, default
   `ak-gateway`), `AK_MCP_SANDBOX_MEMORY` (`1g`), `AK_MCP_SANDBOX_CPUS`
   (`1`). `AK_MCP_SANDBOX_NETWORK` is retired: guests that share a network
-  can reach each other (#5447), so a worker with it set refuses every
-  sandbox job. For an npm or PyPI guest the runner first creates the
+  can reach each other (#5447), so `run --sandbox` with it set (or with an
+  empty `AK_MCP_SANDBOX_GATEWAY`) exits with an error before claiming
+  anything. For an npm or PyPI guest the runner first creates the
   guest's own network, `<engine> network create --internal --label=...
-  <name>`, and attaches the forwarder to it under the host of `AK_URL`,
-  `<engine> network connect --alias <AK host> <name> <gateway>`; if either
-  fails the guest is not started (`start_failed`, retried). An `AK_URL`
-  with an IP address instead of a host name is refused for npm and PyPI.
+  <name>`, and attaches the forwarder to it under the host of the job's
+  `akBaseUrl` (the backend's public base URL; `AK_URL` only when the job
+  has none), `<engine> network connect --alias <AK host> <name>
+  <gateway>`, then reads the forwarder's address on it (`<engine>
+  container inspect --format '{{(index .NetworkSettings.Networks
+  "<name>").IPAddress}}' <gateway>`) and gives the guest
+  `--add-host=<AK host>:<address>`, so the guest does not depend on the
+  engine's DNS; if any of these fails the guest is not started
+  (`start_failed`, retried). An `akBaseUrl` with an IP address instead of a host name is
+  `start_failed` too. Workers sharing a host need distinct
+  `AK_MCP_INTROSPECTOR_ID`s: leftovers are reaped by that id, at startup
+  and every 10 minutes while idle.
   The guest is rendered as `<engine> run --rm -i
   --name=ak-mcp-sbx-<job>-<random> --label=com.artifactkeeper.mcp-sandbox=<job>
   --label=com.artifactkeeper.mcp-sandbox.owner=<worker id> --runtime=runsc

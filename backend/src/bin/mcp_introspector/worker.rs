@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::http::{check_url, HttpTransport};
 use crate::protocol::{probe, ProbeReport};
-use crate::sandbox::{guest_spec, run_and_probe, Images, SandboxRunner};
+use crate::sandbox::{guest_spec, run_and_probe, Images, SandboxError, SandboxRunner};
 
 use artifact_keeper_backend::services::mcp_capabilities as caps;
 
@@ -223,9 +223,16 @@ pub async fn sandbox_probe(
             r.details.insert("notes".into(), json!(spec.notes));
             within_backend_limits(r)
         }
+        // The deployment, not the server: retried (`start_failed` is
+        // transient), never stored as the server's state.
+        Err(e @ SandboxError::Deployment(_)) => failed("start_failed", e.to_string()),
         Err(e) => failed("unsupported", e.to_string()),
     }
 }
+
+/// How often an idle worker removes guests and guest networks that leaked
+/// (a cleanup command failed or timed out), besides once at startup.
+pub const REAP_EVERY: Duration = Duration::from_secs(600);
 
 impl Worker {
     pub fn kinds(&self) -> Vec<&'static str> {
@@ -280,11 +287,38 @@ impl Worker {
         Ok(true)
     }
 
+    /// Remove the guests and guest networks earlier runs of this worker left
+    /// behind. Run at startup and, while idle, every [`REAP_EVERY`]: jobs
+    /// run one at a time, so no guest of this worker is live then. The
+    /// number of guests removed.
+    pub async fn reap(&self) -> usize {
+        let Some(runner) = &self.runner else {
+            return 0;
+        };
+        match crate::sandbox::reap_leftovers(runner.as_ref()).await {
+            Ok(0) => 0,
+            Ok(n) => {
+                tracing::warn!(removed = n, "removed leftover sandbox guests");
+                n
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not check for leftover sandbox guests");
+                0
+            }
+        }
+    }
+
     pub async fn run_forever(&self, poll: Duration) {
+        let mut last_reap = std::time::Instant::now();
         loop {
             match self.once().await {
                 Ok(true) => continue,
-                Ok(false) => {}
+                Ok(false) => {
+                    if last_reap.elapsed() >= REAP_EVERY {
+                        self.reap().await;
+                        last_reap = std::time::Instant::now();
+                    }
+                }
                 Err(e) => tracing::warn!(error = %e, "introspection worker"),
             }
             tokio::time::sleep(poll).await;
@@ -395,6 +429,65 @@ mod tests {
             .await;
         assert_eq!(r["outcome"], "start_failed");
         assert_eq!(r["details"]["runner"], "external");
+    }
+
+    /// #5447: a job the deployment cannot isolate (here an AK base URL that
+    /// is an IP address, which the forwarder cannot stand in for) is
+    /// `start_failed`, which the backend retries, not a terminal
+    /// `unsupported` stored as the server's state.
+    #[tokio::test]
+    async fn deployment_refusals_are_retryable() {
+        let w = worker(
+            "http://127.0.0.1:9",
+            Some(Box::new(crate::sandbox::OciRunner::default())),
+        );
+        let r = w
+            .run_job(
+                &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://203.0.113.10",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "registryBaseUrl": "https://203.0.113.10/npm/r"}}}),
+            )
+            .await;
+        assert_eq!(r["outcome"], "start_failed", "{r}");
+        assert!(r["error"].as_str().unwrap().contains("IP address"), "{r}");
+    }
+
+    /// The periodic reap: nothing without a runner; with one, this worker's
+    /// leftover guests (by its owner label) are removed.
+    #[tokio::test]
+    async fn reap_removes_this_workers_leftovers() {
+        assert_eq!(worker("http://127.0.0.1:9", None).reap().await, 0);
+        let dir = std::env::temp_dir().join(format!("ak-reap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = dir.join("engine");
+        std::fs::write(
+            &engine,
+            "#!/bin/sh\ncase \"$1 $2\" in ps*) echo c1;; 'network ls') echo n1;; 'network rm') exit 1;; esac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runner = crate::sandbox::OciRunner {
+            engine: engine.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        // A teardown command that fails is a warning, not an error.
+        assert_eq!(
+            worker("http://127.0.0.1:9", Some(Box::new(runner)))
+                .reap()
+                .await,
+            1
+        );
+        let broken = crate::sandbox::OciRunner {
+            engine: "/nonexistent/podman".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            worker("http://127.0.0.1:9", Some(Box::new(broken)))
+                .reap()
+                .await,
+            0
+        );
     }
 
     #[tokio::test]

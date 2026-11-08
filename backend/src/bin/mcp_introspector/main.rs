@@ -191,9 +191,25 @@ fn convert_file(from: &str, file: &str) -> Result<Value, String> {
     adapters::convert(kind, &read_json(file)?)
 }
 
+/// The sandbox runner of `run --sandbox`, `None` without it. A configuration
+/// that cannot isolate guests is an error: the worker refuses to start
+/// rather than claim jobs it would fail (#5447).
+fn sandbox_runner(
+    sandbox: bool,
+    get: impl Fn(&str) -> Option<String>,
+    worker_id: &str,
+) -> Result<Option<Box<dyn sandbox::SandboxRunner>>, String> {
+    if !sandbox {
+        return Ok(None);
+    }
+    sandbox::runner_from_env(get, worker_id)
+        .map(Some)
+        .map_err(|e| format!("the sandbox is misconfigured, not starting: {e}"))
+}
+
 /// The guest spec and runner command for a claimed job document.
 fn render_sandbox(job: &Value) -> Result<Value, String> {
-    let runner = sandbox::runner_from_env(env, &default_owner());
+    let runner = sandbox::runner_from_env(env, &default_owner())?;
     let ak = job["akBaseUrl"].as_str().ok_or("job has no akBaseUrl")?;
     let spec = sandbox::guest_spec(
         job["jobId"].as_str().unwrap_or("job"),
@@ -214,6 +230,7 @@ fn render_sandbox(job: &Value) -> Result<Value, String> {
     command.extend(plan.args);
     Ok(
         json!({"runner": runner.name(), "spec": spec, "setup": setup,
+        "hostLookup": plan.host_lookup.as_ref().map(|l| json!({"host": l.host, "command": argv(&l.cmd)})),
         "command": command, "cleanup": cleanup}),
     )
 }
@@ -231,24 +248,21 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         } => {
             ensure_public_only()?;
             harden_process();
+            // Before the token, and before anything is claimed: a sandbox
+            // configuration that cannot isolate guests stops the worker.
+            let runner = sandbox_runner(sandbox, env, &worker_id)?;
             let token = resolve_token(token, token_file.as_deref(), std::io::stdin())?;
             let w = worker::Worker {
                 backend: worker::Backend::new(&ak_url, &token),
-                runner: sandbox.then(|| sandbox::runner_from_env(env, &worker_id)),
+                runner,
                 worker_id,
                 images: sandbox::images_from_env(env),
                 http: http::guarded_client(),
             };
             tracing::info!(kinds = ?w.kinds(), "ak-mcp-introspector started");
-            if let Some(runner) = &w.runner {
+            if w.runner.is_some() {
                 // Guests a crashed or killed earlier run left behind.
-                match sandbox::reap_leftovers(runner.as_ref()).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::warn!(removed = n, "removed leftover sandbox guests"),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "could not check for leftover sandbox guests")
-                    }
-                }
+                w.reap().await;
                 for image in w.images.unpinned() {
                     tracing::warn!(%image, "sandbox runner image is not pinned by digest");
                 }
@@ -303,7 +317,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Command::SandboxProbe { job } => {
             let out = sandbox_probe_job(
-                sandbox::runner_from_env(env, &default_owner()).as_ref(),
+                sandbox::runner_from_env(env, &default_owner())?.as_ref(),
                 &read_json(&job)?,
             )
             .await?;
@@ -422,6 +436,21 @@ mod tests {
         assert!(Cli::try_parse_from(["x", "bogus"]).is_err());
     }
 
+    /// #5447: `run --sandbox` with a configuration that cannot isolate
+    /// guests does not start, so it never claims (and fails) a job.
+    #[test]
+    fn a_misconfigured_sandbox_stops_the_worker() {
+        let get = |k: &str| (k == "AK_MCP_SANDBOX_NETWORK").then(|| "ak-mcp-sandbox".to_string());
+        let Err(e) = sandbox_runner(true, get, "w") else {
+            panic!("the retired shared network must stop the worker");
+        };
+        assert!(e.contains("not starting"), "{e}");
+        assert!(e.contains("AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox"), "{e}");
+        // Without --sandbox the variable is irrelevant: no runner.
+        assert!(sandbox_runner(false, get, "w").unwrap().is_none());
+        assert!(sandbox_runner(true, |_| None, "w").unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn convert_render_and_errors() {
         let f = tmp("inv.json", r#"{"tools": ["a", "b"]}"#);
@@ -442,6 +471,8 @@ mod tests {
         assert_eq!(out["setup"][0][1], "network");
         assert_eq!(out["setup"][0][2], "create");
         assert_eq!(out["cleanup"].as_array().unwrap().len(), 3);
+        assert_eq!(out["hostLookup"]["host"], "ak.test");
+        assert_eq!(out["hostLookup"]["command"][2], "inspect");
         assert!(render_sandbox(&json!({})).is_err());
         let jf = tmp("job.json", &job.to_string());
         let c = Cli::try_parse_from(["x", "render-sandbox", jf.as_str()]).unwrap();

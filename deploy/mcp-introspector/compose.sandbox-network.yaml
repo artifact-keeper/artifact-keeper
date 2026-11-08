@@ -7,8 +7,9 @@
 # creates an internal network of its own (`<engine> network create
 # --internal ak-mcp-sbx-<job>-<random>`), has this forwarder join it under
 # the AK hostname (`<engine> network connect --alias <AK host> <net>
-# ak-gateway`), starts the guest on it, and removes it after the run. The
-# guest's only peer is the forwarder, so it cannot reach another guest; if
+# ak-gateway`, the host of the job's `akBaseUrl`), reads this forwarder's
+# address on it and starts the guest there with `--add-host <AK host>:<that
+# address>` (so the guest needs no DNS), and removes it after the run. The guest's only peer is the forwarder, so it cannot reach another guest; if
 # the network cannot be created or the forwarder cannot join it, the guest
 # is not started. OCI guests run with `--network=none`.
 #
@@ -18,9 +19,10 @@
 # would forward to itself. It reaches AK as `ak-upstream`, an /etc/hosts
 # entry for AK's address.
 #
-# Replace 203.0.113.10 below with the address the host of AK_URL resolves
-# to (the ingress or load balancer). The container name is what
-# AK_MCP_SANDBOX_GATEWAY names (default `ak-gateway`).
+# Replace 203.0.113.10 below with the address AK's public host name (the
+# host of the backend's public base URL, which every job carries as
+# `akBaseUrl`) resolves to: the ingress or load balancer. The container
+# name is what AK_MCP_SANDBOX_GATEWAY names (default `ak-gateway`).
 name: ak-mcp-sandbox
 
 services:
@@ -41,6 +43,13 @@ services:
     # guest, for the length of a run.
     networks:
       egress: {}
+    # The forwarder joins every live guest network, so it must never route
+    # between them. A new network namespace inherits the host's setting,
+    # and on a Docker host (or one with a VPN or router role) that is 1:
+    # set it off here rather than rely on a default.
+    sysctls:
+      net.ipv4.ip_forward: "0"
+      net.ipv6.conf.all.forwarding: "0"
     # The upstream nginx-ak-gateway.conf forwards to. Not the AK hostname.
     extra_hosts:
       - "ak-upstream:203.0.113.10"

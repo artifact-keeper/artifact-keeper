@@ -77,17 +77,29 @@ attempt it runs, with the guest's fresh name `ak-mcp-sbx-<job>-<random>`:
    no route out. A guest on it has a route to its own subnet only, and the
    engine's DNS answers only for the members of that network.
 2. `<engine> network connect --alias <AK host> <name> ak-gateway`: the
-   forwarder joins it, under the host of `AK_URL`, so the guest's lookup of
-   the AK host returns the forwarder's address on this network.
-3. `<engine> run --network=<name> ...`: the guest, whose only peer is the
-   forwarder.
-4. After the run, whatever the outcome: `<engine> rm -f <name>`,
+   forwarder joins it, under AK's host name, so the guest's lookup of the
+   AK host returns the forwarder's address on this network. The name is the
+   host of the job's `akBaseUrl`, which is the backend's public base URL
+   (the worker's `AK_URL` only for a job that carries none).
+3. `<engine> container inspect --format '{{(index
+   .NetworkSettings.Networks "<name>").IPAddress}}' ak-gateway`: the
+   forwarder's address on this network (the same template works with
+   Docker and Podman). If it cannot be read, the guest is not started.
+4. `<engine> run --network=<name> --add-host=<AK host>:<that address>
+   ...`: the guest, whose only peer is the forwarder. It finds AK through
+   its `/etc/hosts`, not the engine's DNS: a gVisor guest on an internal
+   Docker network cannot reach Docker's embedded DNS server, so the alias
+   alone would leave it unable to find AK.
+5. After the run, whatever the outcome: `<engine> rm -f <name>`,
    `<engine> network disconnect -f <name> ak-gateway`, `<engine> network rm
-   <name>`. At startup the worker also removes guest networks a crashed
-   run left behind (by their owner label), after their containers.
+   <name>`. At startup, and every 10 minutes while it is idle, the worker
+   also removes the guests and guest networks that a crashed run or a
+   failed cleanup left behind (by their owner label); a teardown command
+   that fails is logged as a warning naming the command.
 
-If step 1 or 2 fails (the engine cannot create the network, the forwarder
-is not running, the alias is refused), the guest is not started: the job
+If step 1, 2 or 3 fails (the engine cannot create the network, the
+forwarder is not running, the alias is refused, its address cannot be
+read), the guest is not started: the job
 is `start_failed` with the engine's message and is retried. A guest never
 runs on a network the worker did not just create for it.
 
@@ -98,31 +110,59 @@ What holds, and what it rests on:
   capabilities (`--cap-drop=ALL`), so no raw sockets and no route changes.
 - **Guest to forwarder: TCP 80 and 443 only**, the ports nginx listens on.
   The forwarder forwards only to `ak-upstream` (AK's address) and does not
-  route between its networks: IP forwarding is off in its network
-  namespace (the default; do not enable it), and it has no capabilities
-  but the four nginx needs.
+  route between its networks: the compose file turns IP forwarding off in
+  its network namespace (`net.ipv4.ip_forward=0`,
+  `net.ipv6.conf.all.forwarding=0`). Do not rely on a default: a new
+  network namespace inherits the host's setting, which is on wherever
+  Docker or a router role enabled it. It has no capabilities but the four
+  nginx needs.
 - **Guest to the forwarder's other networks: no.** The forwarder joins the
   networks of all guests running at the same time, but a guest reaches it
   only on the address of its own network; it has no route to the others.
 - **Guest to anything else: no.** An internal network has no default
   route and no forwarding of outside DNS names. The bridge address itself
-  (the engine's DNS server) answers only names of that network.
+  (the engine's DNS server, where the guest can reach it) answers only
+  names of that network.
 - **OCI guests** have no network (`--network=none`), and no network is
   created for them.
 
-`AK_MCP_SANDBOX_NETWORK`, which named the shared network, is retired: a
-worker that still has it set refuses every sandbox job with an error that
-says so, rather than leave the operator believing a shared network is in
-use. `AK_MCP_SANDBOX_GATEWAY` names the forwarder's container (default
-`ak-gateway`). `AK_URL` must use a host name, not an IP address: the guest
-reaches AK only through the forwarder's alias, and a guest told to connect
-to an IP address would find no route to it.
+What remains: the forwarder is **one process joined to every live guest
+network**. It is the single shared point between concurrent guests. A
+guest that could compromise nginx's stream proxy (a bug in nginx, not in
+anything the guest is allowed to do) would sit on all of those networks at
+once. Keep it minimal: the stock nginx image pinned by digest, read-only,
+the four capabilities, `no-new-privileges`, no HTTP or TLS processing, and
+forwarding off. Jobs run one at a time per worker, so concurrent guests
+come from several workers sharing one host and one forwarder; one
+forwarder per worker (each worker's `AK_MCP_SANDBOX_GATEWAY` naming its
+own) removes even that.
+
+`AK_MCP_SANDBOX_NETWORK`, which named the shared network, is retired. A
+worker started with `--sandbox` while it is set (or with an empty
+`AK_MCP_SANDBOX_GATEWAY`) **does not start**: it exits with an error that
+says so, before it claims anything. Skipping the upgrade step stops the
+worker; it does not lose jobs, which stay queued until a worker that can
+run them claims them. `AK_MCP_SANDBOX_GATEWAY` names the forwarder's
+container (default `ak-gateway`).
+
+The backend's public base URL must use a host name, not an IP address: the
+guest reaches AK only through the forwarder's alias, and a guest told to
+connect to an IP address would find no route to it. A job whose
+`akBaseUrl` is an IP address is reported `start_failed` (a deployment
+problem, retried), not stored as the server's state.
+
+When several workers share one host, give each a unique
+`AK_MCP_INTROSPECTOR_ID`. A worker removes the leftovers labelled with its
+own id; two workers with the same id (the default is `ak-mcp-introspector`)
+would remove each other's live guests and detach the forwarder from each
+other's guest networks.
 
 This was checked with rootless Podman 6.1 (netavark, crun): a guest on its
-own network reached the forwarder under the alias, and failed to reach a
-second guest, the forwarder's address on the second guest's network, and
-the internet; with both guests on one network, the second guest was
-reachable. Check your own host with `sandbox-check/guest-isolation-check.sh`
+own network reached the forwarder under the alias, had no default route,
+could not resolve outside names, and failed to reach a second guest, the
+forwarder's address on the second guest's network, and the internet (which
+a container on the forwarder's egress network reached); with both guests
+on one network, the second guest was reachable. Check your own host with `sandbox-check/guest-isolation-check.sh`
 (step 7 below).
 
 ## Option A: a dedicated host with rootless Podman (recommended)
@@ -162,7 +202,8 @@ reachable. Check your own host with `sandbox-check/guest-isolation-check.sh`
 3. **Forwarder.** As `ak-sbx`, edit
    `deploy/mcp-introspector/compose.sandbox-network.yaml`: replace
    `203.0.113.10` (the `ak-upstream` entry in `extra_hosts`) with the
-   address the host of `AK_URL` resolves to. Then run `podman-compose -f
+   address AK's public host name resolves to (the host of the backend's
+   public base URL, which jobs carry as `akBaseUrl`). Then run `podman-compose -f
    compose.sandbox-network.yaml up -d`. This starts the forwarder
    `ak-gateway` on its own way out, `ak-mcp-sandbox-egress`, which no guest
    joins. There is no shared guest network: the worker attaches the
@@ -214,12 +255,18 @@ reachable. Check your own host with `sandbox-check/guest-isolation-check.sh`
    ```
 
    It builds the per-guest topology with throwaway names and passes only
-   if a guest reaches the forwarder but not a second guest, the forwarder's
-   address on the second guest's network or the internet, a guest sharing
-   the second guest's network does reach it (so a probe that cannot
-   connect at all does not pass), and the second guest recorded exactly
-   that one connection. `SHARED=1` puts both guests on one network, the
-   old layout: the check must then fail. Then set
+   if a guest reaches the forwarder under the alias but not a second
+   guest, the forwarder's address on the second guest's network or the
+   internet; has no default route; cannot resolve an outside name; a guest
+   sharing the second guest's network does reach it (so a probe that
+   cannot connect at all does not pass); the second guest recorded exactly
+   that one connection; and IP forwarding is off in the test forwarder and
+   in the running `ak-gateway` (`GATEWAY=` names another). The internet
+   check counts only when a container on the egress network can reach the
+   internet (`EGRESS_HOST`/`EGRESS_PORT`, default `1.1.1.1:80`); otherwise
+   it is reported inconclusive and the missing default route decides.
+   `SHARED=1` puts both guests on one network, the old layout: the check
+   must then fail. Then set
    `mcp_sandbox_introspection: on` on the repositories that should use it.
 
 ## Option B: Kubernetes with a gVisor RuntimeClass
@@ -288,13 +335,21 @@ and on demand. On a GitHub-hosted Ubuntu runner it does the following:
    internet.
 6. It runs `sandbox-check/guest-isolation-check.sh` under `runsc`: a guest
    on its own network reaches the forwarder and nothing else, and the same
-   check fails with both guests on one network.
-7. It validates the compose file and the Kubernetes manifests.
+   check fails with both guests on one network, because the second guest
+   was reached (the step asserts that line, so a check that could not run
+   does not count as the expected failure).
+7. It runs `sandbox-probe` on an npm job with the real Docker CLI and a
+   stand-in forwarder: the guest reaches the forwarder under the AK host
+   name, and afterwards no guest container or guest network is left and
+   the forwarder is back on its egress network only. It also checks that
+   a worker with `AK_MCP_SANDBOX_NETWORK` set refuses to run.
+8. It validates the compose file and the Kubernetes manifests.
 
 The workflow does not cover npm or PyPI guests, which need a running AK to
 install from, or the Kubernetes launcher, which needs a cluster with a gVisor
 RuntimeClass. The isolation check exercises the topology the worker builds,
-with Docker; the worker's own commands for it are pinned by unit tests.
+with Docker; the worker's own commands for it are pinned by unit tests and
+run once against Docker by step 7.
 Malicious npm and PyPI guests against an independent second-guest recorder
 on rootless Podman are covered by artifact-keeper-test. Those are deployment checks: run `sandbox-probe` against your
 own AK with a job document for a published server.

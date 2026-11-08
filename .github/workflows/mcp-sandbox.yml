@@ -170,7 +170,54 @@ jobs:
           set -u
           ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh
           # The policy-removed control: with the attacker on the victim's
-          # network (the old shared bridge), the same check must fail.
-          if SHARED=1 ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh; then
+          # network (the old shared bridge), the same check must fail, and
+          # fail because the victim was reached, not because the check
+          # could not run (a pull failure or a missing runtime).
+          if SHARED=1 ENGINE=docker RUNTIME=runsc sh deploy/mcp-introspector/sandbox-check/guest-isolation-check.sh \
+              > "$RUNNER_TEMP/shared.txt" 2>&1; then
+            cat "$RUNNER_TEMP/shared.txt"
             echo "the isolation check passed on a shared network"; exit 1
           fi
+          cat "$RUNNER_TEMP/shared.txt"
+          grep -q '^FAIL attacker -> second guest' "$RUNNER_TEMP/shared.txt"
+          grep -q '^FAIL victim recorded 2 connection(s)' "$RUNNER_TEMP/shared.txt"
+
+      - name: The worker gives an npm guest its own network, with the forwarder only (#5447)
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runsc
+        run: |
+          set -eu
+          # A stand-in forwarder that records connections: the guest's npx
+          # reaches it under the AK hostname, fails TLS and exits, so the
+          # outcome is needs_config. What is checked is the engine commands
+          # the worker ran (create, connect --alias, run, then cleanup),
+          # against the real Docker CLI.
+          docker network create ak-mcp-sandbox-egress-ci
+          docker run -d --name ak-gateway --network=ak-mcp-sandbox-egress-ci \
+            --sysctl net.ipv4.ip_forward=0 \
+            docker.io/library/alpine:3.20 nc -lk -p 443 -e sh -c 'echo connection >&2'
+          printf '%s' '{"jobId": "npm-ci", "akBaseUrl": "https://ak.example.com", "target": {"type": "package", "registryType": "npm", "package": {"registryType": "npm", "identifier": "@acme/weather", "version": "1.0.0", "registryBaseUrl": "https://ak.example.com/npm/npm", "transport": {"type": "stdio"}}}}' \
+            > "$RUNNER_TEMP/npm-job.json"
+          ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/npm-job.json" > "$RUNNER_TEMP/npm.json" || true
+          cat "$RUNNER_TEMP/npm.json"
+          jq -e '.outcome == "needs_config"' "$RUNNER_TEMP/npm.json"
+          docker logs ak-gateway 2>&1 | grep -q '^connection$'
+          test -z "$(docker ps -aq --filter label=com.artifactkeeper.mcp-sandbox)"
+          test -z "$(docker network ls -q --filter label=com.artifactkeeper.mcp-sandbox)"
+          test "$(docker inspect ak-gateway --format '{{len .NetworkSettings.Networks}}')" = 1
+          docker rm -f ak-gateway
+          docker network rm ak-mcp-sandbox-egress-ci
+
+      - name: The retired shared network stops the worker (#5447)
+        env:
+          AK_MCP_SANDBOX_ENGINE: docker
+          AK_MCP_SANDBOX_RUNTIME: runsc
+          AK_MCP_SANDBOX_NETWORK: ak-mcp-sandbox
+        run: |
+          set -u
+          if ./target/debug/ak-mcp-introspector sandbox-probe "$RUNNER_TEMP/job.json" 2> "$RUNNER_TEMP/retired.txt"; then
+            echo "a retired AK_MCP_SANDBOX_NETWORK must be refused"; exit 1
+          fi
+          cat "$RUNNER_TEMP/retired.txt"
+          grep -q 'AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox is no longer supported' "$RUNNER_TEMP/retired.txt"
