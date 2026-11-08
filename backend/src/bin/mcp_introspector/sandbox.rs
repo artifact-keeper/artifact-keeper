@@ -12,8 +12,12 @@
 //!   package manager (`NPM_CONFIG_*`, `UV_*`, `PIP_*`, ...) are refused;
 //! * no real secrets: every `isSecret` value, every required value without
 //!   a default, and every `{template}` value becomes `AK_PLACEHOLDER_<NAME>`;
-//! * the guest's network is the operator's AK-only network for installs,
-//!   and `none` for an OCI image (already pulled by the engine);
+//! * the guest's network is `none` for an OCI image (already pulled by the
+//!   engine); an npm or PyPI guest gets a network of its own, created for
+//!   the run as an internal network whose only other member is the AK
+//!   forwarder, and removed after it (#5447). Guests never share a network,
+//!   so one guest cannot reach another; the run is refused if that network
+//!   cannot be created or the forwarder cannot join it;
 //! * 120 s wall clock, enforced by the worker around the whole run; when
 //!   the run ends the guest is removed through the engine (killing the
 //!   engine client alone leaves the container running), and leftovers of a
@@ -128,12 +132,19 @@ pub const REFUSED_ENV_PREFIXES: &[&str] = &[
 pub enum SandboxError {
     Unsupported(String),
     Invalid(String),
+    /// The sandbox deployment, not the job, cannot run it (no forwarder
+    /// configured, an AK base URL the forwarder cannot stand in for):
+    /// reported `start_failed`, so the job is retried, not stored as the
+    /// server's state.
+    Deployment(String),
 }
 
 impl std::fmt::Display for SandboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SandboxError::Unsupported(m) | SandboxError::Invalid(m) => {
+            SandboxError::Unsupported(m)
+            | SandboxError::Invalid(m)
+            | SandboxError::Deployment(m) => {
                 write!(f, "{m}")
             }
         }
@@ -413,20 +424,59 @@ impl Cmd {
 /// A process to start: its stdin/stdout are the guest's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunPlan {
+    /// Run in order before the guest; each must succeed, or the guest is
+    /// not started (`start_failed`) and the cleanup runs. This is where the
+    /// guest's own network is created and the forwarder joins it: a guest
+    /// never starts without the network that isolates it.
+    pub setup: Vec<Cmd>,
+    /// Run after `setup`: the forwarder's address on the guest's network,
+    /// which the guest gets as an `/etc/hosts` entry for AK's host name
+    /// (`--add-host`). The guest does not depend on the engine's DNS for
+    /// it, which a gVisor guest on an internal Docker network cannot reach.
+    /// An address that cannot be read stops the run like a failed setup.
+    pub host_lookup: Option<HostLookup>,
     pub program: String,
     pub args: Vec<String>,
     /// Run after the guest, whatever the outcome: remove the container
-    /// (the engine client exiting does not stop it) and prune the job's
-    /// own image.
+    /// (the engine client exiting does not stop it), its network, and
+    /// prune the job's own image.
     pub cleanup: Vec<Cmd>,
 }
 
+/// How to find the address `host` should resolve to in the guest: `cmd`
+/// prints it (one IP address).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLookup {
+    pub host: String,
+    pub cmd: Cmd,
+}
+
+/// `args` (an engine `run` command line, `args[0] == "run"`) with
+/// `--add-host=<host>:<ip>` added among the run options, before the image.
+pub fn with_host_entry(args: &[String], host: &str, ip: &str) -> Vec<String> {
+    let mut out = args.to_vec();
+    out.insert(1.min(out.len()), format!("--add-host={host}:{ip}"));
+    out
+}
+
+/// The IP address a lookup command printed, or why there is none.
+pub fn parse_lookup_ip(stdout: &str) -> Result<String, String> {
+    let text = stdout.trim();
+    match text.parse::<std::net::IpAddr>() {
+        Ok(ip) if !ip.is_unspecified() => Ok(ip.to_string()),
+        _ => Err(format!("printed `{text}`, not an IP address")),
+    }
+}
+
 /// Leftover guests of this worker: `list` prints one container id per
-/// line, `remove` (with the ids appended) removes them.
+/// line, `remove` (with the ids appended) removes them. `networks`, when
+/// the runner creates any, prints one leftover guest network per line;
+/// each is torn down with [`SandboxRunner::network_teardown`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reap {
     pub list: Cmd,
     pub remove: Cmd,
+    pub networks: Option<Cmd>,
 }
 
 /// The pluggable sandbox interface. A runner renders a [`GuestSpec`] into
@@ -441,6 +491,11 @@ pub trait SandboxRunner: Send + Sync {
     /// no state between jobs.
     fn reap(&self) -> Option<Reap> {
         None
+    }
+    /// The commands that remove the guest network `network` (detach the
+    /// forwarder, then remove the network). Empty: the runner creates none.
+    fn network_teardown(&self, _network: &str) -> Vec<Cmd> {
+        Vec::new()
     }
 }
 
@@ -483,8 +538,10 @@ pub struct OciRunner {
     /// (`AK_MCP_SANDBOX_RUNTIME`). Anything but gVisor or Kata is refused
     /// unless `allow_default_runtime`.
     pub runtime: String,
-    /// The pre-created network that reaches only AK (`AK_MCP_SANDBOX_NETWORK`).
-    pub ak_network: String,
+    /// The container of the AK forwarder (`AK_MCP_SANDBOX_GATEWAY`, default
+    /// `ak-gateway`). Every npm or PyPI guest gets an internal network of
+    /// its own, and this container joins it under the AK hostname.
+    pub gateway: String,
     pub memory: String,
     pub cpus: String,
     pub pids_limit: u32,
@@ -494,12 +551,36 @@ pub struct OciRunner {
     pub owner: String,
 }
 
+/// The forwarder's container name in `compose.sandbox-network.yaml`.
+pub const DEFAULT_GATEWAY: &str = "ak-gateway";
+
+/// The host part of the job's AK base URL (`akBaseUrl`, the backend's
+/// public base URL; the worker's `AK_URL` only when the job has none), the
+/// name the forwarder answers on in a guest network. An IP literal is a
+/// [`SandboxError::Deployment`] error: the guest would connect to it
+/// directly, and an internal network has no route to it.
+pub fn gateway_alias(ak_base_url: &str) -> Result<String, SandboxError> {
+    let url = url::Url::parse(ak_base_url)
+        .map_err(|e| SandboxError::Invalid(format!("AK URL `{ak_base_url}`: {e}")))?;
+    match url.host() {
+        Some(url::Host::Domain(d)) if !d.is_empty() => Ok(d.to_string()),
+        Some(_) => Err(SandboxError::Deployment(format!(
+            "AK base URL `{ak_base_url}` names an IP address; an npm or PyPI guest reaches \
+             AK through the forwarder under AK's host name, so the backend's public base \
+             URL must use one"
+        ))),
+        None => Err(SandboxError::Invalid(format!(
+            "AK URL `{ak_base_url}` has no host"
+        ))),
+    }
+}
+
 impl Default for OciRunner {
     fn default() -> Self {
         Self {
             engine: "podman".into(),
             runtime: "runsc".into(),
-            ak_network: "ak-mcp-sandbox".into(),
+            gateway: DEFAULT_GATEWAY.into(),
             memory: "1g".into(),
             cpus: "1".into(),
             pids_limit: 256,
@@ -521,6 +602,52 @@ impl OciRunner {
 
     fn owner_filter(&self) -> String {
         format!("label={OWNER_LABEL}={}", name_part(&self.owner, 128))
+    }
+
+    fn labels(&self, job: &str) -> [String; 2] {
+        [
+            format!("--label={SANDBOX_LABEL}={job}"),
+            format!("--label={OWNER_LABEL}={}", name_part(&self.owner, 128)),
+        ]
+    }
+
+    /// The command that prints the forwarder's address on `network`. The
+    /// `NetworkSettings.Networks.<name>.IPAddress` template works with both
+    /// Docker and Podman `container inspect`.
+    fn gateway_ip_lookup(&self, network: &str) -> Cmd {
+        let format = format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}");
+        Cmd::new(
+            &self.engine,
+            &["container", "inspect", "--format", &format, &self.gateway],
+        )
+    }
+
+    /// The commands that give a guest its own network `network`: an
+    /// internal network (no route out, no other guest), labelled like the
+    /// guest so a crashed worker's leftovers are reaped, which the
+    /// forwarder then joins under the AK hostname `alias`. Either failing
+    /// aborts the run.
+    fn network_setup(&self, network: &str, job: &str, alias: &str) -> Vec<Cmd> {
+        let mut create: Vec<String> = vec!["network".into(), "create".into(), "--internal".into()];
+        create.extend(self.labels(job));
+        create.push(network.into());
+        vec![
+            Cmd {
+                program: self.engine.clone(),
+                args: create,
+            },
+            Cmd::new(
+                &self.engine,
+                &[
+                    "network",
+                    "connect",
+                    "--alias",
+                    alias,
+                    network,
+                    &self.gateway,
+                ],
+            ),
+        ]
     }
 }
 
@@ -545,25 +672,36 @@ impl SandboxRunner for OciRunner {
                  runs it anyway)"
             )));
         }
-        let network = match spec.network.as_str() {
-            "none" => "none".to_string(),
-            _ => self.ak_network.clone(),
-        };
         // A fresh name per attempt: a retry never collides with a guest of
-        // an earlier attempt that is still being removed.
+        // an earlier attempt that is still being removed. The guest's own
+        // network (npm, PyPI) carries the same name.
         let job = name_part(&spec.job_id, 64);
         let name = format!(
             "ak-mcp-sbx-{job}-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
+        let (network, setup, setup_alias) = match spec.network.as_str() {
+            "none" => ("none".to_string(), Vec::new(), None),
+            _ => {
+                if self.gateway.trim().is_empty() {
+                    return Err(SandboxError::Deployment(
+                        "AK_MCP_SANDBOX_GATEWAY is empty: npm and PyPI guests reach AK only \
+                         through the forwarder"
+                            .into(),
+                    ));
+                }
+                let alias = gateway_alias(&spec.ak_base_url)?;
+                let setup = self.network_setup(&name, &job, &alias);
+                (name.clone(), setup, Some(alias))
+            }
+        };
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
             "-i".into(),
             format!("--name={name}"),
-            format!("--label={SANDBOX_LABEL}={job}"),
-            format!("--label={OWNER_LABEL}={}", name_part(&self.owner, 128)),
         ];
+        args.extend(self.labels(&job));
         if !self.runtime.is_empty() {
             args.push(format!("--runtime={}", self.runtime));
         }
@@ -597,10 +735,19 @@ impl SandboxRunner for OciRunner {
         args.push(spec.image.clone());
         args.extend(spec.argv.iter().cloned());
         let mut cleanup = vec![Cmd::new(&self.engine, &["rm", "-f", &name])];
+        if !setup.is_empty() {
+            cleanup.extend(self.network_teardown(&name));
+        }
         if spec.prune_image {
             cleanup.push(Cmd::new(&self.engine, &["rmi", &spec.image]));
         }
+        let host_lookup = setup_alias.map(|host| HostLookup {
+            host,
+            cmd: self.gateway_ip_lookup(&name),
+        });
         Ok(RunPlan {
+            setup,
+            host_lookup,
             program: self.engine.clone(),
             args,
             cleanup,
@@ -608,13 +755,28 @@ impl SandboxRunner for OciRunner {
     }
 
     fn reap(&self) -> Option<Reap> {
+        let filter = self.owner_filter();
         Some(Reap {
-            list: Cmd::new(
-                &self.engine,
-                &["ps", "-a", "-q", "--filter", &self.owner_filter()],
-            ),
+            list: Cmd::new(&self.engine, &["ps", "-a", "-q", "--filter", &filter]),
             remove: Cmd::new(&self.engine, &["rm", "-f"]),
+            networks: Some(Cmd::new(
+                &self.engine,
+                &["network", "ls", "-q", "--filter", &filter],
+            )),
         })
+    }
+
+    /// Detach the forwarder, then remove the network. Never `network rm
+    /// -f`: that removes every container on the network, the forwarder
+    /// included.
+    fn network_teardown(&self, network: &str) -> Vec<Cmd> {
+        vec![
+            Cmd::new(
+                &self.engine,
+                &["network", "disconnect", "-f", network, &self.gateway],
+            ),
+            Cmd::new(&self.engine, &["network", "rm", network]),
+        ]
     }
 }
 
@@ -639,34 +801,56 @@ impl SandboxRunner for ExternalRunner {
             args: vec![
                 serde_json::to_string(spec).map_err(|e| SandboxError::Invalid(e.to_string()))?
             ],
-            cleanup: Vec::new(),
+            ..Default::default()
         })
     }
 }
 
 /// The runner the environment configures: `AK_MCP_SANDBOX_COMMAND` selects
 /// an [`ExternalRunner`], otherwise an [`OciRunner`] from
-/// `AK_MCP_SANDBOX_ENGINE` / `_RUNTIME` / `_NETWORK` / `_MEMORY` / `_CPUS`,
+/// `AK_MCP_SANDBOX_ENGINE` / `_RUNTIME` / `_GATEWAY` / `_MEMORY` / `_CPUS`,
 /// labelling its guests with `owner` (the worker id).
+///
+/// A configuration that cannot isolate guests is an error, and the worker
+/// does not start: the retired `AK_MCP_SANDBOX_NETWORK` (a shared guest
+/// network, #5447) or an empty `AK_MCP_SANDBOX_GATEWAY`. Refusing per job
+/// instead would let a running worker claim and fail every job.
 pub fn runner_from_env(
     get: impl Fn(&str) -> Option<String>,
     owner: &str,
-) -> Box<dyn SandboxRunner> {
+) -> Result<Box<dyn SandboxRunner>, String> {
     if let Some(command) = get("AK_MCP_SANDBOX_COMMAND").filter(|c| !c.is_empty()) {
-        return Box::new(ExternalRunner { command });
+        return Ok(Box::new(ExternalRunner { command }));
+    }
+    if let Some(net) = get("AK_MCP_SANDBOX_NETWORK").filter(|n| !n.is_empty()) {
+        return Err(format!(
+            "AK_MCP_SANDBOX_NETWORK={net} is no longer supported: guests that share a network \
+             can reach each other (#5447). Unset it (and remove that network); every npm or \
+             PyPI guest now gets an internal network of its own that only the forwarder \
+             (AK_MCP_SANDBOX_GATEWAY, default `{DEFAULT_GATEWAY}`) joins. \
+             docs/security/mcp-sandbox.md, \"Guest networks\""
+        ));
     }
     let d = OciRunner::default();
-    Box::new(OciRunner {
+    let r = OciRunner {
         engine: get("AK_MCP_SANDBOX_ENGINE").unwrap_or(d.engine),
         runtime: get("AK_MCP_SANDBOX_RUNTIME").unwrap_or(d.runtime),
-        ak_network: get("AK_MCP_SANDBOX_NETWORK").unwrap_or(d.ak_network),
+        gateway: get("AK_MCP_SANDBOX_GATEWAY").unwrap_or(d.gateway),
         memory: get("AK_MCP_SANDBOX_MEMORY").unwrap_or(d.memory),
         cpus: get("AK_MCP_SANDBOX_CPUS").unwrap_or(d.cpus),
         allow_default_runtime: get("AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME").as_deref()
             == Some("true"),
         owner: owner.to_string(),
         ..d
-    })
+    };
+    if r.gateway.trim().is_empty() {
+        return Err(
+            "AK_MCP_SANDBOX_GATEWAY is empty: npm and PyPI guests reach AK only through the \
+             forwarder container it names (default `ak-gateway`)"
+                .into(),
+        );
+    }
+    Ok(Box::new(r))
 }
 
 pub fn images_from_env(get: impl Fn(&str) -> Option<String>) -> Images {
@@ -713,23 +897,77 @@ fn command(program: &str, args: &[String]) -> tokio::process::Command {
     c
 }
 
-/// Run a short engine command (cleanup, listing) to completion within
-/// `limit`; its stdout when it ran.
-async fn run_cmd(cmd: &Cmd, limit: Duration) -> Option<(std::process::ExitStatus, String)> {
+/// Run a short engine command (setup, cleanup, listing) to completion
+/// within `limit`; its exit status and output when it ran.
+async fn run_cmd(cmd: &Cmd, limit: Duration) -> Option<std::process::Output> {
     let child = command(&cmd.program, &cmd.args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
-    let out = tokio::time::timeout(limit, child.wait_with_output())
+    tokio::time::timeout(limit, child.wait_with_output())
         .await
         .ok()?
-        .ok()?;
-    Some((
-        out.status,
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    ))
+        .ok()
+}
+
+/// The start of a command's stderr, for an error or a warning.
+fn stderr_head(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr[..out.stderr.len().min(STDERR_KEEP)])
+        .trim()
+        .to_string()
+}
+
+/// Run a plan's setup and host lookup: the plan to start, with the
+/// forwarder's `--add-host` entry, or why the guest must not start.
+async fn prepare(plan: &RunPlan) -> Result<RunPlan, String> {
+    run_setup(&plan.setup).await?;
+    let Some(lookup) = &plan.host_lookup else {
+        return Ok(plan.clone());
+    };
+    let line = format!("{} {}", lookup.cmd.program, lookup.cmd.args.join(" "));
+    let ip = match run_cmd(&lookup.cmd, CLEANUP_TIMEOUT).await {
+        Some(out) if out.status.success() => parse_lookup_ip(&String::from_utf8_lossy(&out.stdout)),
+        Some(out) => Err(format!("{}: {}", out.status, stderr_head(&out))),
+        None => Err("could not be run or timed out".into()),
+    }
+    .map_err(|why| {
+        format!(
+            "the forwarder's address on the guest network could not be read, so the guest \
+             was not started: `{line}` failed ({why})"
+        )
+    })?;
+    Ok(RunPlan {
+        args: with_host_entry(&plan.args, &lookup.host, &ip),
+        ..plan.clone()
+    })
+}
+
+/// Run a plan's setup commands in order, stopping at the first that does
+/// not succeed: why it failed, with the start of its stderr.
+async fn run_setup(setup: &[Cmd]) -> Result<(), String> {
+    for cmd in setup {
+        let why = match run_cmd(cmd, CLEANUP_TIMEOUT).await {
+            Some(out) if out.status.success() => continue,
+            Some(out) => {
+                let err = stderr_head(&out);
+                format!(
+                    "{}{}{err}",
+                    out.status,
+                    if err.is_empty() { "" } else { ": " }
+                )
+            }
+            None => "could not be run or timed out".into(),
+        };
+        return Err(format!(
+            "the guest network could not be prepared, so the guest was not started: `{} {}` \
+             failed ({why})",
+            cmd.program,
+            cmd.args.join(" ")
+        ));
+    }
+    Ok(())
 }
 
 /// Remove the guests a previous run of this worker left behind. The number
@@ -738,27 +976,58 @@ pub async fn reap_leftovers(runner: &dyn SandboxRunner) -> Result<usize, String>
     let Some(reap) = runner.reap() else {
         return Ok(0);
     };
-    let (status, out) = run_cmd(&reap.list, CLEANUP_TIMEOUT)
-        .await
-        .ok_or_else(|| format!("`{}` could not be run", reap.list.program))?;
-    if !status.success() {
-        return Err(format!("listing leftover guests failed ({status})"));
+    let ids = list_lines(&reap.list, "guests").await?;
+    if !ids.is_empty() {
+        let mut remove = reap.remove.clone();
+        remove.args.extend(ids.iter().cloned());
+        match run_cmd(&remove, CLEANUP_TIMEOUT).await {
+            Some(out) if out.status.success() => {}
+            _ => return Err(format!("removing {} leftover guest(s) failed", ids.len())),
+        }
     }
-    let ids: Vec<String> = out
+    // The guests' own networks, once no guest uses them.
+    if let Some(list) = &reap.networks {
+        for net in list_lines(list, "guest networks").await? {
+            for cmd in runner.network_teardown(&net) {
+                run_logged(&cmd, "leftover guest network teardown").await;
+            }
+        }
+    }
+    Ok(ids.len())
+}
+
+/// Run a cleanup or teardown command; warn, naming it, when it could not be
+/// run or exited non-zero. Whether it succeeded.
+async fn run_logged(cmd: &Cmd, what: &str) -> bool {
+    let line = format!("{} {}", cmd.program, cmd.args.join(" "));
+    match run_cmd(cmd, CLEANUP_TIMEOUT).await {
+        Some(out) if out.status.success() => true,
+        Some(out) => {
+            let err = stderr_head(&out);
+            tracing::warn!(command = %line, status = %out.status, stderr = %err, "{what} failed");
+            false
+        }
+        None => {
+            tracing::warn!(command = %line, "{what} did not run");
+            false
+        }
+    }
+}
+
+/// The non-empty lines `list` prints, or why it could not be listed.
+async fn list_lines(list: &Cmd, what: &str) -> Result<Vec<String>, String> {
+    let out = run_cmd(list, CLEANUP_TIMEOUT)
+        .await
+        .ok_or_else(|| format!("`{}` could not be run", list.program))?;
+    if !out.status.success() {
+        return Err(format!("listing leftover {what} failed ({})", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(String::from)
-        .collect();
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let mut remove = reap.remove.clone();
-    remove.args.extend(ids.iter().cloned());
-    match run_cmd(&remove, CLEANUP_TIMEOUT).await {
-        Some((s, _)) if s.success() => Ok(ids.len()),
-        _ => Err(format!("removing {} leftover guest(s) failed", ids.len())),
-    }
+        .collect())
 }
 
 /// Stop the engine client or launcher: `SIGTERM`, then `SIGKILL` after
@@ -796,11 +1065,17 @@ pub async fn run_and_probe_within(
     max_bytes: usize,
     wall_clock: Duration,
 ) -> crate::protocol::ProbeReport {
-    let report = probe_child(plan, max_items, max_bytes, wall_clock).await;
+    let report = match prepare(plan).await {
+        Ok(ready) => probe_child(&ready, max_items, max_bytes, wall_clock).await,
+        Err(e) => crate::protocol::ProbeReport {
+            outcome: "start_failed".into(),
+            auth_state: "none".into(),
+            error: Some(e),
+            ..Default::default()
+        },
+    };
     for cmd in &plan.cleanup {
-        if run_cmd(cmd, CLEANUP_TIMEOUT).await.is_none() {
-            tracing::warn!(program = %cmd.program, args = ?cmd.args, "sandbox cleanup did not run");
-        }
+        run_logged(cmd, "sandbox cleanup").await;
     }
     report
 }
@@ -1057,7 +1332,6 @@ mod tests {
             "--rm",
             "-i",
             "--runtime=runsc",
-            "--network=ak-mcp-sandbox",
             "--read-only",
             "--user=65532:65532",
             "--cap-drop=ALL",
@@ -1096,11 +1370,12 @@ mod tests {
             .to_string();
         assert!(name.starts_with("ak-mcp-sbx-j1-"), "{name}");
         assert_eq!(
-            plan.cleanup,
-            [Cmd::new("podman", &["rm", "-f", &name])],
+            plan.cleanup[0],
+            Cmd::new("podman", &["rm", "-f", &name]),
             "{:?}",
             plan.cleanup
         );
+        assert!(!plan.cleanup.iter().any(|c| c.args[0] == "rmi"));
         let again = OciRunner::default().plan(&spec).unwrap();
         assert!(!again.args.iter().any(|a| *a == format!("--name={name}")));
         // Docker has no --timeout / --http-proxy.
@@ -1125,6 +1400,9 @@ mod tests {
         // The job's own image is pruned after the container is removed.
         assert_eq!(plan.cleanup.len(), 2);
         assert_eq!(plan.cleanup[1], Cmd::new("podman", &["rmi", &spec.image]));
+        // No network is created for it, and none removed.
+        assert!(plan.setup.is_empty());
+        assert!(plan.host_lookup.is_none());
         // No runtime: refused unless the operator explicitly allows it.
         let r = OciRunner {
             runtime: String::new(),
@@ -1165,7 +1443,9 @@ mod tests {
             }
         };
         assert_eq!(
-            runner_from_env(env(&[("AK_MCP_SANDBOX_COMMAND", "/x")]), "w").name(),
+            runner_from_env(env(&[("AK_MCP_SANDBOX_COMMAND", "/x")]), "w")
+                .unwrap()
+                .name(),
             "external"
         );
         let r = runner_from_env(
@@ -1174,7 +1454,8 @@ mod tests {
                 ("AK_MCP_SANDBOX_RUNTIME", "kata-fc"),
             ]),
             "host-1",
-        );
+        )
+        .unwrap();
         assert_eq!(r.name(), "oci");
         let p = r.plan(&spec).unwrap();
         assert_eq!(p.program, "docker");
@@ -1183,6 +1464,11 @@ mod tests {
             .args
             .iter()
             .any(|a| a == "--label=com.artifactkeeper.mcp-sandbox.owner=host-1"));
+        let p = runner_from_env(env(&[("AK_MCP_SANDBOX_GATEWAY", "fwd")]), "w")
+            .unwrap()
+            .plan(&spec)
+            .unwrap();
+        assert_eq!(p.setup[1].args.last().unwrap(), "fwd");
         assert_eq!(
             images_from_env(env(&[("AK_MCP_SANDBOX_NODE_IMAGE", "ak/node")])).node,
             "ak/node"
@@ -1281,11 +1567,355 @@ mod tests {
         );
     }
 
+    fn network_arg(plan: &RunPlan) -> String {
+        let nets: Vec<&str> = plan
+            .args
+            .iter()
+            .filter_map(|a| a.strip_prefix("--network="))
+            .collect();
+        assert_eq!(nets.len(), 1, "exactly one --network: {:?}", plan.args);
+        nets[0].to_string()
+    }
+
+    fn pypi_target() -> Value {
+        json!({"package": {"registryType": "pypi", "identifier": "acme-mcp", "version": "2.0",
+            "registryBaseUrl": "https://ak.example.test/pypi/pypi-remote"}})
+    }
+
+    /// #5447: every npm and PyPI guest gets an internal network of its own
+    /// that only the forwarder joins, created before the guest starts and
+    /// removed after it; never a network another guest shares.
+    #[test]
+    fn npm_and_pypi_guests_get_a_network_of_their_own() {
+        for target in [npm_target(), pypi_target()] {
+            let spec = guest_spec("j1", &target, AK, &Images::default()).unwrap();
+            let r = OciRunner::default();
+            let plan = r.plan(&spec).unwrap();
+            let name = plan
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix("--name="))
+                .unwrap()
+                .to_string();
+            let net = network_arg(&plan);
+            assert_eq!(net, name, "the guest's network is its own");
+            assert_ne!(net, "ak-mcp-sandbox");
+            assert_eq!(
+                plan.setup,
+                [
+                    Cmd::new(
+                        "podman",
+                        &[
+                            "network",
+                            "create",
+                            "--internal",
+                            "--label=com.artifactkeeper.mcp-sandbox=j1",
+                            "--label=com.artifactkeeper.mcp-sandbox.owner=ak-mcp-introspector",
+                            &net,
+                        ]
+                    ),
+                    Cmd::new(
+                        "podman",
+                        &[
+                            "network",
+                            "connect",
+                            "--alias",
+                            "ak.example.test",
+                            &net,
+                            "ak-gateway"
+                        ]
+                    ),
+                ]
+            );
+            // The guest gets the forwarder's address on its network as a
+            // hosts entry (no dependence on the engine's DNS).
+            let fmt = format!("{{{{(index .NetworkSettings.Networks \"{net}\").IPAddress}}}}");
+            assert_eq!(
+                plan.host_lookup,
+                Some(HostLookup {
+                    host: "ak.example.test".into(),
+                    cmd: Cmd::new(
+                        "podman",
+                        &["container", "inspect", "--format", &fmt, "ak-gateway"]
+                    ),
+                })
+            );
+            // Removed after the guest, the forwarder detached first (never
+            // `network rm -f`, which would remove the forwarder too).
+            assert_eq!(
+                plan.cleanup,
+                [
+                    Cmd::new("podman", &["rm", "-f", &name]),
+                    Cmd::new(
+                        "podman",
+                        &["network", "disconnect", "-f", &net, "ak-gateway"]
+                    ),
+                    Cmd::new("podman", &["network", "rm", &net]),
+                ]
+            );
+            assert!(!plan.cleanup.iter().any(|c| c.args.contains(&"-f".into())
+                && c.args.first().map(String::as_str) == Some("network")
+                && c.args.get(1).map(String::as_str) == Some("rm")));
+            // Two guests of the same job never share one.
+            let other = network_arg(&r.plan(&spec).unwrap());
+            assert_ne!(other, net);
+        }
+        // The forwarder's name and the engine are configurable; the AK
+        // hostname alias carries no port.
+        let spec = guest_spec(
+            "j9",
+            &json!({"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "registryBaseUrl": "https://ak.example.test:8443/npm/r"}}),
+            "https://ak.example.test:8443",
+            &Images::default(),
+        )
+        .unwrap();
+        let plan = OciRunner {
+            engine: "docker".into(),
+            runtime: "kata-fc".into(),
+            gateway: "fwd-1".into(),
+            ..Default::default()
+        }
+        .plan(&spec)
+        .unwrap();
+        let net = network_arg(&plan);
+        assert_eq!(plan.setup[0].program, "docker");
+        assert_eq!(
+            plan.setup[1].args,
+            [
+                "network",
+                "connect",
+                "--alias",
+                "ak.example.test",
+                &net,
+                "fwd-1"
+            ]
+        );
+        assert_eq!(
+            plan.cleanup[1].args,
+            ["network", "disconnect", "-f", &net, "fwd-1"]
+        );
+    }
+
+    /// #5447: a configuration that cannot isolate guests is no runner at
+    /// all, so the worker does not start (and claims nothing) instead of
+    /// failing every job it claims.
+    #[test]
+    fn a_configuration_that_cannot_isolate_guests_is_no_runner() {
+        let get = |pairs: Vec<(&'static str, &'static str)>| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let Err(m) = runner_from_env(get(vec![("AK_MCP_SANDBOX_NETWORK", "ak-mcp-sandbox")]), "w")
+        else {
+            panic!("a shared guest network must be refused");
+        };
+        assert!(m.contains("AK_MCP_SANDBOX_NETWORK=ak-mcp-sandbox"), "{m}");
+        assert!(m.contains("#5447"), "{m}");
+        let Err(m) = runner_from_env(get(vec![("AK_MCP_SANDBOX_GATEWAY", "")]), "w") else {
+            panic!("an empty gateway must be refused");
+        };
+        assert!(m.contains("AK_MCP_SANDBOX_GATEWAY"), "{m}");
+        // Set but empty is the same as unset; an external launcher has no
+        // use for either.
+        assert!(runner_from_env(get(vec![("AK_MCP_SANDBOX_NETWORK", "")]), "w").is_ok());
+        assert!(runner_from_env(
+            get(vec![
+                ("AK_MCP_SANDBOX_COMMAND", "/opt/launch"),
+                ("AK_MCP_SANDBOX_NETWORK", "x")
+            ]),
+            "w"
+        )
+        .is_ok());
+    }
+
+    /// What `plan` cannot run for the deployment's sake (no forwarder, an
+    /// AK base URL the forwarder cannot stand in for) is a deployment
+    /// error, which the worker reports as retryable `start_failed`.
+    #[test]
+    fn configurations_that_cannot_isolate_guests_are_refused() {
+        let npm = guest_spec("j1", &npm_target(), AK, &Images::default()).unwrap();
+        let oci = guest_spec(
+            "j3",
+            &json!({"package": {"registryType": "oci",
+                "identifier": "ak.example.test/oci/acme/mcp@sha256:abc"}}),
+            AK,
+            &Images::default(),
+        )
+        .unwrap();
+        // No forwarder: npm/PyPI refused, OCI (no network) still runs.
+        let no_gw = OciRunner {
+            gateway: " ".into(),
+            ..Default::default()
+        };
+        assert!(
+            matches!(no_gw.plan(&npm), Err(SandboxError::Deployment(m)) if m.contains("AK_MCP_SANDBOX_GATEWAY"))
+        );
+        assert_eq!(network_arg(&no_gw.plan(&oci).unwrap()), "none");
+        // An AK URL that is an IP address: the guest would bypass the
+        // forwarder's alias, and an internal network has no route to it.
+        let mut by_ip = npm.clone();
+        by_ip.ak_base_url = "https://203.0.113.10".into();
+        assert!(matches!(
+            OciRunner::default().plan(&by_ip),
+            Err(SandboxError::Deployment(_))
+        ));
+    }
+
+    #[test]
+    fn the_forwarder_alias_is_the_ak_host_name() {
+        assert_eq!(
+            gateway_alias("https://ak.example.com").unwrap(),
+            "ak.example.com"
+        );
+        assert_eq!(
+            gateway_alias("https://ak.example.com:8443/base/").unwrap(),
+            "ak.example.com"
+        );
+        for ip in ["https://203.0.113.10", "http://[2001:db8::1]:8080"] {
+            assert!(
+                matches!(gateway_alias(ip), Err(SandboxError::Deployment(_))),
+                "{ip}"
+            );
+        }
+        for bad in ["not a url", "unix:/run/ak.sock"] {
+            assert!(
+                matches!(gateway_alias(bad), Err(SandboxError::Invalid(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The guest's network not being created, or the forwarder not joining
+    /// it, aborts the run before the guest starts: `start_failed` with the
+    /// engine's message, and the cleanup still runs.
+    #[tokio::test]
+    async fn a_guest_never_starts_without_its_network() {
+        let dir = scratch();
+        let started = dir.join("started");
+        let cleaned = dir.join("cleaned");
+        let mut plan = sh(&format!("touch {}; exit 0", started.display()));
+        plan.cleanup = vec![Cmd::new(
+            "sh",
+            &["-c", &format!("touch {}", cleaned.display())],
+        )];
+        for failing in [
+            vec![Cmd::new(
+                "sh",
+                &["-c", "echo 'Error: network already exists' >&2; exit 125"],
+            )],
+            vec![
+                Cmd::new("true", &[]),
+                Cmd::new(
+                    "sh",
+                    &[
+                        "-c",
+                        "echo 'Error: no container with name ak-gateway' >&2; exit 125",
+                    ],
+                ),
+            ],
+            vec![Cmd::new("/nonexistent/podman", &["network", "create"])],
+        ] {
+            plan.setup = failing;
+            let r = run_and_probe(&plan, 10, 1024).await;
+            assert_eq!(r.outcome, "start_failed", "{r:?}");
+            let e = r.error.unwrap();
+            assert!(e.contains("guest was not started"), "{e}");
+            assert!(!started.exists(), "the guest ran without its network");
+            assert!(cleaned.exists(), "cleanup ran");
+            std::fs::remove_file(&cleaned).unwrap();
+        }
+        let r = run_and_probe(&plan, 10, 1024).await;
+        assert!(r
+            .error
+            .unwrap()
+            .contains("/nonexistent/podman network create"));
+        // Every setup command succeeding: the guest runs.
+        plan.setup = vec![Cmd::new("true", &[]), Cmd::new("true", &[])];
+        assert_eq!(run_and_probe(&plan, 10, 1024).await.outcome, "needs_config");
+        assert!(started.exists());
+        // The stderr kept for the error names the cause.
+        plan.setup = vec![Cmd::new(
+            "sh",
+            &["-c", "echo 'Error: network already exists' >&2; exit 125"],
+        )];
+        let e = run_and_probe(&plan, 10, 1024).await.error.unwrap();
+        assert!(e.contains("network already exists"), "{e}");
+    }
+
+    #[test]
+    fn host_entries_and_lookup_output() {
+        let args: Vec<String> = ["run", "--rm", "img"].map(String::from).to_vec();
+        assert_eq!(
+            with_host_entry(&args, "ak.example.test", "10.89.7.3"),
+            ["run", "--add-host=ak.example.test:10.89.7.3", "--rm", "img"]
+        );
+        assert_eq!(parse_lookup_ip("10.89.7.3\n").unwrap(), "10.89.7.3");
+        assert_eq!(parse_lookup_ip(" fd00::3 ").unwrap(), "fd00::3");
+        // What Docker and Podman print for a network the container is not on.
+        for bad in ["", "<no value>", "0.0.0.0", "ak-gateway"] {
+            assert!(parse_lookup_ip(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The forwarder's address is read after setup and handed to the guest
+    /// as `--add-host`; when it cannot be read the guest never starts.
+    #[tokio::test]
+    async fn the_guest_gets_the_forwarders_address_or_does_not_start() {
+        let dir = scratch();
+        let argv = dir.join("argv");
+        let engine = dir.join("engine");
+        std::fs::write(
+            &engine,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+                argv.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lookup = |script: &str| HostLookup {
+            host: "ak.example.test".into(),
+            cmd: Cmd::new("sh", &["-c", script]),
+        };
+        let mut plan = RunPlan {
+            setup: vec![Cmd::new("true", &[])],
+            host_lookup: Some(lookup("echo 10.89.7.3")),
+            program: engine.to_string_lossy().into_owned(),
+            args: ["run", "--rm", "img"].map(String::from).to_vec(),
+            cleanup: Vec::new(),
+        };
+        run_and_probe(&plan, 10, 1024).await;
+        assert_eq!(
+            std::fs::read_to_string(&argv).unwrap(),
+            "run\n--add-host=ak.example.test:10.89.7.3\n--rm\nimg\n"
+        );
+        for failing in [
+            "echo '<no value>'",
+            "echo 'Error: no such container ak-gateway' >&2; exit 125",
+        ] {
+            std::fs::remove_file(&argv).ok();
+            plan.host_lookup = Some(lookup(failing));
+            let r = run_and_probe(&plan, 10, 1024).await;
+            assert_eq!(r.outcome, "start_failed", "{r:?}");
+            assert!(
+                r.error.unwrap().contains("forwarder's address"),
+                "{failing}"
+            );
+            assert!(!argv.exists(), "the guest started without the address");
+        }
+    }
+
     fn sh(script: &str) -> RunPlan {
         RunPlan {
             program: "sh".into(),
             args: vec!["-c".into(), script.into()],
-            cleanup: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1372,7 +2002,7 @@ mod tests {
         std::fs::write(
             &engine,
             format!(
-                "#!/bin/sh\necho \"$*\" >> {}\ncase \"$1\" in ps) printf 'c1\\nc2\\n';; esac\n",
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \"$1 $2\" in ps*) printf 'c1\\nc2\\n';; 'network ls') printf 'n1\\n';; esac\n",
                 log.display()
             ),
         )
@@ -1388,7 +2018,11 @@ mod tests {
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
             calls,
-            "ps -a -q --filter label=com.artifactkeeper.mcp-sandbox.owner=host-1\nrm -f c1 c2\n"
+            "ps -a -q --filter label=com.artifactkeeper.mcp-sandbox.owner=host-1\n\
+             rm -f c1 c2\n\
+             network ls -q --filter label=com.artifactkeeper.mcp-sandbox.owner=host-1\n\
+             network disconnect -f n1 ak-gateway\n\
+             network rm n1\n"
         );
         assert_eq!(
             reap_leftovers(&ExternalRunner {

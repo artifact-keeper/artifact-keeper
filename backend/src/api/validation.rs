@@ -14,7 +14,12 @@
 //!    [`is_blocked_url`] on every redirect hop. This closes the
 //!    redirect-follow bypass — without it, an upstream returning
 //!    `302 Location: http://[::ffff:127.0.0.1]/` would defeat layer 1.
-//! 3. Egress NetworkPolicy at the cluster layer is a defense-in-depth
+//! 3. Under an environment proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+//!    either case) the guarded clients resolve and check every destination
+//!    they would hand to the proxy, refusing one that does not resolve,
+//!    since the connect-time resolver never sees a proxied destination
+//!    (#5459; `services::env_proxy_guard`).
+//! 4. Egress NetworkPolicy at the cluster layer is a defense-in-depth
 //!    follow-up tracked separately.
 //!
 //! # Residual gaps
@@ -23,6 +28,11 @@
 //! time and a private IP at fetch time is not caught by string-based
 //! validation. Mitigation requires a custom DNS resolver or pinning the
 //! resolved IP via `reqwest`'s `resolve_to_addrs`. Tracked as a follow-up.
+//!
+//! Proxied destinations: a proxy resolves the destination name itself, so
+//! the check in layer 3 cannot bind the proxy to the address it saw. An
+//! answer that changes between that check and the proxy's own lookup is
+//! for the proxy's destination policy to refuse.
 
 use crate::error::{AppError, Result};
 
@@ -76,6 +86,10 @@ const BLOCKED_HOSTS: &[&str] = &[
 pub(crate) enum BlockReason {
     Hostname(String),
     Ip(std::net::IpAddr),
+    /// A host name that did not resolve, where an unresolvable destination
+    /// is refused rather than left to connect time (a proxied destination,
+    /// #5459).
+    Unresolved(String),
 }
 
 impl BlockReason {
@@ -84,6 +98,7 @@ impl BlockReason {
         match self {
             BlockReason::Hostname(_) => "hostname",
             BlockReason::Ip(_) => "ip",
+            BlockReason::Unresolved(_) => "unresolved",
         }
     }
 }
@@ -375,6 +390,9 @@ fn block_reason_to_error(label: &str, reason: BlockReason, ctx: OutboundUrlConte
             AppError::Validation(format!("{} host '{}' is not allowed", label, host))
         }
         BlockReason::Ip(ip) => AppError::Validation(blocked_ip_message(label, ip, ctx)),
+        BlockReason::Unresolved(host) => {
+            AppError::Validation(format!("{} host '{}' could not be resolved", label, host))
+        }
     }
 }
 
@@ -458,20 +476,28 @@ fn is_blocked_url_in(url: &reqwest::Url, ctx: OutboundUrlContext) -> Option<Bloc
     is_blocked_host_str(host, ctx)
 }
 
-/// Decide whether a host string (a DNS name or an IP literal, possibly
-/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
-/// given context. Factored out of [`is_blocked_url_in`] so the
-/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
-/// live in one place and are shared by [`validate_outbound_ldap_url`]
-/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
-fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
+/// The part of a host check that needs no DNS: the `BLOCKED_HOSTS` names
+/// and IP literals. Shared by the validation-time check
+/// ([`is_blocked_host_str`]) and the environment-proxy destination check
+/// (`services::env_proxy_guard`, #5459), which resolves asynchronously.
+pub(crate) enum HostVerdict {
+    /// Refused without a lookup.
+    Blocked(BlockReason),
+    /// An allowed IP literal: nothing to resolve.
+    Allowed,
+    /// A DNS name (lowercased, trailing dot removed) whose addresses decide.
+    Resolve(String),
+}
+
+/// See [`HostVerdict`]. `host` may be a bracketed IPv6 literal (`[::1]`).
+pub(crate) fn host_verdict(host: &str, ctx: OutboundUrlContext) -> HostVerdict {
     let host_lower = host.to_lowercase();
     // Strip a trailing dot so `localhost.` is treated like `localhost`.
     let host_normalized = host_lower.trim_end_matches('.');
 
     for blocked in BLOCKED_HOSTS {
         if host_normalized == *blocked || host_normalized.ends_with(&format!(".{}", blocked)) {
-            return Some(BlockReason::Hostname(host.to_string()));
+            return HostVerdict::Blocked(BlockReason::Hostname(host.to_string()));
         }
     }
 
@@ -482,13 +508,49 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = bare_host.parse::<std::net::IpAddr>() {
-        if is_blocked_ip_in(ip, ctx) {
-            return Some(BlockReason::Ip(ip));
-        }
         // An IP literal carries no DNS resolution step, so once the IP
         // itself is cleared there is nothing more to check.
-        return None;
+        return match first_blocked_ip([ip], ctx) {
+            Some(reason) => HostVerdict::Blocked(reason),
+            None => HostVerdict::Allowed,
+        };
     }
+    HostVerdict::Resolve(host_normalized.to_string())
+}
+
+/// The first of `ips` the policy for `ctx` refuses, as a [`BlockReason`].
+pub(crate) fn first_blocked_ip(
+    ips: impl IntoIterator<Item = std::net::IpAddr>,
+    ctx: OutboundUrlContext,
+) -> Option<BlockReason> {
+    ips.into_iter()
+        .find(|ip| is_blocked_ip_in(*ip, ctx))
+        .map(BlockReason::Ip)
+}
+
+/// Decide whether a host string (a DNS name or an IP literal, possibly
+/// bracketed for IPv6 like `[::1]`) targets a blocked address for the
+/// given context. Factored out of [`is_blocked_url_in`] so the
+/// `BLOCKED_HOSTS` list, literal-IP rules, and hostname-resolution step
+/// live in one place and are shared by [`validate_outbound_ldap_url`]
+/// (which cannot reuse the http(s)-only [`validate_outbound_url`]).
+fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReason> {
+    is_blocked_host_str_with(host, ctx, false)
+}
+
+/// [`is_blocked_host_str`], refusing a DNS name that does not resolve when
+/// `fail_closed` (a destination that will be handed to a proxy, which
+/// resolves it on its own, #5459).
+fn is_blocked_host_str_with(
+    host: &str,
+    ctx: OutboundUrlContext,
+    fail_closed: bool,
+) -> Option<BlockReason> {
+    let name = match host_verdict(host, ctx) {
+        HostVerdict::Blocked(reason) => return Some(reason),
+        HostVerdict::Allowed => return None,
+        HostVerdict::Resolve(name) => name,
+    };
 
     // The host is a DNS name, not an IP literal. The string-based checks
     // above (BLOCKED_HOSTS) only catch known service names, so an
@@ -505,16 +567,29 @@ fn is_blocked_host_str(host: &str, ctx: OutboundUrlContext) -> Option<BlockReaso
     // the resolved address into the request (reqwest `resolve_to_addrs`)
     // is the follow-up that closes the TOCTOU window.
     use std::net::ToSocketAddrs;
-    if let Ok(addrs) = (host_normalized, 0u16).to_socket_addrs() {
-        for addr in addrs {
-            let ip = addr.ip();
-            if is_blocked_ip_in(ip, ctx) {
-                return Some(BlockReason::Ip(ip));
+    match (name.as_str(), 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            if fail_closed && ips.is_empty() {
+                return Some(BlockReason::Unresolved(host.to_string()));
             }
+            first_blocked_ip(ips, ctx)
         }
+        Err(_) if fail_closed => Some(BlockReason::Unresolved(host.to_string())),
+        // A direct request resolves again at connect time, through the
+        // SSRF resolver, so an unresolvable name fails there.
+        Err(_) => None,
     }
+}
 
-    None
+/// [`is_blocked_url`] in any trust class, refusing a host name that does
+/// not resolve: for a destination that is about to be handed to a proxy
+/// (#5459).
+pub(crate) fn is_blocked_url_fail_closed(
+    url: &reqwest::Url,
+    ctx: OutboundUrlContext,
+) -> Option<BlockReason> {
+    is_blocked_host_str_with(url.host_str()?, ctx, true)
 }
 
 /// Return true when an IP must not be contacted from server-side requests.
@@ -903,7 +978,7 @@ fn ssrf_surface(ctx: OutboundUrlContext, label: &str) -> &'static str {
 
 fn record_block(label: &str, reason: &BlockReason, surface: &'static str) {
     let detail = match reason {
-        BlockReason::Hostname(host) => host.clone(),
+        BlockReason::Hostname(host) | BlockReason::Unresolved(host) => host.clone(),
         BlockReason::Ip(ip) => ip.to_string(),
     };
     tracing::warn!(

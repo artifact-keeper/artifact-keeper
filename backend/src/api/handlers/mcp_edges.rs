@@ -118,7 +118,6 @@ async fn holds(
     .map_err(mcp::mcp_error)?;
     let encode = |n: &str, v: &str| seal.encode_position(repo.id, fmt::cursor_kind::HOLDS, n, v);
     let want = q.limit as usize;
-    let policy = mcp::current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(&state, false);
     let mut out: Vec<(String, String, serde_json::Value)> = Vec::new();
     let mut after = q.cursor.clone();
@@ -135,7 +134,7 @@ async fn holds(
         for row in &batch.rows {
             let instance = mcp::instance_url(base.as_str(), &repo.key, &row.name, &row.version);
             let decision =
-                mcp::decide_row(ctx, row, policy, false, GateAudience::ReasonGated, instance).await;
+                mcp::decide_row(ctx, row, false, GateAudience::ReasonGated, instance).await;
             if let ServeDecision::Refuse { status, body, .. } = decision {
                 out.push((
                     row.name.clone(),

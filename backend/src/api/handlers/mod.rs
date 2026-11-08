@@ -4,12 +4,99 @@ use axum::http::HeaderMap;
 
 /// Request marker set by peer replication writes. Receiving handlers use this
 /// to avoid queuing the replicated write back to the origin peer.
+///
+/// The marker is a client-set header, so it is a routing hint only (sync-loop
+/// suppression, the OCI replication routes' entry check). It never grants a
+/// privilege on its own: every replication *exemption* goes through
+/// [`trusted_peer_replication`] (#5455).
 pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
     headers
         .get("x-artifact-keeper-replication")
         .and_then(|value| value.to_str().ok())
         .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false)
+}
+
+/// Whether this request is a peer replication that may take a replication
+/// exemption: skipping the storage quota, bringing the source row's metadata
+/// instead of the server deriving it, refreshing an identical or mutable
+/// replicated row in place, deleting a released (immutable) artifact, or
+/// writing to and deleting from an MCP registry through the generic routes.
+///
+/// The one decision for every such exemption (#5455), so the chunked, raw,
+/// multipart, delete and immutability paths cannot drift apart. The
+/// replication header is client-set, so it must accompany an independently
+/// authenticated peer identity. Nothing binds an inbound credential to a
+/// registered peer (`peer_instances.api_key` is the key this instance
+/// presents to that peer, not the one the peer presents here); a peer link
+/// is set up with an instance administrator's token on the receiving side,
+/// and an administrator can already override every one of these checks, so
+/// the administrator is the peer identity. A service account is an ordinary
+/// writer: with the header it gets exactly what it gets without it.
+///
+/// Fan-out suppression (not queuing a replicated write back out to peers)
+/// stays keyed on the raw header ([`is_replication_request`]) by design. A
+/// writer that forges it can only keep its own write from fanning out, which
+/// it could equally do by not writing; keying it on this decision instead
+/// would make a peer whose key is a service-account token push every write it
+/// receives straight back to the origin, a replication loop.
+pub(crate) fn trusted_peer_replication(
+    auth: &crate::api::middleware::auth::AuthExtension,
+    headers: &HeaderMap,
+) -> bool {
+    trusted_peer_replication_marked(auth, is_replication_request(headers))
+}
+
+/// [`trusted_peer_replication`] for a call site whose replication marker is
+/// not (only) the request header: a chunked upload session records the
+/// marker at creation and the completion request may not repeat it.
+pub(crate) fn trusted_peer_replication_marked(
+    auth: &crate::api::middleware::auth::AuthExtension,
+    marked: bool,
+) -> bool {
+    if marked && !auth.is_admin {
+        warn_ignored_replication_header(auth);
+    }
+    marked && auth.is_admin
+}
+
+/// Seconds between two [`warn_ignored_replication_header`] lines, so a peer
+/// pushing a backlog under the wrong key logs once a minute, not per request.
+const IGNORED_REPLICATION_WARN_INTERVAL_SECS: i64 = 60;
+
+/// Unix seconds of the last [`warn_ignored_replication_header`] line.
+static IGNORED_REPLICATION_LAST_WARN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Whether a throttled warning last written at `last` is due again at `now`.
+fn throttled_warn_due(last: i64, now: i64, interval: i64) -> bool {
+    last == i64::MIN || now.saturating_sub(last) >= interval
+}
+
+/// Rate-limited operator hint (#5455): a request carried the replication
+/// header under a credential that is not an administrator's, so it was
+/// handled as an ordinary write. Usually a peer link whose key here is a
+/// service-account token.
+fn warn_ignored_replication_header(auth: &crate::api::middleware::auth::AuthExtension) {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let last = IGNORED_REPLICATION_LAST_WARN.load(Ordering::Relaxed);
+    if !throttled_warn_due(last, now, IGNORED_REPLICATION_WARN_INTERVAL_SECS) {
+        return;
+    }
+    if IGNORED_REPLICATION_LAST_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        user_id = %auth.user_id,
+        username = %auth.username,
+        service_account = auth.is_service_account,
+        "replication header from non-admin principal ignored; re-issue the peer key as an \
+         administrator token"
+    );
 }
 
 /// Queue push sync tasks for a freshly committed hosted upload so every
@@ -2908,6 +2995,186 @@ mod raw_error_body_class_tests {
              them — a stale exemption silently excuses the next site that reuses the \
              wording:\n{}",
             unmatched.join("\n")
+        );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod replication_peer_identity_gate_5455 {
+    // -----------------------------------------------------------------------
+    // #5455: every replication exemption goes through one decision.
+    //
+    // The replication header is client-set. "A service account plus the
+    // header" was once read as a peer on the chunked, raw, multipart, delete
+    // and immutability paths, each with its own copy of the rule, and the
+    // copies drifted (#5368 narrowed the MCP one only). The exemptions now
+    // call `trusted_peer_replication` / `trusted_peer_replication_marked`;
+    // this gate pins every exemption site to them and every remaining raw
+    // use of the marker to the routing-only sites below.
+    // -----------------------------------------------------------------------
+    use super::like_pattern_escape_class_tests::{rust_sources, test_module_line_ranges};
+
+    /// Production uses of the raw marker, `is_replication_request(..)`, per
+    /// file: all are routing (sync-loop suppression, the OCI replication
+    /// routes' entry check, the Maven plugin-prefix merge, the chunked
+    /// commit's marker that feeds `trusted_peer_replication_marked`). A new
+    /// use that would grant an exemption must call the helper instead; a
+    /// genuinely routing-only one is added here.
+    const RAW_MARKER_SITES: &[(&str, usize)] = &[
+        ("api/handlers/mod.rs", 2),
+        ("api/handlers/debian.rs", 1),
+        ("api/handlers/goproxy.rs", 1),
+        ("api/handlers/incus.rs", 2),
+        ("api/handlers/maven.rs", 2),
+        ("api/handlers/npm.rs", 1),
+        ("api/handlers/oci_v2.rs", 1),
+        ("api/handlers/pypi.rs", 1),
+        ("api/handlers/repositories.rs", 2),
+        ("api/handlers/upload.rs", 1),
+    ];
+
+    /// `(file, fn)` of every replication exemption: each must decide through
+    /// the shared helper, directly or through `mcp_generic_mutation_refusal`
+    /// (itself pinned here). `delete_artifact`'s immutability guard needs
+    /// none: the helper implies an admin, who is exempt anyway.
+    const EXEMPTION_SITES: &[(&str, &str)] = &[
+        ("api/handlers/upload.rs", "create_session"),
+        ("api/handlers/upload.rs", "complete_session_commit"),
+        (
+            "api/handlers/repositories.rs",
+            "persist_generic_staged_upload",
+        ),
+        (
+            "api/handlers/repositories.rs",
+            "mcp_generic_mutation_refusal",
+        ),
+        ("api/handlers/repositories.rs", "delete_artifact"),
+    ];
+
+    fn relative(path: &std::path::Path) -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        path.strip_prefix(&src)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Non-comment production lines (1-based number, text) of `src`.
+    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let tests = test_module_line_ranges(src);
+        src.lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .filter(|(n, line)| {
+                !tests.iter().any(|(from, to)| n >= from && n <= to)
+                    && !line.trim_start().starts_with("//")
+            })
+            .collect()
+    }
+
+    /// The body of the top-level `fn name(` in `src`, up to its closing
+    /// brace at column 0.
+    fn fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let at = [format!("async fn {name}("), format!("fn {name}(")]
+            .iter()
+            .find_map(|needle| src.find(needle.as_str()))?;
+        let end = src[at..].find("\n}\n").map(|e| at + e).unwrap_or(src.len());
+        Some(&src[at..end])
+    }
+
+    #[test]
+    fn raw_replication_marker_is_routing_only() {
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for (path, src) in rust_sources() {
+            let file = relative(&path);
+            for (_, line) in production_lines(&src) {
+                if line.contains("is_replication_request(")
+                    && !line.contains("fn is_replication_request(")
+                {
+                    *seen.entry(file.clone()).or_default() += 1;
+                }
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> = RAW_MARKER_SITES
+            .iter()
+            .map(|(f, n)| (f.to_string(), *n))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "#5455: a raw `is_replication_request` use changed. The header is \
+             client-set; an exemption must decide through \
+             `trusted_peer_replication`, and a routing-only use is listed in \
+             RAW_MARKER_SITES"
+        );
+    }
+
+    #[test]
+    fn no_replication_decision_trusts_a_service_account() {
+        let mut offenders = Vec::new();
+        for (path, src) in rust_sources() {
+            let file = relative(&path);
+            for (n, line) in production_lines(&src) {
+                let lower = line.to_ascii_lowercase();
+                let retired = line.contains("replication_exemption_trusted")
+                    || line.contains("mcp_replication_trusted");
+                if retired || (lower.contains("replication") && line.contains("is_service_account"))
+                {
+                    offenders.push(format!("{file}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "#5455: a service account (or a retired per-path rule) decides a \
+             replication exemption; use `trusted_peer_replication`:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn ignored_header_warning_is_throttled() {
+        use super::throttled_warn_due as due;
+        assert!(due(i64::MIN, 0, 60), "the first one is written");
+        assert!(!due(1_000, 1_059, 60));
+        assert!(due(1_000, 1_060, 60));
+        // A non-admin marked request is still refused while the warning is
+        // being throttled.
+        let writer = crate::api::middleware::auth::AuthExtension {
+            is_service_account: true,
+            ..Default::default()
+        };
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+    }
+
+    #[test]
+    fn every_exemption_site_uses_the_shared_decision() {
+        let sources: std::collections::BTreeMap<String, String> = rust_sources()
+            .into_iter()
+            .map(|(path, src)| (relative(&path), src))
+            .collect();
+        for (file, name) in EXEMPTION_SITES {
+            let src = sources
+                .get(*file)
+                .unwrap_or_else(|| panic!("{file} not found"));
+            let body = fn_body(src, name).unwrap_or_else(|| panic!("{file}: fn {name} not found"));
+            assert!(
+                body.contains("trusted_peer_replication(")
+                    || body.contains("trusted_peer_replication_marked(")
+                    || body.contains("mcp_generic_mutation_refusal("),
+                "#5455: {file}::{name} must decide its replication exemption \
+                 through `trusted_peer_replication`"
+            );
+        }
+        let helper = fn_body(
+            &sources["api/handlers/mod.rs"],
+            "trusted_peer_replication_marked",
+        )
+        .expect("the shared decision");
+        assert!(
+            !helper.contains("is_service_account"),
+            "#5455: a service account is not a peer identity"
         );
     }
 }

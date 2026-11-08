@@ -1427,6 +1427,319 @@ async fn remote_pins_packages_pulled_through_backing_remotes() {
     h.teardown().await;
 }
 
+/// A backing repository for the `open` Remote tests: `repo_type` `format`
+/// (with `upstream` for a Remote), registered for teardown.
+async fn backing(
+    h: &mut Harness,
+    repo_type: &str,
+    format: &str,
+    upstream: Option<&str>,
+) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let key = format!("{format}-{repo_type}-{}", &id.to_string()[..8]);
+    sqlx::query(
+        "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+         VALUES ($1, $2, $2, $3, $4::repository_type, $5::repository_format, $6, true)",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(format!("{}/{key}", h.dir))
+    .bind(repo_type)
+    .bind(format)
+    .bind(upstream)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    h.extra.push(id);
+    (id, key)
+}
+
+/// A proxy-cache entry of `repo` at `cache_path` (what a pull-through writes).
+async fn cache_entry(h: &Harness, repo: Uuid, cache_path: &str) {
+    sqlx::query(
+        "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+         size_bytes, checksum_sha256) VALUES ($1, $2, $3, $4, 1, $5)",
+    )
+    .bind(repo)
+    .bind(cache_path)
+    .bind(format!("proxy-cache/{repo}/{cache_path}"))
+    .bind(format!("proxy-cache/{repo}/{cache_path}.meta"))
+    .bind("cd".repeat(32))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+}
+
+/// An upstream entry `name@1.0.0` with one package.
+fn package_entry(name: &str, package: serde_json::Value) -> serde_json::Value {
+    let mut doc = server(name, "1.0.0", "Echo");
+    doc["packages"] = serde_json::json!([package]);
+    entry(doc, T1)
+}
+
+fn artifact_pkg(ty: &str, identifier: &str, base: &str) -> serde_json::Value {
+    serde_json::json!({"registryType": ty, "registryBaseUrl": base, "identifier": identifier,
+                       "version": "1.0.0", "transport": {"type": "stdio"}})
+}
+
+/// The stored first pin of `name`.
+async fn stored_pin(h: &Harness, name: &str) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT m.metadata->'packages'->0 FROM artifacts a \
+         JOIN artifact_metadata m ON m.artifact_id = a.id \
+         WHERE a.repository_id = $1 AND a.name = $2",
+    )
+    .bind(h.repo_id)
+    .bind(name)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap()
+}
+
+/// #5452: a Remote MCP repository under `open` pins every package of an
+/// ingested version through its backing repositories, as under `own-repos`.
+/// Coordinates naming another registry are accepted for a hosted backing
+/// repository (an npm package with a foreign `registryBaseUrl`, pinned and
+/// served at AK coordinates, the stored pin agreeing with the served
+/// document), and for a Remote only when they name its upstream (PyPI). A
+/// foreign registry other than a Remote's upstream (PyPI, OCI) is never
+/// resolved through it, so a same-named package the Remote proxies cannot
+/// stand in for it; nor is a package no backing repository holds. Those
+/// versions are unresolved (hidden), and the foreign registry, a live
+/// server here, sees no request.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn open_remote_pins_foreign_coordinates_or_hides_the_version() {
+    let mut h = Harness::new(false).await;
+    let evil = MockServer::start().await;
+    let digest = seed_latest_image(&mut h).await;
+    let oci_key: String = sqlx::query_scalar(
+        "SELECT value::jsonb->>'oci' FROM repository_config \
+         WHERE repository_id = $1 AND key = 'mcp_package_repos'",
+    )
+    .bind(h.repo_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let (npm_id, npm_key) = backing(&mut h, "local", "npm", None).await;
+    sqlx::query(
+        "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, \
+         content_type, storage_key) VALUES ($1, '@acme/echo-npm/1.0.0/echo-npm-1.0.0.tgz', \
+         '@acme/echo-npm', '1.0.0', 1, $2, 'application/octet-stream', 'k')",
+    )
+    .bind(npm_id)
+    .bind("ab".repeat(32))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let (pypi_id, pypi_key) = backing(&mut h, "remote", "pypi", Some("https://pypi.org")).await;
+    cache_entry(
+        &h,
+        pypi_id,
+        "simple/echo-pkg/echo_pkg-1.0.0-py3-none-any.whl",
+    )
+    .await;
+    let mapping = serde_json::json!({"oci": oci_key, "npm": npm_key, "pypi": pypi_key});
+    let entries = vec![
+        package_entry(
+            "io.github.acme/npm",
+            artifact_pkg("npm", "@acme/echo-npm", &evil.uri()),
+        ),
+        package_entry(
+            "io.github.acme/pypi",
+            artifact_pkg("pypi", "Echo_Pkg", "https://pypi.org/simple"),
+        ),
+        package_entry(
+            "io.github.acme/pypi-squat",
+            artifact_pkg("pypi", "Echo_Pkg", &evil.uri()),
+        ),
+        package_entry(
+            "io.github.acme/missing",
+            artifact_pkg("npm", "@evil/missing", &evil.uri()),
+        ),
+        entry(
+            oci_server("io.github.acme/img-squat", "evil.example/acme/mcp:latest"),
+            T1,
+        ),
+        entry(
+            oci_server("io.github.acme/img", "ghcr.io/acme/mcp:latest"),
+            T1,
+        ),
+    ];
+    h.config("mcp_package_policy", "open").await;
+    h.config("mcp_package_repos", &mapping.to_string()).await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme/*"]"#)
+        .await;
+    mount_quiet_upstream(&h.upstream, &entries).await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary["unresolved"], 3, "{summary}");
+    let mut served = h.listed_names().await;
+    served.sort();
+    assert_eq!(
+        served,
+        [
+            "io.github.acme/img@1.0.0",
+            "io.github.acme/npm@1.0.0",
+            "io.github.acme/pypi@1.0.0"
+        ]
+    );
+    for (name, code) in [
+        ("io.github.acme/missing", "mcp_package_not_found"),
+        ("io.github.acme/pypi-squat", "mcp_external_registry"),
+        ("io.github.acme/img-squat", "mcp_external_registry"),
+    ] {
+        let (s, b) = h
+            .read(
+                None,
+                &format!("/servers/{}/versions/1.0.0", urlencoding::encode(name)),
+            )
+            .await;
+        assert_eq!(
+            (s, String::from_utf8_lossy(&b).as_ref()),
+            (StatusCode::NOT_FOUND, NOT_FOUND),
+            "{name}"
+        );
+        let item = h.item(name).await;
+        assert_eq!(
+            item["ingested"][0]["unresolved"][0]["error"], code,
+            "{name}: {item}"
+        );
+    }
+
+    let read = |name: &'static str| {
+        let h = &h;
+        async move {
+            let (s, b) = h
+                .read(
+                    None,
+                    &format!("/servers/{}/versions/1.0.0", urlencoding::encode(name)),
+                )
+                .await;
+            assert_eq!(s, StatusCode::OK, "{name}");
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()["server"]["packages"][0]
+                .clone()
+        }
+    };
+    // Hosted: the foreign coordinates are replaced, and say so.
+    let pkg = read("io.github.acme/npm").await;
+    assert!(pkg["registryBaseUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/npm/{npm_key}")));
+    let resolved = &pkg["_meta"]["com.artifactkeeper/resolved"];
+    assert_eq!(resolved["submittedRegistryBaseUrl"], evil.uri());
+    assert_eq!(
+        resolved["warnings"],
+        serde_json::json!(["foreign_coordinates_replaced"])
+    );
+    let pin = stored_pin(&h, "io.github.acme/npm").await;
+    assert_eq!(pin["resolved"]["repository"], npm_key.as_str());
+    assert_eq!(pin["resolved"]["sha256"], "ab".repeat(32));
+    assert_eq!(resolved["sha256"], pin["resolved"]["sha256"]);
+    // A Remote's upstream named: pinned from its cache.
+    let pkg = read("io.github.acme/pypi").await;
+    assert!(pkg["registryBaseUrl"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/pypi/{pypi_key}")));
+    assert_eq!(
+        stored_pin(&h, "io.github.acme/pypi").await["resolved"]["sha256"],
+        "cd".repeat(32)
+    );
+    let pkg = read("io.github.acme/img").await;
+    assert!(pkg["identifier"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/{oci_key}/acme/mcp:latest@{digest}")));
+    assert!(
+        evil.received_requests().await.unwrap().is_empty(),
+        "the foreign registry is never contacted"
+    );
+    h.teardown().await;
+}
+
+/// #5452: a version a Remote MCP repository ingested under `open` before the
+/// fix has packages but no pins and an empty `unresolved` list. The sync
+/// picks it up again (it used to select only versions with a reported
+/// unresolved package, so such a version stayed hidden for good), pins it
+/// once its package is in a backing repository and serves it. A version that
+/// keeps failing records every attempt, also one stored without `ingest`,
+/// so the least recently tried come first and it cannot sort first forever.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn open_remote_re_resolves_versions_stored_unpinned() {
+    let mut h = Harness::new(false).await;
+    let (npm_id, npm_key) =
+        backing(&mut h, "remote", "npm", Some("https://registry.npmjs.org")).await;
+    cache_entry(&h, npm_id, "@acme/echo-npm/-/echo-npm-1.0.0.tgz").await;
+    let upstream_url = "https://registry.npmjs.org";
+    let entries = vec![
+        package_entry(
+            "io.github.acme/legacy",
+            artifact_pkg("npm", "@acme/echo-npm", upstream_url),
+        ),
+        package_entry(
+            "io.github.acme/stuck",
+            artifact_pkg("npm", "@acme/never-pulled", upstream_url),
+        ),
+    ];
+    h.config("mcp_package_policy", "open").await;
+    h.config(
+        "mcp_package_repos",
+        &serde_json::json!({"npm": npm_key}).to_string(),
+    )
+    .await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme/*"]"#)
+        .await;
+    mount_quiet_upstream(&h.upstream, &entries).await;
+    h.sync().await;
+    assert_eq!(h.listed_names().await, ["io.github.acme/legacy@1.0.0"]);
+    // A pin of the upstream's own URL records what it replaced, as a
+    // publish naming it does.
+    assert_eq!(
+        stored_pin(&h, "io.github.acme/legacy").await["resolved"]["warnings"],
+        serde_json::json!(["foreign_coordinates_replaced"])
+    );
+
+    // The pre-#5452 `open` shape: no pins, nothing reported unresolved; and
+    // a stuck version stored without `ingest` at all.
+    sqlx::query(
+        "UPDATE artifact_metadata SET metadata = CASE WHEN a.name = 'io.github.acme/legacy' \
+           THEN jsonb_set(jsonb_set(metadata, '{packages}', '[]'), '{ingest,unresolved}', '[]') \
+           ELSE metadata - 'ingest' END \
+         FROM artifacts a WHERE a.id = artifact_metadata.artifact_id AND a.repository_id = $1",
+    )
+    .bind(h.repo_id)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(h.listed_names().await.is_empty(), "held unresolvable");
+    let attempted = || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT m.metadata->'ingest'->>'reResolveAttemptedAt' FROM artifacts a \
+             JOIN artifact_metadata m ON m.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.name = 'io.github.acme/stuck'",
+        )
+        .bind(h.repo_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+    };
+    let summary = h.sync().await;
+    assert_eq!(summary["reResolved"], 1, "{summary}");
+    assert_eq!(h.listed_names().await, ["io.github.acme/legacy@1.0.0"]);
+    assert_eq!(
+        stored_pin(&h, "io.github.acme/legacy").await["resolved"]["sha256"],
+        "cd".repeat(32)
+    );
+    let first = attempted().await.expect("the failed attempt is recorded");
+    h.sync().await;
+    let second = attempted().await.expect("the failed attempt is recorded");
+    assert!(second > first, "{first} then {second}");
+    h.teardown().await;
+}
+
 /// S2 leftover (#5253): a Remote version deleted and purged from the trash
 /// is never ingested again, whatever upstream serves under its
 /// `name@version` now: the tombstone ledger outlives the purge, the sync
