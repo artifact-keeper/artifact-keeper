@@ -477,8 +477,7 @@ impl TokenService {
         match auth_service.validate_api_token(token).await {
             Ok(validation) => {
                 // Get token details
-                if token.len() >= 8 {
-                    let prefix = &token[..token.floor_char_boundary(8)];
+                if let Some(prefix) = AuthService::api_token_prefix(token) {
                     if let Ok(Some(token_info)) = sqlx::query!(
                         "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
                         prefix
@@ -528,11 +527,11 @@ impl TokenService {
     /// # Returns
     /// * `Ok(bool)` - Whether the token has the scope
     pub async fn has_scope(&self, token: &str, required_scope: &str) -> Result<bool> {
-        if token.len() < 8 {
+        // `None` for a short token and for one whose byte 8 is inside a
+        // multibyte character (#5525); `&token[..8]` panicked on the latter.
+        let Some(prefix) = AuthService::api_token_prefix(token) else {
             return Err(AppError::Authentication("Invalid token format".to_string()));
-        }
-
-        let prefix = &token[..token.floor_char_boundary(8)];
+        };
         let token_info = sqlx::query!(
             "SELECT scopes FROM api_tokens WHERE token_prefix = $1",
             prefix
