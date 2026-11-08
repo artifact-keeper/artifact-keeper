@@ -432,7 +432,14 @@ pub fn build_repo_client(config: &EgressProxyConfig) -> Result<reqwest::Client> 
 /// The [`reqwest::ClientBuilder`] behind [`build_repo_client`], for a caller
 /// that adds its own settings (a client-wide timeout) before building.
 pub fn repo_client_builder(config: &EgressProxyConfig) -> Result<reqwest::ClientBuilder> {
-    let mut builder = crate::services::http_client::base_client_builder();
+    // `direct` and `explicit` replace the environment proxy, so they start
+    // from a builder that never installs it (or its destination check).
+    let mut builder = match config.mode {
+        EgressProxyMode::Inherit => crate::services::http_client::base_client_builder(),
+        EgressProxyMode::Direct | EgressProxyMode::Explicit => {
+            crate::services::http_client::base_client_builder_without_env_proxy()
+        }
+    };
 
     match config.mode {
         EgressProxyMode::Inherit => {

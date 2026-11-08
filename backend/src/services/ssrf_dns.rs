@@ -265,12 +265,11 @@ fn filter_allowed(
         .collect()
 }
 
-/// Host of the proxy URL a guarded client hands `reqwest` in place of the
-/// environment proxy when it refuses the destination (#5459): see
-/// `http_client::guarded_env_proxy`. `.invalid` (RFC 2606) never resolves,
-/// and the resolver refuses this name before any lookup, so the request
-/// fails with the ordinary connect-time SSRF refusal and nothing is sent to
-/// the proxy or the destination.
+/// A host the resolver refuses before any lookup, with the ordinary
+/// connect-time SSRF refusal (#5459). `env_proxy_guard` sends a request here
+/// to obtain a `reqwest::Error` for a destination it refused before sending
+/// (`reqwest` has no public constructor). `.invalid` (RFC 2606) never
+/// resolves, so nothing leaves the process. The caller counts the refusal.
 pub(crate) const REFUSED_DESTINATION_PROXY_HOST: &str = "ssrf-refused.artifact-keeper.invalid";
 
 /// The connect-time refusal error, worded so
@@ -292,9 +291,7 @@ impl Resolve for SsrfGuardResolver {
             .as_str()
             .eq_ignore_ascii_case(REFUSED_DESTINATION_PROXY_HOST)
         {
-            // A proxied destination the client refused (#5459). Counted here,
-            // once per connection attempt; the client logged the destination.
-            crate::services::metrics_service::record_ssrf_block(mode.ssrf_surface());
+            // Counted by the caller that refused the destination (#5459).
             return Box::pin(async { Err(connect_refusal()) });
         }
         // Exempt the configured egress-proxy host (issue #2570): matched by
@@ -447,10 +444,10 @@ mod tests {
         }
     }
 
-    /// #5459: the refused-destination proxy host is refused by every
-    /// resolver mode before any lookup, with the standard connect-time
-    /// refusal wording and an SSRF-block count, even when the exempt set
-    /// names it.
+    /// #5459: the refused-destination host is refused by every resolver mode
+    /// before any lookup, with the standard connect-time refusal wording,
+    /// even when the exempt set names it. The caller counts the refusal, so
+    /// the resolver does not count it again.
     #[test]
     fn refused_destination_proxy_host_is_refused_without_lookup_5459() {
         use crate::services::metrics_service::capture_counters_async;
@@ -482,7 +479,7 @@ mod tests {
         for surface in ["upstream", "internal", "webhook", "sso"] {
             assert_eq!(
                 counted.get("ak_ssrf_blocks_total", &[("surface", surface)]),
-                1,
+                0,
                 "{surface}"
             );
         }

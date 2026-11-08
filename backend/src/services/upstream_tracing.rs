@@ -84,6 +84,15 @@ pub(crate) async fn send_upstream_audited(
     let had_auth = request.headers().contains_key(AUTHORIZATION);
     let span = upstream_client_span(request.method(), request.url());
     inject_trace_context(&span, request.headers_mut());
+    // A plain-HTTP request the environment proxy carries may ride a pooled
+    // connection that never passes the connect-time check again (#5459).
+    if let Err(err) = crate::services::env_proxy_guard::check_upstream_request(request.url())
+        .instrument(span.clone())
+        .await
+    {
+        record_transport_error(&span, &err);
+        return Err(err);
+    }
     let pending = audit.map(|target| PendingFetch::start(target, &request, had_auth));
 
     let result = client.execute(request).instrument(span.clone()).await;
