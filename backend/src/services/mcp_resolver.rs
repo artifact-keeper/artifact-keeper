@@ -141,6 +141,11 @@ pub async fn resolve_document(
                 let Some(remote) = fill_target(&state.db, repo).await? else {
                     return Err(McpError::PackageNotFound { index, detail });
                 };
+                // Foreign coordinates (`open`) are neither pinned from nor
+                // filled through a Remote of another upstream (#5452).
+                if !mcp_packages::remote_may_serve(pkg, repo, &remote, base_url) {
+                    return Err(mcp_packages::foreign_through_remote(index, pkg, &remote));
+                }
                 match cached_pin(&state.db, repo, &remote, index, pkg).await? {
                     Some(mut pin) => {
                         mcp_packages::note_foreign_coordinates(&mut pin, pkg, repo, base_url);
@@ -341,16 +346,28 @@ async fn find_cached(
 /// Remote MCP ingest uses it after the `artifacts` lookup misses: npm, PyPI,
 /// NuGet and Cargo packages pulled through a Remote live only in its proxy
 /// cache.
+///
+/// Foreign coordinates (`open`) naming another registry than the Remote's
+/// upstream are refused ([`mcp_packages::remote_may_serve`]); the pin records
+/// [`mcp_packages::FOREIGN_COORDINATES_WARNING`] when they name it.
 pub async fn cached_pin_through(
     db: &PgPool,
     mapped: &BackingRepo,
     index: usize,
     pkg: &fmt::Package,
+    base_url: &str,
 ) -> Result<Option<PackagePin>, McpError> {
-    match fill_target(db, mapped).await? {
-        Some(remote) => cached_pin(db, mapped, &remote, index, pkg).await,
-        None => Ok(None),
+    let Some(remote) = fill_target(db, mapped).await? else {
+        return Ok(None);
+    };
+    if !mcp_packages::remote_may_serve(pkg, mapped, &remote, base_url) {
+        return Err(mcp_packages::foreign_through_remote(index, pkg, &remote));
     }
+    let mut found = cached_pin(db, mapped, &remote, index, pkg).await?;
+    if let Some(pin) = found.as_mut() {
+        mcp_packages::note_foreign_coordinates(pin, pkg, mapped, base_url);
+    }
+    Ok(found)
 }
 
 /// A pin on a package `remote` (the mapped repository or its Remote member)
@@ -1258,6 +1275,13 @@ async fn resolve_pending(
                 Err(e) => Err(e),
             }
         } else {
+            // No policy re-check here: a pin does not depend on the policy
+            // (#5452), only the hostname check does, and that ran at publish.
+            // What can change since is the Remote, so the foreign-coordinate
+            // rule is checked against the fill target again.
+            if !mcp_packages::remote_may_serve(&pkg, mapped, &remote, base) {
+                return Err(mcp_packages::foreign_through_remote(p.index, &pkg, &remote));
+            }
             let mut found = cached_pin(&state.db, mapped, &remote, p.index, &pkg).await;
             if let Ok(Some(pin)) = found.as_mut() {
                 mcp_packages::note_foreign_coordinates(pin, &pkg, mapped, base);
@@ -1509,6 +1533,41 @@ mod tests {
     /// Review finding 12: the asynchronous fill runs with the publishing
     /// token's scope (repository allowlist, scopes), recorded on the
     /// resolution; a job without a readable record gets nothing.
+    /// #5452: a pending package keeps its submitted `registryBaseUrl` through
+    /// the job record, so the filled pin can record the coordinates it
+    /// replaced; a record written before the field existed still loads.
+    #[test]
+    fn pending_keeps_the_submitted_registry_base_url() {
+        let p = Pending {
+            index: 1,
+            registry_type: "npm".into(),
+            identifier: "@acme/echo".into(),
+            version: Some("2.0.0".into()),
+            fill_repository: "npm-remote".into(),
+            fill_repository_id: Uuid::nil(),
+            fill_format: "npm".into(),
+            registry_base_url: Some("https://registry.npmjs.org".into()),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["registryBaseUrl"], "https://registry.npmjs.org");
+        assert_eq!(serde_json::from_value::<Pending>(v).unwrap(), p);
+        assert_eq!(
+            p.package().registry_base_url.as_deref(),
+            Some("https://registry.npmjs.org")
+        );
+        let legacy = serde_json::json!({
+            "index": 0, "registryType": "npm", "identifier": "@acme/echo", "version": "1.0.0",
+            "fillRepository": "npm-remote", "fillRepositoryId": Uuid::nil(), "fillFormat": "npm",
+        });
+        let old: Pending = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.registry_base_url, None);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("registryBaseUrl")
+            .is_none());
+        assert_eq!(old.package().registry_base_url, None);
+    }
+
     #[test]
     fn fills_run_with_the_publishing_scope() {
         let (allowed, other) = (Uuid::new_v4(), Uuid::new_v4());

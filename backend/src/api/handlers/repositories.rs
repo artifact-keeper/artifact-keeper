@@ -1138,8 +1138,9 @@ pub struct CreateRepositoryRequest {
     pub npm_virtual_isolate_hosted_names: Option<bool>,
     /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
     /// must resolve to an artifact in a repository of this instance) or
-    /// `open` (packages stored and served verbatim, not gated). Stored in
-    /// `repository_config` under `mcp_package_policy`.
+    /// `open` (#5452: coordinates naming another registry are accepted, but
+    /// every package is still resolved, pinned and gated as under
+    /// `own-repos`). Stored in `repository_config` under `mcp_package_policy`.
     pub mcp_package_policy: Option<String>,
     /// MCP registries (#5253): the backing repository key per `registryType`
     /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
@@ -1495,8 +1496,9 @@ pub struct UpdateRepositoryRequest {
     pub npm_virtual_isolate_hosted_names: Option<bool>,
     /// MCP registries (#5253): `own-repos` (default: every `packages[]` entry
     /// must resolve to an artifact in a repository of this instance) or
-    /// `open` (packages stored and served verbatim, not gated). Stored in
-    /// `repository_config` under `mcp_package_policy`.
+    /// `open` (#5452: coordinates naming another registry are accepted, but
+    /// every package is still resolved, pinned and gated as under
+    /// `own-repos`). Stored in `repository_config` under `mcp_package_policy`.
     pub mcp_package_policy: Option<String>,
     /// MCP registries (#5253): the backing repository key per `registryType`
     /// (`npm`, `pypi`, `nuget`, `cargo`, `oci`), e.g.
@@ -10606,6 +10608,7 @@ pub async fn get_artifact_metadata(
     Path((key, path)): Path<(String, String)>,
     Query(version_query): Query<ArtifactVersionQuery>,
     dl_ctx: crate::api::middleware::download_telemetry::DownloadContext,
+    base: crate::api::extractors::RequestBaseUrl,
 ) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
@@ -10614,6 +10617,16 @@ pub async fn get_artifact_metadata(
     // (#5253).
     if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
         return Err(generic_artifact_not_found(&repo));
+    }
+    // #5452: the server.json an MCP version serves is the pinned document.
+    // A Virtual answers with the member's bytes (below), so it answers
+    // with the served document; a direct row's metadata carries it as
+    // `metadata.server`.
+    let mcp_served = mcp_generic_server_json(&state, &repo, &path, base.as_str()).await?;
+    if repo.repo_type == RepositoryType::Virtual {
+        if let Some(doc) = &mcp_served {
+            return Ok(mcp_server_json_response(doc, false));
+        }
     }
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
@@ -10752,7 +10765,7 @@ pub async fn get_artifact_metadata(
             created_at: artifact.created_at,
             uploaded_by: artifact.uploaded_by,
             uploaded_by_username: uploader_username,
-            metadata: metadata.map(|m| m.metadata),
+            metadata: metadata.map(|m| super::mcp::with_served_server(m.metadata, mcp_served)),
             // This handler resolves a real `artifacts` row by id, so it is
             // always a hosted artifact (analyzable), even inside a Remote repo.
             analyzable: true,
@@ -11564,25 +11577,74 @@ pub(crate) async fn mcp_generic_path_visible(
     if repo.format != RepositoryFormat::Mcp {
         return Ok(true);
     }
-    let owners: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT a.repository_id FROM artifacts a \
+    let Some((owner, _)) = mcp_generic_owner(state, repo, path).await? else {
+        return Ok(true);
+    };
+    Ok(super::mcp::GenericArtifactGate::new(state, auth)
+        .visible(owner, path)
+        .await)
+}
+
+/// The `(repository, artifact)` an MCP generic path names: the repository's
+/// own row, else the first Virtual member (by priority) holding the path.
+async fn mcp_generic_owner(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+) -> Result<Option<(Uuid, Uuid)>> {
+    sqlx::query_as(
+        "SELECT a.repository_id, a.id FROM artifacts a \
          LEFT JOIN virtual_repo_members vm \
            ON vm.member_repo_id = a.repository_id AND vm.virtual_repo_id = $1 \
          WHERE a.path = $2 AND a.is_deleted = false \
            AND (a.repository_id = $1 OR vm.virtual_repo_id IS NOT NULL) \
-         ORDER BY (a.repository_id = $1) DESC, vm.priority",
+         ORDER BY (a.repository_id = $1) DESC, vm.priority LIMIT 1",
     )
     .bind(repo.id)
     .bind(path)
-    .fetch_all(&state.db)
+    .fetch_optional(&state.db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-    let Some(owner) = owners.first() else {
-        return Ok(true);
-    };
-    Ok(super::mcp::GenericArtifactGate::new(state, auth)
-        .visible(*owner, path)
-        .await)
+    .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// The served server.json (#5452) of the MCP server version a generic route
+/// addresses at `path` (in `repo`, or the Virtual member that owns it), as
+/// [`super::mcp::served_server_json`] builds it; `None` for any other format
+/// or path (a bundle). Called after [`mcp_generic_path_visible`].
+async fn mcp_generic_server_json(
+    state: &SharedState,
+    repo: &crate::models::repository::Repository,
+    path: &str,
+    base: &str,
+) -> Result<Option<serde_json::Value>> {
+    if repo.format != RepositoryFormat::Mcp {
+        return Ok(None);
+    }
+    match mcp_generic_owner(state, repo, path).await? {
+        Some((_, artifact_id)) => {
+            super::mcp::served_server_json(&state.db, artifact_id, base).await
+        }
+        None => Ok(None),
+    }
+}
+
+/// The response a generic content route gives for a served MCP server.json
+/// (#5452): the rewritten document, never cached by a shared cache (the
+/// serve decision behind it can change on the next read).
+pub(crate) fn mcp_server_json_response(doc: &serde_json::Value, is_head: bool) -> Response {
+    let bytes = serde_json::to_vec(doc).unwrap_or_default();
+    let len = bytes.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(if is_head {
+            Body::empty()
+        } else {
+            Body::from(bytes)
+        })
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// The plain `404` a generic artifact route answers for a missing artifact,
@@ -13035,7 +13097,7 @@ pub async fn download_artifact(
     Query(version_query): Query<ArtifactVersionQuery>,
     dl_ctx: crate::api::middleware::download_telemetry::DownloadContext,
     request: axum::http::Request<axum::body::Body>,
-) -> Result<impl IntoResponse> {
+) -> Result<Response> {
     // A HEAD request must return identical headers to GET but no body, and it
     // must close the connection. Without this flag the handler builds a
     // `Body::from_stream(..)` whose Content-Length advertises the full size
@@ -13078,6 +13140,15 @@ pub async fn download_artifact(
     // the registry surface (#5253); also before any upstream fallback.
     if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
         return Err(generic_artifact_not_found(&repo));
+    }
+    // #5452: a served MCP server.json is the pinned document, as the
+    // registry serves it, never the stored submission.
+    let base = crate::api::extractors::request_base_url_from_request(
+        request.headers(),
+        Some(request.uri()),
+    );
+    if let Some(doc) = mcp_generic_server_json(&state, &repo, &path, &base).await? {
+        return Ok(mcp_server_json_response(&doc, is_head));
     }
 
     // Enforce quarantine AND the repository's scan policy before serving the
@@ -39102,6 +39173,7 @@ mod content_encoding_forwarding_tests {
             axum::extract::Path((fx.repo_key.clone(), "blobs/meta.bin".to_string())),
             axum::extract::Query(ArtifactVersionQuery { version: None }),
             Default::default(),
+            crate::api::extractors::RequestBaseUrl("http://localhost".into()),
         )
         .await;
         drop_member(&fx, member_id).await;
@@ -39135,6 +39207,7 @@ mod content_encoding_forwarding_tests {
             axum::extract::Path((fx.repo_key.clone(), "blobs/meta.bin".to_string())),
             axum::extract::Query(ArtifactVersionQuery { version: None }),
             Default::default(),
+            crate::api::extractors::RequestBaseUrl("http://localhost".into()),
         )
         .await;
         drop_member(&fx, member_id).await;
@@ -39193,6 +39266,7 @@ mod content_encoding_forwarding_tests {
             )),
             axum::extract::Query(ArtifactVersionQuery { version: None }),
             Default::default(),
+            crate::api::extractors::RequestBaseUrl("http://localhost".into()),
         )
         .await;
         let by_id = crate::api::handlers::artifacts::get_artifact(

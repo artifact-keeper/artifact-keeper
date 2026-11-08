@@ -402,25 +402,45 @@ Each repository has a package policy (`mcp_package_policy`):
   serves the package's Artifact Keeper coordinates, gated like any download.
 - **`open`**. Foreign coordinates are accepted, nothing else is relaxed
   (#5452). A `registryBaseUrl` naming another registry, or an OCI image on
-  another host, is not refused with `mcp_external_registry`; the package is
-  still looked up by name and version (an image by its path and tag or
-  digest) in the repository `mcp_package_repos` maps its `registryType` to,
-  pinned, served at its Artifact Keeper coordinates and gated exactly as
-  under `own-repos`. The foreign registry is never contacted and never
-  served: a client installs the bytes the backing repository holds (a Remote
-  backing repository fills from its own configured upstream, not from the
-  submitted URL). The pin records the warning `foreign_coordinates_replaced`.
-  A package that does not resolve is refused at publish like under
+  another host, is not refused with `mcp_external_registry` when the package
+  resolves in a hosted (Local or Staging) backing repository, or a Virtual's
+  hosted member: the package is looked up there by name and version (an image
+  by its path and tag or digest), pinned, served at its Artifact Keeper
+  coordinates and gated exactly as under `own-repos`.
+
+  Content that reaches this instance through a Remote came from that
+  Remote's upstream, so it stands only for coordinates naming that upstream.
+  Foreign coordinates naming any other host are neither pinned from a Remote
+  backing repository (or a Virtual's Remote member, including its proxy
+  cache) nor filled through it: the publish is refused with
+  `mcp_external_registry`, and a Remote MCP repository's sync stores the
+  version `unresolvable`. Without this rule `@corp/tool` on
+  `npm.internal.corp` would be replaced by a same-named (possibly squatted)
+  public package the Remote proxies. The foreign registry itself is never
+  contacted and never served.
+
+  A pin of foreign coordinates records the warning
+  `foreign_coordinates_replaced`. The served package carries what was
+  replaced in `_meta["com.artifactkeeper/resolved"]` (`submittedIdentifier`,
+  `submittedRegistryBaseUrl` for npm, PyPI, NuGet and Cargo, the backing
+  repository and `warnings`), and the version's health lists the warning per
+  package. A package that does not resolve is refused at publish as under
   `own-repos` (`mcp_package_not_found`, or `mcp_external_registry` for a
   `registryType` with no backing repository), or `202 resolving` and filled
-  through a Remote backing repository; a Remote MCP repository's sync
-  stores the version `unresolvable` (hidden). A package is never served
-  unpinned or ungated under either policy.
+  through a Remote backing repository when the coordinates allow it. A
+  package is never served unpinned or ungated under either policy.
+
+  An `open` publisher needs `read` on the backing repository, as under
+  `own-repos` (see below): the package is looked up there.
 
   Before #5452 `open` stored and served `packages[]` verbatim, without pins
   or gates. Versions stored that way are `unresolvable` (hidden, `404
-  mcp_unresolvable` for a holder) from this release on; republish them as a
-  new version once their packages are in a backing repository.
+  mcp_unresolvable` for a holder) until they are pinned. A Remote MCP
+  repository's sync re-resolves them on every pass (the versions not
+  attempted longest first) and serves each once its packages pin. A hosted
+  version is re-resolved in place by an administrator's
+  [`PUT .../versions/{version}`](#put-versionsversion-admin-edit) of the same
+  document, or republished as a new version.
 
 Settings are part of the repository API (`POST`/`PATCH /api/v1/repositories`):
 
@@ -600,6 +620,10 @@ One decision function (`decide_mcp_serve`) answers every read:
 | a gate cannot be evaluated (database error) | omitted | `503` | `503` | `503` | `mcp_gate_unavailable` |
 | `deprecated` | listed | eligible | `200` | `200` | |
 | `deleted` | omitted unless `include_deleted=true` | skipped | `404` plain; `200` with `include_deleted=true` | same | |
+
+A package with no pin (a version stored under `open` before #5452) is held
+as `mcp_unresolvable` too. Changing the package policy does not change a
+pinned version's decision: pins and gates are the same under both policies.
 
 - **`404` plain** is byte for byte the answer for a name that does not exist:
   `{"detail":"Server not found","status":404,"title":"Not Found","type":"about:blank"}`
@@ -987,7 +1011,10 @@ quarantine exactly as a publish is); registry state is kept and `updatedAt`
 bumped. When `packages[]` is unchanged the pins are kept as they are;
 otherwise every package is resolved again (and may answer `202` with
 `status: "resolving"` exactly as a publish). Identical bytes answer `200`
-without a write. Audited `MCP_SERVER_EDITED`
+without a write, except for a version with a package no pin covers (stored
+under `open` before #5452): a `PUT` of the same document resolves its
+packages again in place, which is how such a version is made servable
+without a new version number. Audited `MCP_SERVER_EDITED`
 (`previous_sha256`, `sha256`, `packages_changed`, `resolving`).
 
 ### `DELETE .../versions/{version}` (soft delete)

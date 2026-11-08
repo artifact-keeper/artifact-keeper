@@ -393,8 +393,11 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
+    base: crate::api::extractors::RequestBaseUrl,
 ) -> Result<Json<ArtifactMetadataResponse>> {
     require_existing_visible_artifact(&state, &auth, id).await?;
+    // #5452: an MCP server version's `server` is its served (pinned) form.
+    let served = super::mcp::served_server_json(&state.db, id, base.as_str()).await?;
 
     let metadata = sqlx::query!(
         r#"
@@ -412,7 +415,7 @@ pub async fn get_artifact_metadata(
     Ok(Json(ArtifactMetadataResponse {
         artifact_id: metadata.artifact_id,
         format: metadata.format,
-        metadata: metadata.metadata,
+        metadata: super::mcp::with_served_server(metadata.metadata, served),
         properties: metadata.properties,
     }))
 }

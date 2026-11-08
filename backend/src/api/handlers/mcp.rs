@@ -588,6 +588,53 @@ pub(crate) fn served_entry(
     fmt::envelope(server, &registry, source)
 }
 
+/// The server.json a generic content route serves for the stored artifact
+/// `artifact_id` (#5452): the repository download, the tree content and the
+/// artifact metadata routes. It is the document the registry surface serves,
+/// every pinned package rewritten to its Artifact Keeper coordinates
+/// ([`fmt::rewrite_packages_for_serve`]), never the stored submission, whose
+/// `registryBaseUrl` or image host may name a registry Artifact Keeper does
+/// not gate. `Ok(None)` for an artifact that is not an MCP server version (a
+/// bundle, or any other format); an MCP metadata document that does not parse
+/// is an error, never a fallback to the stored bytes.
+pub(crate) async fn served_server_json(
+    db: &PgPool,
+    artifact_id: Uuid,
+    base: &str,
+) -> crate::error::Result<Option<serde_json::Value>> {
+    let doc: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT metadata FROM artifact_metadata WHERE artifact_id = $1 AND format = 'mcp'",
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    let Some(doc) = doc else {
+        return Ok(None);
+    };
+    let stored = StoredVersion::from_metadata(&doc).ok_or_else(|| {
+        crate::error::AppError::Internal("unreadable MCP server version".to_string())
+    })?;
+    Ok(Some(fmt::rewrite_packages_for_serve(
+        &stored.server,
+        &stored.pins,
+        base,
+    )))
+}
+
+/// An artifact's metadata document with an MCP server version's `server`
+/// replaced by its served form ([`served_server_json`]); unchanged when
+/// `served` is `None` (any other artifact).
+pub(crate) fn with_served_server(
+    mut metadata: serde_json::Value,
+    served: Option<serde_json::Value>,
+) -> serde_json::Value {
+    if let (Some(doc), Some(obj)) = (served, metadata.as_object_mut()) {
+        obj.insert("server".into(), doc);
+    }
+    metadata
+}
+
 // ---------------------------------------------------------------------------
 // The generic catalog (`/api/v1/packages`) view
 // ---------------------------------------------------------------------------
@@ -4728,6 +4775,84 @@ mod tests {
             StatusCode::OK
         );
         assert_eq!(listed(anon(repos())).await.len(), 2);
+        env.teardown().await;
+    }
+
+    /// #5452: the generic content routes serve an MCP server.json as the
+    /// registry does, its packages at their pinned AK coordinates: the
+    /// repository download (GET and HEAD), the artifact metadata (by path and
+    /// by id) and the tree content. The submitted foreign `registryBaseUrl`
+    /// appears only as `_meta[...resolved].submittedRegistryBaseUrl`.
+    #[tokio::test]
+    async fn generic_routes_serve_the_pinned_server_json() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let (npm, _) = env.npm_backing(&["1.0.0"]).await;
+        let mut p = npm_pkg("@acme/echo", Some("1.0.0"));
+        p["registryBaseUrl"] = "https://npm.evil.test".into();
+        let d = doc(
+            "com.acme/gen",
+            "1.0.0",
+            serde_json::json!({"packages": [p]}),
+        );
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        let key = env.fx.repo_key.clone();
+        let path = "servers/com.acme/gen/1.0.0/server.json";
+        let id = env.server_artifact("com.acme/gen", "1.0.0").await;
+        let own = format!("http://localhost/npm/{}", npm.key);
+        let check = |server: &serde_json::Value, route: &str| {
+            let pkg = &server["packages"][0];
+            assert_eq!(pkg["registryBaseUrl"], own.as_str(), "{route}: {server}");
+            assert_eq!(
+                pkg["_meta"][fmt::AK_RESOLVED_META_KEY]["submittedRegistryBaseUrl"],
+                "https://npm.evil.test",
+                "{route}"
+            );
+        };
+        let anon = |r: Router<SharedState>| env.fx.router_anon(r);
+        let get = |app: Router, uri: String| async move { call(app, "GET", &uri, None).await };
+
+        let downloads = || crate::api::handlers::repositories::download_router();
+        let (s, b, h) = get(anon(downloads()), format!("/{key}/download/{path}")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        check(&json(&b), "download");
+        let (s, b, h) = call(
+            anon(downloads()),
+            "HEAD",
+            &format!("/{key}/download/{path}"),
+            None,
+        )
+        .await;
+        assert_eq!((s, b.len()), (StatusCode::OK, 0));
+        assert!(
+            h[header::CONTENT_LENGTH]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                > 0
+        );
+
+        let repos = || crate::api::handlers::repositories::router();
+        let (s, b, _) = get(anon(repos()), format!("/{key}/artifacts/{path}")).await;
+        assert_eq!(s, StatusCode::OK);
+        check(&json(&b)["metadata"]["server"], "metadata");
+        let by_id = || crate::api::handlers::artifacts::router();
+        let (s, b, _) = get(anon(by_id()), format!("/{id}/metadata")).await;
+        assert_eq!(s, StatusCode::OK);
+        check(&json(&b)["metadata"]["server"], "metadata by id");
+        let tree = || crate::api::handlers::tree::router();
+        let (s, b, _) = get(
+            anon(tree()),
+            format!("/content?repository_key={key}&path={path}"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        check(&json(&b), "tree content");
         env.teardown().await;
     }
 

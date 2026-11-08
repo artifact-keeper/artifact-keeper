@@ -487,6 +487,86 @@ pub fn registry_base_url_is_foreign(
     })
 }
 
+/// The host `pkg`'s `registryBaseUrl` names, lowercased.
+fn submitted_host(pkg: &mcp::Package) -> Option<String> {
+    pkg.registry_base_url
+        .as_deref()
+        .map(|u| mcp::host_of(u).to_ascii_lowercase())
+}
+
+/// Whether content that reached this instance through `remote` (a Remote
+/// repository: the backing repository itself or a Virtual's member) may be
+/// pinned for `pkg` (#5452). Always, unless `pkg` names a foreign
+/// `registryBaseUrl` (accepted only under `open`): then only when that is
+/// `remote`'s own upstream host. Otherwise `open` would replace one
+/// package identity by another of the same name: `@corp/tool` on
+/// `npm.internal.corp` by a same-named (possibly squatted) public package the
+/// Remote proxies, with a fill pulling it in on the publisher's behalf.
+pub fn remote_may_serve(
+    pkg: &mcp::Package,
+    mapped: &BackingRepo,
+    remote: &BackingRepo,
+    base_url: &str,
+) -> bool {
+    !registry_base_url_is_foreign(pkg, mapped, base_url) || upstream_is_named(pkg, remote)
+}
+
+/// Whether `pkg`'s `registryBaseUrl` names `remote`'s upstream host.
+fn upstream_is_named(pkg: &mcp::Package, remote: &BackingRepo) -> bool {
+    let upstream = remote
+        .upstream_url
+        .as_deref()
+        .map(|u| mcp::host_of(u).to_ascii_lowercase());
+    upstream.is_some() && upstream == submitted_host(pkg)
+}
+
+/// The refusal of foreign coordinates that would resolve through a Remote of
+/// another upstream ([`remote_may_serve`]).
+pub fn foreign_through_remote(index: usize, pkg: &mcp::Package, repo: &BackingRepo) -> McpError {
+    McpError::ExternalRegistry {
+        index,
+        detail: format!(
+            "registryBaseUrl names {}, which is not the upstream of the Remote repository \
+             '{}' would resolve {} {} through; publish the package to a hosted repository \
+             mapped for {}, or name the Remote's upstream",
+            submitted_host(pkg).unwrap_or_default(),
+            repo.key,
+            pkg.registry_type,
+            pkg.identifier,
+            pkg.registry_type
+        ),
+    }
+}
+
+/// The Remote repositories among those `repo` serves (itself, or a Virtual's
+/// members) whose upstream is not the registry `pkg` names
+/// ([`remote_may_serve`]).
+async fn remotes_not_named_by(
+    db: &PgPool,
+    repo: &BackingRepo,
+    pkg: &mcp::Package,
+) -> Result<Vec<BackingRepo>, McpError> {
+    let keys: Vec<String> = if repo.is_virtual() {
+        sqlx::query_scalar(
+            "SELECT r.key FROM virtual_repo_members m JOIN repositories r ON r.id = m.member_repo_id \
+             WHERE m.virtual_repo_id = $1 AND r.repo_type = 'remote'",
+        )
+        .bind(repo.id)
+        .fetch_all(db)
+        .await
+        .map_err(db_err)?
+    } else if repo.is_remote() {
+        vec![repo.key.clone()]
+    } else {
+        Vec::new()
+    };
+    Ok(repos_by_key(db, &keys)
+        .await?
+        .into_iter()
+        .filter(|remote| !upstream_is_named(pkg, remote))
+        .collect())
+}
+
 /// Record [`FOREIGN_COORDINATES_WARNING`] on a pin found in a Remote's proxy
 /// cache rather than by [`resolve_package`] (which records it itself), so
 /// every pin of foreign coordinates says so, wherever it was found.
@@ -513,7 +593,8 @@ async fn resolve_artifact_package(
     policy: PackagePolicy,
 ) -> Result<PackagePin, McpError> {
     let mut warnings = Vec::new();
-    if registry_base_url_is_foreign(pkg, repo, base_url) {
+    let foreign = registry_base_url_is_foreign(pkg, repo, base_url);
+    if foreign {
         if policy == PackagePolicy::Open {
             warnings.push(FOREIGN_COORDINATES_WARNING.to_string());
         } else {
@@ -536,12 +617,12 @@ async fn resolve_artifact_package(
     // A Virtual serves the first member (by priority) holding the version,
     // so its rows come first and the pinned digest is that member's.
     let sql = format!(
-        "SELECT a.id, a.checksum_sha256 FROM artifacts a \
+        "SELECT a.id, a.checksum_sha256, a.repository_id FROM artifacts a \
          WHERE a.repository_id = ANY($1) AND a.is_deleted = false AND {} \
          ORDER BY array_position($1, a.repository_id), a.path",
         name_predicate(&pkg.registry_type)
     );
-    let rows: Vec<(Uuid, String)> = match lookup_version(&pkg.registry_type, version) {
+    let rows: Vec<(Uuid, String, Uuid)> = match lookup_version(&pkg.registry_type, version) {
         Some(lookup) => sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(&repo_ids)
             .bind(lookup_name(&pkg.registry_type, &pkg.identifier))
@@ -551,7 +632,18 @@ async fn resolve_artifact_package(
             .map_err(db_err)?,
         None => Vec::new(),
     };
-    let Some((_, sha256)) = rows.first().cloned() else {
+    if foreign {
+        // Foreign coordinates (`open`) never stand for what a Remote of
+        // another upstream holds: the winning row must be hosted, or in a
+        // Remote whose upstream is the submitted registry.
+        let untrusted = remotes_not_named_by(db, repo, pkg).await?;
+        if let Some((_, _, owner)) = rows.first() {
+            if untrusted.iter().any(|r| r.id == *owner) {
+                return Err(foreign_through_remote(index, pkg, repo));
+            }
+        }
+    }
+    let Some((_, sha256, _)) = rows.first().cloned() else {
         return Err(McpError::PackageNotFound {
             index,
             detail: format!(
@@ -574,7 +666,7 @@ async fn resolve_artifact_package(
         resolved: ResolvedPin {
             repository: repo.key.clone(),
             repository_id: repo.id,
-            artifact_ids: rows.iter().map(|(id, _)| *id).collect(),
+            artifact_ids: rows.iter().map(|(id, ..)| *id).collect(),
             sha256: Some(sha256),
             name: None,
             tag: None,
@@ -629,8 +721,10 @@ struct OciBackingPath {
 }
 
 /// The image path inside `repo` an identifier names, or why it is foreign.
-/// Under `open` a foreign host is accepted and its path looked up in `repo`
-/// (#5452): the image still has to be there, and is served from there.
+/// Under `open` a foreign host is accepted for a hosted repository and its
+/// path looked up there (#5452): the image still has to be there, and is
+/// served from there. A Remote's images came from its upstream, so naming
+/// another host is refused under either policy ([`remote_may_serve`]).
 fn oci_backing_path(
     r: &mcp::OciRef,
     repo: &BackingRepo,
@@ -651,7 +745,7 @@ fn oci_backing_path(
             path: r.path.clone(),
             foreign: false,
         }),
-        Some(_) if policy == PackagePolicy::Open => Ok(OciBackingPath {
+        Some(_) if policy == PackagePolicy::Open && !repo.is_remote() => Ok(OciBackingPath {
             path: r.path.clone(),
             foreign: true,
         }),
@@ -1910,6 +2004,20 @@ pub async fn record_pin_drift(
 mod tests {
     use super::*;
 
+    fn test_repo(key: &str, repo_type: &str, format: &str, upstream: Option<&str>) -> BackingRepo {
+        BackingRepo {
+            id: Uuid::nil(),
+            key: key.into(),
+            repo_type: repo_type.into(),
+            format: format.into(),
+            upstream_url: upstream.map(Into::into),
+            location: StorageLocation {
+                backend: "filesystem".into(),
+                path: "/tmp".into(),
+            },
+        }
+    }
+
     #[test]
     fn format_backing_rules() {
         assert!(format_backs("npm", "npm"));
@@ -1971,16 +2079,8 @@ mod tests {
         );
         assert_eq!(hex_of("sha256:abc"), "abc");
         assert_eq!(hex_of("abc"), "abc");
-        let repo = |repo_type: &str, upstream: Option<&str>| BackingRepo {
-            id: Uuid::nil(),
-            key: "oci-r".into(),
-            repo_type: repo_type.into(),
-            format: "docker".into(),
-            upstream_url: upstream.map(Into::into),
-            location: StorageLocation {
-                backend: "filesystem".into(),
-                path: "/tmp".into(),
-            },
+        let repo = |repo_type: &str, upstream: Option<&str>| {
+            test_repo("oci-r", repo_type, "docker", upstream)
         };
         let r = mcp::parse_oci_identifier("ghcr.io/acme/mcp:1.2").unwrap();
         let own_repos = |r: &mcp::OciRef, repo: &BackingRepo| {
@@ -2019,22 +2119,57 @@ mod tests {
         assert!(!not_pulled_hint(&repo("remote", None)).is_empty());
     }
 
+    /// #5452: foreign coordinates stand for what a Remote holds only when
+    /// they name its upstream host; coordinates naming this instance (or
+    /// none) always may. A Remote with no upstream serves no foreign name.
+    #[test]
+    fn a_remote_serves_foreign_coordinates_only_for_its_upstream() {
+        let mapped = test_repo("npm-v", "virtual", "npm", None);
+        let remote = test_repo(
+            "npm-r",
+            "remote",
+            "npm",
+            Some("https://Registry.NPMjs.org/"),
+        );
+        let pkg = |base: Option<&str>| -> mcp::Package {
+            serde_json::from_value(serde_json::json!({
+                "registryType": "npm", "identifier": "@corp/tool", "version": "1.0.0",
+                "registryBaseUrl": base, "transport": {"type": "stdio"},
+            }))
+            .unwrap()
+        };
+        let base = "https://ak.test";
+        for (submitted, may) in [
+            (None, true),
+            (Some("https://ak.test/npm/npm-v"), true),
+            (Some("https://registry.npmjs.org"), true),
+            (Some("https://npm.internal.corp"), false),
+            (Some("https://registry.npmjs.org.evil.test"), false),
+        ] {
+            assert_eq!(
+                remote_may_serve(&pkg(submitted), &mapped, &remote, base),
+                may,
+                "{submitted:?}"
+            );
+        }
+        let bare = test_repo("npm-r", "remote", "npm", None);
+        assert!(!remote_may_serve(
+            &pkg(Some("https://registry.npmjs.org")),
+            &mapped,
+            &bare,
+            base
+        ));
+        let e = foreign_through_remote(3, &pkg(Some("https://npm.internal.corp")), &remote);
+        assert!(matches!(e, McpError::ExternalRegistry { index: 3, .. }));
+        assert!(e.detail().contains("npm.internal.corp") && e.detail().contains("npm-r"));
+    }
+
     /// #5452: a pin found in a Remote's proxy cache records the foreign
     /// coordinates it replaced, once, as a direct pin does; this instance's
     /// own `registryBaseUrl` (or none) records nothing.
     #[test]
     fn proxy_cache_pins_note_foreign_coordinates() {
-        let repo = BackingRepo {
-            id: Uuid::nil(),
-            key: "npm-r".into(),
-            repo_type: "remote".into(),
-            format: "npm".into(),
-            upstream_url: Some("https://registry.npmjs.org".into()),
-            location: StorageLocation {
-                backend: "filesystem".into(),
-                path: "/tmp".into(),
-            },
-        };
+        let repo = test_repo("npm-r", "remote", "npm", Some("https://registry.npmjs.org"));
         let pkg = |base: Option<&str>| -> mcp::Package {
             serde_json::from_value(serde_json::json!({
                 "registryType": "npm", "identifier": "@acme/x", "version": "1.0.0",
@@ -2086,26 +2221,16 @@ mod tests {
     /// ones. `own-repos` keeps refusing the same identifiers.
     #[test]
     fn open_policy_looks_foreign_images_up_in_the_backing_repository() {
-        let repo = |repo_type: &str, upstream: Option<&str>| BackingRepo {
-            id: Uuid::nil(),
-            key: "oci-r".into(),
-            repo_type: repo_type.into(),
-            format: "docker".into(),
-            upstream_url: upstream.map(Into::into),
-            location: StorageLocation {
-                backend: "filesystem".into(),
-                path: "/tmp".into(),
-            },
+        let repo = |repo_type: &str, upstream: Option<&str>| {
+            test_repo("oci-r", repo_type, "docker", upstream)
         };
         let open = |r: &mcp::OciRef, repo: &BackingRepo| {
             oci_backing_path(r, repo, "https://ak.test", PackagePolicy::Open)
         };
         let evil = mcp::parse_oci_identifier("evil.example/acme/mcp:1.2").unwrap();
-        for backing in [
-            repo("local", None),
-            repo("staging", None),
-            repo("remote", Some("https://ghcr.io")),
-        ] {
+        // A Remote holds what its upstream served: another host is refused.
+        assert!(open(&evil, &repo("remote", Some("https://ghcr.io"))).is_err());
+        for backing in [repo("local", None), repo("staging", None)] {
             assert!(
                 oci_backing_path(&evil, &backing, "https://ak.test", PackagePolicy::OwnRepos)
                     .is_err(),

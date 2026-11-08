@@ -726,7 +726,11 @@ async fn edit_impl(
     }
     add_staged_bundles(&state.db, &repo, &mut server, base.as_str()).await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
-    let keep_pins = packages_unchanged(&current.stored.server, &server);
+    // A version with an unpinned package (stored under `open` before #5452)
+    // is resolved again, even by a PUT of the same document: that is how an
+    // administrator re-resolves it in place.
+    let repin = current.stored.unpinned_package().is_some();
+    let keep_pins = !repin && packages_unchanged(&current.stored.server, &server);
     if !keep_pins {
         mcp_packages::refuse_unreadable_backing(&state.db, &ext, &settings, &server)
             .await
@@ -760,7 +764,7 @@ async fn edit_impl(
         .map_err(IntoResponse::into_response)?;
     let bytes = fmt::canonical_bytes(&server);
     let sha256 = fmt::sha256_hex(&bytes);
-    if sha256 == current.checksum.trim() {
+    if sha256 == current.checksum.trim() && !repin {
         // Nothing to change.
         let entry = served_entry(
             &current,
@@ -2891,6 +2895,115 @@ mod tests {
                 "{key}: the refusal names the policy: {b}"
             );
         }
+        env.teardown().await;
+    }
+
+    /// #5452: under `open`, coordinates naming another registry than a Remote
+    /// backing repository's upstream are neither filled through it nor
+    /// pinned from it (refused, and neither registry sees a request);
+    /// coordinates naming its upstream are filled (`202 resolving`), pinned
+    /// with `foreign_coordinates_replaced` and served at AK coordinates. A
+    /// version whose pins were lost (the pre-#5452 `open` shape) is
+    /// re-resolved in place by an admin `PUT` of the same document.
+    #[tokio::test]
+    async fn open_fills_through_a_remote_only_for_its_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@acme/echo/-/echo-2.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz-2".to_vec()))
+            .mount(&upstream)
+            .await;
+        let (remote_id, remote_key) = env.repo("remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        tdh::grant_repo_access(&env.fx.pool, remote_id, env.fx.user_id).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remote_key}).to_string(),
+        )
+        .await;
+        let with_base = |base: &str| {
+            let mut p = npm("2.0.0");
+            p[0]["registryBaseUrl"] = base.into();
+            doc("com.acme/echo", "2.0.0", p)
+        };
+
+        let (s, b) = env
+            .json(
+                env.member(),
+                "POST",
+                "/publish",
+                Some(&with_base(&foreign.uri())),
+            )
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_external_registry")
+            ),
+            "{b}"
+        );
+        assert!(foreign.received_requests().await.unwrap().is_empty());
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+
+        let named = with_base(&upstream.uri());
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&named))
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let id = env.artifact("com.acme/echo", "2.0.0").await;
+        let res = resolve_until_settled(&env, id).await;
+        assert_eq!(res["state"], "resolved", "{res}");
+        let tail = "/servers/com.acme/echo/versions/2.0.0";
+        let (s, b) = env.json(env.anon(), "GET", tail, None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pkg = &b["server"]["packages"][0];
+        assert_eq!(
+            pkg["registryBaseUrl"],
+            format!("http://localhost/npm/{remote_key}")
+        );
+        let resolved = &pkg["_meta"][fmt::AK_RESOLVED_META_KEY];
+        assert_eq!(resolved["submittedRegistryBaseUrl"], upstream.uri());
+        assert_eq!(
+            resolved["warnings"],
+            serde_json::json!([mcp_packages::FOREIGN_COORDINATES_WARNING])
+        );
+        assert!(foreign.received_requests().await.unwrap().is_empty());
+
+        // The pins lost (as `open` stored versions before #5452): held, then
+        // re-resolved in place by a PUT of the same document.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{packages}', '[]') \
+             WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            env.json(env.member(), "GET", tail, None).await.1["error"],
+            "mcp_unresolvable"
+        );
+        let (s, b) = env.json(env.admin(), "PUT", tail, Some(&named)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let (s, b) = env.json(env.anon(), "GET", tail, None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["server"]["packages"][0]["registryBaseUrl"],
+            format!("http://localhost/npm/{remote_key}")
+        );
         env.teardown().await;
     }
 

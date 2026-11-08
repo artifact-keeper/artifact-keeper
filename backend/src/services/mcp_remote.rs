@@ -911,13 +911,11 @@ async fn pin_packages(
                     repo,
                     index,
                     &candidate,
+                    "",
                 )
                 .await
                 {
-                    Ok(Some(mut pin)) => {
-                        mcp_packages::note_foreign_coordinates(&mut pin, &candidate, repo, "");
-                        found = Ok(pin)
-                    }
+                    Ok(Some(pin)) => found = Ok(pin),
                     Ok(None) => {}
                     Err(e) => found = Err(e),
                 }
@@ -936,6 +934,18 @@ async fn pin_packages(
         }
     }
     (pins, unresolved)
+}
+
+/// The `packages[]` indexes of a stored version that no pin covers.
+fn unpinned_indexes(stored: &fmt::StoredVersion) -> Vec<usize> {
+    let count = stored
+        .server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .map_or(0, Vec::len);
+    (0..count)
+        .filter(|i| !stored.pins.iter().any(|p| p.index == *i))
+        .collect()
 }
 
 /// An upstream URL as it may be stored, served or audited: userinfo
@@ -1751,11 +1761,19 @@ async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), Str
 /// unresolved packages (a package pulled through the backing Remote since,
 /// a mapping added since).
 async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), String> {
+    // A version needs another attempt when a package of it has no pin: one
+    // the sync reported unresolved, and one stored unpinned with an empty
+    // `unresolved` list, as `open` ingested every package before #5452.
+    // Least recently attempted first, so versions that keep failing do not
+    // starve the rest of the batch.
     let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
         "SELECT a.id, m.metadata FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
          WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
-           AND jsonb_array_length(COALESCE(m.metadata->'ingest'->'unresolved', '[]'::jsonb)) > 0 \
-         ORDER BY a.name, a.version LIMIT $2",
+           AND (jsonb_array_length(COALESCE(m.metadata->'ingest'->'unresolved', '[]'::jsonb)) > 0 \
+             OR jsonb_array_length(COALESCE(m.metadata->'packages', '[]'::jsonb)) \
+                < jsonb_array_length(COALESCE(m.metadata->'server'->'packages', '[]'::jsonb))) \
+         ORDER BY COALESCE(m.metadata->'ingest'->>'reResolveAttemptedAt', '') , a.name, a.version \
+         LIMIT $2",
     )
     .bind(run.repo.id)
     .bind(MAX_RERESOLVE)
@@ -1769,13 +1787,21 @@ async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), S
         let Ok(server) = serde_json::from_value::<ServerJson>(stored.server.clone()) else {
             continue;
         };
-        let before: Vec<Unresolved> = meta
-            .pointer("/ingest/unresolved")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let indexes: Vec<usize> = before.iter().map(|u| u.index).collect();
+        let indexes = unpinned_indexes(&stored);
         let (new_pins, still) = pin_packages(run, &server, Some(&indexes)).await;
         if new_pins.is_empty() {
+            // Record the attempt (and what is still unresolved) so the next
+            // pass tries the versions not attempted yet first.
+            sqlx::query(
+                "UPDATE artifact_metadata SET metadata = jsonb_set(jsonb_set(metadata, \
+                 '{ingest,unresolved}', $2), '{ingest,reResolveAttemptedAt}', to_jsonb(now()::text)) \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .bind(serde_json::to_value(&still).unwrap_or_default())
+            .execute(&run.state.db)
+            .await
+            .map_err(db_err)?;
             continue;
         }
         let mut pins = stored.pins.clone();

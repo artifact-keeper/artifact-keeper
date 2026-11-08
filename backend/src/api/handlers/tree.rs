@@ -393,7 +393,8 @@ pub async fn get_content(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Query(params): Query<ContentQuery>,
-) -> Result<impl IntoResponse> {
+    base: crate::api::extractors::RequestBaseUrl,
+) -> Result<axum::response::Response> {
     // Verify repository exists and check visibility
     let repo_row: Option<(
         Uuid,
@@ -455,6 +456,16 @@ pub async fn get_content(
             params.path
         )));
     }
+    // #5452: an MCP server version's content is its served (pinned)
+    // document, as the registry serves it, never the stored submission.
+    if format == "mcp" {
+        if let Some(doc) =
+            crate::api::handlers::mcp::served_server_json(&state.db, artifact.id, base.as_str())
+                .await?
+        {
+            return Ok(crate::api::handlers::repositories::mcp_server_json_response(&doc, false));
+        }
+    }
 
     // Fetch content from storage
     let location = crate::storage::StorageLocation {
@@ -497,7 +508,8 @@ pub async fn get_content(
             ),
         ],
         body,
-    ))
+    )
+        .into_response())
 }
 
 /// The `Cache-Control` of a `/tree/content` answer. Only a public
