@@ -1385,8 +1385,9 @@ async fn gate_rows(
 /// rejected or deleted. Those rows are locked `FOR SHARE`, so a quarantine,
 /// rejection or deletion of a backing package either is seen here or waits
 /// for the caller's commit. This is the quarantine half of
-/// [`backing_gate`] only: the scan-policy and Remote gates stay with the
-/// full serve gate, which the caller evaluates beforehand.
+/// [`backing_gate`] only: the scan-policy, Remote and OCI-presence gates
+/// stay with the full serve gate, which the caller evaluates beforehand
+/// (#5533 tracks evaluating the whole gate on the transaction).
 pub async fn held_backing_package(
     conn: &mut sqlx::PgConnection,
     stored: &mcp::StoredVersion,
@@ -1394,33 +1395,47 @@ pub async fn held_backing_package(
     if let Some(package) = stored.unpinned_package() {
         return Ok(Some(package));
     }
-    let now = Utc::now();
+    let mut pins = Vec::new();
     for pin in &stored.pins {
-        let rows = gate_rows(&mut *conn, pin).await?;
-        let ids: Vec<Uuid> = rows.iter().filter(|r| !r.cached).map(|r| r.id).collect();
-        let locked: Vec<(Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT quarantine_status, quarantine_until FROM artifacts \
-             WHERE id = ANY($1) AND is_deleted = false ORDER BY id FOR SHARE",
+        pins.push((pin, gate_rows(&mut *conn, pin).await?));
+    }
+    // Every pinned row of every pin locked in one statement, in id order, so
+    // two completions never take them in opposite orders.
+    let mut ids: Vec<Uuid> = pins
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().filter(|r| !r.cached).map(|r| r.id))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let locked: HashMap<Uuid, (Option<String>, Option<DateTime<Utc>>)> =
+        sqlx::query_as::<_, (Uuid, Option<String>, Option<DateTime<Utc>>)>(
+            "SELECT id, quarantine_status, quarantine_until FROM artifacts \
+         WHERE id = ANY($1) AND is_deleted = false ORDER BY id FOR SHARE",
         )
         .bind(&ids)
         .fetch_all(&mut *conn)
-        .await?;
-        let held = rows.is_empty()
-            || rows.iter().any(|r| r.cache_held(now))
-            || locked.len() != ids.len()
-            || locked.iter().any(|(status, until)| {
-                crate::services::quarantine_service::check_download_allowed(
-                    status.as_deref(),
-                    *until,
-                    now,
-                )
-                .is_err()
-            });
-        if held {
-            return Ok(Some(pin.label()));
+        .await?
+        .into_iter()
+        .map(|(id, status, until)| (id, (status, until)))
+        .collect();
+    let now = Utc::now();
+    let cleared = |r: &GateRow| {
+        if r.cached {
+            return !r.cache_held(now);
         }
-    }
-    Ok(None)
+        locked.get(&r.id).is_some_and(|(status, until)| {
+            crate::services::quarantine_service::check_download_allowed(
+                status.as_deref(),
+                *until,
+                now,
+            )
+            .is_ok()
+        })
+    };
+    Ok(pins
+        .iter()
+        .find(|(_, rows)| rows.is_empty() || !rows.iter().all(cleared))
+        .map(|(pin, _)| pin.label()))
 }
 
 /// Whether the pinned OCI manifest still exists in its repository.

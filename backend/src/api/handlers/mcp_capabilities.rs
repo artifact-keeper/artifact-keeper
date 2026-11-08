@@ -34,7 +34,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::extractors::RequestBaseUrl;
-use crate::api::handlers::mcp::{self as surface, problem, server_name};
+use crate::api::handlers::mcp::{self as surface, problem, server_name, Servability};
 use crate::api::handlers::proxy_helpers::RepoInfo;
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -50,7 +50,7 @@ pub const INTROSPECT_SCOPE: &str = "mcp:introspect";
 pub const INGEST_MAX_DEPTH: usize = 64;
 /// Default and maximum number of snapshot summaries listed.
 pub const DEFAULT_HISTORY: i64 = 50;
-pub const MAX_HISTORY: i64 = 200;
+pub const MAX_HISTORY: i64 = caps::HISTORY_WINDOW;
 /// The spec caveat every capability response carries.
 pub const NOTICE: &str = "Capability lists are untrusted. Tools may vary by the authorization \
      presented, annotations are server-asserted, and a declared list is a claim, not an \
@@ -359,7 +359,8 @@ pub fn parse_report(body: &[u8], now: DateTime<Utc>) -> Result<Report, Response>
             if t > now + chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS) {
                 return Err(bad_request("observedAt", "is in the future"));
             }
-            t
+            // Skew is tolerated, never ranked above arrival (#5464).
+            t.min(now)
         }
     };
     let auth_state = match opt_string(o, "authState", 32)? {
@@ -784,6 +785,7 @@ pub fn job_limits(kind: JobKind) -> Value {
         (status = 400, description = "Malformed request"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not an `mcp:introspect` API token (`mcp_forbidden`)"),
+        (status = 503, description = "`mcp_gate_unavailable`: the claimed job's gates could not be evaluated; it is back in the queue"),
     )
 )]
 async fn claim_job(
@@ -838,9 +840,17 @@ async fn claim_payload(
     // Only a version whose gates pass is ever introspected: a sandbox run
     // executes exactly the bytes AK scanned, and a remote probe contacts a
     // held, blocked or unapproved version's endpoints no more than a reader
-    // could.
-    if !surface::artifact_servable(state, &repo, v.artifact_id, base).await {
-        return Ok(Err("server version is held".into()));
+    // could. A gate that cannot be evaluated is no hold: the claim is handed
+    // back to the queue and the worker told to retry, never cancelled.
+    match surface::artifact_servability(state, &repo, v.artifact_id, base).await {
+        Servability::Servable => {}
+        Servability::Held => return Ok(Err("server version is held".into())),
+        Servability::Unavailable => {
+            jobs::release(&state.db, job, "serve gate unavailable")
+                .await
+                .map_err(app_error)?;
+            return Err(gate_unavailable());
+        }
     }
     let served = fmt::rewrite_packages_for_serve(&stored.server, &stored.pins, base);
     let target = match jobs::job_target(kind, &job.target_key, &stored, &served) {
@@ -871,11 +881,12 @@ async fn claim_payload(
     params(("id" = Uuid, Path, description = "Job id")),
     request_body(content = Object, description = "The worker's result: claimToken, outcome, the lists on success"),
     responses(
-        (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, current, drift}` (`current: false`: a fresher snapshot of the source exists, this one is history) or `{status: \"retry\", notBefore}`"),
+        (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, current, drift}` (`current`: whether the stored snapshot is the version's current view now) or `{status: \"retry\", notBefore}`"),
         (status = 400, description = "Malformed result, or an `observedAt` outside the claim's window"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not an `mcp:introspect` API token, or the token is not scoped to the job's repository (`mcp_forbidden`)"),
         (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim, or its lease expired; `mcp_target_ineligible`: the server version or a backing package stopped being eligible after the claim, and the job was cancelled"),
+        (status = 503, description = "`mcp_gate_unavailable`: the server version's gates could not be evaluated; nothing was stored and the claim is unchanged"),
     )
 )]
 async fn complete_job(
@@ -911,7 +922,13 @@ async fn complete_job(
     // The full serve gate a claim passes, evaluated again now (#5463); the
     // version's and its backing packages' holds are re-read under lock in
     // the transaction as well.
-    let servable = version_servable(&state, job.artifact_id, base.as_str()).await?;
+    let servable = match version_servable(&state, job.artifact_id, base.as_str()).await? {
+        Servability::Servable => true,
+        Servability::Held => false,
+        // No verdict is no hold: the claim stays for the worker to retry or
+        // the reaper to return.
+        Servability::Unavailable => return Err(gate_unavailable()),
+    };
     // The claim token proves only the claim; the repository scope is
     // re-checked against the job's repository inside the transaction that
     // ends the claim (#5460).
@@ -955,21 +972,33 @@ async fn complete_job(
     Ok(json_resp(StatusCode::OK, &out))
 }
 
-/// Whether the server version `artifact_id` passes the serve gate a claim
-/// passes ([`claim_payload`]): it exists and is servable to readers now.
+/// The serve gate a claim passes ([`claim_payload`]) for the server version
+/// `artifact_id` now: a deleted version is [`Servability::Held`]. A
+/// repository that vanished since the claim answers its own `404` from
+/// `mcp_repo`, leaving the claim for the reaper.
 async fn version_servable(
     state: &SharedState,
     artifact_id: Uuid,
     base: &str,
-) -> Result<bool, Response> {
+) -> Result<Servability, Response> {
     let Some(v) = caps::version_ref(&state.db, artifact_id)
         .await
         .map_err(internal)?
     else {
-        return Ok(false);
+        return Ok(Servability::Held);
     };
     let repo = surface::mcp_repo(&state.db, &v.repository_key).await?;
-    Ok(surface::artifact_servable(state, &repo, artifact_id, base).await)
+    Ok(surface::artifact_servability(state, &repo, artifact_id, base).await)
+}
+
+/// `503 mcp_gate_unavailable`: a gate could not be evaluated.
+fn gate_unavailable() -> Response {
+    problem(
+        503,
+        "mcp_gate_unavailable",
+        "The registry could not evaluate this server version's gates; retry later",
+        json!({}),
+    )
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -2099,9 +2128,25 @@ mod db_tests {
         env.snapshots(artifact_id, Source::RemoteProbe).await
     }
 
-    /// Post every result in `results` to `job` at once, each from its own
-    /// task on the multi-threaded runtime.
+    /// Post every result in `results` to `job` at once, deterministically
+    /// interleaved: a side connection holds the job row `FOR UPDATE` while
+    /// the completions pass the handler's token check and pre-check and
+    /// queue on the claim lock (as many as the fixture pool lets open a
+    /// transaction), and only then lets them go. Without the claim lock's
+    /// re-check (#5389) every queued completion would store.
     async fn race(env: &Env, job: Uuid, results: Vec<Value>) -> Vec<(StatusCode, Value)> {
+        // Two side connections: the lock holder, and a poller outside its
+        // transaction (`pg_stat_activity` is a snapshot within one).
+        let side = crate::testing::try_pool_with(2).await.expect("side pool");
+        let mut holder = side.begin().await.unwrap();
+        sqlx::query("SELECT id FROM mcp_introspection_jobs WHERE id = $1 FOR UPDATE")
+            .bind(job)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let queued = results
+            .len()
+            .min(env.fx.pool.options().get_max_connections() as usize);
         let uri = format!("/jobs/{job}/complete");
         let tasks: Vec<_> = results
             .into_iter()
@@ -2110,6 +2155,25 @@ mod db_tests {
                 tokio::spawn(async move { call(app, "POST", &uri, Some(r)).await })
             })
             .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+                   AND query LIKE '%FROM mcp_introspection_jobs j%FOR UPDATE OF j%'",
+            )
+            .fetch_one(&side)
+            .await
+            .unwrap();
+            if waiting as usize >= queued {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {waiting} of {queued} completions queued on the claim lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        holder.commit().await.unwrap();
         let mut out = Vec::new();
         for t in tasks {
             out.push(t.await.unwrap());
@@ -2118,8 +2182,9 @@ mod db_tests {
     }
 
     /// #5461: concurrent completions of one claim, identical and divergent,
-    /// through the HTTP handler: exactly one stores, every other one is the
-    /// claim conflict and stores nothing. A transient retry racing a
+    /// through the HTTP handler and queued together on the claim lock
+    /// ([`race`]): exactly one stores, every other one is the claim conflict
+    /// and stores nothing. A transient retry racing a
     /// successful result never leaves a stored snapshot behind a pending job.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_completions_of_one_claim_have_one_winner() {
@@ -2160,8 +2225,9 @@ mod db_tests {
             stored[0]["snapshotId"].as_str().map(String::from)
         );
 
-        // Retry against success, a few rounds so both orders are likely.
-        for round in 0..4 {
+        // Retry against success: whichever wins, no snapshot behind a
+        // pending job.
+        for round in 0..2 {
             let before = snapshot_count(&env, artifact_id).await;
             let token = format!("tok-retry-{round}");
             let job = env.claim_probe(artifact_id, &token).await;
@@ -2523,6 +2589,20 @@ mod db_tests {
         assert_eq!(
             (s, b["current"].as_bool()),
             (StatusCode::OK, Some(true)),
+            "{b}"
+        );
+        assert_eq!(env.current().await["tools"][0]["name"], "newest");
+        // A stored failure is never the current view.
+        let job = env.claim_target(version, "remote:1", "tok-fail").await;
+        let (s, b) = env
+            .complete(
+                job.id,
+                json!({"claimToken": "tok-fail", "outcome": "auth_required"}),
+            )
+            .await;
+        assert_eq!(
+            (s, b["current"].as_bool()),
+            (StatusCode::OK, Some(false)),
             "{b}"
         );
         assert_eq!(env.current().await["tools"][0]["name"], "newest");

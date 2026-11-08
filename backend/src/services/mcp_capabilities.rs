@@ -49,6 +49,9 @@ pub const DRIFT_FINDING_SOURCE: &str = "mcp-capabilities";
 /// ([`prune_snapshots`], #5386), newest first. Rows still referenced are kept
 /// on top of these.
 pub const SNAPSHOT_KEEP: i64 = 20;
+/// The freshest snapshots of a version read when choosing its current view
+/// ([`pick_current`]) or listing its history.
+pub const HISTORY_WINDOW: i64 = 200;
 /// Snapshots deleted per retention pass at most.
 pub const SNAPSHOT_PRUNE_BATCH: i64 = 1000;
 /// How far a reported or observed `observedAt` may lie ahead of the
@@ -1165,7 +1168,7 @@ pub async fn get_snapshot(db: &PgPool, id: Uuid) -> sqlx::Result<Option<Snapshot
 /// Snapshots of one server version, freshest first ([`FRESHEST_FIRST`]),
 /// optionally of one source.
 pub async fn list_snapshots(
-    db: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     artifact_id: Uuid,
     source: Option<Source>,
     limit: i64,
@@ -1247,6 +1250,18 @@ pub fn pick_current(rows: &[SnapshotRow], source: Option<Source>) -> Option<&Sna
                 .cmp(&rank(b))
                 .then(b.freshness_key().cmp(&a.freshness_key()))
         })
+}
+
+/// Whether snapshot `id` is the current view of `artifact_id`
+/// ([`pick_current`] over the freshest [`HISTORY_WINDOW`]), read on `conn`
+/// (the transaction that stored it).
+pub async fn is_current_in(
+    conn: &mut sqlx::PgConnection,
+    artifact_id: Uuid,
+    id: Uuid,
+) -> sqlx::Result<bool> {
+    let rows = list_snapshots(&mut *conn, artifact_id, None, HISTORY_WINDOW).await?;
+    Ok(pick_current(&rows, None).is_some_and(|c| c.id == id))
 }
 
 /// The successful snapshot just before `to` in freshness order among `rows`

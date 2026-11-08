@@ -335,8 +335,8 @@ pub fn parse_result(r: &WorkerResult) -> Result<ParsedResult, caps::CapError> {
 
 /// The `observedAt` a result is stored with (#5464): the worker's, when it
 /// lies between the job's claim and now (each give or take
-/// [`caps::OBSERVED_AT_SKEW_SECS`] of clock skew), else refused; `now` when
-/// the worker sent none. Freshness orders the current view, so a result may
+/// [`caps::OBSERVED_AT_SKEW_SECS`] of clock skew), else refused, and never
+/// later than now; `now` when the worker sent none. Freshness orders the current view, so a result may
 /// not claim to be older than the claim it answers or newer than its
 /// arrival.
 pub fn validated_observed_at(
@@ -357,7 +357,9 @@ pub fn validated_observed_at(
             "is before the job was claimed",
         ));
     }
-    Ok(t)
+    // The skew is tolerated, never ranked: a result cannot claim to be
+    // fresher than its arrival.
+    Ok(t.min(now))
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +678,25 @@ async fn finish(
     Ok(done.rows_affected() == 1)
 }
 
+/// Hand a claimed job back to the queue without spending its attempt, due
+/// again in a minute: its gates could not be evaluated, which is no verdict
+/// on the job. Only the current claim is released.
+pub async fn release(db: &PgPool, job: &JobRow, reason: &str) -> crate::error::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE mcp_introspection_jobs SET status = 'pending', \
+           attempts = GREATEST(attempts - 1, 0), not_before = NOW() + INTERVAL '1 minute', \
+           last_error = $3, claim_token_hash = NULL, lease_expires_at = NULL, updated_at = NOW() \
+         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2",
+    )
+    .bind(job.id)
+    .bind(&job.claim_token_hash)
+    .bind(reason)
+    .execute(db)
+    .await
+    .map_err(db_err)?;
+    Ok(done.rows_affected() == 1)
+}
+
 /// Cancel a claimed job that cannot run (target gone, version held).
 pub async fn cancel(db: &PgPool, job: &JobRow, reason: &str) -> crate::error::Result<bool> {
     finish(db, job, "cancelled", None, None, Some(reason)).await
@@ -688,8 +709,8 @@ pub async fn cancel(db: &PgPool, job: &JobRow, reason: &str) -> crate::error::Re
 #[allow(clippy::large_enum_variant)]
 pub enum Completed {
     /// A snapshot was stored (and drift raised when `drift_scan` is set).
-    /// `current` is false when a fresher snapshot of the same source exists:
-    /// this one is history and not the current view (#5464).
+    /// `current`: whether the stored (or repeated) snapshot is the version's
+    /// current view ([`caps::pick_current`]) as of this commit (#5464).
     Stored {
         snapshot: caps::SnapshotRow,
         drift_scan: Option<Uuid>,
@@ -948,6 +969,9 @@ pub async fn complete(
     let ins = caps::insert_snapshot_in(&mut tx, &snap)
         .await
         .map_err(db_err)?;
+    let current = caps::is_current_in(&mut tx, v.artifact_id, ins.snapshot.id)
+        .await
+        .map_err(db_err)?;
     // The row is locked and matched above, so this ends the claim.
     if !finish(
         &mut *tx,
@@ -964,7 +988,7 @@ pub async fn complete(
     tx.commit().await.map_err(db_err)?;
     let drift_scan = caps::record_stored(db, &snap, &ins, &v.repository_key).await?;
     Ok(Completed::Stored {
-        current: !ins.superseded,
+        current,
         snapshot: ins.snapshot,
         drift_scan,
     })
@@ -1312,7 +1336,7 @@ mod tests {
         let ok = |t| validated_observed_at(Some(t), Some(claimed), now);
         assert_eq!(validated_observed_at(None, Some(claimed), now), Ok(now));
         assert_eq!(ok(claimed), Ok(claimed));
-        assert_eq!(ok(now + skew), Ok(now + skew), "clock skew tolerated");
+        assert_eq!(ok(now + skew), Ok(now), "skew tolerated, never ranked");
         assert_eq!(ok(claimed - skew), Ok(claimed - skew));
         let future = ok(now + skew + chrono::Duration::seconds(1)).unwrap_err();
         assert_eq!(future.path, "observedAt");
