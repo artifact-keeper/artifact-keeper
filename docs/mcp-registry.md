@@ -1078,6 +1078,10 @@ curl -X PUT -H "Authorization: Bearer $AK_TOKEN" --data-binary @echo.mcpb \
   allowlisted namespace, `mcp_server_denied`, `mcp_namespace_not_granted`). A version already recorded (published, even
   deleted) is `409 mcp_version_exists`. Body at most 256 MiB
   (`413 mcp_bundle_too_large`); streamed to staging, not buffered.
+- A bundle's ZIP may hold at most `MAX_INGEST_ARCHIVE_ENTRIES` entries
+  (default 10,000, the shared ingest ceiling); more is
+  `400 mcp_bundle_invalid` before the manifest is looked up, so no bundle
+  row or version is written.
 - AK reads `manifest.json` (at most 1 MiB, an object with string `name` and
   `version`; else `400 mcp_bundle_invalid`) and verifies the signature
   block the `mcpb sign` tool appends (`MCPB_SIG_V1`, PKCS#7 detached
