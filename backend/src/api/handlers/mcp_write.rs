@@ -1243,7 +1243,7 @@ async fn purge_impl(
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
     for artifact in &trashed {
-        artifacts.finish_delete(artifact, true).await;
+        artifacts.finish_delete(artifact, true, Some(&ext)).await;
     }
     let mut released = Vec::new();
     for (repository_id, image, digest) in oci_pin_digests(&row) {

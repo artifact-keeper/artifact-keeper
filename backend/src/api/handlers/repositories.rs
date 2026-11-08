@@ -11517,10 +11517,10 @@ pub(crate) async fn materialize_staged_for_repo<'a>(
 /// route, which validates the document, applies the namespace policy and
 /// pins its packages. A generic write of `servers/<name>/<version>/...` would
 /// skip all of that (and squat the version), so the generic upload entry
-/// points refuse an MCP repository. A peer replication under an instance
-/// administrator's token still lands ([`mcp_replication_trusted`]; a
-/// service account does not qualify, #5368), so MCP repositories replicate
-/// like any other.
+/// points refuse an MCP repository. A peer replication by an authenticated
+/// peer still lands ([`super::trusted_peer_replication`]; a service account
+/// does not qualify, #5368, #5455), so MCP repositories replicate like any
+/// other.
 #[allow(clippy::result_large_err)]
 pub(crate) fn reject_generic_write_to_mcp(
     format: &RepositoryFormat,
@@ -11531,7 +11531,19 @@ pub(crate) fn reject_generic_write_to_mcp(
         .map_err(IntoResponse::into_response)
 }
 
-const MCP_GENERIC_WRITE_REFUSED: &str =
+/// [`reject_generic_write_to_mcp`] for a call site that already holds the
+/// [`super::trusted_peer_replication_marked`] decision (the chunked commit,
+/// whose marker is partly the session's).
+#[allow(clippy::result_large_err)]
+pub(crate) fn reject_generic_write_to_mcp_marked(
+    format: &RepositoryFormat,
+    trusted_peer: bool,
+) -> std::result::Result<(), Response> {
+    mcp_refusal(format, trusted_peer, MCP_GENERIC_WRITE_REFUSED)
+        .map_err(IntoResponse::into_response)
+}
+
+pub(crate) const MCP_GENERIC_WRITE_REFUSED: &str =
     "MCP registries accept server versions only through POST /mcp/{repository}/v0.1/publish";
 
 /// The generic artifact `DELETE` on an MCP registry (#5253). A server version
@@ -11596,38 +11608,60 @@ fn generic_artifact_not_found(repo: &crate::models::repository::Repository) -> A
 }
 
 /// `400` for a generic write or delete into an MCP repository unless the/// `400` for a generic write or delete into an MCP repository unless the
-/// caller is a peer replication under an instance administrator's
-/// credential ([`mcp_replication_trusted`]).
+/// caller is an authenticated peer replicating
+/// ([`super::trusted_peer_replication`], #5368, #5455). "A service account
+/// plus the header" let any CI account with `write` store a `name@version`
+/// in another team's namespace with an unvalidated, unpinned document, or
+/// trash another namespace's server.json.
 pub(crate) fn mcp_generic_mutation_refusal(
     format: &RepositoryFormat,
     auth: &AuthExtension,
     headers: &HeaderMap,
     message: &str,
 ) -> Result<()> {
-    let trusted = mcp_replication_trusted(super::is_replication_request(headers), auth.is_admin);
-    if format == &RepositoryFormat::Mcp && !trusted {
+    mcp_refusal(
+        format,
+        super::trusted_peer_replication(auth, headers),
+        message,
+    )
+}
+
+/// `MCP_SERVER_PUBLISHED` for a server.json a generic write committed into
+/// an MCP registry (#5455). Only an authenticated peer replicating gets past
+/// [`mcp_generic_mutation_refusal`], and its write must leave the same
+/// publish audit row the MCP publish route writes, attributed to the
+/// committing principal. A no-op for other formats and for an MCP bundle
+/// (any path that is not a server version's `server.json`).
+pub(crate) fn audit_generic_mcp_publish(
+    db: &sqlx::PgPool,
+    repo: &crate::models::repository::Repository,
+    actor: Uuid,
+    artifact_id: Uuid,
+    path: &str,
+) {
+    if repo.format != RepositoryFormat::Mcp {
+        return;
+    }
+    let Some((name, version)) = crate::formats::mcp::parse_storage_path(path) else {
+        return;
+    };
+    crate::services::mcp_write::audit(
+        db,
+        crate::services::audit_service::AuditAction::McpServerPublished,
+        crate::services::mcp_write::Actor::User(actor),
+        &repo.key,
+        Some(artifact_id),
+        &name,
+        &version,
+        serde_json::json!({ "repository_id": repo.id, "replicated": true }),
+    );
+}
+
+fn mcp_refusal(format: &RepositoryFormat, trusted_peer: bool, message: &str) -> Result<()> {
+    if format == &RepositoryFormat::Mcp && !trusted_peer {
         return Err(AppError::Validation(message.to_string()));
     }
     Ok(())
-}
-
-/// Whether a generic write or delete into an MCP repository is a peer
-/// replication that may skip the MCP routes (#5368).
-///
-/// Narrower than [`replication_exemption_trusted`]: a service account does
-/// not qualify. The replication header is client-set, and nothing binds an
-/// inbound credential to a registered peer (`peer_instances.api_key` is the
-/// key this instance presents to that peer, not the one the peer presents
-/// here), so "a service account plus the header" let any CI account with
-/// `write` store a `name@version` in another team's namespace with an
-/// unvalidated document, unpinned (the tombstone guard of migration 328
-/// still refused a recorded version), or trash another namespace's
-/// server.json. Peer links carry an instance administrator's token (the
-/// documented peer setup), and an administrator can already edit, delete
-/// and purge any version, so the exemption keeps replication of MCP
-/// repositories working without trusting any lesser identity.
-pub(crate) fn mcp_replication_trusted(is_replication: bool, is_admin: bool) -> bool {
-    is_replication && is_admin
 }
 
 pub(crate) async fn authorize_generic_upload(
@@ -11741,16 +11775,12 @@ async fn persist_generic_staged_upload(
     // them with the target row locked in the publishing transaction.
     let precondition = parse_write_precondition(headers).map_err(|e| e.into_response())?;
 
-    // A TRUSTED replication push (admin or service account) is stored as the
-    // source sent it, with nothing derived from the bytes: a source row with
-    // format metadata replicates through the chunked flow, which carries it,
-    // so one arriving here had none. The replication header alone is
+    // A TRUSTED replication push (an authenticated peer, #5455) is stored as
+    // the source sent it, with nothing derived from the bytes: a source row
+    // with format metadata replicates through the chunked flow, which carries
+    // it, so one arriving here had none. The replication header alone is
     // client-set, so an untrusted caller gets the full parse.
-    let replication_trusted = replication_exemption_trusted(
-        is_replication_request(headers),
-        auth.is_admin,
-        auth.is_service_account,
-    );
+    let replication_trusted = super::trusted_peer_replication(auth, headers);
 
     // #3801: an `.rpm` pushed into an RPM repository through this generic
     // endpoint gets the same header parse as the native and chunked paths —
@@ -11947,6 +11977,7 @@ async fn persist_generic_staged_upload(
     // whether or not the upload succeeded.
     staged.discard().await;
     let artifact = artifact.map_err(|e| e.into_response())?;
+    audit_generic_mcp_publish(&state.db, repo, auth.user_id, artifact.id, &artifact.path);
     let context = super::upload::format_finalize::FinalizeContext {
         repository_id: repo.id,
         repository_key: &key,
@@ -13503,40 +13534,16 @@ pub async fn download_artifact(
 ///
 /// A delete is blocked when the coordinates classify as
 /// [`cache_classifier::Mutability::Immutable`] (the same structural rule the
-/// upload and proxy-cache paths use) and the caller is neither an admin nor a
-/// *trusted* replication request. Admins keep an explicit retraction escape
-/// hatch; replication must be able to mirror upstream deletes; mutable paths
-/// (e.g. Maven SNAPSHOT directories, indexes) are always deletable.
+/// upload and proxy-cache paths use) and the caller is not an admin. Admins
+/// keep an explicit retraction escape hatch; mutable paths (e.g. Maven
+/// SNAPSHOT directories, indexes) are always deletable.
 ///
-/// `replication_trusted` must already fold in the caller's machine identity:
-/// the raw replication request marker is a client-supplied header and so is
-/// only honored here when it accompanies a trusted principal (admin or service
-/// account). See [`replication_exemption_trusted`] and the call site in
-/// [`delete_artifact`].
-fn delete_blocked_by_immutability(
-    format: &RepositoryFormat,
-    path: &str,
-    is_admin: bool,
-    replication_trusted: bool,
-) -> bool {
-    !is_admin && !replication_trusted && cache_classifier::classify(format, path).is_immutable()
-}
-
-/// Whether the replication escape hatch on the immutability delete guard may be
-/// honored for this request.
-///
-/// The replication marker itself is a client-supplied request header, so it is
-/// forgeable by any authenticated caller. We therefore only treat it as a
-/// genuine replication write when it accompanies a trusted machine identity —
-/// an admin or a service account — which an ordinary human-user token cannot
-/// assert. Genuine peer replication runs under such a token, so legitimate
-/// mirroring of upstream immutable-artifact deletes is preserved.
-pub(crate) fn replication_exemption_trusted(
-    is_replication: bool,
-    is_admin: bool,
-    is_service_account: bool,
-) -> bool {
-    is_replication && (is_admin || is_service_account)
+/// Peer replication mirrors an upstream delete under the administrator's
+/// token a peer link carries, so it needs no separate exemption: the
+/// replication header adds nothing here (#5455,
+/// [`super::trusted_peer_replication`] implies an admin).
+fn delete_blocked_by_immutability(format: &RepositoryFormat, path: &str, is_admin: bool) -> bool {
+    !is_admin && cache_classifier::classify(format, path).is_immutable()
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -13616,9 +13623,11 @@ pub async fn delete_artifact(
     // with plain repo-write permanently destroy a released artifact, bypassing
     // the promotion/approval controls. Reject it for non-approvers. Admins are
     // the release-approvers (approve_promotion requires is_admin) and keep the
-    // retraction escape hatch; trusted service accounts (e.g. peer replication)
-    // are exempt too, mirroring the immutability guard's exemptions below. The
-    // promotion service writes via its own RAW SQL path and is unaffected.
+    // retraction escape hatch. Service accounts are exempt as well: a
+    // standing service-account policy shared with the native npm and pacman
+    // deletes, independent of the replication header (which grants nothing
+    // here, #5455). The promotion service writes via its own RAW SQL path and
+    // is unaffected.
     if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_delete(
         repo.promotion_only,
         auth.is_admin || auth.is_service_account,
@@ -13633,19 +13642,14 @@ pub async fn delete_artifact(
     // a different-bytes re-upload (the upload path already rejects an existing
     // immutable version at `artifact_service`), so refuse the delete here using
     // the SAME structural classification the proxy-cache and upload paths use.
-    // Admins retain an explicit escape hatch for genuine retractions; mutable
-    // paths (e.g. Maven SNAPSHOT directories) are unaffected.
-    //
-    // The replication exemption must reflect a real machine identity, not just
-    // the client-supplied replication header (which any caller can forge).
-    // Genuine peer replication runs under a service-account or admin peer token,
-    // so only honor the exemption when the header accompanies such a principal.
-    // The raw `is_replication` marker is still used below purely for sync-loop
-    // suppression, where its semantics are unchanged.
+    // Admins retain an explicit escape hatch for genuine retractions (a peer
+    // mirroring an upstream delete runs under one); mutable paths (e.g. Maven
+    // SNAPSHOT directories) are unaffected. The client-supplied replication
+    // header grants nothing here (#5455): a service account sending it is an
+    // ordinary writer. The raw `is_replication` marker is used below purely
+    // for sync-loop suppression.
     let is_replication = is_replication_request(&headers);
-    let replication_trusted =
-        replication_exemption_trusted(is_replication, auth.is_admin, auth.is_service_account);
-    if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin, replication_trusted) {
+    if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin) {
         return Err(AppError::Conflict(
             "Cannot delete an immutable/released artifact".to_string(),
         ));
@@ -13753,7 +13757,7 @@ pub async fn delete_artifact(
     // not hold the transaction open, and the audit write must not roll back
     // with it.
     artifact_service
-        .finish_delete(&artifact, !is_replication)
+        .finish_delete(&artifact, !is_replication, Some(&auth))
         .await;
 
     // Deleting a Maven artifact changes the version set for its GAV. Drop both
@@ -17490,7 +17494,7 @@ mod tests {
     // origin peer (delete-loop prevention).
     // -----------------------------------------------------------------------
 
-    fn headers_with_replication(value: &str) -> HeaderMap {
+    pub(super) fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-artifact-keeper-replication",
@@ -36122,7 +36126,6 @@ mod tests {
                 &format,
                 "myorg/myapp/releases/download/v1/app.tar.gz",
                 false,
-                false
             ));
         }
     }
@@ -36137,35 +36140,13 @@ mod tests {
             &RepositoryFormat::Maven,
             immutable_path,
             false, // not admin
-            false, // not a trusted replication request
         ));
 
-        // The replication exemption is keyed on a *trusted* machine identity,
-        // not the raw client-supplied replication header. A forged header on an
-        // ordinary user token does not produce `replication_trusted`, so the
-        // delete is still blocked -> the header-forgery bypass is closed.
-        assert!(delete_blocked_by_immutability(
-            &RepositoryFormat::Maven,
-            immutable_path,
-            false, // not admin
-            false, // forged header on a normal user yields replication_trusted = false
-        ));
-
-        // Same coordinates: an admin retraction is allowed.
+        // Same coordinates: an admin retraction (or a peer mirroring the
+        // delete under its administrator's token) is allowed.
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Maven,
             immutable_path,
-            true,
-            false,
-        ));
-
-        // Same coordinates: a genuine peer replication delete under a
-        // service-account or admin peer token (replication_trusted = true) is
-        // allowed -> legitimate peer replication still works.
-        assert!(!delete_blocked_by_immutability(
-            &RepositoryFormat::Maven,
-            immutable_path,
-            false,
             true,
         ));
 
@@ -36175,12 +36156,10 @@ mod tests {
             &RepositoryFormat::Maven,
             "com/acme/widget/maven-metadata.xml",
             false,
-            false,
         ));
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Maven,
             "com/acme/widget/1.0-SNAPSHOT/",
-            false,
             false,
         ));
 
@@ -36189,32 +36168,53 @@ mod tests {
             &RepositoryFormat::Npm,
             "lodash/-/lodash-4.17.21.tgz",
             false,
-            false,
         ));
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Npm,
             "lodash",
             false,
-            false,
         ));
     }
 
     #[test]
-    fn test_replication_exemption_requires_trusted_identity() {
-        // A forged replication header on an ordinary human-user token (no admin,
-        // no service account) must NOT grant the exemption -> immutability holds.
-        assert!(!replication_exemption_trusted(true, false, false));
+    fn test_replication_exemption_requires_an_authenticated_peer() {
+        use crate::api::handlers::{trusted_peer_replication, trusted_peer_replication_marked};
+        let principal = |is_admin: bool, is_service_account: bool| AuthExtension {
+            is_admin,
+            is_service_account,
+            ..Default::default()
+        };
+        let marked = headers_with_replication("true");
+        // #5455: a forged replication header grants nothing to an ordinary
+        // user OR a service account -> immutability, quota and the MCP
+        // refusal hold.
+        assert!(!trusted_peer_replication(&principal(false, false), &marked));
+        assert!(!trusted_peer_replication(&principal(false, true), &marked));
+        assert!(!trusted_peer_replication_marked(
+            &principal(false, true),
+            true
+        ));
 
         // Without the replication marker at all, identity is irrelevant.
-        assert!(!replication_exemption_trusted(false, true, false));
-        assert!(!replication_exemption_trusted(false, false, true));
-        assert!(!replication_exemption_trusted(false, false, false));
+        for (admin, sa) in [(true, false), (false, true), (false, false), (true, true)] {
+            assert!(!trusted_peer_replication(
+                &principal(admin, sa),
+                &HeaderMap::new()
+            ));
+            assert!(!trusted_peer_replication_marked(
+                &principal(admin, sa),
+                false
+            ));
+        }
 
-        // Genuine peer replication runs under a service-account or admin token
-        // carrying the marker -> the exemption is honored.
-        assert!(replication_exemption_trusted(true, false, true));
-        assert!(replication_exemption_trusted(true, true, false));
-        assert!(replication_exemption_trusted(true, true, true));
+        // A peer link runs under an instance administrator's token carrying
+        // the marker -> the exemption is honored.
+        assert!(trusted_peer_replication(&principal(true, false), &marked));
+        assert!(trusted_peer_replication(&principal(true, true), &marked));
+        assert!(trusted_peer_replication_marked(
+            &principal(true, false),
+            true
+        ));
     }
 
     #[test]
@@ -41771,5 +41771,276 @@ mod conditional_put_and_serve_verification_tests {
         assert!(super::stages_on_backend("azure", &streaming));
         assert!(!super::stages_on_backend("filesystem", &streaming));
         assert!(!super::stages_on_backend("s3", &buffering));
+    }
+}
+
+// --------------------------------------------------------------------------
+// #5455: the replication header is not a peer identity
+// --------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod replication_peer_identity_5455_tests {
+    use super::tests::headers_with_replication;
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    fn replication_headers() -> HeaderMap {
+        headers_with_replication("true")
+    }
+
+    /// A repository writer with `read`, `write` and `delete` on a fresh
+    /// repository of `format`, as a service account (`auth`) and the same
+    /// user as an instance administrator (`peer`, how a peer link is set up).
+    struct Rig {
+        pool: sqlx::PgPool,
+        user_id: Uuid,
+        repo_id: Uuid,
+        key: String,
+        dir: std::path::PathBuf,
+        service_account: AuthExtension,
+        peer: AuthExtension,
+    }
+
+    impl Rig {
+        async fn setup(format: &str) -> Option<Self> {
+            let pool = tdh::try_pool().await?;
+            let (user_id, username) = tdh::create_user(&pool).await;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "local", format).await;
+            tdh::grant_repo_access(&pool, repo_id, user_id).await;
+            tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+            let mut service_account = tdh::make_auth(user_id, &username);
+            service_account.is_service_account = true;
+            let peer = tdh::admin_auth(user_id, &username);
+            Some(Self {
+                pool,
+                user_id,
+                repo_id,
+                key,
+                dir,
+                service_account,
+                peer,
+            })
+        }
+
+        fn state(&self) -> State<SharedState> {
+            State(tdh::build_state(
+                self.pool.clone(),
+                self.dir.to_string_lossy().as_ref(),
+            ))
+        }
+
+        async fn seed(&self, path: &str, name: &str, version: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO artifacts (id, repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, $3, $4, $5, 2, $6, 'application/octet-stream', $7)",
+            )
+            .bind(id)
+            .bind(self.repo_id)
+            .bind(path)
+            .bind(name)
+            .bind(version)
+            .bind("b".repeat(64))
+            .bind(format!("seed/{id}"))
+            .execute(&self.pool)
+            .await
+            .expect("seed artifact row");
+            id
+        }
+
+        async fn live(&self, id: Uuid) -> bool {
+            sqlx::query_scalar("SELECT NOT is_deleted FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("artifact row")
+        }
+
+        async fn delete(&self, auth: &AuthExtension, path: &str, headers: HeaderMap) -> Result<()> {
+            delete_artifact(
+                self.state(),
+                Extension(Some(auth.clone())),
+                Path((self.key.clone(), path.to_string())),
+                Query(DeleteArtifactQuery::default()),
+                headers,
+            )
+            .await
+        }
+
+        async fn teardown(self) {
+            let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+                .bind(self.repo_id)
+                .execute(&self.pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM mcp_version_tombstones WHERE repository_id = $1")
+                .bind(self.repo_id)
+                .execute(&self.pool)
+                .await;
+            tdh::cleanup(&self.pool, self.repo_id, self.user_id).await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A released npm tarball stays immutable for a service account with the
+    /// `delete` action whether or not it sends the replication header (409,
+    /// row stays live). An administrator's token, which is what a peer link
+    /// carries, still deletes it (the header adds nothing: admins are exempt
+    /// anyway), and the audit row names the caller as the actor.
+    #[tokio::test]
+    async fn forged_header_does_not_unlock_immutable_npm_delete_5455_db() {
+        let Some(rig) = Rig::setup("npm").await else {
+            return;
+        };
+        let path = "lodash/-/lodash-4.17.21.tgz";
+        let id = rig.seed(path, "lodash", "4.17.21").await;
+        let plain = rig
+            .delete(&rig.service_account, path, HeaderMap::new())
+            .await;
+        let forged = rig
+            .delete(&rig.service_account, path, replication_headers())
+            .await;
+        let live_after_forged = rig.live(id).await;
+        let peer = rig.delete(&rig.peer, path, replication_headers()).await;
+        let live_after_peer = rig.live(id).await;
+        let audit = tdh::audit_row_eventually(&rig.pool, id, "ARTIFACT_DELETED").await;
+        let user_id = rig.user_id;
+        rig.teardown().await;
+
+        assert!(matches!(plain, Err(AppError::Conflict(_))), "{plain:?}");
+        assert!(
+            matches!(forged, Err(AppError::Conflict(_))),
+            "the header must not turn the immutable 409 into a delete: {forged:?}"
+        );
+        assert!(live_after_forged, "the released tarball stays live");
+        assert!(
+            peer.is_ok(),
+            "an administrator's (peer link's) delete lands: {peer:?}"
+        );
+        assert!(!live_after_peer);
+        assert_eq!(
+            audit.user_id,
+            Some(user_id),
+            "the generic delete audits its authenticated actor"
+        );
+    }
+
+    /// The generic delete of an MCP server.json, header or not, is refused
+    /// for the service account and the row stays live; the multipart routes
+    /// refuse its forged write and store nothing (the raw PUT is pinned by
+    /// `generic_put_into_an_mcp_registry_needs_an_admin_peer_db`).
+    #[tokio::test]
+    async fn forged_header_gets_no_mcp_delete_or_multipart_write_5455_db() {
+        let Some(rig) = Rig::setup("mcp").await else {
+            return;
+        };
+        let path = "servers/com.other/echo/1.0.0/server.json";
+        let id = rig.seed(path, "com.other/echo", "1.0.0").await;
+        let delete = rig
+            .delete(&rig.service_account, path, replication_headers())
+            .await;
+        let live = rig.live(id).await;
+
+        let form = "--XB\r\n\
+                    Content-Disposition: form-data; name=\"file\"; filename=\"server.json\"\r\n\
+                    \r\n\
+                    {\"name\":\"com.other/squat\",\"version\":\"1.0.0\"}\r\n\
+                    --XB--\r\n";
+        let multipart = || async {
+            use axum::extract::FromRequest;
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(header::CONTENT_TYPE, "multipart/form-data; boundary=XB")
+                .body(Body::from(form))
+                .unwrap();
+            Multipart::from_request(req, &()).await.expect("multipart")
+        };
+        let squat = "servers/com.other/squat/1.0.0/server.json".to_string();
+        let with_path = upload_artifact_multipart_with_path(
+            rig.state(),
+            Extension(Some(rig.service_account.clone())),
+            Path((rig.key.clone(), squat)),
+            replication_headers(),
+            multipart().await,
+        )
+        .await;
+        let without_path = upload_artifact_multipart(
+            rig.state(),
+            Extension(Some(rig.service_account.clone())),
+            Path(rig.key.clone()),
+            replication_headers(),
+            multipart().await,
+        )
+        .await;
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(rig.repo_id)
+                .fetch_one(&rig.pool)
+                .await
+                .unwrap();
+        rig.teardown().await;
+
+        match delete {
+            Err(AppError::Validation(m)) => assert_eq!(m, MCP_GENERIC_DELETE_REFUSED),
+            other => panic!("a forged MCP generic delete must be refused: {other:?}"),
+        }
+        assert!(live, "the server.json row stays live");
+        for (route, result) in [("with path", with_path), ("without path", without_path)] {
+            match result {
+                Err(r) => assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{route}"),
+                Ok(r) => panic!(
+                    "forged multipart {route} must be refused, got {}",
+                    r.status()
+                ),
+            }
+        }
+        assert_eq!(rows, 1, "the refused multipart writes stored nothing");
+    }
+
+    /// A peer replication of a server.json through the raw PUT records the
+    /// publish audit row, attributed to the peer's principal.
+    #[tokio::test]
+    async fn peer_generic_mcp_write_is_audited_as_a_publish_5455_db() {
+        let Some(rig) = Rig::setup("mcp").await else {
+            return;
+        };
+        let path = "servers/com.peer/echo/1.0.0/server.json".to_string();
+        let doc = serde_json::json!({"name": "com.peer/echo", "version": "1.0.0"});
+        let replicated = upload_artifact(
+            rig.state(),
+            Extension(Some(rig.peer.clone())),
+            Path((rig.key.clone(), path.clone())),
+            replication_headers(),
+            Body::from(serde_json::to_vec(&doc).unwrap()),
+        )
+        .await;
+        let id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(rig.repo_id)
+                .bind(&path)
+                .fetch_optional(&rig.pool)
+                .await
+                .unwrap();
+        let audit = match id {
+            Some(id) => {
+                Some(tdh::audit_row_eventually(&rig.pool, id, "MCP_SERVER_PUBLISHED").await)
+            }
+            None => None,
+        };
+        let user_id = rig.user_id;
+        rig.teardown().await;
+
+        match replicated {
+            Ok(r) => assert!(r.status().is_success(), "{}", r.status()),
+            Err(r) => panic!("an admin peer replication must land, got {}", r.status()),
+        }
+        let audit = audit.expect("the replicated server.json row");
+        assert_eq!(audit.user_id, Some(user_id));
+        assert_eq!(audit.details["server"], "com.peer/echo");
+        assert_eq!(audit.details["version"], "1.0.0");
+        assert_eq!(audit.details["replicated"], true);
     }
 }

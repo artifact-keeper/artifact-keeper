@@ -1920,7 +1920,8 @@ async fn execute_delete(
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
             let msg = format!("Remote peer returned {status} for delete: {body}");
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            let scope = failure_scope_for_peer_response(status.as_u16(), &body);
+            handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
         Err(e) => {
@@ -2189,16 +2190,28 @@ pub(crate) enum FailureScope {
 
 /// Classify a non-success peer response (#4921).
 ///
-/// Only a 400 or 409 whose body names a checksum mismatch or an occupied
-/// immutable path is an item rejection. Every other status, including a 409
-/// for a chunk still in progress, stays a peer failure so it backs off and
-/// retries as before.
+/// Only a 400 or 409 whose body names a checksum mismatch, an occupied
+/// immutable path or a refused delete of a released artifact, and a 413 or
+/// 507 whose body names a storage-quota refusal, are item rejections. Every
+/// other status, including a 409 for a chunk still in progress, stays a peer
+/// failure so it backs off and retries as before.
+///
+/// The released-delete and quota refusals are what a receiver answers when
+/// the peer key is not an administrator's token (#5455): it then replicates
+/// as an ordinary writer. Counting them against the peer would back off
+/// every other delivery to it.
 pub(crate) fn failure_scope_for_peer_response(status: u16, body: &str) -> FailureScope {
-    if !matches!(status, 400 | 409) {
-        return FailureScope::Peer;
-    }
     let body = body.to_ascii_lowercase();
-    if body.contains("checksum mismatch") || body.contains("already exists and is immutable") {
+    let item = match status {
+        400 | 409 => {
+            body.contains("checksum mismatch")
+                || body.contains("already exists and is immutable")
+                || body.contains("cannot delete an immutable/released artifact")
+        }
+        413 | 507 => body.contains("storage quota exceeded"),
+        _ => false,
+    };
+    if item {
         FailureScope::Item
     } else {
         FailureScope::Peer
@@ -5445,6 +5458,30 @@ mod tests {
             ),
             FailureScope::Item
         );
+        // #5455: a receiver that replicates the peer as an ordinary writer
+        // refuses a released delete and a quota overrun for this item only.
+        assert_eq!(
+            failure_scope_for_peer_response(
+                409,
+                r#"{"code":"CONFLICT","message":"Cannot delete an immutable/released artifact"}"#
+            ),
+            FailureScope::Item
+        );
+        for status in [413, 507] {
+            assert_eq!(
+                failure_scope_for_peer_response(
+                    status,
+                    r#"{"code":"QUOTA_EXCEEDED","message":"Repository storage quota exceeded"}"#
+                ),
+                FailureScope::Item,
+                "{status}"
+            );
+            assert_eq!(
+                failure_scope_for_peer_response(status, "No space left on device"),
+                FailureScope::Peer,
+                "{status}: a full disk is the peer's problem"
+            );
+        }
         // A chunk still in progress is a transient 409.
         assert_eq!(
             failure_scope_for_peer_response(409, "Chunk 0 is already being uploaded"),
@@ -5768,6 +5805,56 @@ mod tests {
         );
         assert!(transient.is_err());
         assert!(transient_backoff, "a 503 still backs the peer off");
+    }
+
+    /// #5455: a receiver that refuses a mirrored delete of a released
+    /// artifact (the peer key is not an administrator's token there, so the
+    /// delete is an ordinary writer's) fails that delete task only; the peer
+    /// is not backed off, so its other deliveries continue.
+    #[tokio::test]
+    async fn refused_released_delete_does_not_back_off_the_peer_5455() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        sqlx::query("UPDATE sync_tasks SET task_type = 'delete' WHERE id = $1")
+            .bind(f.task_ids[0])
+            .execute(&f.pool)
+            .await
+            .expect("delete task");
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(409).set_body_string(
+                r#"{"code":"CONFLICT","message":"Cannot delete an immutable/released artifact"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let result = run_claimed_transfer(&f, &server).await;
+        let (backoff_set, consecutive): (bool, i32) = sqlx::query_as(
+            "SELECT backoff_until IS NOT NULL AND backoff_until > NOW(), consecutive_failures \
+             FROM peer_instances WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("peer");
+        let status: String =
+            sqlx::query_scalar("SELECT status::TEXT FROM sync_tasks WHERE id = $1")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("task");
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_err());
+        assert!(
+            !backoff_set,
+            "a refused released delete must not back off the peer"
+        );
+        assert_eq!(consecutive, 0);
+        assert_eq!(status, "failed");
     }
 
     /// The in-statement live-claim count caps the batch at the peer's

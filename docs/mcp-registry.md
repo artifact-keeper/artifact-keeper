@@ -446,11 +446,13 @@ generic artifact upload routes (`PUT`/`POST /api/v1/repositories/{key}/artifacts
 and `/api/v1/uploads`) refuse an MCP repository with `400`, except for a
 peer replication under an instance administrator's token (an administrator
 sending the replication header, which is how a peer link is set up). A
-service account does not qualify, unlike for the other formats: the header is
+service account does not qualify, for this or any other format: the header is
 client-set and nothing binds a credential to a registered peer, so "a service
 account plus the header" let any CI account with `write` claim a
 `name@version` in another team's namespace with an unvalidated, unpinned
-document (#5368). Likewise a server version (or a bundle) leaves an MCP
+document (#5368, #5455). A server.json replicated this way writes the
+`MCP_SERVER_PUBLISHED` audit row, with the peer's principal as its actor.
+Likewise a server version (or a bundle) leaves an MCP
 repository only through `DELETE .../servers/{serverName}/versions/{version}`
 (the soft delete below) and, after it, the administrator
 [purge](#post-versionsversionpurge-admin-purge): the generic
