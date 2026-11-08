@@ -478,7 +478,7 @@ impl TokenService {
             Ok(validation) => {
                 // Get token details
                 if token.len() >= 8 {
-                    let prefix = &token[..8];
+                    let prefix = &token[..token.floor_char_boundary(8)];
                     if let Ok(Some(token_info)) = sqlx::query!(
                         "SELECT scopes, expires_at FROM api_tokens WHERE token_prefix = $1",
                         prefix
@@ -532,7 +532,7 @@ impl TokenService {
             return Err(AppError::Authentication("Invalid token format".to_string()));
         }
 
-        let prefix = &token[..8];
+        let prefix = &token[..token.floor_char_boundary(8)];
         let token_info = sqlx::query!(
             "SELECT scopes FROM api_tokens WHERE token_prefix = $1",
             prefix
