@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5463]
+---
+- **An MCP introspection result is refused when its server version stopped being eligible after the claim** (#5463). A completion used to re-check only the claim token and the worker's repository scope, so a result for a version quarantined, rejected, marked deleted or deleted after the claim, or whose backing package was quarantined or deleted, was still stored and could become the version's current capability view. A completion now re-runs the serve gate a claim passes and, inside the transaction that ends the claim, re-reads the version's hold, its registry status and every backing package's pinned rows (locked so a concurrent quarantine or deletion waits for the commit). A target that no longer qualifies answers `409 mcp_target_ineligible`, stores nothing and cancels the job, as a claim of a held version already did; a worker whose repository scope no longer covers the job still gets `403 mcp_forbidden`. This concerns the capability state repository holders see; it does not change what is served to package clients.

@@ -102,7 +102,7 @@ async fn time_out(h: &McpHarness, id: Uuid, token: &str) -> Completed {
         ..Default::default()
     };
     let parsed = parse_result(&result).unwrap();
-    complete(&h.pool, &job, &result, parsed, &AccessScope::Admin)
+    complete(&h.pool, &job, &result, parsed, &AccessScope::Admin, true)
         .await
         .unwrap()
 }

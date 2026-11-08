@@ -2118,9 +2118,14 @@ a `notice` member.
 | `remote_probe` | the `ak-mcp-introspector` worker against a `remotes[]` URL | observed (remote) |
 | `sandbox_run` | the `ak-mcp-introspector` worker running a stdio package in a sandbox | observed (sandbox) |
 
-The **current** snapshot is the newest successful (`outcome: ok`) one of the
-best source in this order: `sandbox_run`, `remote_probe`, `gateway_reported`,
-`ci_reported`, `publisher_declared`.
+The **current** snapshot is the freshest successful (`outcome: ok`) one of
+the best source in this order: `sandbox_run`, `remote_probe`,
+`gateway_reported`, `ci_reported`, `publisher_declared`. Freshness is the
+latest time the content was validly seen (`lastSeenAt`, else `observedAt`),
+then arrival, then id, never arrival alone (#5464): a result or report that
+arrives later but was observed earlier than the current snapshot is kept as
+history and does not replace it, raises no `tool_drift` finding and is not
+linted. "Newest" below means freshest in this order.
 
 History is kept, deduplicated and bounded (#5386):
 
@@ -2246,7 +2251,7 @@ default 50, max 200).
     "createdAt": "2026-11-03T10:00:01Z",
     "tools": [], "resources": [], "prompts": [], "instructions": null
   },
-  "snapshots": [ /* summaries, newest first: `current` without tools/resources/prompts/instructions */ ],
+  "snapshots": [ /* summaries, freshest first: `current` without tools/resources/prompts/instructions */ ],
   "introspection": {
     "remoteProbe": "off", "probeEnabled": false,
     "sandbox": "off", "sandboxEnabled": false,
@@ -2400,7 +2405,19 @@ the audit, lint and drift side effects run only after it commits. Of two
 completions of one claim, or a completion racing the reaper or a re-claim,
 exactly one stores a snapshot; the other stores nothing and is answered
 `409 mcp_claim_invalid`. A retry (`status: "retry"`) likewise only counts
-when it ended the current claim.
+when it ended the current claim, so a retry racing a successful result
+never leaves a stored snapshot behind a pending job (#5461).
+
+The same transaction also requires a live lease: a claim whose
+`leaseExpiresAt` has passed cannot complete or retry, whether or not the
+reaper has run yet (`409 mcp_claim_invalid`, nothing stored, the job left for
+the reaper) (#5462). And it revalidates the target (#5463): the serve gate a
+claim passes is evaluated again, and the version's hold (quarantined,
+rejected, deleted), its registry status (`deleted`) and every backing
+package's pinned rows (quarantined, rejected, deleted) are
+re-read under lock in the transaction. A target that no longer qualifies
+answers `409 mcp_target_ineligible` with a `reason`, stores nothing and
+cancels the job, as a claim of a held version does.
 
 Claim order is fair across repositories: a claim hands out a due job from the
 repository with the fewest jobs claimed at that moment, and within it the
@@ -2473,13 +2490,18 @@ OCI identifier rewritten to akBaseUrl */ }}` with limits `{"wallClockMs":
 }
 ```
 
-A failed outcome carries no lists. `200 {"status": "stored", "snapshotId",
-"contentHash", "drift": {"scanId"} | null}` (`snapshotId` is the existing
-snapshot when the result repeats it) or `200 {"status": "retry",
-"notBefore"}`; `409 mcp_claim_invalid` when the token does not match the
-current claim (expired, re-claimed or already completed); `403
-mcp_forbidden` when the token is not scoped to the job's repository; `400`
-for a malformed result.
+A failed outcome carries no lists. `observedAt` (default: the arrival time)
+must lie between the job's claim and its arrival, with 5 minutes of clock
+skew either side, else `400` and the claim is left as it was (#5464).
+`200 {"status": "stored", "snapshotId", "contentHash", "current", "drift":
+{"scanId"} | null}` (`snapshotId` is the existing snapshot when the result
+repeats it; `current: false` when a fresher snapshot of the same source
+exists, so this one is history) or `200 {"status": "retry", "notBefore"}`;
+`409 mcp_claim_invalid` when the token does not match the current claim
+(lease expired, re-claimed or already completed); `409
+mcp_target_ineligible` when the version or a backing package stopped being
+eligible after the claim (the job is cancelled); `403 mcp_forbidden` when the
+token is not scoped to the job's repository; `400` for a malformed result.
 
 ### The `ak-mcp-introspector` worker
 
