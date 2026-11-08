@@ -930,7 +930,7 @@ async fn complete_job(
         // The claim ended between the token check and the store (a duplicate
         // or concurrent completion, the reaper): nothing was stored (#5389).
         jobs::Completed::ClaimLost => return Err(claim_invalid()),
-        // The token does not (or no longer) cover the job's repository:
+        // The token's scope does not cover the job's repository:
         // nothing was stored and the claim is unchanged (#5460).
         jobs::Completed::Forbidden => return Err(out_of_scope()),
     };
@@ -1867,17 +1867,14 @@ mod db_tests {
         let (_, caps_b) = call(b.admin(), "GET", &b.url(""), None).await;
         assert_eq!(caps_b["current"]["source"], "publisher_declared");
 
-        // A B-scoped worker completes B's job: the claim stayed valid.
-        let (s, body) = call(
-            b.scoped_worker(vec![b.fx.repo_id]),
-            "POST",
-            &complete_b,
-            Some(json!({"claimToken": "tok-b", "outcome": "ok",
-                        "tools": [{"name": "get_weather"}]})),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK, "{body}");
-        assert_eq!(body["status"], "stored");
+        // The denials left B's claim current: its token still proves it.
+        // (Whether a worker other than the claimant may complete it is
+        // #5465's concern, so this test does not complete it as anyone.)
+        let still = jobs::get_job(pool, job_b).await.unwrap().unwrap();
+        assert!(
+            jobs::token_matches(&still, "tok-b"),
+            "B's claim stays valid"
+        );
 
         // Benign: A's own job is claimed and completed by the A worker.
         a.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
@@ -1891,20 +1888,22 @@ mod db_tests {
         let ok_a = json!({"claimToken": job["claimToken"], "outcome": "ok",
                           "tools": [{"name": "get_weather"}]});
 
-        // Cross-job: another job's valid claim token does not complete A's.
-        jobs::enqueue_for_artifact(pool, art_b, None).await.unwrap();
-        b.claim_probe(art_b, "tok-b2").await;
+        // Cross-job: another job's valid claim token (B's, still current)
+        // does not complete A's.
         let (s, _) = call(
             worker_a(),
             "POST",
             &complete_a,
-            Some(json!({"claimToken": "tok-b2", "outcome": "ok"})),
+            Some(json!({"claimToken": "tok-b", "outcome": "ok"})),
         )
         .await;
         assert_eq!(s, StatusCode::CONFLICT, "a token proves only its own job");
 
         // Scope change after the claim: the credential no longer covers A
-        // (here: restricted to B), so the completion is refused.
+        // (here: restricted to B), so the completion is refused. In
+        // production the change reaches `complete` once the API-token
+        // validation cache (300 s) has expired; this router carries the new
+        // scope directly.
         let claimed = job_state(pool, job_a).await;
         let (s, body) = call(
             a.scoped_worker(vec![b.fx.repo_id]),
@@ -1959,8 +1958,61 @@ mod db_tests {
         .await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(job_state(pool, forged).await, claimed);
-        assert_eq!(b.snapshots(art_b, Source::RemoteProbe).await, 1);
+        assert_eq!(b.snapshots(art_b, Source::RemoteProbe).await, 0);
 
+        a.cleanup().await;
+        b.cleanup().await;
+    }
+
+    /// #5460: the repository filter sits in the claim's candidate selection,
+    /// not after it. An older out-of-scope job queued ahead of a due
+    /// in-scope one does not shadow it: the A worker gets A's job, not `204`,
+    /// and B's job is left pending.
+    #[tokio::test]
+    async fn a_scoped_worker_skips_older_out_of_scope_jobs() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fa) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let Some(fb) = tdh::Fixture::setup("local", "mcp").await else {
+            fa.teardown().await;
+            return;
+        };
+        let (a, b) = (Env { fx: fa }, Env { fx: fb });
+        a.publish("1.0.0").await;
+        b.publish("1.0.0").await;
+        let pool = &a.fx.pool;
+        // Neither repository has a claimed job, so the fair ordering ties and
+        // B's job, due decades earlier, is first in line.
+        let mut queued = Vec::new();
+        for (env, due) in [(&b, "1999-01-01"), (&a, "2000-01-01")] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO mcp_introspection_jobs (repository_id, artifact_id, kind, \
+                   target_key, not_before, created_at) \
+                 VALUES ($1, $2, 'remote_probe', 'remote:0', $3::timestamptz, $3::timestamptz) \
+                 RETURNING id",
+            )
+            .bind(env.fx.repo_id)
+            .bind(env.artifact("1.0.0").await)
+            .bind(due)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            queued.push(id);
+        }
+        let (job_b, job_a) = (queued[0], queued[1]);
+        let before = job_state(pool, job_b).await;
+        let (s, job) = call(
+            a.scoped_worker(vec![a.fx.repo_id]),
+            "POST",
+            "/jobs/claim",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{job}");
+        assert_eq!(job["jobId"], job_a.to_string());
+        assert_eq!(job_state(pool, job_b).await, before, "B's job untouched");
+        assert_eq!(before.0, "pending");
         a.cleanup().await;
         b.cleanup().await;
     }

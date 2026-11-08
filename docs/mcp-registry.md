@@ -2355,8 +2355,11 @@ nothing of its own is due), and a completion re-checks the token's scope
 against the job's repository, and that the job belongs to the repository of
 the server version it introspects, inside the transaction that ends the
 claim. Holding a valid claim token is not enough: a completion by a token
-that does not (or no longer) cover the job's repository answers
-`403 mcp_forbidden` and stores nothing, leaving the claim as it was.
+that does not cover the job's repository answers `403 mcp_forbidden` and
+stores nothing, leaving the claim as it was. A change to a token's
+repository restriction takes effect once the API-token validation cache
+(up to 5 minutes) has expired; until then requests run with the scope
+the token was last validated with.
 
 `POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
 "workerId": "pod-a"}` (both optional) answers `204` when nothing is due, or

@@ -1418,7 +1418,13 @@ pub struct VersionRef {
     pub metadata: Value,
 }
 
-pub async fn version_ref(db: &PgPool, artifact_id: Uuid) -> sqlx::Result<Option<VersionRef>> {
+/// The server version `artifact_id` with its repository, through any
+/// executor: a pool, or the transaction that holds a job's claim locked, so a
+/// completion reads it on its one connection (#5460).
+pub async fn version_ref(
+    db: impl sqlx::PgExecutor<'_>,
+    artifact_id: Uuid,
+) -> sqlx::Result<Option<VersionRef>> {
     sqlx::query_as(
         "SELECT a.id AS artifact_id, a.repository_id, r.key AS repository_key, a.name, a.version, \
                 m.metadata \

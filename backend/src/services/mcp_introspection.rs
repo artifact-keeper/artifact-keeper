@@ -504,6 +504,13 @@ fn new_token() -> String {
 /// server version the job introspects belongs to that same repository.
 /// Claim and completion use this one predicate, so their checks cannot drift
 /// apart, and possession of a claim token never stands in for it.
+///
+/// The binding half applies to unrestricted tokens too. It is an invariant
+/// today, not a filter that ever bites: `insert_job` always files a job under
+/// its artifact's repository. A job that broke it would never be claimed,
+/// and `reap_expired` only reaps claimed jobs, so it would keep its slot in
+/// `uq_mcp_introspection_jobs_open` (blocking re-queues of that target) until
+/// removed by hand.
 fn repo_authorized(j: &str, n: u8) -> String {
     format!(
         "(${n}::uuid[] IS NULL OR {j}.repository_id = ANY(${n}::uuid[])) \
@@ -706,9 +713,11 @@ async fn lock_claim(
 /// audit, lint and drift side effects run after the commit, and only for a
 /// newly stored snapshot (#5389). Under that same row lock the worker's
 /// repository scope and the job's repository binding are re-checked, for a
-/// retry as for a result, so a credential that does not (or no longer)
-/// covers the job's repository gets [`Completed::Forbidden`] and changes
-/// nothing (#5460).
+/// retry as for a result, so a credential whose scope (as validated for
+/// this request) does not cover the job's repository gets
+/// [`Completed::Forbidden`] and changes nothing (#5460). A scope narrowed
+/// after the claim is seen here once the API-token validation cache has
+/// expired.
 pub async fn complete(
     db: &PgPool,
     job: &JobRow,
@@ -746,7 +755,12 @@ pub async fn complete(
         tx.commit().await.map_err(db_err)?;
         return Ok(Completed::Retry { not_before });
     }
-    let v = caps::version_ref(db, job.artifact_id)
+    // Read on the transaction's connection: the completion holds the job
+    // row lock, and waiting for a second pool connection under it could
+    // stall concurrent completions until the acquire timeout. The
+    // repository id the snapshot is filed under is read in the same locked
+    // view the authorization check above ran in.
+    let v = caps::version_ref(&mut *tx, job.artifact_id)
         .await
         .map_err(db_err)?
         .ok_or_else(|| crate::error::AppError::NotFound("server version deleted".into()))?;
