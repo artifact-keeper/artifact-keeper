@@ -835,6 +835,18 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "replication: {body}");
         drop_session(&fx, &body).await;
 
+        // #5455: a forged header (an ordinary writer, not the peer) is not a
+        // replication: it takes the short-circuit like a plain request.
+        let (status, body) = init_session_with(
+            &fx,
+            auth.clone(),
+            request("ferry/blob.bin", &sha, content.len(), Some(true)),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "forged header: {body}");
+        assert_eq!(body["already_present"], true, "forged header: {body}");
+
         // A soft-deleted row is not "present": the upload must go through.
         set_deleted(&fx, "ferry/blob.bin", true).await;
         let (status, body) = init_session(

@@ -76,11 +76,21 @@ Notes:
 
 - The low side sends `api_key` to the high side as a bearer token on every
   transfer, so issue it on the high side with write access to the target
-  repositories. Issue it as an instance administrator's token: the high side
-  honors the replication exemptions (quota, the source's metadata, mirrored
-  deletes of released artifacts, MCP registries) only for an administrator
-  sending the replication header. A service-account token replicates as an
-  ordinary writer (#5455).
+  repositories. Issue it as an instance administrator's token, with the
+  `admin` (or `*`) scope: the high side honors the replication exemptions
+  (quota, the source's metadata, mirrored deletes of released artifacts, MCP
+  registries) only for an administrator sending the replication header
+  (#5455). A service-account token, or an administrator token without the
+  `admin` scope, replicates as an ordinary writer: its mirrored deletes of
+  released artifacts and its writes over a quota are refused and fail those
+  tasks, and the high side logs `replication header from non-admin principal
+  ignored` (at most once a minute).
+- Restrict that administrator token to the replicated repositories when you
+  mint it (`repository_ids`), so it cannot write anywhere else. Even so it is
+  an administrator's credential: whoever reads the low side's database (where
+  `peer_instances.api_key` is stored) holds administrator access to every
+  instance it pushes to. Protect the low side's database accordingly. A
+  credential bound to replication alone is tracked in #5516.
 - Each artifact is written to the high side at the same repository key and
   path, with `PUT /api/v1/repositories/{key}/artifacts/{path}`. Create the
   matching repositories on the high side first. The usual pattern is to

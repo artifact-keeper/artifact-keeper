@@ -13534,23 +13534,16 @@ pub async fn download_artifact(
 ///
 /// A delete is blocked when the coordinates classify as
 /// [`cache_classifier::Mutability::Immutable`] (the same structural rule the
-/// upload and proxy-cache paths use) and the caller is neither an admin nor a
-/// *trusted* replication request. Admins keep an explicit retraction escape
-/// hatch; replication must be able to mirror upstream deletes; mutable paths
-/// (e.g. Maven SNAPSHOT directories, indexes) are always deletable.
+/// upload and proxy-cache paths use) and the caller is not an admin. Admins
+/// keep an explicit retraction escape hatch; mutable paths (e.g. Maven
+/// SNAPSHOT directories, indexes) are always deletable.
 ///
-/// `replication_trusted` must already fold in the caller's peer identity: the
-/// raw replication request marker is a client-supplied header and so is only
-/// honored here when it accompanies an authenticated peer. See
-/// [`super::trusted_peer_replication`] and the call site in
-/// [`delete_artifact`].
-fn delete_blocked_by_immutability(
-    format: &RepositoryFormat,
-    path: &str,
-    is_admin: bool,
-    replication_trusted: bool,
-) -> bool {
-    !is_admin && !replication_trusted && cache_classifier::classify(format, path).is_immutable()
+/// Peer replication mirrors an upstream delete under the administrator's
+/// token a peer link carries, so it needs no separate exemption: the
+/// replication header adds nothing here (#5455,
+/// [`super::trusted_peer_replication`] implies an admin).
+fn delete_blocked_by_immutability(format: &RepositoryFormat, path: &str, is_admin: bool) -> bool {
+    !is_admin && cache_classifier::classify(format, path).is_immutable()
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -13630,9 +13623,11 @@ pub async fn delete_artifact(
     // with plain repo-write permanently destroy a released artifact, bypassing
     // the promotion/approval controls. Reject it for non-approvers. Admins are
     // the release-approvers (approve_promotion requires is_admin) and keep the
-    // retraction escape hatch; trusted service accounts (e.g. peer replication)
-    // are exempt too, mirroring the immutability guard's exemptions below. The
-    // promotion service writes via its own RAW SQL path and is unaffected.
+    // retraction escape hatch. Service accounts are exempt as well: a
+    // standing service-account policy shared with the native npm and pacman
+    // deletes, independent of the replication header (which grants nothing
+    // here, #5455). The promotion service writes via its own RAW SQL path and
+    // is unaffected.
     if crate::api::handlers::proxy_helpers::promotion_only_blocks_direct_delete(
         repo.promotion_only,
         auth.is_admin || auth.is_service_account,
@@ -13647,17 +13642,14 @@ pub async fn delete_artifact(
     // a different-bytes re-upload (the upload path already rejects an existing
     // immutable version at `artifact_service`), so refuse the delete here using
     // the SAME structural classification the proxy-cache and upload paths use.
-    // Admins retain an explicit escape hatch for genuine retractions; mutable
-    // paths (e.g. Maven SNAPSHOT directories) are unaffected.
-    //
-    // The replication exemption must reflect an authenticated peer, not just
-    // the client-supplied replication header (which any caller can forge): a
-    // service account with the header is an ordinary writer (#5455). The raw
-    // `is_replication` marker is still used below purely for sync-loop
-    // suppression, where its semantics are unchanged.
+    // Admins retain an explicit escape hatch for genuine retractions (a peer
+    // mirroring an upstream delete runs under one); mutable paths (e.g. Maven
+    // SNAPSHOT directories) are unaffected. The client-supplied replication
+    // header grants nothing here (#5455): a service account sending it is an
+    // ordinary writer. The raw `is_replication` marker is used below purely
+    // for sync-loop suppression.
     let is_replication = is_replication_request(&headers);
-    let replication_trusted = super::trusted_peer_replication(&auth, &headers);
-    if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin, replication_trusted) {
+    if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin) {
         return Err(AppError::Conflict(
             "Cannot delete an immutable/released artifact".to_string(),
         ));
@@ -17502,7 +17494,7 @@ mod tests {
     // origin peer (delete-loop prevention).
     // -----------------------------------------------------------------------
 
-    fn headers_with_replication(value: &str) -> HeaderMap {
+    pub(super) fn headers_with_replication(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-artifact-keeper-replication",
@@ -36134,7 +36126,6 @@ mod tests {
                 &format,
                 "myorg/myapp/releases/download/v1/app.tar.gz",
                 false,
-                false
             ));
         }
     }
@@ -36149,35 +36140,13 @@ mod tests {
             &RepositoryFormat::Maven,
             immutable_path,
             false, // not admin
-            false, // not a trusted replication request
         ));
 
-        // The replication exemption is keyed on a *trusted* machine identity,
-        // not the raw client-supplied replication header. A forged header on an
-        // ordinary user token does not produce `replication_trusted`, so the
-        // delete is still blocked -> the header-forgery bypass is closed.
-        assert!(delete_blocked_by_immutability(
-            &RepositoryFormat::Maven,
-            immutable_path,
-            false, // not admin
-            false, // forged header on a normal user yields replication_trusted = false
-        ));
-
-        // Same coordinates: an admin retraction is allowed.
+        // Same coordinates: an admin retraction (or a peer mirroring the
+        // delete under its administrator's token) is allowed.
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Maven,
             immutable_path,
-            true,
-            false,
-        ));
-
-        // Same coordinates: a genuine peer replication delete under a
-        // service-account or admin peer token (replication_trusted = true) is
-        // allowed -> legitimate peer replication still works.
-        assert!(!delete_blocked_by_immutability(
-            &RepositoryFormat::Maven,
-            immutable_path,
-            false,
             true,
         ));
 
@@ -36187,12 +36156,10 @@ mod tests {
             &RepositoryFormat::Maven,
             "com/acme/widget/maven-metadata.xml",
             false,
-            false,
         ));
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Maven,
             "com/acme/widget/1.0-SNAPSHOT/",
-            false,
             false,
         ));
 
@@ -36201,12 +36168,10 @@ mod tests {
             &RepositoryFormat::Npm,
             "lodash/-/lodash-4.17.21.tgz",
             false,
-            false,
         ));
         assert!(!delete_blocked_by_immutability(
             &RepositoryFormat::Npm,
             "lodash",
-            false,
             false,
         ));
     }
@@ -36219,11 +36184,7 @@ mod tests {
             is_service_account,
             ..Default::default()
         };
-        let mut marked = HeaderMap::new();
-        marked.insert(
-            "x-artifact-keeper-replication",
-            axum::http::HeaderValue::from_static("true"),
-        );
+        let marked = headers_with_replication("true");
         // #5455: a forged replication header grants nothing to an ordinary
         // user OR a service account -> immutability, quota and the MCP
         // refusal hold.
@@ -41820,17 +41781,13 @@ mod conditional_put_and_serve_verification_tests {
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod replication_peer_identity_5455_tests {
+    use super::tests::headers_with_replication;
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::http::StatusCode;
 
     fn replication_headers() -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-artifact-keeper-replication",
-            axum::http::HeaderValue::from_static("true"),
-        );
-        headers
+        headers_with_replication("true")
     }
 
     /// A repository writer with `read`, `write` and `delete` on a fresh
@@ -41929,8 +41886,9 @@ mod replication_peer_identity_5455_tests {
 
     /// A released npm tarball stays immutable for a service account with the
     /// `delete` action whether or not it sends the replication header (409,
-    /// row stays live). The peer (an administrator's token with the header)
-    /// still mirrors the delete, and the audit row names it as the actor.
+    /// row stays live). An administrator's token, which is what a peer link
+    /// carries, still deletes it (the header adds nothing: admins are exempt
+    /// anyway), and the audit row names the caller as the actor.
     #[tokio::test]
     async fn forged_header_does_not_unlock_immutable_npm_delete_5455_db() {
         let Some(rig) = Rig::setup("npm").await else {
@@ -41957,7 +41915,10 @@ mod replication_peer_identity_5455_tests {
             "the header must not turn the immutable 409 into a delete: {forged:?}"
         );
         assert!(live_after_forged, "the released tarball stays live");
-        assert!(peer.is_ok(), "the peer mirrors the delete: {peer:?}");
+        assert!(
+            peer.is_ok(),
+            "an administrator's (peer link's) delete lands: {peer:?}"
+        );
         assert!(!live_after_peer);
         assert_eq!(
             audit.user_id,

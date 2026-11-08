@@ -451,7 +451,8 @@ client-set and nothing binds a credential to a registered peer, so "a service
 account plus the header" let any CI account with `write` claim a
 `name@version` in another team's namespace with an unvalidated, unpinned
 document (#5368, #5455). A server.json replicated this way writes the
-`MCP_SERVER_PUBLISHED` audit row, with the peer's principal as its actor. Likewise a server version (or a bundle) leaves an MCP
+`MCP_SERVER_PUBLISHED` audit row, with the peer's principal as its actor.
+Likewise a server version (or a bundle) leaves an MCP
 repository only through `DELETE .../servers/{serverName}/versions/{version}`
 (the soft delete below) and, after it, the administrator
 [purge](#post-versionsversionpurge-admin-purge): the generic

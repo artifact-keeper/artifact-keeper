@@ -33,6 +33,13 @@ pub(crate) fn is_replication_request(headers: &HeaderMap) -> bool {
 /// and an administrator can already override every one of these checks, so
 /// the administrator is the peer identity. A service account is an ordinary
 /// writer: with the header it gets exactly what it gets without it.
+///
+/// Fan-out suppression (not queuing a replicated write back out to peers)
+/// stays keyed on the raw header ([`is_replication_request`]) by design. A
+/// writer that forges it can only keep its own write from fanning out, which
+/// it could equally do by not writing; keying it on this decision instead
+/// would make a peer whose key is a service-account token push every write it
+/// receives straight back to the origin, a replication loop.
 pub(crate) fn trusted_peer_replication(
     auth: &crate::api::middleware::auth::AuthExtension,
     headers: &HeaderMap,
@@ -47,7 +54,49 @@ pub(crate) fn trusted_peer_replication_marked(
     auth: &crate::api::middleware::auth::AuthExtension,
     marked: bool,
 ) -> bool {
+    if marked && !auth.is_admin {
+        warn_ignored_replication_header(auth);
+    }
     marked && auth.is_admin
+}
+
+/// Seconds between two [`warn_ignored_replication_header`] lines, so a peer
+/// pushing a backlog under the wrong key logs once a minute, not per request.
+const IGNORED_REPLICATION_WARN_INTERVAL_SECS: i64 = 60;
+
+/// Unix seconds of the last [`warn_ignored_replication_header`] line.
+static IGNORED_REPLICATION_LAST_WARN: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// Whether a throttled warning last written at `last` is due again at `now`.
+fn throttled_warn_due(last: i64, now: i64, interval: i64) -> bool {
+    last == i64::MIN || now.saturating_sub(last) >= interval
+}
+
+/// Rate-limited operator hint (#5455): a request carried the replication
+/// header under a credential that is not an administrator's, so it was
+/// handled as an ordinary write. Usually a peer link whose key here is a
+/// service-account token.
+fn warn_ignored_replication_header(auth: &crate::api::middleware::auth::AuthExtension) {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let last = IGNORED_REPLICATION_LAST_WARN.load(Ordering::Relaxed);
+    if !throttled_warn_due(last, now, IGNORED_REPLICATION_WARN_INTERVAL_SECS) {
+        return;
+    }
+    if IGNORED_REPLICATION_LAST_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(
+        user_id = %auth.user_id,
+        username = %auth.username,
+        service_account = auth.is_service_account,
+        "replication header from non-admin principal ignored; re-issue the peer key as an \
+         administrator token"
+    );
 }
 
 /// Queue push sync tasks for a freshly committed hosted upload so every
@@ -2986,7 +3035,9 @@ mod replication_peer_identity_gate_5455 {
     ];
 
     /// `(file, fn)` of every replication exemption: each must decide through
-    /// the shared helper.
+    /// the shared helper, directly or through `mcp_generic_mutation_refusal`
+    /// (itself pinned here). `delete_artifact`'s immutability guard needs
+    /// none: the helper implies an admin, who is exempt anyway.
     const EXEMPTION_SITES: &[(&str, &str)] = &[
         ("api/handlers/upload.rs", "create_session"),
         ("api/handlers/upload.rs", "complete_session_commit"),
@@ -3082,6 +3133,22 @@ mod replication_peer_identity_gate_5455 {
     }
 
     #[test]
+    fn ignored_header_warning_is_throttled() {
+        use super::throttled_warn_due as due;
+        assert!(due(i64::MIN, 0, 60), "the first one is written");
+        assert!(!due(1_000, 1_059, 60));
+        assert!(due(1_000, 1_060, 60));
+        // A non-admin marked request is still refused while the warning is
+        // being throttled.
+        let writer = crate::api::middleware::auth::AuthExtension {
+            is_service_account: true,
+            ..Default::default()
+        };
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+        assert!(!super::trusted_peer_replication_marked(&writer, true));
+    }
+
+    #[test]
     fn every_exemption_site_uses_the_shared_decision() {
         let sources: std::collections::BTreeMap<String, String> = rust_sources()
             .into_iter()
@@ -3094,7 +3161,8 @@ mod replication_peer_identity_gate_5455 {
             let body = fn_body(src, name).unwrap_or_else(|| panic!("{file}: fn {name} not found"));
             assert!(
                 body.contains("trusted_peer_replication(")
-                    || body.contains("trusted_peer_replication_marked("),
+                    || body.contains("trusted_peer_replication_marked(")
+                    || body.contains("mcp_generic_mutation_refusal("),
                 "#5455: {file}::{name} must decide its replication exemption \
                  through `trusted_peer_replication`"
             );

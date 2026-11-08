@@ -2787,6 +2787,16 @@ impl ArtifactService {
         self.delete_with_sync_options(id, true).await
     }
 
+    /// [`Self::delete`] on behalf of the authenticated request principal,
+    /// recorded as the `ARTIFACT_DELETED` actor (#5455).
+    pub async fn delete_by(
+        &self,
+        id: Uuid,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) -> Result<()> {
+        self.delete_as(id, true, actor).await
+    }
+
     /// Soft-delete an artifact, optionally suppressing peer sync task fan-out.
     ///
     /// Thin wrapper preserving the historical single-call shape: pre-flight,
@@ -2796,6 +2806,15 @@ impl ArtifactService {
     /// [`Self::prepare_delete`] / [`Self::commit_delete_in_tx`] /
     /// [`Self::finish_delete`] directly so the whole delete is atomic.
     pub async fn delete_with_sync_options(&self, id: Uuid, enqueue_sync_tasks: bool) -> Result<()> {
+        self.delete_as(id, enqueue_sync_tasks, None).await
+    }
+
+    async fn delete_as(
+        &self,
+        id: Uuid,
+        enqueue_sync_tasks: bool,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) -> Result<()> {
         let artifact = self.prepare_delete(id).await?;
         let mut tx = self
             .db
@@ -2806,7 +2825,7 @@ impl ArtifactService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        self.finish_delete(&artifact, enqueue_sync_tasks, None)
+        self.finish_delete(&artifact, enqueue_sync_tasks, actor)
             .await;
         Ok(())
     }

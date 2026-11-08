@@ -821,6 +821,12 @@ async fn complete_session_commit(
         UploadService::fail_committing(&state.db, &session, MCP_SESSION_ERROR).await;
         return Err(rejection);
     }
+    // #5455: the source row's metadata a session carries is honoured only
+    // for the commit decision above, not the create-time one. A session an
+    // administrator opened and a narrower token completes, or one opened
+    // with the header by a non-administrator before the upgrade, commits
+    // with server-derived metadata only.
+    let session = without_untrusted_replication_metadata(session, replication_trusted);
     let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
     // #1846: a format with a native upload route (Maven, npm, PyPI, RPM,
     // Incus, Debian, Alpine) gets the coordinates that route writes, derived from the
@@ -2214,6 +2220,26 @@ fn maven_grouped_name_for_format(
         Ok(coords) => Some(format!("{}:{}", coords.group_id, coords.artifact_id)),
         Err(_) => None,
     }
+}
+
+/// Drop the caller-supplied replication fields (artifact metadata and its
+/// properties, package description and metadata) from `session` unless the
+/// commit is a trusted peer replication (#5455). Every later read of those
+/// fields in the commit (the metadata document, the rpm repodata and pacman
+/// file-list subsets, the catalog entry) then sees only what a trusted peer
+/// sent.
+fn without_untrusted_replication_metadata(
+    mut session: upload_service::UploadSession,
+    replication_trusted: bool,
+) -> upload_service::UploadSession {
+    if !replication_trusted {
+        session.artifact_metadata_format = None;
+        session.artifact_metadata = None;
+        session.artifact_metadata_properties = None;
+        session.package_description = None;
+        session.package_metadata = None;
+    }
+    session
 }
 
 fn completed_package_description(session: &upload_service::UploadSession) -> Option<&str> {
@@ -6654,6 +6680,76 @@ mod tests {
             vec![client_path.to_string()],
             "only the client upload queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5455: a session a peer opened with the source row's metadata, then
+    /// completed by a narrower (non-administrator) token, commits with no
+    /// caller-supplied artifact metadata, properties or package fields.
+    #[tokio::test]
+    async fn non_peer_commit_drops_session_replication_metadata_5455() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let payload: &[u8] = b"forged-metadata-bytes-5455";
+        let artifact_path = "pool/main/f/forged/forged_1_amd64.deb";
+        let calls = std::cell::Cell::new(0);
+        complete_replication_upload_as(
+            &f,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    tdh::admin_auth(f.user_id, &f.username)
+                } else {
+                    let mut narrower = tdh::make_auth(f.user_id, &f.username);
+                    narrower.is_service_account = true;
+                    narrower
+                }
+            },
+            serde_json::json!({
+                "repository_key": f.repo_key,
+                "artifact_path": artifact_path,
+                "artifact_name": "forged",
+                "artifact_version": "1",
+                "artifact_metadata_format": "debian",
+                "artifact_metadata": {"format": "debian", "architecture": "amd64"},
+                "artifact_metadata_properties": {"source": "forged"},
+                "package_description": "forged description",
+                "package_metadata": {"format": "debian"},
+                "total_size": payload.len() as i64,
+                "checksum_sha256": sha256_hex(payload),
+                "chunk_size": 1024 * 1024_i64,
+            }),
+            payload,
+        )
+        .await;
+        assert_eq!(
+            calls.get(),
+            3,
+            "create and chunk as the peer, complete as the narrower token"
+        );
+        let forged: Option<String> = sqlx::query_scalar(
+            "SELECT am.format FROM artifact_metadata am JOIN artifacts a ON a.id = am.artifact_id \
+             WHERE a.repository_id = $1 AND a.path = $2 AND am.format = 'debian'",
+        )
+        .bind(f.repo_id)
+        .bind(artifact_path)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        let description: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT description FROM packages WHERE repository_id = $1 AND description = 'forged description'",
+        )
+        .bind(f.repo_id)
+        .fetch_optional(&f.pool)
+        .await
+        .unwrap();
+        f.teardown().await;
+
+        assert!(
+            forged.is_none(),
+            "the session's debian document must not be written"
+        );
+        assert!(description.is_none(), "nor its package description");
     }
 
     #[tokio::test]
