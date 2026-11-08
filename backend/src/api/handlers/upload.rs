@@ -271,7 +271,12 @@ async fn create_session(
     // #5253: an MCP registry publishes through its own route only.
     super::repositories::reject_generic_write_to_mcp(&repo_record.format, &auth, &headers)?;
 
-    let is_replication = super::is_replication_request(&headers);
+    // #5455: the session is a replication session only for an authenticated
+    // peer. The header alone is client-set: a forged one opens an ordinary
+    // session (quota applies, no caller-supplied metadata, no cleanup of
+    // other sessions) and records `is_replication = false`, so the commit
+    // cannot inherit an exemption from it either.
+    let is_replication = super::trusted_peer_replication(&auth, &headers);
     if req.skip_if_present && !is_replication {
         let declared = super::artifact_presence::DeclaredUpload {
             path: &req.artifact_path,
@@ -291,7 +296,7 @@ async fn create_session(
             return Ok((StatusCode::OK, Json(present)).into_response());
         }
     }
-    let replication_metadata = replication_session_metadata_from_request(&headers, &req);
+    let replication_metadata = replication_session_metadata_from_request(is_replication, &req);
 
     if is_replication {
         cleanup_stale_replication_upload_sessions(&state, repo.0, &req.artifact_path).await;
@@ -304,13 +309,9 @@ async fn create_session(
     // and drive one DB row per chunk. Skipped for peer replication so artifacts
     // that legitimately predate a quota change can still replicate; the
     // `max_upload_size` cap inside `create_session` still applies in that case.
-    // Only a TRUSTED replication session (admin or service account) is
-    // exempt: the replication header alone is client-set.
-    if !super::repositories::replication_exemption_trusted(
-        is_replication,
-        auth.is_admin,
-        auth.is_service_account,
-    ) {
+    // Only a TRUSTED replication session (an authenticated peer,
+    // `trusted_peer_replication`) is exempt: the header alone is client-set.
+    if !is_replication {
         let denied_by = state
             .create_repository_service()
             .quota_preflight(repo_id, req.total_size)
@@ -801,14 +802,25 @@ async fn complete_session_commit(
     // here becomes a legal write the moment the occupying artifact is
     // deleted, so the client can retry this session instead of re-uploading
     // every chunk.
-    // Only a TRUSTED replication session (admin or service account) may
+    // Only a TRUSTED replication session (an authenticated peer, #5455) may
     // bring its own metadata instead of the server deriving it from the
-    // bytes: the replication header is client-set.
-    let replication_trusted = super::repositories::replication_exemption_trusted(
+    // bytes: the replication header is client-set. Re-decided here for the
+    // committing principal, not inherited from the session alone.
+    let replication_trusted = super::trusted_peer_replication_marked(
+        auth,
         is_replication_request || session.is_replication,
-        auth.is_admin,
-        auth.is_service_account,
     );
+    // #5455: the create-time MCP refusal, re-applied to the committing
+    // principal with the same decision, so no session (whoever opened it)
+    // commits a server.json into an MCP registry outside the publish route
+    // unless an authenticated peer replicates it. Terminal, like the
+    // hosted-only gate above.
+    if let Err(rejection) =
+        super::repositories::reject_generic_write_to_mcp_marked(&repo.format, replication_trusted)
+    {
+        UploadService::fail_committing(&state.db, &session, MCP_SESSION_ERROR).await;
+        return Err(rejection);
+    }
     let replicated_metadata = replication_trusted && session.artifact_metadata_format.is_some();
     // #1846: a format with a native upload route (Maven, npm, PyPI, RPM,
     // Incus, Debian, Alpine) gets the coordinates that route writes, derived from the
@@ -1553,6 +1565,14 @@ async fn complete_session_commit(
     state
         .event_bus
         .emit_artifact_uploaded(artifact_id, session.repository_id, Some(user_id));
+    // #5455: a replicated MCP server.json leaves the publish audit row.
+    super::repositories::audit_generic_mcp_publish(
+        &state.db,
+        &repo,
+        user_id,
+        artifact_id,
+        &session.artifact_path,
+    );
 
     // Terminal transition, token-guarded. A lost lease here means the commit
     // took longer than the 6h staleness window and a newer complete request
@@ -1936,6 +1956,11 @@ fn reject_session_if_promotion_only(promotion_only: bool, is_admin: bool) -> Opt
 /// repository is not hosted (#4420).
 const NOT_HOSTED_SESSION_ERROR: &str =
     "repository does not accept direct uploads (remote or virtual repository)";
+
+/// `upload_sessions.error_message` for a completion refused because the
+/// repository is an MCP registry and the committer is not an authenticated
+/// peer replicating into it (#5455).
+const MCP_SESSION_ERROR: &str = super::repositories::MCP_GENERIC_WRITE_REFUSED;
 
 /// Extract a simple artifact name from its path (last path component without extension).
 /// Read the leading bytes of an uploaded `.rpm` that hold its lead,
@@ -2368,11 +2393,11 @@ struct ReplicationSessionMetadata<'a> {
     package_metadata: Option<&'a serde_json::Value>,
 }
 
-fn replication_session_metadata_from_request<'a>(
-    headers: &HeaderMap,
-    req: &'a CreateSessionRequest,
-) -> ReplicationSessionMetadata<'a> {
-    if !super::is_replication_request(headers) {
+fn replication_session_metadata_from_request(
+    trusted_replication: bool,
+    req: &CreateSessionRequest,
+) -> ReplicationSessionMetadata<'_> {
+    if !trusted_replication {
         return ReplicationSessionMetadata {
             artifact_metadata_format: None,
             artifact_metadata: None,
@@ -3164,21 +3189,11 @@ mod tests {
         }
     }
 
-    fn headers_with_replication(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-artifact-keeper-replication",
-            axum::http::HeaderValue::from_str(value).unwrap(),
-        );
-        headers
-    }
-
     #[test]
     fn test_replication_session_metadata_keeps_fields_for_peer_request() {
         let req = request_with_replication_metadata();
-        let headers = headers_with_replication("true");
 
-        let metadata = replication_session_metadata_from_request(&headers, &req);
+        let metadata = replication_session_metadata_from_request(true, &req);
 
         assert_eq!(metadata.artifact_metadata_format, Some("debian"));
         assert_eq!(
@@ -3202,9 +3217,8 @@ mod tests {
     #[test]
     fn test_replication_session_metadata_drops_fields_without_peer_marker() {
         let req = request_with_replication_metadata();
-        let headers = HeaderMap::new();
 
-        let metadata = replication_session_metadata_from_request(&headers, &req);
+        let metadata = replication_session_metadata_from_request(false, &req);
 
         assert!(metadata.artifact_metadata_format.is_none());
         assert!(metadata.artifact_metadata.is_none());
@@ -4310,9 +4324,10 @@ mod tests {
         create_body: serde_json::Value,
         payload: &[u8],
     ) -> Uuid {
+        // A peer replicates under an administrator's token (#5455).
         complete_replication_upload_as(
             f,
-            || tdh::make_auth(f.user_id, &f.username),
+            || tdh::admin_auth(f.user_id, &f.username),
             create_body,
             payload,
         )
@@ -4385,7 +4400,28 @@ mod tests {
         let Some(f) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
+        let peer = tdh::admin_auth(f.user_id, &f.username);
+        replication_session_retry_case(f, peer, true).await;
+    }
 
+    /// #5455: the replication header from a caller that is not an
+    /// authenticated peer (a service account with `write`, or a plain
+    /// writer) opens an ordinary session. It neither removes another
+    /// session's in-flight replication upload nor records the new session as
+    /// a replication one, so the commit cannot inherit an exemption.
+    #[tokio::test]
+    async fn forged_replication_session_is_an_ordinary_session_5455() {
+        for service_account in [true, false] {
+            let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+                return;
+            };
+            let mut writer = tdh::make_auth(f.user_id, &f.username);
+            writer.is_service_account = service_account;
+            replication_session_retry_case(f, writer, false).await;
+        }
+    }
+
+    async fn replication_session_retry_case(f: tdh::Fixture, auth: AuthExtension, peer: bool) {
         let artifact_path = "torch/2.0.0/torch-2.0.0-cp311-cp311-win_amd64.whl";
         let stale_session_id = Uuid::new_v4();
         let stale_temp = f
@@ -4430,7 +4466,6 @@ mod tests {
         .await
         .expect("insert stale chunk row");
 
-        let auth = tdh::make_auth(f.user_id, &f.username);
         let app = upload_router_with_auth(f.state.clone(), auth);
         let req = create_replication_session_req(&serde_json::json!({
             "repository_key": f.repo_key,
@@ -4452,32 +4487,59 @@ mod tests {
             String::from_utf8_lossy(&body)
         );
 
-        assert_eq!(
-            upload_session_row_counts(&f.pool, stale_session_id).await,
-            (0, 0),
-            "retrying peer replication must remove stale upload session/chunk rows"
-        );
-        assert!(
-            !stale_temp.exists(),
-            "retry cleanup should remove the stale replication temp file"
-        );
+        let stale_rows = upload_session_row_counts(&f.pool, stale_session_id).await;
+        let stale_temp_survived = stale_temp.exists();
 
         let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let new_session_id: Uuid =
             serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
-        let is_replication: bool =
-            sqlx::query_scalar("SELECT is_replication FROM upload_sessions WHERE id = $1")
-                .bind(new_session_id)
-                .fetch_one(&f.pool)
-                .await
-                .expect("query new upload session");
-        assert!(
-            is_replication,
-            "new peer-created upload session must be marked as replication"
-        );
+        let (is_replication, metadata_format): (bool, Option<String>) = sqlx::query_as(
+            "SELECT is_replication, artifact_metadata_format FROM upload_sessions WHERE id = $1",
+        )
+        .bind(new_session_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("query new upload session");
 
         cleanup_created_session(&f.pool, &body).await;
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(stale_session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(stale_session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = tokio::fs::remove_file(&stale_temp).await;
         f.teardown().await;
+
+        if peer {
+            assert_eq!(
+                stale_rows,
+                (0, 0),
+                "retrying peer replication must remove stale upload session/chunk rows"
+            );
+            assert!(
+                !stale_temp_survived,
+                "retry cleanup should remove the stale replication temp file"
+            );
+        } else {
+            assert_eq!(
+                stale_rows,
+                (1, 1),
+                "a forged replication header must not remove another session"
+            );
+            assert!(stale_temp_survived, "nor its staged bytes");
+        }
+        assert_eq!(
+            is_replication, peer,
+            "only a peer-created upload session is marked as replication"
+        );
+        assert_eq!(
+            metadata_format.is_some(),
+            peer,
+            "only a peer session keeps caller-supplied metadata"
+        );
     }
 
     #[tokio::test]
@@ -7170,6 +7232,16 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "an untrusted replication header must not skip the create-time quota check"
         );
+        // #5455: nor a service account's.
+        let mut service_account = user.clone();
+        service_account.is_service_account = true;
+        let (status, _) =
+            create_session_as(&f, &service_account, "quota/sa.bin", payload, true).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a service account's replication header must not skip the quota"
+        );
         let admin = tdh::admin_auth(f.user_id, &f.username);
         let (status, _) = create_session_as(&f, &admin, "quota/peer.bin", payload, true).await;
         assert_eq!(
@@ -7265,5 +7337,162 @@ mod tests {
         crate::services::quarantine_service::invalidate_config_cache(f.repo_id);
         f.teardown().await;
         assert_eq!(held.as_deref(), Some("quarantined"));
+    }
+
+    // -----------------------------------------------------------------------
+    // #5455: the replication header is not a peer identity (chunked path)
+    // -----------------------------------------------------------------------
+
+    fn mcp_server_json(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"name": name, "version": "1.0.0"})).unwrap()
+    }
+
+    async fn repo_row_counts(f: &tdh::Fixture) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM artifacts WHERE repository_id = $1), \
+                    (SELECT COUNT(*) FROM upload_sessions WHERE repository_id = $1)",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A service account with `write` on an MCP registry cannot open a
+    /// one-chunk session for a server.json in a namespace it holds no grant
+    /// for, with or without the replication header: the same `400` either
+    /// way, and no session or artifact row exists afterwards (so nothing can
+    /// be served).
+    #[tokio::test]
+    async fn forged_header_one_chunk_mcp_session_is_refused_5455_db() {
+        let Some(f) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let mut service_account = tdh::make_auth(f.user_id, &f.username);
+        service_account.is_service_account = true;
+        let doc = mcp_server_json("io.modelcontextprotocol/squat");
+        let path = "servers/io.modelcontextprotocol/squat/1.0.0/server.json";
+        let mut statuses = Vec::new();
+        for replication in [false, true] {
+            statuses.push(create_session_as(&f, &service_account, path, &doc, replication).await);
+        }
+        let counts = repo_row_counts(&f).await;
+        f.teardown().await;
+
+        for (status, session) in &statuses {
+            assert_eq!(*status, StatusCode::BAD_REQUEST);
+            assert!(session.is_none());
+        }
+        assert_eq!(counts, (0, 0), "nothing stored, nothing to serve");
+    }
+
+    /// The peer (an administrator's token with the header) still replicates
+    /// a server.json through the chunked flow, and the commit records the
+    /// `MCP_SERVER_PUBLISHED` audit row with the peer as its actor.
+    #[tokio::test]
+    async fn peer_one_chunk_mcp_replication_lands_and_is_audited_5455_db() {
+        let Some(f) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let peer = tdh::admin_auth(f.user_id, &f.username);
+        let path = "servers/com.peer/echo/1.0.0/server.json";
+        let (status, body) = f
+            .chunked_upload_as(
+                peer,
+                path,
+                &mcp_server_json("com.peer/echo"),
+                serde_json::json!({}),
+                true,
+            )
+            .await;
+        let artifact: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(f.repo_id)
+                .bind(path)
+                .fetch_optional(&f.pool)
+                .await
+                .unwrap();
+        let audit = match artifact {
+            Some(id) => Some(tdh::audit_row_eventually(&f.pool, id, "MCP_SERVER_PUBLISHED").await),
+            None => None,
+        };
+        let _ = sqlx::query("DELETE FROM mcp_version_tombstones WHERE repository_id = $1")
+            .bind(f.repo_id)
+            .execute(&f.pool)
+            .await;
+        let user_id = f.user_id;
+        f.teardown().await;
+
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let audit = audit.expect("the replicated server.json row");
+        assert_eq!(
+            audit.user_id,
+            Some(user_id),
+            "a non-null authenticated actor"
+        );
+        assert_eq!(audit.details["server"], "com.peer/echo");
+        assert_eq!(audit.details["version"], "1.0.0");
+    }
+
+    /// The commit re-decides peer identity for the committing principal: a
+    /// session a peer opened (marked `is_replication`) and that a non-peer
+    /// completes, even with the header, is refused for an MCP registry and
+    /// stores nothing.
+    #[tokio::test]
+    async fn commit_rechecks_peer_identity_for_mcp_5455_db() {
+        let Some(f) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let peer = tdh::admin_auth(f.user_id, &f.username);
+        let doc = mcp_server_json("com.peer/late");
+        let path = "servers/com.peer/late/1.0.0/server.json";
+        let (status, session) = create_session_as(&f, &peer, path, &doc, true).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let session: Uuid = session.unwrap().parse().unwrap();
+        let chunk = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/{session}"))
+            .header(
+                "content-range",
+                format!("bytes 0-{}/{}", doc.len() - 1, doc.len()),
+            )
+            .body(axum::body::Body::from(doc.clone()))
+            .unwrap();
+        let (status, _) = tdh::send(
+            upload_router_with_auth(f.state.clone(), peer.clone()),
+            chunk,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut service_account = tdh::make_auth(f.user_id, &f.username);
+        service_account.is_service_account = true;
+        let mut complete = complete_req(session);
+        complete.headers_mut().insert(
+            "x-artifact-keeper-replication",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let (status, body) = tdh::send(
+            upload_router_with_auth(f.state.clone(), service_account),
+            complete,
+        )
+        .await;
+        let (artifacts, _) = repo_row_counts(&f).await;
+        let error: Option<String> =
+            sqlx::query_scalar("SELECT error_message FROM upload_sessions WHERE id = $1")
+                .bind(session)
+                .fetch_optional(&f.pool)
+                .await
+                .unwrap()
+                .flatten();
+        f.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(artifacts, 0, "the refused commit stored nothing");
+        assert_eq!(error.as_deref(), Some(MCP_SESSION_ERROR));
     }
 }

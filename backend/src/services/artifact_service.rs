@@ -2806,7 +2806,8 @@ impl ArtifactService {
         tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        self.finish_delete(&artifact, enqueue_sync_tasks).await;
+        self.finish_delete(&artifact, enqueue_sync_tasks, None)
+            .await;
         Ok(())
     }
 
@@ -2863,7 +2864,17 @@ impl ArtifactService {
     /// never fails the delete, so this deliberately runs AFTER the caller's
     /// COMMIT: none of it may hold the transaction open, and the audit write
     /// must not be rolled back with it.
-    pub async fn finish_delete(&self, artifact: &Artifact, enqueue_sync_tasks: bool) {
+    ///
+    /// `actor` is the authenticated principal that asked for the delete, when
+    /// there is one: it becomes the audit row's actor (#5455). `None` (a
+    /// service-internal delete with no request principal) leaves the actor
+    /// unset as before.
+    pub async fn finish_delete(
+        &self,
+        artifact: &Artifact,
+        enqueue_sync_tasks: bool,
+        actor: Option<&crate::api::middleware::auth::AuthExtension>,
+    ) {
         let id = artifact.id;
 
         // A delete supersedes any upload retries for the same artifact.
@@ -2902,10 +2913,18 @@ impl ArtifactService {
             use crate::services::audit_service::{
                 audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
             };
-            // The service-layer delete does not carry the acting principal, so
-            // `user_id` (the actor) is intentionally left unset here; the
-            // original uploader is recorded in `details` for context.
-            let entry = AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact)
+            // The acting principal, when the caller has one (#5455); a
+            // service-internal delete leaves `user_id` unset. The original
+            // uploader is recorded in `details` for context.
+            let entry = match actor {
+                Some(auth) => AuditEntry::for_principal(
+                    AuditAction::ArtifactDeleted,
+                    ResourceType::Artifact,
+                    auth,
+                ),
+                None => AuditEntry::new(AuditAction::ArtifactDeleted, ResourceType::Artifact),
+            };
+            let entry = entry
                 .resource(artifact.id)
                 .resource_name(artifact.path.clone())
                 .details_typed(crate::services::audit_export::details::ArtifactDetails {

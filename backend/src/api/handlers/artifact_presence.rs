@@ -823,10 +823,11 @@ mod tests {
         drop_session(&fx, &body).await;
         tdh::cleanup_user(&fx.pool, writer_id).await;
 
-        // Replication never takes the short-circuit, even when asked to.
+        // Replication (a peer: an administrator's token with the header,
+        // #5455) never takes the short-circuit, even when asked to.
         let (status, body) = init_session_with(
             &fx,
-            auth.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
             request("ferry/blob.bin", &sha, content.len(), Some(true)),
             true,
         )

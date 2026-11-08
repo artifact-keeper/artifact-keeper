@@ -76,7 +76,11 @@ Notes:
 
 - The low side sends `api_key` to the high side as a bearer token on every
   transfer, so issue it on the high side with write access to the target
-  repositories.
+  repositories. Issue it as an instance administrator's token: the high side
+  honors the replication exemptions (quota, the source's metadata, mirrored
+  deletes of released artifacts, MCP registries) only for an administrator
+  sending the replication header. A service-account token replicates as an
+  ordinary writer (#5455).
 - Each artifact is written to the high side at the same repository key and
   path, with `PUT /api/v1/repositories/{key}/artifacts/{path}`. Create the
   matching repositories on the high side first. The usual pattern is to
