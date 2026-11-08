@@ -970,7 +970,7 @@ async fn delete_package(
         .map_err(|e| e.into_response())?;
     state
         .create_artifact_service(storage)
-        .delete(artifact_id)
+        .delete_by(artifact_id, Some(&auth))
         .await
         .map_err(|e| e.into_response())?;
 
@@ -1379,9 +1379,18 @@ mod db_tests {
             StatusCode::NOT_FOUND
         );
         assert_eq!(delete(&fx, "x86_64/myrepo.db").await, StatusCode::NOT_FOUND);
+        let package_id =
+            tdh::artifact_id_at(&fx.pool, fx.repo_id, &format!("any/{MARKER_FILE}")).await;
         assert_eq!(
             delete(&fx, &format!("x86_64/{MARKER_FILE}")).await,
             StatusCode::NO_CONTENT
+        );
+        // #5455: the deleting principal is the audit actor.
+        assert_eq!(
+            tdh::audit_row_eventually(&fx.pool, package_id, "ARTIFACT_DELETED")
+                .await
+                .user_id,
+            Some(fx.user_id)
         );
         let (_, db) = get(&fx, "x86_64/myrepo.db").await;
         assert!(db_members(&db).is_empty());

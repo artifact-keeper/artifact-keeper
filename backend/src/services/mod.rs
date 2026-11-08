@@ -42,6 +42,7 @@ pub mod egress_proxy;
 pub mod email_dispatcher;
 pub mod email_rate_limiter;
 pub mod encryption;
+pub mod env_proxy_guard;
 pub mod environment_lock;
 pub mod environment_reeval;
 pub mod environment_sbom;

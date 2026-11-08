@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::formats::mcp::{GateOutcome, PackagePin, PackagePolicy, StoredVersion};
+use crate::formats::mcp::{GateOutcome, PackagePin, StoredVersion};
 use crate::services::mcp_lint::{self, LintSummary};
 use crate::services::mcp_packages::{self, GateCtx};
 
@@ -63,6 +63,10 @@ pub struct PackageHealth {
     /// unavailable`.
     pub gate: &'static str,
     pub status: HealthStatus,
+    /// The pin's warnings (`foreign_coordinates_replaced`, `oci_floating_tag`,
+    /// `oci_tag_digest_mismatch`); empty for an unpinned package.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,10 +124,11 @@ pub fn lint_status(lint: &LintSummary) -> HealthStatus {
     }
 }
 
-/// The version's status (pure): the worst of its parts.
+/// The version's status (pure): the worst of its parts. A package with no
+/// pin holds the version (`unresolvable`), so it is critical.
 pub fn roll_up(packages: &[PackageHealth], lint: &LintSummary, unpinned: bool) -> HealthStatus {
     let floor = if unpinned {
-        HealthStatus::Unknown
+        HealthStatus::Critical
     } else {
         HealthStatus::Ok
     };
@@ -209,28 +214,50 @@ async fn package_health(
         counts,
         gate: gate_token(gate),
         status: package_status(gate, scanned, &counts),
+        warnings: pin.resolved.warnings.clone(),
     })
 }
 
-/// The health of the stored server version `artifact_id` in `repo_id`.
+/// The entry of a `packages[]` entry no pin covers (#5452): it holds the
+/// version `unresolvable`, so it is critical; nothing was resolved, so it
+/// names no backing repository and has no scan.
+fn unpinned_health(index: usize, package: String, registry_type: &str) -> PackageHealth {
+    let gate = GateOutcome::Unresolvable;
+    PackageHealth {
+        index,
+        package,
+        registry_type: registry_type.to_string(),
+        repository: String::new(),
+        scanned: false,
+        score: None,
+        grade: None,
+        counts: SeverityCounts::default(),
+        gate: gate_token(&gate),
+        status: package_status(&gate, false, &SeverityCounts::default()),
+        warnings: Vec::new(),
+    }
+}
+
+/// The health of the stored server version `artifact_id`.
 pub async fn server_health(
     ctx: GateCtx<'_>,
-    repo_id: Uuid,
     artifact_id: Uuid,
     stored: &StoredVersion,
 ) -> Result<ServerHealth> {
     let db = ctx.db;
-    let policy_now = mcp_packages::load_settings(db, repo_id)
-        .await
-        .map(|s| s.policy)
-        .unwrap_or(PackagePolicy::OwnRepos);
-    let gates = mcp_packages::backing_gates(ctx, stored, policy_now).await;
+    let gates = mcp_packages::backing_gates(ctx, stored).await;
     let mut packages = Vec::with_capacity(stored.pins.len());
     for pin in &stored.pins {
         packages.push(package_health(db, pin, gate_of(&gates, pin)).await?);
     }
+    let unpinned = stored.unpinned_packages();
+    for (index, label) in &unpinned {
+        let ty = label.split_once(':').map_or("", |(t, _)| t);
+        packages.push(unpinned_health(*index, label.clone(), ty));
+    }
+    packages.sort_by_key(|p| p.index);
     let lint = mcp_lint::lint_summary(db, artifact_id).await?;
-    let unpinned = stored.unpinned_package().is_some();
+    let unpinned = !unpinned.is_empty();
     Ok(ServerHealth {
         name: stored
             .server
@@ -318,7 +345,27 @@ mod tests {
             counts: SeverityCounts::default(),
             gate: "allowed",
             status,
+            warnings: Vec::new(),
         }
+    }
+
+    /// #5452: a package with no pin is an `unresolvable`, critical entry and
+    /// floors the version at critical.
+    #[test]
+    fn an_unpinned_package_is_critical() {
+        let p = unpinned_health(2, "npm:@evil/x@1.0.0".into(), "npm");
+        assert_eq!(
+            (p.index, p.gate, p.status, p.repository.as_str()),
+            (2, "unresolvable", HealthStatus::Critical, "")
+        );
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("warnings").is_none());
+        let mut warned = pkg(HealthStatus::Ok);
+        warned.warnings = vec!["foreign_coordinates_replaced".into()];
+        assert_eq!(
+            serde_json::to_value(&warned).unwrap()["warnings"],
+            serde_json::json!(["foreign_coordinates_replaced"])
+        );
     }
 
     #[test]
@@ -341,7 +388,7 @@ mod tests {
         assert_eq!(lint_status(&block), HealthStatus::Critical);
 
         assert_eq!(roll_up(&[], &ran, false), HealthStatus::Ok);
-        assert_eq!(roll_up(&[], &ran, true), HealthStatus::Unknown);
+        assert_eq!(roll_up(&[], &ran, true), HealthStatus::Critical);
         assert_eq!(
             roll_up(&[pkg(HealthStatus::Ok)], &review, false),
             HealthStatus::Warning

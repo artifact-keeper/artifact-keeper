@@ -1592,9 +1592,18 @@ pub fn validate_status_change(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackagePolicy {
-    /// Default: every package resolves to an AK repository of its format.
+    /// Default: every package resolves to an AK repository of its format,
+    /// and its coordinates must name that repository (`registryBaseUrl`
+    /// omitted or this instance's, an OCI image on this instance or the
+    /// backing Remote's upstream).
     OwnRepos,
-    /// Explicit opt-out: packages stored and served verbatim, not gated.
+    /// Foreign coordinates accepted (#5452): a `registryBaseUrl` or OCI image
+    /// host naming another registry is not refused. The package itself is
+    /// still looked up by name and version (an image by path and tag or
+    /// digest) in the mapped backing repository, pinned, served at its AK
+    /// coordinates and gated exactly as under `own-repos`; one that does not
+    /// resolve is refused at publish, or held (`unresolvable`) when synced or
+    /// stored without a pin. Nothing is served verbatim.
     Open,
 }
 
@@ -1778,27 +1787,37 @@ impl StoredVersion {
         })
     }
 
-    /// Whether every `packages[]` entry of the server has a pin. A version
-    /// published under `open` and read under `own-repos` (or whose pins were
-    /// lost) is `unresolvable`.
+    /// The first `packages[]` entry of the server with no pin, if any. Such a
+    /// version is `unresolvable` under either policy: one stored before
+    /// #5452 under `open` (which pinned nothing), one whose pins were lost,
+    /// or a synced version a package of which did not resolve.
     pub fn unpinned_package(&self) -> Option<String> {
+        self.unpinned_packages().into_iter().next().map(|(_, l)| l)
+    }
+
+    /// Every `packages[]` entry with no pin, as `(index, label)` (the label
+    /// as [`PackagePin::label`] would name it).
+    pub fn unpinned_packages(&self) -> Vec<(usize, String)> {
         let packages = self
             .server
             .get("packages")
             .and_then(|p| p.as_array())
             .cloned()
             .unwrap_or_default();
-        packages.iter().enumerate().find_map(|(i, p)| {
-            if self.pins.iter().any(|pin| pin.index == i) {
-                return None;
-            }
-            let ty = p.get("registryType").and_then(|v| v.as_str()).unwrap_or("");
-            let id = p.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
-            Some(match p.get("version").and_then(|v| v.as_str()) {
-                Some(v) => format!("{ty}:{id}@{v}"),
-                None => format!("{ty}:{id}"),
+        packages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.pins.iter().any(|pin| pin.index == *i))
+            .map(|(i, p)| {
+                let ty = p.get("registryType").and_then(|v| v.as_str()).unwrap_or("");
+                let id = p.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
+                let label = match p.get("version").and_then(|v| v.as_str()) {
+                    Some(v) => format!("{ty}:{id}@{v}"),
+                    None => format!("{ty}:{id}"),
+                };
+                (i, label)
             })
-        })
+            .collect()
     }
 }
 
@@ -1827,21 +1846,19 @@ pub fn host_of(base_url: &str) -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-/// The served form of a stored `server`: under `own-repos` every pinned
-/// package is rewritten to its AK coordinates (`registryBaseUrl` for
-/// npm/pypi/nuget/cargo, `identifier` with `@sha256:` for OCI, original in
-/// `_meta[com.artifactkeeper/resolved]`); under `open` the stored document is
-/// returned untouched.
+/// The served form of a stored `server`: every pinned package is rewritten
+/// to its AK coordinates (`registryBaseUrl` for npm/pypi/nuget/cargo,
+/// `identifier` with `@sha256:` for OCI, original in
+/// `_meta[com.artifactkeeper/resolved]`), whatever the package policy: an
+/// `open` document is pinned and served the same way (#5452). A package with
+/// no pin is left as stored, but the version is never served then: the
+/// serve decision holds it `unresolvable` ([`StoredVersion::unpinned_package`]).
 pub fn rewrite_packages_for_serve(
     server: &serde_json::Value,
     pins: &[PackagePin],
-    policy: PackagePolicy,
     base_url: &str,
 ) -> serde_json::Value {
     let mut out = server.clone();
-    if policy == PackagePolicy::Open {
-        return out;
-    }
     let base = base_url.trim_end_matches('/');
     let oci_host = host_of(base);
     let Some(packages) = out.get_mut("packages").and_then(|p| p.as_array_mut()) else {
@@ -1864,21 +1881,22 @@ pub fn rewrite_packages_for_serve(
                 None => format!("{oci_host}/{}/{name}@{digest}", r.repository),
             };
             pkg.insert("identifier".into(), identifier.into());
-            let meta = pkg.entry("_meta").or_insert_with(|| serde_json::json!({}));
-            if let Some(meta) = meta.as_object_mut() {
-                meta.insert(
-                    AK_RESOLVED_META_KEY.into(),
-                    serde_json::json!({
-                        "submittedIdentifier": pin.submitted.identifier,
-                        "digest": digest,
-                        "mediaType": r.media_type,
-                        "children": r.children,
-                        "backingRepository": r.repository,
-                        "resolvedAt": r.resolved_at,
-                    }),
-                );
+            let mut resolved = serde_json::json!({
+                "submittedIdentifier": pin.submitted.identifier,
+                "digest": digest,
+                "mediaType": r.media_type,
+                "children": r.children,
+                "backingRepository": r.repository,
+                "resolvedAt": r.resolved_at,
+            });
+            if !r.warnings.is_empty() {
+                resolved["warnings"] = serde_json::json!(r.warnings);
             }
+            set_resolved_meta(pkg, resolved);
         } else {
+            // What the publisher named, so a client (and a reviewer) can see
+            // that a foreign registry was replaced by this one (#5452).
+            let submitted = pkg.get("registryBaseUrl").cloned();
             pkg.insert(
                 "registryBaseUrl".into(),
                 format!(
@@ -1887,9 +1905,37 @@ pub fn rewrite_packages_for_serve(
                 )
                 .into(),
             );
+            let mut resolved = serde_json::json!({
+                "submittedIdentifier": pin.submitted.identifier,
+                "sha256": r.sha256,
+                "backingRepository": r.repository,
+                "resolvedAt": r.resolved_at,
+            });
+            if let Some(url) = submitted.filter(|u| !u.is_null()) {
+                resolved["submittedRegistryBaseUrl"] = url;
+            }
+            if !r.warnings.is_empty() {
+                resolved["warnings"] = serde_json::json!(r.warnings);
+            }
+            set_resolved_meta(pkg, resolved);
         }
     }
     out
+}
+
+/// Set `_meta["com.artifactkeeper/resolved"]` of a served package, replacing
+/// whatever the stored document carried under that key.
+fn set_resolved_meta(
+    pkg: &mut serde_json::Map<String, serde_json::Value>,
+    resolved: serde_json::Value,
+) {
+    let meta = pkg.entry("_meta").or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({});
+    }
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert(AK_RESOLVED_META_KEY.into(), resolved);
+    }
 }
 
 /// One server version as a list/detail entry: `{server, _meta}`.
@@ -3226,16 +3272,26 @@ mod tests {
             pin(3, "oci", None),
             pin(9, "npm", None),
         ];
-        let out = rewrite_packages_for_serve(
-            &server,
-            &pins,
-            PackagePolicy::OwnRepos,
-            "https://ak.test:8443/",
-        );
+        let mut pins = pins;
+        pins[0].resolved.warnings = vec!["foreign_coordinates_replaced".into()];
+        let out = rewrite_packages_for_serve(&server, &pins, "https://ak.test:8443/");
         assert_eq!(
             out["packages"][0]["registryBaseUrl"],
             "https://ak.test:8443/npm/npm-local"
         );
+        // #5452: the replaced coordinates and the pin's warnings are served.
+        let npm = &out["packages"][0]["_meta"][AK_RESOLVED_META_KEY];
+        assert_eq!(
+            npm["submittedRegistryBaseUrl"],
+            "https://registry.npmjs.org"
+        );
+        assert_eq!(
+            npm["warnings"],
+            serde_json::json!(["foreign_coordinates_replaced"])
+        );
+        assert_eq!(npm["backingRepository"], "npm-local");
+        let nuget = &out["packages"][2]["_meta"][AK_RESOLVED_META_KEY];
+        assert!(nuget.get("submittedRegistryBaseUrl").is_none() && nuget.get("warnings").is_none());
         let hex = "c".repeat(64);
         assert_eq!(
             out["packages"][1]["identifier"],
@@ -3252,10 +3308,6 @@ mod tests {
         assert_eq!(
             out["packages"][3]["identifier"],
             format!("ak.test:8443/oci-local/acme/mcp@sha256:{hex}")
-        );
-        assert_eq!(
-            rewrite_packages_for_serve(&server, &pins, PackagePolicy::Open, "https://ak.test"),
-            server
         );
         assert_eq!(host_of("not a url"), "localhost");
         assert_eq!(pins[0].label(), "npm:@acme/w@1.0.0");

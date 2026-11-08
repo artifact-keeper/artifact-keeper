@@ -6882,6 +6882,7 @@ fn rows_not_kept<'a>(
 /// again from what is left), and invalidate the packument caches.
 async fn unpublish_npm_rows(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     package: &str,
     rows: &[&NpmPackageRow],
@@ -6890,7 +6891,7 @@ async fn unpublish_npm_rows(
     let artifact_service = state.create_artifact_service(storage);
     let mut removed_versions: Vec<String> = Vec::new();
     for row in rows {
-        match artifact_service.delete(row.id).await {
+        match artifact_service.delete_by(row.id, auth).await {
             // A concurrent unpublish got there first: the row is gone either way.
             Ok(()) | Err(AppError::NotFound(_)) => {}
             Err(e) => return Err(e.into_response()),
@@ -6955,7 +6956,7 @@ async fn unpublish_versions_for(
         )
         .into_response());
     }
-    unpublish_npm_rows(state, &repo, package, &removed).await?;
+    unpublish_npm_rows(state, auth, &repo, package, &removed).await?;
     Ok(npm_ok_response())
 }
 
@@ -6972,7 +6973,7 @@ async fn unpublish_package_for(
         return Err(npm_package_not_found(package));
     }
     let all: Vec<&NpmPackageRow> = rows.iter().collect();
-    unpublish_npm_rows(state, &repo, package, &all).await?;
+    unpublish_npm_rows(state, auth, &repo, package, &all).await?;
     let _ = sqlx::query("DELETE FROM npm_dist_tags WHERE repository_id = $1 AND name = $2")
         .bind(repo.id)
         .bind(package)
@@ -7003,7 +7004,7 @@ async fn unpublish_tarball_for(
                 .into_response(),
         );
     }
-    unpublish_npm_rows(state, &repo, package, &matching).await?;
+    unpublish_npm_rows(state, auth, &repo, package, &matching).await?;
     Ok(npm_ok_response())
 }
 
@@ -20610,6 +20611,10 @@ mod unpublish_4025_tests {
         let gone = tarball_status(&fx, &format!("{pkg}/-/{pkg}-2.0.0.tgz")).await;
         let kept = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.1.0.tgz")).await;
         let audits = tdh::audit_count_eventually(&fx.pool, removed_id, "ARTIFACT_DELETED", 1).await;
+        let actor = tdh::audit_row_eventually(&fx.pool, removed_id, "ARTIFACT_DELETED")
+            .await
+            .user_id;
+        let owner = fx.user_id;
         fx.teardown().await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(version_keys(&after), vec!["1.0.0", "1.1.0"]);
@@ -20621,6 +20626,11 @@ mod unpublish_4025_tests {
         assert_eq!(gone, StatusCode::NOT_FOUND, "unpublished tarball 404s");
         assert_eq!(kept, StatusCode::OK, "other versions remain");
         assert_eq!(audits, 1, "the delete goes through ArtifactService (audit)");
+        assert_eq!(
+            actor,
+            Some(owner),
+            "#5455: the unpublishing principal is the actor"
+        );
     }
 
     #[tokio::test]
