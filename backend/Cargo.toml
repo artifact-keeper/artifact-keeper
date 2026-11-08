@@ -42,7 +42,11 @@ tower-http.workspace = true
 # can set an HTTP/1 header-read timeout, which `axum::serve` cannot (#4665).
 # Both are already in the tree through axum.
 hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+# `client-proxy`: the guarded outbound clients read the environment proxy
+# with the same matcher reqwest uses, so they can check each proxied
+# destination before handing it to the proxy (#5459). reqwest already
+# compiles it in.
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio", "client-proxy"] }
 
 # Database
 sqlx.workspace = true
