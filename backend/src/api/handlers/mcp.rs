@@ -28,7 +28,7 @@ use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::mcp::{
     self as fmt, BackingGate, GateAudience, GateOutcome, HoldKind, McpError, PackagePin,
-    PackagePolicy, RegistryState, ServeDecision, ServerStatus, StoredVersion, VersionState,
+    RegistryState, ServeDecision, ServerStatus, StoredVersion, VersionState,
 };
 use crate::services::mcp_curation;
 use crate::services::mcp_lint;
@@ -513,7 +513,6 @@ async fn repo_hold(ctx: GateCtx<'_>, row: &VersionRow) -> Result<Option<HoldKind
 pub(crate) async fn decide_row(
     ctx: GateCtx<'_>,
     row: &VersionRow,
-    policy_now: PackagePolicy,
     include_deleted: bool,
     audience: GateAudience,
     instance: String,
@@ -539,7 +538,7 @@ pub(crate) async fn decide_row(
             None
         }),
     };
-    gates.extend(mcp_packages::backing_gates(ctx, &row.stored, policy_now).await);
+    gates.extend(mcp_packages::backing_gates(ctx, &row.stored).await);
     // A version whose packages are still being filled is held as
     // `resolving` (its pending packages have no pin yet).
     let own = own.or(row.stored.resolving.then_some(HoldKind::Resolving));
@@ -565,12 +564,7 @@ pub(crate) fn served_entry(
     base: &str,
     is_latest: bool,
 ) -> serde_json::Value {
-    let server = fmt::rewrite_packages_for_serve(
-        &row.stored.server,
-        &row.stored.pins,
-        row.stored.policy,
-        base,
-    );
+    let server = fmt::rewrite_packages_for_serve(&row.stored.server, &row.stored.pins, base);
     let mut registry = row.stored.registry.clone();
     registry.is_latest = is_latest;
     let mut source = serde_json::json!({
@@ -592,15 +586,6 @@ pub(crate) fn served_entry(
         };
     }
     fmt::envelope(server, &registry, source)
-}
-
-/// The repository's package policy now (a read failure is fail-closed: the
-/// versions are gated as `own-repos`).
-pub(crate) async fn current_policy(db: &PgPool, repo_id: Uuid) -> PackagePolicy {
-    mcp_packages::load_settings(db, repo_id)
-        .await
-        .map(|s| s.policy)
-        .unwrap_or(PackagePolicy::OwnRepos)
 }
 
 // ---------------------------------------------------------------------------
@@ -644,20 +629,19 @@ pub(crate) async fn catalog_view(
         return CatalogView::Hide;
     };
     let ctx = GateCtx::of(state, false);
-    let policy = current_policy(&state.db, repo_id).await;
     let own: Vec<VersionRow> = rows
         .iter()
         .filter(|r| r.version == version)
         .cloned()
         .collect();
-    let own_servable = !own.is_empty() && !servable(ctx, repo_id, own, policy).await.is_empty();
+    let own_servable = !own.is_empty() && !servable(ctx, repo_id, own).await.is_empty();
     if own_servable || audience(&state.db, auth, repo_id).await == GateAudience::ReasonGated {
         return CatalogView::Keep {
             servable: own_servable,
         };
     }
     let none = std::collections::HashSet::new();
-    let Ok(Some(row)) = newest_servable(ctx, repo_id, rows, &none, policy).await.0 else {
+    let Ok(Some(row)) = newest_servable(ctx, repo_id, rows, &none).await.0 else {
         return CatalogView::Hide;
     };
     let metadata: Option<serde_json::Value> =
@@ -696,9 +680,8 @@ pub(crate) async fn catalog_visible_versions(
     let Ok(rows) = versions_of(&state.db, repo_id, name).await else {
         return Some(Default::default());
     };
-    let policy = current_policy(&state.db, repo_id).await;
     Some(
-        servable(GateCtx::of(state, false), repo_id, rows, policy)
+        servable(GateCtx::of(state, false), repo_id, rows)
             .await
             .into_iter()
             .map(|r| r.version)
@@ -844,10 +827,9 @@ impl<'a> GenericArtifactGate<'a> {
             .filter(|r| r.stored.registry.status != fmt::ServerStatus::Deleted)
             .collect();
         let ctx = GateCtx::of(self.state, false);
-        let policy = current_policy(&self.state.db, repo.id).await;
         let mut out = std::collections::HashSet::new();
         for chunk in rows.chunks(LISTING_GATE_CHUNK) {
-            for r in servable(ctx, repo.id, chunk.to_vec(), policy).await {
+            for r in servable(ctx, repo.id, chunk.to_vec()).await {
                 out.insert((r.name, r.version));
             }
         }
@@ -1166,9 +1148,8 @@ pub(crate) async fn servable(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
-    policy_now: PackagePolicy,
 ) -> Vec<VersionRow> {
-    servable_checked(ctx, repo_id, rows, policy_now)
+    servable_checked(ctx, repo_id, rows)
         .await
         .unwrap_or_default()
 }
@@ -1181,7 +1162,6 @@ pub(crate) async fn servable_checked(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: Vec<VersionRow>,
-    policy_now: PackagePolicy,
 ) -> Result<Vec<VersionRow>, mcp_packages::GateUnavailable> {
     if rows.is_empty() {
         return Ok(rows);
@@ -1195,7 +1175,7 @@ pub(crate) async fn servable_checked(
             stored: r.stored.clone(),
         })
         .collect();
-    let refused = match mcp_packages::listing_refusals(ctx, repo_id, &listing, policy_now).await {
+    let refused = match mcp_packages::listing_refusals(ctx, repo_id, &listing).await {
         Ok(refused) => refused,
         Err(mcp_packages::GateUnavailable) => {
             listing_gate_unavailable(ctx.db, repo_id);
@@ -1256,7 +1236,6 @@ pub(crate) async fn newest_servable(
     repo_id: Uuid,
     rows: Vec<VersionRow>,
     known: &std::collections::HashSet<Uuid>,
-    policy_now: PackagePolicy,
 ) -> (
     Result<Option<VersionRow>, mcp_packages::GateUnavailable>,
     usize,
@@ -1271,7 +1250,7 @@ pub(crate) async fn newest_servable(
             .collect();
         evaluated += unknown.len();
         let ok: std::collections::HashSet<Uuid> =
-            match servable_checked(ctx, repo_id, unknown, policy_now).await {
+            match servable_checked(ctx, repo_id, unknown).await {
                 Ok(rows) => rows.into_iter().map(|r| r.artifact_id).collect(),
                 Err(e) => return (Err(e), evaluated),
             };
@@ -1291,14 +1270,13 @@ async fn latest_ids(
     ctx: GateCtx<'_>,
     repo_id: Uuid,
     rows: &[VersionRow],
-    policy_now: PackagePolicy,
 ) -> Result<std::collections::HashSet<Uuid>, Response> {
     let known: std::collections::HashSet<Uuid> = rows.iter().map(|r| r.artifact_id).collect();
     let names: std::collections::BTreeSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
     let mut out = std::collections::HashSet::new();
     for name in names {
         let all = versions_of(ctx.db, repo_id, name).await?;
-        if let (Ok(Some(row)), _) = newest_servable(ctx, repo_id, all, &known, policy_now).await {
+        if let (Ok(Some(row)), _) = newest_servable(ctx, repo_id, all, &known).await {
             out.insert(row.artifact_id);
         }
     }
@@ -1311,9 +1289,8 @@ async fn served_entries(
     repo: &RepoInfo,
     base: &str,
     rows: &[VersionRow],
-    policy_now: PackagePolicy,
 ) -> Result<Vec<serde_json::Value>, Response> {
-    let latest = latest_ids(ctx, repo.id, rows, policy_now).await?;
+    let latest = latest_ids(ctx, repo.id, rows).await?;
     Ok(rows
         .iter()
         .map(|r| served_entry(r, repo, base, latest.contains(&r.artifact_id)))
@@ -1344,12 +1321,11 @@ async fn list_servers(
         seal.decode_position(repo.id, fmt::cursor_kind::SERVERS, c)
     })
     .map_err(mcp_error)?;
-    let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(&state, false);
     let (entries, next) = if q.version.as_deref() == Some("latest") {
-        list_latest(ctx, &repo, &q, policy_now, base.as_str()).await?
+        list_latest(ctx, &repo, &q, base.as_str()).await?
     } else {
-        list_versions_page(ctx, &repo, &q, policy_now, base.as_str()).await?
+        list_versions_page(ctx, &repo, &q, base.as_str()).await?
     };
     let next = next.map(|(n, v)| seal.encode_position(repo.id, fmt::cursor_kind::SERVERS, &n, &v));
     Ok(json_listing(&fmt::list_envelope(entries, next)))
@@ -1374,7 +1350,6 @@ async fn list_versions_page(
     ctx: GateCtx<'_>,
     repo: &RepoInfo,
     q: &ListQuery,
-    policy_now: PackagePolicy,
     base: &str,
 ) -> Result<PageOut, Response> {
     let want = q.limit as usize;
@@ -1388,7 +1363,7 @@ async fn list_versions_page(
         if let Some(last) = batch.last {
             after = Some(last);
         }
-        out.extend(servable(ctx, repo.id, batch.rows, policy_now).await);
+        out.extend(servable(ctx, repo.id, batch.rows).await);
         if out.len() > want || exhausted || read >= MAX_LISTING_ROWS {
             break exhausted;
         }
@@ -1405,10 +1380,7 @@ async fn list_versions_page(
         None
     };
     out.truncate(want);
-    Ok((
-        served_entries(ctx, repo, base, &out, policy_now).await?,
-        next,
-    ))
+    Ok((served_entries(ctx, repo, base, &out).await?, next))
 }
 
 /// Server names of a listing, in order, after `name_after`.
@@ -1450,7 +1422,6 @@ async fn list_latest(
     ctx: GateCtx<'_>,
     repo: &RepoInfo,
     q: &ListQuery,
-    policy_now: PackagePolicy,
     base: &str,
 ) -> Result<PageOut, Response> {
     let want = q.limit as usize;
@@ -1476,7 +1447,7 @@ async fn list_latest(
                 break 'scan;
             }
             let all = versions_of(ctx.db, repo.id, &name).await?;
-            let (picked, evaluated) = newest_servable(ctx, repo.id, all, &none, policy_now).await;
+            let (picked, evaluated) = newest_servable(ctx, repo.id, all, &none).await;
             budget = budget.saturating_sub(evaluated.max(1));
             // An unevaluable gate omits the server (never an older version).
             if let Some(row) = picked.ok().flatten().filter(|r| {
@@ -1573,8 +1544,7 @@ async fn list_versions_impl(
     let latest = {
         let known = served.iter().map(|r| r.artifact_id).collect();
         let all = versions_of(&state.db, repo.id, name).await?;
-        let policy_now = current_policy(&state.db, repo.id).await;
-        newest_servable(GateCtx::of(state, false), repo.id, all, &known, policy_now)
+        newest_servable(GateCtx::of(state, false), repo.id, all, &known)
             .await
             .0
             .ok()
@@ -1598,7 +1568,6 @@ pub(crate) async fn servable_versions(
     name: &str,
     include_deleted: bool,
 ) -> Result<Result<Vec<VersionRow>, mcp_packages::GateUnavailable>, Response> {
-    let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(state, false);
     let mut rows: Vec<VersionRow> = versions_of(&state.db, repo.id, name)
         .await?
@@ -1617,7 +1586,7 @@ pub(crate) async fn servable_versions(
         rows.truncate(MAX_LISTING_ROWS);
         rows.sort_by(|a, b| a.version.cmp(&b.version));
     }
-    Ok(servable_checked(ctx, repo.id, rows, policy_now).await)
+    Ok(servable_checked(ctx, repo.id, rows).await)
 }
 
 async fn get_version_encoded(
@@ -1777,12 +1746,11 @@ pub(crate) async fn walk_candidates(
         miss_shaped_work(state, repo, name, version).await;
         return Ok(CandidateWalk::NotFound);
     }
-    let policy_now = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(state, true);
     let mut first_refusal: Option<(Response, &VersionRow, &'static str)> = None;
     for row in &candidates {
         let instance = instance_url(base, &repo.key, &row.name, &row.version);
-        match decide_row(ctx, row, policy_now, include_deleted, audience, instance).await {
+        match decide_row(ctx, row, include_deleted, audience, instance).await {
             ServeDecision::Serve => {
                 return Ok(CandidateWalk::Served {
                     row: row.clone(),
@@ -1835,7 +1803,6 @@ pub(crate) async fn walk_candidates(
 async fn miss_shaped_work(state: &SharedState, repo: &RepoInfo, name: &str, version: &str) {
     #[cfg(test)]
     MISS_SHAPED_WORK.with(|n| n.set(n.get() + 1));
-    let _ = current_policy(&state.db, repo.id).await;
     let ctx = GateCtx::of(state, false);
     let _ = own_hold(ctx.db, Uuid::nil()).await;
     if let Ok(policy) = mcp_curation::load_serve_policy(ctx.db, repo.id).await {
@@ -1858,10 +1825,9 @@ pub(crate) async fn is_newest_servable(
     row: &VersionRow,
     all: Vec<VersionRow>,
 ) -> bool {
-    let policy_now = current_policy(&state.db, repo.id).await;
     let known = std::iter::once(row.artifact_id).collect();
     let listing = GateCtx::of(state, false);
-    newest_servable(listing, repo.id, all, &known, policy_now)
+    newest_servable(listing, repo.id, all, &known)
         .await
         .0
         .ok()
@@ -2373,8 +2339,7 @@ async fn publish_server(
     let mut server = admit_document(&body, &settings).map_err(mcp_error)?;
     name_write_gates(&state, &ext, &repo, &server.name, &headers).await?;
     refuse_case_only_twin(&state.db, repo.id, &server.name).await?;
-    super::mcp_write::add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
-        .await?;
+    super::mcp_write::add_staged_bundles(&state.db, &repo, &mut server, base.as_str()).await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
     mcp_packages::refuse_unreadable_backing(&state.db, &ext, &settings, &server)
         .await
@@ -2531,24 +2496,19 @@ async fn publish_server(
         &resolution,
     );
     let row = stored_row(&state.db, artifact_id).await?;
-    let latest = row_is_latest(&state, &repo, &row, settings.policy).await;
+    let latest = row_is_latest(&state, &repo, &row).await;
     let entry = served_entry(&row, &repo, base.as_str(), latest);
     Ok(super::mcp_write::publish_answer(entry, &resolution))
 }
 
 /// Whether `row` is its server's newest servable version (the reader-only
 /// gate), for a write's response. A read failure answers `false`.
-pub(super) async fn row_is_latest(
-    state: &SharedState,
-    repo: &RepoInfo,
-    row: &VersionRow,
-    policy_now: PackagePolicy,
-) -> bool {
+pub(super) async fn row_is_latest(state: &SharedState, repo: &RepoInfo, row: &VersionRow) -> bool {
     let Ok(all) = versions_of(&state.db, repo.id, &row.name).await else {
         return false;
     };
     let ctx = GateCtx::of(state, false);
-    newest_servable(ctx, repo.id, all, &Default::default(), policy_now)
+    newest_servable(ctx, repo.id, all, &Default::default())
         .await
         .0
         .ok()
@@ -2766,20 +2726,13 @@ async fn update_status_impl(
         mcp_lint::record_after_write(&state.db, *id, &status_lint, source).await;
         super::mcp_write::refresh_catalog_row(&state.db, *id).await;
     }
-    let policy_now = current_policy(&state.db, repo.id).await;
     let all = versions_of(&state.db, repo.id, name).await?;
-    let latest = newest_servable(
-        GateCtx::of(state, false),
-        repo.id,
-        all,
-        &Default::default(),
-        policy_now,
-    )
-    .await
-    .0
-    .ok()
-    .flatten()
-    .map(|r| r.artifact_id);
+    let latest = newest_servable(GateCtx::of(state, false), repo.id, all, &Default::default())
+        .await
+        .0
+        .ok()
+        .flatten()
+        .map(|r| r.artifact_id);
     let mut entries = Vec::new();
     for id in &changed {
         let row = stored_row(&state.db, *id).await?;
@@ -2828,13 +2781,11 @@ pub(crate) async fn visible_version(
 }
 
 async fn servable_row(state: &SharedState, repo: &RepoInfo, row: &VersionRow, base: &str) -> bool {
-    let policy_now = current_policy(&state.db, repo.id).await;
     let instance = instance_url(base, &repo.key, &row.name, &row.version);
     matches!(
         decide_row(
             GateCtx::of(state, false),
             row,
-            policy_now,
             false,
             GateAudience::ReaderOnly,
             instance,
@@ -3593,43 +3544,168 @@ mod tests {
         env.teardown().await;
     }
 
+    /// The stored pins of `name@version` (`metadata.packages`).
+    async fn stored_pins(env: &Env, name: &str, version: &str) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT metadata->'packages' FROM artifact_metadata WHERE artifact_id = $1",
+        )
+        .bind(env.server_artifact(name, version).await)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap()
+    }
+
+    /// #5452: under `open` a package must still resolve through the mapped
+    /// backing repository. `registryBaseUrl` may name another registry, but
+    /// the served document carries the AK coordinates, the stored pin agrees
+    /// with them and records that the submitted coordinates were replaced,
+    /// and the backing artifact's gates apply. A package the backing
+    /// repository does not hold, or whose `registryType` has no backing
+    /// repository, is refused and stores nothing. A version stored unpinned
+    /// under `open` before the fix is `unresolvable`, under either policy.
     #[tokio::test]
-    async fn open_policy_stores_and_serves_packages_verbatim() {
-        let Some(env) = Env::new().await else { return };
+    async fn open_policy_pins_and_gates_npm_and_pypi_packages() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
         env.config(mcp_packages::POLICY_KEY, "open").await;
-        let mut p = npm_pkg("@acme/elsewhere", Some("3.0.0"));
-        p["registryBaseUrl"] = "https://registry.npmjs.org".into();
-        let (s, body) = env
-            .publish(&doc(
-                "com.acme/open",
-                "1.0.0",
-                serde_json::json!({"packages": [p]}),
-            ))
-            .await;
-        assert_eq!(s, StatusCode::OK, "{body}");
-        assert_eq!(
-            body["server"]["packages"][0]["registryBaseUrl"],
-            "https://registry.npmjs.org"
-        );
-        let (s, b, _) = env
-            .get(env.anon(), "/servers/com.acme%2Fopen/versions/latest")
-            .await;
-        assert_eq!(
+        let (npm, ids) = env.npm_backing(&["1.0.0"]).await;
+        let pypi = env.repo("local", "pypi").await;
+        tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &env.fx.pool,
+            &pypi,
+            "pypi/acme-tool-2.0.0.whl",
+            "acme-tool/2.0.0/acme_tool-2.0.0-py3-none-any.whl",
+            "acme-tool",
+            "2.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"whl"),
+            env.fx.user_id,
+            &"f".repeat(64),
+        )
+        .await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": npm.key, "pypi": pypi.key}).to_string(),
+        )
+        .await;
+        let foreign = |ty: &str, id: &str, v: &str, url: &str| {
+            serde_json::json!({"registryType": ty, "identifier": id, "version": v,
+                "registryBaseUrl": url, "transport": {"type": "stdio"}})
+        };
+        let one = |name: &str, p: serde_json::Value| {
+            doc(name, "1.0.0", serde_json::json!({"packages": [p]}))
+        };
+
+        // Not in the backing repository, or no backing repository at all:
+        // refused, nothing stored.
+        let npm_evil = foreign("npm", "@evil/pkg", "3.0.0", "https://npm.evil.test");
+        let pypi_evil = foreign("pypi", "evil-tool", "1.0", "https://pypi.evil.test/simple");
+        let cargo_evil = foreign("cargo", "evil", "1.0.0", "https://crates.evil.test");
+        for (name, p, code) in [
+            ("com.acme/npm-evil", npm_evil, "mcp_package_not_found"),
+            ("com.acme/pypi-evil", pypi_evil, "mcp_package_not_found"),
+            ("com.acme/cargo-evil", cargo_evil, "mcp_external_registry"),
+        ] {
+            let (s, b) = env.publish(&one(name, p)).await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (StatusCode::UNPROCESSABLE_ENTITY, Some(code)),
+                "{name}: {b}"
+            );
+            let stored: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(env.fx.repo_id)
+            .bind(fmt::storage_path(name, "1.0.0"))
+            .fetch_optional(&env.fx.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, None, "{name}");
+        }
+
+        // In the backing repository: pinned and served from it.
+        for (name, p, repo_key, sha) in [
             (
-                s,
-                json(&b)["_meta"][fmt::AK_SOURCE_META_KEY]["packagePolicy"].as_str()
+                "com.acme/npm-ok",
+                foreign("npm", "@acme/echo", "1.0.0", "https://npm.evil.test"),
+                &npm.key,
+                "e",
             ),
-            (StatusCode::OK, Some("open"))
-        );
-        // Switching back to own-repos leaves the version unresolvable.
-        env.config(mcp_packages::POLICY_KEY, "own-repos").await;
+            (
+                "com.acme/pypi-ok",
+                foreign(
+                    "pypi",
+                    "Acme_Tool",
+                    "2.0.0",
+                    "https://pypi.evil.test/simple",
+                ),
+                &pypi.key,
+                "f",
+            ),
+        ] {
+            let ty = p["registryType"].as_str().unwrap().to_string();
+            let (s, b) = env.publish(&one(name, p)).await;
+            assert_eq!(s, StatusCode::OK, "{name}: {b}");
+            let own = format!("http://localhost/{ty}/{repo_key}");
+            assert_eq!(b["server"]["packages"][0]["registryBaseUrl"], own, "{name}");
+            let tail = format!("/servers/{}/versions/latest", urlencoding::encode(name));
+            let (s, read, _) = env.get(env.anon(), &tail).await;
+            let read = json(&read);
+            assert_eq!(s, StatusCode::OK, "{name}: {read}");
+            assert_eq!(read["server"]["packages"][0]["registryBaseUrl"], own);
+            assert_eq!(
+                read["_meta"][fmt::AK_SOURCE_META_KEY]["packagePolicy"],
+                "open"
+            );
+            let pins = stored_pins(&env, name, "1.0.0").await;
+            assert_eq!(pins[0]["resolved"]["repository"], repo_key.as_str());
+            assert_eq!(pins[0]["resolved"]["sha256"], sha.repeat(64));
+            assert_eq!(
+                pins[0]["resolved"]["warnings"],
+                serde_json::json!([mcp_packages::FOREIGN_COORDINATES_WARNING])
+            );
+        }
+
+        // The backing artifact's gates apply to an `open` version.
+        env.hold(ids[0], Some("quarantined")).await;
         let (s, b, _) = env
-            .get(env.member(), "/servers/com.acme%2Fopen/versions/1.0.0")
+            .get(env.member(), "/servers/com.acme%2Fnpm-ok/versions/1.0.0")
             .await;
         assert_eq!(
             (s, json(&b)["error"].as_str()),
-            (StatusCode::NOT_FOUND, Some("mcp_unresolvable"))
+            (StatusCode::NOT_FOUND, Some("mcp_backing_artifact_blocked"))
         );
+        let (_, list, _) = env.get(env.anon(), "/servers").await;
+        assert_eq!(
+            listed_names(&json(&list)),
+            ["com.acme/pypi-ok@1.0.0".to_string()]
+        );
+
+        // A version stored unpinned under `open` (as before #5452) is never
+        // served: not under `open`, not under `own-repos`.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{packages}', '[]') \
+             WHERE artifact_id = $1",
+        )
+        .bind(env.server_artifact("com.acme/pypi-ok", "1.0.0").await)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        for policy in ["open", "own-repos"] {
+            env.config(mcp_packages::POLICY_KEY, policy).await;
+            let (s, b, _) = env
+                .get(env.member(), "/servers/com.acme%2Fpypi-ok/versions/1.0.0")
+                .await;
+            assert_eq!(
+                (s, json(&b)["error"].as_str()),
+                (StatusCode::NOT_FOUND, Some("mcp_unresolvable")),
+                "{policy}"
+            );
+            let (_, list, _) = env.get(env.anon(), "/servers").await;
+            assert!(listed_names(&json(&list)).is_empty(), "{policy}");
+        }
         env.teardown().await;
     }
 
@@ -3714,6 +3790,67 @@ mod tests {
                 {"registryType": "oci", "identifier": identifier, "transport": {"type": "stdio"}}
             ]}),
         )
+    }
+
+    /// #5452: under `open` an image named on another host is looked up by
+    /// path in the backing repository and, when there, pinned to its digest
+    /// and served at AK coordinates (the submitted identifier only in
+    /// `_meta`); the backing manifest's gates apply. An image the backing
+    /// repository does not hold is refused.
+    #[tokio::test]
+    async fn open_policy_pins_and_gates_oci_images() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (oci, digest) = seed_oci(&mut env).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let mut evil = oci_doc("evil.example/acme/other:1.0");
+        evil["name"] = "com.acme/evil-img".into();
+        let (s, b) = env.publish(&evil).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_package_not_found")
+            ),
+            "{b}"
+        );
+        let (s, body) = env.publish(&oci_doc("ghcr.io/acme/mcp:1.2")).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let (s, read, _) = env
+            .get(env.anon(), "/servers/com.acme%2Fimg/versions/1.0.0")
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        let pkg = &json(&read)["server"]["packages"][0];
+        assert_eq!(
+            pkg["identifier"],
+            format!("localhost/{}/acme/mcp:1.2@{digest}", oci.key)
+        );
+        let resolved = &pkg["_meta"][fmt::AK_RESOLVED_META_KEY];
+        assert_eq!(resolved["submittedIdentifier"], "ghcr.io/acme/mcp:1.2");
+        assert_eq!(resolved["digest"], digest.as_str());
+        let pins = stored_pins(&env, "com.acme/img", "1.0.0").await;
+        assert_eq!(pins[0]["resolved"]["digest"], digest.as_str());
+        assert_eq!(
+            pins[0]["resolved"]["warnings"],
+            serde_json::json!([mcp_packages::FOREIGN_COORDINATES_WARNING])
+        );
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_source = 'admin' \
+             WHERE repository_id = $1",
+        )
+        .bind(oci.id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let (s, b, _) = env
+            .get(env.member(), "/servers/com.acme%2Fimg/versions/1.0.0")
+            .await;
+        assert_eq!(
+            (s, json(&b)["error"].as_str()),
+            (StatusCode::NOT_FOUND, Some("mcp_backing_artifact_blocked"))
+        );
+        env.teardown().await;
     }
 
     #[tokio::test]
@@ -4863,16 +5000,7 @@ mod tests {
             record_reviews: false,
         };
         for audience in [GateAudience::ReaderOnly, GateAudience::ReasonGated] {
-            match decide_row(
-                ctx,
-                &row,
-                PackagePolicy::OwnRepos,
-                false,
-                audience,
-                "i".into(),
-            )
-            .await
-            {
+            match decide_row(ctx, &row, false, audience, "i".into()).await {
                 ServeDecision::Refuse { status, body, .. } => {
                     assert_eq!(
                         (status, body["error"].as_str()),
@@ -4889,17 +5017,12 @@ mod tests {
             stored: row.stored.clone(),
         }];
         assert!(
-            mcp_packages::listing_refusals(ctx, env.fx.repo_id, &listing, PackagePolicy::OwnRepos)
+            mcp_packages::listing_refusals(ctx, env.fx.repo_id, &listing)
                 .await
                 .is_err()
-                || servable(
-                    ctx,
-                    env.fx.repo_id,
-                    vec![row.clone()],
-                    PackagePolicy::OwnRepos
-                )
-                .await
-                .is_empty()
+                || servable(ctx, env.fx.repo_id, vec![row.clone()])
+                    .await
+                    .is_empty()
         );
         env.teardown().await;
     }
@@ -5457,16 +5580,7 @@ mod tests {
             age_gate: Some(&svc),
             record_reviews,
         };
-        let decide = |ctx, audience| {
-            decide_row(
-                ctx,
-                &row,
-                PackagePolicy::OwnRepos,
-                false,
-                audience,
-                "i".into(),
-            )
-        };
+        let decide = |ctx, audience| decide_row(ctx, &row, false, audience, "i".into());
         // Cached just now: held. The listing is read-only and omits it.
         match decide(ctx(false), GateAudience::ReasonGated).await {
             ServeDecision::Refuse { status, body, .. } => {
@@ -5488,14 +5602,9 @@ mod tests {
             }
             ServeDecision::Serve => panic!("held for readers too"),
         }
-        assert!(servable(
-            ctx(false),
-            env.fx.repo_id,
-            vec![row.clone()],
-            PackagePolicy::OwnRepos
-        )
-        .await
-        .is_empty());
+        assert!(servable(ctx(false), env.fx.repo_id, vec![row.clone()])
+            .await
+            .is_empty());
         let reviews = || async {
             sqlx::query_as::<_, (Uuid, String, Option<DateTime<Utc>>)>(
                 "SELECT id, status, upstream_published_at FROM age_gate_reviews \
@@ -5532,14 +5641,9 @@ mod tests {
             ServeDecision::Serve
         );
         assert_eq!(
-            servable(
-                ctx(false),
-                env.fx.repo_id,
-                vec![row.clone()],
-                PackagePolicy::OwnRepos
-            )
-            .await
-            .len(),
+            servable(ctx(false), env.fx.repo_id, vec![row.clone()])
+                .await
+                .len(),
             1
         );
         // A rejection holds, old or not.

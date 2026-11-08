@@ -76,6 +76,12 @@ pub struct Pending {
     pub fill_repository: String,
     pub fill_repository_id: Uuid,
     pub fill_format: String,
+    /// The submitted `registryBaseUrl` (accepted under `open` when foreign,
+    /// #5452), so the pin a fill produces records
+    /// [`mcp_packages::FOREIGN_COORDINATES_WARNING`] as a direct pin does.
+    /// Never fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_base_url: Option<String>,
 }
 
 impl Pending {
@@ -84,6 +90,7 @@ impl Pending {
             "registryType": self.registry_type,
             "identifier": self.identifier,
             "version": self.version,
+            "registryBaseUrl": self.registry_base_url,
             "transport": {"type": "stdio"},
         }))
         .expect("a pending package is a valid package")
@@ -118,10 +125,9 @@ pub async fn resolve_document(
     server: &fmt::ServerJson,
     base_url: &str,
 ) -> Result<Resolution, McpError> {
+    // `open` resolves exactly as `own-repos` does (#5452): it only accepts
+    // foreign coordinates (`mcp_packages::resolve_package`).
     let mut out = Resolution::default();
-    if settings.policy == fmt::PackagePolicy::Open {
-        return Ok(out);
-    }
     for (index, pkg) in server.packages.iter().enumerate() {
         if pkg.registry_type == "mcpb" {
             out.pins
@@ -136,7 +142,10 @@ pub async fn resolve_document(
                     return Err(McpError::PackageNotFound { index, detail });
                 };
                 match cached_pin(&state.db, repo, &remote, index, pkg).await? {
-                    Some(pin) => out.pins.push(pin),
+                    Some(mut pin) => {
+                        mcp_packages::note_foreign_coordinates(&mut pin, pkg, repo, base_url);
+                        out.pins.push(pin)
+                    }
                     None => out.pending.push(Pending {
                         index,
                         registry_type: pkg.registry_type.clone(),
@@ -145,6 +154,7 @@ pub async fn resolve_document(
                         fill_repository: remote.key.clone(),
                         fill_repository_id: remote.id,
                         fill_format: remote.format.clone(),
+                        registry_base_url: pkg.registry_base_url.clone(),
                     }),
                 }
             }
@@ -1248,7 +1258,11 @@ async fn resolve_pending(
                 Err(e) => Err(e),
             }
         } else {
-            cached_pin(&state.db, mapped, &remote, p.index, &pkg).await
+            let mut found = cached_pin(&state.db, mapped, &remote, p.index, &pkg).await;
+            if let Ok(Some(pin)) = found.as_mut() {
+                mcp_packages::note_foreign_coordinates(pin, &pkg, mapped, base);
+            }
+            found
         }
     };
     let to_step = |e: McpError| match e {

@@ -1427,6 +1427,179 @@ async fn remote_pins_packages_pulled_through_backing_remotes() {
     h.teardown().await;
 }
 
+/// #5452: a Remote MCP repository under `open` pins every package of an
+/// ingested version through its backing repositories, as under `own-repos`;
+/// it only accepts coordinates naming another registry. npm and PyPI packages
+/// with a foreign `registryBaseUrl`, and an image on a foreign host, are
+/// pinned to what the backing Remotes hold and served at AK coordinates; the
+/// stored pins agree with the served document. A package no backing
+/// repository holds leaves its version unresolved (hidden), never served as
+/// upstream wrote it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
+async fn open_remote_pins_foreign_coordinates_or_hides_the_version() {
+    let mut h = Harness::new(false).await;
+    let digest = seed_latest_image(&mut h).await;
+    let oci_key: String = sqlx::query_scalar(
+        "SELECT value::jsonb->>'oci' FROM repository_config \
+         WHERE repository_id = $1 AND key = 'mcp_package_repos'",
+    )
+    .bind(h.repo_id)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let mut mapping = serde_json::json!({"oci": oci_key});
+    let mut entries = vec![entry(
+        oci_server("io.github.acme/img", "evil.example/acme/mcp:latest"),
+        T1,
+    )];
+    // (registryType and backing format, identifier, proxy cache path)
+    let cases = [
+        (
+            "npm",
+            "@acme/echo-npm",
+            "@acme/echo-npm/-/echo-npm-1.0.0.tgz",
+        ),
+        (
+            "pypi",
+            "Echo_Pkg",
+            "simple/echo-pkg/echo_pkg-1.0.0-py3-none-any.whl",
+        ),
+    ];
+    for (ty, identifier, cache_path) in cases {
+        let id = Uuid::new_v4();
+        let key = format!("{ty}-remote-{}", &id.to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, upstream_url, is_public) \
+             VALUES ($1, $2, $2, $3, 'remote', $4::repository_format, 'https://upstream.example.test', true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(format!("{}/{key}", h.dir))
+        .bind(ty)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        h.extra.push(id);
+        mapping[ty] = key.into();
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes, checksum_sha256) VALUES ($1, $2, $3, $4, 1, $5)",
+        )
+        .bind(id)
+        .bind(cache_path)
+        .bind(format!("proxy-cache/{id}/p"))
+        .bind(format!("proxy-cache/{id}/p.meta"))
+        .bind("cd".repeat(32))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+        let mut doc = server(&format!("io.github.acme/echo-{ty}"), "1.0.0", "Echo");
+        doc["packages"] = serde_json::json!([{
+            "registryType": ty, "registryBaseUrl": format!("https://{ty}.evil.test"),
+            "identifier": identifier, "version": "1.0.0", "transport": {"type": "stdio"},
+        }]);
+        entries.push(entry(doc, T1));
+    }
+    let mut missing = server("io.github.acme/missing", "1.0.0", "Missing");
+    missing["packages"] = serde_json::json!([{
+        "registryType": "npm", "registryBaseUrl": "https://npm.evil.test",
+        "identifier": "@evil/missing", "version": "1.0.0", "transport": {"type": "stdio"},
+    }]);
+    entries.push(entry(missing, T1));
+    h.config("mcp_package_policy", "open").await;
+    h.config("mcp_package_repos", &mapping.to_string()).await;
+    h.config("mcp_auto_approve_namespaces", r#"["io.github.acme/*"]"#)
+        .await;
+    mount_quiet_upstream(&h.upstream, &entries).await;
+
+    let summary = h.sync().await;
+    assert_eq!(summary["unresolved"], 1, "{summary}");
+    let mut served = h.listed_names().await;
+    served.sort();
+    assert_eq!(
+        served,
+        [
+            "io.github.acme/echo-npm@1.0.0",
+            "io.github.acme/echo-pypi@1.0.0",
+            "io.github.acme/img@1.0.0"
+        ]
+    );
+    let (s, b) = h
+        .read(None, "/servers/io.github.acme%2Fmissing/versions/1.0.0")
+        .await;
+    assert_eq!(
+        (s, String::from_utf8_lossy(&b).as_ref()),
+        (StatusCode::NOT_FOUND, NOT_FOUND)
+    );
+    let item = h.item("io.github.acme/missing").await;
+    assert_eq!(
+        item["ingested"][0]["unresolved"][0]["error"], "mcp_package_not_found",
+        "{item}"
+    );
+
+    let stored = |name: &str| {
+        let pool = h.pool.clone();
+        let repo = h.repo_id;
+        let name = name.to_string();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT m.metadata->'packages'->0 FROM artifacts a \
+                 JOIN artifact_metadata m ON m.artifact_id = a.id \
+                 WHERE a.repository_id = $1 AND a.name = $2",
+            )
+            .bind(repo)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for (ty, ..) in cases {
+        let name = format!("io.github.acme/echo-{ty}");
+        let (s, b) = h
+            .read(
+                None,
+                &format!("/servers/{}/versions/1.0.0", urlencoding::encode(&name)),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let pin = stored(&name).await;
+        let base = v["server"]["packages"][0]["registryBaseUrl"]
+            .as_str()
+            .unwrap();
+        assert!(
+            base.ends_with(&format!("/{ty}/{}", mapping[ty].as_str().unwrap())),
+            "{ty}: {base}"
+        );
+        assert_eq!(pin["resolved"]["repository"], mapping[ty], "{ty}");
+        assert_eq!(pin["resolved"]["sha256"], "cd".repeat(32), "{ty}");
+        assert_eq!(
+            pin["resolved"]["warnings"],
+            serde_json::json!(["foreign_coordinates_replaced"]),
+            "{ty}"
+        );
+    }
+    let (_, b) = h
+        .read(None, "/servers/io.github.acme%2Fimg/versions/1.0.0")
+        .await;
+    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+    let identifier = v["server"]["packages"][0]["identifier"].as_str().unwrap();
+    assert!(
+        identifier.ends_with(&format!("/{oci_key}/acme/mcp:latest@{digest}"))
+            && !identifier.starts_with("evil.example"),
+        "{identifier}"
+    );
+    let pin = stored("io.github.acme/img").await;
+    assert_eq!(pin["resolved"]["digest"], digest.as_str());
+    assert_eq!(
+        pin["resolved"]["warnings"],
+        serde_json::json!(["oci_floating_tag", "foreign_coordinates_replaced"])
+    );
+    h.teardown().await;
+}
+
 /// S2 leftover (#5253): a Remote version deleted and purged from the trash
 /// is never ingested again, whatever upstream serves under its
 /// `name@version` now: the tombstone ledger outlives the purge, the sync

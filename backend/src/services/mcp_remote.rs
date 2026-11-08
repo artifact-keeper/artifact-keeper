@@ -861,8 +861,10 @@ async fn pin_packages(
 ) -> (Vec<PackagePin>, Vec<Unresolved>) {
     let mut pins = Vec::new();
     let mut unresolved = Vec::new();
+    // `open` pins as `own-repos` does (#5452); it only accepts foreign
+    // coordinates. A package that does not pin leaves the version
+    // `unresolvable`.
     let settings = match &run.packages {
-        Ok(s) if s.policy == PackagePolicy::Open => return (pins, unresolved),
         Ok(s) => s,
         Err(detail) => {
             let all = server
@@ -912,7 +914,10 @@ async fn pin_packages(
                 )
                 .await
                 {
-                    Ok(Some(pin)) => found = Ok(pin),
+                    Ok(Some(mut pin)) => {
+                        mcp_packages::note_foreign_coordinates(&mut pin, &candidate, repo, "");
+                        found = Ok(pin)
+                    }
                     Ok(None) => {}
                     Err(e) => found = Err(e),
                 }

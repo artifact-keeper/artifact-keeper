@@ -834,7 +834,7 @@ async fn claim_payload(
     if !surface::artifact_servable(state, &repo, v.artifact_id, base).await {
         return Ok(Err("server version is held".into()));
     }
-    let served = fmt::rewrite_packages_for_serve(&stored.server, &stored.pins, stored.policy, base);
+    let served = fmt::rewrite_packages_for_serve(&stored.server, &stored.pins, base);
     let target = match jobs::job_target(kind, &job.target_key, &stored, &served) {
         Ok(t) => t,
         Err(_) => return Ok(Err("target no longer eligible".into())),

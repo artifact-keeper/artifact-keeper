@@ -218,18 +218,15 @@ async fn staged_bundles(
 
 /// When a document names no `mcpb` package but bundles were uploaded for its
 /// version, add one `packages[]` entry per bundle (identifier = the bundle's
-/// Artifact Keeper URL, `fileSha256` computed at upload). Under the `open`
-/// policy nothing is added.
+/// Artifact Keeper URL, `fileSha256` computed at upload), under either
+/// package policy.
 pub async fn add_staged_bundles(
     db: &PgPool,
     repo: &RepoInfo,
-    settings: &McpSettings,
     server: &mut fmt::ServerJson,
     base: &str,
 ) -> Result<(), Response> {
-    if settings.policy == fmt::PackagePolicy::Open
-        || server.packages.iter().any(|p| p.registry_type == "mcpb")
-    {
+    if server.packages.iter().any(|p| p.registry_type == "mcpb") {
         return Ok(());
     }
     for (file, sha) in staged_bundles(db, repo.id, &server.name, &server.version).await? {
@@ -560,7 +557,7 @@ async fn validate(
             fmt::check_installable(&server)?;
             return Ok((server, None));
         }
-        add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
+        add_staged_bundles(&state.db, &repo, &mut server, base.as_str())
             .await
             .map_err(|_| McpError::Internal("bundle lookup failed".into()))?;
         fmt::check_installable(&server)?;
@@ -727,7 +724,7 @@ async fn edit_impl(
             serde_json::json!({}),
         ));
     }
-    add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str()).await?;
+    add_staged_bundles(&state.db, &repo, &mut server, base.as_str()).await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
     let keep_pins = packages_unchanged(&current.stored.server, &server);
     if !keep_pins {
@@ -870,7 +867,7 @@ async fn edit_impl(
         );
     }
     let row = stored_row(&state.db, current.artifact_id).await?;
-    let latest = surface::row_is_latest(state, &repo, &row, settings.policy).await;
+    let latest = surface::row_is_latest(state, &repo, &row).await;
     let entry = served_entry(&row, &repo, base.as_str(), latest);
     Ok(publish_answer(entry, &resolution))
 }
@@ -1709,11 +1706,9 @@ async fn download_bundle(
     else {
         return Err(not_found());
     };
-    let policy_now = surface::current_policy(&state.db, repo.id).await;
     match surface::decide_row(
         mcp_packages::GateCtx::of(state, false),
         &owner,
-        policy_now,
         false,
         fmt::GateAudience::ReaderOnly,
         String::new(),
@@ -1909,6 +1904,7 @@ mod tests {
                 fill_repository: "npm-remote".into(),
                 fill_repository_id: Uuid::nil(),
                 fill_format: "npm".into(),
+                registry_base_url: None,
             }],
         };
         let v = validation_result(Ok(&res));

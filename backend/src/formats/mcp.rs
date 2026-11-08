@@ -1592,9 +1592,18 @@ pub fn validate_status_change(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PackagePolicy {
-    /// Default: every package resolves to an AK repository of its format.
+    /// Default: every package resolves to an AK repository of its format,
+    /// and its coordinates must name that repository (`registryBaseUrl`
+    /// omitted or this instance's, an OCI image on this instance or the
+    /// backing Remote's upstream).
     OwnRepos,
-    /// Explicit opt-out: packages stored and served verbatim, not gated.
+    /// Foreign coordinates accepted (#5452): a `registryBaseUrl` or OCI image
+    /// host naming another registry is not refused. The package itself is
+    /// still looked up by name and version (an image by path and tag or
+    /// digest) in the mapped backing repository, pinned, served at its AK
+    /// coordinates and gated exactly as under `own-repos`; one that does not
+    /// resolve is refused at publish, or held (`unresolvable`) when synced or
+    /// stored without a pin. Nothing is served verbatim.
     Open,
 }
 
@@ -1778,9 +1787,10 @@ impl StoredVersion {
         })
     }
 
-    /// Whether every `packages[]` entry of the server has a pin. A version
-    /// published under `open` and read under `own-repos` (or whose pins were
-    /// lost) is `unresolvable`.
+    /// The first `packages[]` entry of the server with no pin, if any. Such a
+    /// version is `unresolvable` under either policy: one stored before
+    /// #5452 under `open` (which pinned nothing), one whose pins were lost,
+    /// or a synced version a package of which did not resolve.
     pub fn unpinned_package(&self) -> Option<String> {
         let packages = self
             .server
@@ -1827,21 +1837,19 @@ pub fn host_of(base_url: &str) -> String {
         .unwrap_or_else(|| "localhost".to_string())
 }
 
-/// The served form of a stored `server`: under `own-repos` every pinned
-/// package is rewritten to its AK coordinates (`registryBaseUrl` for
-/// npm/pypi/nuget/cargo, `identifier` with `@sha256:` for OCI, original in
-/// `_meta[com.artifactkeeper/resolved]`); under `open` the stored document is
-/// returned untouched.
+/// The served form of a stored `server`: every pinned package is rewritten
+/// to its AK coordinates (`registryBaseUrl` for npm/pypi/nuget/cargo,
+/// `identifier` with `@sha256:` for OCI, original in
+/// `_meta[com.artifactkeeper/resolved]`), whatever the package policy: an
+/// `open` document is pinned and served the same way (#5452). A package with
+/// no pin is left as stored, but the version is never served then: the
+/// serve decision holds it `unresolvable` ([`StoredVersion::unpinned_package`]).
 pub fn rewrite_packages_for_serve(
     server: &serde_json::Value,
     pins: &[PackagePin],
-    policy: PackagePolicy,
     base_url: &str,
 ) -> serde_json::Value {
     let mut out = server.clone();
-    if policy == PackagePolicy::Open {
-        return out;
-    }
     let base = base_url.trim_end_matches('/');
     let oci_host = host_of(base);
     let Some(packages) = out.get_mut("packages").and_then(|p| p.as_array_mut()) else {
@@ -3226,12 +3234,7 @@ mod tests {
             pin(3, "oci", None),
             pin(9, "npm", None),
         ];
-        let out = rewrite_packages_for_serve(
-            &server,
-            &pins,
-            PackagePolicy::OwnRepos,
-            "https://ak.test:8443/",
-        );
+        let out = rewrite_packages_for_serve(&server, &pins, "https://ak.test:8443/");
         assert_eq!(
             out["packages"][0]["registryBaseUrl"],
             "https://ak.test:8443/npm/npm-local"
@@ -3252,10 +3255,6 @@ mod tests {
         assert_eq!(
             out["packages"][3]["identifier"],
             format!("ak.test:8443/oci-local/acme/mcp@sha256:{hex}")
-        );
-        assert_eq!(
-            rewrite_packages_for_serve(&server, &pins, PackagePolicy::Open, "https://ak.test"),
-            server
         );
         assert_eq!(host_of("not a url"), "localhost");
         assert_eq!(pins[0].label(), "npm:@acme/w@1.0.0");

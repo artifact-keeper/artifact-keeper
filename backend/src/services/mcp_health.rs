@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::formats::mcp::{GateOutcome, PackagePin, PackagePolicy, StoredVersion};
+use crate::formats::mcp::{GateOutcome, PackagePin, StoredVersion};
 use crate::services::mcp_lint::{self, LintSummary};
 use crate::services::mcp_packages::{self, GateCtx};
 
@@ -212,19 +212,14 @@ async fn package_health(
     })
 }
 
-/// The health of the stored server version `artifact_id` in `repo_id`.
+/// The health of the stored server version `artifact_id`.
 pub async fn server_health(
     ctx: GateCtx<'_>,
-    repo_id: Uuid,
     artifact_id: Uuid,
     stored: &StoredVersion,
 ) -> Result<ServerHealth> {
     let db = ctx.db;
-    let policy_now = mcp_packages::load_settings(db, repo_id)
-        .await
-        .map(|s| s.policy)
-        .unwrap_or(PackagePolicy::OwnRepos);
-    let gates = mcp_packages::backing_gates(ctx, stored, policy_now).await;
+    let gates = mcp_packages::backing_gates(ctx, stored).await;
     let mut packages = Vec::with_capacity(stored.pins.len());
     for pin in &stored.pins {
         packages.push(package_health(db, pin, gate_of(&gates, pin)).await?);

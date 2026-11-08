@@ -400,11 +400,27 @@ Each repository has a package policy (`mcp_package_policy`):
   (`mcp_package_repos`). The publish looks it up in the database; it never
   contacts the package's registry. The version is pinned, and every read
   serves the package's Artifact Keeper coordinates, gated like any download.
-- **`open`**. An explicit opt-out for a catalog of servers whose packages live
-  elsewhere: `packages[]` is stored and served verbatim after the shape
-  checks. Nothing is resolved, rewritten or gated, so a held or vulnerable
-  package does not hide the server. Treat an `open` repository as a list of
-  links, not as a control.
+- **`open`**. Foreign coordinates are accepted, nothing else is relaxed
+  (#5452). A `registryBaseUrl` naming another registry, or an OCI image on
+  another host, is not refused with `mcp_external_registry`; the package is
+  still looked up by name and version (an image by its path and tag or
+  digest) in the repository `mcp_package_repos` maps its `registryType` to,
+  pinned, served at its Artifact Keeper coordinates and gated exactly as
+  under `own-repos`. The foreign registry is never contacted and never
+  served: a client installs the bytes the backing repository holds (a Remote
+  backing repository fills from its own configured upstream, not from the
+  submitted URL). The pin records the warning `foreign_coordinates_replaced`.
+  A package that does not resolve is refused at publish like under
+  `own-repos` (`mcp_package_not_found`, or `mcp_external_registry` for a
+  `registryType` with no backing repository), or `202 resolving` and filled
+  through a Remote backing repository; a Remote MCP repository's sync
+  stores the version `unresolvable` (hidden). A package is never served
+  unpinned or ungated under either policy.
+
+  Before #5452 `open` stored and served `packages[]` verbatim, without pins
+  or gates. Versions stored that way are `unresolvable` (hidden, `404
+  mcp_unresolvable` for a holder) from this release on; republish them as a
+  new version once their packages are in a backing repository.
 
 Settings are part of the repository API (`POST`/`PATCH /api/v1/repositories`):
 
@@ -462,13 +478,13 @@ would let a writer of one namespace delete another's server.json. Lifecycle
 policies skip MCP repositories altogether (see
 [Lifecycle policy assignments](lifecycle-policy-assignments.md#execution)).
 
-To publish a server under `own-repos`, publish (or pull through a Remote) its
+To publish a server under either policy, publish (or pull through a Remote) its
 package first, then publish the server.json. A publish answers `422` with one
 `detail` line naming the entry and the fix:
 
 | `error` | When |
 | --- | --- |
-| `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. |
+| `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. Under `open` only the first case and `registryBaseUrl` on an `mcpb` entry are refused; foreign coordinates are looked up in the backing repository. |
 | `mcp_package_not_found` | The exact package version (npm, PyPI, NuGet, Cargo) or image tag/digest (OCI) is not in a hosted backing repository, or an `mcpb` entry's `fileSha256` matches no uploaded bundle. A package missing from a Remote backing repository is not refused: it is filled (`202`, see [Write path](#write-path-phase-2-and-3)). |
 | `mcp_bundle_signature_required` | The repository sets `mcp_require_bundle_signature` and an `mcpb` entry's bundle (uploaded here or found through `mcp_package_repos.mcpb`) has no recorded signature from a trusted signer (see [MCPB bundles](#mcpb-bundles)). |
 | `mcp_package_version_unpinned` | An npm, PyPI, NuGet or Cargo entry has no `version`. |
@@ -559,8 +575,10 @@ still does). Deleting the whole MCP repository that holds the version
 job has removed its rows, none of its versions pins anything, and their
 tombstones go with it.
 
-Switching a repository from `open` to `own-repos` does not resolve versions
-already published: they are `unresolvable` until republished as a new version.
+Switching a repository between `open` and `own-repos` does not change
+versions already published: they keep the pins they were published with and
+are gated by them. A version stored unpinned (under `open` before #5452) is
+`unresolvable` under either policy until republished as a new version.
 
 ## What a client sees
 
@@ -2030,7 +2048,8 @@ body. `?include_deleted=true` answers a soft-deleted version's health too
   (`age_gate`, or a high/medium finding), `unknown` (no completed scan, or
   gate `unavailable`), else `ok`; the lint `critical` (`block` > 0),
   `warning` (`review` > 0), `unknown` (never ran); `unknown` for a version
-  with packages but no pins (published under `open`). Order:
+  with packages but no pins (stored under `open` before #5452; such a
+  version is also held `unresolvable`). Order:
   `critical` > `warning` > `unknown` > `ok`.
 
 ## Capabilities and introspection

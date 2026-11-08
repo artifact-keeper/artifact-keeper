@@ -1,0 +1,7 @@
+---
+section: Security
+issues: [#5452]
+---
+- **MCP registries under the `open` package policy no longer serve runnable packages without an Artifact Keeper pin and gate** (#5452). `open` stored and served `packages[]` verbatim, so a hosted, Remote or Virtual MCP repository could hand an agent an npm, PyPI or OCI coordinate on a registry the publisher controls, and the client fetched those bytes directly, past every age, quarantine and scan gate. `open` now only accepts foreign coordinates: a `registryBaseUrl` or OCI image host naming another registry is not refused, but the package must still resolve by name and version in the repository `mcp_package_repos` maps, and is pinned, served at its Artifact Keeper coordinates (pin warning `foreign_coordinates_replaced`) and gated exactly as under `own-repos`. A package that does not resolve is refused at publish (`422 mcp_package_not_found` / `mcp_external_registry`), filled through a Remote backing repository (`202 resolving`), or, for a Remote MCP repository's sync, stored `unresolvable` (hidden). The serve decision, the listings, health and introspection no longer exempt `open` versions from the backing-package gates.
+
+  Upgrade note: versions published under `open` before this release carry no pins and are now `unresolvable` (hidden; `404 mcp_unresolvable` for a repository holder). Publish their packages to (or pull them through) a mapped backing repository and republish the server as a new version.

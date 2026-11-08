@@ -167,16 +167,14 @@ pub fn unreadable_package_detail(pkg: &mcp::Package) -> String {
 /// mcp_package_not_found` vs `200`, or `202 resolving` vs `200` through a
 /// Remote): the answer is now the same `422` whether the package exists or
 /// not. A caller who can read the repository keeps the precise answers.
-/// `open` resolves nothing, so it checks nothing.
+/// `open` resolves through the same backing repositories (#5452), so it is
+/// checked the same way.
 pub async fn refuse_unreadable_backing(
     db: &PgPool,
     caller: &crate::api::middleware::auth::AuthExtension,
     settings: &McpSettings,
     server: &ServerJson,
 ) -> Result<(), McpError> {
-    if settings.policy == PackagePolicy::Open {
-        return Ok(());
-    }
     let mut seen: BTreeMap<Uuid, bool> = BTreeMap::new();
     for (index, pkg) in server.packages.iter().enumerate() {
         // A bundle is matched by `fileSha256` (no name to probe), and one
@@ -470,16 +468,56 @@ fn not_pulled_hint(repo: &BackingRepo) -> &'static str {
     }
 }
 
+/// The pin warning of a package whose submitted coordinates named another
+/// registry (a foreign `registryBaseUrl` or OCI image host), accepted under
+/// the `open` policy (#5452). The package was resolved in, and is served from,
+/// the backing repository; the foreign coordinates are never served.
+pub const FOREIGN_COORDINATES_WARNING: &str = "foreign_coordinates_replaced";
+
+/// Whether `pkg` names a `registryBaseUrl` other than `repo`'s on this
+/// instance.
+pub fn registry_base_url_is_foreign(
+    pkg: &mcp::Package,
+    repo: &BackingRepo,
+    base_url: &str,
+) -> bool {
+    pkg.registry_base_url.as_deref().is_some_and(|given| {
+        let own = backing_base_url(base_url, &pkg.registry_type, &repo.key);
+        given.trim_end_matches('/') != own.trim_end_matches('/')
+    })
+}
+
+/// Record [`FOREIGN_COORDINATES_WARNING`] on a pin found in a Remote's proxy
+/// cache rather than by [`resolve_package`] (which records it itself), so
+/// every pin of foreign coordinates says so, wherever it was found.
+pub fn note_foreign_coordinates(
+    pin: &mut PackagePin,
+    pkg: &mcp::Package,
+    repo: &BackingRepo,
+    base_url: &str,
+) {
+    let warning = FOREIGN_COORDINATES_WARNING.to_string();
+    if registry_base_url_is_foreign(pkg, repo, base_url)
+        && !pin.resolved.warnings.contains(&warning)
+    {
+        pin.resolved.warnings.push(warning);
+    }
+}
+
 async fn resolve_artifact_package(
     db: &PgPool,
     index: usize,
     pkg: &mcp::Package,
     repo: &BackingRepo,
     base_url: &str,
+    policy: PackagePolicy,
 ) -> Result<PackagePin, McpError> {
-    if let Some(given) = pkg.registry_base_url.as_deref() {
-        let own = backing_base_url(base_url, &pkg.registry_type, &repo.key);
-        if given.trim_end_matches('/') != own.trim_end_matches('/') {
+    let mut warnings = Vec::new();
+    if registry_base_url_is_foreign(pkg, repo, base_url) {
+        if policy == PackagePolicy::Open {
+            warnings.push(FOREIGN_COORDINATES_WARNING.to_string());
+        } else {
+            let own = backing_base_url(base_url, &pkg.registry_type, &repo.key);
             return Err(McpError::ExternalRegistry {
                 index,
                 detail: format!(
@@ -545,7 +583,7 @@ async fn resolve_artifact_package(
             children: Vec::new(),
             gate_digest: None,
             resolved_at: Utc::now(),
-            warnings: Vec::new(),
+            warnings,
             cache_path: None,
             download_path: None,
         },
@@ -581,14 +619,48 @@ fn oci_name_candidates(host: &str, path: &str) -> Vec<String> {
     out
 }
 
+/// Where an OCI identifier is looked up in its backing repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OciBackingPath {
+    /// The image path inside the backing repository.
+    path: String,
+    /// The identifier named another registry, accepted under `open`.
+    foreign: bool,
+}
+
 /// The image path inside `repo` an identifier names, or why it is foreign.
-fn oci_backing_path(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Result<String, String> {
+/// Under `open` a foreign host is accepted and its path looked up in `repo`
+/// (#5452): the image still has to be there, and is served from there.
+fn oci_backing_path(
+    r: &mcp::OciRef,
+    repo: &BackingRepo,
+    base_url: &str,
+    policy: PackagePolicy,
+) -> Result<OciBackingPath, String> {
     // An identifier that already names this instance's repository.
     if same_registry_host(&r.host, &mcp::host_of(base_url)) {
         if let Some(rest) = r.path.strip_prefix(&format!("{}/", repo.key)) {
-            return Ok(rest.to_string());
+            return Ok(OciBackingPath {
+                path: rest.to_string(),
+                foreign: false,
+            });
         }
     }
+    match oci_host_refusal(r, repo, base_url) {
+        None => Ok(OciBackingPath {
+            path: r.path.clone(),
+            foreign: false,
+        }),
+        Some(_) if policy == PackagePolicy::Open => Ok(OciBackingPath {
+            path: r.path.clone(),
+            foreign: true,
+        }),
+        Some(why) => Err(why),
+    }
+}
+
+/// Why an image host is not one `repo` serves under `own-repos`, if it is not.
+fn oci_host_refusal(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Option<String> {
     if repo.is_remote() {
         let upstream = repo
             .upstream_url
@@ -596,7 +668,7 @@ fn oci_backing_path(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Resu
             .map(mcp::host_of)
             .unwrap_or_default();
         if !same_registry_host(&r.host, &upstream) {
-            return Err(format!(
+            return Some(format!(
                 "image host '{}' is not the upstream of repository '{}' ({upstream})",
                 r.host, repo.key
             ));
@@ -605,14 +677,14 @@ fn oci_backing_path(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Resu
         // A Local/Staging repository holds only what was pushed to this
         // instance: an image named on another host is external, whatever
         // its path (#5253 e2e).
-        return Err(format!(
+        return Some(format!(
             "image host '{}' is not this registry; name the image as {}/{}/<image>:<tag>",
             r.host,
             mcp::host_of(base_url),
             repo.key
         ));
     }
-    Ok(r.path.clone())
+    None
 }
 
 /// One manifest found in the backing repository.
@@ -736,6 +808,7 @@ async fn resolve_oci_package(
     repo: &BackingRepo,
     base_url: &str,
     pin_floating: bool,
+    policy: PackagePolicy,
 ) -> Result<PackagePin, McpError> {
     let (r, floating) = match mcp::parse_oci_reference(&pkg.identifier) {
         Ok((_, true)) if !pin_floating => return Err(McpError::OciFloatingTag { index }),
@@ -748,7 +821,7 @@ async fn resolve_oci_package(
             ))
         }
     };
-    let path = oci_backing_path(&r, repo, base_url)
+    let OciBackingPath { path, foreign } = oci_backing_path(&r, repo, base_url, policy)
         .map_err(|detail| McpError::ExternalRegistry { index, detail })?;
     let repo_ids = content_repo_ids(&state.db, repo).await?;
     let names = oci_name_candidates(&r.host, &path);
@@ -818,6 +891,9 @@ async fn resolve_oci_package(
     if floating {
         warnings.push(FLOATING_TAG_WARNING.to_string());
     }
+    if foreign {
+        warnings.push(FOREIGN_COORDINATES_WARNING.to_string());
+    }
     Ok(PackagePin {
         index,
         registry_type: "oci".to_string(),
@@ -859,16 +935,14 @@ async fn repos_location(db: &PgPool, repo_id: Uuid) -> Result<StorageLocation, M
 pub const FLOATING_TAG_WARNING: &str = "oci_floating_tag";
 
 /// Resolve and pin every package of `server` under the repository's policy.
-/// `open` resolves nothing.
+/// `open` resolves and pins exactly as `own-repos` does; it only accepts
+/// foreign coordinates (#5452).
 pub async fn resolve_packages(
     state: &crate::api::SharedState,
     settings: &McpSettings,
     server: &ServerJson,
     base_url: &str,
 ) -> Result<Vec<PackagePin>, McpError> {
-    if settings.policy == PackagePolicy::Open {
-        return Ok(Vec::new());
-    }
     let mut pins = Vec::with_capacity(server.packages.len());
     for (index, pkg) in server.packages.iter().enumerate() {
         pins.push(resolve_package(state, settings, index, pkg, base_url, false).await?);
@@ -916,9 +990,18 @@ pub async fn resolve_package(
         return Err(unmapped(settings, index, &pkg.registry_type));
     };
     if pkg.registry_type == "oci" {
-        resolve_oci_package(state, index, pkg, repo, base_url, pin_floating).await
+        resolve_oci_package(
+            state,
+            index,
+            pkg,
+            repo,
+            base_url,
+            pin_floating,
+            settings.policy,
+        )
+        .await
     } else {
-        resolve_artifact_package(&state.db, index, pkg, repo, base_url).await
+        resolve_artifact_package(&state.db, index, pkg, repo, base_url, settings.policy).await
     }
 }
 
@@ -1534,16 +1617,12 @@ async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin
 }
 
 /// [`backing_gate`] for every pin, plus `Unresolvable` for a package the
-/// stored document names but no pin covers.
-pub async fn backing_gates(
-    ctx: GateCtx<'_>,
-    stored: &mcp::StoredVersion,
-    policy_now: PackagePolicy,
-) -> Vec<BackingGate> {
+/// stored document names but no pin covers. Every version is gated, whatever
+/// policy it was published under or the repository has now: an `open`
+/// version's packages are pinned and gated like any other (#5452), and one
+/// stored unpinned under `open` before that is `unresolvable`.
+pub async fn backing_gates(ctx: GateCtx<'_>, stored: &mcp::StoredVersion) -> Vec<BackingGate> {
     let mut gates = Vec::new();
-    if stored.policy == PackagePolicy::Open && policy_now == PackagePolicy::Open {
-        return gates;
-    }
     if let Some(package) = stored.unpinned_package() {
         gates.push(BackingGate {
             package,
@@ -1558,12 +1637,6 @@ pub async fn backing_gates(
         });
     }
     gates
-}
-
-/// Whether a version's packages are gated: not when it was published under
-/// `open` and the repository is still `open`.
-fn gated(row: &ListingRow, policy_now: PackagePolicy) -> bool {
-    !(row.stored.policy == PackagePolicy::Open && policy_now == PackagePolicy::Open)
 }
 
 /// One row a listing is about to advertise.
@@ -1586,9 +1659,8 @@ pub async fn listing_refusals(
     ctx: GateCtx<'_>,
     mcp_repo_id: Uuid,
     rows: &[ListingRow],
-    policy_now: PackagePolicy,
 ) -> Result<HashSet<Uuid>, GateUnavailable> {
-    listing_refusals_inner(ctx, mcp_repo_id, rows, policy_now)
+    listing_refusals_inner(ctx, mcp_repo_id, rows)
         .await
         .map_err(|()| GateUnavailable)
 }
@@ -1602,7 +1674,6 @@ async fn listing_refusals_inner(
     ctx: GateCtx<'_>,
     mcp_repo_id: Uuid,
     rows: &[ListingRow],
-    policy_now: PackagePolicy,
 ) -> Result<HashSet<Uuid>, ()> {
     use crate::services::quarantine_service::{self as qs, ListingCandidate};
     let db = ctx.db;
@@ -1621,7 +1692,7 @@ async fn listing_refusals_inner(
     // Each gated pin's rows, looked up as the detail read does.
     let mut pin_rows: HashMap<(Uuid, usize), Vec<GateRow>> = HashMap::new();
     for row in rows {
-        if refused.contains(&row.artifact_id) || !gated(row, policy_now) {
+        if refused.contains(&row.artifact_id) {
             continue;
         }
         for pin in &row.stored.pins {
@@ -1658,7 +1729,7 @@ async fn listing_refusals_inner(
 
     let mut cache = FactsCache::new();
     for row in rows {
-        if refused.contains(&row.artifact_id) || !gated(row, policy_now) {
+        if refused.contains(&row.artifact_id) {
             continue;
         }
         let mut blocked = row.stored.unpinned_package().is_some();
@@ -1912,39 +1983,29 @@ mod tests {
             },
         };
         let r = mcp::parse_oci_identifier("ghcr.io/acme/mcp:1.2").unwrap();
-        assert!(
-            oci_backing_path(&r, &repo("local", None), "https://ak.test")
-                .unwrap_err()
-                .contains("not this registry")
-        );
+        let own_repos = |r: &mcp::OciRef, repo: &BackingRepo| {
+            oci_backing_path(r, repo, "https://ak.test", PackagePolicy::OwnRepos)
+        };
+        let local = |path: &str| OciBackingPath {
+            path: path.into(),
+            foreign: false,
+        };
+        assert!(own_repos(&r, &repo("local", None))
+            .unwrap_err()
+            .contains("not this registry"));
         assert_eq!(
-            oci_backing_path(&r, &repo("virtual", None), "https://ak.test").unwrap(),
-            "acme/mcp"
+            own_repos(&r, &repo("virtual", None)).unwrap(),
+            local("acme/mcp")
         );
-        assert!(oci_backing_path(
-            &r,
-            &repo("remote", Some("https://registry-1.docker.io")),
-            "https://ak.test"
-        )
-        .is_err());
+        assert!(own_repos(&r, &repo("remote", Some("https://registry-1.docker.io"))).is_err());
         assert_eq!(
-            oci_backing_path(
-                &r,
-                &repo("remote", Some("https://ghcr.io")),
-                "https://ak.test"
-            )
-            .unwrap(),
-            "acme/mcp"
+            own_repos(&r, &repo("remote", Some("https://ghcr.io"))).unwrap(),
+            local("acme/mcp")
         );
         let own = mcp::parse_oci_identifier("ak.test/oci-r/acme/mcp:1.2").unwrap();
         assert_eq!(
-            oci_backing_path(
-                &own,
-                &repo("remote", Some("https://ghcr.io")),
-                "https://ak.test"
-            )
-            .unwrap(),
-            "acme/mcp"
+            own_repos(&own, &repo("remote", Some("https://ghcr.io"))).unwrap(),
+            local("acme/mcp")
         );
         assert_eq!(
             backing_base_url("https://ak.test/", "nuget", "n"),
@@ -1956,6 +2017,126 @@ mod tests {
         );
         assert_eq!(not_pulled_hint(&repo("local", None)), "");
         assert!(!not_pulled_hint(&repo("remote", None)).is_empty());
+    }
+
+    /// #5452: a pin found in a Remote's proxy cache records the foreign
+    /// coordinates it replaced, once, as a direct pin does; this instance's
+    /// own `registryBaseUrl` (or none) records nothing.
+    #[test]
+    fn proxy_cache_pins_note_foreign_coordinates() {
+        let repo = BackingRepo {
+            id: Uuid::nil(),
+            key: "npm-r".into(),
+            repo_type: "remote".into(),
+            format: "npm".into(),
+            upstream_url: Some("https://registry.npmjs.org".into()),
+            location: StorageLocation {
+                backend: "filesystem".into(),
+                path: "/tmp".into(),
+            },
+        };
+        let pkg = |base: Option<&str>| -> mcp::Package {
+            serde_json::from_value(serde_json::json!({
+                "registryType": "npm", "identifier": "@acme/x", "version": "1.0.0",
+                "registryBaseUrl": base, "transport": {"type": "stdio"},
+            }))
+            .unwrap()
+        };
+        let mut pin = PackagePin {
+            index: 0,
+            registry_type: "npm".into(),
+            submitted: SubmittedRef {
+                identifier: "@acme/x".into(),
+                version: Some("1.0.0".into()),
+            },
+            resolved: ResolvedPin {
+                repository: repo.key.clone(),
+                repository_id: repo.id,
+                artifact_ids: Vec::new(),
+                sha256: Some("cd".repeat(32)),
+                name: None,
+                tag: None,
+                digest: None,
+                media_type: None,
+                children: Vec::new(),
+                gate_digest: None,
+                resolved_at: Utc::now(),
+                warnings: Vec::new(),
+                cache_path: Some("@acme/x/-/x-1.0.0.tgz".into()),
+                download_path: None,
+            },
+            drift: None,
+        };
+        let base = "https://ak.test";
+        for own in [None, Some("https://ak.test/npm/npm-r/")] {
+            assert!(!registry_base_url_is_foreign(&pkg(own), &repo, base));
+            note_foreign_coordinates(&mut pin, &pkg(own), &repo, base);
+            assert!(pin.resolved.warnings.is_empty(), "{own:?}");
+        }
+        let evil = pkg(Some("https://npm.evil.test"));
+        assert!(registry_base_url_is_foreign(&evil, &repo, base));
+        note_foreign_coordinates(&mut pin, &evil, &repo, base);
+        note_foreign_coordinates(&mut pin, &evil, &repo, base);
+        assert_eq!(pin.resolved.warnings, [FOREIGN_COORDINATES_WARNING]);
+    }
+
+    /// #5452: under `open` an image on a foreign host is not refused, but it
+    /// is looked up (by path) in the backing repository and flagged foreign,
+    /// so the pin records that its served coordinates replaced the submitted
+    /// ones. `own-repos` keeps refusing the same identifiers.
+    #[test]
+    fn open_policy_looks_foreign_images_up_in_the_backing_repository() {
+        let repo = |repo_type: &str, upstream: Option<&str>| BackingRepo {
+            id: Uuid::nil(),
+            key: "oci-r".into(),
+            repo_type: repo_type.into(),
+            format: "docker".into(),
+            upstream_url: upstream.map(Into::into),
+            location: StorageLocation {
+                backend: "filesystem".into(),
+                path: "/tmp".into(),
+            },
+        };
+        let open = |r: &mcp::OciRef, repo: &BackingRepo| {
+            oci_backing_path(r, repo, "https://ak.test", PackagePolicy::Open)
+        };
+        let evil = mcp::parse_oci_identifier("evil.example/acme/mcp:1.2").unwrap();
+        for backing in [
+            repo("local", None),
+            repo("staging", None),
+            repo("remote", Some("https://ghcr.io")),
+        ] {
+            assert!(
+                oci_backing_path(&evil, &backing, "https://ak.test", PackagePolicy::OwnRepos)
+                    .is_err(),
+                "{}",
+                backing.repo_type
+            );
+            assert_eq!(
+                open(&evil, &backing).unwrap(),
+                OciBackingPath {
+                    path: "acme/mcp".into(),
+                    foreign: true
+                },
+                "{}",
+                backing.repo_type
+            );
+        }
+        // Coordinates `own-repos` accepts are not flagged under `open`.
+        let upstream = mcp::parse_oci_identifier("ghcr.io/acme/mcp:1.2").unwrap();
+        assert!(
+            !open(&upstream, &repo("remote", Some("https://ghcr.io")))
+                .unwrap()
+                .foreign
+        );
+        let own = mcp::parse_oci_identifier("ak.test/oci-r/acme/mcp:1.2").unwrap();
+        assert_eq!(
+            open(&own, &repo("local", None)).unwrap(),
+            OciBackingPath {
+                path: "acme/mcp".into(),
+                foreign: false
+            }
+        );
     }
 
     #[test]
