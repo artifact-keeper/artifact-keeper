@@ -2026,15 +2026,18 @@ async fn backing_gate(
     if rows.iter().any(|row| row.cache_held(now)) {
         return GateOutcome::Quarantine;
     }
-    if let Err((_, e)) = crate::services::quarantine_service::enforce_download_gate_all(
-        ctx.db,
-        &rows
-            .iter()
-            .filter(|row| !row.cached)
-            .map(|row| row.id)
-            .collect::<Vec<_>>(),
-    )
-    .await
+    let gate: Vec<_> = rows
+        .iter()
+        .filter(|row| !row.cached)
+        .map(|row| crate::services::quarantine_service::GateRow {
+            artifact_id: row.id,
+            repository_id: row.repository_id,
+            quarantine_status: row.quarantine_status.as_deref(),
+            quarantine_until: row.quarantine_until,
+        })
+        .collect();
+    if let Err((_, e)) =
+        crate::services::quarantine_service::enforce_download_gate_rows(ctx.db, &gate).await
     {
         return outcome_for_gate_error(&e);
     }

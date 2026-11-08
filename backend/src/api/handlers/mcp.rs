@@ -6760,6 +6760,79 @@ mod tests {
             );
         }
 
+        /// `(generic download, tree content)` status of the manifest row at
+        /// `reference`, the two path-addressed reads.
+        async fn path_reads(&self, reference: &str) -> (StatusCode, StatusCode) {
+            let path = format!("v2/{ALIAS_IMAGE}/manifests/{reference}");
+            let key = &self.docker.key;
+            let (download, _) = tdh::send(
+                self.env
+                    .fx
+                    .router_with_auth(crate::api::handlers::repositories::download_router()),
+                tdh::get(format!("/{key}/download/{path}")),
+            )
+            .await;
+            let (tree, _) = tdh::send(
+                self.env
+                    .fx
+                    .router_with_auth(crate::api::handlers::tree::router()),
+                tdh::get(format!("/content?repository_key={key}&path={path}")),
+            )
+            .await;
+            (download, tree)
+        }
+
+        /// Upsert the manifest row of `reference` to `digest` through the
+        /// shared upsert every manifest writer uses (no tag row, no bytes).
+        async fn upsert(&self, reference: &str, digest: &str) {
+            crate::api::handlers::oci_v2::upsert_manifest_artifact(
+                &self.env.fx.pool,
+                self.docker.id,
+                ALIAS_IMAGE,
+                reference,
+                digest,
+                ALIAS_MT,
+                &crate::api::handlers::oci_v2::manifest_storage_key(digest),
+                10,
+                Some(self.env.fx.user_id),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Set the hold of the row at `reference` (`until` as SQL).
+        async fn set_hold(&self, reference: &str, status: &str, until: &str, source: &str) {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE artifacts SET quarantine_status = $3, quarantine_until = {until}, \
+                 quarantine_source = $4 WHERE repository_id = $1 AND path = $2"
+            )))
+            .bind(self.docker.id)
+            .bind(format!("v2/{ALIAS_IMAGE}/manifests/{reference}"))
+            .bind(status)
+            .bind(source)
+            .execute(&self.env.fx.pool)
+            .await
+            .unwrap();
+        }
+
+        /// `(status, timed, source, is_deleted)` of the row at `reference`.
+        async fn hold_at(
+            &self,
+            reference: &str,
+        ) -> Option<(Option<String>, bool, Option<String>, bool)> {
+            sqlx::query_as(
+                "SELECT quarantine_status, quarantine_until IS NOT NULL, quarantine_source, \
+                        is_deleted \
+                 FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(self.docker.id)
+            .bind(format!("v2/{ALIAS_IMAGE}/manifests/{reference}"))
+            .fetch_optional(&self.env.fx.pool)
+            .await
+            .unwrap()
+        }
+
         async fn teardown(self) {
             self.env.teardown().await;
         }
@@ -6880,6 +6953,15 @@ mod tests {
         rejection_follows_the_digest(Refusal::Scanner, RefuseAt::DigestRowAfterMove).await;
     }
 
+    /// A digest no stored manifest has, for row-level cases.
+    fn row_digest() -> String {
+        format!(
+            "sha256:{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        )
+    }
+
     /// #5457 without an MCP pin: a tag push writes no digest-path row, so the
     /// hold of a moved tag's row is carried onto a new one and D1 stays
     /// refused by digest. A weaker hold carried later never downgrades it,
@@ -6894,6 +6976,286 @@ mod tests {
         rig.refuse(tag_row, Refusal::Scanner).await;
         assert_eq!(rig.rows_of(&d1).await.len(), 1, "no digest-path row yet");
         let d2 = rig.push("solo-next").await;
+        let digest_path = |d: &str| format!("v2/{ALIAS_IMAGE}/manifests/{d}");
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(digest_path(&d1), Some("rejected".to_string()))]
+        );
+        assert_eq!(
+            rig.native(&rig.docker.key, &d1).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(rig.native(&rig.docker.key, "1.0").await, StatusCode::OK);
+
+        // A live timed hold on the tag row (now D2); a re-push of the same
+        // bytes keeps it; the row then moves back to D1: the hold goes to a
+        // new D2 digest-path row, D1's rejection is not downgraded.
+        rig.set_hold("1.0", "quarantined", "NOW() + INTERVAL '1 hour'", "upload")
+            .await;
+        for (digest, held) in [(&d2, "1.0".to_string()), (&d1, d2.clone())] {
+            rig.upsert("1.0", digest).await;
+            assert_eq!(
+                rig.rows_of(&d2).await,
+                vec![(
+                    format!("v2/{ALIAS_IMAGE}/manifests/{held}"),
+                    Some("quarantined".to_string())
+                )]
+            );
+        }
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![
+                (digest_path("1.0"), None),
+                (digest_path(&d1), Some("rejected".to_string())),
+            ]
+        );
+        // Both refusals hold by digest, each with its own answer.
+        assert_eq!(
+            (
+                rig.native(&rig.docker.key, &d1).await,
+                rig.native(&rig.docker.key, &d2).await
+            ),
+            (StatusCode::FORBIDDEN, StatusCode::CONFLICT)
+        );
+        rig.teardown().await;
+    }
+
+    /// #5457 review: what a move carries, row by row. A hold that no longer
+    /// refuses (an expired timed hold) is not carried; a soft-deleted digest
+    /// row is revived with the STRONGER of its own and the carried hold; a
+    /// release is not undone by a carried timed hold; a manifest migrated
+    /// under a content-addressed storage key is carried by its checksum.
+    #[tokio::test]
+    async fn the_carry_keeps_the_stronger_hold_5457() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let live = "NOW() + INTERVAL '1 hour'";
+        // Expired timed hold: nothing to carry.
+        let (d1, d2) = (row_digest(), row_digest());
+        rig.upsert("expired", &d1).await;
+        rig.set_hold(
+            "expired",
+            "quarantined",
+            "NOW() - INTERVAL '1 minute'",
+            "upload",
+        )
+        .await;
+        rig.upsert("expired", &d2).await;
+        assert_eq!(rig.hold_at(&d1).await, None, "no row for an expired hold");
+
+        // Soft-deleted rejected digest row + a live timed hold on the tag:
+        // revived, still rejected.
+        let (d1, d2) = (row_digest(), row_digest());
+        rig.upsert(&d1, &d1).await;
+        rig.set_hold(&d1, "rejected", "NULL", "admin").await;
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(rig.docker.id)
+        .bind(format!("v2/{ALIAS_IMAGE}/manifests/{d1}"))
+        .execute(&rig.env.fx.pool)
+        .await
+        .unwrap();
+        rig.upsert("deleted", &d1).await;
+        rig.set_hold("deleted", "quarantined", live, "upload").await;
+        rig.upsert("deleted", &d2).await;
+        assert_eq!(
+            rig.hold_at(&d1).await,
+            Some((Some("rejected".into()), false, Some("admin".into()), false))
+        );
+
+        // An administrator's release outranks a carried timed hold; a
+        // carried permanent quarantine outranks the release.
+        for (hold, until, expected) in [
+            ("quarantined", live, Some(("released", false))),
+            ("quarantined", "NULL", Some(("quarantined", false))),
+        ] {
+            let (d1, d2) = (row_digest(), row_digest());
+            rig.upsert(&d1, &d1).await;
+            rig.set_hold(&d1, "released", "NULL", "admin").await;
+            rig.upsert("released", &d1).await;
+            rig.set_hold("released", hold, until, "admin").await;
+            rig.upsert("released", &d2).await;
+            let got = rig.hold_at(&d1).await.unwrap();
+            assert_eq!(
+                got.0.as_deref().map(|s| (s, got.1)),
+                expected,
+                "{hold} until {until}"
+            );
+        }
+
+        // A migrated row with a content-addressed key is carried by checksum.
+        let (d1, d2) = (row_digest(), row_digest());
+        rig.upsert("migrated", &d1).await;
+        sqlx::query("UPDATE artifacts SET storage_key = 'cas/ab/cd/abcd' WHERE repository_id = $1 AND path = $2")
+            .bind(rig.docker.id)
+            .bind(format!("v2/{ALIAS_IMAGE}/manifests/migrated"))
+            .execute(&rig.env.fx.pool)
+            .await
+            .unwrap();
+        rig.set_hold("migrated", "rejected", "NULL", "admin").await;
+        rig.upsert("migrated", &d2).await;
+        assert_eq!(
+            rig.hold_at(&d1).await,
+            Some((Some("rejected".into()), false, Some("admin".into()), false))
+        );
+        rig.teardown().await;
+    }
+
+    /// #5457 review: a scan-policy hold (written as the scanner writes it)
+    /// carried by a tag move is recorded as an administrator's, so the
+    /// acknowledgement release, which passes a row with no scan of its own,
+    /// cannot lift it; D1 stays refused.
+    #[tokio::test]
+    async fn a_carried_scan_policy_hold_is_not_released_by_an_acknowledgement_5457() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("scan").await;
+        let tag_row = rig.row_id("1.0").await;
+        // The scanner's policy-violation write (scanner_service).
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+             quarantine_reason = 'max_severity exceeded', \
+             quarantine_source = CASE WHEN quarantine_status = 'quarantined' \
+                                           AND quarantine_until IS NULL \
+                                      THEN quarantine_source ELSE 'scan_policy' END \
+             WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
+        )
+        .bind(tag_row)
+        .execute(&rig.env.fx.pool)
+        .await
+        .unwrap();
+        rig.push("scan-next").await;
+        assert_eq!(
+            rig.hold_at(&d1).await,
+            Some((
+                Some("quarantined".into()),
+                false,
+                Some("admin".into()),
+                false
+            ))
+        );
+        let carried = rig.row_id(&d1).await;
+        assert!(
+            !crate::services::quarantine_service::release_cleared_scan_policy_hold(
+                &rig.env.fx.pool,
+                carried,
+                None,
+                "acknowledgement"
+            )
+            .await
+            .unwrap(),
+            "the acknowledgement release must not lift the carried hold"
+        );
+        assert_eq!(rig.native(&rig.docker.key, &d1).await, StatusCode::CONFLICT);
+        rig.teardown().await;
+    }
+
+    /// #5457 review: the path-addressed reads (the generic download and the
+    /// tree content endpoint) gate a manifest with every alias of its digest:
+    /// D1's digest path is refused while only its tag row is held, and the
+    /// tag path while only its digest row is.
+    #[tokio::test]
+    async fn path_addressed_reads_gate_every_alias_5457() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("paths").await;
+        rig.publish("1.0.0").await;
+        // Control: neither read refuses before a hold. (The generic
+        // download of a docker repository's manifest answers 502 past the
+        // gate here, from its storage read; only the gate is under test.)
+        let (download, tree) = rig.path_reads(&d1).await;
+        assert!(
+            ![StatusCode::CONFLICT, StatusCode::FORBIDDEN].contains(&download)
+                && tree == StatusCode::OK,
+            "control: {download} {tree}"
+        );
+        rig.refuse(rig.row_id("1.0").await, Refusal::Manual).await;
+        assert_eq!(
+            rig.path_reads(&d1).await,
+            (StatusCode::CONFLICT, StatusCode::CONFLICT),
+            "digest path, tag row held"
+        );
+        rig.set_hold("1.0", "released", "NULL", "admin").await;
+        rig.refuse(rig.row_id(&d1).await, Refusal::Scanner).await;
+        assert_eq!(
+            rig.path_reads("1.0").await,
+            (StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "tag path, digest row rejected"
+        );
+        rig.teardown().await;
+    }
+
+    /// #5457 review: with the upload-time quarantine on, D2 gets its own
+    /// timed upload hold on the rewritten tag row, not D1's rejection, and
+    /// D1's rejection moves to its digest-path row.
+    #[tokio::test]
+    async fn with_upload_holds_d2_gets_its_own_timed_hold_5457() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'quarantine_enabled', 'true'), ($1, 'quarantine_duration_minutes', '60')",
+        )
+        .bind(rig.docker.id)
+        .execute(&rig.env.fx.pool)
+        .await
+        .unwrap();
+        crate::services::quarantine_service::invalidate_config_cache(rig.docker.id);
+        let d1 = rig.push("held").await;
+        assert_eq!(
+            rig.hold_at("1.0").await,
+            Some((
+                Some("quarantined".into()),
+                true,
+                Some("upload".into()),
+                false
+            )),
+            "control: the push is held"
+        );
+        rig.refuse(rig.row_id("1.0").await, Refusal::Scanner).await;
+        let d2 = rig.push("held-next").await;
+        assert_eq!(
+            rig.hold_at("1.0").await,
+            Some((
+                Some("quarantined".into()),
+                true,
+                Some("upload".into()),
+                false
+            )),
+            "D2's own upload hold"
+        );
+        assert_eq!(
+            rig.hold_at(&d1).await.map(|h| h.0),
+            Some(Some("rejected".into()))
+        );
+        assert_eq!(
+            (
+                rig.native(&rig.docker.key, &d1).await,
+                rig.native(&rig.docker.key, &d2).await
+            ),
+            (StatusCode::FORBIDDEN, StatusCode::CONFLICT)
+        );
+        crate::services::quarantine_service::invalidate_config_cache(rig.docker.id);
+        rig.teardown().await;
+    }
+
+    /// #5457 review: two concurrent pushes moving a rejected tag both
+    /// commit, and D1's rejection survives on its digest-path row whichever
+    /// lands first.
+    #[tokio::test]
+    async fn concurrent_tag_moves_keep_the_rejection_5457() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("race").await;
+        rig.refuse(rig.row_id("1.0").await, Refusal::Scanner).await;
+        let (d2, d3) = tokio::join!(rig.push("race-a"), rig.push("race-b"));
+        assert_ne!(d2, d3);
         assert_eq!(
             rig.rows_of(&d1).await,
             vec![(
@@ -6906,81 +7268,6 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(rig.native(&rig.docker.key, "1.0").await, StatusCode::OK);
-
-        // The tag row (now D2) is held, then the tag moves back to D1: the
-        // timed hold carried to D2's new digest-path row, and D1's rejection
-        // is not downgraded by the clean tag row coming back to it.
-        rig.refuse(tag_row, Refusal::Manual).await;
-        sqlx::query(
-            "UPDATE artifacts SET quarantine_until = NOW() + INTERVAL '1 hour' WHERE id = $1",
-        )
-        .bind(tag_row)
-        .execute(&rig.env.fx.pool)
-        .await
-        .unwrap();
-        // Re-push D2 under the tag: same bytes, the row keeps its hold.
-        crate::api::handlers::oci_v2::upsert_manifest_artifact(
-            &rig.env.fx.pool,
-            rig.docker.id,
-            ALIAS_IMAGE,
-            "1.0",
-            &d2,
-            ALIAS_MT,
-            &crate::api::handlers::oci_v2::manifest_storage_key(&d2),
-            10,
-            Some(rig.env.fx.user_id),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            rig.rows_of(&d2).await,
-            vec![(
-                format!("v2/{ALIAS_IMAGE}/manifests/1.0"),
-                Some("quarantined".to_string())
-            )]
-        );
-        // Point the tag row back at D1: D2's timed hold moves to a new D2
-        // digest-path row; D1's digest-path row stays rejected.
-        crate::api::handlers::oci_v2::upsert_manifest_artifact(
-            &rig.env.fx.pool,
-            rig.docker.id,
-            ALIAS_IMAGE,
-            "1.0",
-            &d1,
-            ALIAS_MT,
-            &crate::api::handlers::oci_v2::manifest_storage_key(&d1),
-            10,
-            Some(rig.env.fx.user_id),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            rig.rows_of(&d2).await,
-            vec![(
-                format!("v2/{ALIAS_IMAGE}/manifests/{d2}"),
-                Some("quarantined".to_string())
-            )]
-        );
-        assert_eq!(
-            rig.rows_of(&d1).await,
-            vec![
-                (format!("v2/{ALIAS_IMAGE}/manifests/1.0"), None),
-                (
-                    format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
-                    Some("rejected".to_string())
-                ),
-            ]
-        );
-        // Both refusals hold by digest, each with its own answer.
-        assert_eq!(
-            (
-                rig.native(&rig.docker.key, &d1).await,
-                rig.native(&rig.docker.key, &d2).await
-            ),
-            (StatusCode::FORBIDDEN, StatusCode::CONFLICT)
-        );
         rig.teardown().await;
     }
 

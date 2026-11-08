@@ -64,6 +64,39 @@ A release clears the source. The gate never trusts the free-text
 policy refuses the artifact right now (the same evaluation the gate's policy
 half runs), so no backfill is needed for the status codes to be right.
 
+## OCI images: holds follow the digest
+
+An OCI manifest can have several `artifacts` rows in one repository: one per
+tag (`v2/<name>/manifests/<tag>`) and a digest row
+(`v2/<name>/manifests/sha256:<hex>`, written by an MCP pin, a push by digest
+or a Remote pull). Since #5457 every read of a manifest (the native pull and
+HEAD, hosted and through a Virtual, the MCP backing gate, the generic
+`/download` route and the tree content read) checks every live row of the
+digest in that repository, whatever the image name. If any row is held or
+rejected, every reference to the digest is refused.
+
+When a push moves a tag whose row is held (a rejection, a permanent
+quarantine, or a timed hold that has not expired) to another image, the hold
+moves to the old digest's digest row. That row is created if needed, and
+revived if it was deleted. When it already has a hold, it keeps whichever of
+the two is stronger: rejected, then a permanent quarantine, then a release,
+then a timed hold. The tag row starts clean for the new image, which gets its
+own upload hold if the repository has one. A moved scan-policy hold is
+recorded as `admin`. The digest row has no scan of its own, so acknowledging
+findings cannot release it, and an administrator releases it instead.
+
+What this means for operators:
+
+- Releasing or rejecting acts on one row. To serve a held image again, release
+  every held row of the digest (its tag rows and its digest row). There is no
+  "release this digest everywhere" action yet. While any row of the digest is
+  still held, the image stays refused.
+- A rejected image whose tag moved away keeps a live digest row, so it is
+  retained (and listed) until an administrator deletes it.
+- Only manifests are gated. Layers and other blobs are content-addressed and
+  shared between images, so a client that already knows a blob digest can
+  still fetch it (as since #2912).
+
 ## Queues
 
 - `GET /api/v1/admin/holds/summary`: counts of pending age-gate reviews,

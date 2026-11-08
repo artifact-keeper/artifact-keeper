@@ -133,24 +133,69 @@ where
 // (`v2/<name>/manifests/<tag>`, rewritten in place when the tag moves), the
 // digest-path row an MCP pin or a by-digest push writes
 // (`v2/<name>/manifests/<digest>`), and further tags. The download decision
-// for a digest is therefore taken over EVERY live alias (any refusal
-// refuses), and a tag move carries a hold on the rewritten row over to the
-// bytes it named instead of handing it to the new digest.
+// for a digest is therefore taken over EVERY live alias in the repository
+// (any refusal refuses; repository-wide rather than per image name, so it
+// fails closed), and a tag move carries a hold on the rewritten row over to
+// the bytes it named instead of handing it to the new digest.
 
-/// The hold strength of the row aliased `$t`: rejected (3) over a permanent
-/// quarantine (2) over a timed one (1) over anything else (0).
+/// The hold strength of the row aliased `$t`: rejected (4) over a permanent
+/// quarantine (3) over an explicit release (2) over a live timed quarantine
+/// (1) over anything else, an expired timed hold included (0). A release
+/// outranks a timed hold so an upload hold carried from another alias cannot
+/// undo an administrator's release; a permanent hold outranks it (fail
+/// closed).
 macro_rules! hold_rank_sql {
     ($t:literal) => {
         concat!(
             "(CASE WHEN ",
             $t,
-            ".quarantine_status = 'rejected' THEN 3 WHEN ",
+            ".quarantine_status = 'rejected' THEN 4 WHEN ",
             $t,
             ".quarantine_status = 'quarantined' AND ",
             $t,
-            ".quarantine_until IS NULL THEN 2 WHEN ",
+            ".quarantine_until IS NULL THEN 3 WHEN ",
             $t,
-            ".quarantine_status = 'quarantined' THEN 1 ELSE 0 END)"
+            ".quarantine_status = 'released' THEN 2 WHEN ",
+            $t,
+            ".quarantine_status = 'quarantined' AND ",
+            $t,
+            ".quarantine_until > NOW() THEN 1 ELSE 0 END)"
+        )
+    };
+}
+
+/// Whether the hold of `EXCLUDED` (the carried one) is stronger than the
+/// hold of the existing `artifacts` row: a higher rank, or the later expiry
+/// of two live timed holds.
+macro_rules! carried_is_stronger_sql {
+    () => {
+        concat!(
+            "(",
+            $crate::services::oci_manifests::hold_rank_sql!("EXCLUDED"),
+            " > ",
+            $crate::services::oci_manifests::hold_rank_sql!("artifacts"),
+            " OR (",
+            $crate::services::oci_manifests::hold_rank_sql!("artifacts"),
+            " = 1 AND ",
+            $crate::services::oci_manifests::hold_rank_sql!("EXCLUDED"),
+            " = 1 AND EXCLUDED.quarantine_until > artifacts.quarantine_until))"
+        )
+    };
+}
+
+/// One quarantine column of the carried row on conflict: the carried value
+/// when its hold is the stronger one, else the existing row's.
+macro_rules! stronger_hold_column_sql {
+    ($c:literal) => {
+        concat!(
+            $c,
+            " = CASE WHEN ",
+            $crate::services::oci_manifests::carried_is_stronger_sql!(),
+            " THEN EXCLUDED.",
+            $c,
+            " ELSE artifacts.",
+            $c,
+            " END, "
         )
     };
 }
@@ -158,15 +203,24 @@ macro_rules! hold_rank_sql {
 /// The `WITH` clause `upsert_manifest_artifact` runs ahead of its upsert, so
 /// a tag move cannot leave the bytes the tag named behind a clean alias.
 ///
-/// When the row at the upserted path is held (quarantined or rejected) and
-/// names other bytes than the upsert writes (the tag moved), the hold is
-/// carried to the old digest's digest-path row: created when missing (a tag
-/// push writes only the tag-path row), revived when soft-deleted, and
-/// otherwise raised to the carried hold when that is the stronger one (a
-/// weaker carried hold never downgrades the row). The upsert itself then
-/// clears the rewritten row's hold, which described the old bytes; the new
-/// bytes get their own upload hold after commit, and any hold another alias
-/// of theirs carries still refuses them through [`alias_rows`].
+/// When the row at the upserted path is under a hold that still refuses (a
+/// rejection, a permanent quarantine, or a timed one that has not expired)
+/// and names other bytes than the upsert writes (the tag moved), the hold is
+/// carried to the old digest's digest-path row (`sha256:` plus the row's
+/// checksum, whatever its storage key). That row is created when missing (a
+/// tag push writes only the tag-path row). When it exists, live or
+/// soft-deleted, it keeps the stronger of its own hold and the carried one
+/// (a soft-deleted row is revived, so the bytes stay refused by digest). The
+/// upsert itself then clears the rewritten row's hold, which described the
+/// old bytes. The new bytes get their own upload hold after commit, and any
+/// hold another alias of theirs carries still refuses them through
+/// [`alias_rows`].
+///
+/// A carried scan-policy hold is recorded as an administrator's: the
+/// digest-path row has no scan of its own, so the acknowledgement release
+/// (which re-evaluates a `scan_policy` hold against the row's scans, and
+/// passes a row with none) would otherwise lift it with the findings still
+/// open. An administrator releases it.
 ///
 /// One statement with the upsert, so the carry commits or rolls back with it.
 /// The upsert must read `carried` before it writes (`WHERE (SELECT COUNT(*)
@@ -182,13 +236,16 @@ macro_rules! carry_moved_hold_cte {
             "WITH moved AS ( \
                  SELECT a.size_bytes, a.checksum_sha256, a.content_type, a.storage_key, \
                         a.uploaded_by, a.quarantine_status, a.quarantine_until, \
-                        a.quarantine_reason, a.quarantine_source, \
-                        substr(a.storage_key, length('oci-manifests/') + 1) AS digest \
+                        a.quarantine_reason, \
+                        CASE WHEN a.quarantine_source = 'scan_policy' THEN 'admin' \
+                             ELSE a.quarantine_source END AS quarantine_source, \
+                        'sha256:' || a.checksum_sha256 AS digest \
                  FROM artifacts a \
                  WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false \
-                   AND a.checksum_sha256 <> $6 \
-                   AND a.quarantine_status IN ('quarantined', 'rejected') \
-                   AND a.storage_key LIKE 'oci-manifests/%' \
+                   AND a.checksum_sha256 <> $6::bpchar \
+                   AND (a.quarantine_status = 'rejected' \
+                        OR (a.quarantine_status = 'quarantined' \
+                            AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW()))) \
                  FOR UPDATE \
              ), carried AS ( \
                  INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
@@ -201,30 +258,24 @@ macro_rules! carry_moved_hold_cte {
                         m.quarantine_until, m.quarantine_reason, m.quarantine_source \
                  FROM moved m \
                  WHERE 'v2/' || $11::text || '/manifests/' || m.digest <> $2 \
-                 ON CONFLICT (repository_id, path) DO UPDATE SET \
-                     quarantine_status = EXCLUDED.quarantine_status, \
-                     quarantine_until = EXCLUDED.quarantine_until, \
-                     quarantine_reason = EXCLUDED.quarantine_reason, \
-                     quarantine_source = EXCLUDED.quarantine_source, \
-                     is_deleted = false, \
+                 ON CONFLICT (repository_id, path) DO UPDATE SET ",
+            $crate::services::oci_manifests::stronger_hold_column_sql!("quarantine_status"),
+            $crate::services::oci_manifests::stronger_hold_column_sql!("quarantine_until"),
+            $crate::services::oci_manifests::stronger_hold_column_sql!("quarantine_reason"),
+            $crate::services::oci_manifests::stronger_hold_column_sql!("quarantine_source"),
+            "is_deleted = false, \
                      updated_at = NOW() \
-                 WHERE artifacts.is_deleted \
-                    OR ",
-            $crate::services::oci_manifests::hold_rank_sql!("EXCLUDED"),
-            " > ",
-            $crate::services::oci_manifests::hold_rank_sql!("artifacts"),
-            " OR (",
-            $crate::services::oci_manifests::hold_rank_sql!("artifacts"),
-            " = 1 AND ",
-            $crate::services::oci_manifests::hold_rank_sql!("EXCLUDED"),
-            " = 1 AND EXCLUDED.quarantine_until > artifacts.quarantine_until) \
-                 RETURNING artifacts.id \
+                 WHERE artifacts.is_deleted OR ",
+            $crate::services::oci_manifests::carried_is_stronger_sql!(),
+            " RETURNING artifacts.id \
              ) "
         )
     };
 }
+pub(crate) use carried_is_stronger_sql;
 pub(crate) use carry_moved_hold_cte;
 pub(crate) use hold_rank_sql;
+pub(crate) use stronger_hold_column_sql;
 
 /// One live `artifacts` row naming a manifest digest: a tag-path or a
 /// digest-path alias of the same stored manifest (#5457).
@@ -238,6 +289,18 @@ pub(crate) struct AliasRow {
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl AliasRow {
+    /// The row as the download gate evaluates it.
+    pub(crate) fn gate_row(&self) -> crate::services::quarantine_service::GateRow<'_> {
+        crate::services::quarantine_service::GateRow {
+            artifact_id: self.id,
+            repository_id: self.repository_id,
+            quarantine_status: self.quarantine_status.as_deref(),
+            quarantine_until: self.quarantine_until,
+        }
+    }
+}
+
 type AliasRowTuple = (
     Uuid,
     Uuid,
@@ -247,11 +310,38 @@ type AliasRowTuple = (
     Option<chrono::DateTime<chrono::Utc>>,
 );
 
+/// The columns and ordering both alias lookups select: rejected rows first,
+/// then held ones, so the refusal a gate reports is the strongest.
+macro_rules! alias_rows_sql {
+    ($from_where:literal) => {
+        concat!(
+            "SELECT a.id, a.repository_id, a.checksum_sha256::text, a.created_at, \
+                    a.quarantine_status, a.quarantine_until ",
+            $from_where,
+            " AND a.is_deleted = false AND ",
+            crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+            " ORDER BY CASE a.quarantine_status WHEN 'rejected' THEN 0 \
+                       WHEN 'quarantined' THEN 1 ELSE 2 END, a.path"
+        )
+    };
+}
+
+fn alias_row(t: AliasRowTuple) -> AliasRow {
+    AliasRow {
+        id: t.0,
+        repository_id: t.1,
+        checksum: t.2,
+        created_at: t.3,
+        quarantine_status: t.4,
+        quarantine_until: t.5,
+    }
+}
+
 /// Every live manifest-shaped `artifacts` row of `repo_id` carrying one of
-/// `digests`, whatever path (tag or digest) it sits at. Rejected rows sort
-/// first, then held ones, so the refusal a gate reports is the strongest.
-/// The rows the native manifest gate and the MCP backing gate both evaluate
-/// (#5457): the decision follows the stored bytes, not one alias.
+/// `digests`, whatever path (tag or digest) it sits at. The rows the native
+/// manifest gate and the MCP backing gate both evaluate (#5457): the decision
+/// follows the stored bytes, not one alias. The checksum is compared as
+/// `bpchar` so `idx_artifacts_checksum` serves the lookup (#4426).
 pub(crate) async fn alias_rows(
     db: impl sqlx::PgExecutor<'_>,
     repo_id: Uuid,
@@ -261,31 +351,56 @@ pub(crate) async fn alias_rows(
         .iter()
         .map(|d| d.split_once(':').map_or(*d, |(_, hex)| hex))
         .collect();
-    let rows: Vec<AliasRowTuple> = sqlx::query_as(concat!(
-        "SELECT a.id, a.repository_id, a.checksum_sha256::text, a.created_at, \
-                a.quarantine_status, a.quarantine_until \
-         FROM artifacts a \
-         WHERE a.repository_id = $1 AND a.is_deleted = false \
-           AND a.checksum_sha256 = ANY($2) AND ",
-        crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
-        " ORDER BY CASE a.quarantine_status WHEN 'rejected' THEN 0 \
-                   WHEN 'quarantined' THEN 1 ELSE 2 END, a.path"
+    let rows: Vec<AliasRowTuple> = sqlx::query_as(alias_rows_sql!(
+        "FROM artifacts a WHERE a.repository_id = $1 AND a.checksum_sha256 = ANY($2::bpchar[])"
     ))
     .bind(repo_id)
     .bind(&hexes)
     .fetch_all(db)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|t| AliasRow {
-            id: t.0,
-            repository_id: t.1,
-            checksum: t.2,
-            created_at: t.3,
-            quarantine_status: t.4,
-            quarantine_until: t.5,
-        })
-        .collect())
+    Ok(rows.into_iter().map(alias_row).collect())
+}
+
+/// Whether `path` has the shape of an OCI manifest row (the same shape
+/// [`alias_rows`] selects), so a path-addressed download gates the digest.
+pub(crate) fn is_manifest_path(path: &str) -> bool {
+    path.contains("/manifests/")
+        || path.ends_with("/manifest.json")
+        || path.ends_with("/list.manifest.json")
+}
+
+/// The download gate of the live artifact at `(repository_id, path)`, for a
+/// route that addresses an artifact by path (the generic download, the tree
+/// content read). An OCI manifest row is gated with every alias of its
+/// digest, as the native pull is (#5457); anything else, or a path with no
+/// live row, is [`enforce_download_gate`] of that row as before.
+///
+/// [`enforce_download_gate`]: crate::services::quarantine_service::enforce_download_gate
+pub(crate) async fn enforce_path_download_gate(
+    db: &PgPool,
+    artifact_id: Uuid,
+    path: &str,
+) -> crate::error::Result<()> {
+    use crate::services::quarantine_service as qs;
+    if is_manifest_path(path) {
+        let rows: Vec<AliasRowTuple> = sqlx::query_as(alias_rows_sql!(
+            "FROM artifacts r JOIN artifacts a ON a.repository_id = r.repository_id \
+               AND a.checksum_sha256 = r.checksum_sha256 \
+             WHERE r.id = $1 AND r.is_deleted = false"
+        ))
+        .bind(artifact_id)
+        .fetch_all(db)
+        .await
+        .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+        let rows: Vec<AliasRow> = rows.into_iter().map(alias_row).collect();
+        if rows.iter().any(|r| r.id == artifact_id) {
+            let gate: Vec<_> = rows.iter().map(AliasRow::gate_row).collect();
+            return qs::enforce_download_gate_rows(db, &gate)
+                .await
+                .map_err(|(_, e)| e);
+        }
+    }
+    qs::enforce_download_gate(db, artifact_id).await
 }
 
 /// Whether a manifest delete that has just removed the digest's last tag also

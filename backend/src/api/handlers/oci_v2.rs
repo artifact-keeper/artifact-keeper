@@ -10550,12 +10550,11 @@ async fn oci_manifest_quarantine_block(
             }
         };
 
-    match crate::services::quarantine_service::enforce_download_gate_all(
-        &state.db,
-        &aliases.iter().map(|row| row.id).collect::<Vec<_>>(),
-    )
-    .await
-    {
+    let gate: Vec<_> = aliases
+        .iter()
+        .map(crate::services::oci_manifests::AliasRow::gate_row)
+        .collect();
+    match crate::services::quarantine_service::enforce_download_gate_rows(&state.db, &gate).await {
         Ok(()) => None,
         Err((artifact_id, e)) => {
             // Mapped explicitly to the OCI error envelope rather than reusing the
@@ -41341,6 +41340,52 @@ mod proxy_scan_block_tests {
             "a refused pull is not counted as a download"
         );
         assert_eq!(hits, 1, "the refusals never reach upstream");
+    }
+
+    /// #5457: a Remote member's cache rows are aliases too. A pull by tag
+    /// writes a tag-keyed and a digest-keyed `artifacts` row; holding either
+    /// one refuses the manifest under both references, direct and through
+    /// the Virtual.
+    #[tokio::test]
+    async fn remote_cache_aliases_share_one_decision_5457() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (_upstream, state, (virt_id, virt_key), _manifest, digest) =
+            virtual_cold_rig(&fx, "1.0", "5457-remote-alias").await;
+        let cold = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let mut seen = Vec::new();
+        for (held, read) in [("1.0", digest.as_str()), (digest.as_str(), "1.0")] {
+            let rows = sqlx::query(
+                "UPDATE artifacts SET quarantine_status = CASE WHEN path = $2 THEN 'rejected' END \
+                 WHERE repository_id = $1 AND storage_key = $3",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("v2/app/manifests/{held}"))
+            .bind(manifest_storage_key(&digest))
+            .execute(&fx.pool)
+            .await
+            .expect("hold one alias")
+            .rows_affected();
+            seen.push((
+                rows,
+                pull_manifest(&state, &fx.repo_key, read).await.status(),
+                pull_manifest(&state, &virt_key, read).await.status(),
+            ));
+        }
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(cold, StatusCode::OK, "precondition: cold pull");
+        assert_eq!(
+            seen,
+            vec![
+                (2, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+                (2, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            ],
+            "(alias rows, direct, Virtual): the tag row held refuses the digest, \
+             the digest row held refuses the tag"
+        );
     }
 
     /// #3712 / #3611: a manifest cached by a pull the scan gate REFUSED is

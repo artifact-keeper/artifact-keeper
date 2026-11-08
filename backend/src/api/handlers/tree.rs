@@ -473,8 +473,14 @@ pub async fn get_content(
         path: storage_path,
     };
     let storage = state.storage_for_repo(&location)?;
-    // Check quarantine status before serving
-    crate::services::quarantine_service::check_artifact_download(&state.db, artifact.id).await?;
+    // Check quarantine status before serving; an OCI manifest is gated with
+    // every alias of its digest (#5457).
+    crate::services::oci_manifests::enforce_path_download_gate(
+        &state.db,
+        artifact.id,
+        &params.path,
+    )
+    .await?;
 
     let content = storage.get(&artifact.storage_key).await?;
 
