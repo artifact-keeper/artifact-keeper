@@ -19,9 +19,9 @@
 
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::header::{
-    CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_RANGE, RANGE,
-};
+#[cfg(test)]
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,6 +34,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
+use crate::api::handlers::repositories::{apply_range_to_streamed_serve, effective_range};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::services::proxy_service::UPSTREAM_COMMIT_HEADER;
@@ -1548,87 +1549,6 @@ async fn download_file_namespaced(
         ctx,
     )
     .await
-}
-
-/// The `Range` to honour for this request, if any.
-///
-/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
-/// keeps reporting the whole file. `If-Range` keeps it only for the current
-/// strong ETag; an older ETag or a date gets the whole file, which is the safe
-/// answer for a client resuming a file that may have changed (§13.1.5).
-fn effective_range<'a>(
-    headers: &'a HeaderMap,
-    etag: Option<&str>,
-    is_head: bool,
-) -> Option<&'a str> {
-    if is_head {
-        return None;
-    }
-    if let Some(validator) = headers.get(IF_RANGE) {
-        let current = etag.filter(|e| !e.starts_with("W/"));
-        if validator.to_str().ok() != current || current.is_none() {
-            return None;
-        }
-    }
-    headers.get(RANGE).and_then(|v| v.to_str().ok())
-}
-
-/// Apply the client's `Range` to a Remote or Virtual serve, which arrives from
-/// the shared streaming builder as a complete `200` (#5145).
-///
-/// The window is cut from the object's stream by
-/// [`ranged_stream_response`](crate::api::handlers::repositories::ranged_stream_response),
-/// as the OCI blob route does for its proxied bytes. `Range` is never forwarded
-/// upstream, so a cold serve still fills the cache with the whole file.
-///
-/// Left as it is: anything but a `200` (a presigned redirect's target answers
-/// `Range` itself), a content-coded body (a client's offsets describe the
-/// decoded file) and a body of unknown length.
-///
-/// The generic download route's Remote arm uses it for the same reason.
-#[allow(clippy::result_large_err)]
-pub(crate) fn apply_range_to_streamed_serve(
-    resp: Response,
-    headers: &HeaderMap,
-    is_head: bool,
-) -> Result<Response, Response> {
-    use futures::StreamExt;
-
-    let total = resp
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let Some(total) = total.filter(|_| {
-        resp.status() == StatusCode::OK && !resp.headers().contains_key(CONTENT_ENCODING)
-    }) else {
-        return Ok(resp);
-    };
-
-    let etag = resp.headers().get(ETAG).and_then(|v| v.to_str().ok());
-    let range = effective_range(headers, etag, is_head);
-    let (mut parts, body) = resp.into_parts();
-    let stream = body
-        .into_data_stream()
-        .map(|chunk| chunk.map_err(|e| crate::error::AppError::BadGateway(e.to_string())))
-        .boxed();
-    let ranged = crate::api::handlers::repositories::ranged_stream_response(
-        range,
-        total,
-        stream,
-        Vec::new(),
-    )
-    .map_err(|e| e.into_response())?;
-
-    let (ranged_parts, ranged_body) = ranged.into_parts();
-    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
-        // No representation is served, so none of its headers apply.
-        parts.headers.clear();
-    }
-    parts.status = ranged_parts.status;
-    parts.headers.remove(CONTENT_LENGTH);
-    parts.headers.extend(ranged_parts.headers);
-    Ok(Response::from_parts(parts, ranged_body))
 }
 
 /// The stored file at `artifact_path`, with what the resolve route serves it by.
