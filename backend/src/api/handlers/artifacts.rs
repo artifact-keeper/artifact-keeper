@@ -393,8 +393,11 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<ArtifactMetadataResponse>> {
+    base: crate::api::extractors::RequestBaseUrl,
+) -> Result<axum::response::Response> {
     require_existing_visible_artifact(&state, &auth, id).await?;
+    // #5452: an MCP server version's `server` is its served (pinned) form.
+    let served = super::mcp::served_server_json(&state.db, id, base.as_str()).await?;
 
     let metadata = sqlx::query!(
         r#"
@@ -409,12 +412,23 @@ pub async fn get_artifact_metadata(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("Artifact metadata not found".to_string()))?;
 
-    Ok(Json(ArtifactMetadataResponse {
-        artifact_id: metadata.artifact_id,
-        format: metadata.format,
-        metadata: metadata.metadata,
-        properties: metadata.properties,
-    }))
+    let embeds_mcp = served.is_some();
+    let mut response =
+        axum::response::IntoResponse::into_response(Json(ArtifactMetadataResponse {
+            artifact_id: metadata.artifact_id,
+            format: metadata.format,
+            metadata: super::mcp::with_served_server(metadata.metadata, served),
+            properties: metadata.properties,
+        }));
+    if embeds_mcp {
+        // The embedded server.json follows the request's base URL and the
+        // serve decision of this read (#5452).
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    Ok(response)
 }
 
 /// Get artifact download statistics

@@ -342,8 +342,7 @@ async fn virtual_latest(
         if rows.is_empty() {
             continue;
         }
-        let policy = mcp::current_policy(&state.db, m.id).await;
-        match mcp::newest_servable(ctx, m.id, rows, &HashSet::new(), policy)
+        match mcp::newest_servable(ctx, m.id, rows, &HashSet::new())
             .await
             .0
         {
@@ -684,16 +683,15 @@ async fn drop_shadowed(
         if theirs.is_empty() {
             continue;
         }
-        let policy = mcp::current_policy(&state.db, m.id).await;
         let all_theirs: HashSet<(String, String)> = theirs
             .iter()
             .map(|r| (r.name.clone(), r.version.clone()))
             .collect();
-        let served: HashSet<(String, String)> =
-            match mcp::servable_checked(ctx, m.id, theirs, policy).await {
-                Ok(served) => served.into_iter().map(|r| (r.name, r.version)).collect(),
-                Err(_) => all_theirs,
-            };
+        let served: HashSet<(String, String)> = match mcp::servable_checked(ctx, m.id, theirs).await
+        {
+            Ok(served) => served.into_iter().map(|r| (r.name, r.version)).collect(),
+            Err(_) => all_theirs,
+        };
         rows.retain(|r| !served.contains(&(r.name.clone(), r.version.clone())));
     }
     Ok(rows)
@@ -712,7 +710,6 @@ async fn list_page(
     let mut resume: Option<String> = None;
     'members: for idx in start.0..members.order.len() {
         let m = &members.order[idx];
-        let policy = mcp::current_policy(&state.db, m.id).await;
         let mut after = if idx == start.0 {
             start.1.clone()
         } else {
@@ -726,7 +723,7 @@ async fn list_page(
             if let Some(last) = batch.last {
                 after = Some(last);
             }
-            let rows = mcp::servable(ctx, m.id, batch.rows, policy).await;
+            let rows = mcp::servable(ctx, m.id, batch.rows).await;
             let rows = drop_shadowed(state, members, idx, rows, q.include_deleted).await?;
             out.extend(rows.into_iter().map(|r| (idx, r)));
             if out.len() > want {
@@ -1029,6 +1026,14 @@ mod tests {
         /// written by its sync in production; here a hosted publish into a
         /// scratch repository is moved under it.
         async fn store(&self, m: usize, name: &str, version: &str, description: &str) -> Uuid {
+            self.store_doc(m, &server_doc(name, version, description))
+                .await
+        }
+
+        /// [`Self::store`] of a whole server.json.
+        async fn store_doc(&self, m: usize, doc: &serde_json::Value) -> Uuid {
+            let name = doc["name"].as_str().unwrap();
+            let version = doc["version"].as_str().unwrap();
             let (id, key, _) = &self.members[m];
             let remote: bool = sqlx::query_scalar(
                 "SELECT repo_type::text = 'remote' FROM repositories WHERE id = $1",
@@ -1052,9 +1057,7 @@ mod tests {
                 .method("POST")
                 .uri(format!("/{key}/v0.1/publish"))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&server_doc(name, version, description)).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(doc).unwrap()))
                 .unwrap();
             let (s, b, _) = tdh::send_with_headers(admin, req).await;
             if remote {
@@ -1192,6 +1195,84 @@ mod tests {
         assert_eq!((s, b), (StatusCode::NOT_FOUND, fmt::not_found_value()));
         let (s, _) = env.get("/servers/com.acme/none/versions").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+        env.teardown().await;
+    }
+
+    /// #5452: a Virtual serves an `open` member's version only as the
+    /// member's own serve decision allows. A version whose package carries
+    /// no AK pin (as `open` stored them before the fix) is never served
+    /// through the Virtual: the read falls through to the next member, and
+    /// the listing does not carry it. A member's pinned `open` package is
+    /// served at its AK coordinates, not the submitted foreign registry.
+    #[tokio::test]
+    async fn open_members_serve_only_pinned_packages() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let l1 = env.member("local", 1, true).await;
+        let l2 = env.member("local", 2, true).await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&env.fx.pool, "local", "npm").await;
+        let mut npm = tdh::make_repo_info(npm_id, &npm_key, &npm_dir, "local", None);
+        npm.format = "npm".into();
+        tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &env.fx.pool,
+            &npm,
+            "npm/echo-1.0.0.tgz",
+            "@acme/echo/-/echo-1.0.0.tgz",
+            "@acme/echo",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"tgz"),
+            env.fx.user_id,
+            &"e".repeat(64),
+        )
+        .await;
+        env.members.push((npm_id, npm_key.clone(), npm_dir));
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'mcp_package_repos', $2)",
+        )
+        .bind(env.members[l2].0)
+        .bind(serde_json::json!({"npm": npm_key}).to_string())
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+
+        let unpinned = env.store(l1, "com.acme/x", "1.0.0", "from-l1").await;
+        let mut pinned = server_doc("com.acme/x", "1.0.0", "from-l2");
+        pinned["packages"] = serde_json::json!([{
+            "registryType": "npm", "identifier": "@acme/echo", "version": "1.0.0",
+            "registryBaseUrl": "https://npm.evil.test", "transport": {"type": "stdio"},
+        }]);
+        env.store_doc(l2, &pinned).await;
+        // l1's version as `open` stored it before #5452: a package, no pin.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{server,packages}', $2) \
+             WHERE artifact_id = $1",
+        )
+        .bind(unpinned)
+        .bind(serde_json::json!([{
+            "registryType": "npm", "identifier": "@evil/pkg", "version": "3.0.0",
+            "registryBaseUrl": "https://npm.evil.test", "transport": {"type": "stdio"},
+        }]))
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+
+        let (s, b) = env.get("/servers/com.acme%2Fx/versions/1.0.0").await;
+        assert_eq!(
+            (s, b["server"]["description"].as_str()),
+            (StatusCode::OK, Some("from-l2")),
+            "{b}"
+        );
+        assert_eq!(
+            b["server"]["packages"][0]["registryBaseUrl"],
+            format!("http://localhost/npm/{npm_key}")
+        );
+        let (s, b) = env.get("/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(descriptions(&b), vec!["com.acme/x@1.0.0=from-l2"]);
         env.teardown().await;
     }
 
