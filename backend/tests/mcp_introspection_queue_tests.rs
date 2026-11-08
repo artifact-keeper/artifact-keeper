@@ -18,6 +18,7 @@ mod common;
 use axum::http::StatusCode;
 use uuid::Uuid;
 
+use artifact_keeper_backend::models::access_scope::AccessScope;
 use artifact_keeper_backend::services::mcp_capabilities::sha256_hex;
 use artifact_keeper_backend::services::mcp_introspection::{
     claim, complete, get_job, parse_result, Completed, JobKind, WorkerResult,
@@ -101,7 +102,9 @@ async fn time_out(h: &McpHarness, id: Uuid, token: &str) -> Completed {
         ..Default::default()
     };
     let parsed = parse_result(&result).unwrap();
-    complete(&h.pool, &job, &result, parsed).await.unwrap()
+    complete(&h.pool, &job, &result, parsed, &AccessScope::Admin)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -121,11 +124,17 @@ async fn claim_prefers_the_repository_with_fewer_claimed_jobs() {
     let kinds = [JobKind::RemoteProbe];
 
     // Nothing is claimed yet: the oldest due job goes first.
-    let first = claim(&h.pool, &kinds, "w1").await.unwrap().unwrap();
+    let first = claim(&h.pool, &kinds, "w1", &AccessScope::Admin)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(first.job.id, a_jobs[0], "oldest job first");
     // A now has a job claimed and B none: B's job goes next although A's
     // nine others are older.
-    let second = claim(&h.pool, &kinds, "w2").await.unwrap().unwrap();
+    let second = claim(&h.pool, &kinds, "w2", &AccessScope::Admin)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         second.job.id, b_job,
         "a repository with a claimed job must not take the next worker \
@@ -133,7 +142,10 @@ async fn claim_prefers_the_repository_with_fewer_claimed_jobs() {
         second.job.target_key
     );
     // One claimed job each: back to the oldest, A's second job.
-    let third = claim(&h.pool, &kinds, "w3").await.unwrap().unwrap();
+    let third = claim(&h.pool, &kinds, "w3", &AccessScope::Admin)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(third.job.id, a_jobs[1]);
 
     h.teardown(&[key_a, key_b]).await;

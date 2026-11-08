@@ -33,6 +33,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::formats::mcp::{PackagePin, StoredVersion};
+use crate::models::access_scope::AccessScope;
 use crate::services::mcp_capabilities::{
     self as caps, AuthState, CapabilitySet, NewSnapshot, Outcome, Source,
 };
@@ -495,16 +496,37 @@ fn new_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// The repository authorization every claim and every completion checks
+/// (#5460), as a SQL predicate on the job row aliased `j` with the worker
+/// credential's repository allowlist bound at `$n` (`NULL`: a token with no
+/// repository restriction; an empty list matches nothing). It holds when the
+/// job's repository is in that allowlist AND the job is bound to it: the
+/// server version the job introspects belongs to that same repository.
+/// Claim and completion use this one predicate, so their checks cannot drift
+/// apart, and possession of a claim token never stands in for it.
+fn repo_authorized(j: &str, n: u8) -> String {
+    format!(
+        "(${n}::uuid[] IS NULL OR {j}.repository_id = ANY(${n}::uuid[])) \
+         AND EXISTS (SELECT 1 FROM artifacts ra WHERE ra.id = {j}.artifact_id \
+                     AND ra.repository_id = {j}.repository_id)"
+    )
+}
+
 /// Claim a due job of `kinds`, fairly across repositories (#5387): the job
 /// comes from the repository with the fewest jobs claimed right now, and is
 /// that repository's oldest due job. One publisher queueing many versions
 /// therefore cannot hold every worker while other repositories' jobs wait.
 /// A single statement: `FOR UPDATE SKIP LOCKED` keeps concurrent claims from
 /// handing out one job twice.
+///
+/// Only jobs of repositories `scope` covers are candidates (#5460): a worker
+/// credential restricted to repository A is never handed repository B's job,
+/// and B's job is left exactly as it was.
 pub async fn claim(
     db: &PgPool,
     kinds: &[JobKind],
     worker_id: &str,
+    scope: &AccessScope,
 ) -> crate::error::Result<Option<Claim>> {
     let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
     let token = new_token();
@@ -516,6 +538,7 @@ pub async fn claim(
            SELECT p.id FROM mcp_introspection_jobs p \
            LEFT JOIN busy b ON b.repository_id = p.repository_id \
            WHERE p.status = 'pending' AND p.not_before <= NOW() AND p.kind = ANY($1) \
+             AND {} \
            ORDER BY COALESCE(b.claimed, 0), p.not_before, p.created_at \
            LIMIT 1 FOR UPDATE OF p SKIP LOCKED) \
          UPDATE mcp_introspection_jobs j SET status = 'claimed', attempts = j.attempts + 1, \
@@ -523,6 +546,7 @@ pub async fn claim(
            lease_expires_at = NOW() + make_interval(secs => $3), claim_token_hash = $4, \
            updated_at = NOW() \
          FROM next WHERE j.id = next.id RETURNING {}",
+        repo_authorized("p", 5),
         JOB_COLUMNS
             .split(", ")
             .map(|c| format!("j.{c}"))
@@ -534,6 +558,7 @@ pub async fn claim(
         .bind(caps_truncate(worker_id, 128))
         .bind(LEASE_SECS as f64)
         .bind(caps::sha256_hex(token.as_bytes()))
+        .bind(scope.as_allowed_repo_ids())
         .fetch_optional(db)
         .await
         .map_err(db_err)?;
@@ -639,45 +664,87 @@ pub enum Completed {
     /// by a concurrent or duplicate request, reaped, re-claimed): nothing was
     /// stored. `409 mcp_claim_invalid` (#5389).
     ClaimLost,
+    /// The worker credential does not cover the job's repository (or the job
+    /// is not bound to its server version's repository) at completion time:
+    /// nothing was stored and the claim was left as it was.
+    /// `403 mcp_forbidden` (#5460).
+    Forbidden,
+}
+
+/// Lock the current claim of `job` in the transaction that will end it, and
+/// re-check the repository authorization ([`repo_authorized`]) under that
+/// same lock: `None` when the claim is no longer current (#5389),
+/// `Some(false)` when `scope` does not authorize the job's repository
+/// (#5460), `Some(true)` when the transaction may end the claim.
+async fn lock_claim(
+    tx: &mut sqlx::PgConnection,
+    job: &JobRow,
+    scope: &AccessScope,
+) -> crate::error::Result<Option<bool>> {
+    let sql = format!(
+        "SELECT {} FROM mcp_introspection_jobs j \
+         WHERE j.id = $1 AND j.status = 'claimed' AND j.claim_token_hash = $2 FOR UPDATE OF j",
+        repo_authorized("j", 3)
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(job.id)
+        .bind(&job.claim_token_hash)
+        .bind(scope.as_allowed_repo_ids())
+        .fetch_optional(tx)
+        .await
+        .map_err(db_err)
 }
 
 /// Record a worker result for a claimed job (token already checked by the
-/// caller, but the claim may end concurrently).
+/// caller, but the claim may end concurrently), as a worker whose credential
+/// carries repository `scope`.
 ///
 /// The claim check and end and the snapshot insert run in one transaction
 /// (the job row is locked with its token hash and `claimed` status), so of
 /// two completions of one claim exactly one stores a snapshot; the other, and
 /// one racing the reaper or a re-claim, gets [`Completed::ClaimLost`]. The
 /// audit, lint and drift side effects run after the commit, and only for a
-/// newly stored snapshot (#5389).
+/// newly stored snapshot (#5389). Under that same row lock the worker's
+/// repository scope and the job's repository binding are re-checked, for a
+/// retry as for a result, so a credential that does not (or no longer)
+/// covers the job's repository gets [`Completed::Forbidden`] and changes
+/// nothing (#5460).
 pub async fn complete(
     db: &PgPool,
     job: &JobRow,
     result: &WorkerResult,
     parsed: ParsedResult,
+    scope: &AccessScope,
 ) -> crate::error::Result<Completed> {
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
+    let mut tx = db.begin().await.map_err(db_err)?;
+    match lock_claim(&mut tx, job, scope).await? {
+        None => return Ok(Completed::ClaimLost),
+        Some(false) => return Ok(Completed::Forbidden),
+        Some(true) => {}
+    }
     if is_transient(parsed.outcome)
         && job.attempts < attempts_allowed(kind, parsed.outcome, job.max_attempts)
     {
         let delay = retry_delay_secs(parsed.outcome, job.attempts, result.retry_after_ms);
         let not_before = Utc::now() + chrono::Duration::seconds(delay);
-        let ended = finish(
-            db,
+        // The row is locked and matched above, so this ends the claim.
+        if !finish(
+            &mut *tx,
             job,
             "pending",
             Some(not_before),
             None,
             Some(result.error.as_deref().unwrap_or(parsed.outcome.as_str())),
         )
-        .await?;
-        return Ok(if ended {
-            Completed::Retry { not_before }
-        } else {
-            Completed::ClaimLost
-        });
+        .await?
+        {
+            return Ok(Completed::ClaimLost);
+        }
+        tx.commit().await.map_err(db_err)?;
+        return Ok(Completed::Retry { not_before });
     }
     let v = caps::version_ref(db, job.artifact_id)
         .await
@@ -719,19 +786,6 @@ pub async fn complete(
     } else {
         "completed"
     };
-    let mut tx = db.begin().await.map_err(db_err)?;
-    let current: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM mcp_introspection_jobs \
-         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2 FOR UPDATE",
-    )
-    .bind(job.id)
-    .bind(&job.claim_token_hash)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    if current.is_none() {
-        return Ok(Completed::ClaimLost);
-    }
     let ins = caps::insert_snapshot_in(&mut tx, &snap)
         .await
         .map_err(db_err)?;

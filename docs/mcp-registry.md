@@ -2348,6 +2348,16 @@ Authenticated with an API token minted with the **`mcp:introspect`** scope
 (admin-only to mint; a token with `*`/`admin` or an interactive session does
 not qualify: `403 mcp_forbidden`). Mint it for a dedicated service account.
 
+A token minted with a repository restriction only works that repository's
+jobs (#5460): a claim hands it only jobs of repositories it is scoped to
+(another repository's due job is left untouched, so the answer is `204` when
+nothing of its own is due), and a completion re-checks the token's scope
+against the job's repository, and that the job belongs to the repository of
+the server version it introspects, inside the transaction that ends the
+claim. Holding a valid claim token is not enough: a completion by a token
+that does not (or no longer) cover the job's repository answers
+`403 mcp_forbidden` and stores nothing, leaving the claim as it was.
+
 `POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
 "workerId": "pod-a"}` (both optional) answers `204` when nothing is due, or
 `200`:
@@ -2398,8 +2408,9 @@ A failed outcome carries no lists. `200 {"status": "stored", "snapshotId",
 "contentHash", "drift": {"scanId"} | null}` (`snapshotId` is the existing
 snapshot when the result repeats it) or `200 {"status": "retry",
 "notBefore"}`; `409 mcp_claim_invalid` when the token does not match the
-current claim (expired, re-claimed or already completed); `400` for a
-malformed result.
+current claim (expired, re-claimed or already completed); `403
+mcp_forbidden` when the token is not scoped to the job's repository; `400`
+for a malformed result.
 
 ### The `ak-mcp-introspector` worker
 
