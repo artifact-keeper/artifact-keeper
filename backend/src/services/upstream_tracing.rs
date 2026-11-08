@@ -68,16 +68,34 @@ use crate::services::upstream_fetch_audit::{PendingFetch, UpstreamAuditTarget};
 pub(crate) fn send_upstream(
     request: reqwest::RequestBuilder,
 ) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send {
-    send_upstream_audited(request, None)
+    send_upstream_audited(request, None, true)
+}
+
+/// [`send_upstream`] from a client that may not follow the environment
+/// proxy: `env_proxy` is false for a per-repository `direct`/`explicit`
+/// client, whose requests the environment-proxy recheck must not judge
+/// (see [`send_upstream_audited`]).
+pub(crate) fn send_upstream_for(
+    request: reqwest::RequestBuilder,
+    env_proxy: bool,
+) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send {
+    send_upstream_audited(request, None, env_proxy)
 }
 
 /// [`send_upstream`] that also records the request as an `UPSTREAM_FETCHED`
 /// audit row when `audit` is given (#5286). A request that fails to build is
 /// never sent and never recorded. The row is written off the request path
 /// (see [`crate::services::upstream_fetch_audit`]).
+///
+/// `env_proxy_recheck` is whether the sending client follows the environment
+/// proxy (the shared upstream client): its plain-HTTP requests are then
+/// rechecked before each send (#5459). A per-repository `direct` or
+/// `explicit` client is not routed by the environment proxy and passes
+/// `false`.
 pub(crate) async fn send_upstream_audited(
     request: reqwest::RequestBuilder,
     audit: Option<UpstreamAuditTarget>,
+    env_proxy_recheck: bool,
 ) -> reqwest::Result<reqwest::Response> {
     let (client, built) = request.build_split();
     let mut request = built?;
@@ -86,10 +104,14 @@ pub(crate) async fn send_upstream_audited(
     inject_trace_context(&span, request.headers_mut());
     // A plain-HTTP request the environment proxy carries may ride a pooled
     // connection that never passes the connect-time check again (#5459).
-    if let Err(err) = crate::services::env_proxy_guard::check_upstream_request(request.url())
-        .instrument(span.clone())
-        .await
-    {
+    let recheck = if env_proxy_recheck {
+        crate::services::env_proxy_guard::check_upstream_request(request.url())
+            .instrument(span.clone())
+            .await
+    } else {
+        Ok(())
+    };
+    if let Err(err) = recheck {
         record_transport_error(&span, &err);
         return Err(err);
     }

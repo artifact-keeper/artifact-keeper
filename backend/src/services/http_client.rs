@@ -119,7 +119,11 @@ fn warn_on_env_proxy_posture(
 /// Under an environment proxy the destination of every proxied request is
 /// checked first, or the proxy is not used at all with
 /// `AK_UPSTREAM_ENV_PROXY=ignore` (#5459, see
-/// [`crate::services::env_proxy_guard`]).
+/// [`crate::services::env_proxy_guard`]). A caller's later `.no_proxy()`
+/// removes the routing but keeps the destination-check connector layer, so
+/// the fail-closed checks continue for any destination the environment
+/// proxy would have carried; a caller with its own routing should start from
+/// [`base_client_builder_without_env_proxy`] instead.
 pub fn base_client_builder() -> ClientBuilder {
     use crate::services::env_proxy_guard::{upstream_env_proxy_mode, UpstreamEnvProxyMode};
     let guard = match upstream_env_proxy_mode() {
@@ -1639,6 +1643,21 @@ mod tests {
         }
     }
 
+    /// A `NO_PROXY` suffix that would also cover a probe host (`.invalid`)
+    /// must not switch the checks off while real hosts are still proxied.
+    #[test]
+    fn test_no_proxy_suffix_does_not_disable_the_guard_5459() {
+        for no in [".invalid", "invalid", "localhost,.local,.invalid"] {
+            let guard = guard_5459(
+                &[("HTTP_PROXY", "http://corp:3128"), ("NO_PROXY", no)],
+                pinned_lookup_5459(),
+            );
+            assert!(guard.proxies(&url_5459("http://public.example/")), "{no}");
+            assert!(!guard.proxies(&url_5459("http://x.invalid/")), "{no}");
+            assert!(guard.proxies_plain_http(), "{no}");
+        }
+    }
+
     /// The destination check: names and literals the policy refuses, a name
     /// resolving to loopback, and a name that does not resolve (or resolves
     /// to nothing) are refused; a public name or literal passes.
@@ -1856,6 +1875,25 @@ mod tests {
         }
     }
 
+    /// The live form of the `.invalid` case: with `NO_PROXY` naming that
+    /// suffix, a loopback destination is still refused before the proxy.
+    #[tokio::test]
+    async fn test_no_proxy_invalid_suffix_still_refuses_loopback_5459() {
+        let (listener, proxy_url) = proxy_listener_5459().await;
+        let client = with_env_proxy_5459(
+            &[
+                ("HTTP_PROXY", proxy_url.as_str()),
+                ("NO_PROXY", "localhost,.local,.invalid"),
+            ],
+            || build_5459(base_client_builder()),
+        );
+        for dest in ["http://127.0.0.1:9/pkg", "http://[::1]:9/pkg"] {
+            assert_ssrf_refusal_5459(client.get(dest).send().await, dest);
+            let reached = next_proxy_request_5459(&listener, Duration::from_millis(200), b"").await;
+            assert_eq!(reached, None, "{dest} reached the proxy");
+        }
+    }
+
     /// The production upstream builder with a pinned resolver behind its
     /// destination check: a host name resolving to loopback, and one that
     /// does not resolve, are refused before the proxy is contacted; a public
@@ -1907,6 +1945,28 @@ mod tests {
         }
     }
 
+    /// Installs a guard for the upstream send path's per-request check and
+    /// removes it again when dropped, so the test need not keep the proxy
+    /// variables set (outside [`PROXY_ENV_LOCK`]) while it sends.
+    struct UpstreamGuardOverride5459;
+
+    impl UpstreamGuardOverride5459 {
+        fn install(guard: EnvProxyGuard) -> Self {
+            *crate::services::env_proxy_guard::TEST_UPSTREAM_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(guard);
+            Self
+        }
+    }
+
+    impl Drop for UpstreamGuardOverride5459 {
+        fn drop(&mut self) {
+            *crate::services::env_proxy_guard::TEST_UPSTREAM_GUARD
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
     /// The keep-alive bypass: the first plain-HTTP fetch of a host goes
     /// through the proxy on a pooled connection, then its DNS answer turns
     /// to loopback. The upstream send path refuses the next request before
@@ -1915,18 +1975,14 @@ mod tests {
     #[tokio::test]
     async fn test_reused_proxy_connection_is_rechecked_per_request_5459() {
         let rebound = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        *crate::services::env_proxy_guard::TEST_UPSTREAM_LOOKUP
-            .lock()
-            .unwrap() = Some(flipping_lookup_5459(std::sync::Arc::clone(&rebound)));
         let (listener, proxy_url) = proxy_listener_5459().await;
-        let vars = [("HTTP_PROXY", proxy_url.as_str())];
-        let client = with_env_proxy_5459(&vars, || {
-            build_5459(super::upstream_client_builder(Some(
-                EnvProxyGuard::with_lookup(
-                    OutboundUrlContext::Upstream,
-                    flipping_lookup_5459(std::sync::Arc::clone(&rebound)),
-                ),
-            )))
+        let guard = guard_5459(
+            &[("HTTP_PROXY", proxy_url.as_str())],
+            flipping_lookup_5459(std::sync::Arc::clone(&rebound)),
+        );
+        let _override = UpstreamGuardOverride5459::install(guard.clone());
+        let client = with_env_proxy_5459(&[("HTTP_PROXY", proxy_url.as_str())], || {
+            build_5459(super::upstream_client_builder(Some(guard)))
         });
         let (seen, proxy) = keep_alive_proxy_5459(listener);
         let send = |path: &str| {
@@ -1935,14 +1991,10 @@ mod tests {
             )
         };
 
-        // The env var must be visible to the per-request check, which reads
-        // the environment each time.
-        let first = with_env_proxy_5459(&vars, || send("first"));
-        let first = first.await.expect("first fetch through the proxy");
+        let first = send("first").await.expect("first fetch through the proxy");
         assert_eq!(first.text().await.unwrap(), "ok");
 
         rebound.store(true, std::sync::atomic::Ordering::SeqCst);
-        std::env::set_var("HTTP_PROXY", &proxy_url);
         assert_ssrf_refusal_5459(send("second").await, "rebound host on the send path");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
@@ -1953,7 +2005,6 @@ mod tests {
 
         // Control: around the send path the pooled connection carries it.
         let around = client.get("http://flip.example/around").send().await;
-        std::env::remove_var("HTTP_PROXY");
         assert!(around.is_ok(), "{around:?}");
         assert_eq!(
             seen.lock().unwrap().last().cloned(),
@@ -1961,6 +2012,40 @@ mod tests {
             "the control must ride the same pooled connection"
         );
         proxy.abort();
+    }
+
+    /// The per-request recheck judges only a client that follows the
+    /// environment proxy: a per-repository `direct`/`explicit` client's
+    /// request (`env_proxy: false`) goes out even for a host the backend
+    /// cannot resolve, while the same request from the shared client is
+    /// refused.
+    #[tokio::test]
+    async fn test_recheck_skips_clients_off_the_env_proxy_5459() {
+        let _override = UpstreamGuardOverride5459::install(guard_5459(
+            &[("HTTP_PROXY", "http://proxy.example:3128")],
+            pinned_lookup_5459(),
+        ));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        // The per-repository client's own routing reaches the upstream.
+        let client = loopback_client_from(
+            reqwest::Client::builder().resolve("unresolvable.example", *server.address()),
+        );
+        let url = format!(
+            "http://unresolvable.example:{}/pkg",
+            server.address().port()
+        );
+        let send = |env_proxy| {
+            crate::services::upstream_tracing::send_upstream_for(client.get(&url), env_proxy)
+        };
+        let direct = send(false)
+            .await
+            .expect("an explicit/direct client is not rechecked");
+        assert_eq!(direct.status(), reqwest::StatusCode::OK);
+        assert_ssrf_refusal_5459(send(true).await, "the shared client is rechecked");
     }
 
     /// The webhook and SSO clients, which do not use the upstream send path,

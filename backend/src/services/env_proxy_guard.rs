@@ -89,19 +89,41 @@ pub(crate) type Lookup = Arc<
         + Sync,
 >;
 
-/// The system resolver, bounded by [`LOOKUP_TIMEOUT`].
+/// Most proxied-destination lookups in flight at once. A lookup runs on the
+/// blocking pool and keeps its thread until the system resolver gives up,
+/// even after [`LOOKUP_TIMEOUT`] drops the future, so the count is bounded.
+const MAX_CONCURRENT_LOOKUPS: usize = 32;
+
+/// The system resolver, bounded by [`LOOKUP_TIMEOUT`] (waiting for a lookup
+/// slot included) and [`MAX_CONCURRENT_LOOKUPS`]. A timeout is an error,
+/// which the check reads as a refusal.
 fn system_lookup() -> Lookup {
+    static SLOTS: tokio::sync::Semaphore =
+        tokio::sync::Semaphore::const_new(MAX_CONCURRENT_LOOKUPS);
     Arc::new(|host: String| {
         Box::pin(async move {
-            let addrs =
-                tokio::time::timeout(LOOKUP_TIMEOUT, tokio::net::lookup_host((host.as_str(), 0)))
-                    .await
-                    .map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "lookup timed out")
-                    })??;
-            Ok(addrs.map(|a| a.ip()).collect())
+            let lookup = async {
+                let _slot = SLOTS.acquire().await.map_err(std::io::Error::other)?;
+                let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+                Ok::<_, std::io::Error>(addrs.map(|a| a.ip()).collect())
+            };
+            tokio::time::timeout(LOOKUP_TIMEOUT, lookup)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "lookup timed out")
+                })?
         })
     })
+}
+
+/// The first of `names` that is set, as `hyper-util` reads the proxy
+/// variables: an upper-case variable that is set, even to the empty string,
+/// hides the lower-case one.
+fn first_env(names: [&str; 2]) -> String {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .unwrap_or_default()
 }
 
 /// The environment proxy of one guarded client and the destination check it
@@ -111,14 +133,13 @@ pub(crate) struct EnvProxyGuard {
     matcher: Arc<Matcher>,
     ctx: OutboundUrlContext,
     lookup: Lookup,
-    /// Whether any environment proxy is configured at all; when not, the
-    /// connector layer does nothing.
+    /// Whether a proxy variable is set at all (read from the variables, not
+    /// from the matcher, so no `NO_PROXY` entry can turn it off); when not,
+    /// the connector layer has nothing to check.
     configured: bool,
+    /// Whether a variable that covers `http://` is set.
+    plain_http: bool,
 }
-
-/// A destination no `NO_PROXY` list plausibly names, to ask the matcher
-/// whether a scheme is proxied at all.
-const PROBE_HOST: &str = "ak-env-proxy-probe.invalid";
 
 impl EnvProxyGuard {
     /// The environment proxy as `reqwest` would read it now, for the trust
@@ -129,33 +150,36 @@ impl EnvProxyGuard {
 
     /// [`Self::from_env`] with `lookup` in place of the system resolver.
     pub(crate) fn with_lookup(ctx: OutboundUrlContext, lookup: Lookup) -> Self {
-        let matcher = Matcher::from_system();
-        let configured = ["http", "https"].iter().any(|scheme| {
-            format!("{scheme}://{PROBE_HOST}/")
-                .parse::<http::Uri>()
-                .is_ok_and(|uri| matcher.intercept(&uri).is_some())
-        });
+        // The matcher ignores every variable in a CGI process.
+        let cgi = std::env::var_os("REQUEST_METHOD").is_some();
+        let set = |names| !cgi && !first_env(names).trim().is_empty();
+        let all = set(["ALL_PROXY", "all_proxy"]);
+        let plain_http = all || set(["HTTP_PROXY", "http_proxy"]);
         Self {
-            matcher: Arc::new(matcher),
+            matcher: Arc::new(Matcher::from_system()),
             ctx,
             lookup,
-            configured,
+            configured: plain_http || set(["HTTPS_PROXY", "https_proxy"]),
+            plain_http,
         }
     }
 
     /// Whether the environment proxy would carry a request for `url`.
+    ///
+    /// Always asks the matcher, which is cheap: a probe destination could be
+    /// named by a `NO_PROXY` suffix (`.invalid`) and would then report no
+    /// proxy while real hosts are still proxied.
     pub(crate) fn proxies(&self, url: &reqwest::Url) -> bool {
-        self.configured
-            && url
-                .as_str()
-                .parse::<http::Uri>()
-                .is_ok_and(|uri| self.matcher.intercept(&uri).is_some())
+        url.as_str()
+            .parse::<http::Uri>()
+            .is_ok_and(|uri| self.matcher.intercept(&uri).is_some())
     }
 
-    /// Whether plain-HTTP destinations go through the environment proxy
-    /// (forward-proxied, so a pooled connection is reused per destination).
+    /// Whether plain-HTTP destinations may go through the environment proxy
+    /// (forward-proxied, so a pooled connection is reused per destination):
+    /// a variable covering `http://` is set.
     pub(crate) fn proxies_plain_http(&self) -> bool {
-        reqwest::Url::parse(&format!("http://{PROBE_HOST}/")).is_ok_and(|url| self.proxies(&url))
+        self.plain_http
     }
 
     /// The routing half: a `reqwest` proxy that sends a request where the
@@ -320,10 +344,16 @@ where
                     return Err(Box::new(refusal_error()) as BoxError);
                 }
                 Some(Some(dst)) => {
-                    if let Ok(url) = reqwest::Url::parse(&dst.to_string()) {
-                        if guard.check_url(&url).await.is_err() {
-                            return Err(Box::new(refusal_error()) as BoxError);
+                    let checked = match reqwest::Url::parse(&dst.to_string()) {
+                        Ok(url) => guard.check_url(&url).await,
+                        Err(_) => {
+                            let reason = BlockReason::Unresolved(dst.to_string());
+                            guard.record_refusal("<unparseable destination>", &reason);
+                            Err(reason)
                         }
+                    };
+                    if checked.is_err() {
+                        return Err(Box::new(refusal_error()) as BoxError);
                     }
                 }
             }
@@ -332,10 +362,26 @@ where
     }
 }
 
-/// Test override of the lookup [`check_upstream_request`] uses.
+/// Test override of the guard [`check_upstream_request`] uses, so a test
+/// need not keep the proxy variables set while it sends.
 #[cfg(test)]
-pub(crate) static TEST_UPSTREAM_LOOKUP: std::sync::Mutex<Option<Lookup>> =
+pub(crate) static TEST_UPSTREAM_GUARD: std::sync::Mutex<Option<EnvProxyGuard>> =
     std::sync::Mutex::new(None);
+
+/// The installed [`TEST_UPSTREAM_GUARD`], if any.
+#[cfg(test)]
+fn test_upstream_guard() -> Option<EnvProxyGuard> {
+    TEST_UPSTREAM_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// No override outside tests.
+#[cfg(not(test))]
+fn test_upstream_guard() -> Option<EnvProxyGuard> {
+    None
+}
 
 /// The per-request half for the upstream send path
 /// (`upstream_tracing::send_upstream_audited`): a plain-HTTP destination the
@@ -343,19 +389,18 @@ pub(crate) static TEST_UPSTREAM_LOOKUP: std::sync::Mutex<Option<Lookup>> =
 /// reused forward-proxy connection skips the connector layer. HTTPS needs no
 /// per-request check: a reused `CONNECT` tunnel stays at the address the
 /// proxy reached when the tunnel, checked by the layer, was opened.
+///
+/// Only for a request sent by a client that uses the environment proxy (the
+/// shared upstream client); a per-repository `direct`/`explicit` client is
+/// not routed by it and is skipped by the caller.
 pub(crate) async fn check_upstream_request(url: &reqwest::Url) -> reqwest::Result<()> {
-    if url.scheme() != "http" || upstream_env_proxy_mode() == UpstreamEnvProxyMode::Ignore {
+    let overridden = test_upstream_guard();
+    if url.scheme() != "http"
+        || (overridden.is_none() && upstream_env_proxy_mode() == UpstreamEnvProxyMode::Ignore)
+    {
         return Ok(());
     }
-    #[cfg(test)]
-    let lookup = TEST_UPSTREAM_LOOKUP
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-        .unwrap_or_else(system_lookup);
-    #[cfg(not(test))]
-    let lookup = system_lookup();
-    let guard = EnvProxyGuard::with_lookup(OutboundUrlContext::Upstream, lookup);
+    let guard = overridden.unwrap_or_else(|| EnvProxyGuard::from_env(OutboundUrlContext::Upstream));
     match guard.check_url(url).await {
         Ok(()) => Ok(()),
         Err(_) => Err(refusal_reqwest_error().await),
