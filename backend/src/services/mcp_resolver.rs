@@ -1530,9 +1530,6 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
 mod tests {
     use super::*;
 
-    /// Review finding 12: the asynchronous fill runs with the publishing
-    /// token's scope (repository allowlist, scopes), recorded on the
-    /// resolution; a job without a readable record gets nothing.
     /// #5452: a pending package keeps its submitted `registryBaseUrl` through
     /// the job record, so the filled pin can record the coordinates it
     /// replaced; a record written before the field existed still loads.
@@ -1568,6 +1565,9 @@ mod tests {
         assert_eq!(old.package().registry_base_url, None);
     }
 
+    /// Review finding 12: the asynchronous fill runs with the publishing
+    /// token's scope (repository allowlist, scopes), recorded on the
+    /// resolution; a job without a readable record gets nothing.
     #[test]
     fn fills_run_with_the_publishing_scope() {
         let (allowed, other) = (Uuid::new_v4(), Uuid::new_v4());

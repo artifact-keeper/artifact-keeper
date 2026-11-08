@@ -856,7 +856,10 @@ async fn edit_impl(
         serde_json::json!({
             "previous_sha256": current.checksum.trim(),
             "sha256": sha256,
-            "packages_changed": !keep_pins,
+            "packages_changed": !packages_unchanged(&current.stored.server, &server),
+            // A version with an unpinned package resolved again, even for
+            // an identical document (#5452).
+            "repinned": repin,
             "resolving": resolution.pending.iter().map(|p| p.index).collect::<Vec<_>>(),
         }),
     );
@@ -2998,6 +3001,14 @@ mod tests {
         );
         let (s, b) = env.json(env.admin(), "PUT", tail, Some(&named)).await;
         assert_eq!(s, StatusCode::OK, "{b}");
+        let edit = tdh::audit_row_eventually(&env.fx.pool, id, "MCP_SERVER_EDITED").await;
+        assert_eq!(
+            (
+                edit.details["repinned"].as_bool(),
+                edit.details["packages_changed"].as_bool()
+            ),
+            (Some(true), Some(false))
+        );
         let (s, b) = env.json(env.anon(), "GET", tail, None).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(

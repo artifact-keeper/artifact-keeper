@@ -10622,7 +10622,10 @@ pub async fn get_artifact_metadata(
     // A Virtual answers with the member's bytes (below), so it answers
     // with the served document; a direct row's metadata carries it as
     // `metadata.server`.
-    let mcp_served = mcp_generic_server_json(&state, &repo, &path, base.as_str()).await?;
+    let mcp_served = mcp_generic_server_json(&state, &repo, &path, base.as_str())
+        .await?
+        .map(|(_, doc)| doc);
+    let embeds_mcp = mcp_served.is_some();
     if repo.repo_type == RepositoryType::Virtual {
         if let Some(doc) = &mcp_served {
             return Ok(mcp_server_json_response(doc, false));
@@ -10752,7 +10755,7 @@ pub async fn get_artifact_metadata(
             .await
             .remove(&artifact.id);
 
-        return Ok(Json(ArtifactResponse {
+        let mut response = Json(ArtifactResponse {
             id: artifact.id,
             repository_key: key,
             path: artifact.path,
@@ -10780,7 +10783,16 @@ pub async fn get_artifact_metadata(
             origin,
             last_promotion,
         })
-        .into_response());
+        .into_response();
+        if embeds_mcp {
+            // The embedded server.json follows the request's base URL and
+            // the serve decision of this read (#5452).
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+        }
+        return Ok(response);
     }
 
     // B9 / #1221 / #1217: a virtual repository owns no `artifacts` rows of
@@ -11610,27 +11622,30 @@ async fn mcp_generic_owner(
 /// The served server.json (#5452) of the MCP server version a generic route
 /// addresses at `path` (in `repo`, or the Virtual member that owns it), as
 /// [`super::mcp::served_server_json`] builds it; `None` for any other format
-/// or path (a bundle). Called after [`mcp_generic_path_visible`].
+/// or path (a bundle), with the artifact it serves. Called after
+/// [`mcp_generic_path_visible`].
 async fn mcp_generic_server_json(
     state: &SharedState,
     repo: &crate::models::repository::Repository,
     path: &str,
     base: &str,
-) -> Result<Option<serde_json::Value>> {
+) -> Result<Option<(Uuid, serde_json::Value)>> {
     if repo.format != RepositoryFormat::Mcp {
         return Ok(None);
     }
-    match mcp_generic_owner(state, repo, path).await? {
-        Some((_, artifact_id)) => {
-            super::mcp::served_server_json(&state.db, artifact_id, base).await
-        }
-        None => Ok(None),
-    }
+    let Some((_, artifact_id)) = mcp_generic_owner(state, repo, path).await? else {
+        return Ok(None);
+    };
+    Ok(super::mcp::served_server_json(&state.db, artifact_id, base)
+        .await?
+        .map(|doc| (artifact_id, doc)))
 }
 
 /// The response a generic content route gives for a served MCP server.json
-/// (#5452): the rewritten document, never cached by a shared cache (the
-/// serve decision behind it can change on the next read).
+/// (#5452): the rewritten document, never cached (the serve decision behind
+/// it can change on the next read, and its URLs follow the request's base
+/// URL). Its size and sha256 are the served bytes', not the stored
+/// artifact's; `X-Checksum-Sha256` carries the served one.
 pub(crate) fn mcp_server_json_response(doc: &serde_json::Value, is_head: bool) -> Response {
     let bytes = serde_json::to_vec(doc).unwrap_or_default();
     let len = bytes.len();
@@ -11638,6 +11653,7 @@ pub(crate) fn mcp_server_json_response(doc: &serde_json::Value, is_head: bool) -
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, len)
+        .header("X-Checksum-Sha256", crate::formats::mcp::sha256_hex(&bytes))
         .header(header::CACHE_CONTROL, "no-store")
         .body(if is_head {
             Body::empty()
@@ -13141,16 +13157,6 @@ pub async fn download_artifact(
     if !mcp_generic_path_visible(&state, auth.as_ref(), &repo, &path).await? {
         return Err(generic_artifact_not_found(&repo));
     }
-    // #5452: a served MCP server.json is the pinned document, as the
-    // registry serves it, never the stored submission.
-    let base = crate::api::extractors::request_base_url_from_request(
-        request.headers(),
-        Some(request.uri()),
-    );
-    if let Some(doc) = mcp_generic_server_json(&state, &repo, &path, &base).await? {
-        return Ok(mcp_server_json_response(&doc, is_head));
-    }
-
     // Enforce quarantine AND the repository's scan policy before serving the
     // artifact: quarantined/rejected is a 409/403, a scan-policy violation
     // (`block_unscanned` / `block_on_fail` / `max_severity`) is a 403.
@@ -13184,6 +13190,20 @@ pub async fn download_artifact(
             crate::services::quarantine_service::enforce_download_gate(&state.db, artifact_id)
                 .await?;
         }
+    }
+
+    // #5452: a served MCP server.json is the pinned document, as the
+    // registry serves it, never the stored submission. Its row passed the
+    // download gate (a Virtual's member row too, here), and the download is
+    // counted like any other.
+    let base = crate::api::extractors::request_base_url_from_request(
+        request.headers(),
+        Some(request.uri()),
+    );
+    if let Some((artifact_id, doc)) = mcp_generic_server_json(&state, &repo, &path, &base).await? {
+        crate::services::quarantine_service::enforce_download_gate(&state.db, artifact_id).await?;
+        crate::services::artifact_service::record_download(&state.db, artifact_id, &dl_ctx).await;
+        return Ok(mcp_server_json_response(&doc, is_head));
     }
 
     // #2367: an explicit `?version=` selector on a versioning-enabled

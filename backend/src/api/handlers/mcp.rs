@@ -4819,7 +4819,26 @@ mod tests {
         let (s, b, h) = get(anon(downloads()), format!("/{key}/download/{path}")).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(h[header::CACHE_CONTROL], "no-store");
+        assert_eq!(h["x-checksum-sha256"], fmt::sha256_hex(&b).as_str());
         check(&json(&b), "download");
+        let downloads_now = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&env.fx.pool)
+            .await
+            .unwrap()
+        };
+        let mut counted = 0;
+        for _ in 0..80 {
+            counted = downloads_now().await;
+            if counted > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(counted >= 1, "the download is counted");
         let (s, b, h) = call(
             anon(downloads()),
             "HEAD",
@@ -4838,12 +4857,18 @@ mod tests {
         );
 
         let repos = || crate::api::handlers::repositories::router();
-        let (s, b, _) = get(anon(repos()), format!("/{key}/artifacts/{path}")).await;
-        assert_eq!(s, StatusCode::OK);
+        let (s, b, h) = get(anon(repos()), format!("/{key}/artifacts/{path}")).await;
+        assert_eq!(
+            (s, h[header::CACHE_CONTROL].to_str().unwrap()),
+            (StatusCode::OK, "no-store")
+        );
         check(&json(&b)["metadata"]["server"], "metadata");
         let by_id = || crate::api::handlers::artifacts::router();
-        let (s, b, _) = get(anon(by_id()), format!("/{id}/metadata")).await;
-        assert_eq!(s, StatusCode::OK);
+        let (s, b, h) = get(anon(by_id()), format!("/{id}/metadata")).await;
+        assert_eq!(
+            (s, h[header::CACHE_CONTROL].to_str().unwrap()),
+            (StatusCode::OK, "no-store")
+        );
         check(&json(&b)["metadata"]["server"], "metadata by id");
         let tree = || crate::api::handlers::tree::router();
         let (s, b, _) = get(
@@ -4853,6 +4878,12 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         check(&json(&b), "tree content");
+        // The download gate still applies: a holder of a quarantined
+        // server.json is refused, not served the rewritten document.
+        env.hold(id, Some("quarantined")).await;
+        let member = env.fx.router_with_auth(downloads());
+        let (s, _, _) = get(member, format!("/{key}/download/{path}")).await;
+        assert_eq!(s, StatusCode::CONFLICT);
         env.teardown().await;
     }
 

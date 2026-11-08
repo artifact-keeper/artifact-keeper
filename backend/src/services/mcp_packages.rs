@@ -497,8 +497,8 @@ fn submitted_host(pkg: &mcp::Package) -> Option<String> {
 /// Whether content that reached this instance through `remote` (a Remote
 /// repository: the backing repository itself or a Virtual's member) may be
 /// pinned for `pkg` (#5452). Always, unless `pkg` names a foreign
-/// `registryBaseUrl` (accepted only under `open`): then only when that is
-/// `remote`'s own upstream host. Otherwise `open` would replace one
+/// `registryBaseUrl` (accepted only under `open`): then only when that URL
+/// is under `remote`'s own upstream ([`url_is_under`]). Otherwise `open` would replace one
 /// package identity by another of the same name: `@corp/tool` on
 /// `npm.internal.corp` by a same-named (possibly squatted) public package the
 /// Remote proxies, with a fill pulling it in on the publisher's behalf.
@@ -511,13 +511,46 @@ pub fn remote_may_serve(
     !registry_base_url_is_foreign(pkg, mapped, base_url) || upstream_is_named(pkg, remote)
 }
 
-/// Whether `pkg`'s `registryBaseUrl` names `remote`'s upstream host.
+/// Whether `pkg`'s `registryBaseUrl` is under `remote`'s upstream URL.
 fn upstream_is_named(pkg: &mcp::Package, remote: &BackingRepo) -> bool {
-    let upstream = remote
-        .upstream_url
-        .as_deref()
-        .map(|u| mcp::host_of(u).to_ascii_lowercase());
-    upstream.is_some() && upstream == submitted_host(pkg)
+    match (
+        remote.upstream_url.as_deref(),
+        pkg.registry_base_url.as_deref(),
+    ) {
+        (Some(upstream), Some(submitted)) => url_is_under(upstream, submitted),
+        _ => false,
+    }
+}
+
+/// Whether `submitted` names the registry `upstream` is (#5452): the same
+/// origin (scheme, host and port, normalised: case, default ports) and a
+/// path under the upstream's path, compared by whole segments. A registry is
+/// often one path of a shared host (GitLab's
+/// `/api/v4/projects/<id>/packages/pypi/simple`, Nexus or Artifactory
+/// `/repository/<name>/`), so the host alone does not identify it. A
+/// root-path upstream (`https://registry.npmjs.org/`) covers every path of
+/// its origin. Anything that does not parse is not under (fail closed).
+pub fn url_is_under(upstream: &str, submitted: &str) -> bool {
+    let (Ok(up), Ok(sub)) = (url::Url::parse(upstream), url::Url::parse(submitted)) else {
+        return false;
+    };
+    let origin = |u: &url::Url| {
+        (
+            u.scheme().to_ascii_lowercase(),
+            u.host_str().map(str::to_ascii_lowercase),
+            u.port_or_known_default(),
+        )
+    };
+    if up.host_str().is_none() || origin(&up) != origin(&sub) {
+        return false;
+    }
+    let segments = |u: &url::Url| -> Vec<String> {
+        u.path_segments()
+            .map(|s| s.filter(|p| !p.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let (up, sub) = (segments(&up), segments(&sub));
+    sub.len() >= up.len() && sub[..up.len()] == up[..]
 }
 
 /// The refusal of foreign coordinates that would resolve through a Remote of
@@ -2162,6 +2195,97 @@ mod tests {
         let e = foreign_through_remote(3, &pkg(Some("https://npm.internal.corp")), &remote);
         assert!(matches!(e, McpError::ExternalRegistry { index: 3, .. }));
         assert!(e.detail().contains("npm.internal.corp") && e.detail().contains("npm-r"));
+    }
+
+    /// #5452: a submitted registry URL is a Remote's upstream only with the
+    /// same origin and a path under the upstream's, segment by segment: one
+    /// project or repository of a shared host is not another. A root-path
+    /// upstream covers every path of its origin; nothing unparseable matches.
+    #[test]
+    fn registry_urls_match_by_origin_and_path_prefix() {
+        let gitlab = "https://gitlab.com/api/v4/projects/222/packages/pypi/simple";
+        let nexus = "https://nexus.corp/repository/npm-public/";
+        for (upstream, submitted, under) in [
+            (gitlab, gitlab, true),
+            (
+                gitlab,
+                "https://gitlab.com/api/v4/projects/222/packages/pypi/simple/",
+                true,
+            ),
+            (
+                gitlab,
+                "https://GitLab.com:443/api/v4/projects/222/packages/pypi/simple/tool",
+                true,
+            ),
+            (
+                gitlab,
+                "https://gitlab.com/api/v4/projects/111/packages/pypi/simple",
+                false,
+            ),
+            (
+                gitlab,
+                "https://gitlab.com/api/v4/projects/2222/packages/pypi/simple",
+                false,
+            ),
+            (gitlab, "https://gitlab.com/api/v4/projects/222", false),
+            (nexus, "https://nexus.corp/repository/npm-public", true),
+            (nexus, "https://nexus.corp/repository/npm-private/", false),
+            (nexus, "https://nexus.corp/repository/npm-public-2/", false),
+            (
+                "https://registry.npmjs.org/",
+                "https://registry.npmjs.org",
+                true,
+            ),
+            (
+                "https://registry.npmjs.org/",
+                "https://registry.npmjs.org/any/path",
+                true,
+            ),
+            (
+                "https://registry.npmjs.org",
+                "http://registry.npmjs.org",
+                false,
+            ),
+            (
+                "https://registry.npmjs.org",
+                "https://registry.npmjs.org:8443",
+                false,
+            ),
+            (
+                "https://registry.npmjs.org",
+                "https://registry.npmjs.org.evil.test",
+                false,
+            ),
+            ("https://registry.npmjs.org", "not a url", false),
+            ("not a url", "https://registry.npmjs.org", false),
+        ] {
+            assert_eq!(
+                url_is_under(upstream, submitted),
+                under,
+                "{upstream} / {submitted}"
+            );
+        }
+        let remote = test_repo("pypi-r", "remote", "pypi", Some(gitlab));
+        let mapped = test_repo("pypi-r", "remote", "pypi", Some(gitlab));
+        let pkg = |base: &str| -> mcp::Package {
+            serde_json::from_value(serde_json::json!({
+                "registryType": "pypi", "identifier": "tool", "version": "1.0.0",
+                "registryBaseUrl": base, "transport": {"type": "stdio"},
+            }))
+            .unwrap()
+        };
+        assert!(remote_may_serve(
+            &pkg(gitlab),
+            &mapped,
+            &remote,
+            "https://ak.test"
+        ));
+        assert!(!remote_may_serve(
+            &pkg("https://gitlab.com/api/v4/projects/111/packages/pypi/simple"),
+            &mapped,
+            &remote,
+            "https://ak.test"
+        ));
     }
 
     /// #5452: a pin found in a Remote's proxy cache records the foreign

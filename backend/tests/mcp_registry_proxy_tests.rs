@@ -1663,7 +1663,9 @@ async fn open_remote_pins_foreign_coordinates_or_hides_the_version() {
 /// fix has packages but no pins and an empty `unresolved` list. The sync
 /// picks it up again (it used to select only versions with a reported
 /// unresolved package, so such a version stayed hidden for good), pins it
-/// once its package is in a backing repository and serves it.
+/// once its package is in a backing repository and serves it. A version that
+/// keeps failing records every attempt, also one stored without `ingest`,
+/// so the least recently tried come first and it cannot sort first forever.
 #[tokio::test]
 #[ignore = "requires DATABASE_URL pointed at a Postgres with migrations applied"]
 async fn open_remote_re_resolves_versions_stored_unpinned() {
@@ -1671,10 +1673,17 @@ async fn open_remote_re_resolves_versions_stored_unpinned() {
     let (npm_id, npm_key) =
         backing(&mut h, "remote", "npm", Some("https://registry.npmjs.org")).await;
     cache_entry(&h, npm_id, "@acme/echo-npm/-/echo-npm-1.0.0.tgz").await;
-    let entries = vec![package_entry(
-        "io.github.acme/legacy",
-        artifact_pkg("npm", "@acme/echo-npm", "https://registry.npmjs.org"),
-    )];
+    let upstream_url = "https://registry.npmjs.org";
+    let entries = vec![
+        package_entry(
+            "io.github.acme/legacy",
+            artifact_pkg("npm", "@acme/echo-npm", upstream_url),
+        ),
+        package_entry(
+            "io.github.acme/stuck",
+            artifact_pkg("npm", "@acme/never-pulled", upstream_url),
+        ),
+    ];
     h.config("mcp_package_policy", "open").await;
     h.config(
         "mcp_package_repos",
@@ -1686,18 +1695,37 @@ async fn open_remote_re_resolves_versions_stored_unpinned() {
     mount_quiet_upstream(&h.upstream, &entries).await;
     h.sync().await;
     assert_eq!(h.listed_names().await, ["io.github.acme/legacy@1.0.0"]);
+    // A pin of the upstream's own URL records what it replaced, as a
+    // publish naming it does.
+    assert_eq!(
+        stored_pin(&h, "io.github.acme/legacy").await["resolved"]["warnings"],
+        serde_json::json!(["foreign_coordinates_replaced"])
+    );
 
-    // The pre-#5452 `open` shape: no pins, nothing reported unresolved.
+    // The pre-#5452 `open` shape: no pins, nothing reported unresolved; and
+    // a stuck version stored without `ingest` at all.
     sqlx::query(
-        "UPDATE artifact_metadata SET metadata = jsonb_set(jsonb_set(metadata, '{packages}', '[]'), \
-         '{ingest,unresolved}', '[]') \
-         WHERE artifact_id IN (SELECT id FROM artifacts WHERE repository_id = $1)",
+        "UPDATE artifact_metadata SET metadata = CASE WHEN a.name = 'io.github.acme/legacy' \
+           THEN jsonb_set(jsonb_set(metadata, '{packages}', '[]'), '{ingest,unresolved}', '[]') \
+           ELSE metadata - 'ingest' END \
+         FROM artifacts a WHERE a.id = artifact_metadata.artifact_id AND a.repository_id = $1",
     )
     .bind(h.repo_id)
     .execute(&h.pool)
     .await
     .unwrap();
     assert!(h.listed_names().await.is_empty(), "held unresolvable");
+    let attempted = || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT m.metadata->'ingest'->>'reResolveAttemptedAt' FROM artifacts a \
+             JOIN artifact_metadata m ON m.artifact_id = a.id \
+             WHERE a.repository_id = $1 AND a.name = 'io.github.acme/stuck'",
+        )
+        .bind(h.repo_id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+    };
     let summary = h.sync().await;
     assert_eq!(summary["reResolved"], 1, "{summary}");
     assert_eq!(h.listed_names().await, ["io.github.acme/legacy@1.0.0"]);
@@ -1705,6 +1733,10 @@ async fn open_remote_re_resolves_versions_stored_unpinned() {
         stored_pin(&h, "io.github.acme/legacy").await["resolved"]["sha256"],
         "cd".repeat(32)
     );
+    let first = attempted().await.expect("the failed attempt is recorded");
+    h.sync().await;
+    let second = attempted().await.expect("the failed attempt is recorded");
+    assert!(second > first, "{first} then {second}");
     h.teardown().await;
 }
 

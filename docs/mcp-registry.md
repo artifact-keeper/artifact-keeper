@@ -409,7 +409,13 @@ Each repository has a package policy (`mcp_package_policy`):
   coordinates and gated exactly as under `own-repos`.
 
   Content that reaches this instance through a Remote came from that
-  Remote's upstream, so it stands only for coordinates naming that upstream.
+  Remote's upstream, so it stands only for coordinates naming that upstream:
+  the same origin (scheme, host, port) and a path under the upstream URL's
+  path, compared by whole segments. A registry is often one path of a shared
+  host (GitLab's `/api/v4/projects/<id>/packages/pypi/simple`, Nexus or
+  Artifactory `/repository/<name>/`), so another project or repository on
+  the same host does not match; a root-path upstream such as
+  `https://registry.npmjs.org/` matches any path on its origin.
   Foreign coordinates naming any other host are neither pinned from a Remote
   backing repository (or a Virtual's Remote member, including its proxy
   cache) nor filled through it: the publish is refused with
@@ -1014,7 +1020,9 @@ otherwise every package is resolved again (and may answer `202` with
 without a write, except for a version with a package no pin covers (stored
 under `open` before #5452): a `PUT` of the same document resolves its
 packages again in place, which is how such a version is made servable
-without a new version number. Audited `MCP_SERVER_EDITED`
+without a new version number. Like any edit it rewrites the stored bytes, so
+the repository's upload quarantine hold, if it has one, applies again; the
+audit records `repinned: true`. Audited `MCP_SERVER_EDITED`
 (`previous_sha256`, `sha256`, `packages_changed`, `resolving`).
 
 ### `DELETE .../versions/{version}` (soft delete)
@@ -1219,6 +1227,16 @@ resolving, unresolvable, or soft-deleted) is treated as missing:
   `GET /api/v1/artifacts/{id}` (with `/metadata` and `/stats`) answer the
   route's plain `404`. For a Virtual registry, the member that holds the
   path first (by priority) decides.
+- A served server.json on those routes is the document the registry serves,
+  every pinned package at its Artifact Keeper coordinates (#5452): the
+  download and `/api/v1/tree/content` return it, and the two metadata routes
+  return it as `metadata.server`. Its bytes differ from the stored
+  artifact's, so its size and sha256 are not the artifact's `size_bytes` and
+  `checksum_sha256`: the download carries the served bytes' sha256 in
+  `X-Checksum-Sha256`. These answers are `Cache-Control: no-store` (the
+  coordinates follow the request's base URL). The download still passes the
+  download gate (`409`/`403` for a holder of a quarantined or rejected
+  server.json) and is counted.
 
 - `/api/v1/search/*` excludes those artifacts in the database query:
   `quick` (OpenSearch hits are re-checked in PostgreSQL), `advanced` (items,

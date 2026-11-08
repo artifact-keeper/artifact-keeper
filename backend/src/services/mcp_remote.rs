@@ -458,15 +458,21 @@ pub fn registry_changed(stored: &RegistryState, upstream: &RegistryState) -> boo
         || stored.updated_at != upstream.updated_at
 }
 
-/// A package to resolve: an upstream `registryBaseUrl` that names the host of
-/// the backing Remote's own upstream is the same registry the Remote proxies,
-/// so it is dropped for the lookup (the served form points at the backing
-/// repository anyway).
+/// A package to resolve: an upstream `registryBaseUrl` under the backing
+/// Remote's own upstream URL (same origin and a path under it,
+/// [`mcp_packages::url_is_under`]) is the registry the Remote proxies, so it
+/// is dropped for the lookup (the served form points at the backing
+/// repository anyway). A pin of such a package records
+/// [`mcp_packages::FOREIGN_COORDINATES_WARNING`], as a publish naming the
+/// upstream does ([`pin_packages`]).
 pub fn for_resolution(pkg: &fmt::Package, repo: Option<&BackingRepo>) -> fmt::Package {
     let mut p = pkg.clone();
     if let (Some(given), Some(repo)) = (p.registry_base_url.as_deref(), repo) {
-        let upstream = repo.upstream_url.as_deref().map(fmt::host_of);
-        if repo.repo_type == "remote" && upstream.as_deref() == Some(fmt::host_of(given).as_str()) {
+        let under = repo
+            .upstream_url
+            .as_deref()
+            .is_some_and(|up| mcp_packages::url_is_under(up, given));
+        if repo.repo_type == "remote" && under {
             p.registry_base_url = None;
         }
     }
@@ -924,6 +930,15 @@ async fn pin_packages(
         match found {
             Ok(mut pin) => {
                 pin.submitted.identifier = pkg.identifier.clone();
+                // The upstream's `registryBaseUrl` was replaced by the
+                // backing repository's, as on a publish naming it (#5452).
+                let warning = mcp_packages::FOREIGN_COORDINATES_WARNING.to_string();
+                if pkg.registry_base_url.is_some()
+                    && candidate.registry_base_url.is_none()
+                    && !pin.resolved.warnings.contains(&warning)
+                {
+                    pin.resolved.warnings.push(warning);
+                }
                 pins.push(pin);
             }
             Err(e) => unresolved.push(Unresolved {
@@ -1791,10 +1806,13 @@ async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), S
         let (new_pins, still) = pin_packages(run, &server, Some(&indexes)).await;
         if new_pins.is_empty() {
             // Record the attempt (and what is still unresolved) so the next
-            // pass tries the versions not attempted yet first.
+            // pass tries the versions not attempted yet first. A version
+            // stored without `ingest` gets one, so it cannot sort first
+            // forever.
             sqlx::query(
-                "UPDATE artifact_metadata SET metadata = jsonb_set(jsonb_set(metadata, \
-                 '{ingest,unresolved}', $2), '{ingest,reResolveAttemptedAt}', to_jsonb(now()::text)) \
+                "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{ingest}', \
+                 COALESCE(metadata->'ingest', '{}'::jsonb) || jsonb_build_object( \
+                   'unresolved', $2::jsonb, 'reResolveAttemptedAt', now()::text)) \
                  WHERE artifact_id = $1",
             )
             .bind(id)
@@ -2710,6 +2728,29 @@ mod tests {
         assert!(for_resolution(&pkg, Some(&other))
             .registry_base_url
             .is_some());
+        // #5452: a path-scoped upstream (one project of a shared host) is
+        // not another project on the same host.
+        let gitlab = |project: u32| -> fmt::Package {
+            serde_json::from_value(serde_json::json!({
+                "registryType": "pypi", "identifier": "tool", "version": "1.0.0",
+                "registryBaseUrl": format!(
+                    "https://gitlab.com/api/v4/projects/{project}/packages/pypi/simple"
+                ),
+                "transport": {"type": "stdio"},
+            }))
+            .unwrap()
+        };
+        let project = backing(
+            "remote",
+            "https://gitlab.com/api/v4/projects/222/packages/pypi/simple",
+        );
+        assert!(for_resolution(&gitlab(111), Some(&project))
+            .registry_base_url
+            .is_some());
+        assert_eq!(
+            for_resolution(&gitlab(222), Some(&project)).registry_base_url,
+            None
+        );
         let local = backing("local", "https://registry.npmjs.org");
         assert!(for_resolution(&pkg, Some(&local))
             .registry_base_url
