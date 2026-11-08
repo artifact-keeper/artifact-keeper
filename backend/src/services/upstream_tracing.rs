@@ -8,11 +8,12 @@
 //! (`services::upstream_feed`), the npm audit and `/-/` meta passthroughs, the
 //! Go sumdb proxy, and the AWS token exchange in
 //! `services::aws_upstream_auth` (its SigV4 signature does not cover the
-//! injected headers, which are added after signing). Three upstream callers
-//! off the request proxy path still use a bare `.send()` and are follow-ups on
-//! #3954: the repository "test upstream" check (`api::handlers::repositories`),
-//! the curation sync cycle (`services::scheduler_service`) and the popularity
-//! source (`services::curation::popularity_source`). It wraps the send in an
+//! injected headers, which are added after signing), the repository "test
+//! upstream" check (`api::handlers::repositories`) and the curation sync cycle
+//! (`services::scheduler_service`), the last two through [`send_upstream_for`]
+//! so the environment-proxy recheck follows their egress route (#5459). The
+//! popularity source (`services::curation::popularity_source`) still uses a
+//! bare `.send()` and is a follow-up on #3954. It wraps the send in an
 //! `otel.kind = "client"` span carrying the stable HTTP client semantic
 //! conventions (`http.request.method`, `url.full`, `server.address`,
 //! `server.port`, `http.response.status_code`, `error.type`) and injects the
@@ -52,14 +53,46 @@ use crate::services::proxy_service::redact_url_for_diagnostics;
 /// Send `request` to an upstream inside a `CLIENT` span, injecting its trace
 /// context. Returns exactly what `RequestBuilder::send` would, so each caller
 /// keeps its own error mapping.
-pub(crate) async fn send_upstream(
+pub(crate) fn send_upstream(
     request: reqwest::RequestBuilder,
+) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send {
+    send_upstream_for(request, true)
+}
+
+/// [`send_upstream`] from a client that may not follow the environment
+/// proxy. `env_proxy` is whether the sending client follows the environment
+/// proxy (the shared upstream client): its plain-HTTP requests are then
+/// rechecked before each send (#5459). A per-repository `direct` or
+/// `explicit` client is not routed by the environment proxy and passes
+/// `false`.
+pub(crate) async fn send_upstream_for(
+    request: reqwest::RequestBuilder,
+    env_proxy: bool,
 ) -> reqwest::Result<reqwest::Response> {
     let (client, built) = request.build_split();
     let mut request = built?;
     let had_auth = request.headers().contains_key(AUTHORIZATION);
     let span = upstream_client_span(request.method(), request.url());
     inject_trace_context(&span, request.headers_mut());
+    // A plain-HTTP request the environment proxy carries may ride a pooled
+    // connection that never passes the connect-time check again (#5459).
+    // Boxed: the handler futures that reach this send (the NuGet, conda,
+    // sbt and VS Code member walks) sit at the compiler's layout query-depth
+    // limit, and an opaque future keeps the check from adding to it.
+    let recheck = if env_proxy {
+        let check: std::pin::Pin<
+            Box<dyn std::future::Future<Output = reqwest::Result<()>> + Send + '_>,
+        > = Box::pin(crate::services::env_proxy_guard::check_upstream_request(
+            request.url(),
+        ));
+        check.instrument(span.clone()).await
+    } else {
+        Ok(())
+    };
+    if let Err(err) = recheck {
+        record_transport_error(&span, &err);
+        return Err(err);
+    }
 
     let result = client.execute(request).instrument(span.clone()).await;
     match &result {

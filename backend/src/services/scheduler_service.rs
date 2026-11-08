@@ -2068,8 +2068,8 @@ async fn run_curation_sync_cycle_for(
         // The client this Remote's fetches use, built the way the proxy reaches
         // that upstream: the stored URL passes the upstream URL validation and
         // the requests go out on the Remote's egress route.
-        let client = match curation_client_for(db, *remote_id, upstream_url).await {
-            Ok(CurationClient::Ready(client)) => client,
+        let (client, env_proxy) = match curation_client_for(db, *remote_id, upstream_url).await {
+            Ok(CurationClient::Ready { client, env_proxy }) => (client, env_proxy),
             Ok(CurationClient::Refused(reason)) => {
                 // Skipped without a request and left unstamped, so a URL or
                 // allowlist fix takes effect on the next tick.
@@ -2134,7 +2134,11 @@ async fn run_curation_sync_cycle_for(
                 }
                 // Fetch repomd.xml as raw bytes so a detached signature can be
                 // verified over the exact content before its checksums are trusted.
-                let repomd_bytes = match repomd_req.send().await {
+                let repomd_bytes = match crate::services::upstream_tracing::send_upstream_for(
+                    repomd_req, env_proxy,
+                )
+                .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repomd.xml) buffered for signature verify + href parse; not an artifact blob (#1608)
@@ -2189,7 +2193,11 @@ async fn run_curation_sync_cycle_for(
                             asc_req =
                                 crate::services::upstream_auth::apply_upstream_auth(asc_req, auth);
                         }
-                        let asc = match asc_req.send().await {
+                        let asc = match crate::services::upstream_tracing::send_upstream_for(
+                            asc_req, env_proxy,
+                        )
+                        .await
+                        {
                             Ok(resp) if resp.status().is_success() => {
                                 resp.text().await.unwrap_or_default()
                             }
@@ -2262,7 +2270,9 @@ async fn run_curation_sync_cycle_for(
                     primary_req =
                         crate::services::upstream_auth::apply_upstream_auth(primary_req, auth);
                 }
-                match primary_req.send().await {
+                match crate::services::upstream_tracing::send_upstream_for(primary_req, env_proxy)
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for checksum-pin + decode; not an artifact blob (#1608)
@@ -2388,7 +2398,9 @@ async fn run_curation_sync_cycle_for(
                     packages_req =
                         crate::services::upstream_auth::apply_upstream_auth(packages_req, auth);
                 }
-                match packages_req.send().await {
+                match crate::services::upstream_tracing::send_upstream_for(packages_req, env_proxy)
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         #[allow(clippy::disallowed_methods)]
                         // STREAMING-EXEMPT: capped-metadata (upstream repo index) buffered for gz-decode; not an artifact blob (#1608)
@@ -2414,7 +2426,11 @@ async fn run_curation_sync_cycle_for(
                                 plain_req, auth,
                             );
                         }
-                        match plain_req.send().await {
+                        match crate::services::upstream_tracing::send_upstream_for(
+                            plain_req, env_proxy,
+                        )
+                        .await
+                        {
                             Ok(resp) if resp.status().is_success() => {
                                 let content = resp.text().await.map_err(|e| e.without_url())?;
                                 curation_sync::parse_deb_packages_index(&content, "main")
@@ -2516,7 +2532,12 @@ async fn run_curation_sync_cycle_for(
 
 /// The client for one Remote's curation fetches, or why there is none.
 enum CurationClient {
-    Ready(reqwest::Client),
+    /// `env_proxy`: the client follows the environment proxy (`inherit`), so
+    /// its plain-HTTP requests are rechecked before each send (#5459).
+    Ready {
+        client: reqwest::Client,
+        env_proxy: bool,
+    },
     /// The stored upstream URL is refused by the upstream URL validation.
     Refused(String),
 }
@@ -2550,7 +2571,10 @@ async fn curation_client_for(
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("could not build the HTTP client: {e}"))?;
-    Ok(CurationClient::Ready(client))
+    Ok(CurationClient::Ready {
+        client,
+        env_proxy: !egress.overrides_default_routing(),
+    })
 }
 
 /// Log one staging repo's RPM curation-sync failure and record it so the cycle

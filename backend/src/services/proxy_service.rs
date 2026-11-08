@@ -35,7 +35,7 @@ use crate::services::proxy_hydration::{
 };
 use crate::services::quarantine_service;
 use crate::services::storage_service::StorageService;
-use crate::services::upstream_tracing::send_upstream;
+use crate::services::upstream_tracing::send_upstream_for;
 
 /// Default byte ceiling for a buffered upstream *metadata* read (#1608 Phase 4b
 /// / #2181). Every buffered metadata proxy fetch is bounded so a hostile or
@@ -3734,6 +3734,45 @@ impl UpstreamClient {
         self
     }
 
+    /// Send `request` for `repo_id` through [`send_upstream_for`], with the
+    /// environment-proxy recheck when `repo_id`'s requests use the shared
+    /// client (#5459).
+    ///
+    /// A plain `fn` returning a boxed future, not an `async fn`: the handler
+    /// futures that reach the proxy fetches already sit near the compiler's
+    /// layout query-depth limit in the coverage build, and an opaque boxed
+    /// future adds one level only.
+    fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+        repo_id: Option<Uuid>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let env_proxy_recheck = self.uses_env_proxy(repo_id).await;
+            send_upstream_for(request, env_proxy_recheck).await
+        })
+    }
+
+    /// Whether `repo_id`'s requests go out through the shared client, which
+    /// follows the environment proxy (`inherit`, or no repository), rather
+    /// than a per-repository `direct`/`explicit` client (#5459). Read from
+    /// the egress-client cache [`Self::client_for`] fills, falling back to
+    /// the stored configuration; an unreadable one counts as `inherit`, the
+    /// stricter reading.
+    async fn uses_env_proxy(&self, repo_id: Option<Uuid>) -> bool {
+        let Some(repo_id) = repo_id else {
+            return true;
+        };
+        match self.cached_egress_client(repo_id).await {
+            Some(entry) => entry.is_none(),
+            None => crate::services::egress_proxy::load_egress_proxy(&self.db, repo_id)
+                .await
+                .map_or(true, |config| !config.overrides_default_routing()),
+        }
+    }
+
     /// Apply the upstream outbound address policy to a destination named by
     /// an IP literal, before any client is chosen.
     ///
@@ -3837,6 +3876,11 @@ impl UpstreamClient {
     /// deliberately skipped there. See
     /// [`egress_proxy::ensure_proxied_destination_allowed`] for the residual
     /// DNS-rebinding gap this cannot close.
+    ///
+    /// A repository on `Inherit` under an environment proxy needs no check
+    /// here: the shared client checks every destination it proxies itself,
+    /// in every case spelling of the proxy variables (#5459, see
+    /// `http_client::guarded_env_proxy`).
     async fn client_for(&self, repo_id: Uuid, target_url: &str) -> Result<Client> {
         self.ensure_initial_destination_allowed(target_url)?;
         let entry = match self.cached_egress_client(repo_id).await {
@@ -3994,7 +4038,7 @@ impl UpstreamClient {
             request = request.header(ACCEPT, accept_value);
         }
 
-        let response = send_upstream(request).await.map_err(|e| {
+        let response = self.send(request, Some(repo_id)).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -4075,7 +4119,7 @@ impl UpstreamClient {
         }
         request = apply_custom_ua(request, custom_ua.as_deref());
 
-        let response = send_upstream(request).await.map_err(|e| {
+        let response = self.send(request, Some(repo_id)).await.map_err(|e| {
             classify_send_error(e, &format!("POST JSON to upstream {}", diagnostic_url))
         })?;
 
@@ -4239,7 +4283,7 @@ impl UpstreamClient {
         // both the initial request and the retry. This asymmetry is deliberate
         // and MUST NOT be "unified" — do not add `Accept` here (#1618 S8 review).
 
-        let response = send_upstream(request).await.map_err(|e| {
+        let response = self.send(request, Some(repo_id)).await.map_err(|e| {
             classify_send_error(e, &format!("fetch from upstream {}", diagnostic_url))
         })?;
 
@@ -4385,15 +4429,16 @@ impl UpstreamClient {
                 let retry_request = build_request(client.get(url).bearer_auth(&token));
 
                 let retry_diagnostic_url = redact_url_for_diagnostics(url);
-                let retry_response = send_upstream(retry_request).await.map_err(|e| {
-                    classify_send_error(
-                        e,
-                        &format!(
-                            "fetch from upstream {} after token exchange",
-                            retry_diagnostic_url
-                        ),
-                    )
-                })?;
+                let retry_response =
+                    self.send(retry_request, Some(repo_id)).await.map_err(|e| {
+                        classify_send_error(
+                            e,
+                            &format!(
+                                "fetch from upstream {} after token exchange",
+                                retry_diagnostic_url
+                            ),
+                        )
+                    })?;
 
                 // #4527: no credentials went to the token service, so a
                 // refusal of the anonymous token is not a credentials problem.
@@ -4506,7 +4551,7 @@ impl UpstreamClient {
 
         tracing::debug!("Requesting bearer token from {} (scope={})", realm, scope);
 
-        let token_response = send_upstream(token_request).await.map_err(|e| {
+        let token_response = self.send(token_request, repo_id).await.map_err(|e| {
             AppError::Storage(format!(
                 "Failed to request bearer token from {}: {}",
                 realm, e
@@ -4852,7 +4897,7 @@ impl UpstreamClient {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = send_upstream(request).await.map_err(|e| {
+        let response = self.send(request, Some(repo_id)).await.map_err(|e| {
             AppError::Storage(format!("Failed to check upstream for changes: {}", e))
         })?;
         // The URL may embed upstream `user:password@` credentials (#4452);
@@ -4983,7 +5028,7 @@ impl UpstreamClient {
         let shown = redact_url_for_diagnostics(url);
         // Fully qualified so this compiles whether or not the module imports
         // the plain sender (#5286 replaces that import with the audited one).
-        let response = match crate::services::upstream_tracing::send_upstream(request).await {
+        let response = match self.send(request, Some(repo_id)).await {
             Ok(response) => response,
             Err(e) => {
                 tracing::debug!(
@@ -8014,16 +8059,20 @@ impl ProxyService {
             request = crate::services::upstream_auth::apply_upstream_auth(request, auth);
         }
 
-        let response = send_upstream(request).await.map_err(|e| {
-            // Redact the target URL (may carry `user:pass@` upstream creds) and
-            // drop the URL reqwest embeds in its own error (#2926) before this
-            // surfaces to a client.
-            AppError::Storage(format!(
-                "Failed to fetch from upstream: {} - {}",
-                redact_url_for_diagnostics(url),
-                e.without_url()
-            ))
-        })?;
+        let response = self
+            .upstream_client
+            .send(request, Some(repo_id))
+            .await
+            .map_err(|e| {
+                // Redact the target URL (may carry `user:pass@` upstream creds) and
+                // drop the URL reqwest embeds in its own error (#2926) before this
+                // surfaces to a client.
+                AppError::Storage(format!(
+                    "Failed to fetch from upstream: {} - {}",
+                    redact_url_for_diagnostics(url),
+                    e.without_url()
+                ))
+            })?;
 
         let status = response.status();
 

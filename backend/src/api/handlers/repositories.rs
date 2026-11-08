@@ -12940,10 +12940,14 @@ async fn send_upstream_probe(
         request = crate::services::upstream_auth::apply_upstream_auth(request, upstream_auth);
     }
 
-    request
-        .send()
-        .await
-        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {}", e.without_url())))
+    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
+    // attributes, parented to this request's span, and `traceparent` sent on.
+    crate::services::upstream_tracing::send_upstream_for(
+        request,
+        !egress.overrides_default_routing(),
+    )
+    .await
+    .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {}", e.without_url())))
 }
 
 // ---------------------------------------------------------------------------
