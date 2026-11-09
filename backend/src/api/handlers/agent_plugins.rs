@@ -1283,6 +1283,109 @@ mod tests {
         assert_eq!(catalog.version, "1.2.0");
     }
 
+    /// Downloads of a published archive are the count the Packages API
+    /// reports for that version and its package (#5260): the agent-plugins
+    /// route records the same `download_statistics` rows as every other
+    /// hosted serve, and the catalog count reads them from there.
+    #[tokio::test]
+    async fn downloads_show_in_package_counts_5260() {
+        let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
+            return;
+        };
+        let zip_bytes = claude_zip("counted", "1.0.0");
+        let sha = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&zip_bytes))
+        };
+        let (status, body) = publish(&fx, "counted", "1.0.0", zip_bytes).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 AND checksum_sha256 = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&sha)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("published artifact");
+        let package_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM packages WHERE repository_id = $1 AND name = $2")
+                .bind(fx.repo_id)
+                .bind("counted")
+                .fetch_one(&fx.pool)
+                .await
+                .expect("published package");
+
+        let app = tdh::router_with_auth(
+            Router::new()
+                .nest("/agentplugins", super::router())
+                .nest("/packages", crate::api::handlers::packages::router()),
+            fx.state.clone(),
+            tdh::make_auth(fx.user_id, &fx.username),
+        );
+        for _ in 0..3 {
+            let (dl_status, _) = tdh::send(
+                app.clone(),
+                tdh::get(format!(
+                    "/agentplugins/{}/counted/1.0.0/counted-1.0.0.zip",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(dl_status, StatusCode::OK);
+        }
+        assert_eq!(
+            tdh::download_count_eventually(&fx.pool, artifact_id, 3).await,
+            3
+        );
+
+        let (detail_status, detail_body) =
+            tdh::send(app.clone(), tdh::get(format!("/packages/{package_id}"))).await;
+        let (versions_status, versions_body) = tdh::send(
+            app.clone(),
+            tdh::get(format!("/packages/{package_id}/versions")),
+        )
+        .await;
+        let (list_status, list_body) = tdh::send(
+            app,
+            tdh::get(format!("/packages?repository_key={}", fx.repo_key)),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            detail_status,
+            StatusCode::OK,
+            "detail: {}",
+            String::from_utf8_lossy(&detail_body)
+        );
+        assert_eq!(
+            versions_status,
+            StatusCode::OK,
+            "versions: {}",
+            String::from_utf8_lossy(&versions_body)
+        );
+        assert_eq!(
+            list_status,
+            StatusCode::OK,
+            "list: {}",
+            String::from_utf8_lossy(&list_body)
+        );
+        let detail: Value = serde_json::from_slice(&detail_body).expect("detail json");
+        let versions: Value = serde_json::from_slice(&versions_body).expect("versions json");
+        let list: Value = serde_json::from_slice(&list_body).expect("list json");
+        assert_eq!(detail["download_count"], 3);
+        assert_eq!(versions["versions"][0]["version"], "1.0.0");
+        assert_eq!(versions["versions"][0]["download_count"], 3);
+        let listed = list["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["name"] == "counted")
+            .expect("counted package listed");
+        assert_eq!(listed["download_count"], 3);
+    }
+
     /// Every class of refused publish is a 400 and stores nothing.
     #[tokio::test]
     async fn refused_publishes_are_400_5251() {
