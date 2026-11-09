@@ -167,6 +167,23 @@ Behaviour pinned by the end-to-end suite (clients may rely on it):
   re-renders it as problem+json (test `visibility_middleware_gates_the_surface`).
   A key that names no repository gets the same `401` anonymously, so the
   status does not reveal which private registries exist.
+- Writes keep that guarantee (#5458). A publish, a status change
+  (`PATCH .../status`) or an introspection request (`POST .../capabilities`,
+  `.../capabilities/probe`) on a private repository by an authenticated
+  caller who cannot read it (an administrator of some other repository, a
+  token minted for other repositories) is refused by the same middleware with
+  the plain unknown-name `404`, byte for byte (status, headers, body) what a
+  key naming no repository answers, before any document, namespace, OIDC or
+  policy check runs; nothing is written. A caller who can read the repository
+  but may not write it still gets `403 mcp_forbidden` (test
+  `write_denials_to_non_readers_match_an_unknown_key`). A public or
+  `internal` repository is readable by every authenticated caller, so its
+  write refusal stays `403` (except for a token scoped elsewhere on an
+  `internal` one). The rule is the same on every format route; see
+  [Repository visibility](repository-visibility.md#write-refusals-to-callers-who-cannot-read).
+  Troubleshooting: a publish to a private registry with a token scoped to
+  another repository, or by a user who lost their grant, now answers the
+  unknown-server-name `404`, not `403`; check the token's repository scope.
 - A trailing slash (`/v0.1/servers/`) is not a route: plain `404`.
 - `/versions` is not paged: it returns every servable version (at most the
   newest 1000) with no `nextCursor`.
@@ -184,7 +201,8 @@ Behaviour pinned by the end-to-end suite (clients may rely on it):
   mcp_search_too_short`.
 - A write without `write:artifacts` is `403 mcp_forbidden` ("This token does
   not carry the write:artifacts scope"); a token minted for other repositories
-  is `403 mcp_forbidden`. The `detail` text depends on which check refuses it
+  is `403 mcp_forbidden` on a public repository and the unknown-name `404` on
+  a private or `internal` one (see above). The `detail` text depends on which check refuses it
   ("This token is not scoped to this repository" or "This credential may not
   write to this repository"), so clients should match on `code`, not `detail`.
 
@@ -1718,7 +1736,12 @@ Base: `/api/v1/repositories/{key}/mcp`, Remote MCP repositories only (any
 other key answers `404`). Reads need an authenticated caller who can read
 the repository (token scope `read:repositories`); decisions need the
 repository `admin` action (token scope `write:repositories`). Errors use the
-API's usual `{"code", "message"}` body.
+API's usual `{"code", "message"}` body. A write (sync, seed, pin, a decision
+or a bulk decision) refused to a caller who cannot read the repository
+answers `404 Repository not found`, the same status and body as a key that
+names no repository, so a non-reader cannot learn which private Remote keys
+exist (#5458); a caller who can read it but is not its administrator gets
+`403`.
 
 | Method and path | Who | Request | Response |
 | --- | --- | --- | --- |

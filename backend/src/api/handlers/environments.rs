@@ -36,7 +36,8 @@ use utoipa::{IntoParams, OpenApi};
 use uuid::Uuid;
 
 use crate::api::handlers::repositories::{
-    member_read_visibility, require_repo_action, require_visible,
+    hide_write_denial_from_non_readers, member_read_visibility, require_repo_action,
+    require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -132,7 +133,10 @@ async fn ingest_environment(
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    // #5458: a refusal to a caller who cannot read the repository is the
+    // unknown-key 404.
+    let gate = require_repo_action(&auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(gate, &auth, &repo, &repo_service).await?;
 
     let env = environment_lock::parse_named_lockfile(&query.filename, body.as_ref())?;
     let name = query.name.as_deref().unwrap_or_else(|| {
@@ -292,7 +296,10 @@ async fn delete_environment(
         auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
-    require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // #5458: a refusal to a caller who cannot read the repository is the
+    // unknown-key 404.
+    let gate = require_repo_action(&auth, repo.id, "delete", &state.permission_service).await;
+    hide_write_denial_from_non_readers(gate, &auth, &repo, &repo_service).await?;
 
     let service = EnvironmentService::new(state.db.clone());
     // Read the row first so the audit trail can name what was deleted; a

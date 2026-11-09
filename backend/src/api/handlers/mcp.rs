@@ -6018,6 +6018,114 @@ mod tests {
         env.teardown().await;
     }
 
+    /// #5458: through the real visibility middleware and the surface guard,
+    /// every hosted write (publish, status change, introspection probe) by an
+    /// administrator of ANOTHER repository answers an existing private key
+    /// byte for byte (status, headers, body) as it answers an unknown key,
+    /// and changes nothing. A member who can read keeps the 403.
+    #[tokio::test]
+    async fn write_denials_to_non_readers_match_an_unknown_key() {
+        use crate::api::middleware::auth::{repo_visibility_middleware, RepoVisibilityState};
+        use std::sync::Arc;
+        let Some(env) = Env::new().await else { return };
+        let d = doc("com.acme/a", "1.0.0", serde_json::json!({}));
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        let auth_service = Arc::new(crate::services::auth_service::AuthService::new(
+            env.fx.pool.clone(),
+            Arc::new(env.fx.state.config.clone()),
+        ));
+        let app = Router::new()
+            .nest(MOUNT_PREFIX, super::router())
+            .with_state(env.fx.state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                RepoVisibilityState {
+                    auth_service,
+                    db: env.fx.pool.clone(),
+                    repo_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                    repo_miss_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+                    permission_service: Arc::new(
+                        crate::services::permission_service::PermissionService::new(
+                            env.fx.pool.clone(),
+                        ),
+                    ),
+                },
+                repo_visibility_middleware,
+            ))
+            .layer(axum::middleware::from_fn(mcp_surface_guard));
+        // An administrator of a different repository, not of the instance.
+        let (foreign, _) = tdh::create_user(&env.fx.pool).await;
+        let (own_id, _, own_dir) = tdh::create_repo(&env.fx.pool, "local", "mcp").await;
+        tdh::grant_repo_role(&env.fx.pool, own_id, foreign, "repository-owner").await;
+        let foreign_bearer = tdh::bearer_for(&env.fx.state, foreign).await;
+        let (reader, _) = tdh::create_user(&env.fx.pool).await;
+        tdh::grant_repo_role(&env.fx.pool, env.fx.repo_id, reader, "reader").await;
+        let reader_bearer = tdh::bearer_for(&env.fx.state, reader).await;
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let version = "/servers/com.acme%2Fa/versions/1.0.0";
+        let writes: [(&str, String, Option<serde_json::Value>); 3] = [
+            ("POST", "/publish".to_string(), Some(d.clone())),
+            (
+                "PATCH",
+                format!("{version}/status"),
+                Some(serde_json::json!({"status": "deleted"})),
+            ),
+            ("POST", format!("{version}/capabilities/probe"), None),
+        ];
+        let send =
+            |key: &str, bearer: &str, verb: &str, tail: &str, body: Option<&serde_json::Value>| {
+                let mut b = Request::builder()
+                    .method(verb)
+                    .uri(format!("/mcp/{key}/v0.1{tail}"))
+                    .header(header::AUTHORIZATION, bearer);
+                if body.is_some() {
+                    b = b.header(header::CONTENT_TYPE, "application/json");
+                }
+                let body = body
+                    .map(|v| Body::from(serde_json::to_vec(v).unwrap()))
+                    .unwrap_or_else(Body::empty);
+                tdh::send_with_headers(app.clone(), b.body(body).unwrap())
+            };
+        for (verb, tail, body) in &writes {
+            let existing = send(&env.fx.repo_key, &foreign_bearer, verb, tail, body.as_ref()).await;
+            let missing = send(&unknown, &foreign_bearer, verb, tail, body.as_ref()).await;
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{verb} {tail}");
+            assert_eq!(
+                &existing.1[..],
+                fmt::NOT_FOUND_BODY.as_bytes(),
+                "{verb} {tail}"
+            );
+            assert_eq!(
+                existing, missing,
+                "{verb} {tail}: existing private vs unknown"
+            );
+            assert_refusal_headers(&existing.2);
+            assert!(!existing.2.contains_key(header::WWW_AUTHENTICATE));
+            // A member who can read already knows the repository exists.
+            let (s, b, h) = send(&env.fx.repo_key, &reader_bearer, verb, tail, body.as_ref()).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{verb} {tail}: reader");
+            assert_eq!(json(&b)["error"], "mcp_forbidden");
+            assert_refusal_headers(&h);
+        }
+        // Nothing changed: one stored version, still active, no probe job.
+        let rows = versions_of(&env.fx.pool, env.fx.repo_id, "com.acme/a")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].stored.registry.status, ServerStatus::Active);
+        let jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM mcp_introspection_jobs WHERE repository_id = $1",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(jobs, 0);
+        tdh::cleanup_member_repo(&env.fx.pool, own_id, &own_dir).await;
+        tdh::cleanup_user(&env.fx.pool, foreign).await;
+        tdh::cleanup_user(&env.fx.pool, reader).await;
+        env.teardown().await;
+    }
+
     /// T6: publisher URLs are never dereferenced, on publish or on any read.
     #[tokio::test]
     async fn mcp_no_outbound() {
