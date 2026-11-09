@@ -889,6 +889,18 @@ impl SnapshotRow {
         (self.freshness(), self.created_at, self.id)
     }
 
+    /// What [`pick_current`] ranks this snapshot by.
+    pub fn rank(&self) -> SnapshotRank {
+        SnapshotRank {
+            id: self.id,
+            source: self.source.clone(),
+            outcome: self.outcome.clone(),
+            observed_at: self.observed_at,
+            last_seen_at: self.last_seen_at,
+            created_at: self.created_at,
+        }
+    }
+
     pub fn set(&self) -> CapabilitySet {
         CapabilitySet {
             tools: arr(&self.tools),
@@ -1241,11 +1253,47 @@ pub async fn prune_snapshots(db: &PgPool) -> sqlx::Result<u64> {
 /// not the last to arrive, #5464) of the source with the best
 /// [`Source::precedence`] (or of `source` when given).
 pub fn pick_current(rows: &[SnapshotRow], source: Option<Source>) -> Option<&SnapshotRow> {
-    rows.iter()
+    let ranks: Vec<SnapshotRank> = rows.iter().map(SnapshotRow::rank).collect();
+    let id = pick_current_rank(&ranks, source)?.id;
+    rows.iter().find(|r| r.id == id)
+}
+
+/// The columns [`pick_current`] ranks a snapshot by, without its lists.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct SnapshotRank {
+    pub id: Uuid,
+    pub source: String,
+    pub outcome: String,
+    pub observed_at: DateTime<Utc>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl SnapshotRank {
+    fn freshness_key(&self) -> (DateTime<Utc>, DateTime<Utc>, Uuid) {
+        (
+            self.last_seen_at.unwrap_or(self.observed_at),
+            self.created_at,
+            self.id,
+        )
+    }
+}
+
+/// The current one of `ranks` (see [`pick_current`]): the freshest
+/// successful one of the source with the best [`Source::precedence`], or of
+/// `source` when given. The one ranking both [`pick_current`] and
+/// [`is_current_in`] apply.
+pub fn pick_current_rank(ranks: &[SnapshotRank], source: Option<Source>) -> Option<&SnapshotRank> {
+    ranks
+        .iter()
         .filter(|r| r.outcome == Outcome::Ok.as_str())
         .filter(|r| source.is_none_or(|s| r.source == s.as_str()))
         .min_by(|a, b| {
-            let rank = |r: &SnapshotRow| r.source().map(Source::precedence).unwrap_or(u8::MAX);
+            let rank = |r: &SnapshotRank| {
+                Source::parse(&r.source)
+                    .map(Source::precedence)
+                    .unwrap_or(u8::MAX)
+            };
             rank(a)
                 .cmp(&rank(b))
                 .then(b.freshness_key().cmp(&a.freshness_key()))
@@ -1254,14 +1302,24 @@ pub fn pick_current(rows: &[SnapshotRow], source: Option<Source>) -> Option<&Sna
 
 /// Whether snapshot `id` is the current view of `artifact_id`
 /// ([`pick_current`] over the freshest [`HISTORY_WINDOW`]), read on `conn`
-/// (the transaction that stored it).
+/// (the transaction that stored it). Reads only the ranking columns: this
+/// runs while the job row is locked.
 pub async fn is_current_in(
     conn: &mut sqlx::PgConnection,
     artifact_id: Uuid,
     id: Uuid,
 ) -> sqlx::Result<bool> {
-    let rows = list_snapshots(&mut *conn, artifact_id, None, HISTORY_WINDOW).await?;
-    Ok(pick_current(&rows, None).is_some_and(|c| c.id == id))
+    let sql = format!(
+        "SELECT id, source, outcome, observed_at, last_seen_at, created_at \
+         FROM mcp_capability_snapshots WHERE artifact_id = $1 \
+         ORDER BY {FRESHEST_FIRST} LIMIT $2"
+    );
+    let ranks: Vec<SnapshotRank> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(artifact_id)
+        .bind(HISTORY_WINDOW)
+        .fetch_all(conn)
+        .await?;
+    Ok(pick_current_rank(&ranks, None).is_some_and(|c| c.id == id))
 }
 
 /// The successful snapshot just before `to` in freshness order among `rows`
@@ -1867,6 +1925,19 @@ mod tests {
         );
         rows[0].last_seen_at = DateTime::from_timestamp(35, 0);
         assert_eq!(pick_current(&rows, None).unwrap().id, late.id);
+        // The ranking-columns path picks the same row.
+        let ranks: Vec<SnapshotRank> = rows.iter().map(SnapshotRow::rank).collect();
+        for source in [
+            None,
+            Some(Source::RemoteProbe),
+            Some(Source::PublisherDeclared),
+        ] {
+            assert_eq!(
+                pick_current_rank(&ranks, source).map(|r| r.id),
+                pick_current(&rows, source).map(|r| r.id),
+                "{source:?}"
+            );
+        }
         let rows = &rows[1..];
         let j = rows[2].to_json();
         assert_eq!(j["observed"], true);

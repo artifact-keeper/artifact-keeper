@@ -2428,9 +2428,12 @@ pre-transaction check (#5533 tracks evaluating the whole gate on the
 transaction). A target that no longer qualifies answers `409
 mcp_target_ineligible` with a `reason`, stores nothing and cancels the job,
 as a claim of a held version does. A gate that cannot be evaluated is no
-hold: a claim answers `503 mcp_gate_unavailable` and returns the job to the
-queue (due in a minute, its attempt not spent), a completion answers `503
-mcp_gate_unavailable` and leaves the claim as it was.
+hold: a claim returns the job to the queue and tries the next candidate
+(answering `503 mcp_gate_unavailable` only when nothing servable was found),
+and a completion answers `503 mcp_gate_unavailable` and leaves the claim as it
+was. A released job is due again after 1, 2, 4 ... up to 64 minutes; its first
+five releases give the attempt back, later ones spend it, so a gate that never
+becomes evaluable fails the job once its attempts are used up.
 
 Claim order is fair across repositories: a claim hands out a due job from the
 repository with the fewest jobs claimed at that moment, and within it the
@@ -2459,8 +2462,8 @@ the token was last validated with.
 
 `POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
 "workerId": "pod-a"}` (both optional) answers `204` when nothing is due,
-`503 mcp_gate_unavailable` when the claimed job's gates could not be
-evaluated (the job goes back to the queue), or
+`503 mcp_gate_unavailable` when nothing servable was found and a
+candidate's gates could not be evaluated (it goes back to the queue), or
 `200`:
 
 ```json

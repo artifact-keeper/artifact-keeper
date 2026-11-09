@@ -785,7 +785,7 @@ pub fn job_limits(kind: JobKind) -> Value {
         (status = 400, description = "Malformed request"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not an `mcp:introspect` API token (`mcp_forbidden`)"),
-        (status = 503, description = "`mcp_gate_unavailable`: the claimed job's gates could not be evaluated; it is back in the queue"),
+        (status = 503, description = "`mcp_gate_unavailable`: nothing servable was found and a candidate's gates could not be evaluated; it is back in the queue"),
     )
 )]
 async fn claim_job(
@@ -798,64 +798,82 @@ async fn claim_job(
     // (#5460): a token restricted to repository A never claims B's job.
     let scope = require_introspector(auth)?.access_scope();
     let (kinds, worker) = parse_claim(&body)?;
-    // A job that cannot run any more is cancelled and the next one tried.
+    // A job that cannot run any more is cancelled, one whose gates cannot be
+    // evaluated now is released to the queue, and the next one tried. Only
+    // when nothing servable was found and a gate was unavailable is the
+    // answer `503` rather than `204`.
+    let mut unavailable = false;
     for _ in 0..10 {
         let Some(claim) = jobs::claim(&state.db, &kinds, &worker, &scope)
             .await
             .map_err(app_error)?
         else {
-            return Ok(StatusCode::NO_CONTENT.into_response());
+            break;
         };
         match claim_payload(&state, &claim, base.as_str()).await? {
             Ok(payload) => return Ok(json_resp(StatusCode::OK, &payload)),
-            Err(reason) => {
+            Err(Unclaimable::Cancel(reason)) => {
                 jobs::cancel(&state.db, &claim.job, &reason)
                     .await
                     .map_err(app_error)?;
             }
+            Err(Unclaimable::GateUnavailable) => {
+                jobs::release(&state.db, &claim.job, "serve gate unavailable")
+                    .await
+                    .map_err(app_error)?;
+                unavailable = true;
+            }
         }
     }
+    if unavailable {
+        return Err(gate_unavailable());
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Why a claimed job is not handed to the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unclaimable {
+    /// It cannot run any more: cancelled with this reason.
+    Cancel(String),
+    /// Its gates could not be evaluated: released to the queue.
+    GateUnavailable,
 }
 
 async fn claim_payload(
     state: &SharedState,
     claim: &jobs::Claim,
     base: &str,
-) -> Result<Result<Value, String>, Response> {
+) -> Result<Result<Value, Unclaimable>, Response> {
     let job = &claim.job;
+    let cancel = |reason: &str| Ok(Err(Unclaimable::Cancel(reason.into())));
     let Some(kind) = job.kind() else {
-        return Ok(Err("unknown job kind".into()));
+        return cancel("unknown job kind");
     };
     let Some(v) = caps::version_ref(&state.db, job.artifact_id)
         .await
         .map_err(internal)?
     else {
-        return Ok(Err("server version deleted".into()));
+        return cancel("server version deleted");
     };
     let Some(stored) = fmt::StoredVersion::from_metadata(&v.metadata) else {
-        return Ok(Err("unreadable server version".into()));
+        return cancel("unreadable server version");
     };
     let repo = surface::mcp_repo(&state.db, &v.repository_key).await?;
     // Only a version whose gates pass is ever introspected: a sandbox run
     // executes exactly the bytes AK scanned, and a remote probe contacts a
     // held, blocked or unapproved version's endpoints no more than a reader
-    // could. A gate that cannot be evaluated is no hold: the claim is handed
-    // back to the queue and the worker told to retry, never cancelled.
+    // could. A gate that cannot be evaluated is no hold: the caller hands
+    // the claim back to the queue, never cancels it.
     match surface::artifact_servability(state, &repo, v.artifact_id, base).await {
         Servability::Servable => {}
-        Servability::Held => return Ok(Err("server version is held".into())),
-        Servability::Unavailable => {
-            jobs::release(&state.db, job, "serve gate unavailable")
-                .await
-                .map_err(app_error)?;
-            return Err(gate_unavailable());
-        }
+        Servability::Held => return cancel("server version is held"),
+        Servability::Unavailable => return Ok(Err(Unclaimable::GateUnavailable)),
     }
     let served = fmt::rewrite_packages_for_serve(&stored.server, &stored.pins, base);
     let target = match jobs::job_target(kind, &job.target_key, &stored, &served) {
         Ok(t) => t,
-        Err(_) => return Ok(Err("target no longer eligible".into())),
+        Err(_) => return cancel("target no longer eligible"),
     };
     Ok(Ok(json!({
         "jobId": job.id,
@@ -1731,7 +1749,7 @@ mod db_tests {
         .unwrap();
         assert_eq!(
             claim_payload(&env.fx.state, &claim, base).await.unwrap(),
-            Err("server version is held".to_string())
+            Err(Unclaimable::Cancel("server version is held".to_string()))
         );
         for sql in [
             "DELETE FROM mcp_introspection_jobs WHERE repository_id = $1",
@@ -2147,6 +2165,7 @@ mod db_tests {
         let queued = results
             .len()
             .min(env.fx.pool.options().get_max_connections() as usize);
+        assert!(queued >= 2, "a race needs two queued completions");
         let uri = format!("/jobs/{job}/complete");
         let tasks: Vec<_> = results
             .into_iter()
@@ -2158,7 +2177,8 @@ mod db_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
                    AND query LIKE '%FROM mcp_introspection_jobs j%FOR UPDATE OF j%'",
             )
             .fetch_one(&side)
@@ -2266,6 +2286,79 @@ mod db_tests {
                 other => panic!("round {round}: {other:?}"),
             }
         }
+        env.cleanup().await;
+    }
+
+    /// #5463 review: a job whose gates cannot be evaluated is released, not
+    /// cancelled, with a doubling backoff; the first `RELEASE_REFUNDS`
+    /// releases hand the attempt back, later ones spend it, and a job out of
+    /// attempts fails instead of cycling forever.
+    #[tokio::test]
+    async fn released_jobs_back_off_and_eventually_fail() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let max = jobs::RELEASE_REFUNDS + 3;
+        let mut last_delay = 0;
+        for n in 0..max {
+            let job = env.claim_probe(artifact_id, &format!("tok-rel-{n}")).await;
+            let before = Utc::now();
+            let status = jobs::release(&env.fx.pool, &job, "gate unavailable")
+                .await
+                .unwrap()
+                .expect("the current claim is released");
+            let after = jobs::get_job(&env.fx.pool, job.id).await.unwrap().unwrap();
+            let refunded = n < jobs::RELEASE_REFUNDS;
+            assert_eq!(
+                after.attempts,
+                if refunded {
+                    job.attempts - 1
+                } else {
+                    job.attempts
+                },
+                "release {n}"
+            );
+            if !refunded && job.attempts >= job.max_attempts {
+                assert_eq!(status, "failed", "release {n}");
+                assert!(after.completed_at.is_some());
+                break;
+            }
+            assert_eq!(status, "pending", "release {n}");
+            let delay = jobs::release_delay_secs(n);
+            assert!(delay >= last_delay, "backoff grows");
+            last_delay = delay;
+            let due = (after.not_before - before).num_seconds();
+            assert!(
+                (delay - 2..=delay + 2).contains(&due),
+                "release {n}: {due} vs {delay}"
+            );
+            // Due now, for the next round's claim.
+            env.exec(
+                "UPDATE mcp_introspection_jobs SET not_before = NOW() WHERE id = $1",
+                job.id,
+            )
+            .await;
+            assert!(n + 1 < max, "the job never failed");
+        }
+        // A release of a claim that is no longer current changes nothing.
+        let stale = jobs::JobRow {
+            claim_token_hash: Some("gone".into()),
+            ..jobs::list_jobs(&env.fx.pool, artifact_id, 1).await.unwrap()[0].clone()
+        };
+        assert_eq!(
+            jobs::release(&env.fx.pool, &stale, "x").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            jobs::release_delay_secs(100),
+            60 << jobs::RELEASE_BACKOFF_CAP
+        );
         env.cleanup().await;
     }
 

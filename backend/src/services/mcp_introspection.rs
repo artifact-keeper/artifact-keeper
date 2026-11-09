@@ -678,23 +678,51 @@ async fn finish(
     Ok(done.rows_affected() == 1)
 }
 
-/// Hand a claimed job back to the queue without spending its attempt, due
-/// again in a minute: its gates could not be evaluated, which is no verdict
-/// on the job. Only the current claim is released.
-pub async fn release(db: &PgPool, job: &JobRow, reason: &str) -> crate::error::Result<bool> {
-    let done = sqlx::query(
-        "UPDATE mcp_introspection_jobs SET status = 'pending', \
-           attempts = GREATEST(attempts - 1, 0), not_before = NOW() + INTERVAL '1 minute', \
+/// Releases of a job ([`release`]) that hand its attempt back; later ones
+/// spend it.
+pub const RELEASE_REFUNDS: i32 = 5;
+/// The longest backoff of a released job: `60 s * 2^RELEASE_BACKOFF_CAP`.
+pub const RELEASE_BACKOFF_CAP: i32 = 6;
+
+/// The delay before a job released for the `releases`-th time (counting
+/// from 0) is due again: one minute, doubling up to
+/// [`RELEASE_BACKOFF_CAP`].
+pub fn release_delay_secs(releases: i32) -> i64 {
+    60 * (1i64 << releases.clamp(0, RELEASE_BACKOFF_CAP))
+}
+
+/// Hand a claimed job back to the queue: its gates could not be evaluated,
+/// which is no verdict on the job. It is due again after
+/// [`release_delay_secs`]; the first [`RELEASE_REFUNDS`] releases do not
+/// spend the claim's attempt, later ones do, and a job out of attempts fails
+/// as the reaper fails it, so a gate that never becomes evaluable cannot
+/// cycle a job forever. Only the current claim is released. Returns the
+/// job's status after the release, `None` when the claim was not current.
+pub async fn release(
+    db: &PgPool,
+    job: &JobRow,
+    reason: &str,
+) -> crate::error::Result<Option<String>> {
+    sqlx::query_scalar(
+        "UPDATE mcp_introspection_jobs SET gate_releases = gate_releases + 1, \
+           attempts = CASE WHEN gate_releases < $4 THEN GREATEST(attempts - 1, 0) \
+                           ELSE attempts END, \
+           status = CASE WHEN gate_releases >= $4 AND attempts >= max_attempts \
+                         THEN 'failed' ELSE 'pending' END, \
+           completed_at = CASE WHEN gate_releases >= $4 AND attempts >= max_attempts \
+                               THEN NOW() END, \
+           not_before = NOW() + make_interval(secs => 60 * power(2, LEAST(gate_releases, $5))), \
            last_error = $3, claim_token_hash = NULL, lease_expires_at = NULL, updated_at = NOW() \
-         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2",
+         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2 RETURNING status",
     )
     .bind(job.id)
     .bind(&job.claim_token_hash)
     .bind(reason)
-    .execute(db)
+    .bind(RELEASE_REFUNDS)
+    .bind(RELEASE_BACKOFF_CAP)
+    .fetch_optional(db)
     .await
-    .map_err(db_err)?;
-    Ok(done.rows_affected() == 1)
+    .map_err(db_err)
 }
 
 /// Cancel a claimed job that cannot run (target gone, version held).
