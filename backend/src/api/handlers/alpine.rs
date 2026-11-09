@@ -1340,11 +1340,9 @@ async fn download_package(
     ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     // rules_apko fetches an .apk's three sections as separate ranged GETs and
-    // checksums each; ignoring Range answered 200 and failed all three.
-    let range_header = headers
-        .get(axum::http::header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // checksums each; ignoring Range answered 200 and failed all three. A
+    // stored package carries no ETag, so an `If-Range` gets the whole file.
+    let range_header = proxy_helpers::effective_range(&headers, None, ctx.is_head);
     if !filename.ends_with(".apk") {
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
@@ -1403,7 +1401,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
-                    range_header.as_deref(),
+                    &headers,
                 )
                 .await?
                 {
@@ -1437,11 +1435,10 @@ async fn download_package(
                 )
                 .await?;
 
-                return proxy_helpers::stream_fetch_result_ranged(
-                    result,
-                    "application/vnd.alpine.package",
-                    None,
-                    range_header.as_deref(),
+                return proxy_helpers::apply_range_to_streamed_serve(
+                    proxy_helpers::stream_fetch_result(result, APK_CONTENT_TYPE, None)?,
+                    &headers,
+                    ctx.is_head,
                 );
             }
 
@@ -1463,7 +1460,7 @@ async fn download_package(
             crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
             serve_ranged_apk(
-                range_header.as_deref(),
+                range_header,
                 artifact.size_bytes.max(0) as u64,
                 stream,
                 &filename,
@@ -1486,7 +1483,7 @@ async fn download_package(
 
             let total = content.len() as u64;
             serve_ranged_apk(
-                range_header.as_deref(),
+                range_header,
                 total,
                 futures::stream::once(async move { Ok(content) }).boxed(),
                 &filename,
@@ -1526,7 +1523,7 @@ async fn download_package(
                     &arch,
                     &filename,
                     &ctx,
-                    range_header.as_deref(),
+                    &headers,
                 )
                 .await?
                 {
@@ -1748,7 +1745,7 @@ async fn try_proxy_apk(
     arch: &str,
     filename: &str,
     ctx: &crate::api::middleware::download_telemetry::DownloadContext,
-    range_header: Option<&str>,
+    headers: &HeaderMap,
 ) -> Result<Option<Response>, Response> {
     let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
         (Some(u), Some(p)) => (u, p),
@@ -1777,13 +1774,11 @@ async fn try_proxy_apk(
     // lines up with the catalog row the artifact listing renders. `ctx` is
     // threaded in from `download_package` for exactly this call.
     proxy_helpers::record_proxy_download(state, repo.id, repo_key, &upstream_path, ctx).await;
-    proxy_helpers::stream_fetch_result_ranged(
-        result,
-        "application/octet-stream",
-        None,
-        range_header,
-    )
-    .map(Some)
+    // The proxied serve is a complete `200`; the shared helper cuts the
+    // client's window from it (#5554), and a cold fill the client stops
+    // reading at the window's end still completes (#5509).
+    let resp = proxy_helpers::stream_fetch_result(result, "application/octet-stream", None)?;
+    proxy_helpers::apply_range_to_streamed_serve(resp, headers, ctx.is_head).map(Some)
 }
 
 // ---------------------------------------------------------------------------
@@ -5269,5 +5264,156 @@ mod serve_key_4365_tests {
             assert!(key.scannable, "{path}");
             assert_eq!(key.cache_key, path);
         }
+    }
+}
+
+/// A ranged `.apk` GET on a cold Remote cache fills the cache (#5509).
+///
+/// Served over a real socket, because the bug lives in hyper: it stops
+/// polling a body once `Content-Length` bytes are out, so a client window
+/// ending before EOF used to drop the tee into the proxy cache mid-object.
+/// An in-process `oneshot` reads the body to its end and cannot see that.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+// Test reads of small, bounded bodies (#1608 exempts test scaffolding).
+#[allow(clippy::disallowed_methods)]
+mod ranged_cold_fill_5509 {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::{header, StatusCode};
+
+    const PATH: &str = "v3.21/main/x86_64/pkg-1.0-r0.apk";
+    const ETAG: &str = "\"apk-v1\"";
+
+    /// Several tee chunks long, so the first window ends well before EOF.
+    fn payload() -> Vec<u8> {
+        (0..300 * 1024u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    async fn serve(app: axum::Router) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+        });
+        (base, stop)
+    }
+
+    #[tokio::test]
+    async fn a_cold_ranged_get_fills_the_cache_5509() {
+        let Some(fx) = tdh::Fixture::setup("remote", "alpine").await else {
+            return;
+        };
+        tdh::publish_repo(&fx.pool, fx.repo_id).await;
+        let data = payload();
+        let total = data.len();
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{PATH}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", ETAG)
+                    .set_body_bytes(data.clone()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let (state, cache) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+        let (base, stop) = serve(tdh::router_anon(super::router(), state)).await;
+        let url = format!("{base}/{}/{PATH}", fx.repo_key);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |headers: &[(header::HeaderName, &str)]| {
+            let mut req = client.get(&url);
+            for (name, value) in headers {
+                req = req.header(name.clone(), *value);
+            }
+            req
+        };
+
+        // Cold: the first span only, as rules_apko asks for the signature.
+        let cold = get(&[(header::RANGE, "bytes=0-99")]).send().await.unwrap();
+        assert_eq!(cold.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            cold.headers()[header::CONTENT_RANGE],
+            format!("bytes 0-99/{total}").as_str()
+        );
+        assert_eq!(&cold.bytes().await.unwrap()[..], &data[..100]);
+
+        // The fill outlives the client's window and commits the whole object.
+        tdh::wait_for_cache_commit(cache.path(), total as u64).await;
+
+        let warm = get(&[(header::RANGE, "bytes=100-199")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(warm.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            warm.headers()[header::CONTENT_RANGE],
+            format!("bytes 100-199/{total}").as_str()
+        );
+        assert_eq!(&warm.bytes().await.unwrap()[..], &data[100..200]);
+
+        let whole = get(&[]).send().await.unwrap();
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(&whole.bytes().await.unwrap()[..], &data[..]);
+
+        // `If-Range`: the current ETag keeps the range, a stale one gets all.
+        let current = get(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, ETAG)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&current.bytes().await.unwrap()[..], &data[..10]);
+        let stale = get(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"old\"")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        assert_eq!(&stale.bytes().await.unwrap()[..], &data[..]);
+
+        // HEAD ignores `Range`: a 200 describing the whole file, no body.
+        let head = client
+            .head(&url)
+            .header(header::RANGE, "bytes=0-99")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()[header::CONTENT_LENGTH],
+            total.to_string().as_str()
+        );
+        assert!(head.headers().get(header::CONTENT_RANGE).is_none());
+        assert!(head.bytes().await.unwrap().is_empty());
+
+        // Past the end is a 416 naming the length.
+        let past_end = format!("bytes={total}-");
+        let past = get(&[(header::RANGE, past_end.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            past.headers()[header::CONTENT_RANGE],
+            format!("bytes */{total}").as_str()
+        );
+
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        let _ = stop.send(());
+        fx.teardown().await;
+        assert_eq!(requests.len(), 1, "every serve after the cold one is a hit");
+        assert!(
+            requests.iter().all(|r| !r.headers.contains_key("range")),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
     }
 }

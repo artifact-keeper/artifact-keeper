@@ -2013,81 +2013,94 @@ pub(crate) async fn proxy_cache_fresh_redirect(
     .await)
 }
 
-/// [`stream_fetch_result`] that honours a client `Range` header.
+/// The `Range` to honour for this request, if any.
 ///
-/// Deliberately a sibling rather than an extra parameter on
-/// [`stream_fetch_result`]: that helper has 38 call sites, and only the alpine
-/// `.apk` download has a client that ranges. Every other caller keeps the
-/// existing full-body behaviour until a format needs it.
-#[allow(clippy::result_large_err)]
-pub fn stream_fetch_result_ranged(
-    result: crate::services::proxy_service::StreamingFetchResult,
-    default_content_type: &str,
-    filename: Option<&str>,
-    range_header: Option<&str>,
-) -> std::result::Result<Response, Response> {
-    // No length means no `total` to resolve against; an encoding means offsets
-    // would address coded bytes while the client counts decoded ones.
-    let rangeable = result.content_length.is_some() && result.content_encoding.is_none();
-    let total = match (range_header, result.content_length, rangeable) {
-        (Some(_), Some(total), true) => total,
-        // Advertise the capability even with no Range on this request, or a
-        // client that probes Accept-Ranges first concludes we cannot range.
-        _ => {
-            let mut resp = stream_fetch_result(result, default_content_type, filename)?;
-            if rangeable {
-                resp.headers_mut().insert(
-                    axum::http::header::ACCEPT_RANGES,
-                    axum::http::HeaderValue::from_static("bytes"),
-                );
-            }
-            return Ok(resp);
+/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
+/// keeps reporting the whole file. `If-Range` keeps it only for the current
+/// strong ETag; an older ETag or a date gets the whole file, which is the safe
+/// answer for a client resuming a file that may have changed (§13.1.5).
+pub(crate) fn effective_range<'a>(
+    headers: &'a axum::http::HeaderMap,
+    etag: Option<&str>,
+    is_head: bool,
+) -> Option<&'a str> {
+    use axum::http::header;
+    if is_head {
+        return None;
+    }
+    if let Some(validator) = headers.get(header::IF_RANGE) {
+        let current = etag.filter(|e| !e.starts_with("W/"));
+        if validator.to_str().ok() != current || current.is_none() {
+            return None;
         }
+    }
+    headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+}
+
+/// Apply the client's `Range` to a proxied serve that arrives as a complete
+/// `200`: the one path that ranges a Remote or Virtual serve (#5554), used by
+/// the Hugging Face resolve route (#5145), the generic download route's Remote
+/// and Virtual arms (#5502) and the Alpine `.apk` route (#5478, #5509).
+///
+/// The window is cut from the object's stream by
+/// [`crate::api::handlers::repositories::ranged_stream_response`], as the OCI
+/// blob route does for its proxied bytes, so `206`, `416 bytes */N`, a
+/// multi-range answered `200` with every byte, `If-Range` and HEAD (`200`
+/// with no body) behave the same on every format. `Range` is never forwarded
+/// upstream, so a cold serve fills the cache with the whole file: the proxy
+/// keeps reading a streaming fill the client stops reading once its window
+/// is out (#5509).
+///
+/// Left as it is: anything but a `200` (a presigned redirect's target answers
+/// `Range` itself), a content-coded body (a client's offsets describe the
+/// decoded file) and a body of unknown length. Neither of those advertises
+/// `Accept-Ranges`; every other serve does, ranged or not.
+#[allow(clippy::result_large_err)]
+pub(crate) fn apply_range_to_streamed_serve(
+    resp: Response,
+    headers: &axum::http::HeaderMap,
+    is_head: bool,
+) -> std::result::Result<Response, Response> {
+    use axum::http::header;
+
+    let total = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let Some(total) = total.filter(|_| {
+        resp.status() == StatusCode::OK && !resp.headers().contains_key(header::CONTENT_ENCODING)
+    }) else {
+        return Ok(resp);
     };
 
-    // ranged_stream_response owns content-length; the guard above ruled out encoding.
-    let mut base_headers: Vec<(axum::http::header::HeaderName, String)> = vec![(
-        axum::http::header::CONTENT_TYPE,
-        result
-            .content_type
-            .clone()
-            .unwrap_or_else(|| default_content_type.to_string()),
-    )];
-    if let Some(etag) = result.etag.clone() {
-        base_headers.push((axum::http::header::ETAG, etag));
-    }
-    if let Some(sha) = result.commit_sha.clone() {
-        if axum::http::HeaderValue::from_str(&sha).is_ok() {
-            base_headers.push((
-                axum::http::header::HeaderName::from_static(
-                    crate::services::proxy_service::UPSTREAM_COMMIT_HEADER,
-                ),
-                sha,
-            ));
-        }
-    }
-    if let Some(fname) = filename {
-        base_headers.push((
-            axum::http::header::CONTENT_DISPOSITION,
-            content_disposition_attachment(fname),
-        ));
-    }
-    // #4581: a ranged stale-if-error serve is marked like a whole one.
-    if let Some(since) = result.stale_since {
-        base_headers.push((axum::http::header::WARNING, STALE_WARNING.to_string()));
-        base_headers.push((
-            axum::http::header::HeaderName::from_static(STALE_SINCE_HEADER),
-            since.to_rfc3339(),
-        ));
-    }
-
-    crate::api::handlers::repositories::ranged_stream_response(
-        Some(range_header.unwrap_or_default()),
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok());
+    let range = effective_range(headers, etag, is_head);
+    let (mut parts, body) = resp.into_parts();
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|e| AppError::BadGateway(e.to_string())))
+        .boxed();
+    let ranged = crate::api::handlers::repositories::ranged_stream_response(
+        range,
         total,
-        result.body,
-        base_headers,
+        stream,
+        Vec::new(),
     )
-    .map_err(|e| e.into_response())
+    .map_err(|e| e.into_response())?;
+
+    let (ranged_parts, ranged_body) = ranged.into_parts();
+    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
+        // No representation is served, so none of its headers apply.
+        parts.headers.clear();
+    }
+    parts.status = ranged_parts.status;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.extend(ranged_parts.headers);
+    Ok(Response::from_parts(parts, ranged_body))
 }
 
 /// Fetch from upstream via the proxy service, returning a presigned redirect
@@ -13366,13 +13379,26 @@ mod tests {
         }
     }
 
+    /// The shared Range helper over a proxied serve of `result`, with `range`
+    /// as the client's `Range` header.
+    #[allow(clippy::result_large_err)]
+    fn ranged(
+        result: crate::services::proxy_service::StreamingFetchResult,
+        range: Option<&str>,
+    ) -> std::result::Result<Response, Response> {
+        let mut headers = axum::http::HeaderMap::new();
+        if let Some(range) = range {
+            headers.insert(axum::http::header::RANGE, range.parse().unwrap());
+        }
+        let resp = stream_fetch_result(result, "application/octet-stream", None)?;
+        apply_range_to_streamed_serve(resp, &headers, false)
+    }
+
     /// rules_apko asks for the signature span and checksums exactly those bytes.
     #[test]
     fn a_range_over_a_known_length_is_answered_206() {
-        let resp = stream_fetch_result_ranged(
+        let resp = ranged(
             fetch_result(b"0123456789", Some(10), None),
-            "application/octet-stream",
-            None,
             Some("bytes=0-3"),
         )
         .expect("ranged serve");
@@ -13400,13 +13426,8 @@ mod tests {
     /// No length means no `total`, so serve it all rather than invent one.
     #[test]
     fn a_range_without_a_content_length_serves_the_whole_body() {
-        let resp = stream_fetch_result_ranged(
-            fetch_result(b"0123456789", None, None),
-            "application/octet-stream",
-            None,
-            Some("bytes=0-3"),
-        )
-        .expect("full serve");
+        let resp =
+            ranged(fetch_result(b"0123456789", None, None), Some("bytes=0-3")).expect("full serve");
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp
             .headers()
@@ -13417,10 +13438,8 @@ mod tests {
     /// Offsets would address coded bytes; a gzip slice is silent corruption.
     #[test]
     fn a_range_over_a_content_coded_body_serves_the_whole_body() {
-        let resp = stream_fetch_result_ranged(
+        let resp = ranged(
             fetch_result(b"0123456789", Some(10), Some("gzip")),
-            "application/octet-stream",
-            None,
             Some("bytes=0-3"),
         )
         .expect("full serve");
@@ -13442,13 +13461,7 @@ mod tests {
     /// this request carried no Range.
     #[test]
     fn an_unranged_200_still_advertises_accept_ranges() {
-        let resp = stream_fetch_result_ranged(
-            fetch_result(b"0123456789", Some(10), None),
-            "application/octet-stream",
-            None,
-            None,
-        )
-        .expect("full serve");
+        let resp = ranged(fetch_result(b"0123456789", Some(10), None), None).expect("full serve");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -13463,13 +13476,7 @@ mod tests {
     #[test]
     fn an_unrangeable_body_does_not_advertise_accept_ranges() {
         for (len, enc) in [(None, None), (Some(10), Some("gzip"))] {
-            let resp = stream_fetch_result_ranged(
-                fetch_result(b"0123456789", len, enc),
-                "application/octet-stream",
-                None,
-                None,
-            )
-            .expect("full serve");
+            let resp = ranged(fetch_result(b"0123456789", len, enc), None).expect("full serve");
             assert!(
                 resp.headers()
                     .get(axum::http::header::ACCEPT_RANGES)
@@ -13482,13 +13489,7 @@ mod tests {
     /// No Range must stay exactly as before, or every ordinary apk client regresses.
     #[test]
     fn no_range_header_is_an_ordinary_200() {
-        let resp = stream_fetch_result_ranged(
-            fetch_result(b"0123456789", Some(10), None),
-            "application/octet-stream",
-            None,
-            None,
-        )
-        .expect("full serve");
+        let resp = ranged(fetch_result(b"0123456789", Some(10), None), None).expect("full serve");
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -13505,10 +13506,8 @@ mod tests {
     /// 416, not a silent 200: a bad offset has to be visible to the client.
     #[test]
     fn a_range_past_the_end_is_416() {
-        let resp = stream_fetch_result_ranged(
+        let resp = ranged(
             fetch_result(b"0123456789", Some(10), None),
-            "application/octet-stream",
-            None,
             Some("bytes=99-120"),
         )
         .expect("unsatisfiable serve");

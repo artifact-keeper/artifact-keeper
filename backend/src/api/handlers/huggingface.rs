@@ -34,7 +34,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::handlers::repositories::{apply_range_to_streamed_serve, effective_range};
+use crate::api::handlers::proxy_helpers::{apply_range_to_streamed_serve, effective_range};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::services::proxy_service::UPSTREAM_COMMIT_HEADER;
