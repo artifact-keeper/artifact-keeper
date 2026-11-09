@@ -2826,13 +2826,22 @@ runner-neutral guest spec:
 - pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
   `ghcr.io/astral-sh/uv:python3.12-alpine` pinned by digest), `uvx --no-config
   --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
-- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:...` itself, no
-  network.
+- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:<digest>` itself,
+  no network. The reference must be canonical and carry exactly one
+  lower-case SHA-256 digest on the job's AK origin; a bare image name,
+  another host, a SHA-512 digest, extra `@` delimiters, or a non-canonical
+  path is refused. The AK host must itself be a registry host, that is
+  contain `.` or `:` or be `localhost`: with a bare service name such as
+  `http://artifact-keeper` as the AK base URL, an image reference's first
+  component is a Docker Hub namespace, so OCI introspection is refused
+  (give the base URL a domain or a port).
 
 Only what AK serves is run: a `registryBaseUrl` or OCI identifier that is not
-this AK instance is refused; publisher `runtimeArguments` are dropped;
-environment variables that steer a package manager or runtime (`NPM_CONFIG_*`,
-`UV_*`, `PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
+this AK instance is refused; an OCI package's legacy `version`,
+`registryBaseUrl` or `fileSha256` is refused (the tag or digest belongs only
+in `identifier`); publisher `runtimeArguments` are dropped; environment
+variables that steer a package manager or runtime (`NPM_CONFIG_*`, `UV_*`,
+`PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
 `HOME`, ...) are dropped. Every `isSecret` value, every required value
 without a default and every `{template}` value is the placeholder
 `AK_PLACEHOLDER_<NAME>`. The whole run, install included, is capped at 120 s.
