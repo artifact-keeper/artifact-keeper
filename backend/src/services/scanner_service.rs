@@ -10301,10 +10301,33 @@ impl ScannerService {
                         None => scanner.vuln_db().await,
                     };
 
-                    // Persist findings
-                    self.scan_result_service
+                    // Persist findings. #5534: a batch that cannot be stored
+                    // fails THIS scan, named, and the set moves on to the next
+                    // scanner. It is not completed without the findings it
+                    // lost (that would be a cleaner verdict than the scanner
+                    // gave), and `?` here used to abandon the row `running`
+                    // and skip every later scanner.
+                    if let Err(e) = self
+                        .scan_result_service
                         .create_findings(scan_result.id, artifact_id, &findings)
+                        .await
+                    {
+                        let reason = format!(
+                            "{} reported {} findings that could not be stored: {e}",
+                            scanner.name(),
+                            findings.len()
+                        );
+                        error!("Scan of artifact {}: {}", artifact_id, reason);
+                        self.record_failed_scan(
+                            artifact_id,
+                            scan_result.id,
+                            scanner.as_ref(),
+                            &reason,
+                            started_at,
+                        )
                         .await?;
+                        continue;
+                    }
 
                     // Persist the package inventory (#903). Failures here
                     // are logged but do not fail the scan: the inventory is
@@ -10525,71 +10548,14 @@ impl ScannerService {
                         artifact_id,
                         e
                     );
-                    // Best-effort version probe even on failure: lets ops
-                    // distinguish "scanner crashed mid-scan" from "scanner
-                    // binary missing". `None` is acceptable for the latter.
-                    let scanner_version = scanner.version().await;
-                    self.scan_result_service
-                        .fail_scan(
-                            scan_result.id,
-                            &e.to_string(),
-                            scanner_version.as_deref(),
-                            started_at,
-                        )
-                        .await?;
-
-                    // #1188-R3: the inventory_status column documents
-                    // `'failed'` as "scan itself failed", kept distinct from
-                    // `'partial'` so dashboards can split "scanner crashed"
-                    // from "scanner ran but inventory broken". fail_scan
-                    // above only touches `status`; reflect the crash state
-                    // in `inventory_status` too so the column is actually
-                    // populated by every path the CHECK constraint allows.
-                    // Non-fatal: the scan_result row is already in the
-                    // failed state and the security score still recomputes
-                    // correctly; we log on failure so the gap is grep-able.
-                    if let Err(set_err) = self
-                        .scan_result_service
-                        .set_inventory_status(
-                            scan_result.id,
-                            crate::services::scan_result_service::InventoryStatus::Failed,
-                        )
-                        .await
-                    {
-                        error!(
-                            "Failed to set inventory_status='failed' on scan {}: {}",
-                            scan_result.id, set_err
-                        );
-                    }
-
-                    // Mark as flagged on failure (conservative), but never
-                    // downgrade an artifact that is already in a blocking or
-                    // admin-controlled quarantine-workflow state. A scanner
-                    // that fails AFTER another scanner quarantined the same
-                    // artifact (policy violation, or admin action) must not
-                    // silently un-block it by stomping the status back to
-                    // 'flagged'. Only flag from a non-blocking state.
-                    if let Err(e) = sqlx::query!(
-                        "UPDATE artifacts SET quarantine_status = 'flagged' \
-                         WHERE id = $1 \
-                           AND (quarantine_status IS NULL \
-                                OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
+                    self.record_failed_scan(
                         artifact_id,
+                        scan_result.id,
+                        scanner.as_ref(),
+                        &e.to_string(),
+                        started_at,
                     )
-                    .execute(&self.db)
-                    .await
-                    {
-                        tracing::error!(
-                            artifact_id = %artifact_id,
-                            error = %e,
-                            "Failed to set flagged status after scan failure"
-                        );
-                    }
-
-                    // 'flagged' is downloadable, so a `block_on_fail` policy has to
-                    // be applied here — this path never reaches
-                    // update_quarantine_status (#2912).
-                    self.enforce_policy_after_failed_scan(artifact_id).await;
+                    .await?;
                 }
             }
         }
@@ -11223,6 +11189,91 @@ impl ScannerService {
                 path.display()
             );
         }
+        Ok(())
+    }
+
+    /// Record one scanner's run as failed, fail-closed: the scan row goes
+    /// `failed` with `reason`, its inventory `failed`, the artifact `flagged`
+    /// unless it is already in a blocking state, and `block_on_fail` policies
+    /// are applied (#2912).
+    ///
+    /// Shared by a scanner that errored and, since #5534, by one whose
+    /// findings could not be stored: either way no verdict was recorded, and
+    /// leaving the row `running` for the janitor would also have skipped every
+    /// scanner after it in the set.
+    async fn record_failed_scan(
+        &self,
+        artifact_id: Uuid,
+        scan_result_id: Uuid,
+        scanner: &dyn Scanner,
+        reason: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        // Best-effort version probe even on failure: lets ops
+        // distinguish "scanner crashed mid-scan" from "scanner
+        // binary missing". `None` is acceptable for the latter.
+        let scanner_version = scanner.version().await;
+        self.scan_result_service
+            .fail_scan(
+                scan_result_id,
+                reason,
+                scanner_version.as_deref(),
+                started_at,
+            )
+            .await?;
+
+        // #1188-R3: the inventory_status column documents
+        // `'failed'` as "scan itself failed", kept distinct from
+        // `'partial'` so dashboards can split "scanner crashed"
+        // from "scanner ran but inventory broken". fail_scan
+        // above only touches `status`; reflect the crash state
+        // in `inventory_status` too so the column is actually
+        // populated by every path the CHECK constraint allows.
+        // Non-fatal: the scan_result row is already in the
+        // failed state and the security score still recomputes
+        // correctly; we log on failure so the gap is grep-able.
+        if let Err(set_err) = self
+            .scan_result_service
+            .set_inventory_status(
+                scan_result_id,
+                crate::services::scan_result_service::InventoryStatus::Failed,
+            )
+            .await
+        {
+            error!(
+                "Failed to set inventory_status='failed' on scan {}: {}",
+                scan_result_id, set_err
+            );
+        }
+
+        // Mark as flagged on failure (conservative), but never
+        // downgrade an artifact that is already in a blocking or
+        // admin-controlled quarantine-workflow state. A scanner
+        // that fails AFTER another scanner quarantined the same
+        // artifact (policy violation, or admin action) must not
+        // silently un-block it by stomping the status back to
+        // 'flagged'. Only flag from a non-blocking state.
+        if let Err(e) = sqlx::query!(
+            "UPDATE artifacts SET quarantine_status = 'flagged' \
+             WHERE id = $1 \
+               AND (quarantine_status IS NULL \
+                    OR quarantine_status IN ('clean', 'flagged', 'unscanned'))",
+            artifact_id,
+        )
+        .execute(&self.db)
+        .await
+        {
+            tracing::error!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "Failed to set flagged status after scan failure"
+            );
+        }
+
+        // 'flagged' is downloadable, so a `block_on_fail` policy has to
+        // be applied here — this path never reaches
+        // update_quarantine_status (#2912).
+        self.enforce_policy_after_failed_scan(artifact_id).await;
         Ok(())
     }
 
@@ -31075,6 +31126,110 @@ tonic-build = "0.12"
             assert!(cves.contains(&"CVE-2024-0002".to_string()));
 
             finish(fx).await;
+        }
+
+        /// #5534: an image scan whose advisory lists several fixed versions in
+        /// one string. `affected_version`, `fixed_version` and `source` were
+        /// `VARCHAR(100)` (022), so the one batched findings insert was refused
+        /// and the scan lost all of its findings. Every finding must persist,
+        /// byte for byte, and the scan must complete with its real counts.
+        #[tokio::test]
+        async fn test_image_scan_stores_findings_with_long_version_and_source_strings() {
+            let long_fixed = (0..30)
+                .map(|i| format!("1.{i}.9"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let long_fixed = format!("{long_fixed}{}", "9".repeat(300 - long_fixed.len()));
+            let long_affected = format!(">= 0.1, < {}", "7".repeat(290));
+            let long_source = format!("scanner-adapter/trivy:{}", "d".repeat(278));
+            assert_eq!(long_fixed.len(), 300);
+            assert_eq!(long_affected.len(), 300);
+            assert_eq!(long_source.len(), 300);
+            let mut long = cve_finding(Severity::Critical, "CVE-2024-5534", "libexpat");
+            long.affected_version = Some(long_affected.clone());
+            long.fixed_version = Some(long_fixed.clone());
+            long.source = Some(long_source.clone());
+            let mut findings = two_cve_findings();
+            findings.push(long);
+
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "image-long-versions",
+                vec![FakeScanner::completed("image", findings, Vec::new())],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "image").await;
+            let stored: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT affected_version, fixed_version, source FROM scan_findings \
+                 WHERE scan_result_id = $1 AND cve_id = 'CVE-2024-5534'",
+            )
+            .bind(scan_id)
+            .fetch_all(&fx.pool)
+            .await
+            .expect("read the long finding back");
+            let stored_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM scan_findings WHERE scan_result_id = $1")
+                    .bind(scan_id)
+                    .fetch_one(&fx.pool)
+                    .await
+                    .expect("count findings");
+            finish(fx).await;
+
+            assert_eq!(
+                row.status, "completed",
+                "a long version string must not fail the scan: {:?}",
+                row.error_message
+            );
+            assert_eq!(row.findings_count, 3);
+            assert_eq!(row.critical_count, 2);
+            assert_eq!(row.high_count, 1);
+            assert_eq!(stored_count, 3, "every finding of the scan must persist");
+            assert_eq!(
+                stored,
+                vec![(Some(long_affected), Some(long_fixed), Some(long_source))],
+                "the long values are stored whole, never truncated"
+            );
+        }
+
+        /// #5534: a finding the schema still cannot hold (here a `cve_id` past
+        /// `VARCHAR(30)`) fails ITS scan, fail-closed, with an error that names
+        /// the finding and the column, and the scanners after it in the set
+        /// still run. The findings insert's `?` used to abandon the row
+        /// `running` and skip every later scanner.
+        #[tokio::test]
+        async fn test_unstorable_finding_fails_its_scan_by_name_and_set_continues() {
+            let overlong_id = format!("VENDOR-ADVISORY-{}", "1".repeat(30));
+            let image = FakeScanner::completed(
+                "image",
+                vec![cve_finding(Severity::High, &overlong_id, "zlib")],
+                Vec::new(),
+            );
+            let Some((fx, artifact_id)) =
+                setup_and_scan("image-unstorable", vec![image, grype_completed()], None).await
+            else {
+                return;
+            };
+
+            let image_row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let grype_row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            finish(fx).await;
+
+            assert_failed_closed(&image_row, "finding 1 of 1");
+            let message = image_row.error_message.unwrap_or_default();
+            assert!(
+                message.contains("`cve_id` is 46 characters") && message.contains(&overlong_id),
+                "the error must name the column and the finding, got: {message}"
+            );
+            assert_eq!(
+                grype_row.status, "completed",
+                "the next scanner in the set must still run"
+            );
+            assert_eq!(grype_row.findings_count, 2);
         }
 
         /// egress-restricted (SECURITY-CRITICAL): scanner cannot reach its vuln
