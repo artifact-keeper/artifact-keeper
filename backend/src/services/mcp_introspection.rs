@@ -1142,6 +1142,7 @@ mod tests {
                 repository: "npm-local".into(),
                 repository_id: Uuid::nil(),
                 artifact_ids: vec![],
+                artifact_sha256s: Vec::new(),
                 sha256: None,
                 name: None,
                 tag: None,

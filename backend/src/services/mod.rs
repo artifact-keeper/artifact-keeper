@@ -78,6 +78,7 @@ pub mod mcp_remote;
 pub mod mcp_resolver;
 pub mod mcp_seed;
 pub mod mcp_settings;
+pub mod mcp_virtual_serve;
 pub mod mcp_write;
 pub mod mcpb;
 pub mod metadata_checker;

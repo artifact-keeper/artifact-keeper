@@ -295,7 +295,19 @@ async fn find_cached(
     let Some(version) = pkg.version.as_deref() else {
         return Ok(None);
     };
-    let Some(key) = cache_key(&pkg.registry_type, &pkg.identifier, version) else {
+    cached_entry(db, remote.id, &pkg.registry_type, &pkg.identifier, version).await
+}
+
+/// The proxy-cache entry of `registry_type` `identifier@version` in the
+/// Remote `remote_id`, as `(path, sha256)`: [`find_cached`] by its parts.
+pub(crate) async fn cached_entry(
+    db: &PgPool,
+    remote_id: Uuid,
+    registry_type: &str,
+    identifier: &str,
+    version: &str,
+) -> Result<Option<(String, String)>, McpError> {
+    let Some(key) = cache_key(registry_type, identifier, version) else {
         return Ok(None);
     };
     // Proxy-cache paths are exact, case-sensitive storage keys (the format
@@ -325,7 +337,7 @@ async fn find_cached(
            AND (path LIKE $2 ESCAPE '\\' OR path = $3) \
          ORDER BY path LIMIT 200",
     )
-    .bind(remote.id)
+    .bind(remote_id)
     .bind(&pattern)
     .bind(exact)
     .fetch_all(db)
@@ -335,7 +347,7 @@ async fn find_cached(
         CacheKey::PypiFiles { .. } => path
             .rsplit('/')
             .next()
-            .is_some_and(|f| pypi_file_matches(f, &pkg.identifier, version)),
+            .is_some_and(|f| pypi_file_matches(f, identifier, version)),
         _ => true,
     }))
 }
@@ -371,7 +383,10 @@ pub async fn cached_pin_through(
 }
 
 /// A pin on a package `remote` (the mapped repository or its Remote member)
-/// has in its proxy cache.
+/// has in its proxy cache. Every path that pins a proxy-cache entry (the
+/// publish, the asynchronous fill, Remote MCP ingest) comes through here, so
+/// each refuses a pin the mapped Virtual would not serve from `remote`
+/// (`mcp_package_shadowed`, #5456).
 async fn cached_pin(
     db: &PgPool,
     mapped: &BackingRepo,
@@ -382,7 +397,7 @@ async fn cached_pin(
     let Some((path, sha256)) = find_cached(db, remote, pkg).await? else {
         return Ok(None);
     };
-    Ok(Some(PackagePin {
+    let pin = PackagePin {
         index,
         registry_type: pkg.registry_type.clone(),
         submitted: SubmittedRef {
@@ -393,6 +408,7 @@ async fn cached_pin(
             repository: mapped.key.clone(),
             repository_id: remote.id,
             artifact_ids: Vec::new(),
+            artifact_sha256s: Vec::new(),
             sha256: Some(sha256),
             name: None,
             tag: None,
@@ -406,7 +422,9 @@ async fn cached_pin(
             download_path: None,
         },
         drift: None,
-    }))
+    };
+    mcp_packages::refuse_shadowed_cache_pin(db, mapped, &pin).await?;
+    Ok(Some(pin))
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +470,7 @@ fn bundle_pin(
             repository: repo_key.to_string(),
             repository_id: repo_id,
             artifact_ids: vec![artifact_id],
+            artifact_sha256s: Vec::new(),
             sha256: Some(sha256.to_string()),
             name: None,
             tag: None,

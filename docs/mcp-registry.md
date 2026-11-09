@@ -514,6 +514,7 @@ package first, then publish the server.json. A publish answers `422` with one
 | --- | --- |
 | `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. Under `open` only the first case and `registryBaseUrl` on an `mcpb` entry are refused; foreign coordinates are looked up in the backing repository. |
 | `mcp_package_not_found` | The exact package version (npm, PyPI, NuGet, Cargo) or image tag/digest (OCI) is not in a hosted backing repository, or an `mcpb` entry's `fileSha256` matches no uploaded bundle. A package missing from a Remote backing repository is not refused: it is filled (`202`, see [Write path](#write-path-phase-2-and-3)). |
+| `mcp_package_shadowed` | The backing repository is a Virtual whose download route would serve the package from another member than the one holding it: a Remote member that outranks it (or, for PyPI, any Remote member with an upstream). The detail names both members and the fixes. |
 | `mcp_bundle_signature_required` | The repository sets `mcp_require_bundle_signature` and an `mcpb` entry's bundle (uploaded here or found through `mcp_package_repos.mcpb`) has no recorded signature from a trusted signer (see [MCPB bundles](#mcpb-bundles)). |
 | `mcp_package_version_unpinned` | An npm, PyPI, NuGet or Cargo entry has no `version`. |
 | `mcp_oci_floating_tag` | An OCI identifier is `:latest` or has no tag and no digest. |
@@ -533,8 +534,82 @@ the pinned bytes are the bytes that route serves:
 | NuGet | case-insensitive | NuGet's normalised form in lowercase, as a V3 client requests it (`1.0` is requested as `1.0.0`), compared exactly with the stored version: a package stored as `1.0` or `1.0.0-Beta` is not served for `1.0.0` or `1.0.0-beta` and is not pinned. A version NuGet cannot normalise is not pinned. |
 | Cargo | case-insensitive; `-` and `_` are different crates (a Local repository can hold both) | exact |
 
-A Virtual backing repository pins the first member, by priority, that holds
-the version: the member a download through the Virtual is served from.
+A Virtual backing repository pins the member its download route serves
+the version from (#5456). npm, PyPI, NuGet and Cargo clients install from
+`registryBaseUrl`, which is the Virtual, so the pin is the member the
+Virtual's own member walk picks: nested Virtuals expanded in place, equal
+priorities broken by repository key, and each format's guard applied as the
+download route applies it:
+
+- **npm**: the tarball route's shadowing guard and scope policy. A hosted
+  member holding the exact version withholds the Remote members it outranks;
+  isolate mode withholds every Remote member for a hosted name; a Remote
+  member outside its scope policy never serves.
+- **Cargo**: a hosted member holding the exact `name@version` anywhere in
+  the Virtual withholds every Remote member.
+- **NuGet**: strict priority, no guard.
+- **PyPI**: per file. The simple index lists the files of every hosted
+  member and a download matches the file name alone, so the pin covers
+  every hosted file of the version (versions compared as PEP 440: `1.0` is
+  `1.0.0`; files matched by name, whatever project they were uploaded
+  under). A Remote member can serve other distributions of the version from
+  its upstream (a platform wheel, even when a hosted member owns the name),
+  so a PyPI package is not pinned through a Virtual that has a Remote
+  member with an upstream.
+
+A Remote member that the guard does not withhold, and that is walked before
+the hosted member holding the version, serves it from its upstream whether
+or not it has cached it. Such a publish is refused with
+`422 mcp_package_shadowed`, naming both members and the fixes (rank the
+hosted member above the Remote, enable isolate mode for npm, or map the
+hosted repository directly).
+
+The same check runs on every read. When the route would no longer serve the
+pinned rows, the version is held as `mcp_unresolvable` (the holder's body
+carries `gate: shadowed`). That happens when a hosted member walked earlier
+now holds the version (published at any quarantine state), when a Remote
+member now outranks it or is no longer withheld, or when the pinned member
+leaves the Virtual. For PyPI it also happens when another file of the
+version appears in any hosted member, when a pinned file is gone, or when a
+Remote member with an upstream joins. The pin is never moved. The version serves again
+once the route serves the pinned rows again; otherwise publish a new server
+version to pin what it serves now. A pinned row whose bytes changed in place
+(its checksum is no longer the one pinned) no longer counts as the pinned
+row.
+
+Quarantine and shadowing together, for a Virtual `[H, L]` whose pin is A in
+`L`:
+
+| State | MCP read | Download through the Virtual |
+| --- | --- | --- |
+| A quarantined, nothing in `H` | held (`mcp_backing_artifact_blocked`) | refused |
+| B published in `H`, then A quarantined | held (`mcp_unresolvable`, `gate: shadowed`) | serves B to every client; the approved document is never served with it |
+| B published in `H` and quarantined | held (`mcp_unresolvable`, `gate: shadowed`) | refused (a member refusing what it holds does not fall through to `L`) |
+
+The model walks every member of the Virtual, whoever is asking. Two of the
+route's skips only make it hold more than the route would: PyPI curation,
+and an age gate reporting that a Remote's upstream does not host the
+version. Per-caller member visibility is different and is a known caveat
+(#5536): the download route drops the members the caller cannot read, so for
+a caller who cannot read the pinned member, a lower-ranked hosted member (or,
+for NuGet, any Remote member) can serve other bytes at the pinned coordinate
+while the version is still served as approved. Until #5536 lands, give every
+reader of an MCP repository read access to the members that hold its pinned
+packages.
+
+**Upgrading.** The check also applies to versions approved before it
+existed, so some are held as soon as the upgraded server reads them: those
+pinned through an npm or NuGet Virtual with a Remote member ranked above the
+hosted member holding the package, and those pinned through a PyPI Virtual
+with any Remote member that has an upstream. They answer `404` to readers
+(`mcp_unresolvable`, `gate: shadowed` for the repository holder), drop out of
+listings and `latest`, and their health turns critical. Re-rank the hosted
+member above the Remote, enable isolate mode on an npm Virtual, or (PyPI)
+remove the Remote member from the Virtual: the hold clears on the next read,
+with no republish, because the pin is unchanged and the check is evaluated on
+every read. Mapping the hosted repository directly (`mcp_package_repos`) only
+affects versions published after the change, since an existing version's
+`registryBaseUrl` names the Virtual: publish a new server version for that.
 A proxy-cache entry ([Packages in a Remote backing
 repository](#packages-in-a-remote-backing-repository)) matches by its exact,
 case-sensitive cache path (`1.0.0-RC.1` is not `1.0.0-rc.1`); a NuGet entry by
@@ -624,7 +699,7 @@ One decision function (`decide_mcp_serve`) answers every read:
 | pinned package quarantined | omitted | skipped | `404` plain | `404` + `package`, `gate: quarantine` | `mcp_backing_artifact_blocked` |
 | pinned package refused by scan policy or rejected, or by its Remote's stored proxy-scan verdict | omitted | skipped | `404` plain | `404` + `package`, `gate: scan_policy` | `mcp_backing_artifact_blocked` |
 | pinned package younger than its Remote's age gate | omitted | skipped | `404` plain | `404` + `package`, `gate: age_gate`, `review_id`, `min_age_days`, `requested_age_days` | `mcp_age_gate_blocked` |
-| pinned package gone, or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
+| pinned package gone, no longer what its Virtual serves (`gate: shadowed`), or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
 | a gate cannot be evaluated (database error) | omitted | `503` | `503` | `503` | `mcp_gate_unavailable` |
 | `deprecated` | listed | eligible | `200` | `200` | |
 | `deleted` | omitted unless `include_deleted=true` | skipped | `404` plain; `200` with `include_deleted=true` | same | |
