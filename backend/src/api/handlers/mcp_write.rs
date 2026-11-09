@@ -370,6 +370,7 @@ fn issue(e: &McpError) -> serde_json::Value {
         | McpError::OciFloatingTag { index }
         | McpError::ExternalRegistry { index, .. }
         | McpError::PackageNotFound { index, .. }
+        | McpError::PackageShadowed { index, .. }
         | McpError::BundleSignatureRequired { index, .. }
         | McpError::PackageVersionUnpinned { index }
         | McpError::OciNotAnImage { index } => ("semantic", format!("packages[{index}]")),
@@ -1969,6 +1970,23 @@ mod tests {
     const SIGNED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-signed.mcpb");
     const TAMPERED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-tampered.mcpb");
 
+    /// A ZIP holding `entries` entries, the last of which is a valid root
+    /// `manifest.json`, for the upload-path entry-ceiling regression.
+    fn bundle_with_entries(entries: usize) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..entries.saturating_sub(1) {
+                z.start_file(format!("filler/{i}"), options).unwrap();
+            }
+            z.start_file("manifest.json", options).unwrap();
+            std::io::Write::write_all(&mut z, br#"{"name":"x","version":"1"}"#).unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
     struct Env {
         fx: tdh::Fixture,
         state: SharedState,
@@ -2417,6 +2435,135 @@ mod tests {
             .json(env.admin(), "POST", "/validate", Some(&plain))
             .await;
         assert_eq!(b["issues"][0]["reference"], "mcp_version_exists");
+        env.teardown().await;
+    }
+
+    /// #5467: an MCPB bundle over the shared entry ceiling is refused with the
+    /// bounded 400 before anything is stored, and a valid upload still works.
+    #[tokio::test]
+    async fn bundle_over_entry_ceiling_is_refused_without_rows() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let max = crate::util::bounded_archive::max_ingest_archive_entries() as usize;
+        let tail = "/servers/com.acme/echo/versions/1.0.0/bundles/too-many.mcpb";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(env.url(tail))
+            .body(Body::from(bundle_with_entries(max + 1)))
+            .unwrap();
+        let (status, body) = tdh::send(env.member(), req).await;
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("mcp_bundle_invalid")),
+            "{body}"
+        );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(env.fx.repo_id)
+        .bind(resolver::bundle_path(
+            "com.acme/echo",
+            "1.0.0",
+            "too-many.mcpb",
+        ))
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "a refused bundle stores no artifact");
+
+        // The refusal does not poison the next valid upload.
+        let valid = Request::builder()
+            .method("PUT")
+            .uri(env.url("/servers/com.acme/echo/versions/1.0.0/bundles/echo.mcpb"))
+            .body(Body::from(UNSIGNED))
+            .unwrap();
+        assert_eq!(tdh::send(env.member(), valid).await.0, StatusCode::CREATED);
+
+        env.teardown().await;
+    }
+
+    /// Every file under `dir`, recursively.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// #5468, #5469, #5470: a bundle with duplicate manifests or JSON keys,
+    /// an unsafe, link or special-file entry, a non-UTF-8 name, or central and
+    /// local headers that disagree is refused through the upload route with
+    /// `400 mcp_bundle_invalid` and a detail naming the defect, and nothing
+    /// is stored (no artifact row, no bundle facts, no storage object). A
+    /// benign archive and the fixture are still accepted afterwards.
+    #[tokio::test]
+    async fn hostile_bundle_entries_are_refused_without_storing() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let put = |file: String, bytes: Vec<u8>| {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(env.url(&format!(
+                    "/servers/com.acme/echo/versions/1.0.0/bundles/{file}"
+                )))
+                .body(Body::from(bytes))
+                .unwrap();
+            tdh::send(env.member(), req)
+        };
+        let before = files_under(&env.fx.storage_dir);
+        for (case, bytes, detail) in mcpb::hostile_zips::cases() {
+            let (status, body) = put(format!("{case}.mcpb"), bytes).await;
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("mcp_bundle_invalid")),
+                "{case}: {body}"
+            );
+            assert!(
+                body["detail"].as_str().is_some_and(|d| d.contains(detail)),
+                "{case}: {body}"
+            );
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a refused bundle stores no artifact");
+        let facts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(facts, 0, "a refused bundle records no facts");
+        assert_eq!(
+            files_under(&env.fx.storage_dir),
+            before,
+            "a refused bundle writes no storage object"
+        );
+
+        let (status, body) = put("benign.mcpb".into(), mcpb::hostile_zips::benign()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, _) = put("echo.mcpb".into(), UNSIGNED.to_vec()).await;
+        assert_eq!(status, StatusCode::CREATED);
         env.teardown().await;
     }
 
