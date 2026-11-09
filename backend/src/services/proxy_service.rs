@@ -7825,11 +7825,6 @@ impl ProxyService {
         .await
     }
 
-    /// One coordinated attempt of the streaming fetch. Returns `Ok(None)` when
-    /// the streaming coordinator asked the caller to fall back (re-enter):
-    /// either a late would-be follower that would miss leading bytes, or a
-    /// follower whose leader vanished before publishing headers. The caller
-    /// loops; a re-enter typically lands on the now-warm cache.
     /// The bounds of a [`FinishFillOnDrop`] drain: the #5220 detached-fill
     /// permits and deadline.
     fn finish_fill_limits(&self) -> FinishFillLimits {
@@ -7839,6 +7834,11 @@ impl ProxyService {
         }
     }
 
+    /// One coordinated attempt of the streaming fetch. Returns `Ok(None)` when
+    /// the streaming coordinator asked the caller to fall back (re-enter):
+    /// either a late would-be follower that would miss leading bytes, or a
+    /// follower whose leader vanished before publishing headers. The caller
+    /// loops; a re-enter typically lands on the now-warm cache.
     async fn try_fetch_artifact_streaming_once(
         &self,
         repo: &Repository,
