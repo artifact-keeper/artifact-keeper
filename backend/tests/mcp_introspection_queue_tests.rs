@@ -63,8 +63,8 @@ async fn pending(h: &McpHarness, repo: Uuid, artifact: Uuid, target: &str, minut
     .unwrap()
 }
 
-/// A job of `kind` claimed by a worker on its `attempts`-th attempt, with
-/// claim token `token`.
+/// A job of `kind` claimed by a worker (the harness admin's principal) on
+/// its `attempts`-th attempt, with claim token `token`.
 async fn claimed(
     h: &McpHarness,
     repo: Uuid,
@@ -77,9 +77,9 @@ async fn claimed(
     sqlx::query_scalar(
         "INSERT INTO mcp_introspection_jobs (repository_id, artifact_id, kind, target_key, \
            status, attempts, max_attempts, claimed_by, claimed_at, lease_expires_at, \
-           claim_token_hash) \
+           claim_token_hash, claimed_by_user_id) \
          VALUES ($1, $2, $3, $4, 'claimed', $5, 3, 'it-worker', NOW(), \
-           NOW() + INTERVAL '10 minutes', $6) RETURNING id",
+           NOW() + INTERVAL '10 minutes', $6, $7) RETURNING id",
     )
     .bind(repo)
     .bind(artifact)
@@ -87,6 +87,7 @@ async fn claimed(
     .bind(target)
     .bind(attempts)
     .bind(sha256_hex(token.as_bytes()))
+    .bind(h.admin)
     .fetch_one(&h.pool)
     .await
     .unwrap()
@@ -102,9 +103,17 @@ async fn time_out(h: &McpHarness, id: Uuid, token: &str) -> Completed {
         ..Default::default()
     };
     let parsed = parse_result(&result).unwrap();
-    complete(&h.pool, &job, &result, parsed, &AccessScope::Admin, true)
-        .await
-        .unwrap()
+    complete(
+        &h.pool,
+        &job,
+        &result,
+        parsed,
+        h.admin,
+        &AccessScope::Admin,
+        true,
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -124,14 +133,14 @@ async fn claim_prefers_the_repository_with_fewer_claimed_jobs() {
     let kinds = [JobKind::RemoteProbe];
 
     // Nothing is claimed yet: the oldest due job goes first.
-    let first = claim(&h.pool, &kinds, "w1", &AccessScope::Admin)
+    let first = claim(&h.pool, &kinds, "w1", h.admin, &AccessScope::Admin)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(first.job.id, a_jobs[0], "oldest job first");
     // A now has a job claimed and B none: B's job goes next although A's
     // nine others are older.
-    let second = claim(&h.pool, &kinds, "w2", &AccessScope::Admin)
+    let second = claim(&h.pool, &kinds, "w2", h.admin, &AccessScope::Admin)
         .await
         .unwrap()
         .unwrap();
@@ -142,7 +151,7 @@ async fn claim_prefers_the_repository_with_fewer_claimed_jobs() {
         second.job.target_key
     );
     // One claimed job each: back to the oldest, A's second job.
-    let third = claim(&h.pool, &kinds, "w3", &AccessScope::Admin)
+    let third = claim(&h.pool, &kinds, "w3", h.admin, &AccessScope::Admin)
         .await
         .unwrap()
         .unwrap();

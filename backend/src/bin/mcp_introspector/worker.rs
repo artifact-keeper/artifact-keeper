@@ -103,10 +103,21 @@ impl Backend {
                 result,
             )
             .await?;
-        if status == 200 {
-            Ok(body)
-        } else {
-            Err(format!("complete refused ({status}): {body}"))
+        match status {
+            200 => Ok(body),
+            // A refused result names the field (#5466): say which, so a
+            // result that would be refused on every attempt is diagnosable.
+            400 => {
+                let (code, field) = (
+                    body["error"].as_str().unwrap_or(""),
+                    body["field"].as_str().unwrap_or(""),
+                );
+                tracing::warn!(job = %job_id, %code, %field, "introspection result refused");
+                Err(format!(
+                    "complete refused (400 {code}, field `{field}`): {body}"
+                ))
+            }
+            _ => Err(format!("complete refused ({status}): {body}")),
         }
     }
 

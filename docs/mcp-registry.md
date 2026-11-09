@@ -2571,6 +2571,22 @@ repository restriction takes effect once the API-token validation cache
 (up to 5 minutes) has expired; until then requests run with the scope
 the token was last validated with.
 
+A claim is bound to the worker identity that took it (#5465): the principal
+(user or service account) of the `mcp:introspect` token that sent `POST
+/jobs/claim`. Only that principal can complete the job; another worker that
+holds the claim token gets the same `409 mcp_claim_invalid`, with the same
+body, as a wrong token (checked before the result is read, and again under
+the claim's row lock), and nothing is stored or changed. The binding is to
+the principal, not to the API token, so a worker that rotates its token, or
+uses another `mcp:introspect` token of the same service account, mid-claim
+can still complete its claim; workers that must not complete each other's
+jobs need separate service accounts. `workerId` is a self-chosen label, not
+an identity, and is not checked. The stored snapshot (`reportedBy`) and its
+`MCP_CAPABILITIES_INGESTED` audit record name the completing worker's
+principal. A claim taken before the upgrade that introduced the binding
+(migration 338) has no recorded owner and cannot be completed by anyone; its
+lease expires and the reaper returns the job to the queue.
+
 `POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
 "workerId": "pod-a"}` (both optional) answers `204` when nothing is due,
 `503 mcp_gate_unavailable` when nothing servable was found and a
@@ -2619,21 +2635,39 @@ OCI identifier rewritten to akBaseUrl */ }}` with limits `{"wallClockMs":
 }
 ```
 
-A failed outcome carries no lists. `observedAt` (default: the arrival time)
-must lie between the job's claim and its arrival, with 5 minutes of clock
-skew either side, else `400` and the claim is left as it was; one up to 5
-minutes ahead is stored as of its arrival (#5464).
+A failed outcome carries no lists. The result's metadata is validated
+before anything is stored or changed (#5464, #5466); a refusal answers `400
+mcp_invalid_result_metadata` with the offending `field`. Every check but
+`observedAt`'s lower bound (which needs the claim time, read under the
+claim's lock) runs before anything is locked, for every outcome, a retry
+included:
+
+| Field | Accepted |
+| --- | --- |
+| `observedAt` | default: the arrival time. At most 5 minutes (the clock-skew window) ahead of the registry's clock, and no more than 5 minutes before the job's claim. One inside the window but ahead of arrival is stored as of its arrival. |
+| `cacheScope` | absent, `public` or `private` (exact, lower case). |
+| `ttlMs` | absent, or an integer from `0` to `2592000000` (30 days): it only spaces re-probes (`max(ttlMs, 6 h)`). |
+
+A refused result stores no snapshot, changes no current view, writes no
+audit record and leaves the job claimed with its lease running: the worker
+can post a corrected result before the lease expires, or the reaper returns
+the job to the queue. The reference worker normalises a remote's hints
+before posting: a `cacheScope` other than `public` is sent as `private`
+(with `authState: caller_specific`) and `ttlMs` is capped at 30 days.
+
 `200 {"status": "stored", "snapshotId", "contentHash", "current", "drift":
 {"scanId"} | null}` (`snapshotId` is the existing snapshot when the result
 repeats it; `current`: whether that snapshot is the version's current view
 after the commit) or `200 {"status": "retry", "notBefore"}`;
 `409 mcp_claim_invalid` when the token does not match the current claim
-(lease expired, re-claimed or already completed); `409
+(lease expired, re-claimed or already completed) or the claim is held by
+another worker identity; `409
 mcp_target_ineligible` when the version or a backing package stopped being
 eligible after the claim (the job is cancelled); `503 mcp_gate_unavailable`
 when its gates could not be evaluated (the claim is unchanged); `403
-mcp_forbidden` when the token is not scoped to the job's repository; `400`
-for a malformed result.
+mcp_forbidden` when the token is not scoped to the job's repository; `400
+mcp_invalid_result_metadata` for refused metadata (above) and `400
+mcp_invalid_capabilities` for a malformed result.
 
 ### The `ak-mcp-introspector` worker
 
