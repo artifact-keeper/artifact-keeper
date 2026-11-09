@@ -114,13 +114,15 @@ async fn holds(
     let seal = mcp::cursor_seal(&state);
     let q = mcp::parse_list_query(&query, |c| {
         seal.decode_position(repo.id, fmt::cursor_kind::HOLDS, c)
+            .map(|(n, v)| fmt::ListingResume::after(&n, &v))
     })
     .map_err(mcp::mcp_error)?;
     let encode = |n: &str, v: &str| seal.encode_position(repo.id, fmt::cursor_kind::HOLDS, n, v);
     let want = q.limit as usize;
     let ctx = GateCtx::of(&state, false);
     let mut out: Vec<(String, String, serde_json::Value)> = Vec::new();
-    let mut after = q.cursor.clone();
+    // Holds list only held rows to a holder: the position may name one.
+    let mut after = q.cursor.after.clone();
     let mut read = 0usize;
     let mut resume: Option<String> = None;
     loop {

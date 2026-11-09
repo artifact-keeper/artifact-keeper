@@ -1213,10 +1213,13 @@ pub fn parse_storage_path(path: &str) -> Option<(String, String)> {
 
 /// Listing cursors are sealed: AES-256-GCM under a key derived from the
 /// instance's `jwt_secret`, bound to the repository that issued them and to
-/// the listing kind. A client cannot read the position a cursor names (it
-/// may name a held row: a listing resumes after the last row it read, not
-/// the last one it served) and cannot make one up. The MCP Registry API
-/// treats `cursor` as an opaque string, so the format is free to change.
+/// the listing kind. A client cannot read the position a cursor names and
+/// cannot make one up. The MCP Registry API treats `cursor` as an opaque
+/// string, so the format is free to change.
+///
+/// A reader listing's cursor never names a row the reader is not served,
+/// not even sealed (#5453): it is a [`ListingResume`], the last row the
+/// listing served and the internal id of the last row it read past it.
 ///
 /// Wire form: `base64url(0x01 || nonce(12) || ciphertext+tag)`, no padding;
 /// the plaintext is a JSON array of strings, the first the listing kind.
@@ -1339,6 +1342,92 @@ impl CursorSeal {
             _ => Err(bad()),
         }
     }
+
+    /// A reader listing's [`ListingResume`] of listing `kind` of `scope`.
+    pub fn encode_resume(&self, scope: Uuid, kind: &str, at: &ListingResume) -> String {
+        let (name, version) = at
+            .after
+            .as_ref()
+            .map(|(n, v)| (n.as_str(), v.as_str()))
+            .unwrap_or(("", ""));
+        self.seal(scope, &[kind, name, version, &encode_read(at.read)])
+    }
+
+    /// Inverse of [`Self::encode_resume`]. A plain position of
+    /// [`Self::encode_position`] (a cursor issued before #5453) resumes after
+    /// it.
+    pub fn decode_resume(
+        &self,
+        scope: Uuid,
+        kind: &str,
+        cursor: &str,
+    ) -> std::result::Result<ListingResume, McpError> {
+        let bad = || McpError::invalid_query("cursor", "invalid cursor");
+        let parts = self.open(scope, cursor)?;
+        let (k, name, version, read) = match parts.as_slice() {
+            [k, n, v] => (k, n, v, None),
+            [k, n, v, r] => (k, n, v, decode_read(r).ok_or_else(bad)?),
+            _ => return Err(bad()),
+        };
+        if k != kind {
+            return Err(bad());
+        }
+        let after = match (name.is_empty(), version.is_empty()) {
+            (false, false) => Some((name.clone(), version.clone())),
+            (true, true) if read.is_some() => None,
+            _ => return Err(bad()),
+        };
+        Ok(ListingResume { after, read })
+    }
+}
+
+/// Where a reader listing resumes (#5453): after the keyset position
+/// `after` (the last row it served, `None`: the start), or, when it read
+/// past rows it does not serve (held, refused, unparseable), after the last
+/// of them, which it names only by its internal artifact id `read`. The id
+/// is a random UUID: fixed-length, unordered, and meaningless outside this
+/// instance, so a cursor never carries the name or version of a row the
+/// caller is not served, sealed or not. The listing looks the id up on
+/// resume (deleted rows included) and continues strictly after it, at the
+/// cost of a keyset resume at any depth; if the row was purged it resumes
+/// after `after` instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListingResume {
+    pub after: Option<(String, String)>,
+    pub read: Option<Uuid>,
+}
+
+impl ListingResume {
+    /// Resume after the served row `name@version`.
+    pub fn after(name: &str, version: &str) -> Self {
+        Self {
+            after: Some((name.to_string(), version.to_string())),
+            read: None,
+        }
+    }
+
+    /// Account for one row a scan read, in order: a served row becomes the
+    /// position; an unserved one is remembered by its id only.
+    pub fn advance_one(&mut self, id: Uuid, key: (String, String), served: bool) {
+        if served {
+            self.after = Some(key);
+            self.read = None;
+        } else {
+            self.read = Some(id);
+        }
+    }
+}
+
+/// `read` at a fixed width (the nil UUID for none), so the sealed cursor's
+/// length does not say whether the listing read past unserved rows.
+pub fn encode_read(read: Option<Uuid>) -> String {
+    read.unwrap_or(Uuid::nil()).hyphenated().to_string()
+}
+
+/// Inverse of [`encode_read`]; `None` for anything that is not a UUID.
+pub fn decode_read(s: &str) -> Option<Option<Uuid>> {
+    let id = Uuid::parse_str(s).ok().filter(|_| s.len() == 36)?;
+    Some((!id.is_nil()).then_some(id))
 }
 
 // ---------------------------------------------------------------------------
