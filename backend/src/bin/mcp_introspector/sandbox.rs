@@ -8,9 +8,9 @@
 //! * install only from AK: `npx --registry=<registryBaseUrl>`, `uvx
 //!   --default-index <registryBaseUrl>/simple`, or a canonical AK-served OCI
 //!   reference with exactly one lower-case SHA-256 digest; an OCI package's
-//!   legacy source fields and `runtimeArguments` are refused. Publisher
-//!   `runtimeArguments` on npm/PyPI are dropped (they are where `--registry`
-//!   and `-v /:/host` would go), and environment variables that steer a
+//!   legacy source fields are refused. Publisher `runtimeArguments` are
+//!   dropped (they are where `--registry` and `-v /:/host` would go), and
+//!   environment variables that steer a
 //!   package manager (`NPM_CONFIG_*`, `UV_*`, `PIP_*`, ...) are refused;
 //! * no real secrets: every `isSecret` value, every required value without
 //!   a default, and every `{template}` value becomes `AK_PLACEHOLDER_<NAME>`;
@@ -322,33 +322,40 @@ pub fn package_args(package: &Value) -> Vec<String> {
 /// the engine verbatim, so no other field or argument can choose the source.
 fn oci_image(identifier: &str, ak_base_url: &str) -> Result<String, SandboxError> {
     let invalid = |m: &str| SandboxError::Invalid(format!("OCI identifier: {m}"));
-    if identifier.matches('@').count() != 1 {
-        return Err(invalid("exactly one `@sha256:<digest>` is required"));
-    }
-    let (image, _) = parse_oci_reference(identifier).map_err(|e| match e {
-        OciRefError::Invalid(m) => invalid(&m),
-        OciRefError::Floating => invalid("a SHA-256 digest is required"),
-    })?;
-    let digest = image
-        .digest
-        .as_deref()
-        .ok_or_else(|| invalid("a SHA-256 digest is required"))?;
-    let hash = digest
-        .strip_prefix("sha256:")
-        .ok_or_else(|| invalid("the digest must be SHA-256"))?;
-    if hash.len() != 64
-        || !hash
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return Err(invalid("the digest must be 64 lower-case hex characters"));
-    }
     let base = url::Url::parse(ak_base_url)
         .map_err(|_| SandboxError::Invalid("AK base URL is not a URL".into()))?;
     if base.host_str().is_none() {
         return Err(SandboxError::Invalid("AK base URL has no host".into()));
     }
-    if image.host != host_of(ak_base_url) {
+    let ak_host = host_of(ak_base_url);
+    // An image reference only names a registry host whose first component
+    // contains `.` or `:` or is `localhost`; any other first component is a
+    // Docker Hub namespace, so a bare service name can never be this AK.
+    if !(ak_host.contains('.') || ak_host.contains(':') || ak_host == "localhost") {
+        return Err(SandboxError::Invalid(format!(
+            "AK host `{ak_host}` cannot name an OCI registry: it must contain `.` or `:`, \
+             or be `localhost`"
+        )));
+    }
+    if identifier.matches('@').count() != 1 {
+        return Err(invalid("exactly one `@sha256:<digest>` is required"));
+    }
+    // `parse_oci_reference` resolves a floating tag rather than refusing it,
+    // so `Invalid` is the only error it returns.
+    let (image, _) = parse_oci_reference(identifier).map_err(|e| {
+        invalid(match &e {
+            OciRefError::Invalid(m) => m,
+            OciRefError::Floating => "not an image reference",
+        })
+    })?;
+    // The parser has checked the digest's length and lower-case hex; only
+    // the algorithm is left.
+    let digest = image
+        .digest
+        .as_deref()
+        .filter(|d| d.starts_with("sha256:"))
+        .ok_or_else(|| invalid("the digest must be SHA-256"))?;
+    if image.host != ak_host {
         return Err(invalid("the image host is not this AK instance"));
     }
     // An AK OCI reference is `<ak host>/<repository>/<name>[...]`; a bare
@@ -369,9 +376,10 @@ fn oci_image(identifier: &str, ak_base_url: &str) -> Result<String, SandboxError
     Ok(canonical)
 }
 
-/// OCI keeps its source in `identifier`. Refuse the legacy source fields and
-/// publisher runtime arguments instead of letting a second value compete
-/// with the validated reference.
+/// OCI keeps its source in `identifier`. Refuse the legacy source fields
+/// instead of letting a second value compete with the validated reference.
+/// (Publisher `runtimeArguments` are dropped with a note, as for npm/PyPI:
+/// the engine arguments are fixed by the runner.)
 fn reject_oci_source_overrides(package: &Value) -> Result<(), SandboxError> {
     for field in ["version", "registryBaseUrl", "fileSha256"] {
         if package.get(field).is_some_and(|v| !v.is_null()) {
@@ -379,16 +387,6 @@ fn reject_oci_source_overrides(package: &Value) -> Result<(), SandboxError> {
                 "OCI package must put its tag or digest in `identifier`, not `{field}`"
             )));
         }
-    }
-    if package
-        .get("runtimeArguments")
-        .and_then(|a| a.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
-        return Err(SandboxError::Invalid(
-            "OCI package must not carry runtimeArguments; the runner's engine arguments are fixed"
-                .into(),
-        ));
     }
     Ok(())
 }
@@ -1457,20 +1455,157 @@ mod tests {
                 "{field}"
             );
         }
-        for args in [
-            json!([{"type": "named", "name": "--image", "value": "evil.test/x"}]),
-            json!([{"type": "named", "name": "--registry", "value": "https://evil.test"}]),
-            json!([{"type": "positional", "value": "--pull=always"}]),
+    }
+
+    #[test]
+    fn oci_spec_drops_runtime_arguments_like_npm_and_pypi() {
+        // Docker-style server.json files carry `-e VAR=...` and mounts; publish
+        // accepts them, so the job must still run, with them dropped.
+        let canonical = format!("ak.example.test/oci/acme/mcp@{}", oci_digest());
+        let t = json!({"package": {
+            "registryType": "oci", "identifier": canonical.clone(),
+            "runtimeArguments": [
+                {"type": "named", "name": "-e", "value": "EVIL_VAR=1"},
+                {"type": "named", "name": "-v", "value": "/:/host"},
+                {"type": "named", "name": "--image", "value": "evil.test/x"},
+                {"type": "named", "name": "--registry", "value": "https://evil.test"},
+                {"type": "positional", "value": "--pull=always"},
+            ],
+        }});
+        let spec = guest_spec("j", &t, AK, &Images::default()).unwrap();
+        assert_eq!(spec.image, canonical);
+        assert!(spec.argv.is_empty());
+        assert!(spec.notes.iter().any(|n| n == "runtimeArguments ignored"));
+        let plan = OciRunner::default().plan(&spec).unwrap();
+        // The runner passes its own `-e NAME=value` pairs; none of the
+        // publisher's names, values or flags is among the engine arguments.
+        assert!(!plan.args.iter().any(|a| a == "-v"));
+        for dropped in [
+            "EVIL_VAR",
+            "/:/host",
+            "--image",
+            "evil.test",
+            "--registry",
+            "--pull=always",
         ] {
-            let t = json!({"package": {
-                "registryType": "oci", "identifier": canonical.clone(),
-                "runtimeArguments": args,
-            }});
             assert!(
-                guest_spec("j", &t, AK, &Images::default()).is_err(),
-                "{args}"
+                !plan.args.iter().any(|a| a.contains(dropped)),
+                "{dropped} reached the engine: {:?}",
+                plan.args
             );
         }
+    }
+
+    fn oci_err(identifier: &str, ak: &str) -> String {
+        let t = json!({"package": {"registryType": "oci", "identifier": identifier}});
+        match guest_spec("j", &t, ak, &Images::default()) {
+            Err(SandboxError::Invalid(m)) => m,
+            other => panic!("{identifier} on {ak}: expected Invalid, got {other:?}"),
+        }
+    }
+
+    fn oci_ok(identifier: &str, ak: &str) -> String {
+        let t = json!({"package": {"registryType": "oci", "identifier": identifier}});
+        guest_spec("j", &t, ak, &Images::default())
+            .unwrap_or_else(|e| panic!("{identifier} on {ak}: {e}"))
+            .image
+    }
+
+    #[test]
+    fn oci_spec_refuses_an_unusable_ak_base_url() {
+        let id = format!("ak.example.test/oci/acme/mcp@{}", oci_digest());
+        assert_eq!(oci_err(&id, "not a url"), "AK base URL is not a URL");
+        assert_eq!(oci_err(&id, "unix:/run/ak.sock"), "AK base URL has no host");
+        // A bare service name is read as a Docker Hub namespace by every
+        // image-reference parser, so it can never name this AK as a registry.
+        let d = oci_digest();
+        for (base, id) in [
+            (
+                "http://artifact-keeper",
+                format!("artifact-keeper/oci/acme/mcp@{d}"),
+            ),
+            ("https://ak:443", format!("ak/oci/acme/mcp@{d}")),
+            ("https://ak:443", format!("ak:443/oci/acme/mcp@{d}")),
+        ] {
+            let m = oci_err(&id, base);
+            assert!(
+                m.contains("must contain `.` or `:`, or be `localhost`"),
+                "{base}: {m}"
+            );
+        }
+        // `localhost` and a dotless host with a non-default port are hosts.
+        let id = format!("localhost/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, "http://localhost"), id);
+        let id = format!("artifact-keeper:8080/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, "http://artifact-keeper:8080"), id);
+    }
+
+    #[test]
+    fn oci_spec_edge_references_never_change_the_source() {
+        let d = oci_digest();
+        // IPv6 origin: only the exact bracketed host and port is this AK.
+        let base = "http://[::1]:8080";
+        let id = format!("[::1]:8080/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, base), id);
+        for other in [
+            format!("[::1]/oci/acme/mcp@{d}"),
+            format!("[::1]:8081/oci/acme/mcp@{d}"),
+            format!("[::2]:8080/oci/acme/mcp@{d}"),
+            format!("::1:8080/oci/acme/mcp@{d}"),
+        ] {
+            oci_err(&other, base);
+        }
+        // A written-out default port is dropped from the AK host, as it is
+        // from the served identifier, so only the port-less form matches.
+        let base = "https://ak.example.test:443";
+        let id = format!("ak.example.test/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, base), id);
+        assert!(
+            oci_err(&format!("ak.example.test:443/oci/acme/mcp@{d}"), base)
+                .contains("not this AK instance")
+        );
+        // `:latest` beside a digest is still pinned by the digest: AK serves a
+        // resolved floating tag this way, and the engine runs the digest.
+        let id = format!("ak.example.test/oci/acme/mcp:latest@{d}");
+        assert_eq!(oci_ok(&id, AK), id);
+        oci_err("ak.example.test/oci/acme/mcp:latest", AK);
+        oci_err("ak.example.test/oci/acme/mcp:latest@", AK);
+        // Homoglyphs in the host (Cyrillic `а`) or the path.
+        assert!(
+            oci_err(&format!("\u{430}k.example.test/oci/acme/mcp@{d}"), AK)
+                .contains("not this AK instance")
+        );
+        oci_err(&format!("ak.example.test/oci/\u{430}cme/mcp@{d}"), AK);
+        oci_err(&format!("ak.example.test/oci/acme/mcp:1\u{2024}0@{d}"), AK);
+        // An identifier longer than 512 characters, even on this AK.
+        let id = format!("ak.example.test/oci/{}/mcp@{d}", "a".repeat(480));
+        assert!(id.len() > 512);
+        oci_err(&id, AK);
+        // SHA-512 is a valid OCI digest but not the pin AK serves.
+        assert!(oci_err(
+            &format!("ak.example.test/oci/acme/mcp@sha512:{}", "a".repeat(128)),
+            AK
+        )
+        .contains("must be SHA-256"));
+    }
+
+    #[test]
+    fn oci_spec_refuses_repository_keys_outside_the_image_path_grammar() {
+        // AK repository keys may hold upper case or end in `_`/`.`/`-`; such a
+        // key is not a valid image path component, and podman would refuse the
+        // reference too, so the job fails as invalid rather than running.
+        let d = oci_digest();
+        for key in [
+            "Docker_Local",
+            "docker-local_",
+            "docker-local.",
+            "docker-local-",
+        ] {
+            let m = oci_err(&format!("ak.example.test/{key}/acme/mcp@{d}"), AK);
+            assert!(m.contains("not a valid image name"), "{key}: {m}");
+        }
+        let id = format!("ak.example.test/docker_local/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, AK), id);
     }
 
     #[test]
