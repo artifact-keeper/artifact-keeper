@@ -333,6 +333,35 @@ pub fn parse_result(r: &WorkerResult) -> Result<ParsedResult, caps::CapError> {
     })
 }
 
+/// The `observedAt` a result is stored with (#5464): the worker's, when it
+/// lies between the job's claim and now (each give or take
+/// [`caps::OBSERVED_AT_SKEW_SECS`] of clock skew), else refused, and never
+/// later than now; `now` when the worker sent none. Freshness orders the current view, so a result may
+/// not claim to be older than the claim it answers or newer than its
+/// arrival.
+pub fn validated_observed_at(
+    observed_at: Option<DateTime<Utc>>,
+    claimed_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, caps::CapError> {
+    let Some(t) = observed_at else {
+        return Ok(now);
+    };
+    let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+    if t > now + skew {
+        return Err(caps::CapError::new("observedAt", "is in the future"));
+    }
+    if claimed_at.is_some_and(|c| t < c - skew) {
+        return Err(caps::CapError::new(
+            "observedAt",
+            "is before the job was claimed",
+        ));
+    }
+    // The skew is tolerated, never ranked: a result cannot claim to be
+    // fresher than its arrival.
+    Ok(t.min(now))
+}
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -649,6 +678,53 @@ async fn finish(
     Ok(done.rows_affected() == 1)
 }
 
+/// Releases of a job ([`release`]) that hand its attempt back; later ones
+/// spend it.
+pub const RELEASE_REFUNDS: i32 = 5;
+/// The longest backoff of a released job: `60 s * 2^RELEASE_BACKOFF_CAP`.
+pub const RELEASE_BACKOFF_CAP: i32 = 6;
+
+/// The delay before a job released for the `releases`-th time (counting
+/// from 0) is due again: one minute, doubling up to
+/// [`RELEASE_BACKOFF_CAP`].
+pub fn release_delay_secs(releases: i32) -> i64 {
+    60 * (1i64 << releases.clamp(0, RELEASE_BACKOFF_CAP))
+}
+
+/// Hand a claimed job back to the queue: its gates could not be evaluated,
+/// which is no verdict on the job. It is due again after
+/// [`release_delay_secs`]; the first [`RELEASE_REFUNDS`] releases do not
+/// spend the claim's attempt, later ones do, and a job out of attempts fails
+/// as the reaper fails it, so a gate that never becomes evaluable cannot
+/// cycle a job forever. Only the current claim is released. Returns the
+/// job's status after the release, `None` when the claim was not current.
+pub async fn release(
+    db: &PgPool,
+    job: &JobRow,
+    reason: &str,
+) -> crate::error::Result<Option<String>> {
+    sqlx::query_scalar(
+        "UPDATE mcp_introspection_jobs SET gate_releases = gate_releases + 1, \
+           attempts = CASE WHEN gate_releases < $4 THEN GREATEST(attempts - 1, 0) \
+                           ELSE attempts END, \
+           status = CASE WHEN gate_releases >= $4 AND attempts >= max_attempts \
+                         THEN 'failed' ELSE 'pending' END, \
+           completed_at = CASE WHEN gate_releases >= $4 AND attempts >= max_attempts \
+                               THEN NOW() END, \
+           not_before = NOW() + make_interval(secs => 60 * power(2, LEAST(gate_releases, $5))), \
+           last_error = $3, claim_token_hash = NULL, lease_expires_at = NULL, updated_at = NOW() \
+         WHERE id = $1 AND status = 'claimed' AND claim_token_hash = $2 RETURNING status",
+    )
+    .bind(job.id)
+    .bind(&job.claim_token_hash)
+    .bind(reason)
+    .bind(RELEASE_REFUNDS)
+    .bind(RELEASE_BACKOFF_CAP)
+    .fetch_optional(db)
+    .await
+    .map_err(db_err)
+}
+
 /// Cancel a claimed job that cannot run (target gone, version held).
 pub async fn cancel(db: &PgPool, job: &JobRow, reason: &str) -> crate::error::Result<bool> {
     finish(db, job, "cancelled", None, None, Some(reason)).await
@@ -661,9 +737,12 @@ pub async fn cancel(db: &PgPool, job: &JobRow, reason: &str) -> crate::error::Re
 #[allow(clippy::large_enum_variant)]
 pub enum Completed {
     /// A snapshot was stored (and drift raised when `drift_scan` is set).
+    /// `current`: whether the stored (or repeated) snapshot is the version's
+    /// current view ([`caps::pick_current`]) as of this commit (#5464).
     Stored {
         snapshot: caps::SnapshotRow,
         drift_scan: Option<Uuid>,
+        current: bool,
     },
     /// A transient failure: the job goes back to the queue.
     Retry { not_before: DateTime<Utc> },
@@ -676,24 +755,44 @@ pub enum Completed {
     /// nothing was stored and the claim was left as it was.
     /// `403 mcp_forbidden` (#5460).
     Forbidden,
+    /// The target stopped being eligible after the claim (the version was
+    /// quarantined, rejected, held, deleted or marked deleted, or a backing
+    /// package is held): nothing was stored and
+    /// the job was cancelled with `reason`, as a claim of such a job is.
+    /// `409 mcp_target_ineligible` (#5463).
+    Ineligible { reason: String },
+    /// The result itself was refused (an `observedAt` outside the claim's
+    /// window, #5464): nothing was stored and the claim was left as it was.
+    /// `400`.
+    Invalid(caps::CapError),
+}
+
+/// A claim [`lock_claim`] found current.
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+struct LockedClaim {
+    /// Whether the worker's scope authorizes the job's repository.
+    authorized: bool,
+    claimed_at: Option<DateTime<Utc>>,
 }
 
 /// Lock the current claim of `job` in the transaction that will end it, and
 /// re-check the repository authorization ([`repo_authorized`]) under that
-/// same lock: `None` when the claim is no longer current (#5389),
-/// `Some(false)` when `scope` does not authorize the job's repository
-/// (#5460), `Some(true)` when the transaction may end the claim.
+/// same lock: `None` when the claim is no longer current (#5389) or its lease
+/// has expired, whether or not the reaper has run yet (#5462). The lease is
+/// read against the clock when the row is locked, so a completion and the
+/// reaper (which locks the same row) have exactly one outcome.
 async fn lock_claim(
     tx: &mut sqlx::PgConnection,
     job: &JobRow,
     scope: &AccessScope,
-) -> crate::error::Result<Option<bool>> {
+) -> crate::error::Result<Option<LockedClaim>> {
     let sql = format!(
-        "SELECT {} FROM mcp_introspection_jobs j \
-         WHERE j.id = $1 AND j.status = 'claimed' AND j.claim_token_hash = $2 FOR UPDATE OF j",
+        "SELECT ({}) AS authorized, j.claimed_at FROM mcp_introspection_jobs j \
+         WHERE j.id = $1 AND j.status = 'claimed' AND j.claim_token_hash = $2 \
+           AND j.lease_expires_at > clock_timestamp() FOR UPDATE OF j",
         repo_authorized("j", 3)
     );
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(job.id)
         .bind(&job.claim_token_hash)
         .bind(scope.as_allowed_repo_ids())
@@ -702,38 +801,133 @@ async fn lock_claim(
         .map_err(db_err)
 }
 
+/// Lock the server version row `artifact_id` `FOR SHARE` in a completion's
+/// transaction, before its claim, and read its hold: `None` when it is gone
+/// or deleted. A quarantine, rejection or deletion of the version (an
+/// `UPDATE` of this row) either committed before and is seen here, or waits
+/// for the completion to commit (#5463). Taken before the job row, in the
+/// order a cascading delete of the version locks the two.
+async fn lock_version(
+    tx: &mut sqlx::PgConnection,
+    artifact_id: Uuid,
+) -> crate::error::Result<Option<(Option<String>, Option<DateTime<Utc>>)>> {
+    sqlx::query_as(
+        "SELECT quarantine_status, quarantine_until FROM artifacts \
+         WHERE id = $1 AND is_deleted = false FOR SHARE",
+    )
+    .bind(artifact_id)
+    .fetch_optional(tx)
+    .await
+    .map_err(db_err)
+}
+
+/// Re-check, in the completion's transaction, that the job's target is still
+/// eligible (#5463): `Err(reason)` when it is not. `hold` is the version
+/// row's hold from [`lock_version`]; `servable` is the full serve gate the
+/// caller evaluated before the transaction (the same gate a claim passes).
+/// The in-transaction half covers the version (deleted, quarantined,
+/// rejected, its registry status `deleted`) and every backing package's
+/// pinned rows ([`held_backing_package`]). The target entry itself is not
+/// re-checked: a version's server.json is immutable once published, and the
+/// claim checked the entry against it.
+///
+/// [`held_backing_package`]: crate::services::mcp_packages::held_backing_package
+async fn revalidate(
+    tx: &mut sqlx::PgConnection,
+    job: &JobRow,
+    hold: Option<(Option<String>, Option<DateTime<Utc>>)>,
+    servable: bool,
+) -> crate::error::Result<Result<caps::VersionRef, String>> {
+    let Some((status, until)) = hold else {
+        return Ok(Err("server version deleted".into()));
+    };
+    if !servable
+        || crate::services::quarantine_service::check_download_allowed(
+            status.as_deref(),
+            until,
+            Utc::now(),
+        )
+        .is_err()
+    {
+        return Ok(Err("server version is held".into()));
+    }
+    let Some(v) = caps::version_ref(&mut *tx, job.artifact_id)
+        .await
+        .map_err(db_err)?
+    else {
+        return Ok(Err("server version deleted".into()));
+    };
+    let Some(stored) = StoredVersion::from_metadata(&v.metadata) else {
+        return Ok(Err("unreadable server version".into()));
+    };
+    if stored.registry.status == crate::formats::mcp::ServerStatus::Deleted {
+        return Ok(Err("server version deleted".into()));
+    }
+    if let Some(package) = crate::services::mcp_packages::held_backing_package(&mut *tx, &stored)
+        .await
+        .map_err(db_err)?
+    {
+        return Ok(Err(format!("backing package {package} is held")));
+    }
+    Ok(Ok(v))
+}
+
 /// Record a worker result for a claimed job (token already checked by the
 /// caller, but the claim may end concurrently), as a worker whose credential
-/// carries repository `scope`.
+/// carries repository `scope`. `servable` is the full serve gate of the job's
+/// server version, evaluated by the caller just before (see [`revalidate`]).
 ///
 /// The claim check and end and the snapshot insert run in one transaction
-/// (the job row is locked with its token hash and `claimed` status), so of
-/// two completions of one claim exactly one stores a snapshot; the other, and
-/// one racing the reaper or a re-claim, gets [`Completed::ClaimLost`]. The
-/// audit, lint and drift side effects run after the commit, and only for a
-/// newly stored snapshot (#5389). Under that same row lock the worker's
-/// repository scope and the job's repository binding are re-checked, for a
-/// retry as for a result, so a credential whose scope (as validated for
-/// this request) does not cover the job's repository gets
-/// [`Completed::Forbidden`] and changes nothing (#5460). A scope narrowed
-/// after the claim is seen here once the API-token validation cache has
-/// expired.
+/// (the job row is locked with its token hash, `claimed` status and a live
+/// lease), so of two completions of one claim exactly one stores a snapshot;
+/// the other, and one racing the reaper, a re-claim or its own lease expiry,
+/// gets [`Completed::ClaimLost`] (#5389, #5461, #5462). The audit, lint and
+/// drift side effects run after the commit, and only for a newly stored
+/// snapshot. Under that same row lock:
+///
+/// * the worker's repository scope and the job's repository binding are
+///   re-checked, for a retry as for a result, so a credential whose scope
+///   (as validated for this request) does not cover the job's repository
+///   gets [`Completed::Forbidden`] and changes nothing (#5460). A scope
+///   narrowed after the claim is seen here once the API-token validation
+///   cache has expired;
+/// * the target is revalidated ([`revalidate`]): one that stopped being
+///   eligible after the claim cancels the job and stores nothing
+///   ([`Completed::Ineligible`], #5463);
+/// * the result's `observedAt` is validated against the claim
+///   ([`validated_observed_at`], #5464). The snapshot becomes the current
+///   view only when it is the freshest of its source.
 pub async fn complete(
     db: &PgPool,
     job: &JobRow,
     result: &WorkerResult,
     parsed: ParsedResult,
     scope: &AccessScope,
+    servable: bool,
 ) -> crate::error::Result<Completed> {
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
     let mut tx = db.begin().await.map_err(db_err)?;
-    match lock_claim(&mut tx, job, scope).await? {
+    let hold = lock_version(&mut tx, job.artifact_id).await?;
+    let claimed_at = match lock_claim(&mut tx, job, scope).await? {
         None => return Ok(Completed::ClaimLost),
-        Some(false) => return Ok(Completed::Forbidden),
-        Some(true) => {}
-    }
+        Some(LockedClaim {
+            authorized: false, ..
+        }) => return Ok(Completed::Forbidden),
+        Some(LockedClaim { claimed_at, .. }) => claimed_at,
+    };
+    let v = match revalidate(&mut tx, job, hold, servable).await? {
+        Ok(v) => v,
+        Err(reason) => {
+            // The row is locked and matched above, so this ends the claim.
+            if !finish(&mut *tx, job, "cancelled", None, None, Some(&reason)).await? {
+                return Ok(Completed::ClaimLost);
+            }
+            tx.commit().await.map_err(db_err)?;
+            return Ok(Completed::Ineligible { reason });
+        }
+    };
     if is_transient(parsed.outcome)
         && job.attempts < attempts_allowed(kind, parsed.outcome, job.max_attempts)
     {
@@ -755,15 +949,15 @@ pub async fn complete(
         tx.commit().await.map_err(db_err)?;
         return Ok(Completed::Retry { not_before });
     }
-    // Read on the transaction's connection: the completion holds the job
-    // row lock, and waiting for a second pool connection under it could
-    // stall concurrent completions until the acquire timeout. The
-    // repository id the snapshot is filed under is read in the same locked
-    // view the authorization check above ran in.
-    let v = caps::version_ref(&mut *tx, job.artifact_id)
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| crate::error::AppError::NotFound("server version deleted".into()))?;
+    let observed_at = match validated_observed_at(result.observed_at, claimed_at, Utc::now()) {
+        Ok(t) => t,
+        Err(e) => return Ok(Completed::Invalid(e)),
+    };
+    // `v` was read on the transaction's connection ([`revalidate`]): the
+    // completion holds the job row lock, and waiting for a second pool
+    // connection under it could stall concurrent completions until the
+    // acquire timeout. The repository id the snapshot is filed under is read
+    // in the same locked view the authorization check above ran in.
     let mut details = result.details.clone().unwrap_or_else(|| json!({}));
     if let (Some(o), Some(e)) = (details.as_object_mut(), result.error.as_deref()) {
         o.insert("error".into(), json!(caps_truncate(e, 1000)));
@@ -785,7 +979,7 @@ pub async fn complete(
         auth_state: parsed.auth_state,
         outcome: parsed.outcome,
         protocol_version: result.protocol_version.clone(),
-        observed_at: result.observed_at.unwrap_or_else(Utc::now),
+        observed_at,
         ttl_ms: result.ttl_ms.filter(|t| *t >= 0),
         cache_scope: result.cache_scope.clone(),
         set: parsed.set,
@@ -801,6 +995,9 @@ pub async fn complete(
         "completed"
     };
     let ins = caps::insert_snapshot_in(&mut tx, &snap)
+        .await
+        .map_err(db_err)?;
+    let current = caps::is_current_in(&mut tx, v.artifact_id, ins.snapshot.id)
         .await
         .map_err(db_err)?;
     // The row is locked and matched above, so this ends the claim.
@@ -819,6 +1016,7 @@ pub async fn complete(
     tx.commit().await.map_err(db_err)?;
     let drift_scan = caps::record_stored(db, &snap, &ins, &v.repository_key).await?;
     Ok(Completed::Stored {
+        current,
         snapshot: ins.snapshot,
         drift_scan,
     })
@@ -1156,6 +1354,25 @@ mod tests {
         for b in bad {
             assert!(parse_result(&b).is_err(), "{b:?}");
         }
+    }
+
+    #[test]
+    fn observed_at_lies_in_the_claim_window() {
+        let now = DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let claimed = now - chrono::Duration::minutes(10);
+        let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+        let ok = |t| validated_observed_at(Some(t), Some(claimed), now);
+        assert_eq!(validated_observed_at(None, Some(claimed), now), Ok(now));
+        assert_eq!(ok(claimed), Ok(claimed));
+        assert_eq!(ok(now + skew), Ok(now), "skew tolerated, never ranked");
+        assert_eq!(ok(claimed - skew), Ok(claimed - skew));
+        let future = ok(now + skew + chrono::Duration::seconds(1)).unwrap_err();
+        assert_eq!(future.path, "observedAt");
+        assert!(future.message.contains("future"), "{future:?}");
+        let before = ok(claimed - skew - chrono::Duration::seconds(1)).unwrap_err();
+        assert!(before.message.contains("before the job"), "{before:?}");
+        let old = now - chrono::Duration::days(365);
+        assert_eq!(validated_observed_at(Some(old), None, now), Ok(old));
     }
 
     #[test]

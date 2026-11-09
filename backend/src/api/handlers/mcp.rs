@@ -2828,9 +2828,18 @@ pub(crate) async fn visible_version(
 }
 
 async fn servable_row(state: &SharedState, repo: &RepoInfo, row: &VersionRow, base: &str) -> bool {
+    reader_decision(state, repo, row, base).await == Servability::Servable
+}
+
+async fn reader_decision(
+    state: &SharedState,
+    repo: &RepoInfo,
+    row: &VersionRow,
+    base: &str,
+) -> Servability {
     let instance = instance_url(base, &repo.key, &row.name, &row.version);
-    matches!(
-        decide_row(
+    Servability::of(
+        &decide_row(
             GateCtx::of(state, false),
             row,
             false,
@@ -2838,21 +2847,45 @@ async fn servable_row(state: &SharedState, repo: &RepoInfo, row: &VersionRow, ba
             instance,
         )
         .await,
-        ServeDecision::Serve
     )
 }
 
+/// A reader serve decision, three-way: an introspection claim or completion
+/// cancels its job only on a definite hold, never because a gate could not
+/// be evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Servability {
+    Servable,
+    /// Refused: the version (or a backing package) is held.
+    Held,
+    /// A gate could not be evaluated (`503 mcp_gate_unavailable`): retry
+    /// later.
+    Unavailable,
+}
+
+impl Servability {
+    pub(crate) fn of(decision: &ServeDecision) -> Self {
+        match decision {
+            ServeDecision::Serve => Self::Servable,
+            ServeDecision::Refuse { status: 503, .. } => Self::Unavailable,
+            ServeDecision::Refuse { .. } => Self::Held,
+        }
+    }
+}
+
 /// Whether the stored version `artifact_id` of `repo` is servable to readers
-/// now (the sandbox only ever runs a version whose gates pass).
-pub(crate) async fn artifact_servable(
+/// now (the sandbox only ever runs a version whose gates pass). A version
+/// whose row cannot be read is [`Servability::Unavailable`]: the caller has
+/// already found it (a deleted version is the caller's definite refusal).
+pub(crate) async fn artifact_servability(
     state: &SharedState,
     repo: &RepoInfo,
     artifact_id: Uuid,
     base: &str,
-) -> bool {
+) -> Servability {
     match stored_row(&state.db, artifact_id).await {
-        Ok(row) => servable_row(state, repo, &row, base).await,
-        Err(_) => false,
+        Ok(row) => reader_decision(state, repo, &row, base).await,
+        Err(_) => Servability::Unavailable,
     }
 }
 
@@ -2882,6 +2915,21 @@ mod tests {
         parse_list_query(q, |c| {
             test_seal().decode_position(Uuid::nil(), fmt::cursor_kind::SERVERS, c)
         })
+    }
+
+    #[test]
+    fn servability_is_three_way() {
+        let refuse = |status| ServeDecision::Refuse {
+            status,
+            body: serde_json::json!({}),
+            hold_class: "x",
+        };
+        assert_eq!(
+            Servability::of(&ServeDecision::Serve),
+            Servability::Servable
+        );
+        assert_eq!(Servability::of(&refuse(503)), Servability::Unavailable);
+        assert_eq!(Servability::of(&refuse(404)), Servability::Held);
     }
 
     #[test]

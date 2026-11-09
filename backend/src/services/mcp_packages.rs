@@ -1323,7 +1323,10 @@ const GATE_ROW_COLUMNS: &str = "id, repository_id, checksum_sha256::text, create
 /// time of a read; the digest-path row [`hold_oci_pin`] writes keeps the
 /// pinned bytes addressable. A pin with no live row cannot be gated and is
 /// unresolvable.
-async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::Error> {
+async fn gate_rows(
+    db: impl sqlx::PgExecutor<'_>,
+    pin: &PackagePin,
+) -> Result<Vec<GateRow>, sqlx::Error> {
     if let Some(path) = pin.resolved.cache_path.as_deref() {
         // A cache pin is present while the Remote still caches the pinned
         // bytes at its path; a refresh to other bytes (or an eviction) makes
@@ -1373,6 +1376,66 @@ async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::
         .await?
     };
     Ok(rows.into_iter().map(gate_row).collect())
+}
+
+/// The first package of `stored` whose pinned bytes are no longer cleared
+/// for use, read on `conn` (the transaction that commits an introspection
+/// result, #5463): a package with no pin, a pin with no live row, a cache
+/// pin under its hold, or a pinned `artifacts` row that is quarantined,
+/// rejected or deleted. Those rows are locked `FOR SHARE`, so a quarantine,
+/// rejection or deletion of a backing package either is seen here or waits
+/// for the caller's commit. This is the quarantine half of
+/// [`backing_gate`] only: the scan-policy, Remote and OCI-presence gates
+/// stay with the full serve gate, which the caller evaluates beforehand
+/// (#5533 tracks evaluating the whole gate on the transaction).
+pub async fn held_backing_package(
+    conn: &mut sqlx::PgConnection,
+    stored: &mcp::StoredVersion,
+) -> Result<Option<String>, sqlx::Error> {
+    if let Some(package) = stored.unpinned_package() {
+        return Ok(Some(package));
+    }
+    let mut pins = Vec::new();
+    for pin in &stored.pins {
+        pins.push((pin, gate_rows(&mut *conn, pin).await?));
+    }
+    // Every pinned row of every pin locked in one statement, in id order, so
+    // two completions never take them in opposite orders.
+    let mut ids: Vec<Uuid> = pins
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().filter(|r| !r.cached).map(|r| r.id))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let locked: HashMap<Uuid, (Option<String>, Option<DateTime<Utc>>)> =
+        sqlx::query_as::<_, (Uuid, Option<String>, Option<DateTime<Utc>>)>(
+            "SELECT id, quarantine_status, quarantine_until FROM artifacts \
+         WHERE id = ANY($1) AND is_deleted = false ORDER BY id FOR SHARE",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|(id, status, until)| (id, (status, until)))
+        .collect();
+    let now = Utc::now();
+    let cleared = |r: &GateRow| {
+        if r.cached {
+            return !r.cache_held(now);
+        }
+        locked.get(&r.id).is_some_and(|(status, until)| {
+            crate::services::quarantine_service::check_download_allowed(
+                status.as_deref(),
+                *until,
+                now,
+            )
+            .is_ok()
+        })
+    };
+    Ok(pins
+        .iter()
+        .find(|(_, rows)| rows.is_empty() || !rows.iter().all(cleared))
+        .map(|(pin, _)| pin.label()))
 }
 
 /// Whether the pinned OCI manifest still exists in its repository.

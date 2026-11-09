@@ -2122,9 +2122,20 @@ a `notice` member.
 | `remote_probe` | the `ak-mcp-introspector` worker against a `remotes[]` URL | observed (remote) |
 | `sandbox_run` | the `ak-mcp-introspector` worker running a stdio package in a sandbox | observed (sandbox) |
 
-The **current** snapshot is the newest successful (`outcome: ok`) one of the
-best source in this order: `sandbox_run`, `remote_probe`, `gateway_reported`,
-`ci_reported`, `publisher_declared`.
+The **current** snapshot is the freshest successful (`outcome: ok`) one of
+the best source in this order: `sandbox_run`, `remote_probe`,
+`gateway_reported`, `ci_reported`, `publisher_declared`. Freshness is the
+latest time the content was validly seen (`lastSeenAt`, else `observedAt`),
+then arrival, then id, never arrival alone (#5464): a result or report that
+arrives later but was observed earlier than the current snapshot is kept as
+history and does not replace it, raises no `tool_drift` finding and is not
+linted (its tool text carries no lint finding in the diff view). History
+(`snapshots[]`) and the diff's default `from` follow the same order.
+"Newest" below means freshest in this order. A result or report dated up to
+5 minutes ahead (clock skew) is stored as of its arrival. CI and gateway
+reports have no lower bound on `observedAt`: a pipeline that reports a build
+or commit time older than the current snapshot of its source stores history
+and does not update the current view.
 
 History is kept, deduplicated and bounded (#5386):
 
@@ -2250,7 +2261,7 @@ default 50, max 200).
     "createdAt": "2026-11-03T10:00:01Z",
     "tools": [], "resources": [], "prompts": [], "instructions": null
   },
-  "snapshots": [ /* summaries, newest first: `current` without tools/resources/prompts/instructions */ ],
+  "snapshots": [ /* summaries, freshest first: `current` without tools/resources/prompts/instructions */ ],
   "introspection": {
     "remoteProbe": "off", "probeEnabled": false,
     "sandbox": "off", "sandboxEnabled": false,
@@ -2404,7 +2415,29 @@ the audit, lint and drift side effects run only after it commits. Of two
 completions of one claim, or a completion racing the reaper or a re-claim,
 exactly one stores a snapshot; the other stores nothing and is answered
 `409 mcp_claim_invalid`. A retry (`status: "retry"`) likewise only counts
-when it ended the current claim.
+when it ended the current claim, so a retry racing a successful result
+never leaves a stored snapshot behind a pending job (#5461).
+
+The same transaction also requires a live lease: a claim whose
+`leaseExpiresAt` has passed cannot complete or retry, whether or not the
+reaper has run yet (`409 mcp_claim_invalid`, nothing stored, the job left for
+the reaper) (#5462). And it revalidates the target (#5463): the reader serve
+gate a claim passes is evaluated once more just before the transaction, and
+inside it these are re-read under lock: the version row's quarantine,
+rejection and deletion, its registry status (`deleted`), and every backing
+package's pinned rows (quarantined, rejected, deleted, or a cache pin under
+its hold). The other gates (scan policy, curation and age gates, Remote
+proxy verdicts, OCI manifest presence) are evaluated only by the
+pre-transaction check (#5533 tracks evaluating the whole gate on the
+transaction). A target that no longer qualifies answers `409
+mcp_target_ineligible` with a `reason`, stores nothing and cancels the job,
+as a claim of a held version does. A gate that cannot be evaluated is no
+hold: a claim returns the job to the queue and tries the next candidate
+(answering `503 mcp_gate_unavailable` only when nothing servable was found),
+and a completion answers `503 mcp_gate_unavailable` and leaves the claim as it
+was. A released job is due again after 1, 2, 4 ... up to 64 minutes; its first
+five releases give the attempt back, later ones spend it, so a gate that never
+becomes evaluable fails the job once its attempts are used up.
 
 Claim order is fair across repositories: a claim hands out a due job from the
 repository with the fewest jobs claimed at that moment, and within it the
@@ -2432,7 +2465,9 @@ repository restriction takes effect once the API-token validation cache
 the token was last validated with.
 
 `POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
-"workerId": "pod-a"}` (both optional) answers `204` when nothing is due, or
+"workerId": "pod-a"}` (both optional) answers `204` when nothing is due,
+`503 mcp_gate_unavailable` when nothing servable was found and a
+candidate's gates could not be evaluated (it goes back to the queue), or
 `200`:
 
 ```json
@@ -2477,11 +2512,19 @@ OCI identifier rewritten to akBaseUrl */ }}` with limits `{"wallClockMs":
 }
 ```
 
-A failed outcome carries no lists. `200 {"status": "stored", "snapshotId",
-"contentHash", "drift": {"scanId"} | null}` (`snapshotId` is the existing
-snapshot when the result repeats it) or `200 {"status": "retry",
-"notBefore"}`; `409 mcp_claim_invalid` when the token does not match the
-current claim (expired, re-claimed or already completed); `403
+A failed outcome carries no lists. `observedAt` (default: the arrival time)
+must lie between the job's claim and its arrival, with 5 minutes of clock
+skew either side, else `400` and the claim is left as it was; one up to 5
+minutes ahead is stored as of its arrival (#5464).
+`200 {"status": "stored", "snapshotId", "contentHash", "current", "drift":
+{"scanId"} | null}` (`snapshotId` is the existing snapshot when the result
+repeats it; `current`: whether that snapshot is the version's current view
+after the commit) or `200 {"status": "retry", "notBefore"}`;
+`409 mcp_claim_invalid` when the token does not match the current claim
+(lease expired, re-claimed or already completed); `409
+mcp_target_ineligible` when the version or a backing package stopped being
+eligible after the claim (the job is cancelled); `503 mcp_gate_unavailable`
+when its gates could not be evaluated (the claim is unchanged); `403
 mcp_forbidden` when the token is not scoped to the job's repository; `400`
 for a malformed result.
 
