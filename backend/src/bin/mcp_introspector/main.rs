@@ -463,7 +463,7 @@ mod tests {
         let bad = tmp("bad.json", "{");
         assert!(read_json(&bad).is_err());
         let job = json!({"jobId": "j", "akBaseUrl": "https://ak.test", "target": {"package": {
-            "registryType": "npm", "identifier": "x", "version": "1", "registryBaseUrl": "https://ak.test/npm/r"}}});
+            "registryType": "npm", "identifier": "x", "version": "1.0.0", "registryBaseUrl": "https://ak.test/npm/r"}}});
         let out = render_sandbox(&job).unwrap();
         assert!(out["command"][0].as_str().is_some());
         assert_eq!(out["spec"]["network"], "ak-only");

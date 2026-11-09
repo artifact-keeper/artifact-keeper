@@ -2752,8 +2752,10 @@ runner-neutral guest spec:
 
 - npm: image `AK_MCP_SANDBOX_NODE_IMAGE` (default
   `docker.io/library/node:22-alpine` pinned by digest),
-  `npx --yes --registry=<registryBaseUrl> <identifier>@<version> <args>` and
-  `npm_config_registry=<registryBaseUrl>`;
+  `npx --yes --registry=<registry> <identifier>@<version> <args>` and
+  `npm_config_registry=<registry>`, where `<registry>` (here and for PyPI
+  below) is the canonical form of the checked `registryBaseUrl` (see "npm
+  and PyPI package sources");
 - pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
   `ghcr.io/astral-sh/uv:python3.12-alpine` pinned by digest), `uvx --no-config
   --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
@@ -2782,6 +2784,73 @@ answering is reported `needs_config`, unless the engine exited `125`, `126`
 or `127` (the engine failed: runtime, network or image missing, pull failed,
 name in use), which is `start_failed` with the engine's message, and
 retried.
+
+**npm and PyPI package sources** (#5446). For npm and PyPI jobs the rules
+in this section take precedence over the general ones above: where they
+refuse something the paragraph above says is dropped, the job is refused.
+Before any guest starts, an npm or PyPI job is refused (`unsupported`, with a
+`registryBaseUrl: ...`, `package identifier: ...`, `package version: ...`,
+`packageArguments: ...`, `runtimeArguments: ...` or
+`environmentVariables: ...` reason naming the rule, never the submitted name
+or value) when what it submits would make `npx`/`uvx` fetch the package from
+anywhere but the AK repository it was served from; nothing is stripped to
+make a job fit:
+
+- `registryBaseUrl` is parsed as a URL and must be exactly
+  `<akBaseUrl>/npm/<repository>` (npm) or `<akBaseUrl>/pypi/<repository>`
+  (PyPI): the same scheme, the same host (compared lower-cased and
+  IDNA-normalised), the same effective port (`:443` on `https` is the same
+  origin as no port; another port is not) and that path, an optional
+  trailing slash aside, at most 2048 bytes. It is never compared as a string
+  prefix. Userinfo (`user@`), any percent-encoding (`%40`, `%2F`, `%3A`,
+  `%2e`, ...), a backslash, a `.`/`..` segment, whitespace, a query or a
+  fragment is refused, and so is the lenient `https:host/...` or
+  `https:///host/...` form. The spec carries the canonical URL, not the
+  submitted string.
+- The package must be a plain name and one exact version: npm `name` or
+  `@scope/name` (at most 214 bytes) with a SemVer version without build
+  metadata (`1.2.3`, `1.2.3-rc.1`; npm reads `1.2.3+x.tgz` as a file); PyPI
+  a PEP 508 project name (at most 200 bytes) with a PEP 440 version.
+  Versions are at most 256 bytes and never end in `.tgz`, `.tar` or
+  `.tar.gz`. A URL, path, `git+`/`github:`/`file:`/`npm:` spec, `name@url`,
+  `name @ url` direct reference, extras, a range, a tag such as `latest`,
+  or a marker is refused.
+- `environmentVariables` may not name a variable the job's package manager
+  reads for its registry, index or configuration (any case). npm:
+  `NPM_CONFIG*` / `npm_config_*` (including `NPM_CONFIG_REGISTRY` and
+  `NPM_CONFIG_USERCONFIG`), `YARN_*`, `PNPM_*`, `COREPACK_*` and
+  `NODE_OPTIONS`. PyPI: `UV_*` (`UV_INDEX` beats `--default-index`),
+  `PIP_*` (`PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
+  `PIP_CONFIG_FILE`, `PIP_TRUSTED_HOST`, ...) and `PIPX_*`. The other
+  manager's variables, proxy variables, `HOME`, `XDG_*` and the rest listed
+  above are dropped with a note, as for any job.
+- In `packageArguments` (as rendered) and `runtimeArguments`, a source
+  option whose value (`--opt=<v>`, `-i<v>`, or the next argument) is a URL
+  (`scheme://...`), a `git+` or a `file:` reference is refused (option
+  names compared case-insensitively, `_` read as `-`). npm: `--registry`,
+  `--@<scope>:registry`. PyPI: `--index-url`/`-i`, `--extra-index-url`,
+  `--find-links`/`-f`, `--default-index`, `--index`, `--from`, `--with`,
+  `--with-requirements`, `--with-editable`. `npx` and `uvx` stop reading
+  options at the package spec, so everything else, including these options
+  with any other value (`--index products`, `-f out.json`), is the server's
+  own argument; other `runtimeArguments` are still dropped.
+
+The rendered command pins the canonical registry itself (`npx
+--registry=<registry>` plus `npm_config_registry=<registry>`; `uvx
+--no-config --default-index <registry>/simple` with `UV_NO_CONFIG=1`), and no
+publisher argument or variable can override it. For npm and PyPI guests, a
+package or environment input whose name ends in a credential word (`TOKEN`,
+`SECRET`, `PASSWORD`, `PASSWD`, `APIKEY`, `API_KEY`, `ACCESS_KEY`,
+`PRIVATE_KEY`, as whole `_`/`-` separated words: `GITHUB_TOKEN`,
+`--password`, but not `MAX_TOKENS` or `TOKENIZER`) gets the
+`AK_PLACEHOLDER_<NAME>` placeholder even when it is not marked `isSecret`.
+An `akBaseUrl` with userinfo, a query or a fragment is refused for every
+job.
+
+These checks cover only what the job document names. What the installed
+package pulls in itself (a `git+`, tarball or `file:` dependency, an install
+script) is contained by the guest's network, which reaches only AK, not by
+them.
 
 Each stdio read is bounded: a line is read only up to what is left of the
 1 MiB budget, so a guest printing one endless line costs the worker 1 MiB,
