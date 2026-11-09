@@ -795,6 +795,25 @@ replication write is refused, see [Package policy](#package-policy)).
   and invisible formatting characters (U+200B-U+200F, U+2060-U+2064, the
   BOM), the line and paragraph separators (U+2028/U+2029) and Unicode tag
   characters (U+E0000-U+E007F). URLs must be absolute `http`/`https`.
+- A templated transport URL (`remotes[].url`, `packages[].transport.url`)
+  is checked against what it can expand to, not only its shape (#5529).
+  Each `{variable}` is filled with every publisher value it carries
+  (`value`, `default`, `placeholder`, each `choices` entry; a remote's
+  variables come from its `variables`, a package's from every argument
+  whose `valueHint` or `name` matches and every environment variable whose
+  `name` matches, all of them), and every combination must be an absolute
+  `http`/`https` URL, or the version is refused with `400
+  mcp_invalid_server_json` at `remotes[<i>].url` (or
+  `packages[<i>].transport.url`), naming the variable and the expansion.
+  A variable that opens the URL (`{base}/sse`) picks the scheme, so it
+  needs a `default` or `choices` whether it is declared or not; a variable
+  with no value anywhere else stands in for client input and is accepted.
+  More than 256 combinations are refused rather than checked. The same
+  rule applies to upstream versions a Remote repository ingests: one with
+  such a template is not admitted (counted as invalid at sync). User-info
+  in an expanded URL is not refused (as for a literal URL). A version
+  stored before this rule is not re-validated; the `remote_url_shape` lint
+  flags it when the version is next linted.
 - Publishes are quota-admitted like any upload and capped at 256 KiB, 16
   packages, 8 remotes and 64 entries per list.
 
@@ -2093,7 +2112,7 @@ snapshot (`outcome` other than `ok`) leaves them.
 | `injection_phrase` | `review` | Instructions aimed at the model: "ignore previous instructions", "you must", "do not tell the user", "system prompt", pseudo-tags (`<important>`, `<system>`), HTML/markdown comments, `IMPORTANT:`, chat role tags (`<\|im_start\|>`, `[INST]`, `<<SYS>>`), fenced code, "before using this tool", credential file references (`~/.ssh`, `id_rsa`, `.aws/credentials`, `.npmrc`, `mcp.json`). URLs count only in descriptions and titles shown to the model (server, tools, `inputSchema`), not in `statusMessage` or variable descriptions. Decision 13: `review`, never `block`. |
 | `hidden_text` | `block` | Control (other than tab and line breaks), bidirectional, zero-width or Unicode tag characters in any linted string or object key. Stored as finding class `malicious`. |
 | `dangerous_args` | `block`, `review` | `block`: in `runtimeArguments`, flags that re-route installs around the backing repository (`--registry`, `--index-url`, `--extra-index-url`, `--find-links`, `--index`, `--default-index`, `--source`, `--pypi-mirror`); anywhere, `--privileged`, a bind mount of the host root (`-v /:/host`, `--mount source=/`) or of the Docker socket. `review`: the same re-routing flags in `packageArguments`, other host bind mounts, `--network/--net/--pid/--ipc/--uts/--userns=host`, `--cap-add`, `--security-opt`, `--device`, `--unsafe-perm`, `--trusted-host`, `--insecure`, `-A`/`--allow-*`, and `LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH` and other code-injecting variables (as `-e`/`--env` values, positional `NAME=value` arguments or environment variable names). Both `--flag value` and `--flag=value` spellings. |
-| `remote_url_shape` | `review`, `warn` | `remotes[].url` only. `review`: a template variable in the host, user-info, an IP literal (private or public), `localhost`. `warn`: plain `http`, a non-default port on a public host, an internal host name (`.internal`, `.local`, `.corp`, `.lan`, `.intranet`, `.home.arpa`, `.localdomain`) in a public registry. |
+| `remote_url_shape` | `review`, `warn` | `remotes[].url` (and `packages[].transport.url` for templates). `review`: a template variable in the host, user-info, an IP literal (private or public), `localhost`, a URL template that can expand to a non-`http(s)` URL (refused at publish since #5529; a version stored before is flagged when it is next linted, and one with more than 256 expansions has its scheme-position values checked on their own). `warn`: plain `http`, a non-default port on a public host, an internal host name (`.internal`, `.local`, `.corp`, `.lan`, `.intranet`, `.home.arpa`, `.localdomain`) in a public registry. |
 | `oci_tag_digest_mismatch` | `warn` | A submitted `:tag@sha256:D` whose tag currently resolves to another digest (`D` is pinned). |
 | `oci_label_mismatch` | `warn` | The pinned image's config has no `io.modelcontextprotocol.server.name` label, a label naming another server, or a config that is not stored in the backing repository (labels are read from the stored manifest and config blob, never fetched). Under `mcp_require_oci_label: true` this refuses the publish instead (see below). |
 | `mcpb_missing_sha` | `block`, `review` | `block`: an `mcpb` package without `fileSha256`. `review`: an `mcpb` `fileSha256` that matches no bundle stored with the version (when bundles are stored). |
@@ -2116,7 +2135,7 @@ the rule and the field: re-linting the same version keeps it acknowledged.
 ### Where findings are stored
 
 One completed `scan_results` row with `scan_type = "mcp_lint"` and
-`scanner_version = "ak-mcp-lint/2"` per lint run of the server.json artifact,
+`scanner_version = "ak-mcp-lint/3"` per lint run of the server.json artifact,
 listed by `GET /api/v1/security/artifacts/{artifact_id}/scans` like any scan.
 Each finding:
 
