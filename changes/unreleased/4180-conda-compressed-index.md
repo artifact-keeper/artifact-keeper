@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4180]
----
-- **A remote conda channel serves a plain `repodata.json` by decoding the upstream `.zst`/`.bz2` document instead of buffering the 160-200 MiB plain index** (#4180). Classic conda clients and `CONDA_USE_ONLY_TAR_BZ2` setups request the uncompressed index, which conda-forge publishes far above the 128 MiB compressed-metadata ceiling; the request used to fall through to a slow streaming read of the plain document, and before that answered 502. The plain response is now produced by streaming the compressed upstream document through a decoder, so the ceiling applies to the 20-60 MiB compressed bytes, the decoded document is never held whole, and the compressed bytes stay in the proxy cache for later plain, `.zst` and `.bz2` requests. Channels that publish no compressed encoding still fall back to the plain streaming path. An upstream compressed document that is empty or does not decode answers 502 and is evicted from the proxy cache, so the next request fetches it again.

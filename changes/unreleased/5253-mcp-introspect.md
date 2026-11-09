@@ -1,7 +1,0 @@
----
-section: Added
-issues: [#5253]
----
-- **MCP capability snapshots, tool diffs and an isolated introspection worker** (#5253). Each MCP server version now records what it advertises (tools, resources, prompts, instructions) with its provenance: declared in the server.json (`_meta["com.artifactkeeper/capabilities"]`) or an MCPB manifest, reported by CI or a gateway (`POST .../versions/{v}/capabilities`), or observed by the new `ak-mcp-introspector` worker. `GET .../capabilities` and `GET .../capabilities/diff` give the Tools tab and the approval queue their data, and a changed list under the same version raises a `tool_drift` finding (`MCP_TOOLS_DRIFT`) that the findings UI and scan policy treat like any other.
-
-  Probing is opt-in per repository (`mcp_probe_remotes`, `mcp_sandbox_introspection`, both off by default) and never happens in the backend: the separate `ak-mcp-introspector` binary claims jobs over the API with a dedicated `mcp:introspect` token, probes `remotes[]` over public addresses only (SSRF-guarded resolver, no redirects, 1 MiB cap, never `tools/call`, never the publisher's headers, legacy `initialize` fallback), and can run stdio packages installed from this instance's own repositories in a gVisor or microVM sandbox with placeholder secrets and a 120 s cap. Docker MCP Gateway and ToolHive inventories can be imported with `ak-mcp-introspector push`. See "Capabilities and introspection" in `docs/mcp-registry.md`.

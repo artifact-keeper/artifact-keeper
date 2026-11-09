@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4924, #4544]
----
-- **A cold `repomd.xml` request for a large hosted RPM repository no longer runs the backend out of memory** (#4924, #4544). Rendering repodata loaded every package's stored metadata, file lists included, and built each uncompressed document in full before compressing it, so a root of about 2,500 packages with 2.5 GB of metadata was OOM-killed at a 10 GiB limit and `dnf` saw 503. The render now reads the packages from one consistent database snapshot in batches of about 32 MiB of metadata and compresses and hashes `primary.xml`, `filelists.xml` and `other.xml` incrementally; peak memory follows the batch size instead of the repository size. The documents and checksums are unchanged for repositories whose documents stay under 32 MiB uncompressed; larger documents are compressed as they are written, so their compressed bytes (and the checksums `repomd.xml` gives for them) can differ once from what an earlier release served for the same packages.

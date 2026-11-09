@@ -1,7 +1,0 @@
----
-section: Security
-issues: [#5385]
----
-- **The MCP sandbox reference deployment now reaches Artifact Keeper and nothing else** (#5385). The `ak-gateway` forwarder in `deploy/mcp-introspector/compose.sandbox-network.yaml` carries the AK hostname as a network alias, and `nginx-ak-gateway.conf` forwarded to that same hostname, so inside the forwarder it resolved to the forwarder itself: every connection looped back until nginx ran out of connections, and npm and PyPI installs from a guest failed. The forwarder now reaches AK as `ak-upstream`, an `extra_hosts` entry for AK's address. On Kubernetes, `networkpolicy.yaml` no longer lets `ak-only` guest pods query kube-dns, which forwards outside names and so let a guest send data out in DNS queries; guests reach AK through a `hostAliases` entry built from `AK_MCP_SANDBOX_AK_HOST` and `AK_MCP_SANDBOX_AK_IP` (new placeholders in `deployment.yaml`).
-
-  `docs/security/mcp-sandbox.md` now warns that `runsc --ignore-cgroups` removes the memory, pids and CPU limits and says how to delegate cgroups v2 instead, says what isolation holds with gVisor and without it, and says that "install only from AK" is enforced by the network, not by the worker's `--registry` / `--default-index` arguments. `docs/mcp-registry.md` says that a server can tell it is being probed and answer differently, so a capability snapshot is evidence of what the server showed AK, not of what it shows clients.

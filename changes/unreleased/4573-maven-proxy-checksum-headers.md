@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4573]
----
-- **Maven downloads from remote and virtual repositories carry `X-Checksum-SHA1`, so Maven Resolver skips the separate `.sha1` request** (#4573). Resolver reads the SHA-1 or MD5 of a download from these headers when they are present ("Remote Included" checksums, on by default) and only requests the `.sha1` file when they are not. Hosted repositories have sent them since #568, but a jar served through a remote repository carried only `X-Checksum-SHA256`, which Resolver ignores, so a build from an empty local repository made two requests per artifact. A released artifact served by a remote repository now carries the SHA-1 of its cached `.sha1` file, read from the cache alongside the body and never fetched upstream for the header (the first download of an artifact, before its `.sha1` is cached, still goes without it). A jar that passed the scan-on-proxy gate carries the SHA-1 and MD5 of its exact bytes, and a virtual repository's serve from a hosted member carries that artifact's stored checksums. `-SNAPSHOT` files and content-coded bodies are left without the headers.

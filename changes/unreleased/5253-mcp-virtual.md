@@ -1,7 +1,0 @@
----
-section: Added
-issues: [#5253]
----
-- **Virtual MCP registries, GitHub Actions login for `mcp-publisher`, and per-namespace publish grants** (#5253). A Virtual `mcp` repository merges its MCP members on the same `/mcp/{repo}/v0.1` routes: a version is answered by the first member (hosted members first, then Remotes, each by priority) that serves it under that member's own gates, a name held by any hosted member is never served from a Remote (dependency confusion), listings page across members with a composite cursor, and writes answer `405`. `mcp-publisher login github-oidc --registry https://ak/mcp/{repo}` works through `POST .../v0/auth/github-oidc`, bridged to the CI OIDC exchange; the other upstream logins answer `501`.
-
-  Permission rules accept `conditions.mcp_namespaces` (patterns such as `com.acme/*` or `io.github.{repository_owner}/*`, the latter filled from the CI token's claims), audited as `MCP_NAMESPACE_GRANTED`/`MCP_NAMESPACE_REVOKED`; with `mcp_require_namespace_grant` plain repository write no longer suffices. Administrators can record DNS TXT or HTTPS well-known namespace proofs (`/api/v1/admin/mcp/namespace-proofs`, SSRF-guarded, audited). Also new: `GET .../x/com.artifactkeeper/holds` lists held versions with their reason for repository holders, `GET .../openapi.yaml` serves the upstream API specification, and `MCP_DEFAULT_REPO` optionally serves one repository at the host's `/v0.1` and `/v0`. See `docs/mcp-registry.md`.

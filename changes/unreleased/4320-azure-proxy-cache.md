@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4320]
----
-- **The proxy cache can live on Azure Blob storage with `AZURE_PROXY_CACHE_ENABLED=true`** (#4320). Since #3923 an Azure deployment kept its proxy cache on the local filesystem under `STORAGE_PATH`, so remote repositories pinned to Azure were refused and a multi-replica deployment needed `STORAGE_PATH` on shared storage. With the new setting and `STORAGE_BACKEND=azure`, remote repositories cache in the Azure container, default to `storage_backend: "azure"`, and every replica shares one cache. The Azure backend gained List Blobs (`list`, and the storage reindex's `list_keys`, which used to answer that Azure cannot enumerate its blobs), and its server-side copy (Put Blob From URL) now authorizes the destination with a Shared Key header instead of a SAS URL when an access key is configured, and falls back to a streamed copy when the endpoint answers 501 Not Implemented, as the Azurite emulator does. Off by default because the existing local cache is not migrated: after turning it on each remote repository starts cold. See `docs/operations/proxy-cache-on-azure.md`.
