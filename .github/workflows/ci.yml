@@ -307,7 +307,10 @@ jobs:
               scripts/ci/check-token-mint-surface.sh|\
               scripts/ci/check-auth-event-audit.sh|\
               scripts/ci/check-migration-ledger.sh|\
-              scripts/ci/check-duplicate-migrations.sh)
+              scripts/ci/check-duplicate-migrations.sh|\
+              scripts/ci/check-crypto-provider.sh|\
+              scripts/ci/check-fips-module-manifest.sh|\
+              fips-module-manifest.toml)
                 code=true
                 rust=true
                 ;;
