@@ -4396,16 +4396,18 @@ mod tests {
             )
             .await;
             assert_eq!(adv["pagination"]["total"], 1, "{who}: {adv}");
-            // The facets span the caller's whole scope (the shared test
-            // database has other registries); this registry counts one.
-            let ours: Vec<&serde_json::Value> = adv["facets"]["repositories"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|f| f["value"] == key.as_str())
-                .collect();
-            assert_eq!(ours.len(), 1, "{who}: {adv}");
-            assert_eq!(ours[0]["count"], 1, "{who}: {adv}");
+            // The repository facet spans the caller's whole scope, not the
+            // `repository_key` filter, and lists only the top 20 repositories
+            // by count, so on a reused test database other repositories can
+            // push this one out. Check this repository only: listed, it
+            // counts its one visible row, not the four it stores; left out,
+            // the list must be full (the advanced total above already pins
+            // that hidden rows are not counted).
+            let facet = adv["facets"]["repositories"].as_array().unwrap();
+            match facet.iter().find(|f| f["value"] == key.as_str()) {
+                Some(ours) => assert_eq!(ours["count"], 1, "{who}: {adv}"),
+                None => assert_eq!(facet.len(), 20, "{who}: {adv}"),
+            }
             let list = get_json(
                 mk_app(repos()),
                 format!("/{key}/artifacts?per_page=100&count=exact"),
