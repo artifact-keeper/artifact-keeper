@@ -19,6 +19,50 @@ const PUSH_MIRROR_SUBSCRIPTIONS_SQL: &str = r#"
       AND prs.replication_mode::text IN ('push', 'mirror')
     "#;
 
+/// A restore supersedes the delete task that took the artifact out of the
+/// trash. Unlike [`REARM_SUPERSEDED_PUSH_SQL`], this does not wait for a
+/// checksum or timestamp change: the peer may have applied the delete before
+/// the restore reached this instance, so a finished push must go out again.
+const QUEUE_RESTORED_PUSH_SQL: &str = r#"
+    INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
+    VALUES ($1, $2, 0, 'push')
+    ON CONFLICT (peer_instance_id, artifact_id, task_type)
+    DO UPDATE SET
+        status = 'pending',
+        priority = GREATEST(sync_tasks.priority, 0),
+        retry_count = 0,
+        error_message = NULL,
+        started_at = NULL,
+        completed_at = NULL,
+        claimed_by = NULL,
+        claim_token = NULL,
+        claim_expires_at = NULL
+    -- An in-flight push is left alone: it is already delivering the artifact.
+    -- Known gap: if a delete for the same peer is also in flight, the push and
+    -- the delete race and their order on the peer is not guaranteed. That
+    -- needs three overlapping operations (in-flight push, in-flight delete and
+    -- the restore), so it is not handled here.
+    WHERE sync_tasks.status <> 'in_progress'
+    "#;
+
+/// Cancel the delete tasks a restore supersedes, for the peers `$2` the
+/// restore re-pushes to. A delete for any other peer stays: it may have been
+/// queued because the peer dropped out of a sync policy's scope (the same
+/// `(peer, artifact, 'delete')` row as the trash delete), or its subscription
+/// was disabled or removed, and that peer gets no push to replace it. A worker
+/// that already claimed a delete is left alone: its push is queued as well and
+/// delivered after the in-flight delete finishes.
+const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
+    UPDATE sync_tasks
+    SET status = 'cancelled',
+        completed_at = NOW(),
+        error_message = 'superseded by artifact restore'
+    WHERE artifact_id = $1
+      AND peer_instance_id = ANY($2)
+      AND task_type = 'delete'
+      AND status IN ('pending', 'failed')
+    "#;
+
 /// Queue one pending sync task per artifact of repository `$2` for peer `$1`,
 /// skipping every artifact that already has a push task for that peer (the
 /// unique `(peer_instance_id, artifact_id, task_type)`), and return how many
@@ -1105,19 +1149,51 @@ impl PeerInstanceService {
         Ok(id)
     }
 
-    pub async fn queue_push_sync_tasks(&self, artifact: &PublishedArtifact<'_>) -> usize {
+    /// The peers an upload-time push of `artifact` should go to: every enabled
+    /// push/mirror subscription whose policy filter still accepts it.
+    async fn push_sync_peers<'e, E>(
+        executor: E,
+        artifact: &PublishedArtifact<'_>,
+    ) -> std::result::Result<Vec<Uuid>, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         #[derive(sqlx::FromRow)]
         struct SubWithFilter {
             peer_instance_id: Uuid,
             artifact_filter: Option<serde_json::Value>,
         }
 
-        let subscriptions: Vec<SubWithFilter> = match sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
+        let subscriptions: Vec<SubWithFilter> = sqlx::query_as(PUSH_MIRROR_SUBSCRIPTIONS_SQL)
             .bind(artifact.repository_id)
-            .fetch_all(&self.db)
-            .await
-        {
-            Ok(subs) => subs,
+            .fetch_all(executor)
+            .await?;
+
+        Ok(subscriptions
+            .into_iter()
+            .filter_map(|sub| {
+                let filter: crate::services::sync_policy_service::ArtifactFilter = sub
+                    .artifact_filter
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                if !filter.matches(artifact.path, artifact.size_bytes, artifact.created_at) {
+                    tracing::debug!(
+                        "Artifact {} filtered out for peer {} by policy artifact_filter",
+                        artifact.id,
+                        sub.peer_instance_id,
+                    );
+                    return None;
+                }
+                Some(sub.peer_instance_id)
+            })
+            .collect())
+    }
+
+    pub async fn queue_push_sync_tasks(&self, artifact: &PublishedArtifact<'_>) -> usize {
+        let peers = match Self::push_sync_peers(&self.db, artifact).await {
+            Ok(peers) => peers,
             Err(e) => {
                 tracing::warn!(
                     "Failed to query peer subscriptions for repo {} artifact {}: {}",
@@ -1130,30 +1206,12 @@ impl PeerInstanceService {
         };
 
         let mut queued = 0usize;
-        for sub in &subscriptions {
-            let filter: crate::services::sync_policy_service::ArtifactFilter = sub
-                .artifact_filter
-                .as_ref()
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
-
-            if !filter.matches(artifact.path, artifact.size_bytes, artifact.created_at) {
-                tracing::debug!(
-                    "Artifact {} filtered out for peer {} by policy artifact_filter",
-                    artifact.id,
-                    sub.peer_instance_id,
-                );
-                continue;
-            }
-
-            match self
-                .queue_sync_task(sub.peer_instance_id, artifact.id, 0)
-                .await
-            {
+        for peer_id in peers {
+            match self.queue_sync_task(peer_id, artifact.id, 0).await {
                 Ok(_) => queued += 1,
                 Err(e) => tracing::warn!(
                     "Failed to queue sync task for peer {} artifact {}: {}",
-                    sub.peer_instance_id,
+                    peer_id,
                     artifact.id,
                     e
                 ),
@@ -1167,6 +1225,50 @@ impl PeerInstanceService {
             );
         }
         queued
+    }
+
+    /// Replicate a just-restored artifact: queue a push to every eligible
+    /// peer, forcing a finished push back to `pending`, and cancel those
+    /// peers' delete tasks the restore supersedes (#5505). Deletes for peers
+    /// outside the push set still run.
+    ///
+    /// Runs on the caller's connection so the restore and its replication side
+    /// effects commit together: a crash cannot leave the restored artifact live
+    /// with a pending delete that still takes it off a peer.
+    pub async fn queue_restored_artifact_sync_tasks(
+        conn: &mut sqlx::PgConnection,
+        artifact: &PublishedArtifact<'_>,
+    ) -> Result<usize> {
+        let peers = Self::push_sync_peers(&mut *conn, artifact)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        sqlx::query(CANCEL_SUPERSEDED_DELETE_TASKS_SQL)
+            .bind(artifact.id)
+            .bind(&peers)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut queued = 0usize;
+        for peer_id in peers {
+            let result = sqlx::query(QUEUE_RESTORED_PUSH_SQL)
+                .bind(peer_id)
+                .bind(artifact.id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            if result.rows_affected() == 1 {
+                queued += 1;
+            }
+        }
+        if queued > 0 {
+            tracing::info!(
+                "Queued restore pushes for artifact {} to {} peer(s)",
+                artifact.id,
+                queued
+            );
+        }
+        Ok(queued)
     }
 
     /// Put a finished push task back to `pending` when the artifact it
