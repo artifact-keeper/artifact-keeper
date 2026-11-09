@@ -3437,6 +3437,64 @@ pub async fn create_remote_and_virtual(
     (remote_id, remote_key, virtual_id, virtual_key)
 }
 
+/// #5504 rig: a public Virtual of `format` over two public Remote members on
+/// one mock server. The higher-priority member's upstream answers `404` for
+/// everything (a genuine miss); the lower-priority one answers
+/// `broken_status` for everything. Lets a test pin how a walk reads "member A
+/// missed, member B failed" through the format's real router.
+pub struct MissAndBrokenVirtual {
+    pub virtual_key: String,
+    pub repo_ids: Vec<Uuid>,
+    /// Kept alive for the rig's lifetime; dropping it stops the upstream.
+    pub upstream: wiremock::MockServer,
+}
+
+impl MissAndBrokenVirtual {
+    pub async fn new(pool: &PgPool, format: &str, broken_status: u16) -> Self {
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/miss/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/broken/"))
+            .respond_with(ResponseTemplate::new(broken_status))
+            .mount(&upstream)
+            .await;
+        let (virtual_id, virtual_key, _) = create_repo(pool, "virtual", format).await;
+        publish_repo(pool, virtual_id).await;
+        let mut repo_ids = vec![virtual_id];
+        for (priority, prefix) in [(0, "miss"), (1, "broken")] {
+            let (id, _, _) = create_repo(pool, "remote", format).await;
+            sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+                .bind(format!("{}/{prefix}", upstream.uri()))
+                .bind(id)
+                .execute(pool)
+                .await
+                .expect("point remote upstream at mock");
+            publish_repo(pool, id).await;
+            link_virtual_member(pool, virtual_id, id, priority).await;
+            repo_ids.push(id);
+        }
+        Self {
+            virtual_key,
+            repo_ids,
+            upstream,
+        }
+    }
+
+    pub async fn cleanup(self, pool: &PgPool) {
+        for id in &self.repo_ids {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+    }
+}
+
 /// Decode a body coded with `encoding` — the inverse of [`code_bytes`], so a
 /// test can assert the client receives BYTES it can actually decode rather
 /// than only that a header is present.

@@ -2741,6 +2741,7 @@ async fn serve_scanned_virtual_crate(
         .collect();
     let index_overrides = fetch_index_upstream_overrides(&state.db, &scanning_ids).await;
 
+    let mut failures = proxy_helpers::MemberWalkFailures::default();
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let Some(policy) = policy else {
@@ -2748,9 +2749,9 @@ async fn serve_scanned_virtual_crate(
             continue;
         };
         let run = std::mem::take(&mut unscanned);
-        if let Some(served) =
-            resolve_unscanned_crate_run(state, proxy, run, member_fetch_urls, coordinate).await
-        {
+        if let Some(served) = failures.run_answer(
+            resolve_unscanned_crate_run(state, proxy, run, member_fetch_urls, coordinate).await,
+        ) {
             return Some(served);
         }
         let upstream_url = member.upstream_url.as_deref().unwrap_or_default();
@@ -2784,6 +2785,7 @@ async fn serve_scanned_virtual_crate(
                 return Some(Err(resp))
             }
             Err(resp) => {
+                failures.note(&resp);
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned cargo virtual member did not serve; trying next member"
@@ -2791,11 +2793,9 @@ async fn serve_scanned_virtual_crate(
             }
         }
     }
-    Some(
-        resolve_unscanned_crate_run(state, proxy, unscanned, member_fetch_urls, coordinate)
-            .await
-            .unwrap_or_else(|| Err(proxy_helpers::member_miss_response())),
-    )
+    Some(failures.finish(
+        resolve_unscanned_crate_run(state, proxy, unscanned, member_fetch_urls, coordinate).await,
+    ))
 }
 
 /// [`resolve_unscanned_crate_members`] inside the scanned walk: `None` is a
@@ -2815,8 +2815,7 @@ async fn resolve_unscanned_crate_run(
         .await
     {
         Ok(result) => Some(Ok(virtual_crate_response(coordinate.filename, result))),
-        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
-        Err(_) => None,
+        Err(resp) => proxy_helpers::unscanned_run_failure(resp),
     }
 }
 

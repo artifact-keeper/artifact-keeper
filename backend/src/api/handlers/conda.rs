@@ -7291,6 +7291,7 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
+    let mut failures = proxy_helpers::MemberWalkFailures::default();
     let mut unscanned = Vec::new();
     for (member, policy) in members.iter().zip(policies) {
         let (Some(policy), Some(upstream_url)) = (policy, member.upstream_url.as_deref()) else {
@@ -7298,7 +7299,9 @@ where
             continue;
         };
         let run = std::mem::take(&mut unscanned);
-        if let Some(served) = resolve_unscanned_conda_run(proxy, run, target, local_fetch).await {
+        if let Some(served) =
+            failures.run_answer(resolve_unscanned_conda_run(proxy, run, target, local_fetch).await)
+        {
             return Some(served);
         }
         match serve_scanned_conda_package(
@@ -7319,6 +7322,7 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
+                failures.note(&resp);
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned conda virtual member did not serve; trying next member"
@@ -7326,11 +7330,7 @@ where
             }
         }
     }
-    Some(
-        resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch)
-            .await
-            .unwrap_or_else(|| Err(proxy_helpers::member_miss_response())),
-    )
+    Some(failures.finish(resolve_unscanned_conda_run(proxy, unscanned, target, local_fetch).await))
 }
 
 /// A run of non-scanning members inside the scanned walk, through the shared
@@ -7366,8 +7366,7 @@ where
             conda_package_content_type(target.filename),
             Some(target.filename),
         )),
-        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
-        Err(_) => None,
+        Err(resp) => proxy_helpers::unscanned_run_failure(resp),
     }
 }
 
@@ -23978,6 +23977,42 @@ mod scan_on_proxy_tests {
             writer.finish().unwrap();
         }
         zip_buf
+    }
+
+    /// #5504: conda's own scan-aware walk. With the unscanned higher-priority
+    /// member missing (404), a scanning member whose upstream fails (5xx or
+    /// 429) makes the package a retryable 503, and one that refuses
+    /// permanently (403) a 404; both used to read as a miss.
+    #[tokio::test]
+    async fn scanning_member_5xx_answers_503_and_4xx_answers_404_5504() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut got = Vec::new();
+        for broken in [503u16, 429, 403] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "conda", broken).await;
+            tdh::enable_proxy_scan(&pool, rig.repo_ids[2], "fail_open").await;
+            let dir = std::env::temp_dir().join(format!("condascan5504-{}", rig.virtual_key));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+            let (status, _) = tdh::send(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get(format!("/{}/noarch/pkg5504-1.0-0.conda", rig.virtual_key)),
+            )
+            .await;
+            got.push((broken, status));
+            rig.cleanup(&pool).await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(
+            got,
+            vec![
+                (503, StatusCode::SERVICE_UNAVAILABLE),
+                (429, StatusCode::SERVICE_UNAVAILABLE),
+                (403, StatusCode::NOT_FOUND),
+            ]
+        );
     }
 
     /// A `.tar.bz2` (v1) package declaring `name` / `version`.

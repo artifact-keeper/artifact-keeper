@@ -4007,6 +4007,7 @@ async fn serve_scanned_legacy_virtual_vsix(
         return None;
     }
 
+    let mut failures = proxy_helpers::MemberWalkFailures::default();
     let mut unscanned = Vec::new();
     for (member, policy) in members.into_iter().zip(policies) {
         let Some(policy) = policy else {
@@ -4014,9 +4015,9 @@ async fn serve_scanned_legacy_virtual_vsix(
             continue;
         };
         let run = std::mem::take(&mut unscanned);
-        if let Some(served) =
-            resolve_legacy_vsix_unscanned(state, proxy, run, legacy, extension_id, version).await
-        {
+        if let Some(served) = failures.run_answer(
+            resolve_legacy_vsix_unscanned(state, proxy, run, legacy, extension_id, version).await,
+        ) {
             return Some(served);
         }
         let upstream_url = member.upstream_url.as_deref().unwrap_or_default();
@@ -4041,6 +4042,7 @@ async fn serve_scanned_legacy_virtual_vsix(
                 return Some(Err(resp))
             }
             Err(resp) => {
+                failures.note(&resp);
                 tracing::debug!(
                     member_key = %member.key, status = %resp.status(),
                     "scanned legacy VSIX member did not serve; trying next member"
@@ -4048,11 +4050,9 @@ async fn serve_scanned_legacy_virtual_vsix(
             }
         }
     }
-    Some(
-        resolve_legacy_vsix_unscanned(state, proxy, unscanned, legacy, extension_id, version)
-            .await
-            .unwrap_or_else(|| Err(proxy_helpers::member_miss_response())),
-    )
+    Some(failures.finish(
+        resolve_legacy_vsix_unscanned(state, proxy, unscanned, legacy, extension_id, version).await,
+    ))
 }
 
 /// One run of non-scanning members through the shared resolver. `None` is a
@@ -4092,8 +4092,7 @@ async fn resolve_legacy_vsix_unscanned(
             "application/octet-stream",
             None,
         )),
-        Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
-        Err(_) => None,
+        Err(resp) => proxy_helpers::unscanned_run_failure(resp),
     }
 }
 
