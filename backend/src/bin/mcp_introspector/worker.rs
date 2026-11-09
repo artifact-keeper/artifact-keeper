@@ -419,7 +419,7 @@ mod tests {
         let r = w
             .run_job(
                 &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://ak.test",
-                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://registry.npmjs.org"}}}),
             )
             .await;
@@ -434,7 +434,7 @@ mod tests {
         let r = w
             .run_job(
                 &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://ak.test",
-                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://ak.test/npm/r"}}}),
             )
             .await;
@@ -455,7 +455,7 @@ mod tests {
         let r = w
             .run_job(
                 &json!({"kind": "sandbox_run", "jobId": "j", "akBaseUrl": "https://203.0.113.10",
-                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1",
+                "target": {"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://203.0.113.10/npm/r"}}}),
             )
             .await;

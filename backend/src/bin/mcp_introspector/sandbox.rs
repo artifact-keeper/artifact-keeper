@@ -33,6 +33,8 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::Value;
 
+mod source;
+
 pub const WALL_CLOCK: Duration = Duration::from_secs(120);
 pub const PLACEHOLDER_PREFIX: &str = "AK_PLACEHOLDER_";
 /// The label every guest container carries (value: the job id).
@@ -233,9 +235,14 @@ fn flag(v: &Value, k: &str) -> bool {
 }
 
 /// The value an input (argument or environment variable) gets in the guest.
-fn input_value(input: &Value, label: &str) -> Option<String> {
+/// With `credential_names` (npm and PyPI guests), an input whose name ends in
+/// a credential word (`*_TOKEN`, `--password`, ...) gets a placeholder even
+/// when the publisher did not mark it secret.
+fn input_value(input: &Value, label: &str, credential_names: bool) -> Option<String> {
     let given = s(input, "value").or_else(|| s(input, "default"));
-    if flag(input, "isSecret") || given.is_some_and(|g| g.contains('{')) {
+    let credential =
+        credential_names && s(input, "name").is_some_and(source::looks_like_credential);
+    if flag(input, "isSecret") || credential || given.is_some_and(|g| g.contains('{')) {
         return Some(placeholder(label));
     }
     match given {
@@ -256,7 +263,11 @@ fn valid_env_name(n: &str) -> bool {
 
 /// The guest environment: [`BASE_ENV`] plus the package's
 /// `environmentVariables` (placeholders for secrets, refused names dropped).
-pub fn guest_env(package: &Value, notes: &mut Vec<String>) -> Vec<(String, String)> {
+pub fn guest_env(
+    package: &Value,
+    credential_names: bool,
+    notes: &mut Vec<String>,
+) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = BASE_ENV
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -273,7 +284,7 @@ pub fn guest_env(package: &Value, notes: &mut Vec<String>) -> Vec<(String, Strin
             notes.push(format!("environment variable `{name}` dropped"));
             continue;
         }
-        if let Some(v) = input_value(var, name) {
+        if let Some(v) = input_value(var, name, credential_names) {
             env.retain(|(k, _)| k != name);
             env.push((name.to_string(), v));
         }
@@ -282,7 +293,7 @@ pub fn guest_env(package: &Value, notes: &mut Vec<String>) -> Vec<(String, Strin
 }
 
 /// The package's `packageArguments` for the guest command.
-pub fn package_args(package: &Value) -> Vec<String> {
+pub fn package_args(package: &Value, credential_names: bool) -> Vec<String> {
     let args = package
         .get("packageArguments")
         .and_then(|a| a.as_array())
@@ -297,7 +308,7 @@ pub fn package_args(package: &Value) -> Vec<String> {
         match s(a, "type") {
             Some("named") => {
                 let Some(name) = s(a, "name") else { continue };
-                if let Some(v) = input_value(a, &label) {
+                if let Some(v) = input_value(a, &label, credential_names) {
                     out.push(name.to_string());
                     out.push(v);
                 } else if flag(a, "isRequired") || a.get("value").is_none() {
@@ -305,7 +316,7 @@ pub fn package_args(package: &Value) -> Vec<String> {
                 }
             }
             _ => {
-                if let Some(v) = input_value(a, &label) {
+                if let Some(v) = input_value(a, &label, credential_names) {
                     out.push(v);
                 }
             }
@@ -329,6 +340,17 @@ pub fn guest_spec(
         .filter(|i| !i.is_empty() && !i.starts_with('-'))
         .ok_or_else(|| SandboxError::Invalid("package has no identifier".into()))?;
     let mut notes = Vec::new();
+    let ak = ak_base_url.trim_end_matches('/');
+    source::ak_base(ak)?;
+    // npm and PyPI install from the AK registry only (#5446): whatever could
+    // name another source is refused here, before a runner sees the spec.
+    let confined = matches!(kind, "npm" | "pypi");
+    if confined {
+        source::check_coordinates(kind, identifier, s(package, "version"))?;
+        let runtime = source::raw_arg_tokens(package, "runtimeArguments");
+        source::check_args(kind, "runtimeArguments", &runtime)?;
+        source::check_env(kind, package)?;
+    }
     if package
         .get("runtimeArguments")
         .and_then(|a| a.as_array())
@@ -336,15 +358,12 @@ pub fn guest_spec(
     {
         notes.push("runtimeArguments ignored".into());
     }
-    let env = guest_env(package, &mut notes);
-    let args = package_args(package);
-    let ak = ak_base_url.trim_end_matches('/');
-    let registry = || {
-        s(package, "registryBaseUrl")
-            .filter(|r| r.starts_with(ak))
-            .map(|r| r.trim_end_matches('/').to_string())
-            .ok_or_else(|| SandboxError::Invalid("registryBaseUrl is not this AK instance".into()))
-    };
+    let env = guest_env(package, confined, &mut notes);
+    let args = package_args(package, confined);
+    if confined {
+        source::check_args(kind, "packageArguments", &args)?;
+    }
+    let registry = || source::registry_url(kind, s(package, "registryBaseUrl"), ak);
     let version = || {
         s(package, "version")
             .filter(|v| !v.is_empty())
@@ -1196,7 +1215,7 @@ mod tests {
             "registryType": "npm", "identifier": "@acme/weather", "version": "1.2.3",
             "registryBaseUrl": "https://ak.example.test/npm/npm-virtual",
             "transport": {"type": "stdio"},
-            "runtimeArguments": [{"type": "named", "name": "--registry", "value": "https://evil.test"}],
+            "runtimeArguments": [{"type": "named", "name": "-v", "value": "/:/host-evil"}],
             "packageArguments": [
                 {"type": "positional", "value": "serve"},
                 {"type": "named", "name": "--token", "isSecret": true},
@@ -1211,9 +1230,8 @@ mod tests {
                 {"name": "LOG_LEVEL", "default": "debug"},
                 {"name": "OPTIONAL"},
                 {"name": "REQUIRED_NO_DEFAULT", "isRequired": true},
-                {"name": "NPM_CONFIG_REGISTRY", "value": "https://evil.test"},
-                {"name": "npm_config_registry", "value": "https://evil.test"},
-                {"name": "HOME", "value": "/root"},
+                {"name": "LD_PRELOAD", "value": "/tmp/evil.so"},
+                {"name": "PATH", "value": "/tmp/evil"},
                 {"name": "BAD NAME", "value": "x"},
             ],
         }})
@@ -1257,7 +1275,8 @@ mod tests {
             "AK_PLACEHOLDER_REQUIRED_NO_DEFAULT"
         );
         assert!(!env.contains_key("OPTIONAL"));
-        assert!(!env.contains_key("NPM_CONFIG_REGISTRY"));
+        assert!(!env.contains_key("LD_PRELOAD"));
+        assert!(!env.contains_key("PATH"));
         assert_eq!(
             env["npm_config_registry"],
             "https://ak.example.test/npm/npm-virtual"
@@ -1266,7 +1285,7 @@ mod tests {
         assert_eq!(spec.network, "ak-only");
         assert_eq!(spec.wall_clock_ms, 120_000);
         assert!(spec.notes.iter().any(|n| n == "runtimeArguments ignored"));
-        assert!(spec.notes.iter().any(|n| n.contains("NPM_CONFIG_REGISTRY")));
+        assert!(spec.notes.iter().any(|n| n.contains("LD_PRELOAD")));
     }
 
     #[test]
@@ -1664,7 +1683,7 @@ mod tests {
         // hostname alias carries no port.
         let spec = guest_spec(
             "j9",
-            &json!({"package": {"registryType": "npm", "identifier": "x", "version": "1",
+            &json!({"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://ak.example.test:8443/npm/r"}}),
             "https://ak.example.test:8443",
             &Images::default(),
