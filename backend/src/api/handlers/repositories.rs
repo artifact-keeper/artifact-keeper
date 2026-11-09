@@ -119,7 +119,67 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
 /// rather than re-deriving (or forgetting) it. The `/api/v1/repositories` nest
 /// runs under `optional_auth_middleware` only, NOT `repo_visibility_middleware`,
 /// so each sub-handler must enforce this itself.
+///
+/// A refusal to a caller who may not even READ the repository is the
+/// unknown-key 404 (#5458, see [`hide_write_denial_from_non_readers`]); a
+/// caller who can read keeps the 403.
 pub(crate) async fn require_repo_write_access(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    let decision = tenant_write_gate(auth, repo, repo_service).await;
+    hide_write_denial_from_non_readers(decision, auth, repo, repo_service).await
+}
+
+/// #5458: turn a WRITE refusal (`AppError::Authorization`) into the
+/// existence-hiding answer when the caller may not read the repository.
+///
+/// A key that names no repository answers `404 Repository not found`
+/// ([`RepositoryService::get_by_key`]); an existing repository the caller
+/// cannot read answers the same through [`require_visible`]. Before this, a
+/// write to an existing private repository answered `403` where an unknown
+/// key answered `404`, so any authenticated caller (an owner of some other
+/// repository, a token scoped elsewhere) could enumerate private keys by
+/// trying to write. A caller who CAN read already knows the repository
+/// exists and keeps the `403` with its reason (#3524's reasoning), as does
+/// every caller on an anonymously readable repository, where
+/// `require_visible` passes. Only ever turns one refusal into another;
+/// anything other than an authorization refusal passes through unchanged.
+pub(crate) async fn hide_write_denial_from_non_readers(
+    decision: Result<()>,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    match decision {
+        Err(AppError::Authorization(reason)) => {
+            if let Err(hidden) = require_visible(repo, &Some(auth.clone()), repo_service).await {
+                // A lookup error (database) is returned as is, without
+                // claiming to hide anything.
+                if !matches!(hidden, AppError::NotFound(_)) {
+                    return Err(hidden);
+                }
+                // The caller sees only the unknown-key answer; the operator
+                // keeps the reason the write was refused.
+                tracing::warn!(
+                    repository_id = %repo.id,
+                    user_id = %auth.user_id,
+                    reason = %reason,
+                    "repository write denied to a caller who cannot read the repository; \
+                     answering the existence-hiding 404"
+                );
+                return Err(hidden);
+            }
+            Err(AppError::Authorization(reason))
+        }
+        other => other,
+    }
+}
+
+/// The tenant half of [`require_repo_write_access`], before the
+/// existence-hiding mapping.
+async fn tenant_write_gate(
     auth: &AuthExtension,
     repo: &crate::models::repository::Repository,
     repo_service: &RepositoryService,
@@ -3898,8 +3958,11 @@ pub async fn get_npm_scope_policy(
 
     // Reading the npm scope policy is admin-tier (it discloses the repository's
     // supply-chain configuration). `require_repo_admin` honors an `admin` action
-    // held through a role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // held through a role (`repository-owner`), not only a rule (#4834). A
+    // refusal to a caller who cannot read the repository is the unknown-key
+    // 404 (#5458).
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await?;
     let active = policy.is_active();
@@ -6114,12 +6177,15 @@ pub async fn update_repository(
 
     // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
-    require_repo_access(&auth, existing.id)?;
-
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository. `require_repo_admin` honors an `admin` action held through a
-    // role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, existing.id, &state.permission_service).await?;
+    // role (`repository-owner`), not only a rule (#4834). Either refusal, to a
+    // caller who cannot read the repository, is the unknown-key 404 (#5458).
+    let gate = match require_repo_access(&auth, existing.id) {
+        Ok(()) => require_repo_admin(&auth, existing.id, &state.permission_service).await,
+        Err(e) => Err(e),
+    };
+    hide_write_denial_from_non_readers(gate, &auth, &existing, &service).await?;
 
     // Projects (#2473): (re)assigning a repository to a different project
     // needs a global admin, a system repo-admin, or project-admin on the
@@ -7221,12 +7287,15 @@ pub async fn delete_repository(
         }
         Err(e) => return Err(e),
     };
-    require_repo_access(&auth, repo.id)?;
-
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository. `require_repo_admin` honors an `admin` action held through a
-    // role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // role (`repository-owner`), not only a rule (#4834). Either refusal, to a
+    // caller who cannot read the repository, is the unknown-key 404 (#5458).
+    let gate = match require_repo_access(&auth, repo.id) {
+        Ok(()) => require_repo_admin(&auth, repo.id, &state.permission_service).await,
+        Err(e) => Err(e),
+    };
+    hide_write_denial_from_non_readers(gate, &auth, &repo, &service).await?;
 
     // Record the job and rename the repository to `~deleting~<job id>` in one
     // transaction: from here every lookup by its key misses (no new upload or
@@ -14129,6 +14198,8 @@ pub async fn add_virtual_member(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    // #5458: hide the parent from a caller who cannot read it.
+    require_visible(&virtual_repo, &Some(auth.clone()), &service).await?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
     authorize_virtual_member_mutation(
         &state.db,
@@ -14209,6 +14280,9 @@ pub async fn remove_virtual_member(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    // #5458: a caller who cannot read the parent gets the unknown-key 404
+    // first; the 400 below would otherwise confirm that the key exists.
+    require_visible(&virtual_repo, &Some(auth.clone()), &service).await?;
     // Validate repo type BEFORE any access check so a caller without rights
     // on a non-virtual repo gets 400 (validation), not 403 (authz). The 403
     // path would otherwise act as an enumeration oracle: it tells an
@@ -14301,6 +14375,9 @@ pub async fn update_virtual_members(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    // #5458: a caller who cannot read the parent gets the unknown-key 404
+    // first; the 400 below would otherwise confirm that the key exists.
+    require_visible(&virtual_repo, &Some(auth.clone()), &service).await?;
     // Validate repo type BEFORE any access check so a caller without rights
     // on a non-virtual repo gets 400 (validation), not 403 (authz). Avoids
     // the same enumeration oracle remove_virtual_member guards against.
@@ -14449,6 +14526,10 @@ async fn load_remote_repo(
 ) -> Result<crate::models::repository::Repository> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(key).await?;
+    // #5458: a caller who cannot read the repository gets the unknown-key 404
+    // before the token-scope 403 or the wrong-type 400, either of which would
+    // confirm that the key exists.
+    require_visible(&repo, &Some(auth.clone()), &service).await?;
     require_repo_access(auth, repo.id)?;
     if repo.repo_type != RepositoryType::Remote {
         return Err(AppError::Validation(
@@ -15424,6 +15505,9 @@ async fn conda_allowlist_repo(
     })?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(key).await?;
+    // #5458: a caller who cannot read the repository gets the unknown-key 404
+    // before the token-scope 403 or the wrong-type 400.
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
     require_repo_access(&auth, repo.id)?;
     if repo.repo_type != RepositoryType::Virtual
         || !matches!(
@@ -20989,8 +21073,10 @@ mod tests {
         let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
         let auth = make_auth_ext(Some(vec![Uuid::new_v4()]));
         let res = require_repo_write_access(&auth, &repo, &no_db_repo_service()).await;
+        // #5458: the token cannot read this private repository either, so the
+        // refusal is the unknown-key 404 (still before any DB lookup).
         assert!(
-            matches!(res, Err(AppError::Authorization(_))),
+            matches!(&res, Err(AppError::NotFound(m)) if m == REPOSITORY_NOT_FOUND),
             "a repo-scoped token must be denied write outside its scope: {res:?}"
         );
     }
@@ -21052,8 +21138,10 @@ mod tests {
         let svc = RepositoryService::new(pool.clone());
 
         let denied = require_repo_write_access(&ext, &repo, &svc).await;
+        // #5458: a non-member cannot read the private repository, so it gets
+        // the unknown-key 404 rather than a 403 that confirms the key.
         assert!(
-            matches!(denied, Err(AppError::Authorization(_))),
+            matches!(&denied, Err(AppError::NotFound(m)) if m == REPOSITORY_NOT_FOUND),
             "non-member must be denied write on a private repo: {denied:?}"
         );
 
@@ -25810,8 +25898,16 @@ mod tests {
         let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
         let result = require_repo_write_access(&auth, &repo, &svc).await;
         assert!(result.is_err());
+        // #5458: on a private repository the scope refusal is the unknown-key
+        // 404, byte for byte the message `get_by_key` gives a missing key.
         match result.unwrap_err() {
-            AppError::Authorization(msg) => assert!(msg.contains("does not have access")),
+            AppError::NotFound(msg) => assert_eq!(msg, REPOSITORY_NOT_FOUND),
+            other => panic!("Expected the unknown-key NotFound, got: {:?}", other),
+        }
+        // A public repository has no existence to hide: the 403 stays.
+        let public = make_repo(true);
+        match require_repo_write_access(&auth, &public, &svc).await {
+            Err(AppError::Authorization(msg)) => assert!(msg.contains("does not have access")),
             other => panic!("Expected Authorization error, got: {:?}", other),
         }
     }
@@ -37132,6 +37228,151 @@ mod tests {
             Some(Some("203.0.113.61".to_string())),
             "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
         );
+    }
+
+    /// #5458: a generic upload (`PUT /{key}/artifacts/{path}`) by an owner
+    /// of ANOTHER repository answers an existing private key exactly
+    /// (status, headers, body) as it answers an unknown key, and stores
+    /// nothing; a member who can read but not write keeps the 403.
+    #[tokio::test]
+    async fn generic_upload_denial_to_a_non_reader_matches_an_unknown_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (foreign, foreign_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, repo_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &repo_dir.to_string_lossy());
+        let put = |auth: AuthExtension, key: String| {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+            tdh::send_with_headers(
+                router,
+                tdh::put(
+                    format!("/{key}/artifacts/tool/1.0/tool.bin"),
+                    Bytes::from_static(b"probe"),
+                ),
+            )
+        };
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let existing = put(tdh::make_auth(foreign, &foreign_name), repo_key.clone()).await;
+        let missing = put(tdh::make_auth(foreign, &foreign_name), unknown).await;
+        let (reader_status, _, _) = put(tdh::make_auth(reader, &reader_name), repo_key).await;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        tdh::cleanup_member_repo(&pool, own_id, &own_dir).await;
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup_member_repo(&pool, repo_id, &repo_dir).await;
+
+        assert_eq!(existing.0, StatusCode::NOT_FOUND);
+        assert_eq!(existing, missing, "existing private vs unknown key");
+        assert_eq!(
+            reader_status,
+            StatusCode::FORBIDDEN,
+            "a reader keeps the 403"
+        );
+        assert_eq!(stored, 0);
+    }
+
+    /// #5458 (round 2): the REST repository administration routes refuse a
+    /// caller who cannot read a private repository with exactly what an
+    /// unknown key answers (status, headers, body), before any token-scope,
+    /// admin or wrong-type check could confirm the key: `PATCH` and `DELETE`
+    /// of the repository, environment ingest and delete, the npm scope policy,
+    /// the Remote-only routes (`load_remote_repo`) and the virtual member
+    /// routes. Nothing changes; a reader is still refused, but not with 404.
+    #[tokio::test]
+    async fn admin_route_denials_to_a_non_reader_match_an_unknown_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (own_id, own_key, own_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (foreign, foreign_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, repo_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &repo_dir.to_string_lossy());
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let env_id = Uuid::new_v4();
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            ("PATCH", String::new(), Some("{}")),
+            ("DELETE", String::new(), None),
+            (
+                "POST",
+                "/environments?filename=package-lock.json".to_string(),
+                Some("{}"),
+            ),
+            ("DELETE", format!("/environments/{env_id}"), None),
+            ("GET", "/npm-scope-policy".to_string(), None),
+            ("GET", "/egress-proxy".to_string(), None),
+            ("POST", "/test-upstream".to_string(), None),
+            ("PUT", "/members".to_string(), Some(r#"{"members": []}"#)),
+            ("DELETE", format!("/members/{own_key}"), None),
+        ];
+        let send = |auth: AuthExtension, method: &str, uri: String, body: Option<&str>| {
+            let router = tdh::router_with_auth(
+                super::router().merge(crate::api::handlers::environments::repo_router()),
+                state.clone(),
+                auth,
+            );
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if body.is_some() {
+                b = b.header("content-type", "application/json");
+            }
+            let req = b
+                .body(axum::body::Body::from(body.unwrap_or("").to_string()))
+                .unwrap();
+            tdh::send_with_headers(router, req)
+        };
+        let mut answers = Vec::new();
+        for (method, tail, body) in &cases {
+            let foreign_auth = tdh::make_auth(foreign, &foreign_name);
+            let existing = send(
+                foreign_auth.clone(),
+                method,
+                format!("/{repo_key}{tail}"),
+                *body,
+            )
+            .await;
+            let missing = send(foreign_auth, method, format!("/{unknown}{tail}"), *body).await;
+            let as_reader = send(
+                tdh::make_auth(reader, &reader_name),
+                method,
+                format!("/{repo_key}{tail}"),
+                *body,
+            )
+            .await
+            .0;
+            answers.push((format!("{method} {tail}"), existing, missing, as_reader));
+        }
+        let still_there: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE id = $1)")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup_member_repo(&pool, own_id, &own_dir).await;
+        tdh::cleanup_member_repo(&pool, repo_id, &repo_dir).await;
+
+        for (case, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            assert!(
+                as_reader.is_client_error() && as_reader != StatusCode::NOT_FOUND,
+                "{case}: a reader is refused, and not with the unknown-key 404: {as_reader}"
+            );
+        }
+        assert!(still_there, "the refused DELETE removed nothing");
     }
 }
 

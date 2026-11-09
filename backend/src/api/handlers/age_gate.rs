@@ -1145,11 +1145,13 @@ mod tests {
             tdh::get(format!("/{key}/age-gate")),
         )
         .await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        // #5458: the caller holds no grant on this private repository, so the
+        // refusal is the unknown-key 404, not a 403 that confirms the key.
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         let body = String::from_utf8_lossy(&body).to_string();
         assert!(
             !body.contains("min_age_days") && !body.contains("enabled"),
-            "403 body must not leak gate config: {body}"
+            "the refusal body must not leak gate config: {body}"
         );
         tdh::cleanup(&pool, repo_id, caller_id).await;
     }
@@ -1170,7 +1172,8 @@ mod tests {
             tdh::get(format!("/{key}/age-gate")),
         )
         .await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        // #5458: no grant on this private repository, so the unknown-key 404.
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         tdh::cleanup(&pool, repo_id, caller_id).await;
     }
 
@@ -1507,13 +1510,14 @@ mod tests {
             "the refused cross-repository approve must not have touched the review"
         );
 
-        // The other repository itself is refused outright: no `admin` there.
+        // The other repository itself is refused outright: no grant there,
+        // so the unknown-key 404 (#5458).
         let (status, _body) = tdh::send(
             review_app(state.clone(), caller.clone()),
             tdh::get(format!("/{other_key}/age-gate/reviews")),
         )
         .await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
 
         tdh::cleanup(&pool, mine_id, user_id).await;
         tdh::cleanup_member_repo(&pool, other_id, &other_dir).await;
@@ -1761,9 +1765,11 @@ mod tests {
             tdh::get(format!("/{key_b}/age-gate")),
         )
         .await;
+        // #5458: B is outside the token's scope, so the token cannot read it
+        // and the refusal is the unknown-key 404.
         assert_eq!(
             status,
-            axum::http::StatusCode::FORBIDDEN,
+            axum::http::StatusCode::NOT_FOUND,
             "config read on B"
         );
         let (status, _) = tdh::send(
@@ -1771,7 +1777,7 @@ mod tests {
             decide(&key_b, review_b, "approve"),
         )
         .await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "decide on B");
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "decide on B");
         assert_eq!(review_status(&pool, review_b).await, "pending");
 
         tdh::cleanup(&pool, repo_a, user_id).await;

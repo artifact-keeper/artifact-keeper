@@ -845,10 +845,19 @@ async fn trigger_sync(
         )
         .await?;
     if !sync_tenant_access_allowed(repo.is_public, has_grant) {
-        return Err(AppError::Authorization(format!(
+        // #5458: a caller who cannot read the repository gets the unknown-key
+        // 404, not a 403 that names the key.
+        let denied = Err(AppError::Authorization(format!(
             "You are not authorized to trigger a sync for the '{}' repository's tenant",
             repo.key
         )));
+        crate::api::handlers::repositories::hide_write_denial_from_non_readers(
+            denied,
+            &auth,
+            &repo,
+            &repo_service,
+        )
+        .await?;
     }
 
     // #5253 / #5422: a Remote MCP registry syncs its upstream catalog, in the

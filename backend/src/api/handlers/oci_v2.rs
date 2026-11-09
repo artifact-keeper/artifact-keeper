@@ -818,7 +818,66 @@ fn enforce_token_repo_scope_on_read(
 /// are unaffected: remote/virtual repos reject pushes earlier, and replication
 /// identities hold a repo-scoped or global grant. Fails closed (503) if the
 /// authorization lookup errors, mirroring the REST middleware.
+///
+/// #5458: a refusal to a caller who may not even READ the repository (the
+/// [`oci_read_permitted`] decision) is the existence-hiding 404
+/// `NAME_UNKNOWN` that [`resolve_repo_for_write`] answers for a key naming no
+/// repository, byte for byte, so pushing is not a way to learn which private
+/// repositories exist. A caller who can read keeps the 403 `DENIED`, as does
+/// everyone on a public repository.
+///
+/// The format gate ([`validate_oci_repository_format`]) runs only once the
+/// caller has passed the write gate: run first, it answered `400
+/// UNSUPPORTED` naming the key and its format for an existing non-OCI
+/// repository the caller cannot read, against `404 NAME_UNKNOWN` for an
+/// unknown key (#5458).
 async fn require_oci_repo_write_access(
+    state: &SharedState,
+    claims: &crate::services::auth_service::Claims,
+    repo: &OciRepoInfo,
+    format: &str,
+    image_name: &str,
+    action: &str,
+) -> Result<(), Response> {
+    let denied = match oci_write_decision(state, claims, repo.id, action).await {
+        Ok(()) => return validate_oci_repository_format(&repo.key, format),
+        Err(denied) if denied.status() == StatusCode::FORBIDDEN => denied,
+        Err(other) => return Err(other),
+    };
+    if repo.visibility.allows_anonymous_read() {
+        return Err(denied);
+    }
+    let requested_key = requested_repo_key(image_name);
+    match oci_read_permitted(
+        state,
+        claims,
+        repo.id,
+        &repo.key,
+        requested_key,
+        repo.visibility,
+    )
+    .await
+    {
+        Err(hidden) if hidden.status() == StatusCode::NOT_FOUND => {
+            tracing::warn!(
+                repository_id = %repo.id,
+                user_id = %claims.sub,
+                action,
+                "OCI write denied to a caller who cannot read the repository; answering \
+                 the existence-hiding 404"
+            );
+            Err(hidden)
+        }
+        Err(unavailable) if unavailable.status() == StatusCode::SERVICE_UNAVAILABLE => {
+            Err(unavailable)
+        }
+        _ => Err(denied),
+    }
+}
+
+/// The write/delete decision of [`require_oci_repo_write_access`], before the
+/// existence-hiding mapping.
+async fn oci_write_decision(
     state: &SharedState,
     claims: &crate::services::auth_service::Claims,
     repo_id: Uuid,
@@ -1046,8 +1105,9 @@ async fn oci_read_permitted(
     // both that the repository exists and that an ACL governs it. The denial
     // is logged at debug with the ids — it fires once per denied pull, and a
     // token probing keys must not be able to fill the log at info — so an
-    // operator can still tell the two apart server-side. Writes deliberately
-    // keep 403 (`require_oci_repo_write_access`).
+    // operator can still tell the two apart server-side. Since #5458 a write
+    // refused to such a caller answers this same 404
+    // (`require_oci_repo_write_access`); a reader's refused write keeps 403.
     tracing::debug!(
         repository_id = %repo_id,
         user_id = %claims.sub,
@@ -3124,7 +3184,8 @@ struct OciRepoInfo {
 /// this gate, an OCI client can push manifests into a classic `helm` repository
 /// and those rows later leak into its `index.yaml` (#3150).
 ///
-/// Applied on the MUTATING seam only — see [`resolve_repo_for_write`].
+/// Applied on the MUTATING seam only, after the write gate — see
+/// [`require_oci_repo_write_access`].
 #[allow(clippy::result_large_err)]
 fn validate_oci_repository_format(repo_key: &str, format: &str) -> Result<(), Response> {
     let is_oci = parse_format_str(format)
@@ -3283,12 +3344,24 @@ async fn resolve_repo_for_anonymous_capable_read(
 /// Callers: `handle_start_upload`, `handle_patch_upload`,
 /// `handle_cancel_upload`, `handle_complete_upload`, `handle_put_manifest`,
 /// `handle_delete_manifest`.
-async fn resolve_repo_for_write(db: &PgPool, image_name: &str) -> Result<OciRepoInfo, Response> {
-    let (repo, format) = resolve_repo_inner(db, image_name)
+///
+/// Returns the repository with its declared format. The format gate
+/// ([`validate_oci_repository_format`]) is NOT applied here: it runs inside
+/// [`require_oci_repo_write_access`], after the write gate, so a caller who
+/// may not write learns nothing about the format of a key (#5458).
+///
+/// No Docker-mirror fallback: a key naming no repository is the
+/// existence-hiding `404 NAME_UNKNOWN`, never the mirror. A pull-through
+/// mirror is a Remote and never accepts a push (#1776), and re-resolving a
+/// missing key to it answered the mirror's `403 DENIED`, where an existing
+/// private key the caller cannot read answers `404` (#5458).
+async fn resolve_repo_for_write(
+    db: &PgPool,
+    image_name: &str,
+) -> Result<(OciRepoInfo, String), Response> {
+    resolve_repo_inner_with(db, image_name, false)
         .await?
-        .ok_or_else(|| oci_name_unknown(requested_repo_key(image_name)))?;
-    validate_oci_repository_format(&repo.key, &format)?;
-    Ok(repo)
+        .ok_or_else(|| oci_name_unknown(requested_repo_key(image_name)))
 }
 
 /// The repository key the CLIENT asked for: the first segment of the `/v2`
@@ -3326,6 +3399,17 @@ fn oci_name_unknown(requested_key: &str) -> Response {
 async fn resolve_repo_inner(
     db: &PgPool,
     image_name: &str,
+) -> Result<Option<(OciRepoInfo, String)>, Response> {
+    resolve_repo_inner_with(db, image_name, true).await
+}
+
+/// [`resolve_repo_inner`], with the Docker-mirror fallback (step 2 below)
+/// applied only when `mirror_fallback` is set: reads take it, writes do not
+/// ([`resolve_repo_for_write`]).
+async fn resolve_repo_inner_with(
+    db: &PgPool,
+    image_name: &str,
+    mirror_fallback: bool,
 ) -> Result<Option<(OciRepoInfo, String)>, Response> {
     use sqlx::Row;
     // Split: "test/python" → repo_key="test", image="python"
@@ -3386,7 +3470,7 @@ async fn resolve_repo_inner(
     //    `docker-hub-cache`), and the proxy code path (`is_docker_hub`,
     //    `normalize_docker_image`, blob/manifest cache) takes over with
     //    image="library/postgres".
-    if repo.is_none() {
+    if repo.is_none() && mirror_fallback {
         if let Some(mirror_key) = default_docker_mirror_repo() {
             // Don't infinitely recurse: only attempt the fallback when the
             // miss was on a different key than the mirror itself.
@@ -7153,7 +7237,7 @@ async fn handle_start_upload(
         return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -7161,7 +7245,9 @@ async fn handle_start_upload(
     // gate via `check_repository_action`, parity with the REST artifact-write
     // path. Public visibility confers no write; a non-member (or a rules-less
     // public repo) cannot open a blob upload without a write grant.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write").await
+    {
         return resp;
     }
     // #1776: only repositories that store their own manifests (Local/Staging)
@@ -7626,12 +7712,14 @@ async fn handle_patch_upload(
     // session created against repo A cannot be driven via repo B's URL
     // (issue #1317). Same 404 shape for "no session" and "session in another
     // repo" avoids leaking session existence across repos.
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
     // Repository write authorization (#2603 G1): deny-by-default `write` action gate.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write").await
+    {
         return resp;
     }
 
@@ -7871,12 +7959,14 @@ async fn handle_cancel_upload(
         }
     };
 
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
     // Repository write authorization (#2603 G1): deny-by-default `write` action gate.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write").await
+    {
         return resp;
     }
     let storage = match state.storage_for_repo(&repo.location) {
@@ -8115,11 +8205,13 @@ async fn handle_get_upload_status(
         }
     };
 
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write").await
+    {
         return resp;
     }
 
@@ -8195,12 +8287,14 @@ async fn handle_complete_upload(
     // Resolve repo from URL first, then bind it into the session lookup so a
     // session created against repo A cannot be completed via repo B's URL
     // (issue #1317).
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
     // Repository write authorization (#2603 G1): deny-by-default `write` action gate.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write").await
+    {
         return resp;
     }
 
@@ -13043,12 +13137,14 @@ async fn handle_put_manifest(
         return oci_forbidden_scope(OCI_SCOPE_WRITE);
     }
 
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
     // Repository write authorization (#2603 G1): deny-by-default `write` action gate.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "write").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "write").await
+    {
         return resp;
     }
     // #1776: only repositories that store their own manifests (Local/Staging)
@@ -14419,7 +14515,7 @@ async fn handle_delete_manifest(
         return oci_forbidden_scope(OCI_SCOPE_DELETE);
     }
 
-    let repo = match resolve_repo_for_write(&state.db, image_name).await {
+    let (repo, format) = match resolve_repo_for_write(&state.db, image_name).await {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -14428,7 +14524,9 @@ async fn handle_delete_manifest(
     // deny-by-default. A write-only grantee cannot destroy a manifest, and a
     // public / rules-less repo confers no delete. Matches the REST
     // `delete_artifact` path.
-    if let Err(resp) = require_oci_repo_write_access(state, &claims, repo.id, "delete").await {
+    if let Err(resp) =
+        require_oci_repo_write_access(state, &claims, &repo, &format, image_name, "delete").await
+    {
         return resp;
     }
 
@@ -18227,8 +18325,14 @@ mod tests {
             return;
         };
         let image_name = format!("{}/keycloak", f.repo_key);
-        let response = match resolve_repo_for_write(&f.pool, &image_name).await {
-            Ok(_) => panic!("classic Helm repository resolved through the OCI write seam"),
+        // #5458: the write seam resolves first and applies the format gate
+        // after the write gate (`require_oci_repo_write_access`).
+        let (repo, format) = match resolve_repo_for_write(&f.pool, &image_name).await {
+            Ok(r) => r,
+            Err(_) => panic!("resolution must succeed; the format gate decides"),
+        };
+        let response = match validate_oci_repository_format(&repo.key, &format) {
+            Ok(()) => panic!("classic Helm repository passed the OCI write format gate"),
             Err(response) => response,
         };
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -18274,7 +18378,10 @@ mod tests {
         };
         let image_name = format!("{}/keycloak", f.repo_key);
         let repo = match resolve_repo_for_write(&f.pool, &image_name).await {
-            Ok(repo) => repo,
+            Ok((repo, format)) => {
+                assert!(validate_oci_repository_format(&repo.key, &format).is_ok());
+                repo
+            }
             Err(_) => panic!("helm_oci repository must resolve through the OCI API"),
         };
         assert_eq!(repo.id, f.repo_id);
@@ -24333,6 +24440,94 @@ mod oci_blob_upload_streaming_tests {
             StatusCode::ACCEPTED,
             "a member holding the delete action must delete the manifest (202)"
         );
+    }
+
+    /// #5458: a push (blob upload) and a manifest DELETE by an owner of
+    /// ANOTHER repository answer an existing private key exactly as an
+    /// unknown key (404 `NAME_UNKNOWN`, the requested key echoed, same
+    /// headers), and change nothing; a member who can read but not write
+    /// keeps the 403 `DENIED`.
+    #[tokio::test]
+    async fn write_denial_to_a_non_reader_matches_an_unknown_key() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let pool = f.inner.pool.clone();
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let (foreign, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let foreign_auth = tdh::bearer_for(&f.inner.state, foreign).await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, f.inner.repo_id, reader, "reader").await;
+        let reader_auth = tdh::bearer_for(&f.inner.state, reader).await;
+        let key = f.inner.repo_key.clone();
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let mut answers = Vec::new();
+        for (method, tail) in [
+            (Method::POST, "/app/blobs/uploads/"),
+            (Method::DELETE, "/app/manifests/v1"),
+        ] {
+            let existing = send(
+                f.app(),
+                request(
+                    method.clone(),
+                    format!("/{key}{tail}"),
+                    &foreign_auth,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+            let missing = send(
+                f.app(),
+                request(
+                    method.clone(),
+                    format!("/{unknown}{tail}"),
+                    &foreign_auth,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+            let as_reader = send(
+                f.app(),
+                request(
+                    method.clone(),
+                    format!("/{key}{tail}"),
+                    &reader_auth,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+            answers.push((tail, existing, missing, as_reader));
+        }
+        let sessions: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(f.inner.repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+        tdh::cleanup_member_repo(&pool, own_id, &own_dir).await;
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+        f.teardown().await;
+
+        for (tail, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{tail}");
+            assert_eq!(existing.1, missing.1, "{tail}: headers");
+            // The body echoes the key the client asked for, as for any miss.
+            assert_eq!(
+                String::from_utf8_lossy(&existing.2),
+                String::from_utf8_lossy(&missing.2).replace(&unknown, &key),
+                "{tail}: existing private vs unknown key"
+            );
+            assert!(String::from_utf8_lossy(&existing.2).contains("NAME_UNKNOWN"));
+            assert_eq!(
+                as_reader.0,
+                StatusCode::FORBIDDEN,
+                "{tail}: a reader keeps 403"
+            );
+            assert!(String::from_utf8_lossy(&as_reader.2).contains("DENIED"));
+        }
+        assert_eq!(sessions, 0, "no upload session for a refused push");
     }
 
     /// #1409: a manifest DELETE removes its blob refs (so the blobs become
@@ -34774,9 +34969,11 @@ mod oci_write_authz_and_size_tests {
         let bearer = bearer_for(&state, outsider).await;
 
         let status = start_upload_status(&state, &repo_key, &bearer).await;
+        // #5458: denied with the unknown-key 404 `NAME_UNKNOWN`, not a 403
+        // that confirms the private repository exists.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "non-admin non-member must be denied a blob upload on a private repo"
         );
 
@@ -47618,6 +47815,7 @@ mod public_read_repo_scope_3704 {
         let head_private = probe(&state, Method::HEAD, manifest(&key_c), &scoped).await;
         let head_missing = probe(&state, Method::HEAD, manifest(&key_missing), &scoped).await;
         let put_private = probe(&state, Method::PUT, manifest(&key_c), &scoped).await;
+        let put_missing = probe(&state, Method::PUT, manifest(&key_missing), &scoped).await;
 
         for repo in [repo_a, repo_c] {
             let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
@@ -47679,14 +47877,18 @@ mod public_read_repo_scope_3704 {
             "#3717: HEAD must not disagree with GET (the #3258 lesson)"
         );
 
-        // The security half: writes are NOT unified.
+        // #5458: writes are unified too. `docker push` to a private repository
+        // outside the token's scope is still refused (the unexempted
+        // `enforce_token_repo_scope` in `require_oci_repo_write_access`), and
+        // the refusal is now the same existence-hiding 404 as a miss.
         assert_eq!(
-            put_private,
-            denied(),
-            "#3717 must not touch writes: `docker push` to a private repository \
-             outside the token's scope stays refused with 403 `DENIED` by the \
-             unexempted `enforce_token_repo_scope` in `require_oci_repo_write_access`"
+            normalised(&put_private, &key_c),
+            normalised(&put_missing, &key_missing),
+            "#5458: a push to an existing PRIVATE repository outside the token's \
+             scope must be indistinguishable from a push to a key naming no \
+             repository"
         );
+        assert_eq!(put_private.0, StatusCode::NOT_FOUND);
     }
 
     /// Docker-mirror-mode half of #3717 (#3728 review nit 2, #3729 audit F1).
@@ -47851,6 +48053,178 @@ mod public_read_repo_scope_3704 {
         assert!(
             !manifest_missing.2.contains(&key_m),
             "the manifest denial must not name the mirror either: {manifest_missing:?}"
+        );
+    }
+
+    /// `(status, code, message)` of one `/v2` request through the real router.
+    async fn v2_probe(
+        state: &SharedState,
+        method: Method,
+        uri: String,
+        authorization: &str,
+    ) -> (StatusCode, String, String) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .expect("build request");
+        let resp = router(None)
+            .with_state(state.clone())
+            .oneshot(req)
+            .await
+            .expect("oneshot");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (
+            status,
+            json["errors"][0]["code"].as_str().unwrap_or("").to_string(),
+            json["errors"][0]["message"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// #5458 under Docker-mirror mode: a push to a key naming no repository
+    /// must not be re-resolved to the (public, pull-through) mirror. If it
+    /// were, it would answer the mirror's `403 DENIED` while an existing
+    /// private key the caller cannot read answers `404 NAME_UNKNOWN`: a new
+    /// existence oracle. Both answer `404 NAME_UNKNOWN` echoing the
+    /// requested key; reads keep the mirror fallback.
+    ///
+    /// `default_docker_mirror_repo` caches the variable in a process-wide
+    /// `OnceLock`; nextest runs one process per test.
+    #[tokio::test]
+    async fn test_5458_mirror_mode_push_to_a_missing_key_is_not_sent_to_the_mirror() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (foreign, _) = tdh::create_user(&pool).await;
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        // C: an existing PRIVATE repository the caller holds nothing on.
+        let (repo_c, key_c, dir_c) = tdh::create_repo(&pool, "local", "docker").await;
+        // M: the PUBLIC pull-through mirror every unknown key would reach.
+        let (repo_m, key_m, dir_m) = tdh::create_repo(&pool, "remote", "docker").await;
+        tdh::publish_repo(&pool, repo_m).await;
+        let key_missing = format!("ph-test-docker-{}", Uuid::new_v4());
+        std::env::set_var("AK_DEFAULT_DOCKER_MIRROR_REPO", &key_m);
+        assert_eq!(
+            default_docker_mirror_repo(),
+            Some(key_m.as_str()),
+            "mirror mode must be live for this process before the first request; the \
+             OnceLock was resolved earlier -- run under nextest (one process per test)"
+        );
+        let state = tdh::build_state(pool.clone(), dir_c.to_str().unwrap());
+        let bearer = tdh::bearer_for(&state, foreign).await;
+        let upload = |key: &str| format!("/{key}/{IMAGE}/blobs/uploads/");
+        let manifest = |key: &str| format!("/{key}/{IMAGE}/manifests/latest");
+
+        let upload_private = v2_probe(&state, Method::POST, upload(&key_c), &bearer).await;
+        let upload_missing = v2_probe(&state, Method::POST, upload(&key_missing), &bearer).await;
+        let put_private = v2_probe(&state, Method::PUT, manifest(&key_c), &bearer).await;
+        let put_missing = v2_probe(&state, Method::PUT, manifest(&key_missing), &bearer).await;
+        let delete_private = v2_probe(&state, Method::DELETE, manifest(&key_c), &bearer).await;
+        let delete_missing =
+            v2_probe(&state, Method::DELETE, manifest(&key_missing), &bearer).await;
+        let sessions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_upload_sessions WHERE repository_id = ANY($1)",
+        )
+        .bind(vec![repo_c, repo_m])
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+
+        for (id, dir) in [(own_id, &own_dir), (repo_c, &dir_c), (repo_m, &dir_m)] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        tdh::cleanup_user(&pool, foreign).await;
+
+        let normalised = |r: &(StatusCode, String, String), key: &str| {
+            (r.0, r.1.clone(), r.2.replace(key, "{key}"))
+        };
+        for (what, private, missing) in [
+            ("blob upload", &upload_private, &upload_missing),
+            ("manifest PUT", &put_private, &put_missing),
+            ("manifest DELETE", &delete_private, &delete_missing),
+        ] {
+            assert_eq!(
+                missing,
+                &(
+                    StatusCode::NOT_FOUND,
+                    "NAME_UNKNOWN".to_string(),
+                    format!("repository not found: {key_missing}"),
+                ),
+                "{what}: a push to a missing key must not reach the mirror `{key_m}`"
+            );
+            assert_eq!(
+                normalised(private, &key_c),
+                normalised(missing, &key_missing),
+                "{what}: existing private vs unknown key in mirror mode"
+            );
+        }
+        assert_eq!(sessions, 0, "no upload session is opened anywhere");
+    }
+
+    /// #5458: the `/v2` format gate runs after the write gate. A push by a
+    /// caller who cannot read an existing PRIVATE non-OCI repository (a
+    /// classic `helm` one) answers `404 NAME_UNKNOWN` like an unknown key,
+    /// not `400 UNSUPPORTED` naming the key and its format. A caller who may
+    /// write there still gets the `400 UNSUPPORTED` (#3150).
+    #[tokio::test]
+    async fn test_5458_format_gate_runs_after_the_write_gate() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (foreign, _) = tdh::create_user(&pool).await;
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (writer, _) = tdh::create_user(&pool).await;
+        let (helm_id, helm_key, helm_dir) = tdh::create_repo(&pool, "local", "helm").await;
+        tdh::grant_repo_role(&pool, helm_id, writer, "repository-owner").await;
+        let key_missing = format!("ph-test-helm-{}", Uuid::new_v4());
+        let state = tdh::build_state(pool.clone(), helm_dir.to_str().unwrap());
+        let foreign_bearer = tdh::bearer_for(&state, foreign).await;
+        let writer_bearer = tdh::bearer_for(&state, writer).await;
+        let upload = |key: &str| format!("/{key}/{IMAGE}/blobs/uploads/");
+
+        let private = v2_probe(&state, Method::POST, upload(&helm_key), &foreign_bearer).await;
+        let missing = v2_probe(&state, Method::POST, upload(&key_missing), &foreign_bearer).await;
+        let as_writer = v2_probe(&state, Method::POST, upload(&helm_key), &writer_bearer).await;
+
+        for (id, dir) in [(own_id, &own_dir), (helm_id, &helm_dir)] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, writer).await;
+
+        assert_eq!(private.0, StatusCode::NOT_FOUND, "{private:?}");
+        assert_eq!(
+            (
+                private.0,
+                private.1.clone(),
+                private.2.replace(&helm_key, "{key}")
+            ),
+            (
+                missing.0,
+                missing.1.clone(),
+                missing.2.replace(&key_missing, "{key}")
+            ),
+            "existing private non-OCI key vs unknown key"
+        );
+        assert!(
+            !private.2.contains("format"),
+            "the format must not leak: {private:?}"
+        );
+        assert_eq!(
+            (as_writer.0, as_writer.1.as_str()),
+            (StatusCode::BAD_REQUEST, "UNSUPPORTED"),
+            "a caller who may write still learns the repository is not OCI"
         );
     }
 
@@ -49466,9 +49840,11 @@ mod oci_push_replication_4790_tests {
         tdh::cleanup_user(&fx.pool, reader_id).await;
         fx.teardown().await;
 
+        // #5458: the service account holds no grant and cannot read this
+        // private repository, so its refusal is the unknown-key 404.
         assert_eq!(
             sa_status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a service account without write on the repository"
         );
         assert_eq!(reader_status, StatusCode::FORBIDDEN, "a reader");

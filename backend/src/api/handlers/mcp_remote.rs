@@ -15,7 +15,8 @@ use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::handlers::repositories::{
-    require_repo_admin, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_admin, require_repo_write_access,
+    require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -124,7 +125,11 @@ async fn administered_repo(
     let service = RepositoryService::new(state.db.clone());
     let model = service.get_by_key(key).await?;
     require_repo_write_access(auth, &model, &service).await?;
-    require_repo_admin(auth, model.id, &state.permission_service).await?;
+    // #5458: an admin refusal to a caller who cannot read the repository is
+    // the unknown-key 404 too (`require_repo_write_access` already hides its
+    // own refusals the same way).
+    let admin = require_repo_admin(auth, model.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, auth, &model, &service).await?;
     remote_info(state, key).await
 }
 
@@ -2296,6 +2301,105 @@ mod tests {
         let st = env.finished_after(&before).await;
         assert_eq!(st["lastSummary"]["pages"], 1, "{st}");
         assert_eq!(st["lastSummary"]["namesNew"], 1, "{st}");
+        env.teardown().await;
+    }
+
+    /// #5458: every Remote management write (sync, pin, approve, block,
+    /// reopen, the bulk decisions, a seed) by an administrator of ANOTHER
+    /// repository answers an existing private Remote key exactly (status,
+    /// headers, body) as it answers an unknown key, and changes nothing. A
+    /// member who can read keeps the 403.
+    #[tokio::test]
+    async fn write_denials_to_non_readers_match_an_unknown_key() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        // An administrator of a different repository, not of the instance.
+        let (foreign, foreign_name) = tdh::create_user(&env.fx.pool).await;
+        let (own_id, _, own_dir) = tdh::create_repo(&env.fx.pool, "remote", "mcp").await;
+        env.extra.push((own_id, own_dir));
+        tdh::grant_repo_role(&env.fx.pool, own_id, foreign, "repository-owner").await;
+        let foreign_auth = tdh::make_auth(foreign, &foreign_name);
+        // The same principal through a CI token carrying `trigger:sync`.
+        let mut foreign_ci = foreign_auth.clone();
+        foreign_ci.is_api_token = true;
+        foreign_ci.scopes = Some(vec!["trigger:sync".into(), "write:repositories".into()]);
+        let (reader, reader_name) = tdh::create_user(&env.fx.pool).await;
+        tdh::grant_repo_role(&env.fx.pool, env.fx.repo_id, reader, "reader").await;
+        let reader_auth = tdh::make_auth(reader, &reader_name);
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let row = Uuid::new_v4();
+        let writes: Vec<(String, Option<serde_json::Value>)> = vec![
+            ("/sync".into(), None),
+            (
+                "/catalog/pins".into(),
+                Some(serde_json::json!({"name": "com.acme/a", "version": "1.0.0"})),
+            ),
+            (format!("/catalog/{row}/approve"), None),
+            (format!("/catalog/{row}/block"), None),
+            (format!("/catalog/{row}/reopen"), None),
+            (
+                "/catalog/bulk-approve".into(),
+                Some(serde_json::json!({"pattern": "com.acme/*"})),
+            ),
+            (
+                "/catalog/bulk-block".into(),
+                Some(serde_json::json!({"pattern": "com.acme/*"})),
+            ),
+            (
+                "/catalog/bulk-decide".into(),
+                Some(serde_json::json!({"ids": [row], "action": "approve"})),
+            ),
+            (
+                "/seed".into(),
+                Some(serde_json::json!({"servers": [{"name": "com.acme/a", "version": "1.0.0"}]})),
+            ),
+        ];
+        let send =
+            |auth: &AuthExtension, key: &str, tail: &str, body: Option<&serde_json::Value>| {
+                let mut b = Request::builder()
+                    .method("POST")
+                    .uri(format!("/r/{key}/mcp{tail}"));
+                if body.is_some() {
+                    b = b.header("content-type", "application/json");
+                }
+                let req = b
+                    .body(
+                        body.map(|v| Body::from(v.to_string()))
+                            .unwrap_or_else(Body::empty),
+                    )
+                    .unwrap();
+                tdh::send_with_headers(env.app(Some(auth.clone())), req)
+            };
+        for (tail, body) in &writes {
+            let mut callers = vec![&foreign_auth];
+            if tail == "/sync" || tail == "/seed" {
+                callers.push(&foreign_ci);
+            }
+            for auth in callers {
+                let existing = send(auth, &env.fx.repo_key, tail, body.as_ref()).await;
+                let missing = send(auth, &unknown, tail, body.as_ref()).await;
+                assert_eq!(existing.0, StatusCode::NOT_FOUND, "{tail}");
+                assert_eq!(existing, missing, "{tail}: existing private vs unknown");
+            }
+            // A member who can read already knows the repository exists.
+            let (s, _, _) = send(&reader_auth, &env.fx.repo_key, tail, body.as_ref()).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{tail}: reader");
+        }
+        // Nothing changed: no catalog row, no sync or seed started, no
+        // upstream request.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM curation_packages WHERE staging_repo_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+        let st = env.settled().await;
+        assert!(st["lastStartedAt"].is_null(), "{st}");
+        assert_eq!(env.upstream.received_requests().await.unwrap().len(), 0);
+        tdh::cleanup_user(&env.fx.pool, foreign).await;
+        tdh::cleanup_user(&env.fx.pool, reader).await;
         env.teardown().await;
     }
 }
