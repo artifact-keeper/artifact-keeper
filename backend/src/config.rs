@@ -6470,14 +6470,15 @@ mod tests {
             .parent()
             .expect("backend crate has a parent directory (repo root)");
 
-        // (file, version, commit, go floor, [x/net from, x/net to, x/crypto
-        // floor]) per Dockerfile that builds grype. The override ARGs are part
-        // of the pin: two images built from the same grype tag with different
+        // (file, version, commit, go floor, [x/crypto floor]) per Dockerfile
+        // that builds grype. Override ARGs, when there are any, are part of
+        // the pin: two images built from the same grype tag with different
         // overrides ship different binaries, and .trivyignore describes only
         // one of them (#3465 drifted exactly this way before it was retired).
         // The grpc override ARGs left this list with the override itself when
-        // v0.120.1 made it redundant (#3698).
-        let mut builds: Vec<(String, String, String, String, [String; 3])> = Vec::new();
+        // v0.120.1 made it redundant (#3698), and the x/net ones the same way
+        // when v0.121.3 did (#5565). A future override adds its ARGs back here.
+        let mut builds: Vec<(String, String, String, String, [String; 1])> = Vec::new();
         for file_name in discover_dockerfiles(repo_root) {
             let path = repo_root.join("docker").join(&file_name);
             let content = std::fs::read_to_string(&path)
@@ -6499,7 +6500,7 @@ mod tests {
                 arg("GRYPE_VERSION"),
                 arg("GRYPE_COMMIT"),
                 arg("GO_MIN_PATCH"),
-                [arg("XNET_FROM"), arg("XNET_TO"), arg("XCRYPTO_MIN")],
+                [arg("XCRYPTO_MIN")],
             ));
         }
 
