@@ -3473,6 +3473,18 @@ fn member_failure_outcome<T, E>(e: &crate::error::AppError) -> Option<MemberReso
     is_member_unavailable_error(e).then_some(MemberResolveOutcome::Unavailable)
 }
 
+/// `e` as its `Response`, carrying [`MemberUnavailable`] when it is
+/// transient (#5504), for a member fetch that does not go through
+/// [`map_proxy_error`] (the scanned serve), so a virtual walk still sees it.
+fn member_fetch_error_response(e: crate::error::AppError) -> Response {
+    let unavailable = is_member_unavailable_error(&e);
+    let mut response = e.into_response();
+    if unavailable {
+        response.extensions_mut().insert(MemberUnavailable);
+    }
+    response
+}
+
 /// Whether a member fetch error is transient (#5504); see
 /// [`crate::services::proxy_service::MemberFetchFailure`].
 fn is_member_unavailable_error(e: &crate::error::AppError) -> bool {
@@ -11679,7 +11691,7 @@ pub(crate) async fn serve_scanned_proxy_file<F: ScannedProxyFile>(
                 ));
                 proxy.publish_deferred(pending).await;
             }
-            return Err(e.into_response());
+            return Err(member_fetch_error_response(e));
         }
     };
     let digest = sha256_hex(&bytes);
@@ -12011,9 +12023,7 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
-    // #5504: whether a member could not answer; decides 503 over 404 when
-    // nothing serves.
-    let mut unavailable = false;
+    let mut failures = MemberWalkFailures::default();
     let mut unscanned = Vec::new();
     for (member, policy) in members.into_iter().zip(policies) {
         let Some(policy) = policy else {
@@ -12022,10 +12032,8 @@ where
         };
         let run = std::mem::take(&mut unscanned);
         if !run.is_empty() {
-            match unscanned_run(run).await {
-                Some(Err(resp)) if is_member_unavailable_response(&resp) => unavailable = true,
-                Some(served) => return Some(served),
-                None => {}
+            if let Some(served) = failures.run_answer(unscanned_run(run).await) {
+                return Some(served);
             }
         }
         let member_key = member.key.clone();
@@ -12038,7 +12046,7 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
-                unavailable |= is_member_unavailable_response(&resp);
+                failures.note(&resp);
                 tracing::debug!(
                     member_key = %member_key, status = %resp.status(),
                     "scanned virtual member did not serve; trying next member"
@@ -12046,18 +12054,59 @@ where
             }
         }
     }
-    if !unscanned.is_empty() {
-        match unscanned_run(unscanned).await {
-            Some(Err(resp)) if is_member_unavailable_response(&resp) => unavailable = true,
-            Some(served) => return Some(served),
-            None => {}
+    let last = if unscanned.is_empty() {
+        None
+    } else {
+        unscanned_run(unscanned).await
+    };
+    Some(failures.finish(last))
+}
+
+/// What a scan-aware Virtual walk has seen fail so far (#5504): whether any
+/// member could not answer. Shared by [`walk_virtual_members_with_scan`] and
+/// the formats that drive their own scan-aware loop (cargo, conda, VS Code),
+/// so they all end the same way: the walk's 503 when a member was
+/// unavailable and nothing served, the 404 miss otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct MemberWalkFailures {
+    unavailable: bool,
+}
+
+impl MemberWalkFailures {
+    /// An unscanned run's answer ([`unscanned_run_failure`]'s shape): a
+    /// served response or a policy block is returned to end the walk; a run
+    /// in which a member could not answer is recorded and the walk goes on
+    /// (`None`), as for a miss.
+    pub(crate) fn run_answer(
+        &mut self,
+        answer: Option<Result<Response, Response>>,
+    ) -> Option<Result<Response, Response>> {
+        match answer {
+            Some(Err(resp)) if is_member_unavailable_response(&resp) => {
+                self.unavailable = true;
+                None
+            }
+            other => other,
         }
     }
-    Some(Err(if unavailable {
-        member_unavailable_response()
-    } else {
-        member_miss_response()
-    }))
+
+    /// Record a scanning member's failure that did not end the walk.
+    pub(crate) fn note(&mut self, resp: &Response) {
+        self.unavailable |= is_member_unavailable_response(resp);
+    }
+
+    /// The walk's answer after its last run (`last`): that run's answer if
+    /// it served, else the 503 or 404 the walk earned.
+    pub(crate) fn finish(
+        mut self,
+        last: Option<Result<Response, Response>>,
+    ) -> Result<Response, Response> {
+        match self.run_answer(last) {
+            Some(served) => served,
+            None if self.unavailable => Err(member_unavailable_response()),
+            None => Err(member_miss_response()),
+        }
+    }
 }
 
 /// How the unscanned half of a scan-aware Virtual walk reports a run that

@@ -10919,8 +10919,16 @@ pub async fn get_artifact_metadata(
             },
         )
         .await
-        .map_err(|_| {
-            AppError::NotFound("Artifact not found in any member repository".to_string())
+        .map_err(|resp| {
+            // #5504: a member that could not answer makes "not found"
+            // unknowable; answer the retryable 503, not a cacheable 404.
+            if proxy_helpers::is_member_unavailable_response(&resp) {
+                AppError::ServiceUnavailable(
+                    "A repository member is temporarily unavailable, retry shortly".to_string(),
+                )
+            } else {
+                AppError::NotFound("Artifact not found in any member repository".to_string())
+            }
         })?;
 
         // #2394: unlike the direct-row branch above (metadata JSON only,
@@ -13712,6 +13720,11 @@ pub async fn download_artifact(
                 // #4323: a member whose stored bytes failed verification is
                 // answered as such (502), not as a miss.
                 Err(resp) if crate::storage::verify::is_integrity_failure(&resp) => {
+                    return Ok(resp)
+                }
+                // #5504: no member served and one could not answer: the
+                // walk's retryable 503, not a 404 the client caches.
+                Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
                     return Ok(resp)
                 }
                 Err(_) => return Err(not_found()),
@@ -17860,6 +17873,50 @@ mod tests {
             |key, path| format!("/{key}/{path}"),
         )
         .await;
+    }
+
+    /// #5504: the generic route answers the walk's 503 when the
+    /// higher-priority member misses and the other one's upstream is failing
+    /// (5xx or 429), and 404 when it refuses permanently (403), on both the
+    /// `/download/` route and the `/general/` mount.
+    #[tokio::test]
+    async fn virtual_download_503s_on_member_5xx_and_404s_on_member_4xx_5504() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut got = Vec::new();
+        for broken in [503u16, 429, 403] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "generic", broken).await;
+            let cache = tempfile::tempdir().expect("tempdir");
+            let proxy =
+                tdh::build_proxy_service_with_fs(pool.clone(), cache.path().to_str().unwrap());
+            let state =
+                tdh::build_state_with_proxy(pool.clone(), cache.path().to_str().unwrap(), proxy);
+            for (router, uri) in [
+                (
+                    download_router(),
+                    format!("/{}/download/pkg5504/a.bin", rig.virtual_key),
+                ),
+                (
+                    crate::api::handlers::general::router(),
+                    format!("/{}/pkg5504/a.bin", rig.virtual_key),
+                ),
+            ] {
+                let (status, _) =
+                    tdh::send(tdh::router_anon(router, state.clone()), tdh::get(uri)).await;
+                got.push((broken, status));
+            }
+            rig.cleanup(&pool).await;
+        }
+        let want = |broken: u16| {
+            if broken == 403 {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        };
+        let wrong: Vec<_> = got.iter().filter(|(b, s)| *s != want(*b)).collect();
+        assert!(wrong.is_empty(), "wrong: {wrong:?} of {got:?}");
     }
 
     /// A Virtual repository over a Remote member serves through the member

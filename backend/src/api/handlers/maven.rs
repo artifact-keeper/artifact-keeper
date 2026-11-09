@@ -2743,8 +2743,11 @@ async fn download(
                     .await
                     {
                         Ok(response) => return Ok(response),
-                        // #5504: the member HAS the row; only a missing
-                        // object is a miss, a storage fault is a failure.
+                        // #5504: the member HAS the row, so a failed read
+                        // of its bytes is a failure, never a miss. The
+                        // storage error answers 500 (`map_storage_err`) even
+                        // when the object is gone, so a row whose object
+                        // was lost answers 503 too: the row says it exists.
                         Err(resp) => member_failed |= resp.status() != StatusCode::NOT_FOUND,
                     }
                 }
@@ -10606,7 +10609,7 @@ mod tests {
             "com/acme5504/lib/1.0/lib-1.0.jar.sha1",
         ];
         let mut got = Vec::new();
-        for broken in [503u16, 500, 403, 401] {
+        for broken in [503u16, 500, 429, 403, 401] {
             let rig = tdh::MissAndBrokenVirtual::new(&pool, "maven", broken).await;
             let dir = std::env::temp_dir().join(format!("mvn5504-{}", rig.virtual_key));
             std::fs::create_dir_all(&dir).expect("create scratch dir");
@@ -10624,8 +10627,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        // 429 is the retryable 4xx (rate limiting): unavailable, like a 5xx.
         let want = |broken: u16| {
-            if broken >= 500 {
+            if broken >= 500 || broken == 429 {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::NOT_FOUND
@@ -10639,6 +10643,41 @@ mod tests {
             wrong.is_empty(),
             "member A 404 + member B 5xx must answer 503, + member B 4xx must answer 404, \
              on the artifact and the checksum alike; wrong: {wrong:?}"
+        );
+    }
+
+    /// #5504: a walk that answers 503 because a member could not answer
+    /// yields to a member's age refusal (451), as a 404 does; any other
+    /// answer (a hit, a quarantine block) keeps precedence over it.
+    #[test]
+    fn age_refusal_wins_over_a_404_or_member_unavailable_503_only_5504() {
+        let refusal = || StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS.into_response();
+        let answer = |result| match maven_virtual_age_gate_answer(result, Some(refusal())) {
+            Ok(resp) | Err(resp) => resp.status(),
+        };
+        assert_eq!(
+            answer(Err(proxy_helpers::member_unavailable_response())),
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+        );
+        assert_eq!(
+            answer(Err(proxy_helpers::member_miss_response())),
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+        );
+        // A 503 without the member-unavailable marker is not the walk's.
+        assert_eq!(
+            answer(Err(StatusCode::SERVICE_UNAVAILABLE.into_response())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            answer(Err(StatusCode::CONFLICT.into_response())),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(answer(Ok(StatusCode::OK.into_response())), StatusCode::OK);
+        let no_refusal =
+            maven_virtual_age_gate_answer(Err(proxy_helpers::member_unavailable_response()), None);
+        assert_eq!(
+            no_refusal.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
@@ -13711,6 +13750,39 @@ mod scan_on_proxy_tests {
             tdh::get(format!("/{repo_key}/{route}")),
         )
         .await
+    }
+
+    /// #5504: a scanning Remote member whose upstream fails is unavailable,
+    /// not a miss. Its error comes from the scanned serve, not the proxy
+    /// error mapping, and used to lose that classification, so a virtual
+    /// whose failing member scans still answered 404. A permanent 4xx from
+    /// the same member is still a miss.
+    #[tokio::test]
+    async fn scanning_member_5xx_answers_503_and_4xx_answers_404_5504() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut got = Vec::new();
+        for broken in [503u16, 429, 403] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "maven", broken).await;
+            tdh::enable_proxy_scan(&pool, rig.repo_ids[2], "fail_open").await;
+            let dir = std::env::temp_dir().join(format!("mvnscan5504-{}", rig.virtual_key));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+            let (status, _, _) = pull(&state, &rig.virtual_key, JAR).await;
+            got.push((broken, status));
+            rig.cleanup(&pool).await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(
+            got,
+            vec![
+                (503, StatusCode::SERVICE_UNAVAILABLE),
+                (429, StatusCode::SERVICE_UNAVAILABLE),
+                (403, StatusCode::NOT_FOUND),
+            ]
+        );
     }
 
     #[test]

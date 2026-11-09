@@ -1699,7 +1699,12 @@ async fn download_zip(
                     .await
                     {
                         return match served {
-                            Err(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                            // #5504: a walk that answers 503 because a member
+                            // could not answer yields to the age refusal too.
+                            Err(resp)
+                                if resp.status() == StatusCode::NOT_FOUND
+                                    || proxy_helpers::is_member_unavailable_response(&resp) =>
+                            {
                                 Err(blocked_response.unwrap_or(resp))
                             }
                             other => other,

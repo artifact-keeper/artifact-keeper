@@ -1022,15 +1022,17 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
         )));
     }
     if status.is_server_error() {
-        return Err(AppError::ServiceUnavailable(format!(
-            "Upstream returned error status {}: {}",
-            status, diagnostic_url
+        return Err(AppError::ServiceUnavailable(upstream_status_message(
+            status,
+            "",
+            &diagnostic_url,
         )));
     }
     if !status.is_success() {
-        return Err(AppError::BadGateway(format!(
-            "{UPSTREAM_ERROR_STATUS_PREFIX}{}: {}",
-            status, diagnostic_url
+        return Err(AppError::BadGateway(upstream_status_message(
+            status,
+            "",
+            &diagnostic_url,
         )));
     }
     Ok(())
@@ -1040,6 +1042,21 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
 /// it (`"Upstream returned error status 403 Forbidden: <url>"`). The errors
 /// carry no status field, so [`upstream_error_status`] reads it back from here.
 const UPSTREAM_ERROR_STATUS_PREFIX: &str = "Upstream returned error status ";
+
+/// The one constructor of an upstream-status error message (#5504):
+/// `"Upstream returned error status <status><tag>: <url>"`. Every producer
+/// goes through it, so [`upstream_error_status`] reads every one back. `tag`
+/// sits between the status and the URL ([`ANONYMOUS_TOKEN_REFUSAL_MARKER`],
+/// or empty); `url` must already be redacted.
+fn upstream_status_message(status: StatusCode, tag: &str, url: &str) -> String {
+    format!("{UPSTREAM_ERROR_STATUS_PREFIX}{status}{tag}: {url}")
+}
+
+/// `UPSTREAM_ERROR_STATUS_PREFIX` followed by `status`: what a message for
+/// that status begins with.
+fn upstream_status_prefix(status: StatusCode) -> String {
+    format!("{UPSTREAM_ERROR_STATUS_PREFIX}{status}")
+}
 
 /// The upstream HTTP status behind a proxy fetch error, when the error is one
 /// this module produced for a non-success upstream answer: the
@@ -1076,7 +1093,9 @@ pub(crate) enum MemberFetchFailure {
     /// which [`validate_upstream_status`] maps to [`AppError::BadGateway`]:
     /// `401`/`403` from stale credentials, or an S3-hosted repository that
     /// answers `403` for a key it does not hold. Retrying yields the same
-    /// answer, so it reads as a miss.
+    /// answer, so it reads as a miss. The retryable 4xx (`408`, `425`,
+    /// `429`) are the exception and count as
+    /// [`MemberFetchFailure::Unavailable`].
     Miss,
     /// The member could not answer: an upstream `5xx`
     /// ([`AppError::ServiceUnavailable`]), a transport failure or timeout
@@ -1084,6 +1103,18 @@ pub(crate) enum MemberFetchFailure {
     /// status), or a fault on this server's side (storage, database). The
     /// member may hold the object, so "not found" is unknowable.
     Unavailable,
+}
+
+/// Whether an upstream 4xx is a permanent answer (#5504). `408 Request
+/// Timeout`, `425 Too Early` and `429 Too Many Requests` are the 4xx statuses
+/// that say "ask again later" (rate limiting on Maven Central or Docker Hub
+/// answers 429), so they are transient like a 5xx.
+fn is_permanent_client_error(status: StatusCode) -> bool {
+    status.is_client_error()
+        && !matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+        )
 }
 
 /// Classify a member fetch error for a virtual walk; see
@@ -1098,7 +1129,7 @@ pub(crate) fn classify_member_fetch_failure(err: &AppError) -> MemberFetchFailur
         | AppError::UpstreamAuth(_)
         | AppError::Conflict(_)
         | AppError::Authorization(_) => MemberFetchFailure::Miss,
-        _ if upstream_error_status(err).is_some_and(|s| s.is_client_error()) => {
+        _ if upstream_error_status(err).is_some_and(is_permanent_client_error) => {
             MemberFetchFailure::Miss
         }
         _ => MemberFetchFailure::Unavailable,
@@ -1175,8 +1206,10 @@ fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
         "upstream registry refused a request made with an anonymous bearer token (no \
          credentials were sent); treating the object as not available"
     );
-    AppError::BadGateway(format!(
-        "Upstream returned error status {status}{ANONYMOUS_TOKEN_REFUSAL_MARKER}: {url}"
+    AppError::BadGateway(upstream_status_message(
+        status,
+        ANONYMOUS_TOKEN_REFUSAL_MARKER,
+        &url,
     ))
 }
 
@@ -1204,7 +1237,7 @@ pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode
     };
     [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
         .into_iter()
-        .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
+        .find(|status| msg.starts_with(&format!("{}:", upstream_status_prefix(*status))))
 }
 
 /// At most one of each upstream-auth `security` WARN per Remote per this
@@ -1428,7 +1461,7 @@ fn with_hub_error_code(err: AppError, headers: &reqwest::header::HeaderMap) -> A
     else {
         return err;
     };
-    let prefix = format!("Upstream returned error status {status}");
+    let prefix = upstream_status_prefix(status);
     let tag = |message: String| {
         let tagged = message
             .strip_prefix(&prefix)
@@ -1453,9 +1486,7 @@ fn hub_refusal_error(
 ) -> Option<AppError> {
     is_hub_refusal(headers).then(|| {
         with_hub_error_code(
-            AppError::Storage(format!(
-                "Upstream returned error status {status}: {diagnostic_url}"
-            )),
+            AppError::Storage(upstream_status_message(status, "", diagnostic_url)),
             headers,
         )
     })
@@ -1469,7 +1500,7 @@ pub(crate) fn upstream_hub_error_code(err: &AppError) -> Option<&'static str> {
         return None;
     };
     let rest = message
-        .strip_prefix(&format!("Upstream returned error status {status}"))?
+        .strip_prefix(&upstream_status_prefix(status))?
         .strip_prefix(HUB_ERROR_CODE_TAG)?;
     let (code, _) = rest.split_once(')')?;
     HUB_ERROR_CODES.into_iter().find(|known| *known == code)
@@ -4576,9 +4607,10 @@ impl UpstreamClient {
                 return Self::read_upstream_response_capped(retry_response, url, max).await;
             }
 
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, diagnostic_url
+            return Err(AppError::Storage(upstream_status_message(
+                status,
+                "",
+                &diagnostic_url,
             )));
         }
 
@@ -4819,9 +4851,10 @@ impl UpstreamClient {
                 return Self::read_upstream_response_streaming(retry_response, url);
             }
 
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, diagnostic_url
+            return Err(AppError::Storage(upstream_status_message(
+                status,
+                "",
+                &diagnostic_url,
             )));
         }
 
@@ -9347,10 +9380,10 @@ impl ProxyService {
                     return Ok(Some(resp));
                 }
 
-                Err(AppError::Storage(format!(
-                    "Upstream returned error status {}: {}",
+                Err(AppError::Storage(upstream_status_message(
                     status,
-                    redact_url_for_diagnostics(url)
+                    "",
+                    &redact_url_for_diagnostics(url),
                 )))
             }
             _ => {
@@ -19214,7 +19247,9 @@ mod tests {
             (401, Miss),
             (403, Miss),
             (418, Miss),
-            (429, Miss),
+            (408, Unavailable),
+            (425, Unavailable),
+            (429, Unavailable),
             (500, Unavailable),
             (502, Unavailable),
             (503, Unavailable),
@@ -19262,6 +19297,53 @@ mod tests {
         // A 5xx is never a refusal, even though it carries the status.
         let down = validate_upstream_status(StatusCode::BAD_GATEWAY, "http://x").unwrap_err();
         assert_eq!(upstream_refusal_status(&down), None);
+    }
+
+    /// #5504: every producer of an upstream-status error builds its message
+    /// through `upstream_status_message`, so `upstream_error_status` reads
+    /// each one back; and no production line formats the prefix by hand.
+    #[test]
+    fn every_upstream_status_message_round_trips_5504() {
+        let mut hub = reqwest::header::HeaderMap::new();
+        hub.insert("x-error-code", "GatedRepo".parse().unwrap());
+        let produced = [
+            (
+                StatusCode::FORBIDDEN,
+                validate_upstream_status(StatusCode::FORBIDDEN, "http://x").unwrap_err(),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                validate_upstream_status(StatusCode::SERVICE_UNAVAILABLE, "http://x").unwrap_err(),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "http://x"),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                hub_refusal_error(StatusCode::UNAUTHORIZED, &hub, "http://x").expect("hub"),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                AppError::Storage(upstream_status_message(StatusCode::UNAUTHORIZED, "", "u")),
+            ),
+        ];
+        for (status, err) in produced {
+            assert_eq!(upstream_error_status(&err), Some(status), "{err:?}");
+        }
+
+        let src = include_str!("proxy_service.rs");
+        let production = &src[..src.find("\n#[cfg(test)]").expect("test module")];
+        let literal = ["Upstream returned", " error status"].concat();
+        let hand_formatted: Vec<&str> = production
+            .lines()
+            .filter(|l| l.contains(&literal) && !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            hand_formatted.len(),
+            1,
+            "only UPSTREAM_ERROR_STATUS_PREFIX may spell the prefix: {hand_formatted:?}"
+        );
     }
 
     #[test]
