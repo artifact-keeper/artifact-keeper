@@ -12779,83 +12779,6 @@ pub(crate) fn ranged_stream_response(
     ranged_stream_response_verified(range_header, total, body, base_headers, None)
 }
 
-/// The `Range` to honour for this request, if any.
-///
-/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
-/// keeps reporting the whole file. `If-Range` keeps it only for the current
-/// strong ETag; an older ETag or a date gets the whole file, which is the safe
-/// answer for a client resuming a file that may have changed (§13.1.5).
-pub(crate) fn effective_range<'a>(
-    headers: &'a HeaderMap,
-    etag: Option<&str>,
-    is_head: bool,
-) -> Option<&'a str> {
-    if is_head {
-        return None;
-    }
-    if let Some(validator) = headers.get(header::IF_RANGE) {
-        let current = etag.filter(|e| !e.starts_with("W/"));
-        if validator.to_str().ok() != current || current.is_none() {
-            return None;
-        }
-    }
-    headers.get(header::RANGE).and_then(|v| v.to_str().ok())
-}
-
-/// Apply the client's `Range` to a Remote or Virtual serve that arrives as a
-/// complete `200`: the Hugging Face resolve route (#5145) and the generic
-/// download route's Remote and Virtual arms (#5502).
-///
-/// The window is cut from the object's stream by [`ranged_stream_response`],
-/// as the OCI blob route does for its proxied bytes. `Range` is never forwarded
-/// upstream, so a cold serve still fills the cache with the whole file.
-///
-/// Left as it is: anything but a `200` (a presigned redirect's target answers
-/// `Range` itself), a content-coded body (a client's offsets describe the
-/// decoded file) and a body of unknown length.
-#[allow(clippy::result_large_err)]
-pub(crate) fn apply_range_to_streamed_serve(
-    resp: Response,
-    headers: &HeaderMap,
-    is_head: bool,
-) -> std::result::Result<Response, Response> {
-    use futures::StreamExt;
-
-    let total = resp
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let Some(total) = total.filter(|_| {
-        resp.status() == StatusCode::OK && !resp.headers().contains_key(header::CONTENT_ENCODING)
-    }) else {
-        return Ok(resp);
-    };
-
-    let etag = resp
-        .headers()
-        .get(header::ETAG)
-        .and_then(|v| v.to_str().ok());
-    let range = effective_range(headers, etag, is_head);
-    let (mut parts, body) = resp.into_parts();
-    let stream = body
-        .into_data_stream()
-        .map(|chunk| chunk.map_err(|e| AppError::BadGateway(e.to_string())))
-        .boxed();
-    let ranged =
-        ranged_stream_response(range, total, stream, Vec::new()).map_err(|e| e.into_response())?;
-
-    let (ranged_parts, ranged_body) = ranged.into_parts();
-    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
-        // No representation is served, so none of its headers apply.
-        parts.headers.clear();
-    }
-    parts.status = ranged_parts.status;
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.extend(ranged_parts.headers);
-    Ok(Response::from_parts(parts, ranged_body))
-}
-
 /// [`ranged_stream_response`] that verifies a whole-object serve against the
 /// SHA-256 the response itself advertises (#4323): `X-Checksum-Sha256`, or a
 /// `sha256:` `Docker-Content-Digest`. Skipped when the response declares a
@@ -13624,7 +13547,7 @@ pub async fn download_artifact(
                         // proxied object got every byte, which breaks clients
                         // that fetch byte windows and check each against its
                         // own digest (apk segment fetches).
-                        Ok(apply_range_to_streamed_serve(
+                        Ok(proxy_helpers::apply_range_to_streamed_serve(
                             response.into_response(),
                             request.headers(),
                             dl_ctx.is_head,
@@ -13774,7 +13697,7 @@ pub async fn download_artifact(
             // A member's serve is a complete `200` too, Remote members
             // included; cut the client's `Range` from it as the Remote arm
             // does (#5502).
-            Ok(apply_range_to_streamed_serve(
+            Ok(proxy_helpers::apply_range_to_streamed_serve(
                 builder.body(body).unwrap(),
                 request.headers(),
                 is_head,
@@ -17936,6 +17859,70 @@ mod tests {
 
         assert_eq!(whole.0, StatusCode::OK);
         assert_eq!(&whole.1[..], &data[..]);
+    }
+
+    /// The Virtual arm ranges a LOCAL member's serve too, when the shadowing
+    /// guard finds a non-Remote member owning the path (#5554): `206` for a
+    /// window, and a HEAD with `Range` is a `200` describing the whole file.
+    #[tokio::test]
+    async fn virtual_over_local_member_honours_range_5554() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add virtual member");
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        let data = range_payload_5502();
+        let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_repo,
+            &format!("ph-test/{}.bin", Uuid::new_v4()),
+            "vrange/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from(data.clone()),
+            fx.user_id,
+        )
+        .await;
+        let uri = format!("/{}/download/vrange/blob.bin", fx.repo_key);
+
+        let ranged = tdh::send_with_headers(
+            fx.router_with_auth(download_router()),
+            ranged_get_5502(&uri, Some("bytes=100-199")),
+        )
+        .await;
+        let mut head = ranged_get_5502(&uri, Some("bytes=100-199"));
+        *head.method_mut() = axum::http::Method::HEAD;
+        let head = tdh::send_with_headers(fx.router_with_auth(download_router()), head).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+
+        assert_eq!(ranged.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.2[header::CONTENT_RANGE], "bytes 100-199/1000");
+        assert_eq!(&ranged.1[..], &data[100..200]);
+
+        assert_eq!(head.0, StatusCode::OK);
+        assert_eq!(head.2[header::CONTENT_LENGTH], "1000");
+        assert!(head.2.get(header::CONTENT_RANGE).is_none());
+        assert!(head.1.is_empty());
     }
 
     // -----------------------------------------------------------------------

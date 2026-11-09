@@ -623,9 +623,10 @@ pub struct ProxyUpstreamSettings {
     /// `PROXY_UPSTREAM_FETCH_DEADLINE_SECS`, clamped to 1..=86400. Default
     /// 600.
     pub fetch_deadline_secs: u64,
-    /// Most buffered fills allowed to run detached from their request at once.
-    /// Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to 0..=1024. Default
-    /// 16. Zero keeps every fill in its request.
+    /// Most fills allowed to run detached from their request at once: buffered
+    /// fills, and streamed fills whose client stopped reading after the first
+    /// bytes (#5509). Env: `PROXY_UPSTREAM_MAX_DETACHED_FILLS`, clamped to
+    /// 0..=1024. Default 16. Zero keeps every fill in its request.
     pub max_detached_fills: usize,
 }
 
