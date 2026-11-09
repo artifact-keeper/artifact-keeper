@@ -12779,6 +12779,83 @@ pub(crate) fn ranged_stream_response(
     ranged_stream_response_verified(range_header, total, body, base_headers, None)
 }
 
+/// The `Range` to honour for this request, if any.
+///
+/// `Range` is defined for GET only (RFC 9110 §14.2), so a HEAD ignores it and
+/// keeps reporting the whole file. `If-Range` keeps it only for the current
+/// strong ETag; an older ETag or a date gets the whole file, which is the safe
+/// answer for a client resuming a file that may have changed (§13.1.5).
+pub(crate) fn effective_range<'a>(
+    headers: &'a HeaderMap,
+    etag: Option<&str>,
+    is_head: bool,
+) -> Option<&'a str> {
+    if is_head {
+        return None;
+    }
+    if let Some(validator) = headers.get(header::IF_RANGE) {
+        let current = etag.filter(|e| !e.starts_with("W/"));
+        if validator.to_str().ok() != current || current.is_none() {
+            return None;
+        }
+    }
+    headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+}
+
+/// Apply the client's `Range` to a Remote or Virtual serve that arrives as a
+/// complete `200`: the Hugging Face resolve route (#5145) and the generic
+/// download route's Remote and Virtual arms (#5502).
+///
+/// The window is cut from the object's stream by [`ranged_stream_response`],
+/// as the OCI blob route does for its proxied bytes. `Range` is never forwarded
+/// upstream, so a cold serve still fills the cache with the whole file.
+///
+/// Left as it is: anything but a `200` (a presigned redirect's target answers
+/// `Range` itself), a content-coded body (a client's offsets describe the
+/// decoded file) and a body of unknown length.
+#[allow(clippy::result_large_err)]
+pub(crate) fn apply_range_to_streamed_serve(
+    resp: Response,
+    headers: &HeaderMap,
+    is_head: bool,
+) -> std::result::Result<Response, Response> {
+    use futures::StreamExt;
+
+    let total = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let Some(total) = total.filter(|_| {
+        resp.status() == StatusCode::OK && !resp.headers().contains_key(header::CONTENT_ENCODING)
+    }) else {
+        return Ok(resp);
+    };
+
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok());
+    let range = effective_range(headers, etag, is_head);
+    let (mut parts, body) = resp.into_parts();
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|e| AppError::BadGateway(e.to_string())))
+        .boxed();
+    let ranged =
+        ranged_stream_response(range, total, stream, Vec::new()).map_err(|e| e.into_response())?;
+
+    let (ranged_parts, ranged_body) = ranged.into_parts();
+    if ranged_parts.status == StatusCode::RANGE_NOT_SATISFIABLE {
+        // No representation is served, so none of its headers apply.
+        parts.headers.clear();
+    }
+    parts.status = ranged_parts.status;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.extend(ranged_parts.headers);
+    Ok(Response::from_parts(parts, ranged_body))
+}
+
 /// [`ranged_stream_response`] that verifies a whole-object serve against the
 /// SHA-256 the response itself advertises (#4323): `X-Checksum-Sha256`, or a
 /// `sha256:` `Docker-Content-Digest`. Skipped when the response declares a
@@ -13541,7 +13618,18 @@ pub async fn download_artifact(
                             &dl_ctx,
                         )
                         .await;
-                        Ok(response.into_response())
+                        // The proxied serve is a complete `200`; cut the
+                        // client's `Range` from it as the Hugging Face resolve
+                        // route does (#5145). Without this a ranged GET of a
+                        // proxied object got every byte, which breaks clients
+                        // that fetch byte windows and check each against its
+                        // own digest (apk segment fetches).
+                        Ok(apply_range_to_streamed_serve(
+                            response.into_response(),
+                            request.headers(),
+                            dl_ctx.is_head,
+                        )
+                        .unwrap_or_else(|r| r))
                     }
                     Err(e) => Ok(e.into_response()),
                 }
@@ -13683,7 +13771,15 @@ pub async fn download_artifact(
             } else {
                 Body::from_stream(result.body)
             };
-            Ok(builder.body(body).unwrap())
+            // A member's serve is a complete `200` too, Remote members
+            // included; cut the client's `Range` from it as the Remote arm
+            // does (#5502).
+            Ok(apply_range_to_streamed_serve(
+                builder.body(body).unwrap(),
+                request.headers(),
+                is_head,
+            )
+            .unwrap_or_else(|r| r))
         }
         Err(e) => Err(e),
     }
@@ -17660,6 +17756,186 @@ mod tests {
             .await
             .concat();
         assert_eq!(collected, b"defg");
+    }
+
+    // -----------------------------------------------------------------------
+    // Range on the generic route's proxied serves (#5502)
+    //
+    // A Remote serve (cache hit or upstream fetch) and a Virtual serve through
+    // a Remote member both arrive as a complete `200`. Driven end to end
+    // through `download_router()` and the `/general/` mount the issue names:
+    // the upstream must never see `Range`, so the cache still fills whole.
+    // -----------------------------------------------------------------------
+
+    /// 1000 bytes in which every offset is distinguishable from its neighbours.
+    fn range_payload_5502() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn ranged_get_5502(uri: &str, range: Option<&str>) -> axum::http::Request<Body> {
+        let mut req = tdh::get(uri.to_string());
+        if let Some(range) = range {
+            req.headers_mut()
+                .insert(header::RANGE, range.parse().unwrap());
+        }
+        req
+    }
+
+    async fn mount_upstream_5502(server: &wiremock::MockServer, file: &str, data: &[u8]) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{file}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(data.to_vec()))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn upstream_saw_range_5502(requests: &[wiremock::Request]) -> bool {
+        requests.iter().any(|r| r.headers.contains_key("range"))
+    }
+
+    /// Cold range, warm range, past-end and whole, all against one Remote
+    /// repository's proxied object, through `router`.
+    async fn assert_remote_range_cold_and_cached_5502(
+        router: Router<SharedState>,
+        uri_for: fn(&str, &str) -> String,
+    ) {
+        let Some(f) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&f.pool, f.repo_id).await;
+        let data = range_payload_5502();
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_5502(&server, "pkg/blob.bin", &data).await;
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let uri = uri_for(&f.repo_key, "pkg/blob.bin");
+        let send = |range: Option<&'static str>| {
+            tdh::send_with_headers(
+                tdh::router_anon(router.clone(), state.clone()),
+                ranged_get_5502(&uri, range),
+            )
+        };
+
+        let cold = send(Some("bytes=900-")).await;
+        tdh::wait_for_cache_commit(cache.path(), data.len() as u64).await;
+        let warm = send(Some("bytes=100-199")).await;
+        let past_end = send(Some("bytes=1000-")).await;
+        let whole = send(None).await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        f.teardown().await;
+
+        assert!(
+            !upstream_saw_range_5502(&requests),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
+        assert_eq!(cold.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(cold.2[header::CONTENT_RANGE], "bytes 900-999/1000");
+        assert_eq!(cold.2[header::CONTENT_LENGTH], "100");
+        assert_eq!(&cold.1[..], &data[900..]);
+
+        assert_eq!(warm.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(warm.2[header::CONTENT_RANGE], "bytes 100-199/1000");
+        assert_eq!(&warm.1[..], &data[100..200]);
+
+        assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(past_end.2[header::CONTENT_RANGE], "bytes */1000");
+        assert!(past_end.1.is_empty());
+
+        assert_eq!(whole.0, StatusCode::OK);
+        assert_eq!(&whole.1[..], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn remote_download_honours_range_cold_and_cached_5502() {
+        assert_remote_range_cold_and_cached_5502(download_router(), |key, path| {
+            format!("/{key}/download/{path}")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn general_route_remote_honours_range_cold_and_cached_5502() {
+        assert_remote_range_cold_and_cached_5502(
+            crate::api::handlers::general::router(),
+            |key, path| format!("/{key}/{path}"),
+        )
+        .await;
+    }
+
+    /// A Virtual repository over a Remote member serves through the member
+    /// walk, which builds its own complete `200`.
+    #[tokio::test]
+    async fn virtual_over_remote_honours_range_5502() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let data = range_payload_5502();
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_5502(&server, "pkg/virtual.bin", &data).await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "generic", &server.uri()).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        let cache = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(pool.clone(), cache.path().to_str().unwrap(), proxy);
+        let send = |router: Router<SharedState>, uri: String, range: Option<&'static str>| {
+            tdh::send_with_headers(
+                tdh::router_anon(router, state.clone()),
+                ranged_get_5502(&uri, range),
+            )
+        };
+
+        let download = send(
+            download_router(),
+            format!("/{virtual_key}/download/pkg/virtual.bin"),
+            Some("bytes=900-"),
+        )
+        .await;
+        tdh::wait_for_cache_commit(cache.path(), data.len() as u64).await;
+        let general = send(
+            crate::api::handlers::general::router(),
+            format!("/{virtual_key}/pkg/virtual.bin"),
+            Some("bytes=100-199"),
+        )
+        .await;
+        let past_end = send(
+            download_router(),
+            format!("/{virtual_key}/download/pkg/virtual.bin"),
+            Some("bytes=1000-"),
+        )
+        .await;
+        let whole = send(
+            download_router(),
+            format!("/{virtual_key}/download/pkg/virtual.bin"),
+            None,
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert!(
+            !upstream_saw_range_5502(&requests),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
+        assert_eq!(download.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(download.2[header::CONTENT_RANGE], "bytes 900-999/1000");
+        assert_eq!(&download.1[..], &data[900..]);
+
+        assert_eq!(general.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(general.2[header::CONTENT_RANGE], "bytes 100-199/1000");
+        assert_eq!(&general.1[..], &data[100..200]);
+
+        assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(past_end.2[header::CONTENT_RANGE], "bytes */1000");
+
+        assert_eq!(whole.0, StatusCode::OK);
+        assert_eq!(&whole.1[..], &data[..]);
     }
 
     // -----------------------------------------------------------------------

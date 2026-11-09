@@ -2484,11 +2484,16 @@ document). Body at most 1 MiB, nesting at most 64 levels.
 ```
 
 `source` is required and must be `ci_reported` or `gateway_reported`; every
-other member is optional (`observedAt` defaults to now and may not be more
-than 5 minutes in the future; `authState` defaults to `unknown`;
-`cacheScope` is `public` or `private`; `ttlMs` a non-negative integer). Item
-rules are the declaration rules above. The display label is set by AK, never
-by the caller: `reported by CI (<username>[, <generatedBy>])` /
+other member is optional (`observedAt` defaults to now, `authState` to
+`unknown`). `observedAt`, `cacheScope` and `ttlMs` follow the worker result's
+metadata rules (#5543), except that a report has no lower bound on
+`observedAt`, since it may describe an older build: an `observedAt` at most 5
+minutes (the clock-skew window) ahead of the registry's clock is accepted and
+stored as of its arrival; `cacheScope` is `public` or `private`; `ttlMs` an
+integer from `0` to `2592000000` (30 days). A refused report answers `400
+mcp_invalid_result_metadata` with the offending `field`. Item rules are the
+declaration rules above. The display label is set by AK, never by the caller:
+`reported by CI (<username>[, <generatedBy>])` /
 `reported by a gateway (...)`.
 
 `201`:
@@ -2502,8 +2507,10 @@ by the caller: `reported by CI (<username>[, <generatedBy>])` /
 same source. `created` is `false` when the report repeats the newest one of
 the same source and `generatedBy` (same content, outcome and auth state):
 nothing new is stored, the existing snapshot's `lastSeenAt` is bumped and it
-is returned, without audit or drift. Errors: `400 mcp_invalid_capabilities` (`detail` names the
-field), `401 mcp_unauthorized`, `403 mcp_forbidden`, `404` (unknown or
+is returned, without audit or drift. Errors: `400
+mcp_invalid_result_metadata` for refused metadata (above), `400
+mcp_invalid_capabilities` for a malformed body (`detail` names the field),
+`401 mcp_unauthorized`, `403 mcp_forbidden`, `404` (unknown or
 invisible version), `413 mcp_too_large`. Audited `MCP_CAPABILITIES_INGESTED`.
 
 ### `GET .../servers/{serverName}/versions/{version}/capabilities/diff`
@@ -2819,13 +2826,22 @@ runner-neutral guest spec:
 - pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
   `ghcr.io/astral-sh/uv:python3.12-alpine` pinned by digest), `uvx --no-config
   --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
-- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:...` itself, no
-  network.
+- oci: the AK-served `<ak host>/<repo>/<name>[:tag]@sha256:<digest>` itself,
+  no network. The reference must be canonical and carry exactly one
+  lower-case SHA-256 digest on the job's AK origin; a bare image name,
+  another host, a SHA-512 digest, extra `@` delimiters, or a non-canonical
+  path is refused. The AK host must itself be a registry host, that is
+  contain `.` or `:` or be `localhost`: with a bare service name such as
+  `http://artifact-keeper` as the AK base URL, an image reference's first
+  component is a Docker Hub namespace, so OCI introspection is refused
+  (give the base URL a domain or a port).
 
 Only what AK serves is run: a `registryBaseUrl` or OCI identifier that is not
-this AK instance is refused; publisher `runtimeArguments` are dropped;
-environment variables that steer a package manager or runtime (`NPM_CONFIG_*`,
-`UV_*`, `PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
+this AK instance is refused; an OCI package's legacy `version`,
+`registryBaseUrl` or `fileSha256` is refused (the tag or digest belongs only
+in `identifier`); publisher `runtimeArguments` are dropped; environment
+variables that steer a package manager or runtime (`NPM_CONFIG_*`, `UV_*`,
+`PIP_*`, `PYTHON*`, `NODE_OPTIONS`, `LD_*`, proxy variables, `PATH`,
 `HOME`, ...) are dropped. Every `isSecret` value, every required value
 without a default and every `{template}` value is the placeholder
 `AK_PLACEHOLDER_<NAME>`. The whole run, install included, is capped at 120 s.
