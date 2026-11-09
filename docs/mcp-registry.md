@@ -139,11 +139,20 @@ whose newest 100 versions are all held has no `latest` (the unknown-name
 `nextCursor` is opaque, as upstream specifies: a URL-safe string to pass back
 as `cursor` unchanged. It is sealed (AES-256-GCM under a key derived from the
 instance's `jwt_secret`) and bound to the repository and listing that issued
-it, so it reveals nothing about the row it resumes after (which may be a held
-version a reader must not learn of) and a client cannot make one up. A cursor
-this instance did not issue for that listing, including one issued before an
-upgrade that introduced sealing or before a `jwt_secret` rotation, is
-`400 mcp_invalid_query` (`invalid cursor`); start again without `cursor`.
+it, so a client cannot read or make one up. It never names a version the
+reader is not served, not even sealed: it holds the last row the listing
+served and, when the request stopped at the row bound after reading only
+rows the reader is not served, the internal id of the last of those rows.
+That id is a random UUID: fixed-length, unordered and meaningless outside
+this instance, so it is not a server name or version. The next request
+looks the row up (deleted rows included) and continues strictly after it,
+so the walk moves past held rows at the cost of a keyset resume at any
+depth, and a version deleted or soft-deleted between pages moves nothing.
+If that row has been purged, the walk resumes after the last served row.
+A Virtual's composite cursor works the same way.
+A cursor this instance did not issue for that listing, including one issued
+before an upgrade that introduced sealing or before a `jwt_secret` rotation,
+is `400 mcp_invalid_query` (`invalid cursor`); start again without `cursor`.
 
 Behaviour pinned by the end-to-end suite (clients may rely on it):
 
@@ -1314,7 +1323,16 @@ now. Any other reader is shown the server's newest servable version instead
 row at all when no version of the server is served: `GET
 /api/v1/packages/{id}` is then `404`, and the page's `total` leaves it out.
 `GET /api/v1/packages/{id}/versions` lists only servable versions for such a
-reader. A gate that cannot be evaluated hides the row (fail closed).
+reader. A soft-deleted (`deleted`) version is never servable here: a server
+whose only version is deleted has no row for such a reader, as on the
+`/v0.1` listing. A gate that cannot be evaluated hides the row (fail closed).
+
+Every generic surface below applies one visibility rule to a caller who does
+not hold the registry, before it counts, pages, facets or serves anything: a
+version is shown only when it is not soft-deleted and the `/v0.1` listing
+gate serves it to readers now (not held through its server.json or a pinned
+package, including `gate: shadowed`, not refused by scan policy, curation or
+`mcp_server_deny`, not resolving or unresolvable).
 
 **The generic artifact routes** apply the same decision to an MCP
 registry's stored documents and bundles (`servers/<name>/<version>/server.json`,

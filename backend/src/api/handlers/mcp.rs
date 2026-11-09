@@ -639,6 +639,23 @@ pub(crate) fn with_served_server(
 // The generic catalog (`/api/v1/packages`) view
 // ---------------------------------------------------------------------------
 
+/// The rows of `rows` a reader is shown on a listing, in order: the one
+/// visibility predicate of every generic surface (#5454). A soft-deleted
+/// (`deleted`) version is left out, then [`servable`] applies the
+/// reader-only gate (held, refused, resolving, unresolvable, shadowed or
+/// denied versions go; an unevaluable gate omits them all, fail closed).
+pub(crate) async fn reader_listed(
+    ctx: GateCtx<'_>,
+    repo_id: Uuid,
+    rows: Vec<VersionRow>,
+) -> Vec<VersionRow> {
+    let rows: Vec<VersionRow> = rows
+        .into_iter()
+        .filter(|r| r.stored.registry.status != fmt::ServerStatus::Deleted)
+        .collect();
+    servable(ctx, repo_id, rows).await
+}
+
 /// What `/api/v1/packages` shows a caller of an MCP catalog row (#5253). The
 /// row records the newest version published or ingested, whatever its holds;
 /// the registry surface decides per reader ([`servable`]), and so does the
@@ -681,7 +698,7 @@ pub(crate) async fn catalog_view(
         .filter(|r| r.version == version)
         .cloned()
         .collect();
-    let own_servable = !own.is_empty() && !servable(ctx, repo_id, own).await.is_empty();
+    let own_servable = !own.is_empty() && !reader_listed(ctx, repo_id, own).await.is_empty();
     if own_servable || audience(&state.db, auth, repo_id).await == GateAudience::ReasonGated {
         return CatalogView::Keep {
             servable: own_servable,
@@ -728,7 +745,7 @@ pub(crate) async fn catalog_visible_versions(
         return Some(Default::default());
     };
     Some(
-        servable(GateCtx::of(state, false), repo_id, rows)
+        reader_listed(GateCtx::of(state, false), repo_id, rows)
             .await
             .into_iter()
             .map(|r| r.version)
@@ -869,14 +886,11 @@ impl<'a> GenericArtifactGate<'a> {
             Ok(raw) => raw,
             Err(_) => return Default::default(),
         };
-        let rows: Vec<VersionRow> = rows_from_raw(raw)
-            .into_iter()
-            .filter(|r| r.stored.registry.status != fmt::ServerStatus::Deleted)
-            .collect();
+        let rows = rows_from_raw(raw);
         let ctx = GateCtx::of(self.state, false);
         let mut out = std::collections::HashSet::new();
         for chunk in rows.chunks(LISTING_GATE_CHUNK) {
-            for r in servable(ctx, repo.id, chunk.to_vec()).await {
+            for r in reader_listed(ctx, repo.id, chunk.to_vec()).await {
                 out.insert((r.name, r.version));
             }
         }
@@ -1048,7 +1062,8 @@ fn listing_gate_unavailable(db: &PgPool, repository_id: Uuid) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListQuery {
     pub limit: i64,
-    pub cursor: Option<(String, String)>,
+    /// Where the listing resumes ([`fmt::ListingResume::default`]: the start).
+    pub cursor: fmt::ListingResume,
     pub search: Option<String>,
     pub version: Option<String>,
     pub updated_since: Option<DateTime<Utc>>,
@@ -1071,7 +1086,7 @@ fn parse_bool(key: &str, v: &str) -> Result<bool, McpError> {
 /// [`fmt::CursorSeal`]).
 pub fn parse_list_query(
     q: &HashMap<String, String>,
-    open_cursor: impl FnOnce(&str) -> Result<(String, String), McpError>,
+    open_cursor: impl FnOnce(&str) -> Result<fmt::ListingResume, McpError>,
 ) -> Result<ListQuery, McpError> {
     let limit = match q.get("limit").map(|s| s.trim()) {
         None | Some("") => fmt::DEFAULT_LIMIT,
@@ -1086,8 +1101,8 @@ pub fn parse_list_query(
         },
     };
     let cursor = match q.get("cursor").filter(|c| !c.is_empty()) {
-        Some(c) => Some(open_cursor(c)?),
-        None => None,
+        Some(c) => open_cursor(c)?,
+        None => fmt::ListingResume::default(),
     };
     let search = match q.get("search").filter(|s| !s.is_empty()) {
         Some(s) if s.chars().count() < 3 => return Err(McpError::SearchTooShort),
@@ -1136,13 +1151,55 @@ pub fn parse_list_query(
 
 /// One keyset batch of listing candidates, with what the scan read: rows
 /// whose metadata cannot be parsed are dropped from `rows`, so paging decides
-/// on `raw_len` and resumes after `last`.
+/// on `raw_len`, resumes after `last` and feeds `read` (every row read, in
+/// order, by id and key) to a [`fmt::ListingResume`] ([`advance_resume`]).
 pub(crate) struct ListingBatch {
     pub(crate) rows: Vec<VersionRow>,
     pub(crate) raw_len: usize,
     pub(crate) last: Option<(String, String)>,
+    pub(crate) read: Vec<(Uuid, (String, String))>,
 }
 
+/// Account in `at` for the rows a batch read, of which `served` were
+/// served.
+pub(crate) fn advance_resume(
+    at: &mut fmt::ListingResume,
+    read: &[(Uuid, (String, String))],
+    served: &[VersionRow],
+) {
+    let served: std::collections::HashSet<Uuid> = served.iter().map(|r| r.artifact_id).collect();
+    for (id, key) in read {
+        at.advance_one(*id, key.clone(), served.contains(id));
+    }
+}
+
+/// The keyset position a listing resumed at `at` continues strictly after
+/// (#5453): the row `at.read` names (looked up in `repo_id`, deleted rows
+/// included, so a version deleted between pages moves nothing), or the last
+/// served row when there is none or it was purged. For a `version=latest`
+/// listing only the name counts.
+pub(crate) async fn resume_after(
+    db: &PgPool,
+    repo_id: Uuid,
+    at: &fmt::ListingResume,
+) -> Result<Option<(String, String)>, Response> {
+    if let Some(id) = at.read {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT name, version FROM artifacts WHERE id = $1 AND repository_id = $2",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .fetch_optional(db)
+        .await
+        .map_err(internal)?;
+        if let Some((name, version)) = row {
+            return Ok(Some((name, version.unwrap_or_default())));
+        }
+    }
+    Ok(at.after.clone())
+}
+
+/// The rows after `after`.
 pub(crate) async fn fetch_listing_batch(
     db: &PgPool,
     repo_id: Uuid,
@@ -1179,11 +1236,15 @@ pub(crate) async fn fetch_listing_batch(
         .await
         .map_err(internal)?;
     let raw_len = raw.len();
-    let last = raw.last().map(|r| (r.2.clone(), r.3.clone()));
+    let read: Vec<(Uuid, (String, String))> = raw
+        .iter()
+        .map(|r| (r.0, (r.2.clone(), r.3.clone())))
+        .collect();
     Ok(ListingBatch {
         rows: rows_from_raw(raw),
         raw_len,
-        last,
+        last: read.last().map(|(_, k)| k.clone()),
+        read,
     })
 }
 
@@ -1365,7 +1426,7 @@ async fn list_servers(
     reject_if_not_hosted_read(&repo)?;
     let seal = cursor_seal(&state);
     let q = parse_list_query(&query, |c| {
-        seal.decode_position(repo.id, fmt::cursor_kind::SERVERS, c)
+        seal.decode_resume(repo.id, fmt::cursor_kind::SERVERS, c)
     })
     .map_err(mcp_error)?;
     let ctx = GateCtx::of(&state, false);
@@ -1374,7 +1435,7 @@ async fn list_servers(
     } else {
         list_versions_page(ctx, &repo, &q, base.as_str()).await?
     };
-    let next = next.map(|(n, v)| seal.encode_position(repo.id, fmt::cursor_kind::SERVERS, &n, &v));
+    let next = next.map(|at| seal.encode_resume(repo.id, fmt::cursor_kind::SERVERS, &at));
     Ok(json_listing(&fmt::list_envelope(entries, next)))
 }
 
@@ -1389,9 +1450,8 @@ pub(crate) fn cursor_seal(state: &crate::api::AppState) -> fmt::CursorSeal {
     fmt::CursorSeal::from_secret(&state.config.jwt_secret)
 }
 
-/// A listing page and the keyset position the next page resumes after
-/// (sealed by the caller).
-type PageOut = (Vec<serde_json::Value>, Option<(String, String)>);
+/// A listing page and where the next page resumes (sealed by the caller).
+type PageOut = (Vec<serde_json::Value>, Option<fmt::ListingResume>);
 
 async fn list_versions_page(
     ctx: GateCtx<'_>,
@@ -1401,28 +1461,34 @@ async fn list_versions_page(
 ) -> Result<PageOut, Response> {
     let want = q.limit as usize;
     let mut out: Vec<VersionRow> = Vec::new();
-    let mut after = q.cursor.clone();
+    // The scan's own position (internal, may be a held row), and the resume
+    // point a cursor may carry (the last served row, and the id of the last
+    // row read past it).
+    let mut after = resume_after(ctx.db, repo.id, &q.cursor).await?;
+    let mut resume = q.cursor.clone();
     let mut read = 0usize;
     let exhausted = loop {
         let batch = fetch_listing_batch(ctx.db, repo.id, q, after.as_ref(), q.limit + 1).await?;
         read += batch.raw_len;
         let exhausted = (batch.raw_len as i64) <= q.limit;
-        if let Some(last) = batch.last {
+        if let Some(last) = batch.last.clone() {
             after = Some(last);
         }
-        out.extend(servable(ctx, repo.id, batch.rows).await);
+        let served = servable(ctx, repo.id, batch.rows).await;
+        advance_resume(&mut resume, &batch.read, &served);
+        out.extend(served);
         if out.len() > want || exhausted || read >= MAX_LISTING_ROWS {
             break exhausted;
         }
     };
     let next = if out.len() > want {
         let last = &out[want - 1];
-        Some((last.name.clone(), last.version.clone()))
+        Some(fmt::ListingResume::after(&last.name, &last.version))
     } else if !exhausted {
         // The row bound stopped the scan (almost every row held): resume
-        // after the last row read instead of presenting a short last page.
-        // That row may be held; the sealed cursor does not reveal it.
-        after
+        // past the rows read instead of presenting a short last page, naming
+        // the last one by its id only (#5453).
+        Some(resume)
     } else {
         None
     };
@@ -1430,17 +1496,19 @@ async fn list_versions_page(
     Ok((served_entries(ctx, repo, base, &out).await?, next))
 }
 
-/// Server names of a listing, in order, after `name_after`.
+/// Server names of a listing, in order, after `name_after`, each with the
+/// id of one of its rows (what a [`fmt::ListingResume`] names it by).
 pub(crate) async fn fetch_server_names(
     db: &PgPool,
     repo_id: Uuid,
     search: Option<&str>,
     name_after: Option<&str>,
     limit: i64,
-) -> Result<Vec<String>, Response> {
+) -> Result<Vec<(String, Uuid)>, Response> {
     let pattern = search.map(|s| format!("%{}%", super::escape_like_literal(s)));
-    sqlx::query_scalar(
-        "SELECT a.name FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
+    sqlx::query_as(
+        "SELECT a.name, (array_agg(a.id))[1] FROM artifacts a \
+         JOIN artifact_metadata m ON m.artifact_id = a.id \
          WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
            AND ($2::text IS NULL OR a.name ILIKE $2 ESCAPE '\\') \
            AND ($3::text IS NULL OR a.name > $3) \
@@ -1455,6 +1523,10 @@ pub(crate) async fn fetch_server_names(
     .map_err(internal)
 }
 
+/// The version half of a `version=latest` listing's position (it pages by
+/// server name).
+pub(crate) const LATEST_POSITION: &str = "-";
+
 /// Gate evaluations one `version=latest` listing spends before it answers
 /// with a resume cursor (each server costs at least one).
 pub(crate) const MAX_LATEST_BUDGET: usize = 1000;
@@ -1463,8 +1535,9 @@ pub(crate) const MAX_LATEST_BUDGET: usize = 1000;
 /// The newest is picked from all of a server's versions first; only then do
 /// `updated_since` (on the picked version) apply, so an older version is
 /// never presented as latest because the newest was not updated recently.
-/// The cursor names the last server decided; work is bounded by
-/// [`MAX_LATEST_BUDGET`] and a stopped scan answers a resume cursor.
+/// The cursor names the last server served and, by row id only, the last
+/// server decided past it (#5453); work is bounded by [`MAX_LATEST_BUDGET`]
+/// and a stopped scan answers a resume cursor.
 async fn list_latest(
     ctx: GateCtx<'_>,
     repo: &RepoInfo,
@@ -1473,8 +1546,10 @@ async fn list_latest(
 ) -> Result<PageOut, Response> {
     let want = q.limit as usize;
     let mut out: Vec<VersionRow> = Vec::new();
-    let mut name_after = q.cursor.as_ref().map(|(name, _)| name.clone());
-    let mut last_done: Option<String> = None;
+    let mut name_after = resume_after(ctx.db, repo.id, &q.cursor)
+        .await?
+        .map(|(name, _)| name);
+    let mut resume = q.cursor.clone();
     let mut budget = MAX_LATEST_BUDGET;
     let mut more = false;
     let none = std::collections::HashSet::new();
@@ -1488,7 +1563,7 @@ async fn list_latest(
         )
         .await?;
         let names_exhausted = names.len() <= want;
-        for name in names {
+        for (name, id) in names {
             if out.len() == want || budget == 0 {
                 more = true;
                 break 'scan;
@@ -1497,24 +1572,19 @@ async fn list_latest(
             let (picked, evaluated) = newest_servable(ctx, repo.id, all, &none).await;
             budget = budget.saturating_sub(evaluated.max(1));
             // An unevaluable gate omits the server (never an older version).
-            if let Some(row) = picked.ok().flatten().filter(|r| {
+            let picked = picked.ok().flatten().filter(|r| {
                 q.updated_since
                     .is_none_or(|since| r.stored.registry.updated_at >= since)
-            }) {
-                out.push(row);
-            }
-            last_done = Some(name);
+            });
+            resume.advance_one(id, (name.clone(), LATEST_POSITION.into()), picked.is_some());
+            out.extend(picked);
+            name_after = Some(name);
         }
         if names_exhausted {
             break;
         }
-        name_after = last_done.clone();
     }
-    let next = if more {
-        last_done.map(|n| (n, "-".to_string()))
-    } else {
-        None
-    };
+    let next = more.then_some(resume);
     Ok((
         out.iter()
             .map(|r| served_entry(r, repo, base, true))
@@ -2913,7 +2983,7 @@ mod tests {
 
     fn parse(q: &HashMap<String, String>) -> Result<ListQuery, McpError> {
         parse_list_query(q, |c| {
-            test_seal().decode_position(Uuid::nil(), fmt::cursor_kind::SERVERS, c)
+            test_seal().decode_resume(Uuid::nil(), fmt::cursor_kind::SERVERS, c)
         })
     }
 
@@ -2956,8 +3026,14 @@ mod tests {
         );
         assert_eq!(
             parse(&q(&[("cursor", &c)])).unwrap().cursor,
-            Some(("com.acme/a".into(), "1.0.0".into()))
+            fmt::ListingResume::after("com.acme/a", "1.0.0")
         );
+        let past = fmt::ListingResume {
+            after: None,
+            read: Some(Uuid::new_v4()),
+        };
+        let c = test_seal().encode_resume(Uuid::nil(), fmt::cursor_kind::SERVERS, &past);
+        assert_eq!(parse(&q(&[("cursor", &c)])).unwrap().cursor, past);
         assert_eq!(
             parse(&q(&[("search", "ab")])).unwrap_err(),
             McpError::SearchTooShort
@@ -4157,6 +4233,274 @@ mod tests {
         )
         .await;
         assert_eq!(holder["pagination"]["total"], 2, "{holder}");
+        env.teardown().await;
+    }
+
+    /// #5454: one public registry with a visible server and three it does
+    /// not serve: held (its server.json quarantined), soft-deleted (status
+    /// `deleted`) and denied (`mcp_server_deny`). An anonymous caller and an
+    /// authenticated caller with no grant see the visible server and nothing
+    /// of the other three on every generic surface: search (quick, advanced
+    /// with its total and facets, checksum, suggest, trending, recent), the
+    /// artifact listing and its total, `/api/v1/packages` and a package's
+    /// versions, the storage figures and storage tree, the tree browser and
+    /// the tree content (the same `404` as a path that does not exist).
+    #[tokio::test]
+    async fn generic_surfaces_hide_every_unserved_version_from_readers() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let tag = Uuid::new_v4().simple().to_string()[..10].to_string();
+        let name = |kind: &str| format!("com.acme/{kind}{tag}");
+        for kind in ["vis", "held", "del", "deny"] {
+            let d = doc(&name(kind), "1.0.0", serde_json::json!({}));
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK, "{kind}");
+        }
+        let mut ids = HashMap::new();
+        for kind in ["held", "del", "deny"] {
+            ids.insert(kind, env.server_artifact(&name(kind), "1.0.0").await);
+        }
+        env.hold(ids["held"], Some("quarantined")).await;
+        let (s, b, _) = call(
+            env.member(),
+            "PATCH",
+            &env.url(&format!(
+                "/servers/{}/versions/1.0.0/status",
+                name("del").replace('/', "%2F")
+            )),
+            Some(&serde_json::json!({"status": "deleted"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        env.config(
+            crate::services::mcp_settings::SERVER_DENY_KEY,
+            &serde_json::json!([name("deny")]).to_string(),
+        )
+        .await;
+        tdh::recompute_storage_stats_with_retry(&env.fx.pool, false).await;
+        let key = env.fx.repo_key.clone();
+        let hidden: Vec<String> = ["held", "del", "deny"]
+            .iter()
+            .map(|k| format!("{k}{tag}"))
+            .collect();
+        let mut sums = Vec::new();
+        for kind in ["held", "del", "deny"] {
+            let sha: String =
+                sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                    .bind(ids[kind])
+                    .fetch_one(&env.fx.pool)
+                    .await
+                    .unwrap();
+            sums.push(sha);
+        }
+        let pkg_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM packages WHERE repository_id = $1 AND name = ANY($2)",
+        )
+        .bind(env.fx.repo_id)
+        .bind(
+            ["held", "del", "deny"]
+                .iter()
+                .map(|k| name(k))
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&env.fx.pool)
+        .await
+        .unwrap();
+
+        type Mk = fn() -> Router<SharedState>;
+        let search: Mk = crate::api::handlers::search::router;
+        let repos: Mk = crate::api::handlers::repositories::router;
+        let packages: Mk = crate::api::handlers::packages::router;
+        let tree: Mk = crate::api::handlers::tree::router;
+        let mut cases: Vec<(Mk, String)> = vec![
+            (search, format!("/quick?q={tag}&limit=50")),
+            (search, "/quick?q=com.acme&limit=50".to_string()),
+            (search, "/quick?q=server.json&limit=50".to_string()),
+            (search, format!("/advanced?query={tag}&per_page=50")),
+            (search, format!("/advanced?repository_key={key}&per_page=1")),
+            (search, "/suggest?prefix=com.acme&limit=50".to_string()),
+            (search, "/trending?limit=100".to_string()),
+            (search, "/recent?limit=100".to_string()),
+            (repos, format!("/{key}/artifacts?per_page=100&count=exact")),
+            (
+                repos,
+                format!("/{key}/artifacts?per_page=1&page=2&count=exact"),
+            ),
+            (repos, format!("/{key}/artifacts?q={tag}")),
+            (repos, format!("/{key}/storage/tree?depth=6")),
+            (
+                repos,
+                format!("/{key}/storage/tree?depth=6&path=servers/com.acme"),
+            ),
+            (packages, format!("/?repository_key={key}&per_page=100")),
+            (packages, format!("/?repository_key={key}&search={tag}")),
+            (tree, format!("/?repository_key={key}")),
+            (tree, format!("/?repository_key={key}&path=servers")),
+            (
+                tree,
+                format!("/?repository_key={key}&path=servers/com.acme"),
+            ),
+        ];
+        for sha in &sums {
+            cases.push((search, format!("/checksum?checksum={sha}")));
+        }
+        for kind in ["held", "del", "deny"] {
+            cases.push((search, format!("/quick?q={}&limit=50", name(kind))));
+            cases.push((search, format!("/advanced?name={}", name(kind))));
+        }
+        let reader = outsider(&env).await;
+        let mut leaks: Vec<String> = Vec::new();
+        for (who, mk_app) in [
+            (
+                "anonymous",
+                Box::new(|r: Router<SharedState>| env.fx.router_anon(r))
+                    as Box<dyn Fn(Router<SharedState>) -> Router>,
+            ),
+            (
+                "outsider",
+                Box::new(|r: Router<SharedState>| as_caller(&env, &reader, r)),
+            ),
+        ] {
+            for (mk, uri) in &cases {
+                let (s, b, _) = call(mk_app(mk()), "GET", uri, None).await;
+                let body = String::from_utf8_lossy(&b);
+                assert!(
+                    s == StatusCode::OK || s == StatusCode::NOT_FOUND,
+                    "{who} {uri}: {s} {body}"
+                );
+                for h in &hidden {
+                    if body.contains(h.as_str()) {
+                        leaks.push(format!("{who} {uri} names {h}: {body}"));
+                    }
+                }
+                if sums.iter().any(|sha| body.contains(sha.as_str())) {
+                    leaks.push(format!("{who} {uri} names a hidden checksum"));
+                }
+            }
+            assert!(leaks.is_empty(), "{}", leaks.join("\n"));
+            // The visible server is still found.
+            let quick = get_json(
+                mk_app(search()),
+                format!("/quick?q={}&limit=50", name("vis")),
+            )
+            .await;
+            assert!(
+                quick.to_string().contains(&format!("vis{tag}")),
+                "{who}: {quick}"
+            );
+            let adv = get_json(
+                mk_app(search()),
+                format!("/advanced?repository_key={key}&per_page=50"),
+            )
+            .await;
+            assert_eq!(adv["pagination"]["total"], 1, "{who}: {adv}");
+            // The facets span the caller's whole scope (the shared test
+            // database has other registries); this registry counts one.
+            let ours: Vec<&serde_json::Value> = adv["facets"]["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["value"] == key.as_str())
+                .collect();
+            assert_eq!(ours.len(), 1, "{who}: {adv}");
+            assert_eq!(ours[0]["count"], 1, "{who}: {adv}");
+            let list = get_json(
+                mk_app(repos()),
+                format!("/{key}/artifacts?per_page=100&count=exact"),
+            )
+            .await;
+            assert_eq!(list["pagination"]["total"], 1, "{who}: {list}");
+            let pk = get_json(
+                mk_app(packages()),
+                format!("/?repository_key={key}&per_page=100"),
+            )
+            .await;
+            assert_eq!(pk["pagination"]["total"], 1, "{who}: {pk}");
+            let st = get_json(mk_app(repos()), format!("/{key}/storage")).await;
+            assert_eq!(st["blob_count"], 1, "{who}: {st}");
+            let stree = get_json(mk_app(repos()), format!("/{key}/storage/tree?depth=6")).await;
+            assert_eq!(stree["node"]["file_count"], 1, "{who}: {stree}");
+            for id in &pkg_ids {
+                for tail in [format!("/{id}"), format!("/{id}/versions")] {
+                    let (s, b, _) = call(mk_app(packages()), "GET", &tail, None).await;
+                    let body = String::from_utf8_lossy(&b);
+                    let empty = json(&b)["versions"]
+                        .as_array()
+                        .is_some_and(|v| v.is_empty());
+                    assert!(
+                        s == StatusCode::NOT_FOUND || empty,
+                        "{who} package {tail}: {s} {body}"
+                    );
+                    for h in &hidden {
+                        assert!(!body.contains(h.as_str()), "{who} {tail}: {body}");
+                    }
+                }
+            }
+            // Tree content: a hidden server.json is the 404 of a path that
+            // does not exist (same status and body shape), never the document.
+            let (ms, mb, _) = call(
+                mk_app(tree()),
+                "GET",
+                &format!(
+                    "/content?repository_key={key}&path=servers/com.acme/none{tag}/1.0.0/server.json"
+                ),
+                None,
+            )
+            .await;
+            assert_eq!(ms, StatusCode::NOT_FOUND);
+            // A hidden server's folder lists as a folder that does not exist.
+            let folder = |n: &str| format!("/?repository_key={key}&path=servers/com.acme/{n}");
+            let (fs, fb, _) =
+                call(mk_app(tree()), "GET", &folder(&format!("none{tag}")), None).await;
+            for kind in ["held", "del", "deny"] {
+                let (s, b, _) = call(
+                    mk_app(tree()),
+                    "GET",
+                    &folder(&format!("{kind}{tag}")),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    (
+                        s,
+                        String::from_utf8_lossy(&b).replace(&format!("{kind}{tag}"), "X")
+                    ),
+                    (
+                        fs,
+                        String::from_utf8_lossy(&fb).replace(&format!("none{tag}"), "X")
+                    ),
+                    "{who} tree folder {kind}"
+                );
+            }
+            for kind in ["held", "del", "deny"] {
+                let path = format!("servers/com.acme/{kind}{tag}/1.0.0/server.json");
+                let (s, b, _) = call(
+                    mk_app(tree()),
+                    "GET",
+                    &format!("/content?repository_key={key}&path={path}"),
+                    None,
+                )
+                .await;
+                assert_eq!(s, StatusCode::NOT_FOUND, "{who} content {kind}");
+                assert_eq!(
+                    String::from_utf8_lossy(&b).replace(&format!("{kind}{tag}"), "X"),
+                    String::from_utf8_lossy(&mb).replace(&format!("none{tag}"), "X"),
+                    "{who} content {kind} must read as a missing path"
+                );
+            }
+            let (s, _, _) = call(
+                mk_app(tree()),
+                "GET",
+                &format!(
+                    "/content?repository_key={key}&path=servers/com.acme/vis{tag}/1.0.0/server.json"
+                ),
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{who} visible content");
+        }
         env.teardown().await;
     }
 
@@ -6941,6 +7285,214 @@ mod tests {
             )
             .await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{first}: replayed elsewhere");
+        }
+        env.teardown().await;
+    }
+
+    /// `n` held copies of the held server.json row `template`, named
+    /// `com.acme/held-<from..from+n>` at version 7.7.7.
+    async fn held_copies(env: &Env, template: Uuid, from: i32, n: i32) {
+        sqlx::query(
+            "WITH src AS (SELECT * FROM artifacts WHERE id = $1), \
+             made AS ( \
+               INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                   checksum_sha256, content_type, storage_key, uploaded_by, origin, \
+                   quarantine_status, quarantine_source) \
+               SELECT src.repository_id, \
+                   'servers/com.acme/held-' || lpad(i::text, 4, '0') || '/7.7.7/server.json', \
+                   'com.acme/held-' || lpad(i::text, 4, '0'), src.version, src.size_bytes, \
+                   src.checksum_sha256, src.content_type, src.storage_key, src.uploaded_by, \
+                   src.origin, 'quarantined', 'admin' \
+               FROM src, generate_series($2, $2 + $3 - 1) AS i \
+               RETURNING id, name) \
+             INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+             SELECT made.id, 'mcp', jsonb_set(m.metadata, '{server,name}', to_jsonb(made.name)) \
+             FROM made, artifact_metadata m WHERE m.artifact_id = $1",
+        )
+        .bind(template)
+        .bind(from)
+        .bind(n)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+    }
+
+    /// A public registry with the clean servers `clean` (version 1.0.0) and
+    /// `held` held servers `com.acme/held-0000..` (version 7.7.7).
+    async fn cursor_fixture(clean: &[&str], held: i32) -> Option<Env> {
+        let env = Env::new().await?;
+        tdh::publish_repo(&env.fx.pool, env.fx.repo_id).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let d = doc("com.acme/held-0000", "7.7.7", serde_json::json!({}));
+        assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        for name in clean {
+            let d = doc(name, "1.0.0", serde_json::json!({}));
+            assert_eq!(env.publish(&d).await.0, StatusCode::OK);
+        }
+        let template = env.server_artifact("com.acme/held-0000", "7.7.7").await;
+        env.hold(template, Some("quarantined")).await;
+        held_copies(&env, template, 1, held - 1).await;
+        Some(env)
+    }
+
+    /// Walk the listing `first` (a `limit=1` query) page by page as `app`,
+    /// calling `between` with each cursor's id before the next page. Asserts
+    /// that no cursor, opened with the instance's seal, names a held server
+    /// (`held-`) or version (7.7.7), and that the walk ends. Returns the
+    /// entries seen and the number of cursors.
+    async fn walk_cursors<F, Fut>(
+        env: &Env,
+        app: &Router,
+        first: &str,
+        mut between: F,
+    ) -> (Vec<String>, usize)
+    where
+        F: FnMut(Option<Uuid>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let seal = cursor_seal(&env.fx.state);
+        let mut seen = Vec::new();
+        let mut tail = first.to_string();
+        for cursors in 0..10 {
+            let (s, b, _) = env.get(app.clone(), &tail).await;
+            let b = json(&b);
+            assert_eq!(s, StatusCode::OK, "{tail}: {b}");
+            seen.extend(listed_names(&b));
+            let Some(c) = b["metadata"]["nextCursor"].as_str() else {
+                return (seen, cursors);
+            };
+            let parts = seal.open(env.fx.repo_id, c).unwrap();
+            assert!(
+                !parts
+                    .iter()
+                    .any(|p| p.contains("held") || p.contains("7.7.7")),
+                "{first}: the cursor names a held row: {parts:?}"
+            );
+            // The id of the row the cursor resumes after, if it names one.
+            let read = parts.get(3).and_then(|p| Uuid::parse_str(p).ok());
+            between(read).await;
+            tail = format!("{first}&cursor={c}");
+        }
+        panic!("{first}: the walk did not end");
+    }
+
+    const CURSOR_WALKS: [&str; 2] = ["/servers?limit=1", "/servers?version=latest&limit=1"];
+
+    /// #5453: a cursor never names a row the reader is not served, not even
+    /// sealed. More held servers than one request reads (the row bound and
+    /// the `latest` budget) sort before the one clean server; a `limit=1`
+    /// walk of the raw and the `latest` listing, anonymous and as an
+    /// authenticated outsider, reaches the clean server exactly once and
+    /// ends, and no cursor of either walk carries a held name or version.
+    #[tokio::test]
+    async fn listing_cursors_name_no_unserved_row() {
+        let n = (MAX_LISTING_ROWS.max(MAX_LATEST_BUDGET) + 1) as i32;
+        let Some(env) = cursor_fixture(&["com.acme/zz-clean"], n).await else {
+            return;
+        };
+        let reader = outsider(&env).await;
+        for (who, app) in [
+            ("anonymous", env.anon()),
+            ("outsider", as_caller(&env, &reader, super::router())),
+        ] {
+            for first in CURSOR_WALKS {
+                let (seen, cursors) = walk_cursors(&env, &app, first, |_| async {}).await;
+                assert!(cursors >= 1, "{who} {first}: the bound was not reached");
+                assert_eq!(seen, vec!["com.acme/zz-clean@1.0.0"], "{who} {first}");
+            }
+        }
+        env.teardown().await;
+    }
+
+    /// #5453: held rows at the end of the listing, more than one request
+    /// reads: the page after the clean server is the bounded one, its cursor
+    /// names no held row, and the walk ends on an empty last page.
+    #[tokio::test]
+    async fn listing_cursor_past_trailing_held_rows() {
+        let n = (MAX_LISTING_ROWS.max(MAX_LATEST_BUDGET) + 1) as i32;
+        let Some(env) = cursor_fixture(&["com.acme/aa-clean"], n).await else {
+            return;
+        };
+        for first in CURSOR_WALKS {
+            let (seen, cursors) = walk_cursors(&env, &env.anon(), first, |_| async {}).await;
+            assert!(cursors >= 1, "{first}: the bound was not reached");
+            assert_eq!(seen, vec!["com.acme/aa-clean@1.0.0"], "{first}");
+        }
+        env.teardown().await;
+    }
+
+    /// #5453: rows deleted inside the stretch a cursor skipped (soft-deleted,
+    /// and the row the cursor resumes after removed) move nothing: the walk
+    /// still returns every visible row after the stretch, once.
+    #[tokio::test]
+    async fn listing_cursor_survives_deletes_inside_the_stretch() {
+        let n = (MAX_LISTING_ROWS.max(MAX_LATEST_BUDGET) + 1) as i32;
+        let clean = ["com.acme/aa-first", "com.acme/zz-1", "com.acme/zz-2"];
+        let Some(env) = cursor_fixture(&clean, n).await else {
+            return;
+        };
+        let pool = env.fx.pool.clone();
+        let repo = env.fx.repo_id;
+        for first in CURSOR_WALKS {
+            let (seen, cursors) = walk_cursors(&env, &env.anon(), first, |read| {
+                let pool = pool.clone();
+                async move {
+                    // Soft-delete 100 held rows before the resume row, and
+                    // remove the resume row itself.
+                    sqlx::query(
+                        "UPDATE artifact_metadata SET metadata = \
+                         jsonb_set(metadata, '{registry,status}', '\"deleted\"') \
+                         WHERE artifact_id IN ( \
+                           SELECT a.id FROM artifacts a \
+                           JOIN artifact_metadata m ON m.artifact_id = a.id \
+                           WHERE a.repository_id = $1 AND a.name LIKE 'com.acme/held-%' \
+                             AND a.is_deleted = false \
+                             AND m.metadata->'registry'->>'status' IS DISTINCT FROM 'deleted' \
+                           ORDER BY a.name LIMIT 100)",
+                    )
+                    .bind(repo)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                    if let Some(id) = read {
+                        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+                            .bind(id)
+                            .execute(&pool)
+                            .await
+                            .unwrap();
+                    }
+                }
+            })
+            .await;
+            assert!(cursors >= 1, "{first}: the bound was not reached");
+            assert_eq!(
+                seen,
+                vec![
+                    "com.acme/aa-first@1.0.0",
+                    "com.acme/zz-1@1.0.0",
+                    "com.acme/zz-2@1.0.0"
+                ],
+                "{first}"
+            );
+            // Restore for the next walk.
+            sqlx::query(
+                "UPDATE artifact_metadata m SET \
+                 metadata = jsonb_set(m.metadata, '{registry,status}', '\"active\"') \
+                 FROM artifacts a WHERE a.id = m.artifact_id AND a.repository_id = $1 \
+                   AND a.name LIKE 'com.acme/held-%'",
+            )
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = false WHERE repository_id = $1 \
+                 AND name LIKE 'com.acme/held-%'",
+            )
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
         env.teardown().await;
     }
