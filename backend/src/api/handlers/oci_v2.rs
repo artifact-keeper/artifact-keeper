@@ -10512,31 +10512,6 @@ async fn handle_head_manifest(
     )
 }
 
-/// Record one download-statistics row for a local Docker/OCI manifest pull
-/// (#2260). The manifest's `artifacts` row is resolved by its content-addressed
-/// storage key, so a manifest addressable under both a tag-keyed and a
-/// digest-keyed path still counts once per GET. Best-effort: a lookup miss or a
-/// stats failure never affects the pull.
-/// Resolve the `artifacts` row for a local manifest by its content-addressed
-/// storage key. Shared by the download-stats and quarantine-gate paths so both
-/// agree on which row represents a manifest.
-async fn resolve_local_manifest_artifact_id(
-    state: &SharedState,
-    repo_id: Uuid,
-    manifest_digest: &str,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let manifest_key = manifest_storage_key(manifest_digest);
-    sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM artifacts \
-         WHERE repository_id = $1 AND storage_key = $2 AND is_deleted = false \
-         LIMIT 1",
-    )
-    .bind(repo_id)
-    .bind(&manifest_key)
-    .fetch_optional(&state.db)
-    .await
-}
-
 /// Quarantine gate for a Docker/OCI manifest pull (#2912).
 ///
 /// Container images are exactly what the image scanners raise findings on, so a
@@ -10544,6 +10519,12 @@ async fn resolve_local_manifest_artifact_id(
 /// manifest is what makes that stick: an OCI client must fetch the manifest
 /// before any layer, and blobs are content-addressed and shared across images, so
 /// they have no one-to-one `artifacts` row to gate.
+///
+/// The decision is the digest's, not one row's (#5457): every live alias of
+/// the manifest (its tag-path rows and its digest-path row,
+/// [`oci_manifests::alias_rows`](crate::services::oci_manifests::alias_rows))
+/// must pass, so rejecting any alias rejects the bytes under every reference,
+/// the same rows the MCP backing gate evaluates.
 ///
 /// Returns `Some(response)` when the pull must be refused. A lookup miss leaves
 /// the pull alone — remote/virtual pass-through manifests resolve no local row —
@@ -10553,10 +10534,11 @@ async fn oci_manifest_quarantine_block(
     repo_id: Uuid,
     manifest_digest: &str,
 ) -> Option<Response> {
-    let artifact_id =
-        match resolve_local_manifest_artifact_id(state, repo_id, manifest_digest).await {
-            Ok(Some(id)) => id,
-            Ok(None) => return None,
+    let aliases =
+        match crate::services::oci_manifests::alias_rows(&state.db, repo_id, &[manifest_digest])
+            .await
+        {
+            Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(
                     %repo_id,
@@ -10568,10 +10550,13 @@ async fn oci_manifest_quarantine_block(
             }
         };
 
-    match crate::services::quarantine_service::check_artifact_download(&state.db, artifact_id).await
-    {
+    let gate: Vec<_> = aliases
+        .iter()
+        .map(crate::services::oci_manifests::AliasRow::gate_row)
+        .collect();
+    match crate::services::quarantine_service::enforce_download_gate_rows(&state.db, &gate).await {
         Ok(()) => None,
-        Err(e) => {
+        Err((artifact_id, e)) => {
             // Mapped explicitly to the OCI error envelope rather than reusing the
             // REST response, which an OCI client cannot parse.
             // `check_download_allowed` returns `Conflict` for a quarantine hold and
@@ -13090,9 +13075,16 @@ where
     // are admitted blob by blob; the usage ledger excludes `oci-manifests/%`
     // rows (#4545, migration 288), so the row adds 0 (a push, a migration
     // import and a reindex all land here).
-    sqlx::query_scalar(
+    //
+    // #5457: a tag move rewrites this row in place. Its hold described the
+    // bytes the tag named, so the leading CTE carries it to their
+    // digest-path row and the update below clears it from the rewritten row
+    // (kept when the bytes are unchanged).
+    sqlx::query_scalar(concat!(
+        crate::services::oci_manifests::carry_moved_hold_cte!(),
         r#"INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key, uploaded_by, origin)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+           WHERE (SELECT COUNT(*) FROM carried) >= 0
            ON CONFLICT (repository_id, path) DO UPDATE SET
              version = EXCLUDED.version,
              size_bytes = EXCLUDED.size_bytes,
@@ -13100,10 +13092,18 @@ where
              content_type = EXCLUDED.content_type,
              storage_key = EXCLUDED.storage_key,
              uploaded_by = EXCLUDED.uploaded_by,
+             quarantine_status = CASE WHEN artifacts.checksum_sha256 = EXCLUDED.checksum_sha256
+                                      THEN artifacts.quarantine_status END,
+             quarantine_until = CASE WHEN artifacts.checksum_sha256 = EXCLUDED.checksum_sha256
+                                     THEN artifacts.quarantine_until END,
+             quarantine_reason = CASE WHEN artifacts.checksum_sha256 = EXCLUDED.checksum_sha256
+                                      THEN artifacts.quarantine_reason END,
+             quarantine_source = CASE WHEN artifacts.checksum_sha256 = EXCLUDED.checksum_sha256
+                                      THEN artifacts.quarantine_source END,
              is_deleted = false,
              updated_at = NOW()
            RETURNING id"#,
-    )
+    ))
     .bind(repo_id)
     .bind(artifact_path)
     .bind(artifact_name)
@@ -13114,6 +13114,8 @@ where
     .bind(storage_key)
     .bind(uploaded_by)
     .bind(origin)
+    // $11: the image name the carried digest-path row is written under.
+    .bind(image)
     .fetch_one(executor)
     .await
 }
@@ -41338,6 +41340,52 @@ mod proxy_scan_block_tests {
             "a refused pull is not counted as a download"
         );
         assert_eq!(hits, 1, "the refusals never reach upstream");
+    }
+
+    /// #5457: a Remote member's cache rows are aliases too. A pull by tag
+    /// writes a tag-keyed and a digest-keyed `artifacts` row; holding either
+    /// one refuses the manifest under both references, direct and through
+    /// the Virtual.
+    #[tokio::test]
+    async fn remote_cache_aliases_share_one_decision_5457() {
+        let Some(fx) = tdh::Fixture::setup("remote", "docker").await else {
+            return;
+        };
+        let (_upstream, state, (virt_id, virt_key), _manifest, digest) =
+            virtual_cold_rig(&fx, "1.0", "5457-remote-alias").await;
+        let cold = pull_manifest(&state, &fx.repo_key, "1.0").await.status();
+        let mut seen = Vec::new();
+        for (held, read) in [("1.0", digest.as_str()), (digest.as_str(), "1.0")] {
+            let rows = sqlx::query(
+                "UPDATE artifacts SET quarantine_status = CASE WHEN path = $2 THEN 'rejected' END \
+                 WHERE repository_id = $1 AND storage_key = $3",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("v2/app/manifests/{held}"))
+            .bind(manifest_storage_key(&digest))
+            .execute(&fx.pool)
+            .await
+            .expect("hold one alias")
+            .rows_affected();
+            seen.push((
+                rows,
+                pull_manifest(&state, &fx.repo_key, read).await.status(),
+                pull_manifest(&state, &virt_key, read).await.status(),
+            ));
+        }
+        cleanup_virtual(&fx.pool, virt_id).await;
+        fx.teardown().await;
+
+        assert_eq!(cold, StatusCode::OK, "precondition: cold pull");
+        assert_eq!(
+            seen,
+            vec![
+                (2, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+                (2, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            ],
+            "(alias rows, direct, Virtual): the tag row held refuses the digest, \
+             the digest row held refuses the tag"
+        );
     }
 
     /// #3712 / #3611: a manifest cached by a pull the scan gate REFUSED is

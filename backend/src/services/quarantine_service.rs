@@ -862,6 +862,72 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
     enforce_scan_policy_gate(db, artifact_id, repository_id).await
 }
 
+/// One row [`enforce_download_gate_rows`] decides, with the quarantine fields
+/// the caller's lookup already selected.
+#[derive(Debug, Clone, Copy)]
+pub struct GateRow<'a> {
+    pub artifact_id: Uuid,
+    /// The artifact's owning repository.
+    pub repository_id: Uuid,
+    pub quarantine_status: Option<&'a str>,
+    pub quarantine_until: Option<DateTime<Utc>>,
+}
+
+/// [`enforce_download_gate`] over several rows that hold the same bytes (the
+/// aliases of one OCI manifest digest, #5457): every row must pass, and the
+/// first refusal is returned with the row it came from. No rows passes, as an
+/// absent artifact does.
+///
+/// Same decision and order as the per-row gate, from the fields in hand: the
+/// quarantine half of every row first (no statement unless one is held), then
+/// the scan-policy half, evaluated only when an enabled policy applies to the
+/// row's repository (one statement per repository).
+pub async fn enforce_download_gate_rows(
+    db: &PgPool,
+    rows: &[GateRow<'_>],
+) -> std::result::Result<(), (Uuid, AppError)> {
+    let now = Utc::now();
+    for row in rows {
+        if let Err(e) = check_download_allowed(row.quarantine_status, row.quarantine_until, now) {
+            let e = refine_hold_refusal(db, row.artifact_id, row.repository_id, e).await;
+            return Err((row.artifact_id, e));
+        }
+    }
+    let mut applies: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
+    for row in rows {
+        let policy_applies = match applies.get(&row.repository_id) {
+            Some(v) => *v,
+            None => {
+                let v = scan_policy_applies(db, row.repository_id)
+                    .await
+                    .map_err(|e| (row.artifact_id, e))?;
+                applies.insert(row.repository_id, v);
+                v
+            }
+        };
+        if policy_applies {
+            enforce_scan_policy_gate(db, row.artifact_id, row.repository_id)
+                .await
+                .map_err(|e| (row.artifact_id, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether any enabled scan policy (repository-specific or global) applies to
+/// `repository_id`: the predicate `PolicyService::evaluate_artifact` loads its
+/// policies with.
+async fn scan_policy_applies(db: &PgPool, repository_id: Uuid) -> Result<bool> {
+    sqlx::query_scalar(SCAN_POLICY_APPLIES_SQL)
+        .bind(repository_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+}
+
+const SCAN_POLICY_APPLIES_SQL: &str = "SELECT EXISTS (SELECT 1 FROM scan_policies \
+      WHERE is_enabled AND (repository_id = $1 OR repository_id IS NULL))";
+
 /// Turn the quarantine 409 of an active hold into the scan-policy 403 when
 /// the hold is a scan-policy hold (#4510). Any other refusal is returned
 /// unchanged. Runs only for a refused (held) artifact, so the common
@@ -1113,14 +1179,7 @@ async fn listing_refusals_with(
     let policy_applies = match known {
         Some(v) => v,
         None => {
-            let v: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM scan_policies \
-                  WHERE is_enabled AND (repository_id = $1 OR repository_id IS NULL))",
-            )
-            .bind(repository_id)
-            .fetch_one(db)
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            let v = scan_policy_applies(db, repository_id).await?;
             presence.insert(repository_id, v).await;
             v
         }

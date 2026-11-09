@@ -13283,6 +13283,10 @@ pub async fn download_artifact(
     // covers the `?version=` historical-revision branch below — which serves
     // straight from content-addressed storage and never reaches
     // `ArtifactService::prepare_download`.
+    //
+    // #5457: an OCI manifest row (`v2/<name>/manifests/<ref>`) is gated with
+    // every alias of its digest, as the native pull is, so a rejected image
+    // is not downloadable here through a clean tag or digest alias.
     {
         if let Some(artifact_id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT id \
@@ -13295,8 +13299,12 @@ pub async fn download_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            crate::services::quarantine_service::enforce_download_gate(&state.db, artifact_id)
-                .await?;
+            crate::services::oci_manifests::enforce_path_download_gate(
+                &state.db,
+                artifact_id,
+                &path,
+            )
+            .await?;
         }
     }
 
