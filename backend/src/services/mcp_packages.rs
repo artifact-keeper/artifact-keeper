@@ -17,6 +17,7 @@ use crate::formats::mcp::{
     ServerJson, SubmittedRef,
 };
 use crate::models::repository::RepositoryFormat;
+use crate::services::mcp_virtual_serve::{serve_model, shadow_reason, HostedRow, ServeModel};
 use crate::storage::StorageLocation;
 
 /// `repository_config` keys of an MCP repository.
@@ -382,8 +383,9 @@ pub async fn load_settings(db: &PgPool, repo_id: Uuid) -> Result<McpSettings, Mc
     })
 }
 
-/// The repositories whose rows a backing repository serves: its virtual
-/// members for a Virtual, itself otherwise.
+/// The repositories whose rows a backing repository serves: for a Virtual
+/// its leaf members (nested Virtuals expanded) in the order its download
+/// walk tries them, itself otherwise.
 pub(crate) async fn content_repo_ids(
     db: &PgPool,
     repo: &BackingRepo,
@@ -391,19 +393,14 @@ pub(crate) async fn content_repo_ids(
     if !repo.is_virtual() {
         return Ok(vec![repo.id]);
     }
-    sqlx::query_scalar(
-        "SELECT member_repo_id FROM virtual_repo_members WHERE virtual_repo_id = $1 \
-         ORDER BY priority",
-    )
-    .bind(repo.id)
-    .fetch_all(db)
-    .await
-    .map_err(db_err)
+    crate::api::handlers::proxy_helpers::fetch_virtual_member_leaf_ids(db, repo.id)
+        .await
+        .map_err(|_| McpError::Internal("virtual member walk failed".into()))
 }
 
 /// The SQL predicate on `artifacts` that matches a package name as each
 /// format's publish path stores it (`$2` name, `$3` version).
-fn name_predicate(registry_type: &str) -> &'static str {
+pub(crate) fn name_predicate(registry_type: &str) -> &'static str {
     match registry_type {
         // PEP 503: compare normalised forms; `$2` arrives normalised.
         "pypi" => "lower(regexp_replace(a.name, '[-_.]+', '-', 'g')) = $2 AND a.version = $3",
@@ -646,37 +643,19 @@ async fn resolve_artifact_package(
         .version
         .as_deref()
         .ok_or(McpError::PackageVersionUnpinned { index })?;
-    let repo_ids = content_repo_ids(db, repo).await?;
-    // A Virtual serves the first member (by priority) holding the version,
-    // so its rows come first and the pinned digest is that member's.
-    let sql = format!(
-        "SELECT a.id, a.checksum_sha256, a.repository_id FROM artifacts a \
-         WHERE a.repository_id = ANY($1) AND a.is_deleted = false AND {} \
-         ORDER BY array_position($1, a.repository_id), a.path",
-        name_predicate(&pkg.registry_type)
-    );
-    let rows: Vec<(Uuid, String, Uuid)> = match lookup_version(&pkg.registry_type, version) {
-        Some(lookup) => sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(&repo_ids)
-            .bind(lookup_name(&pkg.registry_type, &pkg.identifier))
-            .bind(lookup)
-            .fetch_all(db)
-            .await
-            .map_err(db_err)?,
-        None => Vec::new(),
-    };
+    let rows = pinned_rows(db, index, pkg, repo, version).await?;
     if foreign {
         // Foreign coordinates (`open`) never stand for what a Remote of
         // another upstream holds: the winning row must be hosted, or in a
         // Remote whose upstream is the submitted registry.
         let untrusted = remotes_not_named_by(db, repo, pkg).await?;
-        if let Some((_, _, owner)) = rows.first() {
-            if untrusted.iter().any(|r| r.id == *owner) {
+        if let Some(first) = rows.first() {
+            if untrusted.iter().any(|r| r.id == first.repository_id) {
                 return Err(foreign_through_remote(index, pkg, repo));
             }
         }
     }
-    let Some((_, sha256, _)) = rows.first().cloned() else {
+    let Some(first) = rows.first() else {
         return Err(McpError::PackageNotFound {
             index,
             detail: format!(
@@ -689,6 +668,7 @@ async fn resolve_artifact_package(
             ),
         });
     };
+    let sha256 = first.checksum.clone();
     Ok(PackagePin {
         index,
         registry_type: pkg.registry_type.clone(),
@@ -699,7 +679,8 @@ async fn resolve_artifact_package(
         resolved: ResolvedPin {
             repository: repo.key.clone(),
             repository_id: repo.id,
-            artifact_ids: rows.iter().map(|(id, ..)| *id).collect(),
+            artifact_ids: rows.iter().map(|r| r.id).collect(),
+            artifact_sha256s: rows.iter().map(|r| r.checksum.clone()).collect(),
             sha256: Some(sha256),
             name: None,
             tag: None,
@@ -714,6 +695,95 @@ async fn resolve_artifact_package(
         },
         drift: None,
     })
+}
+
+/// The rows a pin of `pkg` (npm, PyPI, NuGet, Cargo) at `version` covers:
+/// for a Virtual, the rows of the member its download walk serves the
+/// version from (PyPI: every hosted file of the version), refusing a
+/// coordinate a Remote member would serve instead (#5456); for any other
+/// repository its own rows (PyPI: every file of the version).
+async fn pinned_rows(
+    db: &PgPool,
+    index: usize,
+    pkg: &mcp::Package,
+    repo: &BackingRepo,
+    version: &str,
+) -> Result<Vec<HostedRow>, McpError> {
+    use crate::services::mcp_virtual_serve::{serve_model, Winner};
+    if !repo.is_virtual() {
+        return own_rows(db, repo, &pkg.registry_type, &pkg.identifier, version).await;
+    }
+    let model = serve_model(db, repo.id, &pkg.registry_type, &pkg.identifier, version).await?;
+    let shadowed = |remote: &str| McpError::PackageShadowed {
+        index,
+        detail: shadowed_detail(pkg, version, repo, remote, model.first_holder.as_deref()),
+    };
+    if pkg.registry_type == "pypi" {
+        if model.files.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some((_, remote)) = model.remotes.first() {
+            return Err(shadowed(remote));
+        }
+        return Ok(model.files);
+    }
+    match model.winner {
+        Some(Winner::Hosted { rows, .. }) => Ok(rows),
+        // Nothing hosted: a Remote member may still fill it (the resolver).
+        Some(Winner::Remote { .. }) | None if model.first_holder.is_none() => Ok(Vec::new()),
+        Some(Winner::Remote { key, .. }) => Err(shadowed(&key)),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The refusal of a coordinate a Remote member of Virtual `repo` would
+/// serve in place of the hosted member that holds it: names both members
+/// and the fixes.
+fn shadowed_detail(
+    pkg: &mcp::Package,
+    version: &str,
+    repo: &BackingRepo,
+    remote: &str,
+    holder: Option<&str>,
+) -> String {
+    let coordinate = format!("{} {}@{version}", pkg.registry_type, pkg.identifier);
+    let holder = holder.unwrap_or("the hosted member");
+    if pkg.registry_type == "pypi" {
+        return format!(
+            "{coordinate} is in '{holder}', but Remote member '{remote}' of repository '{}' can \
+             serve other distributions of it from its upstream; map '{holder}' directly",
+            repo.key
+        );
+    }
+    let isolate = if pkg.registry_type == "npm" {
+        ", enable isolate mode on the Virtual"
+    } else {
+        ""
+    };
+    format!(
+        "Remote member '{remote}' outranks '{holder}' for {coordinate} in repository '{}', so a \
+         download would come from its upstream; rank '{holder}' above '{remote}'{isolate}, or map \
+         '{holder}' directly",
+        repo.key
+    )
+}
+
+/// The rows of a coordinate in a repository that is not a Virtual.
+async fn own_rows(
+    db: &PgPool,
+    repo: &BackingRepo,
+    registry_type: &str,
+    identifier: &str,
+    version: &str,
+) -> Result<Vec<HostedRow>, McpError> {
+    crate::services::mcp_virtual_serve::repo_rows(
+        db,
+        &[repo.id],
+        registry_type,
+        identifier,
+        version,
+    )
+    .await
 }
 
 /// Hosts that all name Docker Hub.
@@ -1032,6 +1102,7 @@ async fn resolve_oci_package(
             repository: repo.key.clone(),
             repository_id: found.repo_id,
             artifact_ids,
+            artifact_sha256s: Vec::new(),
             sha256: None,
             name: Some(found.name),
             tag: r.tag.clone(),
@@ -1323,7 +1394,10 @@ const GATE_ROW_COLUMNS: &str = "id, repository_id, checksum_sha256::text, create
 /// time of a read; the digest-path row [`hold_oci_pin`] writes keeps the
 /// pinned bytes addressable. A pin with no live row cannot be gated and is
 /// unresolvable.
-async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::Error> {
+async fn gate_rows(
+    db: impl sqlx::PgExecutor<'_>,
+    pin: &PackagePin,
+) -> Result<Vec<GateRow>, sqlx::Error> {
     if let Some(path) = pin.resolved.cache_path.as_deref() {
         // A cache pin is present while the Remote still caches the pinned
         // bytes at its path; a refresh to other bytes (or an eviction) makes
@@ -1372,7 +1446,217 @@ async fn gate_rows(db: &PgPool, pin: &PackagePin) -> Result<Vec<GateRow>, sqlx::
         .fetch_all(db)
         .await?
     };
-    Ok(rows.into_iter().map(gate_row).collect())
+    Ok(rows
+        .into_iter()
+        .map(gate_row)
+        .filter(|row| row_bytes_pinned(pin, row))
+        .collect())
+}
+
+/// Whether an `artifacts` row still holds the bytes pinned for it: its
+/// checksum is the one recorded at publish (`artifact_sha256s`, or the
+/// pin's `sha256` for an older single-row pin). A row rewritten in place no
+/// longer counts as the pinned row.
+fn row_bytes_pinned(pin: &PackagePin, row: &GateRow) -> bool {
+    let r = &pin.resolved;
+    let expected = match r.artifact_ids.iter().position(|id| *id == row.id) {
+        Some(i) if !r.artifact_sha256s.is_empty() => r.artifact_sha256s.get(i),
+        Some(_) if r.artifact_ids.len() == 1 => r.sha256.as_ref(),
+        _ => None,
+    };
+    expected.is_none_or(|sha| sha.eq_ignore_ascii_case(&row.checksum))
+}
+
+/// Per-evaluation memo of the mapped repositories and Virtual serve models
+/// the shadowing check reads (#5456), so a listing batch reads each
+/// Virtual's member walk once per coordinate.
+#[derive(Default)]
+pub(crate) struct ShadowCache {
+    repos: HashMap<String, Option<BackingRepo>>,
+    models: HashMap<(Uuid, String, String, String), ServeModel>,
+}
+
+/// Whether the advertised URL of an npm, PyPI, NuGet or Cargo pin no longer
+/// delivers the pinned rows (#5456).
+///
+/// These pins are served as `registryBaseUrl` = the mapped repository, so a
+/// client following the approved document downloads whatever that
+/// repository's route serves for the coordinate. For a Virtual that is the
+/// member its download walk picks ([`serve_model`]): once that is not the
+/// pinned member (a higher-ranked hosted member holds the version, a Remote
+/// member the format's guard does not withhold outranks it, the pinned
+/// member left), the gate would be evaluating rows the client never gets,
+/// so the version is held instead. For PyPI every hosted file of the version
+/// is part of the pin, in a Virtual or not: a file that is not pinned (or a
+/// pinned one that is gone) holds it, and so does any Remote member with an
+/// upstream. The pin never moves; the version serves again once the route
+/// serves the pinned rows again, or a new server version pins what it
+/// serves now.
+///
+/// OCI pins are digest-addressed and MCPB bundles are served from their own
+/// route, so neither is affected.
+async fn pin_shadowed(
+    db: &PgPool,
+    cache: &mut ShadowCache,
+    pin: &PackagePin,
+    rows: &[GateRow],
+) -> Result<bool, McpError> {
+    let r = &pin.resolved;
+    let Some(version) = pin.submitted.version.as_deref() else {
+        return Ok(false);
+    };
+    if matches!(pin.registry_type.as_str(), "oci" | "mcpb") {
+        return Ok(false);
+    }
+    // The repository the advertised URL names, looked up as the URL is: by
+    // key.
+    if !cache.repos.contains_key(&r.repository) {
+        let found = repos_by_key(db, std::slice::from_ref(&r.repository))
+            .await?
+            .into_iter()
+            .next();
+        cache.repos.insert(r.repository.clone(), found);
+    }
+    let Some(mapped) = cache.repos[&r.repository].clone() else {
+        return Ok(true);
+    };
+    let cached = rows.iter().any(|row| row.cached);
+    // The key now names another repository than the one pinned through. A
+    // cache pin records its Remote's id: through a Virtual the serve model
+    // decides whether that Remote still serves; any other repository must be
+    // the pinned one itself.
+    if mapped.id != r.repository_id && (!cached || !mapped.is_virtual()) {
+        return Ok(true);
+    }
+    let live: Vec<HostedRow> = rows
+        .iter()
+        .filter(|row| !row.cached)
+        .map(|row| HostedRow {
+            id: row.id,
+            repository_id: row.repository_id,
+            checksum: row.checksum.clone(),
+        })
+        .collect();
+    let memo = (
+        mapped.id,
+        pin.registry_type.clone(),
+        pin.submitted.identifier.clone(),
+        version.to_string(),
+    );
+    if !cache.models.contains_key(&memo) {
+        let model = if mapped.is_virtual() {
+            serve_model(
+                db,
+                mapped.id,
+                &pin.registry_type,
+                &pin.submitted.identifier,
+                version,
+            )
+            .await?
+        } else if pin.registry_type == "pypi" {
+            ServeModel {
+                files: own_rows(db, &mapped, "pypi", &pin.submitted.identifier, version).await?,
+                ..ServeModel::default()
+            }
+        } else {
+            return Ok(false);
+        };
+        cache.models.insert(memo.clone(), model);
+    }
+    Ok(shadow_reason(&cache.models[&memo], pin, &live, cached).is_some())
+}
+
+/// Refuse a cache pin (a package a Remote member of `repo` has in its proxy
+/// cache) that the Virtual `repo` would not serve from that Remote (#5456).
+pub(crate) async fn refuse_shadowed_cache_pin(
+    db: &PgPool,
+    repo: &BackingRepo,
+    pin: &PackagePin,
+) -> Result<(), McpError> {
+    if !repo.is_virtual() {
+        return Ok(());
+    }
+    let version = pin.submitted.version.as_deref().unwrap_or_default();
+    let model = serve_model(
+        db,
+        repo.id,
+        &pin.registry_type,
+        &pin.submitted.identifier,
+        version,
+    )
+    .await?;
+    match shadow_reason(&model, pin, &[], true) {
+        None => Ok(()),
+        Some(reason) => Err(McpError::PackageShadowed {
+            index: pin.index,
+            detail: format!(
+                "{} is in a Remote member's proxy cache, but {reason} through repository '{}'; \
+                 map the member that holds it directly",
+                pin.label(),
+                repo.key
+            ),
+        }),
+    }
+}
+
+/// The first package of `stored` whose pinned bytes are no longer cleared
+/// for use, read on `conn` (the transaction that commits an introspection
+/// result, #5463): a package with no pin, a pin with no live row, a cache
+/// pin under its hold, or a pinned `artifacts` row that is quarantined,
+/// rejected or deleted. Those rows are locked `FOR SHARE`, so a quarantine,
+/// rejection or deletion of a backing package either is seen here or waits
+/// for the caller's commit. This is the quarantine half of
+/// [`backing_gate`] only: the scan-policy, Remote and OCI-presence gates
+/// stay with the full serve gate, which the caller evaluates beforehand
+/// (#5533 tracks evaluating the whole gate on the transaction).
+pub async fn held_backing_package(
+    conn: &mut sqlx::PgConnection,
+    stored: &mcp::StoredVersion,
+) -> Result<Option<String>, sqlx::Error> {
+    if let Some(package) = stored.unpinned_package() {
+        return Ok(Some(package));
+    }
+    let mut pins = Vec::new();
+    for pin in &stored.pins {
+        pins.push((pin, gate_rows(&mut *conn, pin).await?));
+    }
+    // Every pinned row of every pin locked in one statement, in id order, so
+    // two completions never take them in opposite orders.
+    let mut ids: Vec<Uuid> = pins
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().filter(|r| !r.cached).map(|r| r.id))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let locked: HashMap<Uuid, (Option<String>, Option<DateTime<Utc>>)> =
+        sqlx::query_as::<_, (Uuid, Option<String>, Option<DateTime<Utc>>)>(
+            "SELECT id, quarantine_status, quarantine_until FROM artifacts \
+         WHERE id = ANY($1) AND is_deleted = false ORDER BY id FOR SHARE",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|(id, status, until)| (id, (status, until)))
+        .collect();
+    let now = Utc::now();
+    let cleared = |r: &GateRow| {
+        if r.cached {
+            return !r.cache_held(now);
+        }
+        locked.get(&r.id).is_some_and(|(status, until)| {
+            crate::services::quarantine_service::check_download_allowed(
+                status.as_deref(),
+                *until,
+                now,
+            )
+            .is_ok()
+        })
+    };
+    Ok(pins
+        .iter()
+        .find(|(_, rows)| rows.is_empty() || !rows.iter().all(cleared))
+        .map(|(pin, _)| pin.label()))
 }
 
 /// Whether the pinned OCI manifest still exists in its repository.
@@ -1707,7 +1991,12 @@ async fn remote_gates(
 /// manifest's presence, then the download gate (quarantine, then scan
 /// policy) of every row carrying the pinned bytes, then the Remote gates
 /// (stored proxy verdict, age gate).
-async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin) -> GateOutcome {
+async fn backing_gate(
+    ctx: GateCtx<'_>,
+    cache: &mut FactsCache,
+    shadows: &mut ShadowCache,
+    pin: &PackagePin,
+) -> GateOutcome {
     if pin.registry_type == "oci" {
         match oci_pin_present(ctx.db, pin).await {
             Ok(true) => {}
@@ -1721,6 +2010,11 @@ async fn backing_gate(ctx: GateCtx<'_>, cache: &mut FactsCache, pin: &PackagePin
     };
     if rows.is_empty() {
         return GateOutcome::Unresolvable;
+    }
+    match pin_shadowed(ctx.db, shadows, pin, &rows).await {
+        Ok(false) => {}
+        Ok(true) => return GateOutcome::Shadowed,
+        Err(_) => return GateOutcome::Unavailable,
     }
     let now = Utc::now();
     for row in &rows {
@@ -1757,10 +2051,11 @@ pub async fn backing_gates(ctx: GateCtx<'_>, stored: &mcp::StoredVersion) -> Vec
         });
     }
     let mut cache = FactsCache::new();
+    let mut shadows = ShadowCache::default();
     for pin in &stored.pins {
         gates.push(BackingGate {
             package: pin.label(),
-            outcome: backing_gate(ctx, &mut cache, pin).await,
+            outcome: backing_gate(ctx, &mut cache, &mut shadows, pin).await,
         });
     }
     gates
@@ -1855,6 +2150,7 @@ async fn listing_refusals_inner(
     }
 
     let mut cache = FactsCache::new();
+    let mut shadows = ShadowCache::default();
     for row in rows {
         if refused.contains(&row.artifact_id) {
             continue;
@@ -1869,6 +2165,11 @@ async fn listing_refusals_inner(
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             blocked = found.is_empty() || found.iter().any(|r| backing_refused.contains(&r.id));
+            if !blocked {
+                blocked = pin_shadowed(db, &mut shadows, pin, found)
+                    .await
+                    .map_err(|_| ())?;
+            }
             if !blocked && pin.registry_type == "oci" {
                 blocked = !oci_pin_present(db, pin).await.map_err(|_| ())?;
             }
@@ -2312,6 +2613,7 @@ mod tests {
                 repository: repo.key.clone(),
                 repository_id: repo.id,
                 artifact_ids: Vec::new(),
+                artifact_sha256s: Vec::new(),
                 sha256: Some("cd".repeat(32)),
                 name: None,
                 tag: None,

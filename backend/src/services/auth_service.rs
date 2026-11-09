@@ -3197,6 +3197,18 @@ impl AuthService {
         })
     }
 
+    /// The `token_prefix` lookup key of an API token: its first 8 bytes.
+    ///
+    /// `None` when the token is shorter than 8 bytes, or when byte 8 falls
+    /// inside a multibyte character (#5525). Such a token cannot match any
+    /// stored prefix, which is always 8 ASCII hex digits, so callers treat
+    /// `None` like any other malformed token. Slicing with `&token[..8]`
+    /// instead panicked on a Basic password such as `1234567é`, and that
+    /// panic dropped the connection.
+    pub fn api_token_prefix(token: &str) -> Option<&str> {
+        token.get(..8)
+    }
+
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
         // Hash the raw token before using it as cache key so plaintext tokens
@@ -3240,13 +3252,12 @@ impl AuthService {
         // API tokens have format: prefix_secret
         // We store hash of full token and prefix for lookup
         let dummy = Self::dummy_bcrypt_hash();
-        if token.len() < 8 {
-            // Still must burn bcrypt time to avoid leaking token length info
+        let Some(prefix) = Self::api_token_prefix(token) else {
+            // Too short, or byte 8 is not a char boundary (#5525). Still
+            // must burn bcrypt time to avoid leaking token length info.
             let _ = Self::verify_password(token, dummy).await;
             return Err(AppError::Authentication("Invalid API token".to_string()));
-        }
-
-        let prefix = &token[..8];
+        };
 
         // Find token by prefix (includes revoked_at and last_used_at for
         // revocation check and debounced usage tracking).
@@ -4286,6 +4297,59 @@ fn check_token_validation_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // API-token prefix on a multibyte credential (#5525)
+    // -----------------------------------------------------------------------
+
+    /// `x:1234567é` as a Basic password lands the `é` across byte 8. The
+    /// prefix lookup must answer `None` there, not panic, and must still be
+    /// the plain first 8 bytes for every real token.
+    #[test]
+    fn api_token_prefix_refuses_a_non_boundary_byte_8_5525() {
+        // The issue's credential: 7 ASCII bytes then a two-byte `é`.
+        assert_eq!(AuthService::api_token_prefix("1234567é"), None);
+        // Longer password with the same boundary problem.
+        assert_eq!(AuthService::api_token_prefix("1234567éabcdef"), None);
+        // Too short.
+        assert_eq!(AuthService::api_token_prefix("1234567"), None);
+        assert_eq!(AuthService::api_token_prefix(""), None);
+        // Multibyte before the boundary is fine: byte 8 is a boundary.
+        assert_eq!(AuthService::api_token_prefix("123456é9"), Some("123456é"));
+        // A real token: `<8 hex>_<32 hex>`.
+        let token = format!("0123abcd_{}", "f".repeat(32));
+        assert_eq!(AuthService::api_token_prefix(&token), Some("0123abcd"));
+    }
+
+    /// The real path: the credential from #5485 finding 2 used to panic in
+    /// `validate_api_token` before any lookup; it is now a plain 401.
+    #[tokio::test]
+    async fn validate_api_token_rejects_a_multibyte_credential_5525() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let err = svc
+            .validate_api_token("1234567é")
+            .await
+            .expect_err("a non-boundary credential is refused, not a panic");
+        assert!(
+            matches!(err, AppError::Authentication(_)),
+            "expected Authentication, got {err:?}"
+        );
+
+        let token_svc = crate::services::token_service::TokenService::new(
+            pool,
+            Arc::new(Config::test_config()),
+        );
+        let validation = token_svc.validate_token("1234567é").await;
+        assert!(!validation.is_valid);
+        let err = token_svc
+            .has_scope("1234567é", "read")
+            .await
+            .expect_err("has_scope refuses the same credential");
+        assert!(matches!(err, AppError::Authentication(_)), "{err:?}");
+    }
 
     // -----------------------------------------------------------------------
     // last_login_at write throttling (#2107)

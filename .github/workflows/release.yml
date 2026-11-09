@@ -755,18 +755,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: artifact-keeper-linux-amd64
+            features: vendored-openssl,jemalloc
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             name: artifact-keeper-linux-arm64
+            features: vendored-openssl,jemalloc
           - target: x86_64-apple-darwin
             os: macos-latest
             name: artifact-keeper-darwin-amd64
+            features: vendored-openssl
           - target: aarch64-apple-darwin
             os: macos-latest
             name: artifact-keeper-darwin-arm64
+            features: vendored-openssl
           - target: x86_64-pc-windows-gnu
             os: ubuntu-latest
             name: artifact-keeper-windows-amd64
+            features: vendored-openssl
 
     steps:
       - name: Checkout
@@ -834,6 +839,16 @@ jobs:
           mv Cargo.toml.tmp Cargo.toml
           head -5 Cargo.toml
 
+      # jemalloc fixes its page size at compile time. The aarch64 Linux leg is
+      # cross-compiled on a 4 KiB-page x86_64 runner, so build it for 64 KiB
+      # pages; the resulting binary then starts on both 4 KiB and 64 KiB-page
+      # kernels (#5130). This has to match the Dockerfile's arm64 build.
+      - name: Build jemalloc for 64 KiB pages on arm64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
       - name: Build
         env:
           SQLX_OFFLINE: true
@@ -859,7 +874,7 @@ jobs:
         # that `cargo audit bin` read a complete graph out of. cargo-auditable's
         # own CI covers native macOS and an ELF cross with a GCC cross-toolchain
         # (i686), which is the shape of the aarch64-unknown-linux-gnu leg.
-        run: cargo auditable build --release --target ${{ matrix.target }} --features vendored-openssl
+        run: cargo auditable build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
 
       - name: Package binary (Unix)
         if: "!contains(matrix.target, 'windows')"
@@ -895,9 +910,11 @@ jobs:
       # platform-filtered, so all five targets genuinely differ. Measured on
       # this tree at 1.8.1 with cargo-cyclonedx 0.5.9 -- linux-amd64 724,
       # linux-arm64 720, darwin-amd64 733, darwin-arm64 729, windows-amd64 744
-      # components. `--features vendored-openssl` matches the build above for
-      # the same reason: it pulls in openssl-src, which would otherwise be
-      # missing from the SBOM of a binary that contains it.
+      # components. `--features ${{ matrix.features }}` matches the build above
+      # for the same reason: it pulls in openssl-src and jemalloc, which would
+      # otherwise be missing from the SBOM of a binary that contains them. The
+      # Linux counts are higher than the 1.8.1 measurement above because the
+      # Linux legs have built with jemalloc since #5130.
       - name: Generate CycloneDX SBOM
         run: |
           set -euo pipefail
@@ -906,7 +923,7 @@ jobs:
             --spec-version 1.5 \
             --all \
             --target ${{ matrix.target }} \
-            --features vendored-openssl \
+            --features ${{ matrix.features }} \
             --override-filename "${{ matrix.name }}"
           mkdir -p dist
           # cargo-cyclonedx writes beside the CRATE manifest (backend/), not the

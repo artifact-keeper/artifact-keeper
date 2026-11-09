@@ -34,7 +34,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api::extractors::RequestBaseUrl;
-use crate::api::handlers::mcp::{self as surface, problem, server_name};
+use crate::api::handlers::mcp::{self as surface, problem, server_name, Servability};
 use crate::api::handlers::proxy_helpers::RepoInfo;
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
@@ -50,7 +50,7 @@ pub const INTROSPECT_SCOPE: &str = "mcp:introspect";
 pub const INGEST_MAX_DEPTH: usize = 64;
 /// Default and maximum number of snapshot summaries listed.
 pub const DEFAULT_HISTORY: i64 = 50;
-pub const MAX_HISTORY: i64 = 200;
+pub const MAX_HISTORY: i64 = caps::HISTORY_WINDOW;
 /// The spec caveat every capability response carries.
 pub const NOTICE: &str = "Capability lists are untrusted. Tools may vary by the authorization \
      presented, annotations are server-asserted, and a declared list is a claim, not an \
@@ -356,10 +356,11 @@ pub fn parse_report(body: &[u8], now: DateTime<Utc>) -> Result<Report, Response>
             let t = DateTime::parse_from_rfc3339(&s)
                 .map_err(|_| bad_request("observedAt", "must be an RFC 3339 timestamp"))?
                 .with_timezone(&Utc);
-            if t > now + chrono::Duration::minutes(5) {
+            if t > now + chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS) {
                 return Err(bad_request("observedAt", "is in the future"));
             }
-            t
+            // Skew is tolerated, never ranked above arrival (#5464).
+            t.min(now)
         }
     };
     let auth_state = match opt_string(o, "authState", 32)? {
@@ -784,6 +785,7 @@ pub fn job_limits(kind: JobKind) -> Value {
         (status = 400, description = "Malformed request"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not an `mcp:introspect` API token (`mcp_forbidden`)"),
+        (status = 503, description = "`mcp_gate_unavailable`: nothing servable was found and a candidate's gates could not be evaluated; it is back in the queue"),
     )
 )]
 async fn claim_job(
@@ -796,56 +798,82 @@ async fn claim_job(
     // (#5460): a token restricted to repository A never claims B's job.
     let scope = require_introspector(auth)?.access_scope();
     let (kinds, worker) = parse_claim(&body)?;
-    // A job that cannot run any more is cancelled and the next one tried.
+    // A job that cannot run any more is cancelled, one whose gates cannot be
+    // evaluated now is released to the queue, and the next one tried. Only
+    // when nothing servable was found and a gate was unavailable is the
+    // answer `503` rather than `204`.
+    let mut unavailable = false;
     for _ in 0..10 {
         let Some(claim) = jobs::claim(&state.db, &kinds, &worker, &scope)
             .await
             .map_err(app_error)?
         else {
-            return Ok(StatusCode::NO_CONTENT.into_response());
+            break;
         };
         match claim_payload(&state, &claim, base.as_str()).await? {
             Ok(payload) => return Ok(json_resp(StatusCode::OK, &payload)),
-            Err(reason) => {
+            Err(Unclaimable::Cancel(reason)) => {
                 jobs::cancel(&state.db, &claim.job, &reason)
                     .await
                     .map_err(app_error)?;
             }
+            Err(Unclaimable::GateUnavailable) => {
+                jobs::release(&state.db, &claim.job, "serve gate unavailable")
+                    .await
+                    .map_err(app_error)?;
+                unavailable = true;
+            }
         }
     }
+    if unavailable {
+        return Err(gate_unavailable());
+    }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Why a claimed job is not handed to the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unclaimable {
+    /// It cannot run any more: cancelled with this reason.
+    Cancel(String),
+    /// Its gates could not be evaluated: released to the queue.
+    GateUnavailable,
 }
 
 async fn claim_payload(
     state: &SharedState,
     claim: &jobs::Claim,
     base: &str,
-) -> Result<Result<Value, String>, Response> {
+) -> Result<Result<Value, Unclaimable>, Response> {
     let job = &claim.job;
+    let cancel = |reason: &str| Ok(Err(Unclaimable::Cancel(reason.into())));
     let Some(kind) = job.kind() else {
-        return Ok(Err("unknown job kind".into()));
+        return cancel("unknown job kind");
     };
     let Some(v) = caps::version_ref(&state.db, job.artifact_id)
         .await
         .map_err(internal)?
     else {
-        return Ok(Err("server version deleted".into()));
+        return cancel("server version deleted");
     };
     let Some(stored) = fmt::StoredVersion::from_metadata(&v.metadata) else {
-        return Ok(Err("unreadable server version".into()));
+        return cancel("unreadable server version");
     };
     let repo = surface::mcp_repo(&state.db, &v.repository_key).await?;
     // Only a version whose gates pass is ever introspected: a sandbox run
     // executes exactly the bytes AK scanned, and a remote probe contacts a
     // held, blocked or unapproved version's endpoints no more than a reader
-    // could.
-    if !surface::artifact_servable(state, &repo, v.artifact_id, base).await {
-        return Ok(Err("server version is held".into()));
+    // could. A gate that cannot be evaluated is no hold: the caller hands
+    // the claim back to the queue, never cancels it.
+    match surface::artifact_servability(state, &repo, v.artifact_id, base).await {
+        Servability::Servable => {}
+        Servability::Held => return cancel("server version is held"),
+        Servability::Unavailable => return Ok(Err(Unclaimable::GateUnavailable)),
     }
     let served = fmt::rewrite_packages_for_serve(&stored.server, &stored.pins, base);
     let target = match jobs::job_target(kind, &job.target_key, &stored, &served) {
         Ok(t) => t,
-        Err(_) => return Ok(Err("target no longer eligible".into())),
+        Err(_) => return cancel("target no longer eligible"),
     };
     Ok(Ok(json!({
         "jobId": job.id,
@@ -871,17 +899,19 @@ async fn claim_payload(
     params(("id" = Uuid, Path, description = "Job id")),
     request_body(content = Object, description = "The worker's result: claimToken, outcome, the lists on success"),
     responses(
-        (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, drift}` or `{status: \"retry\", notBefore}`"),
-        (status = 400, description = "Malformed result"),
+        (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, current, drift}` (`current`: whether the stored snapshot is the version's current view now) or `{status: \"retry\", notBefore}`"),
+        (status = 400, description = "Malformed result, or an `observedAt` outside the claim's window"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not an `mcp:introspect` API token, or the token is not scoped to the job's repository (`mcp_forbidden`)"),
-        (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim"),
+        (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim, or its lease expired; `mcp_target_ineligible`: the server version or a backing package stopped being eligible after the claim, and the job was cancelled"),
+        (status = 503, description = "`mcp_gate_unavailable`: the server version's gates could not be evaluated; nothing was stored and the claim is unchanged"),
     )
 )]
 async fn complete_job(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path(id): Path<Uuid>,
+    base: RequestBaseUrl,
     body: Bytes,
 ) -> HandlerResult {
     let scope = require_introspector(auth)?.access_scope();
@@ -907,20 +937,32 @@ async fn complete_job(
         .filter(|j| jobs::token_matches(j, &result.claim_token))
         .ok_or_else(claim_invalid)?;
     let parsed = jobs::parse_result(&result).map_err(|e| bad_request(&e.path, &e.message))?;
+    // The full serve gate a claim passes, evaluated again now (#5463); the
+    // version's and its backing packages' holds are re-read under lock in
+    // the transaction as well.
+    let servable = match version_servable(&state, job.artifact_id, base.as_str()).await? {
+        Servability::Servable => true,
+        Servability::Held => false,
+        // No verdict is no hold: the claim stays for the worker to retry or
+        // the reaper to return.
+        Servability::Unavailable => return Err(gate_unavailable()),
+    };
     // The claim token proves only the claim; the repository scope is
     // re-checked against the job's repository inside the transaction that
     // ends the claim (#5460).
-    let out = match jobs::complete(&state.db, &job, &result, parsed, &scope)
+    let out = match jobs::complete(&state.db, &job, &result, parsed, &scope, servable)
         .await
         .map_err(app_error)?
     {
         jobs::Completed::Stored {
             snapshot,
             drift_scan,
+            current,
         } => json!({
             "status": "stored",
             "snapshotId": snapshot.id,
             "contentHash": snapshot.content_hash,
+            "current": current,
             "drift": drift_scan.map(|scan_id| json!({"scanId": scan_id})),
         }),
         jobs::Completed::Retry { not_before } => json!({
@@ -933,8 +975,48 @@ async fn complete_job(
         // The token's scope does not cover the job's repository:
         // nothing was stored and the claim is unchanged (#5460).
         jobs::Completed::Forbidden => return Err(out_of_scope()),
+        // The target stopped being eligible after the claim: nothing was
+        // stored and the job is cancelled (#5463).
+        jobs::Completed::Ineligible { reason } => {
+            return Err(problem(
+                409,
+                "mcp_target_ineligible",
+                "This job's server version is no longer eligible for introspection; the job was cancelled",
+                json!({"reason": reason}),
+            ))
+        }
+        jobs::Completed::Invalid(e) => return Err(bad_request(&e.path, &e.message)),
     };
     Ok(json_resp(StatusCode::OK, &out))
+}
+
+/// The serve gate a claim passes ([`claim_payload`]) for the server version
+/// `artifact_id` now: a deleted version is [`Servability::Held`]. A
+/// repository that vanished since the claim answers its own `404` from
+/// `mcp_repo`, leaving the claim for the reaper.
+async fn version_servable(
+    state: &SharedState,
+    artifact_id: Uuid,
+    base: &str,
+) -> Result<Servability, Response> {
+    let Some(v) = caps::version_ref(&state.db, artifact_id)
+        .await
+        .map_err(internal)?
+    else {
+        return Ok(Servability::Held);
+    };
+    let repo = surface::mcp_repo(&state.db, &v.repository_key).await?;
+    Ok(surface::artifact_servability(state, &repo, artifact_id, base).await)
+}
+
+/// `503 mcp_gate_unavailable`: a gate could not be evaluated.
+fn gate_unavailable() -> Response {
+    problem(
+        503,
+        "mcp_gate_unavailable",
+        "The registry could not evaluate this server version's gates; retry later",
+        json!({}),
+    )
 }
 
 #[cfg(ak_test_shard = "handlers-1")]
@@ -1166,15 +1248,27 @@ mod db_tests {
             )
         }
         async fn publish(&self, version: &str) {
+            self.publish_doc(doc(version, json!({"tools": [{"name": "get_weather"}]})))
+                .await;
+        }
+        async fn publish_doc(&self, doc: Value) {
             let publish = format!("/{}/v0.1/publish", self.fx.repo_key);
-            let (s, b) = call(
-                self.admin(),
-                "POST",
-                &publish,
-                Some(doc(version, json!({"tools": [{"name": "get_weather"}]}))),
-            )
-            .await;
+            let (s, b) = call(self.admin(), "POST", &publish, Some(doc)).await;
             assert_eq!(s, StatusCode::OK, "{b}");
+        }
+        fn introspector(&self) -> Router {
+            self.worker(Some(vec![INTROSPECT_SCOPE.into()]))
+        }
+        /// `POST /jobs/{job}/complete` as the introspector.
+        async fn complete(&self, job: Uuid, result: Value) -> (StatusCode, Value) {
+            let uri = format!("/jobs/{job}/complete");
+            call(self.introspector(), "POST", &uri, Some(result)).await
+        }
+        /// The current view of version 1.0.0, as a reader sees it.
+        async fn current(&self) -> Value {
+            let (s, b) = call(self.admin(), "GET", &self.url(""), None).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            b["current"].clone()
         }
         async fn artifact(&self, version: &str) -> Uuid {
             sqlx::query_scalar(
@@ -1190,19 +1284,36 @@ mod db_tests {
         /// Claim the open probe of `artifact_id` with `token`, without the
         /// global claim query (which could hand out another test's job).
         async fn claim_probe(&self, artifact_id: Uuid, token: &str) -> jobs::JobRow {
+            self.claim_target(artifact_id, "remote:0", token).await
+        }
+        /// [`Self::claim_probe`] of the probe of remote `target`, queueing it
+        /// first when no job of it is open.
+        async fn claim_target(&self, artifact_id: Uuid, target: &str, token: &str) -> jobs::JobRow {
+            jobs::enqueue_for_artifact(&self.fx.pool, artifact_id, None)
+                .await
+                .unwrap();
             let id: Uuid = sqlx::query_scalar(
                 "UPDATE mcp_introspection_jobs SET status = 'claimed', \
                    attempts = attempts + 1, claimed_by = 'test', claimed_at = NOW(), \
-                   lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $2 \
-                 WHERE artifact_id = $1 AND kind = 'remote_probe' AND status = 'pending' \
+                   lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $3 \
+                 WHERE artifact_id = $1 AND kind = 'remote_probe' AND target_key = $2 \
+                   AND status = 'pending' \
                  RETURNING id",
             )
             .bind(artifact_id)
+            .bind(target)
             .bind(caps::sha256_hex(token.as_bytes()))
             .fetch_one(&self.fx.pool)
             .await
             .unwrap();
             jobs::get_job(&self.fx.pool, id).await.unwrap().unwrap()
+        }
+        async fn exec(&self, sql: &'static str, id: Uuid) {
+            sqlx::query(sql)
+                .bind(id)
+                .execute(&self.fx.pool)
+                .await
+                .unwrap();
         }
         async fn snapshots(&self, artifact_id: Uuid, source: Source) -> i64 {
             sqlx::query_scalar(
@@ -1638,7 +1749,7 @@ mod db_tests {
         .unwrap();
         assert_eq!(
             claim_payload(&env.fx.state, &claim, base).await.unwrap(),
-            Err("server version is held".to_string())
+            Err(Unclaimable::Cancel("server version is held".to_string()))
         );
         for sql in [
             "DELETE FROM mcp_introspection_jobs WHERE repository_id = $1",
@@ -1713,6 +1824,7 @@ mod db_tests {
             &r1,
             jobs::parse_result(&r1).unwrap(),
             &AccessScope::Admin,
+            true,
         )
         .await
         .unwrap();
@@ -1728,6 +1840,7 @@ mod db_tests {
             &r2,
             jobs::parse_result(&r2).unwrap(),
             &AccessScope::Admin,
+            true,
         )
         .await
         .unwrap();
@@ -1766,13 +1879,21 @@ mod db_tests {
             &timeout,
             parsed.clone(),
             &AccessScope::Admin,
+            true,
         )
         .await
         .unwrap();
         assert!(matches!(first, jobs::Completed::Retry { .. }), "{first:?}");
-        let second = jobs::complete(&env.fx.pool, &job, &timeout, parsed, &AccessScope::Admin)
-            .await
-            .unwrap();
+        let second = jobs::complete(
+            &env.fx.pool,
+            &job,
+            &timeout,
+            parsed,
+            &AccessScope::Admin,
+            true,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(second, jobs::Completed::ClaimLost),
             "a duplicate retry ends nothing: {second:?}"
@@ -2015,6 +2136,570 @@ mod db_tests {
         assert_eq!(before.0, "pending");
         a.cleanup().await;
         b.cleanup().await;
+    }
+
+    fn ok_result(token: &str, tools: Value) -> Value {
+        json!({"claimToken": token, "outcome": "ok", "tools": tools})
+    }
+
+    async fn snapshot_count(env: &Env, artifact_id: Uuid) -> i64 {
+        env.snapshots(artifact_id, Source::RemoteProbe).await
+    }
+
+    /// Post every result in `results` to `job` at once, deterministically
+    /// interleaved: a side connection holds the job row `FOR UPDATE` while
+    /// the completions pass the handler's token check and pre-check and
+    /// queue on the claim lock (as many as the fixture pool lets open a
+    /// transaction), and only then lets them go. Without the claim lock's
+    /// re-check (#5389) every queued completion would store.
+    async fn race(env: &Env, job: Uuid, results: Vec<Value>) -> Vec<(StatusCode, Value)> {
+        // Two side connections: the lock holder, and a poller outside its
+        // transaction (`pg_stat_activity` is a snapshot within one).
+        let side = crate::testing::try_pool_with(2).await.expect("side pool");
+        let mut holder = side.begin().await.unwrap();
+        sqlx::query("SELECT id FROM mcp_introspection_jobs WHERE id = $1 FOR UPDATE")
+            .bind(job)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let queued = results
+            .len()
+            .min(env.fx.pool.options().get_max_connections() as usize);
+        assert!(queued >= 2, "a race needs two queued completions");
+        let uri = format!("/jobs/{job}/complete");
+        let tasks: Vec<_> = results
+            .into_iter()
+            .map(|r| {
+                let (app, uri) = (env.introspector(), uri.clone());
+                tokio::spawn(async move { call(app, "POST", &uri, Some(r)).await })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                   AND query LIKE '%FROM mcp_introspection_jobs j%FOR UPDATE OF j%'",
+            )
+            .fetch_one(&side)
+            .await
+            .unwrap();
+            if waiting as usize >= queued {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {waiting} of {queued} completions queued on the claim lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        holder.commit().await.unwrap();
+        let mut out = Vec::new();
+        for t in tasks {
+            out.push(t.await.unwrap());
+        }
+        out
+    }
+
+    /// #5461: concurrent completions of one claim, identical and divergent,
+    /// through the HTTP handler and queued together on the claim lock
+    /// ([`race`]): exactly one stores, every other one is the claim conflict
+    /// and stores nothing. A transient retry racing a
+    /// successful result never leaves a stored snapshot behind a pending job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_completions_of_one_claim_have_one_winner() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let job = env.claim_probe(artifact_id, "tok-race").await;
+        let weather = json!([{"name": "get_weather"}]);
+        let results = vec![
+            ok_result("tok-race", weather.clone()),
+            ok_result("tok-race", weather.clone()),
+            ok_result("tok-race", json!([{"name": "get_weather"}, {"name": "rm"}])),
+            ok_result("tok-race", json!([{"name": "other"}])),
+        ];
+        let answers = race(&env, job.id, results).await;
+        let stored: Vec<&Value> = answers
+            .iter()
+            .filter(|(s, _)| *s == StatusCode::OK)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(stored.len(), 1, "exactly one winner: {answers:?}");
+        assert_eq!(stored[0]["status"], "stored");
+        for (s, b) in answers.iter().filter(|(s, _)| *s != StatusCode::OK) {
+            assert_eq!(*s, StatusCode::CONFLICT, "{b}");
+            assert_eq!(b["error"], "mcp_claim_invalid", "{b}");
+        }
+        assert_eq!(snapshot_count(&env, artifact_id).await, 1);
+        let done = jobs::get_job(&env.fx.pool, job.id).await.unwrap().unwrap();
+        assert_eq!(done.status, "completed");
+        assert_eq!(
+            done.snapshot_id.map(|id| id.to_string()),
+            stored[0]["snapshotId"].as_str().map(String::from)
+        );
+
+        // Retry against success: whichever wins, no snapshot behind a
+        // pending job.
+        for round in 0..2 {
+            let before = snapshot_count(&env, artifact_id).await;
+            let token = format!("tok-retry-{round}");
+            let job = env.claim_probe(artifact_id, &token).await;
+            let answers = race(
+                &env,
+                job.id,
+                vec![
+                    json!({"claimToken": token, "outcome": "timeout"}),
+                    ok_result(&token, json!([{"name": format!("t{round}")}])),
+                ],
+            )
+            .await;
+            let winners: Vec<&Value> = answers
+                .iter()
+                .filter(|(s, _)| *s == StatusCode::OK)
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(winners.len(), 1, "round {round}: {answers:?}");
+            let after = jobs::get_job(&env.fx.pool, job.id).await.unwrap().unwrap();
+            let added = snapshot_count(&env, artifact_id).await - before;
+            match winners[0]["status"].as_str() {
+                Some("stored") => {
+                    assert_eq!((after.status.as_str(), added), ("completed", 1));
+                    assert!(after.snapshot_id.is_some());
+                }
+                Some("retry") => {
+                    assert_eq!((after.status.as_str(), added), ("pending", 0));
+                    assert!(after.snapshot_id.is_none());
+                    // Free the target for the next round.
+                    env.exec(
+                        "UPDATE mcp_introspection_jobs SET status = 'cancelled' WHERE id = $1",
+                        job.id,
+                    )
+                    .await;
+                }
+                other => panic!("round {round}: {other:?}"),
+            }
+        }
+        env.cleanup().await;
+    }
+
+    /// #5463 review: a job whose gates cannot be evaluated is released, not
+    /// cancelled, with a doubling backoff; the first `RELEASE_REFUNDS`
+    /// releases hand the attempt back, later ones spend it, and a job out of
+    /// attempts fails instead of cycling forever.
+    #[tokio::test]
+    async fn released_jobs_back_off_and_eventually_fail() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let max = jobs::RELEASE_REFUNDS + 3;
+        let mut last_delay = 0;
+        for n in 0..max {
+            let job = env.claim_probe(artifact_id, &format!("tok-rel-{n}")).await;
+            let before = Utc::now();
+            let status = jobs::release(&env.fx.pool, &job, "gate unavailable")
+                .await
+                .unwrap()
+                .expect("the current claim is released");
+            let after = jobs::get_job(&env.fx.pool, job.id).await.unwrap().unwrap();
+            let refunded = n < jobs::RELEASE_REFUNDS;
+            assert_eq!(
+                after.attempts,
+                if refunded {
+                    job.attempts - 1
+                } else {
+                    job.attempts
+                },
+                "release {n}"
+            );
+            if !refunded && job.attempts >= job.max_attempts {
+                assert_eq!(status, "failed", "release {n}");
+                assert!(after.completed_at.is_some());
+                break;
+            }
+            assert_eq!(status, "pending", "release {n}");
+            let delay = jobs::release_delay_secs(n);
+            assert!(delay >= last_delay, "backoff grows");
+            last_delay = delay;
+            let due = (after.not_before - before).num_seconds();
+            assert!(
+                (delay - 2..=delay + 2).contains(&due),
+                "release {n}: {due} vs {delay}"
+            );
+            // Due now, for the next round's claim.
+            env.exec(
+                "UPDATE mcp_introspection_jobs SET not_before = NOW() WHERE id = $1",
+                job.id,
+            )
+            .await;
+            assert!(n + 1 < max, "the job never failed");
+        }
+        // A release of a claim that is no longer current changes nothing.
+        let stale = jobs::JobRow {
+            claim_token_hash: Some("gone".into()),
+            ..jobs::list_jobs(&env.fx.pool, artifact_id, 1).await.unwrap()[0].clone()
+        };
+        assert_eq!(
+            jobs::release(&env.fx.pool, &stale, "x").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            jobs::release_delay_secs(100),
+            60 << jobs::RELEASE_BACKOFF_CAP
+        );
+        env.cleanup().await;
+    }
+
+    /// #5462: a claim whose lease has expired cannot complete, for a result
+    /// or a retry, even though the reaper has not run: nothing is stored and
+    /// the job is left for the reaper, which returns it to the queue. A live
+    /// lease completes.
+    #[tokio::test]
+    async fn an_expired_claim_cannot_complete_before_the_reaper_runs() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let artifact_id = env.artifact("1.0.0").await;
+        let job = env.claim_probe(artifact_id, "tok-old").await;
+        env.exec(
+            "UPDATE mcp_introspection_jobs SET lease_expires_at = NOW() - INTERVAL '1 second' \
+             WHERE id = $1",
+            job.id,
+        )
+        .await;
+        let expired = job_state(&env.fx.pool, job.id).await;
+        for result in [
+            ok_result("tok-old", json!([{"name": "get_weather"}])),
+            json!({"claimToken": "tok-old", "outcome": "timeout"}),
+        ] {
+            let (s, b) = env.complete(job.id, result).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{b}");
+            assert_eq!(b["error"], "mcp_claim_invalid", "{b}");
+            assert_eq!(job_state(&env.fx.pool, job.id).await, expired);
+        }
+        assert_eq!(snapshot_count(&env, artifact_id).await, 0);
+        assert_eq!(env.current().await["source"], "publisher_declared");
+        jobs::reap_expired(&env.fx.pool).await.unwrap();
+        let reaped = jobs::get_job(&env.fx.pool, job.id).await.unwrap().unwrap();
+        assert_eq!(reaped.status, "pending");
+
+        // Benign: a live lease completes.
+        let job = env.claim_probe(artifact_id, "tok-live").await;
+        let (s, b) = env
+            .complete(
+                job.id,
+                ok_result("tok-live", json!([{"name": "get_weather"}])),
+            )
+            .await;
+        assert_eq!(
+            (s, b["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{b}"
+        );
+        assert_eq!(env.current().await["source"], "remote_probe");
+        env.cleanup().await;
+    }
+
+    /// #5463: a target that changes after the claim is revalidated when the
+    /// result arrives. The version quarantined, rejected, marked deleted or
+    /// deleted, or its backing package quarantined or deleted: the result is
+    /// refused with `409 mcp_target_ineligible`, nothing is stored, the job
+    /// is cancelled and the current view is unchanged. The in-transaction
+    /// half refuses even when the serve gate passed just before. A worker
+    /// whose repository scope was revoked gets `403` and changes nothing. An
+    /// unchanged target completes. (Holder-visible capability state only:
+    /// nothing here is about serving the package.)
+    #[tokio::test]
+    async fn completion_revalidates_the_target_after_the_claim() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        let pool = env.fx.pool.clone();
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let mut npm = tdh::make_repo_info(npm_id, &npm_key, &npm_dir, "local", None);
+        npm.format = "npm".into();
+        let package = tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &pool,
+            &npm,
+            "npm/echo-1.0.0.tgz",
+            "@acme/echo/-/echo-1.0.0.tgz",
+            "@acme/echo",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"tgz"),
+            env.fx.user_id,
+            &"e".repeat(64),
+        )
+        .await;
+        env.config(crate::services::mcp_packages::POLICY_KEY, "open")
+            .await;
+        env.config(
+            crate::services::mcp_packages::REPOS_KEY,
+            &json!({"npm": npm_key}).to_string(),
+        )
+        .await;
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        let mut d = doc("1.0.0", json!({"tools": [{"name": "get_weather"}]}));
+        d["packages"] = json!([{"registryType": "npm", "identifier": "@acme/echo",
+            "version": "1.0.0", "transport": {"type": "stdio"}}]);
+        env.publish_doc(d).await;
+        let version = env.artifact("1.0.0").await;
+        let pinned: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_array_length(metadata->'packages'), 0)::bigint FROM artifact_metadata \
+             WHERE artifact_id = $1",
+        )
+        .bind(version)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pinned, 1, "the package is pinned");
+
+        let variants: [(&str, &'static str, &'static str, Uuid); 6] = [
+            (
+                "version quarantined",
+                "UPDATE artifacts SET quarantine_status = 'quarantined' WHERE id = $1",
+                "UPDATE artifacts SET quarantine_status = NULL WHERE id = $1",
+                version,
+            ),
+            (
+                "version rejected",
+                "UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = $1",
+                "UPDATE artifacts SET quarantine_status = NULL WHERE id = $1",
+                version,
+            ),
+            (
+                "registry status deleted",
+                "UPDATE artifact_metadata SET metadata = \
+                   jsonb_set(metadata, '{registry,status}', '\"deleted\"') WHERE artifact_id = $1",
+                "UPDATE artifact_metadata SET metadata = \
+                   jsonb_set(metadata, '{registry,status}', '\"active\"') WHERE artifact_id = $1",
+                version,
+            ),
+            (
+                "version deleted",
+                "UPDATE artifacts SET is_deleted = true WHERE id = $1",
+                "UPDATE artifacts SET is_deleted = false WHERE id = $1",
+                version,
+            ),
+            (
+                "backing package quarantined",
+                "UPDATE artifacts SET quarantine_status = 'quarantined' WHERE id = $1",
+                "UPDATE artifacts SET quarantine_status = NULL WHERE id = $1",
+                package,
+            ),
+            (
+                "backing artifact deleted",
+                "UPDATE artifacts SET is_deleted = true WHERE id = $1",
+                "UPDATE artifacts SET is_deleted = false WHERE id = $1",
+                package,
+            ),
+        ];
+        let result = |token: &str| ok_result(token, json!([{"name": "exfiltrate"}]));
+        for (i, (what, mutate, restore, id)) in variants.into_iter().enumerate() {
+            let token = format!("tok-gate-{i}");
+            let job = env.claim_probe(version, &token).await;
+            env.exec(mutate, id).await;
+            let (s, b) = env.complete(job.id, result(&token)).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{what}: {b}");
+            assert_eq!(b["error"], "mcp_target_ineligible", "{what}: {b}");
+            let after = jobs::get_job(&pool, job.id).await.unwrap().unwrap();
+            assert_eq!(after.status, "cancelled", "{what}");
+            assert!(after.snapshot_id.is_none(), "{what}");
+            assert_eq!(snapshot_count(&env, version).await, 0, "{what}");
+            env.exec(restore, id).await;
+            assert_eq!(
+                env.current().await["source"],
+                "publisher_declared",
+                "{what}"
+            );
+        }
+
+        // The serve gate passed before the change landed: the transaction's
+        // own re-read still refuses.
+        for (what, id) in [("version", version), ("backing package", package)] {
+            let token = format!("tok-late-{what}");
+            let job = env.claim_probe(version, &token).await;
+            env.exec(
+                "UPDATE artifacts SET quarantine_status = 'quarantined' WHERE id = $1",
+                id,
+            )
+            .await;
+            let r: jobs::WorkerResult = serde_json::from_value(result(&token)).unwrap();
+            let parsed = jobs::parse_result(&r).unwrap();
+            let out = jobs::complete(&pool, &job, &r, parsed, &AccessScope::Admin, true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(out, jobs::Completed::Ineligible { .. }),
+                "{what}: {out:?}"
+            );
+            assert_eq!(snapshot_count(&env, version).await, 0, "{what}");
+            env.exec(
+                "UPDATE artifacts SET quarantine_status = NULL WHERE id = $1",
+                id,
+            )
+            .await;
+        }
+
+        // The worker's repository scope revoked: 403, the claim untouched.
+        let job = env.claim_probe(version, "tok-acl").await;
+        let claimed = job_state(&pool, job.id).await;
+        let (s, b) = call(
+            env.scoped_worker(vec![Uuid::new_v4()]),
+            "POST",
+            &format!("/jobs/{}/complete", job.id),
+            Some(result("tok-acl")),
+        )
+        .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::FORBIDDEN, Some("mcp_forbidden"))
+        );
+        assert_eq!(job_state(&pool, job.id).await, claimed);
+        assert_eq!(snapshot_count(&env, version).await, 0);
+
+        // Unchanged: the same claim completes.
+        let (s, b) = env.complete(job.id, result("tok-acl")).await;
+        assert_eq!(
+            (s, b["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{b}"
+        );
+        assert_eq!(env.current().await["source"], "remote_probe");
+
+        env.exec("DELETE FROM packages WHERE repository_id = $1", npm_id)
+            .await;
+        tdh::cleanup_member_repo(&pool, npm_id, &npm_dir).await;
+        env.cleanup().await;
+    }
+
+    /// #5464: the current view follows validated `observedAt` freshness, not
+    /// arrival. A probe observed earlier but completed later is stored as
+    /// history (`current: false`) and does not replace the fresher one; a
+    /// later, fresher observation does. An `observedAt` in the future or
+    /// before the job's claim is refused and leaves the claim as it was.
+    #[tokio::test]
+    async fn a_stale_observation_never_replaces_a_fresher_current_one() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        let mut d = doc("1.0.0", json!({"tools": [{"name": "get_weather"}]}));
+        d["remotes"] = json!([
+            {"type": "streamable-http", "url": "https://mcp.acme.test/mcp"},
+            {"type": "streamable-http", "url": "https://mcp2.acme.test/mcp"},
+        ]);
+        env.publish_doc(d).await;
+        let version = env.artifact("1.0.0").await;
+        let stale = env.claim_target(version, "remote:0", "tok-stale").await;
+        let fresh = env.claim_target(version, "remote:1", "tok-fresh").await;
+        let now = Utc::now();
+        let at = |r: Value, t: DateTime<Utc>| {
+            let mut r = r;
+            r["observedAt"] = json!(t);
+            r
+        };
+        let (s, fresh_body) = env
+            .complete(
+                fresh.id,
+                at(ok_result("tok-fresh", json!([{"name": "fresh"}])), now),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{fresh_body}");
+        let older = now - chrono::Duration::minutes(2);
+        let (s, b) = env
+            .complete(
+                stale.id,
+                at(ok_result("tok-stale", json!([{"name": "stale"}])), older),
+            )
+            .await;
+        assert_eq!(
+            (s, b["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{b}"
+        );
+        let current = env.current().await;
+        assert_eq!(current["tools"][0]["name"], "fresh", "{current}");
+        assert_eq!(snapshot_count(&env, version).await, 2, "history kept");
+        assert_eq!(fresh_body["current"], true, "{fresh_body}");
+        assert_eq!(b["current"], false, "a stale observation is history: {b}");
+        let drift_scans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scan_results WHERE artifact_id = $1 AND scan_type = 'external'",
+        )
+        .bind(version)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(drift_scans, 0, "history raises no drift");
+
+        // Out-of-window timestamps are refused; the claim stays.
+        let job = env.claim_target(version, "remote:0", "tok-next").await;
+        let claimed = job_state(&env.fx.pool, job.id).await;
+        for t in [
+            now + chrono::Duration::hours(1),
+            now - chrono::Duration::days(1),
+        ] {
+            let (s, b) = env
+                .complete(job.id, at(ok_result("tok-next", json!([{"name": "x"}])), t))
+                .await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(job_state(&env.fx.pool, job.id).await, claimed);
+        }
+        // A later, fresher observation becomes current.
+        let (s, b) = env
+            .complete(
+                job.id,
+                at(
+                    ok_result("tok-next", json!([{"name": "newest"}])),
+                    Utc::now(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            (s, b["current"].as_bool()),
+            (StatusCode::OK, Some(true)),
+            "{b}"
+        );
+        assert_eq!(env.current().await["tools"][0]["name"], "newest");
+        // A stored failure is never the current view.
+        let job = env.claim_target(version, "remote:1", "tok-fail").await;
+        let (s, b) = env
+            .complete(
+                job.id,
+                json!({"claimToken": "tok-fail", "outcome": "auth_required"}),
+            )
+            .await;
+        assert_eq!(
+            (s, b["current"].as_bool()),
+            (StatusCode::OK, Some(false)),
+            "{b}"
+        );
+        assert_eq!(env.current().await["tools"][0]["name"], "newest");
+        env.cleanup().await;
     }
 
     /// #5386: a snapshot repeating the newest one of its (version, source,

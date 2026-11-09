@@ -2828,9 +2828,18 @@ pub(crate) async fn visible_version(
 }
 
 async fn servable_row(state: &SharedState, repo: &RepoInfo, row: &VersionRow, base: &str) -> bool {
+    reader_decision(state, repo, row, base).await == Servability::Servable
+}
+
+async fn reader_decision(
+    state: &SharedState,
+    repo: &RepoInfo,
+    row: &VersionRow,
+    base: &str,
+) -> Servability {
     let instance = instance_url(base, &repo.key, &row.name, &row.version);
-    matches!(
-        decide_row(
+    Servability::of(
+        &decide_row(
             GateCtx::of(state, false),
             row,
             false,
@@ -2838,21 +2847,45 @@ async fn servable_row(state: &SharedState, repo: &RepoInfo, row: &VersionRow, ba
             instance,
         )
         .await,
-        ServeDecision::Serve
     )
 }
 
+/// A reader serve decision, three-way: an introspection claim or completion
+/// cancels its job only on a definite hold, never because a gate could not
+/// be evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Servability {
+    Servable,
+    /// Refused: the version (or a backing package) is held.
+    Held,
+    /// A gate could not be evaluated (`503 mcp_gate_unavailable`): retry
+    /// later.
+    Unavailable,
+}
+
+impl Servability {
+    pub(crate) fn of(decision: &ServeDecision) -> Self {
+        match decision {
+            ServeDecision::Serve => Self::Servable,
+            ServeDecision::Refuse { status: 503, .. } => Self::Unavailable,
+            ServeDecision::Refuse { .. } => Self::Held,
+        }
+    }
+}
+
 /// Whether the stored version `artifact_id` of `repo` is servable to readers
-/// now (the sandbox only ever runs a version whose gates pass).
-pub(crate) async fn artifact_servable(
+/// now (the sandbox only ever runs a version whose gates pass). A version
+/// whose row cannot be read is [`Servability::Unavailable`]: the caller has
+/// already found it (a deleted version is the caller's definite refusal).
+pub(crate) async fn artifact_servability(
     state: &SharedState,
     repo: &RepoInfo,
     artifact_id: Uuid,
     base: &str,
-) -> bool {
+) -> Servability {
     match stored_row(&state.db, artifact_id).await {
-        Ok(row) => servable_row(state, repo, &row, base).await,
-        Err(_) => false,
+        Ok(row) => reader_decision(state, repo, &row, base).await,
+        Err(_) => Servability::Unavailable,
     }
 }
 
@@ -2882,6 +2915,21 @@ mod tests {
         parse_list_query(q, |c| {
             test_seal().decode_position(Uuid::nil(), fmt::cursor_kind::SERVERS, c)
         })
+    }
+
+    #[test]
+    fn servability_is_three_way() {
+        let refuse = |status| ServeDecision::Refuse {
+            status,
+            body: serde_json::json!({}),
+            hold_class: "x",
+        };
+        assert_eq!(
+            Servability::of(&ServeDecision::Serve),
+            Servability::Servable
+        );
+        assert_eq!(Servability::of(&refuse(503)), Servability::Unavailable);
+        assert_eq!(Servability::of(&refuse(404)), Servability::Held);
     }
 
     #[test]
@@ -6986,6 +7034,712 @@ mod tests {
             .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(count(), before, "a held read decides its candidate instead");
+        env.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5456: the pin is what the Virtual backing repository's route serves
+    // -----------------------------------------------------------------------
+
+    use crate::api::handlers::mcp_shadow_fixtures as sf;
+
+    /// One backing format, spelled as a client spells it.
+    struct ShadowCase {
+        ty: &'static str,
+        name: &'static str,
+        /// The version published to the package repository.
+        published: &'static str,
+        /// The version the server.json names (PyPI: `1.0.0` for a package
+        /// published as `1.0`, PEP 440-equal).
+        pinned: &'static str,
+    }
+
+    const SHADOW_CASES: [ShadowCase; 4] = [
+        ShadowCase {
+            ty: "npm",
+            name: "@acme/echo",
+            published: "1.0.0",
+            pinned: "1.0.0",
+        },
+        ShadowCase {
+            ty: "pypi",
+            name: "Acme_Echo",
+            published: "1.0",
+            pinned: "1.0.0",
+        },
+        ShadowCase {
+            ty: "nuget",
+            name: "Acme.Echo",
+            published: "1.0.0",
+            pinned: "1.0.0",
+        },
+        ShadowCase {
+            ty: "cargo",
+            name: "acme-echo",
+            published: "1.0.0",
+            pinned: "1.0.0",
+        },
+    ];
+
+    const SHADOW_TAIL: &str = "/servers/com.acme%2Fshadow/versions/1.0.0";
+
+    /// What the MCP surface says about `com.acme/shadow@1.0.0`.
+    #[derive(Debug, PartialEq, Eq)]
+    enum View {
+        Served,
+        /// Held: the holder's `error` and `gate`.
+        Held(String, Option<String>),
+    }
+
+    fn held(error: &str, gate: Option<&str>) -> View {
+        View::Held(error.to_string(), gate.map(str::to_string))
+    }
+
+    fn shadowed() -> View {
+        held("mcp_unresolvable", Some("shadowed"))
+    }
+
+    impl Env {
+        /// A Virtual of `ty` with one new member of each `(repo_type,
+        /// priority)`, mapped as this registry's `ty` backing repository.
+        async fn shadow_virtual(
+            &mut self,
+            ty: &str,
+            members: &[(&str, i32)],
+        ) -> (RepoInfo, Vec<RepoInfo>) {
+            let virt = self.repo("virtual", ty).await;
+            let mut out = Vec::new();
+            for (repo_type, priority) in members {
+                let m = self.repo(repo_type, ty).await;
+                tdh::link_virtual_member(&self.fx.pool, virt.id, m.id, *priority).await;
+                out.push(m);
+            }
+            self.config(
+                mcp_packages::REPOS_KEY,
+                &serde_json::json!({ ty: virt.key }).to_string(),
+            )
+            .await;
+            (virt, out)
+        }
+
+        async fn publish_pkg(
+            &self,
+            case: &ShadowCase,
+            repo: &RepoInfo,
+            seed: &[u8],
+            file: Option<&str>,
+        ) -> sf::PublishedPackage {
+            sf::publish_native(
+                &self.fx,
+                case.ty,
+                &repo.key,
+                repo.id,
+                case.name,
+                case.published,
+                seed,
+                file,
+            )
+            .await
+        }
+
+        async fn publish_shadow_server(
+            &self,
+            case: &ShadowCase,
+        ) -> (StatusCode, serde_json::Value) {
+            self.publish(&doc(
+                "com.acme/shadow",
+                "1.0.0",
+                serde_json::json!({"packages": [{"registryType": case.ty,
+                    "identifier": case.name, "version": case.pinned,
+                    "transport": {"type": "stdio"}}]}),
+            ))
+            .await
+        }
+
+        /// The stored `resolved.sha256`.
+        async fn pinned_sha(&self) -> String {
+            let id = self.server_artifact("com.acme/shadow", "1.0.0").await;
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT metadata#>>'{packages,0,resolved,sha256}' FROM artifact_metadata \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&self.fx.pool)
+            .await
+            .unwrap()
+            .unwrap_or_default()
+        }
+
+        async fn native(
+            &self,
+            case: &ShadowCase,
+            virt: &RepoInfo,
+            tail: &str,
+        ) -> (StatusCode, Option<String>) {
+            sf::native_get(&self.fx, case.ty, &format!("/{}{tail}", virt.key)).await
+        }
+
+        /// The exact read (anonymous: `200` or the plain `404`; holder: the
+        /// refusal's `error` and `gate`) and the listing, which must agree.
+        async fn view(&self) -> View {
+            let (anon, body, _) = self.get(self.anon(), SHADOW_TAIL).await;
+            let (_, list, _) = self.get(self.anon(), "/servers").await;
+            let listed = json(&list)["metadata"]["count"].as_i64();
+            if anon == StatusCode::OK {
+                assert_eq!(listed, Some(1), "served but not listed");
+                return View::Served;
+            }
+            assert_eq!(body.as_ref(), fmt::NOT_FOUND_BODY.as_bytes());
+            assert_eq!(listed, Some(0), "held but listed");
+            let (_, held, _) = self.get(self.member(), SHADOW_TAIL).await;
+            let held = json(&held);
+            let text = |k: &str| held[k].as_str().map(str::to_string);
+            View::Held(text("error").unwrap_or_default(), text("gate"))
+        }
+
+        async fn soft_delete(&self, ids: &[Uuid]) {
+            sqlx::query("UPDATE artifacts SET is_deleted = $2 WHERE id = ANY($1)")
+                .bind(ids)
+                .bind(true)
+                .execute(&self.fx.pool)
+                .await
+                .unwrap();
+        }
+
+        /// A Remote member of `virt` at `priority` whose upstream serves
+        /// `case` with the bytes `body`.
+        async fn upstream_member(
+            &mut self,
+            case: &ShadowCase,
+            virt: &RepoInfo,
+            priority: i32,
+            body: &[u8],
+        ) -> (Uuid, String, sf::MockUpstream) {
+            let (id, key, dir) = tdh::attach_remote_member(
+                &self.fx.pool,
+                virt.id,
+                case.ty,
+                "http://unset",
+                priority,
+            )
+            .await;
+            self.extra_repos.push((id, dir));
+            tdh::grant_repo_role(&self.fx.pool, id, self.fx.user_id, "reader").await;
+            let up =
+                sf::mock_upstream(&self.fx, case.ty, id, case.name, case.published, body, None)
+                    .await;
+            (id, key, up)
+        }
+    }
+
+    /// #5456: bytes B published later at the pinned coordinate in a member
+    /// that outranks the pinned one change what the advertised Virtual URL
+    /// delivers, so the version is held (`gate: shadowed`) instead of served
+    /// with a pin and a gate that no longer describe the download. Removing B
+    /// serves it again, still pinned to (and delivering) A. Every package is
+    /// published through its format's real upload route.
+    #[tokio::test]
+    async fn late_virtual_shadowing_holds_the_version_5456() {
+        for case in &SHADOW_CASES {
+            let ty = case.ty;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 1), ("local", 2)]).await;
+            let a = env.publish_pkg(case, &m[1], b"approved A", None).await;
+            let (s, b) = env.publish_shadow_server(case).await;
+            assert_eq!(s, StatusCode::OK, "{ty}: {b}");
+            assert_eq!(
+                b["server"]["packages"][0]["registryBaseUrl"],
+                mcp_packages::backing_base_url("http://localhost", ty, &virt.key),
+                "{ty}: the advertised URL is the Virtual"
+            );
+            assert_eq!(env.pinned_sha().await, a.sha256, "{ty}");
+            assert_eq!(env.view().await, View::Served, "{ty}");
+            assert_eq!(
+                env.native(case, &virt, &a.download_tail).await,
+                (StatusCode::OK, Some(a.sha256.clone())),
+                "{ty}: before shadowing the advertised URL delivers the pin"
+            );
+
+            let b = env.publish_pkg(case, &m[0], b"shadowing B", None).await;
+            assert_eq!(
+                env.native(case, &virt, &a.download_tail).await,
+                (StatusCode::OK, Some(b.sha256.clone())),
+                "{ty}: the Virtual now serves H (unchanged for non-MCP clients)"
+            );
+            assert_eq!(
+                env.pinned_sha().await,
+                a.sha256,
+                "{ty}: the pin never moves"
+            );
+            assert_eq!(env.view().await, shadowed(), "{ty}");
+
+            env.soft_delete(&b.artifact_ids).await;
+            assert_eq!(env.view().await, View::Served, "{ty}");
+            assert_eq!(
+                env.native(case, &virt, &a.download_tail).await,
+                (StatusCode::OK, Some(a.sha256.clone())),
+                "{ty}: served again, and the download is A again"
+            );
+            env.teardown().await;
+        }
+    }
+
+    /// #5456 quarantine orders, each in a clean fixture: the MCP read and the
+    /// advertised native download agree on every order.
+    #[tokio::test]
+    async fn virtual_shadowing_quarantine_orders_agree_5456() {
+        for case in &SHADOW_CASES {
+            let ty = case.ty;
+            for order in ["a", "b-then-a", "b"] {
+                let Some(mut env) = Env::new().await else {
+                    return;
+                };
+                let (virt, m) = env.shadow_virtual(ty, &[("local", 1), ("local", 2)]).await;
+                let a = env.publish_pkg(case, &m[1], b"approved A", None).await;
+                assert_eq!(
+                    env.publish_shadow_server(case).await.0,
+                    StatusCode::OK,
+                    "{ty}"
+                );
+                let b = match order {
+                    "a" => None,
+                    _ => Some(env.publish_pkg(case, &m[0], b"shadowing B", None).await),
+                };
+                let target = match &b {
+                    Some(b) if order == "b" => b.artifact_ids[0],
+                    _ => a.artifact_ids[0],
+                };
+                env.hold(target, Some("quarantined")).await;
+                let (native, delivered) = env.native(case, &virt, &a.download_tail).await;
+                let label = format!("{ty} {order}");
+                match (order, &b) {
+                    // A quarantined, nothing shadows it: both refuse A.
+                    ("a", _) => {
+                        assert_eq!(
+                            env.view().await,
+                            held("mcp_backing_artifact_blocked", Some("quarantine")),
+                            "{label}"
+                        );
+                        assert_ne!(native, StatusCode::OK, "{label}");
+                    }
+                    // Shadowed, then A quarantined: the Virtual serves B to
+                    // every client; the approved document is never served.
+                    ("b-then-a", Some(b)) => {
+                        assert_eq!(env.view().await, shadowed(), "{label}");
+                        assert_eq!(delivered.as_deref(), Some(b.sha256.as_str()), "{label}");
+                    }
+                    // B quarantined: the Virtual refuses the coordinate (it
+                    // does not fall through to A, #3220), and so does MCP.
+                    _ => {
+                        assert_eq!(env.view().await, shadowed(), "{label}");
+                        assert_ne!(native, StatusCode::OK, "{label}");
+                    }
+                }
+                env.teardown().await;
+            }
+        }
+    }
+
+    /// #5456: a Remote member ranked above the hosted package serves the
+    /// version from its upstream whether or not it has cached it. npm and
+    /// NuGet refuse such a publish, and hold an approved version once such a
+    /// member appears (the download then returns the upstream's bytes);
+    /// PyPI refuses any Remote member; Cargo's exact-version owner guard
+    /// withholds every Remote member, so the pin stands.
+    #[tokio::test]
+    async fn higher_ranked_remote_shadows_even_uncached_5456() {
+        for case in &SHADOW_CASES {
+            let ty = case.ty;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 2)]).await;
+            let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
+            let (_, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
+            let (s, b) = env.publish_shadow_server(case).await;
+            if ty == "cargo" {
+                assert_eq!(s, StatusCode::OK, "{b}");
+                assert_eq!(env.view().await, View::Served);
+                assert_eq!(
+                    sf::native_get_with_state(
+                        &up.state,
+                        &env.fx,
+                        ty,
+                        &format!("/{}{}", virt.key, a.download_tail)
+                    )
+                    .await,
+                    (StatusCode::OK, Some(a.sha256.clone())),
+                    "cargo: the owner guard serves the hosted crate"
+                );
+            } else {
+                assert_eq!(
+                    (s, b["error"].as_str()),
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Some("mcp_package_shadowed")
+                    ),
+                    "{ty}: {b}"
+                );
+                let detail = b["detail"].as_str().unwrap_or_default();
+                assert!(
+                    detail.contains(&remote_key) && detail.contains(&m[0].key),
+                    "{ty}: {detail}"
+                );
+            }
+            env.teardown().await;
+            // The mock upstream holds the process-wide SSRF allowlist lock
+            // (`non_loopback_mock_server`), which is not reentrant: release
+            // it before the next mock upstream is started below.
+            drop(up);
+
+            // Late: approved first, then the Remote member joins above.
+            if ty == "cargo" {
+                continue;
+            }
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 2)]).await;
+            let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
+            assert_eq!(
+                env.publish_shadow_server(case).await.0,
+                StatusCode::OK,
+                "{ty}"
+            );
+            assert_eq!(env.view().await, View::Served, "{ty}");
+            let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
+            assert_eq!(
+                env.view().await,
+                shadowed(),
+                "{ty}: held with nothing cached"
+            );
+            let got = sf::native_get_with_state(
+                &up.state,
+                &env.fx,
+                ty,
+                &format!("/{}{}", virt.key, a.download_tail),
+            )
+            .await;
+            if ty == "pypi" {
+                // The PEP 708 guard serves the hosted sdist itself; PyPI is
+                // held for the other distributions the Remote can serve.
+                assert_eq!(got.0, StatusCode::OK, "{ty}");
+            } else {
+                assert_eq!(
+                    got,
+                    (StatusCode::OK, Some(fmt::sha256_hex(b"upstream B"))),
+                    "{ty}: why it is held: the download is the upstream's bytes"
+                );
+            }
+
+            // The upgrade remedy: rank the hosted member above the Remote
+            // (PyPI: remove the Remote). The hold clears on the next read,
+            // with no republish.
+            let remedy = if ty == "pypi" {
+                "DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1 AND member_repo_id = $2"
+            } else {
+                "UPDATE virtual_repo_members SET priority = 0 \
+                 WHERE virtual_repo_id = $1 AND member_repo_id <> $2"
+            };
+            sqlx::query(remedy)
+                .bind(virt.id)
+                .bind(remote)
+                .execute(&env.fx.pool)
+                .await
+                .unwrap();
+            assert_eq!(env.view().await, View::Served, "{ty}: the hold clears");
+            env.teardown().await;
+        }
+    }
+
+    /// #5456: npm isolate mode withholds every Remote member for a hosted
+    /// name, so a Remote-first Virtual in isolate mode pins the hosted
+    /// package and is not held when the Remote has the name cached.
+    #[tokio::test]
+    async fn npm_isolate_mode_virtual_is_not_held_5456() {
+        let case = &SHADOW_CASES[0];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, m) = env.shadow_virtual("npm", &[("local", 2)]).await;
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, 'true')",
+        )
+        .bind(virt.id)
+        .bind(crate::api::handlers::npm::NPM_VIRTUAL_ISOLATE_HOSTED_NAMES_KEY)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
+        let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes, checksum_sha256) VALUES ($1, '@acme/echo/-/echo-1.0.0.tgz', 'k', 'm', 1, $2)",
+        )
+        .bind(remote)
+        .bind("b".repeat(64))
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(env.view().await, View::Served);
+        assert_eq!(
+            sf::native_get_with_state(
+                &up.state,
+                &env.fx,
+                "npm",
+                &format!("/{}{}", virt.key, a.download_tail)
+            )
+            .await,
+            (StatusCode::OK, Some(a.sha256.clone()))
+        );
+        env.teardown().await;
+    }
+
+    /// #5456 Cargo cache pin: a crate pinned from a Remote member's proxy
+    /// cache is held once any hosted member of the Virtual publishes the same
+    /// `name@version`, whatever its priority: the exact-version owner guard
+    /// then serves the hosted crate instead.
+    #[tokio::test]
+    async fn cargo_cache_pin_held_by_a_later_hosted_publish_5456() {
+        let case = &SHADOW_CASES[3];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, m) = env.shadow_virtual("cargo", &[("local", 2)]).await;
+        let (remote, _, _up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        seed_crate_cache(&env.fx.pool, remote).await;
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(env.view().await, View::Served);
+        env.publish_pkg(case, &m[0], b"hosted B", None).await;
+        assert_eq!(env.view().await, shadowed());
+        env.teardown().await;
+    }
+
+    /// Seed `remote`'s proxy cache with the case's crate (`acme-echo@1.0.0`).
+    async fn seed_crate_cache(pool: &sqlx::PgPool, remote: Uuid) {
+        sqlx::query(
+            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
+             size_bytes, checksum_sha256) VALUES ($1, 'api/v1/crates/acme-echo/1.0.0/download', \
+             'k', 'm', 1, $2)",
+        )
+        .bind(remote)
+        .bind("a".repeat(64))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// #5456: the asynchronous fill applies the same cache-pin refusal as the
+    /// synchronous publish. A crate the Remote member caches after the publish
+    /// was accepted (`202`), while a hosted member of the Virtual now holds
+    /// the same `name@version` (so the owner guard serves the hosted crate),
+    /// fails the job with `mcp_package_shadowed` instead of resolving into a
+    /// version that is held for ever.
+    #[tokio::test]
+    async fn async_fill_refuses_a_shadowed_cache_pin_5456() {
+        let case = &SHADOW_CASES[3];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, m) = env.shadow_virtual("cargo", &[("local", 2)]).await;
+        let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "nothing cached or hosted yet: {b}");
+        let id = env.server_artifact("com.acme/shadow", "1.0.0").await;
+        env.publish_pkg(case, &m[0], b"hosted B", None).await;
+        seed_crate_cache(&env.fx.pool, remote).await;
+        assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
+        let res: serde_json::Value = sqlx::query_scalar(
+            "SELECT COALESCE(metadata->'resolution', 'null'::jsonb) FROM artifact_metadata \
+             WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(res["state"], "failed", "{res}");
+        assert_eq!(res["error"]["error"], "mcp_package_shadowed", "{res}");
+        env.teardown().await;
+    }
+
+    /// #5456: a cache pin is bound to the repository its key named. Once the
+    /// Virtual is renamed and a non-Virtual repository takes its key, the
+    /// advertised URL serves that repository, so the version is held.
+    #[tokio::test]
+    async fn cache_pin_held_when_its_key_names_another_repository_5456() {
+        let case = &SHADOW_CASES[3];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, _) = env.shadow_virtual("cargo", &[("local", 2)]).await;
+        let (remote, _, _up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        seed_crate_cache(&env.fx.pool, remote).await;
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(env.view().await, View::Served);
+        let other = env.repo("local", "cargo").await;
+        for (id, key) in [
+            (virt.id, format!("{}-renamed", virt.key)),
+            (other.id, virt.key.clone()),
+        ] {
+            sqlx::query("UPDATE repositories SET key = $2 WHERE id = $1")
+                .bind(id)
+                .bind(key)
+                .execute(&env.fx.pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(env.view().await, shadowed());
+        env.teardown().await;
+    }
+
+    /// #5456 PyPI is per file: the pin covers every hosted file of the
+    /// version (`1.0` is `1.0.0`), and a file of the version in any member,
+    /// a file named for the project but uploaded under another one, or a
+    /// pinned file that is gone, holds it.
+    #[tokio::test]
+    async fn pypi_pin_covers_every_file_of_the_version_5456() {
+        let case = &SHADOW_CASES[1];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (_virt, m) = env
+            .shadow_virtual("pypi", &[("local", 1), ("local", 2)])
+            .await;
+        env.publish_pkg(case, &m[0], b"sdist A", None).await;
+        let wheel = env
+            .publish_pkg(
+                case,
+                &m[0],
+                b"wheel A",
+                Some("acme_echo-1.0-py3-none-any.whl"),
+            )
+            .await;
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::OK, "published as 1.0, pinned as 1.0.0: {b}");
+        assert_eq!(env.view().await, View::Served);
+
+        // A wheel in the member BELOW the pinned one.
+        let below = env
+            .publish_pkg(
+                case,
+                &m[1],
+                b"wheel B",
+                Some("acme_echo-1.0-cp312-cp312-manylinux_2_17_x86_64.whl"),
+            )
+            .await;
+        assert_eq!(env.view().await, shadowed(), "a member below adds a wheel");
+        env.soft_delete(&below.artifact_ids).await;
+        assert_eq!(env.view().await, View::Served);
+
+        // A file named for the project, uploaded under another project.
+        let other = sf::publish_native(
+            &env.fx,
+            "pypi",
+            &m[1].key,
+            m[1].id,
+            "zzz",
+            "1.0",
+            b"zzz",
+            Some("acme_echo-1.0.zip"),
+        )
+        .await;
+        assert_eq!(
+            env.view().await,
+            shadowed(),
+            "served for acme-echo's file name"
+        );
+        env.soft_delete(&other.artifact_ids).await;
+        assert_eq!(env.view().await, View::Served);
+
+        // One pinned file gone (the other still gated and served).
+        env.soft_delete(&wheel.artifact_ids).await;
+        assert_eq!(env.view().await, shadowed(), "a pinned file is gone");
+        env.teardown().await;
+    }
+
+    /// #5456: the walk the check models is the route's: a nested Virtual's
+    /// members are inlined at its slot, and equal priorities are walked by
+    /// repository key.
+    #[tokio::test]
+    async fn nested_virtuals_and_equal_priorities_follow_the_walk_5456() {
+        let case = &SHADOW_CASES[0];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, m) = env.shadow_virtual("npm", &[("local", 2)]).await;
+        let nested = env.repo("virtual", "npm").await;
+        let inner = env.repo("local", "npm").await;
+        tdh::link_virtual_member(&env.fx.pool, nested.id, inner.id, 1).await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, nested.id, 1).await;
+        env.publish_pkg(case, &m[0], b"approved A", None).await;
+        assert_eq!(env.publish_shadow_server(case).await.0, StatusCode::OK);
+        assert_eq!(env.view().await, View::Served);
+        env.publish_pkg(case, &inner, b"nested B", None).await;
+        assert_eq!(env.view().await, shadowed(), "through the nested Virtual");
+        env.teardown().await;
+
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (_virt, mut m) = env
+            .shadow_virtual("npm", &[("local", 1), ("local", 1)])
+            .await;
+        m.sort_by(|x, y| x.key.cmp(&y.key));
+        env.publish_pkg(case, &m[1], b"approved A", None).await;
+        assert_eq!(env.publish_shadow_server(case).await.0, StatusCode::OK);
+        assert_eq!(env.view().await, View::Served);
+        env.publish_pkg(case, &m[0], b"equal-priority B", None)
+            .await;
+        assert_eq!(
+            env.view().await,
+            shadowed(),
+            "the smaller key is walked first"
+        );
+        env.teardown().await;
+    }
+
+    /// #5456: a pinned member that leaves the Virtual leaves nothing to
+    /// deliver the pin, and a pinned row whose bytes changed in place is no
+    /// longer the pinned row.
+    #[tokio::test]
+    async fn member_removal_and_in_place_rewrite_hold_the_version_5456() {
+        let case = &SHADOW_CASES[2];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (_virt, m) = env.shadow_virtual("nuget", &[("local", 1)]).await;
+        let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
+        assert_eq!(env.publish_shadow_server(case).await.0, StatusCode::OK);
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $2 WHERE id = $1")
+            .bind(a.artifact_ids[0])
+            .bind("f".repeat(64))
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            env.view().await,
+            held("mcp_unresolvable", None),
+            "rewritten in place"
+        );
+        sqlx::query("UPDATE artifacts SET checksum_sha256 = $2 WHERE id = $1")
+            .bind(a.artifact_ids[0])
+            .bind(&a.sha256)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(env.view().await, View::Served);
+        sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(m[0].id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(env.view().await, shadowed(), "the pinned member left");
         env.teardown().await;
     }
 }
