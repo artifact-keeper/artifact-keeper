@@ -2484,6 +2484,89 @@ mod tests {
         env.teardown().await;
     }
 
+    /// Every file under `dir`, recursively.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// #5468, #5469, #5470: a bundle with duplicate manifests or JSON keys,
+    /// an unsafe, link or special-file entry, a non-UTF-8 name, or central and
+    /// local headers that disagree is refused through the upload route with
+    /// `400 mcp_bundle_invalid` and a detail naming the defect, and nothing
+    /// is stored (no artifact row, no bundle facts, no storage object). A
+    /// benign archive and the fixture are still accepted afterwards.
+    #[tokio::test]
+    async fn hostile_bundle_entries_are_refused_without_storing() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let put = |file: String, bytes: Vec<u8>| {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(env.url(&format!(
+                    "/servers/com.acme/echo/versions/1.0.0/bundles/{file}"
+                )))
+                .body(Body::from(bytes))
+                .unwrap();
+            tdh::send(env.member(), req)
+        };
+        let before = files_under(&env.fx.storage_dir);
+        for (case, bytes, detail) in mcpb::hostile_zips::cases() {
+            let (status, body) = put(format!("{case}.mcpb"), bytes).await;
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("mcp_bundle_invalid")),
+                "{case}: {body}"
+            );
+            assert!(
+                body["detail"].as_str().is_some_and(|d| d.contains(detail)),
+                "{case}: {body}"
+            );
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a refused bundle stores no artifact");
+        let facts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(facts, 0, "a refused bundle records no facts");
+        assert_eq!(
+            files_under(&env.fx.storage_dir),
+            before,
+            "a refused bundle writes no storage object"
+        );
+
+        let (status, body) = put("benign.mcpb".into(), mcpb::hostile_zips::benign()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, _) = put("echo.mcpb".into(), UNSIGNED.to_vec()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        env.teardown().await;
+    }
+
     #[tokio::test]
     async fn bundles_upload_pin_serve_and_download() {
         let Some(env) = Env::new().await else {

@@ -476,11 +476,29 @@ pub fn parse_server_json(bytes: &[u8]) -> std::result::Result<ServerJson, McpErr
             format!("document nests deeper than {MAX_DEPTH} levels"),
         ));
     }
-    if let Err(e) = serde_json::from_slice::<NoDuplicateKeys>(bytes) {
+    if let Err(e) = reject_duplicate_json_keys(bytes) {
         return Err(McpError::invalid("", format!("invalid server.json: {e}")));
     }
     serde_json::from_slice(bytes)
         .map_err(|e| McpError::invalid("", format!("invalid server.json: {e}")))
+}
+
+/// `s` as shown in an error detail: control characters and quotes escaped,
+/// at most 200 characters (archive entry names, JSON member names).
+pub fn shown(s: &str) -> String {
+    s.chars()
+        .take(200)
+        .collect::<String>()
+        .escape_debug()
+        .to_string()
+}
+
+/// Fail when `bytes` is not JSON or holds an object with a repeated member
+/// name anywhere (server.json, and an MCPB bundle's `manifest.json`, #5468):
+/// `serde_json` would otherwise keep the last value, and another parser may
+/// keep the first.
+pub fn reject_duplicate_json_keys(bytes: &[u8]) -> serde_json::Result<()> {
+    serde_json::from_slice::<NoDuplicateKeys>(bytes).map(|_| ())
 }
 
 /// Walks a JSON document and fails on an object with a repeated member name
@@ -528,7 +546,10 @@ impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
                 let mut seen = std::collections::HashSet::new();
                 while let Some(key) = map.next_key::<String>()? {
                     if !seen.insert(key.clone()) {
-                        return Err(serde::de::Error::custom(format!("duplicate key `{key}`")));
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate key `{}`",
+                            shown(&key)
+                        )));
                     }
                     map.next_value::<NoDuplicateKeys>()?;
                 }
