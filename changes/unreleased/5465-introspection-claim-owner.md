@@ -1,5 +1,0 @@
----
-section: Security
-issues: [#5465]
----
-- **Only the worker that claimed an MCP introspection job can complete it** (#5465). A claim was single-job and single-use but not single-owner: another `mcp:introspect` worker that obtained a job's claim token could complete that job and store its own result. A claim now records the principal (user or service account) of the token that claimed it, and a completion from any other principal is answered exactly like a wrong token, `409 mcp_claim_invalid`, storing and changing nothing; the claimant can still complete. The binding is to the principal rather than the API token, so a worker that rotates its token mid-claim still completes its claim; workers that must not complete each other's jobs need separate service accounts. The stored snapshot (`reportedBy`) and its audit record now name the completing worker. Claims taken before the upgrade (migration 338) have no recorded owner and cannot be completed; they return to the queue when their 10-minute lease expires.

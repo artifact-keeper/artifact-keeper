@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4834]
----
-- **A `repository-owner` role member passes every inline repository-administration check** (#4834). Repository update and delete, cache TTL, upstream-not-found policy, stale-if-error grace, npm scope policy (read and write), proxy cache invalidation and virtual-member mutation gated on fine-grained `permissions` rows only, so a member holding the `admin` action through a role assignment (the `repository-owner` role granted to a repository's creator, and to the developers migration 172 promoted on older rule-less repositories) was refused 403. They now use the same resolver as `require_repo_admin` (#4818). Behaviour change: a `repository-owner` member, or a user with a global role assignment carrying `admin`, can now update and permanently delete that repository (`DELETE /api/v1/repositories/{key}`, token scope `delete:repositories`), not only a global admin or a user with a fine-grained `admin` rule. `developer` and `reader` members are still refused.

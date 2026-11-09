@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#5267]
----
-- **Two Agent Plugins repositories on one shared bucket can publish the same plugin archive** (#5267). Archives were stored under a content-only key, `agentplugins/{sha256}/{name}/{version}/{name}-{version}.zip`, with no repository in it, so when a staging and a production repository (or a private and a public one) on the same S3, GCS or Azure namespace published byte-identical zips, the second publish was refused with 409 "storage key ... is already owned by another repository". New archives on a shared cloud namespace are written under `agentplugins/{repository_id}/{sha256}/...`, the repository-scoped shape npm and Conan already use, so each repository keeps its own object; the content hash stays inside that prefix, so a losing concurrent publish of different bytes to the same version still cannot overwrite the winner's object. Filesystem backends and `STORAGE_KEY_SCHEME=flat` keep the previous key, and archives already published stay readable because downloads resolve the object through the key their artifact row recorded.
