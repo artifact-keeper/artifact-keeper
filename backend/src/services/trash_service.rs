@@ -50,6 +50,7 @@ use uuid::Uuid;
 use crate::api::dto::{Pagination, PaginationQuery};
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
+use crate::services::peer_instance_service::{PeerInstanceService, PublishedArtifact};
 use crate::storage::{StorageLocation, StorageRegistry};
 
 /// Largest `per_page` the list endpoint honours.
@@ -365,6 +366,7 @@ impl TrashService {
         let mut tx = self.db.begin().await?;
         let sql = format!(
             "SELECT {TRASH_COLUMNS_SQL}, a.is_deleted, r.storage_backend, r.storage_path, \
+                    a.created_at, \
                     EXISTS (SELECT 1 FROM artifacts l \
                             WHERE l.repository_id = a.repository_id AND l.path = a.path \
                               AND l.is_deleted = false AND l.id <> a.id) AS path_taken \
@@ -403,6 +405,23 @@ impl TrashService {
         )
         .bind(id)
         .execute(&mut *tx)
+        .await?;
+
+        // A delete task queued while the artifact was trashed (possibly for a
+        // peer that was offline at the time) must not take the restored
+        // artifact off a peer after the fact: cancel it and queue a push in
+        // the same transaction (#5505). A crash between the restore and the
+        // commit cannot leave a live artifact with a pending delete.
+        PeerInstanceService::queue_restored_artifact_sync_tasks(
+            &mut tx,
+            &PublishedArtifact {
+                id: candidate.row.id,
+                repository_id: candidate.row.repository_id,
+                path: &candidate.row.path,
+                size_bytes: candidate.row.size_bytes,
+                created_at: candidate.created_at,
+            },
+        )
         .await?;
         tx.commit().await?;
 
@@ -509,6 +528,7 @@ struct RestoreCandidate {
     is_deleted: bool,
     storage_backend: String,
     storage_path: String,
+    created_at: DateTime<Utc>,
     path_taken: bool,
 }
 
@@ -635,6 +655,61 @@ pub(crate) mod tests {
         )
     }
 
+    /// Register a peer with a `push` subscription to the fixture repository.
+    async fn subscribe_peer(fx: &tdh::Fixture, tag: &str) -> Uuid {
+        let peer_id = tdh::register_test_peer(&fx.pool, "trash-restore", tag).await;
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, 'push')",
+        )
+        .bind(peer_id)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("subscribe peer");
+        peer_id
+    }
+
+    async fn seed_sync_task(
+        fx: &tdh::Fixture,
+        peer_id: Uuid,
+        artifact_id: Uuid,
+        task_type: &str,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status) \
+             VALUES ($1, $2, $3, $4::text::sync_status)",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .bind(task_type)
+        .bind(status)
+        .execute(&fx.pool)
+        .await
+        .expect("seed sync task");
+    }
+
+    /// `(status, error_message)` of the peer's task of `task_type`.
+    async fn sync_task_state(
+        fx: &tdh::Fixture,
+        peer_id: Uuid,
+        artifact_id: Uuid,
+        task_type: &str,
+    ) -> Option<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT status::TEXT, error_message FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND artifact_id = $2 AND task_type = $3",
+        )
+        .bind(peer_id)
+        .bind(artifact_id)
+        .bind(task_type)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("read sync task")
+    }
+
     #[tokio::test]
     async fn list_shows_trashed_rows_with_purge_time_and_restorability() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
@@ -709,6 +784,69 @@ pub(crate) mod tests {
         );
         assert!(matches!(again, Err(AppError::NotFound(_))), "{again:?}");
         assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
+    }
+
+    /// #5505: restores supersede the deletes queued while the artifact was
+    /// trashed, and re-push it even to a peer whose push already finished,
+    /// because that peer may have applied the delete in between.
+    #[tokio::test]
+    async fn restore_cancels_queued_deletes_and_rearms_pushes() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let path = format!("generic/restore-sync-{uid}");
+        let id = seed_trashed(&fx, &path, true).await;
+
+        // A peer that was offline when the artifact was deleted (#5497): its
+        // delete is queued and still pending.
+        let offline = subscribe_peer(&fx, &format!("{uid}-offline")).await;
+        sqlx::query("UPDATE peer_instances SET status = 'offline' WHERE id = $1")
+            .bind(offline)
+            .execute(&fx.pool)
+            .await
+            .expect("mark peer offline");
+        let failed = subscribe_peer(&fx, &format!("{uid}-failed")).await;
+        let inflight = subscribe_peer(&fx, &format!("{uid}-inflight")).await;
+        let completed = subscribe_peer(&fx, &format!("{uid}-completed")).await;
+        let clean = subscribe_peer(&fx, &format!("{uid}-clean")).await;
+
+        seed_sync_task(&fx, offline, id, "delete", "pending").await;
+        seed_sync_task(&fx, failed, id, "delete", "failed").await;
+        seed_sync_task(&fx, inflight, id, "delete", "in_progress").await;
+        seed_sync_task(&fx, completed, id, "push", "completed").await;
+
+        let restored = service(&fx, 0).restore(id).await;
+        let offline_delete = sync_task_state(&fx, offline, id, "delete").await;
+        let failed_delete = sync_task_state(&fx, failed, id, "delete").await;
+        let inflight_delete = sync_task_state(&fx, inflight, id, "delete").await;
+        let mut pushes = Vec::new();
+        for peer_id in [offline, failed, inflight, completed, clean] {
+            pushes.push((peer_id, sync_task_state(&fx, peer_id, id, "push").await));
+        }
+        fx.teardown().await;
+
+        assert!(restored.is_ok(), "{restored:?}");
+        for (label, state) in [("pending", offline_delete), ("failed", failed_delete)] {
+            let (status, message) = state.expect("superseded delete row");
+            assert_eq!(
+                status, "cancelled",
+                "a {label} delete must be superseded by the restore"
+            );
+            assert_eq!(message.as_deref(), Some("superseded by artifact restore"));
+        }
+        assert_eq!(
+            inflight_delete,
+            Some(("in_progress".to_string(), None)),
+            "a delete already in flight is left to finish; the push follows it"
+        );
+        for (peer_id, state) in pushes {
+            assert_eq!(
+                state.map(|(status, _)| status).as_deref(),
+                Some("pending"),
+                "restore must queue a pending push for peer {peer_id}"
+            );
+        }
     }
 
     #[tokio::test]
