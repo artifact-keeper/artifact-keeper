@@ -1803,7 +1803,10 @@ async fn reencrypt_secrets_command() -> Result<()> {
     encryption::install_data_key(Some(
         encryption::parse_data_key(raw).map_err(AppError::Config)?,
     ));
-    let db_pool = db::create_pool(&config).await?;
+    // A plain pool: the startup-retry pool and its metrics are for the server.
+    let db_pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
     let report = encryption::reencrypt_legacy_rows(&db_pool, &config.jwt_secret).await?;
     println!("{report}");
     if report.failed > 0 {

@@ -284,9 +284,11 @@ mod tests {
             verify("x", "$pbkdf2-sha512$1000$c2FsdA$aGFzaGhhc2hoYXNoaGFzaA"),
             Err(Error::Malformed("missing iteration count"))
         );
+        // Without the closing `$` the prefix is not the format at all.
+        assert_eq!(verify("x", "$pbkdf2-sha512"), Err(Error::UnknownFormat));
         assert_eq!(
-            verify("x", "$pbkdf2-sha512"),
-            Err(Error::Malformed("missing parameters"))
+            verify("x", "$pbkdf2-sha512$"),
+            Err(Error::Malformed("missing iteration count"))
         );
         // A bcrypt-looking string that isn't a valid bcrypt hash is a miss.
         assert_eq!(verify("x", "$2b$garbage"), Ok(false));

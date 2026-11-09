@@ -736,7 +736,7 @@ jobs:
         env:
           FIPS_MODE: strict
         run: |
-          cargo nextest run -p artifact-keeper-backend --lib --features fips \
+          cargo nextest run -p artifact-keeper-backend --lib --bins --features fips \
             -E 'test(/^(crypto|fips)::/) | test(/password|api_token|dummy_bcrypt|encryption::|saml_non_approved/)'
 
       - name: Strict mode refuses a non-FIPS build
