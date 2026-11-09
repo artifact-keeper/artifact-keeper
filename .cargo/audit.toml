@@ -89,4 +89,19 @@ ignore = [
     "RUSTSEC-2026-0391",
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
+
+    # libsqlite3-sys 0.30.1 bundles a C SQLite affected by CVE-2026-119375
+    # (RUSTSEC-2026-0459, patched in libsqlite3-sys >= 0.39.0). It is in
+    # Cargo.lock only as the dependency of sqlx-sqlite 0.9.0, which sqlx and
+    # sqlx-macros-core name through weak `sqlx-sqlite?/...` features (any,
+    # chrono, json, uuid, migrate). Cargo writes such optional deps into the
+    # lockfile even when they are never activated; we enable only the
+    # postgres driver, so `cargo tree -i libsqlite3-sys -e normal,build,dev
+    # --target all` prints nothing: no SQLite code is compiled, linked or
+    # executed. Same situation as rsa via sqlx-mysql above. It cannot be
+    # updated away: sqlx 0.9.0 is the latest release and sqlx-sqlite 0.9.0
+    # requires libsqlite3-sys < 0.38, and turning off sqlx's default features
+    # leaves it in the lock. Remove once sqlx allows libsqlite3-sys >= 0.39 or
+    # the lock no longer contains it (#5555).
+    "RUSTSEC-2026-0459",
 ]
