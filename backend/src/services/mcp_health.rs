@@ -88,6 +88,7 @@ pub fn gate_token(g: &GateOutcome) -> &'static str {
         GateOutcome::ScanPolicy => "scan_policy",
         GateOutcome::AgeGate { .. } => "age_gate",
         GateOutcome::Unresolvable => "unresolvable",
+        GateOutcome::Shadowed => "shadowed",
         GateOutcome::Unavailable => "unavailable",
     }
 }
@@ -95,9 +96,10 @@ pub fn gate_token(g: &GateOutcome) -> &'static str {
 /// One package's status (pure).
 pub fn package_status(gate: &GateOutcome, scanned: bool, c: &SeverityCounts) -> HealthStatus {
     match gate {
-        GateOutcome::Quarantine | GateOutcome::ScanPolicy | GateOutcome::Unresolvable => {
-            return HealthStatus::Critical
-        }
+        GateOutcome::Quarantine
+        | GateOutcome::ScanPolicy
+        | GateOutcome::Unresolvable
+        | GateOutcome::Shadowed => return HealthStatus::Critical,
         _ if c.critical > 0 => return HealthStatus::Critical,
         GateOutcome::AgeGate { .. } => return HealthStatus::Warning,
         _ => {}

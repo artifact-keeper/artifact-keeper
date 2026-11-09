@@ -454,6 +454,9 @@ pub mod metadata_epoch;
 #[cfg(test)]
 pub(crate) mod test_db_helpers;
 
+#[cfg(test)]
+pub(crate) mod mcp_shadow_fixtures;
+
 /// #4559: router-level tests for tokens scoped to a virtual repository.
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]

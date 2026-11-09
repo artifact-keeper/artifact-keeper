@@ -370,6 +370,7 @@ fn issue(e: &McpError) -> serde_json::Value {
         | McpError::OciFloatingTag { index }
         | McpError::ExternalRegistry { index, .. }
         | McpError::PackageNotFound { index, .. }
+        | McpError::PackageShadowed { index, .. }
         | McpError::BundleSignatureRequired { index, .. }
         | McpError::PackageVersionUnpinned { index }
         | McpError::OciNotAnImage { index } => ("semantic", format!("packages[{index}]")),

@@ -110,6 +110,9 @@ pub enum McpError {
     ExternalRegistry { index: usize, detail: String },
     /// Package not present in its backing repository (422).
     PackageNotFound { index: usize, detail: String },
+    /// A package a Virtual backing repository would serve from another
+    /// member than the one holding it (422, #5456).
+    PackageShadowed { index: usize, detail: String },
     /// An `mcpb` bundle that does not satisfy the publishing repository's
     /// `mcp_require_bundle_signature` (unsigned, or a signer not on the
     /// trusted list) (422).
@@ -164,6 +167,7 @@ impl McpError {
             | McpError::OciFloatingTag { .. }
             | McpError::ExternalRegistry { .. }
             | McpError::PackageNotFound { .. }
+            | McpError::PackageShadowed { .. }
             | McpError::BundleSignatureRequired { .. }
             | McpError::PackageVersionUnpinned { .. }
             | McpError::OciNotAnImage { .. }
@@ -185,6 +189,7 @@ impl McpError {
             McpError::OciFloatingTag { .. } => "mcp_oci_floating_tag",
             McpError::ExternalRegistry { .. } => "mcp_external_registry",
             McpError::PackageNotFound { .. } => "mcp_package_not_found",
+            McpError::PackageShadowed { .. } => "mcp_package_shadowed",
             McpError::BundleSignatureRequired { .. } => "mcp_bundle_signature_required",
             McpError::PackageVersionUnpinned { .. } => "mcp_package_version_unpinned",
             McpError::OciNotAnImage { .. } => "mcp_oci_not_an_image",
@@ -219,6 +224,7 @@ impl McpError {
             ),
             McpError::ExternalRegistry { index, detail }
             | McpError::PackageNotFound { index, detail }
+            | McpError::PackageShadowed { index, detail }
             | McpError::BundleSignatureRequired { index, detail } => {
                 format!("packages[{index}]: {detail}")
             }
@@ -1641,6 +1647,11 @@ pub struct ResolvedPin {
     /// The backing `artifacts` rows the gate evaluates.
     #[serde(default)]
     pub artifact_ids: Vec<Uuid>,
+    /// The sha256 of each `artifact_ids` row at publish, in the same order
+    /// (absent on pins taken before #5456): a row whose bytes changed in
+    /// place no longer counts as the pinned row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_sha256s: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2156,6 +2167,9 @@ pub enum GateOutcome {
     },
     /// The pinned artifact or manifest is gone (or was never pinned).
     Unresolvable,
+    /// A Virtual backing repository now serves the pinned coordinate from
+    /// another member than the pinned one (#5456).
+    Shadowed,
     /// The gate could not be evaluated.
     Unavailable,
 }
@@ -2360,6 +2374,14 @@ pub fn decide_mcp_serve(
                     "mcp_unresolvable",
                     "A package this server version runs can no longer be resolved",
                     serde_json::json!({"package": gate.package}),
+                )
+            }
+            GateOutcome::Shadowed => {
+                return refuse(
+                    "unresolvable",
+                    "mcp_unresolvable",
+                    "A package this server version runs can no longer be resolved",
+                    serde_json::json!({"package": gate.package, "gate": "shadowed"}),
                 )
             }
         }
@@ -3241,6 +3263,7 @@ mod tests {
                 repository: format!("{ty}-local"),
                 repository_id: Uuid::nil(),
                 artifact_ids: vec![],
+                artifact_sha256s: Vec::new(),
                 sha256: None,
                 name: Some("acme/mcp".into()),
                 tag: tag.map(Into::into),

@@ -2721,6 +2721,7 @@ mod tests {
                 repository: "oci-local".into(),
                 repository_id: Uuid::nil(),
                 artifact_ids: vec![],
+                artifact_sha256s: Vec::new(),
                 sha256: None,
                 name: Some("acme/mcp".into()),
                 tag: Some("1.2".into()),
