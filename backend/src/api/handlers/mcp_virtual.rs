@@ -54,28 +54,33 @@ pub fn serving_order<T>(members: Vec<T>, is_hosted: impl Fn(&T) -> bool) -> Vec<
     hosted
 }
 
-/// A member's keyset position: `(name, version)`, `None` = its first row.
-pub type MemberPosition = (String, Option<(String, String)>);
+/// A member and where that member's listing resumes
+/// ([`fmt::ListingResume::default`]: its first row).
+pub type MemberPosition = (String, fmt::ListingResume);
 
-/// The Virtual `scope`'s cursor resuming member `member_key` after `after`
-/// (`None`: at the start of that member), sealed: opaque to a client, and
-/// a cursor nobody issued is refused.
+/// The Virtual `scope`'s cursor resuming member `member_key` at `at`,
+/// sealed: opaque to a client, and a cursor nobody issued is refused. Like a
+/// hosted listing's, it names only a row the listing served (#5453).
 pub fn encode_member_cursor(
     seal: &fmt::CursorSeal,
     scope: Uuid,
     member_key: &str,
-    after: Option<&(String, String)>,
+    at: &fmt::ListingResume,
 ) -> String {
-    let (name, version) = after
+    let (name, version) = at
+        .after
+        .as_ref()
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .unwrap_or(("", ""));
+    let read = fmt::encode_read(at.read);
     seal.seal(
         scope,
-        &[fmt::cursor_kind::VIRTUAL, member_key, name, version],
+        &[fmt::cursor_kind::VIRTUAL, member_key, name, version, &read],
     )
 }
 
-/// Inverse of [`encode_member_cursor`]: the member key and its keyset
+/// Inverse of [`encode_member_cursor`]: the member key and where it
+/// resumes. A cursor issued before #5453 (no row id) resumes after its
 /// position. Anything else is the listing's `400`.
 pub fn decode_member_cursor(
     seal: &fmt::CursorSeal,
@@ -83,27 +88,32 @@ pub fn decode_member_cursor(
     cursor: &str,
 ) -> Result<MemberPosition, McpError> {
     let bad = || McpError::invalid_query("cursor", "invalid cursor");
-    let [kind, key, name, version] =
-        <[String; 4]>::try_from(seal.open(scope, cursor)?).map_err(|_| bad())?;
+    let parts = seal.open(scope, cursor)?;
+    let (kind, key, name, version, read) = match parts.as_slice() {
+        [k, key, n, v] => (k, key, n, v, None),
+        [k, key, n, v, read] => (k, key, n, v, fmt::decode_read(read).ok_or_else(bad)?),
+        _ => return Err(bad()),
+    };
     if kind != fmt::cursor_kind::VIRTUAL || key.is_empty() {
         return Err(bad());
     }
-    match (name.is_empty(), version.is_empty()) {
-        (true, true) => Ok((key, None)),
-        (false, false) => Ok((key, Some((name, version)))),
-        _ => Err(bad()),
-    }
+    let after = match (name.is_empty(), version.is_empty()) {
+        (true, true) => None,
+        (false, false) => Some((name.clone(), version.clone())),
+        _ => return Err(bad()),
+    };
+    Ok((key.clone(), fmt::ListingResume { after, read }))
 }
 
-/// Where a listing starts: the member index and that member's keyset
-/// position. An unknown member key (a member removed between pages) is the
-/// listing's `400`.
+/// Where a listing starts: the member index and where that member resumes.
+/// An unknown member key (a member removed between pages) is the listing's
+/// `400`.
 pub fn start_position(
     keys: &[&str],
     cursor: Option<MemberPosition>,
-) -> Result<(usize, Option<(String, String)>), McpError> {
+) -> Result<(usize, fmt::ListingResume), McpError> {
     let Some((key, inner)) = cursor else {
-        return Ok((0, None));
+        return Ok((0, fmt::ListingResume::default()));
     };
     let idx = keys
         .iter()
@@ -342,8 +352,7 @@ async fn virtual_latest(
         if rows.is_empty() {
             continue;
         }
-        let policy = mcp::current_policy(&state.db, m.id).await;
-        match mcp::newest_servable(ctx, m.id, rows, &HashSet::new(), policy)
+        match mcp::newest_servable(ctx, m.id, rows, &HashSet::new())
             .await
             .0
         {
@@ -572,13 +581,13 @@ struct Page {
     all_latest: bool,
 }
 
-/// Where the next page resumes: a member and its own cursor.
-fn resume_cursor(members: &Members, idx: usize, after: Option<&(String, String)>) -> String {
+/// Where the next page resumes: a member and its own position.
+fn resume_cursor(members: &Members, idx: usize, at: &fmt::ListingResume) -> String {
     encode_member_cursor(
         &members.seal,
         members.virtual_id,
         &members.order[idx].key,
-        after,
+        at,
     )
 }
 
@@ -684,16 +693,15 @@ async fn drop_shadowed(
         if theirs.is_empty() {
             continue;
         }
-        let policy = mcp::current_policy(&state.db, m.id).await;
         let all_theirs: HashSet<(String, String)> = theirs
             .iter()
             .map(|r| (r.name.clone(), r.version.clone()))
             .collect();
-        let served: HashSet<(String, String)> =
-            match mcp::servable_checked(ctx, m.id, theirs, policy).await {
-                Ok(served) => served.into_iter().map(|r| (r.name, r.version)).collect(),
-                Err(_) => all_theirs,
-            };
+        let served: HashSet<(String, String)> = match mcp::servable_checked(ctx, m.id, theirs).await
+        {
+            Ok(served) => served.into_iter().map(|r| (r.name, r.version)).collect(),
+            Err(_) => all_theirs,
+        };
         rows.retain(|r| !served.contains(&(r.name.clone(), r.version.clone())));
     }
     Ok(rows)
@@ -703,7 +711,7 @@ async fn list_page(
     state: &SharedState,
     members: &Members,
     q: &ListQuery,
-    start: (usize, Option<(String, String)>),
+    start: (usize, fmt::ListingResume),
 ) -> Result<Page, Response> {
     let want = q.limit as usize;
     let ctx = GateCtx::of(state, false);
@@ -712,33 +720,42 @@ async fn list_page(
     let mut resume: Option<String> = None;
     'members: for idx in start.0..members.order.len() {
         let m = &members.order[idx];
-        let policy = mcp::current_policy(&state.db, m.id).await;
-        let mut after = if idx == start.0 {
+        // The scan's own position (internal, may be a held row) and the
+        // resume point a cursor may carry (the last row served from this
+        // member, and the id of the last row read past it).
+        let mut at = if idx == start.0 {
             start.1.clone()
         } else {
-            None
+            fmt::ListingResume::default()
         };
+        let mut after = mcp::resume_after(&state.db, m.id, &at).await?;
         loop {
             let batch =
                 mcp::fetch_listing_batch(&state.db, m.id, q, after.as_ref(), q.limit + 1).await?;
             read += batch.raw_len;
             let exhausted = (batch.raw_len as i64) <= q.limit;
-            if let Some(last) = batch.last {
+            if let Some(last) = batch.last.clone() {
                 after = Some(last);
             }
-            let rows = mcp::servable(ctx, m.id, batch.rows, policy).await;
+            let rows = mcp::servable(ctx, m.id, batch.rows).await;
             let rows = drop_shadowed(state, members, idx, rows, q.include_deleted).await?;
+            mcp::advance_resume(&mut at, &batch.read, &rows);
             out.extend(rows.into_iter().map(|r| (idx, r)));
             if out.len() > want {
                 break 'members;
             }
             if read >= mcp::MAX_LISTING_ROWS {
-                // The row bound stopped the scan: resume where it stopped
-                // rather than presenting a short last page.
+                // The row bound stopped the scan: resume past the rows read
+                // rather than presenting a short last page, naming the last
+                // one by its id only (#5453).
                 if !exhausted {
-                    resume = Some(resume_cursor(members, idx, after.as_ref()));
+                    resume = Some(resume_cursor(members, idx, &at));
                 } else if idx + 1 < members.order.len() {
-                    resume = Some(resume_cursor(members, idx + 1, None));
+                    resume = Some(resume_cursor(
+                        members,
+                        idx + 1,
+                        &fmt::ListingResume::default(),
+                    ));
                 }
                 break 'members;
             }
@@ -752,7 +769,7 @@ async fn list_page(
         Some(resume_cursor(
             members,
             *idx,
-            Some(&(last.name.clone(), last.version.clone())),
+            &fmt::ListingResume::after(&last.name, &last.version),
         ))
     } else {
         resume
@@ -771,7 +788,7 @@ async fn list_latest(
     state: &SharedState,
     members: &Members,
     q: &ListQuery,
-    start: (usize, Option<(String, String)>),
+    start: (usize, fmt::ListingResume),
 ) -> Result<Page, Response> {
     let want = q.limit as usize;
     let mut out: Vec<(usize, VersionRow)> = Vec::new();
@@ -779,11 +796,17 @@ async fn list_latest(
     let mut next: Option<String> = None;
     'members: for idx in start.0..members.order.len() {
         let m = &members.order[idx];
-        let mut name_after = if idx == start.0 {
-            start.1.as_ref().map(|(n, _)| n.clone())
+        // As in `list_page`: the scan's own position, and the resume point
+        // (the last server emitted from this member, and the id of a row of
+        // the last server decided past it).
+        let mut at = if idx == start.0 {
+            start.1.clone()
         } else {
-            None
+            fmt::ListingResume::default()
         };
+        let mut name_after = mcp::resume_after(&state.db, m.id, &at)
+            .await?
+            .map(|(n, _)| n);
         loop {
             let names = mcp::fetch_server_names(
                 &state.db,
@@ -794,13 +817,14 @@ async fn list_latest(
             )
             .await?;
             let names_exhausted = names.len() <= want;
-            let owned = hosted_owned_names(state, members, &names).await?;
-            for name in names {
+            let just_names: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+            let owned = hosted_owned_names(state, members, &just_names).await?;
+            for (name, id) in names {
                 if out.len() == want || budget == 0 {
-                    let after = name_after.as_ref().map(|n| (n.clone(), "-".to_string()));
-                    next = Some(resume_cursor(members, idx, after.as_ref()));
+                    next = Some(resume_cursor(members, idx, &at));
                     break 'members;
                 }
+                let mut emitted = false;
                 if !members.denies(&name) {
                     let owners = members.owners(owned.owns(&name), &name);
                     let (picked, walked) = virtual_latest(state, members, &owners, &name).await?;
@@ -811,8 +835,10 @@ async fn list_latest(
                                 .is_none_or(|since| r.stored.registry.updated_at >= since)
                     }) {
                         out.push((owner, row));
+                        emitted = true;
                     }
                 }
+                at.advance_one(id, (name.clone(), mcp::LATEST_POSITION.into()), emitted);
                 name_after = Some(name);
             }
             if names_exhausted {
@@ -851,21 +877,47 @@ mod tests {
     fn member_cursor_round_trips_and_rejects_garbage() {
         let seal = test_seal();
         let scope = Uuid::new_v4();
-        let at = ("com.acme/x".to_string(), "1.0.0".to_string());
-        let c = encode_member_cursor(&seal, scope, "mcp-local", Some(&at));
+        let at = fmt::ListingResume::after("com.acme/x", "1.0.0");
+        let c = encode_member_cursor(&seal, scope, "mcp-local", &at);
         assert_eq!(
             decode_member_cursor(&seal, scope, &c).unwrap(),
-            ("mcp-local".to_string(), Some(at.clone()))
+            ("mcp-local".to_string(), at.clone())
         );
-        let start = encode_member_cursor(&seal, scope, "mcp-remote", None);
+        let start = encode_member_cursor(&seal, scope, "mcp-remote", &Default::default());
         assert_eq!(
             decode_member_cursor(&seal, scope, &start).unwrap(),
-            ("mcp-remote".to_string(), None)
+            ("mcp-remote".to_string(), Default::default())
+        );
+        // #5453: a resume past unserved rows names none of them.
+        let past = fmt::ListingResume {
+            after: None,
+            read: Some(Uuid::new_v4()),
+        };
+        let c = encode_member_cursor(&seal, scope, "mcp-local", &past);
+        assert_eq!(
+            decode_member_cursor(&seal, scope, &c).unwrap(),
+            ("mcp-local".to_string(), past)
+        );
+        // A cursor issued before #5453 (no skip) still resumes.
+        let legacy = seal.seal(
+            scope,
+            &[
+                fmt::cursor_kind::VIRTUAL,
+                "mcp-local",
+                "com.acme/x",
+                "1.0.0",
+            ],
+        );
+        assert_eq!(
+            decode_member_cursor(&seal, scope, &legacy).unwrap(),
+            ("mcp-local".to_string(), at)
         );
         let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
         // The pre-seal format, which a client could build by hand.
         let hand_made = b64(&format!("m:mcp-local:{}", b64("com.acme/x:1.0.0")));
-        let other_scope = encode_member_cursor(&seal, Uuid::new_v4(), "mcp-local", None);
+        let other_scope =
+            encode_member_cursor(&seal, Uuid::new_v4(), "mcp-local", &Default::default());
+        let bad_read = seal.seal(scope, &[fmt::cursor_kind::VIRTUAL, "k", "a/b", "1", "-1"]);
         let hosted = seal.encode_position(scope, fmt::cursor_kind::SERVERS, "a/b", "1");
         let no_key = seal.seal(scope, &[fmt::cursor_kind::VIRTUAL, "", "", ""]);
         let half = seal.seal(scope, &[fmt::cursor_kind::VIRTUAL, "k", "a/b", ""]);
@@ -879,6 +931,7 @@ mod tests {
             &hosted,
             &no_key,
             &half,
+            &bad_read,
         ] {
             // D4: a malformed composite cursor is a query error.
             assert_eq!(
@@ -894,18 +947,21 @@ mod tests {
     #[test]
     fn start_position_finds_the_member_and_its_keyset() {
         let keys = ["a", "b"];
-        assert_eq!(start_position(&keys, None).unwrap(), (0, None));
-        let at = ("n/x".to_string(), "2".to_string());
         assert_eq!(
-            start_position(&keys, Some(("b".into(), Some(at.clone())))).unwrap(),
-            (1, Some(at))
+            start_position(&keys, None).unwrap(),
+            (0, Default::default())
+        );
+        let at = fmt::ListingResume::after("n/x", "2");
+        assert_eq!(
+            start_position(&keys, Some(("b".into(), at.clone()))).unwrap(),
+            (1, at)
         );
         assert_eq!(
-            start_position(&keys, Some(("b".into(), None))).unwrap(),
-            (1, None)
+            start_position(&keys, Some(("b".into(), Default::default()))).unwrap(),
+            (1, Default::default())
         );
         assert_eq!(
-            start_position(&keys, Some(("gone".into(), None)))
+            start_position(&keys, Some(("gone".into(), Default::default())))
                 .unwrap_err()
                 .code(),
             "mcp_invalid_query"
@@ -1029,6 +1085,14 @@ mod tests {
         /// written by its sync in production; here a hosted publish into a
         /// scratch repository is moved under it.
         async fn store(&self, m: usize, name: &str, version: &str, description: &str) -> Uuid {
+            self.store_doc(m, &server_doc(name, version, description))
+                .await
+        }
+
+        /// [`Self::store`] of a whole server.json.
+        async fn store_doc(&self, m: usize, doc: &serde_json::Value) -> Uuid {
+            let name = doc["name"].as_str().unwrap();
+            let version = doc["version"].as_str().unwrap();
             let (id, key, _) = &self.members[m];
             let remote: bool = sqlx::query_scalar(
                 "SELECT repo_type::text = 'remote' FROM repositories WHERE id = $1",
@@ -1052,9 +1116,7 @@ mod tests {
                 .method("POST")
                 .uri(format!("/{key}/v0.1/publish"))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&server_doc(name, version, description)).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(doc).unwrap()))
                 .unwrap();
             let (s, b, _) = tdh::send_with_headers(admin, req).await;
             if remote {
@@ -1195,6 +1257,84 @@ mod tests {
         env.teardown().await;
     }
 
+    /// #5452: a Virtual serves an `open` member's version only as the
+    /// member's own serve decision allows. A version whose package carries
+    /// no AK pin (as `open` stored them before the fix) is never served
+    /// through the Virtual: the read falls through to the next member, and
+    /// the listing does not carry it. A member's pinned `open` package is
+    /// served at its AK coordinates, not the submitted foreign registry.
+    #[tokio::test]
+    async fn open_members_serve_only_pinned_packages() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let l1 = env.member("local", 1, true).await;
+        let l2 = env.member("local", 2, true).await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&env.fx.pool, "local", "npm").await;
+        let mut npm = tdh::make_repo_info(npm_id, &npm_key, &npm_dir, "local", None);
+        npm.format = "npm".into();
+        tdh::seed_artifact_with_checksum(
+            &env.fx.state,
+            &env.fx.pool,
+            &npm,
+            "npm/echo-1.0.0.tgz",
+            "@acme/echo/-/echo-1.0.0.tgz",
+            "@acme/echo",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from_static(b"tgz"),
+            env.fx.user_id,
+            &"e".repeat(64),
+        )
+        .await;
+        env.members.push((npm_id, npm_key.clone(), npm_dir));
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'mcp_package_repos', $2)",
+        )
+        .bind(env.members[l2].0)
+        .bind(serde_json::json!({"npm": npm_key}).to_string())
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+
+        let unpinned = env.store(l1, "com.acme/x", "1.0.0", "from-l1").await;
+        let mut pinned = server_doc("com.acme/x", "1.0.0", "from-l2");
+        pinned["packages"] = serde_json::json!([{
+            "registryType": "npm", "identifier": "@acme/echo", "version": "1.0.0",
+            "registryBaseUrl": "https://npm.evil.test", "transport": {"type": "stdio"},
+        }]);
+        env.store_doc(l2, &pinned).await;
+        // l1's version as `open` stored it before #5452: a package, no pin.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{server,packages}', $2) \
+             WHERE artifact_id = $1",
+        )
+        .bind(unpinned)
+        .bind(serde_json::json!([{
+            "registryType": "npm", "identifier": "@evil/pkg", "version": "3.0.0",
+            "registryBaseUrl": "https://npm.evil.test", "transport": {"type": "stdio"},
+        }]))
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+
+        let (s, b) = env.get("/servers/com.acme%2Fx/versions/1.0.0").await;
+        assert_eq!(
+            (s, b["server"]["description"].as_str()),
+            (StatusCode::OK, Some("from-l2")),
+            "{b}"
+        );
+        assert_eq!(
+            b["server"]["packages"][0]["registryBaseUrl"],
+            format!("http://localhost/npm/{npm_key}")
+        );
+        let (s, b) = env.get("/servers").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(descriptions(&b), vec!["com.acme/x@1.0.0=from-l2"]);
+        env.teardown().await;
+    }
+
     #[tokio::test]
     async fn hosted_shadows_remote_even_when_unreadable() {
         let Some(mut env) = Env::new().await else {
@@ -1286,7 +1426,7 @@ mod tests {
             (StatusCode::BAD_REQUEST, Some("mcp_invalid_query"))
         );
         let seal = super::super::mcp::cursor_seal(&env.fx.state);
-        let gone = encode_member_cursor(&seal, env.fx.repo_id, "not-a-member", None);
+        let gone = encode_member_cursor(&seal, env.fx.repo_id, "not-a-member", &Default::default());
         assert_eq!(
             env.get(&format!("/servers?cursor={gone}")).await.0,
             StatusCode::BAD_REQUEST

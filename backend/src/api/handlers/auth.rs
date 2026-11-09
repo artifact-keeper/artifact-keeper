@@ -3723,8 +3723,9 @@ mod personal_token_repo_selector_tests {
         );
         assert_eq!(
             write(&rig, &token, &rig.repo_b.1).await,
-            StatusCode::FORBIDDEN,
-            "a write to B outside the selector must be refused"
+            StatusCode::NOT_FOUND,
+            "a write to private B outside the selector must be refused with the \
+             existence-hiding 404 (#5458)"
         );
 
         cleanup(&rig).await;

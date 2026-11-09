@@ -218,18 +218,15 @@ async fn staged_bundles(
 
 /// When a document names no `mcpb` package but bundles were uploaded for its
 /// version, add one `packages[]` entry per bundle (identifier = the bundle's
-/// Artifact Keeper URL, `fileSha256` computed at upload). Under the `open`
-/// policy nothing is added.
+/// Artifact Keeper URL, `fileSha256` computed at upload), under either
+/// package policy.
 pub async fn add_staged_bundles(
     db: &PgPool,
     repo: &RepoInfo,
-    settings: &McpSettings,
     server: &mut fmt::ServerJson,
     base: &str,
 ) -> Result<(), Response> {
-    if settings.policy == fmt::PackagePolicy::Open
-        || server.packages.iter().any(|p| p.registry_type == "mcpb")
-    {
+    if server.packages.iter().any(|p| p.registry_type == "mcpb") {
         return Ok(());
     }
     for (file, sha) in staged_bundles(db, repo.id, &server.name, &server.version).await? {
@@ -373,6 +370,7 @@ fn issue(e: &McpError) -> serde_json::Value {
         | McpError::OciFloatingTag { index }
         | McpError::ExternalRegistry { index, .. }
         | McpError::PackageNotFound { index, .. }
+        | McpError::PackageShadowed { index, .. }
         | McpError::BundleSignatureRequired { index, .. }
         | McpError::PackageVersionUnpinned { index }
         | McpError::OciNotAnImage { index } => ("semantic", format!("packages[{index}]")),
@@ -560,7 +558,7 @@ async fn validate(
             fmt::check_installable(&server)?;
             return Ok((server, None));
         }
-        add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str())
+        add_staged_bundles(&state.db, &repo, &mut server, base.as_str())
             .await
             .map_err(|_| McpError::Internal("bundle lookup failed".into()))?;
         fmt::check_installable(&server)?;
@@ -727,9 +725,13 @@ async fn edit_impl(
             serde_json::json!({}),
         ));
     }
-    add_staged_bundles(&state.db, &repo, &settings, &mut server, base.as_str()).await?;
+    add_staged_bundles(&state.db, &repo, &mut server, base.as_str()).await?;
     fmt::check_installable(&server).map_err(mcp_error)?;
-    let keep_pins = packages_unchanged(&current.stored.server, &server);
+    // A version with an unpinned package (stored under `open` before #5452)
+    // is resolved again, even by a PUT of the same document: that is how an
+    // administrator re-resolves it in place.
+    let repin = current.stored.unpinned_package().is_some();
+    let keep_pins = !repin && packages_unchanged(&current.stored.server, &server);
     if !keep_pins {
         mcp_packages::refuse_unreadable_backing(&state.db, &ext, &settings, &server)
             .await
@@ -763,7 +765,7 @@ async fn edit_impl(
         .map_err(IntoResponse::into_response)?;
     let bytes = fmt::canonical_bytes(&server);
     let sha256 = fmt::sha256_hex(&bytes);
-    if sha256 == current.checksum.trim() {
+    if sha256 == current.checksum.trim() && !repin {
         // Nothing to change.
         let entry = served_entry(
             &current,
@@ -855,7 +857,10 @@ async fn edit_impl(
         serde_json::json!({
             "previous_sha256": current.checksum.trim(),
             "sha256": sha256,
-            "packages_changed": !keep_pins,
+            "packages_changed": !packages_unchanged(&current.stored.server, &server),
+            // A version with an unpinned package resolved again, even for
+            // an identical document (#5452).
+            "repinned": repin,
             "resolving": resolution.pending.iter().map(|p| p.index).collect::<Vec<_>>(),
         }),
     );
@@ -870,7 +875,7 @@ async fn edit_impl(
         );
     }
     let row = stored_row(&state.db, current.artifact_id).await?;
-    let latest = surface::row_is_latest(state, &repo, &row, settings.policy).await;
+    let latest = surface::row_is_latest(state, &repo, &row).await;
     let entry = served_entry(&row, &repo, base.as_str(), latest);
     Ok(publish_answer(entry, &resolution))
 }
@@ -1243,7 +1248,7 @@ async fn purge_impl(
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
     for artifact in &trashed {
-        artifacts.finish_delete(artifact, true).await;
+        artifacts.finish_delete(artifact, true, Some(&ext)).await;
     }
     let mut released = Vec::new();
     for (repository_id, image, digest) in oci_pin_digests(&row) {
@@ -1709,11 +1714,9 @@ async fn download_bundle(
     else {
         return Err(not_found());
     };
-    let policy_now = surface::current_policy(&state.db, repo.id).await;
     match surface::decide_row(
         mcp_packages::GateCtx::of(state, false),
         &owner,
-        policy_now,
         false,
         fmt::GateAudience::ReaderOnly,
         String::new(),
@@ -1909,6 +1912,7 @@ mod tests {
                 fill_repository: "npm-remote".into(),
                 fill_repository_id: Uuid::nil(),
                 fill_format: "npm".into(),
+                registry_base_url: None,
             }],
         };
         let v = validation_result(Ok(&res));
@@ -1965,6 +1969,23 @@ mod tests {
     const UNSIGNED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-unsigned.mcpb");
     const SIGNED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-signed.mcpb");
     const TAMPERED: &[u8] = include_bytes!("../../../tests/fixtures/mcpb/echo-tampered.mcpb");
+
+    /// A ZIP holding `entries` entries, the last of which is a valid root
+    /// `manifest.json`, for the upload-path entry-ceiling regression.
+    fn bundle_with_entries(entries: usize) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for i in 0..entries.saturating_sub(1) {
+                z.start_file(format!("filler/{i}"), options).unwrap();
+            }
+            z.start_file("manifest.json", options).unwrap();
+            std::io::Write::write_all(&mut z, br#"{"name":"x","version":"1"}"#).unwrap();
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
 
     struct Env {
         fx: tdh::Fixture,
@@ -2414,6 +2435,135 @@ mod tests {
             .json(env.admin(), "POST", "/validate", Some(&plain))
             .await;
         assert_eq!(b["issues"][0]["reference"], "mcp_version_exists");
+        env.teardown().await;
+    }
+
+    /// #5467: an MCPB bundle over the shared entry ceiling is refused with the
+    /// bounded 400 before anything is stored, and a valid upload still works.
+    #[tokio::test]
+    async fn bundle_over_entry_ceiling_is_refused_without_rows() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let max = crate::util::bounded_archive::max_ingest_archive_entries() as usize;
+        let tail = "/servers/com.acme/echo/versions/1.0.0/bundles/too-many.mcpb";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(env.url(tail))
+            .body(Body::from(bundle_with_entries(max + 1)))
+            .unwrap();
+        let (status, body) = tdh::send(env.member(), req).await;
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("mcp_bundle_invalid")),
+            "{body}"
+        );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(env.fx.repo_id)
+        .bind(resolver::bundle_path(
+            "com.acme/echo",
+            "1.0.0",
+            "too-many.mcpb",
+        ))
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, 0, "a refused bundle stores no artifact");
+
+        // The refusal does not poison the next valid upload.
+        let valid = Request::builder()
+            .method("PUT")
+            .uri(env.url("/servers/com.acme/echo/versions/1.0.0/bundles/echo.mcpb"))
+            .body(Body::from(UNSIGNED))
+            .unwrap();
+        assert_eq!(tdh::send(env.member(), valid).await.0, StatusCode::CREATED);
+
+        env.teardown().await;
+    }
+
+    /// Every file under `dir`, recursively.
+    fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(files_under(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// #5468, #5469, #5470: a bundle with duplicate manifests or JSON keys,
+    /// an unsafe, link or special-file entry, a non-UTF-8 name, or central and
+    /// local headers that disagree is refused through the upload route with
+    /// `400 mcp_bundle_invalid` and a detail naming the defect, and nothing
+    /// is stored (no artifact row, no bundle facts, no storage object). A
+    /// benign archive and the fixture are still accepted afterwards.
+    #[tokio::test]
+    async fn hostile_bundle_entries_are_refused_without_storing() {
+        let Some(env) = Env::new().await else {
+            return;
+        };
+        let put = |file: String, bytes: Vec<u8>| {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(env.url(&format!(
+                    "/servers/com.acme/echo/versions/1.0.0/bundles/{file}"
+                )))
+                .body(Body::from(bytes))
+                .unwrap();
+            tdh::send(env.member(), req)
+        };
+        let before = files_under(&env.fx.storage_dir);
+        for (case, bytes, detail) in mcpb::hostile_zips::cases() {
+            let (status, body) = put(format!("{case}.mcpb"), bytes).await;
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some("mcp_bundle_invalid")),
+                "{case}: {body}"
+            );
+            assert!(
+                body["detail"].as_str().is_some_and(|d| d.contains(detail)),
+                "{case}: {body}"
+            );
+        }
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a refused bundle stores no artifact");
+        let facts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_metadata m JOIN artifacts a ON a.id = m.artifact_id \
+             WHERE a.repository_id = $1",
+        )
+        .bind(env.fx.repo_id)
+        .fetch_one(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(facts, 0, "a refused bundle records no facts");
+        assert_eq!(
+            files_under(&env.fx.storage_dir),
+            before,
+            "a refused bundle writes no storage object"
+        );
+
+        let (status, body) = put("benign.mcpb".into(), mcpb::hostile_zips::benign()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, _) = put("echo.mcpb".into(), UNSIGNED.to_vec()).await;
+        assert_eq!(status, StatusCode::CREATED);
         env.teardown().await;
     }
 
@@ -2895,6 +3045,123 @@ mod tests {
                 "{key}: the refusal names the policy: {b}"
             );
         }
+        env.teardown().await;
+    }
+
+    /// #5452: under `open`, coordinates naming another registry than a Remote
+    /// backing repository's upstream are neither filled through it nor
+    /// pinned from it (refused, and neither registry sees a request);
+    /// coordinates naming its upstream are filled (`202 resolving`), pinned
+    /// with `foreign_coordinates_replaced` and served at AK coordinates. A
+    /// version whose pins were lost (the pre-#5452 `open` shape) is
+    /// re-resolved in place by an admin `PUT` of the same document.
+    #[tokio::test]
+    async fn open_fills_through_a_remote_only_for_its_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        let foreign = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/@acme/echo/-/echo-2.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz-2".to_vec()))
+            .mount(&upstream)
+            .await;
+        let (remote_id, remote_key) = env.repo("remote", "npm").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(upstream.uri())
+            .bind(remote_id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        tdh::grant_repo_access(&env.fx.pool, remote_id, env.fx.user_id).await;
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"npm": remote_key}).to_string(),
+        )
+        .await;
+        let with_base = |base: &str| {
+            let mut p = npm("2.0.0");
+            p[0]["registryBaseUrl"] = base.into();
+            doc("com.acme/echo", "2.0.0", p)
+        };
+
+        let (s, b) = env
+            .json(
+                env.member(),
+                "POST",
+                "/publish",
+                Some(&with_base(&foreign.uri())),
+            )
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_external_registry")
+            ),
+            "{b}"
+        );
+        assert!(foreign.received_requests().await.unwrap().is_empty());
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+
+        let named = with_base(&upstream.uri());
+        let (s, b) = env
+            .json(env.member(), "POST", "/publish", Some(&named))
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+        let id = env.artifact("com.acme/echo", "2.0.0").await;
+        let res = resolve_until_settled(&env, id).await;
+        assert_eq!(res["state"], "resolved", "{res}");
+        let tail = "/servers/com.acme/echo/versions/2.0.0";
+        let (s, b) = env.json(env.anon(), "GET", tail, None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pkg = &b["server"]["packages"][0];
+        assert_eq!(
+            pkg["registryBaseUrl"],
+            format!("http://localhost/npm/{remote_key}")
+        );
+        let resolved = &pkg["_meta"][fmt::AK_RESOLVED_META_KEY];
+        assert_eq!(resolved["submittedRegistryBaseUrl"], upstream.uri());
+        assert_eq!(
+            resolved["warnings"],
+            serde_json::json!([mcp_packages::FOREIGN_COORDINATES_WARNING])
+        );
+        assert!(foreign.received_requests().await.unwrap().is_empty());
+
+        // The pins lost (as `open` stored versions before #5452): held, then
+        // re-resolved in place by a PUT of the same document.
+        sqlx::query(
+            "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{packages}', '[]') \
+             WHERE artifact_id = $1",
+        )
+        .bind(id)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            env.json(env.member(), "GET", tail, None).await.1["error"],
+            "mcp_unresolvable"
+        );
+        let (s, b) = env.json(env.admin(), "PUT", tail, Some(&named)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let edit = tdh::audit_row_eventually(&env.fx.pool, id, "MCP_SERVER_EDITED").await;
+        assert_eq!(
+            (
+                edit.details["repinned"].as_bool(),
+                edit.details["packages_changed"].as_bool()
+            ),
+            (Some(true), Some(false))
+        );
+        let (s, b) = env.json(env.anon(), "GET", tail, None).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(
+            b["server"]["packages"][0]["registryBaseUrl"],
+            format!("http://localhost/npm/{remote_key}")
+        );
         env.teardown().await;
     }
 

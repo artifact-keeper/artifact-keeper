@@ -458,15 +458,21 @@ pub fn registry_changed(stored: &RegistryState, upstream: &RegistryState) -> boo
         || stored.updated_at != upstream.updated_at
 }
 
-/// A package to resolve: an upstream `registryBaseUrl` that names the host of
-/// the backing Remote's own upstream is the same registry the Remote proxies,
-/// so it is dropped for the lookup (the served form points at the backing
-/// repository anyway).
+/// A package to resolve: an upstream `registryBaseUrl` under the backing
+/// Remote's own upstream URL (same origin and a path under it,
+/// [`mcp_packages::url_is_under`]) is the registry the Remote proxies, so it
+/// is dropped for the lookup (the served form points at the backing
+/// repository anyway). A pin of such a package records
+/// [`mcp_packages::FOREIGN_COORDINATES_WARNING`], as a publish naming the
+/// upstream does ([`pin_packages`]).
 pub fn for_resolution(pkg: &fmt::Package, repo: Option<&BackingRepo>) -> fmt::Package {
     let mut p = pkg.clone();
     if let (Some(given), Some(repo)) = (p.registry_base_url.as_deref(), repo) {
-        let upstream = repo.upstream_url.as_deref().map(fmt::host_of);
-        if repo.repo_type == "remote" && upstream.as_deref() == Some(fmt::host_of(given).as_str()) {
+        let under = repo
+            .upstream_url
+            .as_deref()
+            .is_some_and(|up| mcp_packages::url_is_under(up, given));
+        if repo.repo_type == "remote" && under {
             p.registry_base_url = None;
         }
     }
@@ -861,8 +867,10 @@ async fn pin_packages(
 ) -> (Vec<PackagePin>, Vec<Unresolved>) {
     let mut pins = Vec::new();
     let mut unresolved = Vec::new();
+    // `open` pins as `own-repos` does (#5452); it only accepts foreign
+    // coordinates. A package that does not pin leaves the version
+    // `unresolvable`.
     let settings = match &run.packages {
-        Ok(s) if s.policy == PackagePolicy::Open => return (pins, unresolved),
         Ok(s) => s,
         Err(detail) => {
             let all = server
@@ -909,6 +917,7 @@ async fn pin_packages(
                     repo,
                     index,
                     &candidate,
+                    "",
                 )
                 .await
                 {
@@ -921,6 +930,15 @@ async fn pin_packages(
         match found {
             Ok(mut pin) => {
                 pin.submitted.identifier = pkg.identifier.clone();
+                // The upstream's `registryBaseUrl` was replaced by the
+                // backing repository's, as on a publish naming it (#5452).
+                let warning = mcp_packages::FOREIGN_COORDINATES_WARNING.to_string();
+                if pkg.registry_base_url.is_some()
+                    && candidate.registry_base_url.is_none()
+                    && !pin.resolved.warnings.contains(&warning)
+                {
+                    pin.resolved.warnings.push(warning);
+                }
                 pins.push(pin);
             }
             Err(e) => unresolved.push(Unresolved {
@@ -931,6 +949,18 @@ async fn pin_packages(
         }
     }
     (pins, unresolved)
+}
+
+/// The `packages[]` indexes of a stored version that no pin covers.
+fn unpinned_indexes(stored: &fmt::StoredVersion) -> Vec<usize> {
+    let count = stored
+        .server
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .map_or(0, Vec::len);
+    (0..count)
+        .filter(|i| !stored.pins.iter().any(|p| p.index == *i))
+        .collect()
 }
 
 /// An upstream URL as it may be stored, served or audited: userinfo
@@ -1746,11 +1776,19 @@ async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), Str
 /// unresolved packages (a package pulled through the backing Remote since,
 /// a mapping added since).
 async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), String> {
+    // A version needs another attempt when a package of it has no pin: one
+    // the sync reported unresolved, and one stored unpinned with an empty
+    // `unresolved` list, as `open` ingested every package before #5452.
+    // Least recently attempted first, so versions that keep failing do not
+    // starve the rest of the batch.
     let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
         "SELECT a.id, m.metadata FROM artifacts a JOIN artifact_metadata m ON m.artifact_id = a.id \
          WHERE a.repository_id = $1 AND a.is_deleted = false AND m.format = 'mcp' \
-           AND jsonb_array_length(COALESCE(m.metadata->'ingest'->'unresolved', '[]'::jsonb)) > 0 \
-         ORDER BY a.name, a.version LIMIT $2",
+           AND (jsonb_array_length(COALESCE(m.metadata->'ingest'->'unresolved', '[]'::jsonb)) > 0 \
+             OR jsonb_array_length(COALESCE(m.metadata->'packages', '[]'::jsonb)) \
+                < jsonb_array_length(COALESCE(m.metadata->'server'->'packages', '[]'::jsonb))) \
+         ORDER BY COALESCE(m.metadata->'ingest'->>'reResolveAttemptedAt', '') , a.name, a.version \
+         LIMIT $2",
     )
     .bind(run.repo.id)
     .bind(MAX_RERESOLVE)
@@ -1764,13 +1802,24 @@ async fn re_resolve(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), S
         let Ok(server) = serde_json::from_value::<ServerJson>(stored.server.clone()) else {
             continue;
         };
-        let before: Vec<Unresolved> = meta
-            .pointer("/ingest/unresolved")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        let indexes: Vec<usize> = before.iter().map(|u| u.index).collect();
+        let indexes = unpinned_indexes(&stored);
         let (new_pins, still) = pin_packages(run, &server, Some(&indexes)).await;
         if new_pins.is_empty() {
+            // Record the attempt (and what is still unresolved) so the next
+            // pass tries the versions not attempted yet first. A version
+            // stored without `ingest` gets one, so it cannot sort first
+            // forever.
+            sqlx::query(
+                "UPDATE artifact_metadata SET metadata = jsonb_set(metadata, '{ingest}', \
+                 COALESCE(metadata->'ingest', '{}'::jsonb) || jsonb_build_object( \
+                   'unresolved', $2::jsonb, 'reResolveAttemptedAt', now()::text)) \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .bind(serde_json::to_value(&still).unwrap_or_default())
+            .execute(&run.state.db)
+            .await
+            .map_err(db_err)?;
             continue;
         }
         let mut pins = stored.pins.clone();
@@ -2679,6 +2728,29 @@ mod tests {
         assert!(for_resolution(&pkg, Some(&other))
             .registry_base_url
             .is_some());
+        // #5452: a path-scoped upstream (one project of a shared host) is
+        // not another project on the same host.
+        let gitlab = |project: u32| -> fmt::Package {
+            serde_json::from_value(serde_json::json!({
+                "registryType": "pypi", "identifier": "tool", "version": "1.0.0",
+                "registryBaseUrl": format!(
+                    "https://gitlab.com/api/v4/projects/{project}/packages/pypi/simple"
+                ),
+                "transport": {"type": "stdio"},
+            }))
+            .unwrap()
+        };
+        let project = backing(
+            "remote",
+            "https://gitlab.com/api/v4/projects/222/packages/pypi/simple",
+        );
+        assert!(for_resolution(&gitlab(111), Some(&project))
+            .registry_base_url
+            .is_some());
+        assert_eq!(
+            for_resolution(&gitlab(222), Some(&project)).registry_base_url,
+            None
+        );
         let local = backing("local", "https://registry.npmjs.org");
         assert!(for_resolution(&pkg, Some(&local))
             .registry_base_url

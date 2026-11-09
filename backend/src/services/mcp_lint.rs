@@ -39,7 +39,7 @@ use crate::services::mcp_capabilities::CapabilitySet;
 /// The `scan_results.scan_type` of a lint run (migration 330).
 pub const MCP_LINT_SCAN_TYPE: &str = "mcp_lint";
 /// `scan_results.scanner_version` of a lint run: bump when a rule changes.
-pub const LINT_VERSION: &str = "ak-mcp-lint/2";
+pub const LINT_VERSION: &str = "ak-mcp-lint/3";
 /// Prefix of `scan_findings.source` and of `scan_findings.title`.
 pub const SOURCE_PREFIX: &str = "mcp_lint/";
 /// Source of the server.json lint (document, declared tools, pins, labels).
@@ -1119,6 +1119,38 @@ pub fn lint_remote_url(path: &str, raw: &str, ctx: DocContext, out: &mut Vec<Lin
     }
 }
 
+/// `remote_url_shape` (`review`) for a stored transport URL template that
+/// can expand to something other than an absolute `http(s)` URL (#5529).
+/// Publish refuses these since #5529; a version stored before is not
+/// re-validated, so it is flagged when it is next linted. A template with
+/// more expansions than publish checks has its scheme-position values
+/// checked on their own (`check` is called again with
+/// [`fmt::UrlExpansion::SchemeOnly`]).
+fn lint_url_template(
+    path: &str,
+    check: impl Fn(fmt::UrlExpansion) -> Option<fmt::UrlTemplateIssue>,
+    out: &mut Vec<LintFinding>,
+) {
+    let issue = match check(fmt::UrlExpansion::All) {
+        Some(fmt::UrlTemplateIssue::TooManyExpansions { .. }) => {
+            check(fmt::UrlExpansion::SchemeOnly)
+        }
+        other => other,
+    };
+    match issue {
+        None | Some(fmt::UrlTemplateIssue::TooManyExpansions { .. }) => {}
+        Some(i) => out.push(LintFinding::new(
+            LintRule::RemoteUrlShape,
+            LintAction::Review,
+            path,
+            format!(
+                "remote URL template can expand to a non-http(s) URL: {}",
+                i.message()
+            ),
+        )),
+    }
+}
+
 fn lint_inputs(prefix: &str, inputs: &[Value], out: &mut Vec<LintFinding>) {
     for (i, input) in inputs.iter().enumerate() {
         lint_input(&format!("{prefix}[{i}]"), input, out);
@@ -1203,11 +1235,25 @@ pub fn lint_server_document(server: &Value, ctx: DocContext) -> Vec<LintFinding>
     }
     for (i, pkg) in arr_at(server, "packages").iter().enumerate() {
         lint_package(&format!("packages[{i}]"), pkg, &mut out);
+        if let Ok(p) = serde_json::from_value::<fmt::Package>(pkg.clone()) {
+            lint_url_template(
+                &format!("packages[{i}].transport.url"),
+                |m| fmt::package_url_issue(&p, m),
+                &mut out,
+            );
+        }
     }
     for (i, remote) in arr_at(server, "remotes").iter().enumerate() {
         let path = format!("remotes[{i}]");
         if let Some(u) = str_at(remote, "url") {
             lint_remote_url(&format!("{path}.url"), u, ctx, &mut out);
+        }
+        if let Ok(r) = serde_json::from_value::<fmt::Transport>(remote.clone()) {
+            lint_url_template(
+                &format!("{path}.url"),
+                |m| fmt::remote_url_issue(&r, m),
+                &mut out,
+            );
         }
         lint_inputs(
             &format!("{path}.headers"),
@@ -2552,6 +2598,62 @@ mod tests {
     }
 
     #[test]
+    fn stored_url_templates_that_leave_http_are_flagged() {
+        let flagged = |doc: Value, path: &str| {
+            let f = lint_server_document(&server(doc), DocContext::default());
+            f.iter().any(|x| {
+                x.rule == LintRule::RemoteUrlShape
+                    && x.action == LintAction::Review
+                    && x.path == path
+                    && x.message
+                        .starts_with("remote URL template can expand to a non-http(s) URL")
+            })
+        };
+        assert!(flagged(
+            json!({"remotes": [{"type": "sse", "url": "{base}/sse",
+                "variables": {"base": {"default": "javascript:alert(1)//"}}}]}),
+            "remotes[0].url"
+        ));
+        assert!(flagged(
+            json!({"remotes": [{"type": "sse", "url": "{base}/sse", "variables": {"base": {}}}]}),
+            "remotes[0].url"
+        ));
+        assert!(flagged(
+            json!({"packages": [pkg(json!({
+                "transport": {"type": "sse", "url": "{baseUrl}/sse"},
+                "environmentVariables": [{"name": "baseUrl", "choices": ["vbscript:x"]}]}))]}),
+            "packages[0].transport.url"
+        ));
+        assert!(!flagged(
+            json!({"remotes": [{"type": "sse", "url": "{base}/sse",
+                "variables": {"base": {"default": "https://x.example"}}}]}),
+            "remotes[0].url"
+        ));
+        let many = (0..20).map(|i| format!("v{i}")).collect::<Vec<_>>();
+        let mut schemes = many
+            .iter()
+            .map(|v| format!("https://{v}.example"))
+            .collect::<Vec<_>>();
+        schemes.push("javascript:alert(1)//".into());
+        assert!(flagged(
+            json!({"remotes": [{"type": "sse", "url": "{base}/{a}/{b}",
+                "variables": {"base": {"choices": schemes}, "a": {"choices": many}, "b": {"choices": many}}}]}),
+            "remotes[0].url"
+        ));
+        schemes.pop();
+        assert!(!flagged(
+            json!({"remotes": [{"type": "sse", "url": "{base}/{a}/{b}",
+                "variables": {"base": {"choices": schemes}, "a": {"choices": many}, "b": {"choices": many}}}]}),
+            "remotes[0].url"
+        ));
+        assert!(!flagged(
+            json!({"remotes": [{"type": "sse", "url": "https://x.example/{a}/{b}",
+                "variables": {"a": {"choices": many}, "b": {"choices": many}}}]}),
+            "remotes[0].url"
+        ));
+    }
+
+    #[test]
     fn remote_headers_and_variables_are_linted() {
         let f = lint_server_document(
             &server(json!({"remotes": [{
@@ -2721,6 +2823,7 @@ mod tests {
                 repository: "oci-local".into(),
                 repository_id: Uuid::nil(),
                 artifact_ids: vec![],
+                artifact_sha256s: Vec::new(),
                 sha256: None,
                 name: Some("acme/mcp".into()),
                 tag: Some("1.2".into()),

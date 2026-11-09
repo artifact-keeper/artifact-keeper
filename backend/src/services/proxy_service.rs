@@ -313,6 +313,34 @@ fn tee_publish_done(metadata_key: &str) -> Option<tokio::sync::watch::Receiver<b
         .map(|entry| entry.done_rx.clone())
 }
 
+/// Rewrite a just-committed sidecar without its Package Age Policy hold
+/// (#5223): the catalog commit found the entry released during the fill, so
+/// the hold the sidecar was written with no longer stands. Best-effort like
+/// the sidecar write it follows; a failure leaves the entry held, and the
+/// row reads released, so it is logged.
+async fn drop_released_sidecar_hold(
+    storage: &StorageService,
+    metadata_key: &str,
+    mut metadata: CacheMetadata,
+) {
+    metadata.quarantine_until = None;
+    let written = match serde_json::to_vec(&metadata) {
+        Ok(json) => storage.put(metadata_key, Bytes::from(json)).await,
+        Err(e) => Err(AppError::Internal(format!(
+            "Proxy cache metadata serialization failed: {e}"
+        ))),
+    };
+    match written {
+        Ok(()) => invalidate_proxy_metadata_lru(metadata_key).await,
+        Err(e) => tracing::warn!(
+            metadata_key = %metadata_key,
+            error = %e,
+            "could not clear the hold from a proxy-cache entry released during its fetch; \
+             the entry stays held until its window elapses"
+        ),
+    }
+}
+
 /// Response from an upstream registry fetch.
 pub(crate) struct UpstreamResponse {
     pub(crate) content: Bytes,
@@ -625,6 +653,11 @@ struct CacheMetadataTemplate {
     /// Upstream URL the body was fetched from, recorded on the catalog row when
     /// known (nullable).
     upstream_url: Option<String>,
+    /// The leader recorded this fill's held catalog row before answering
+    /// `409` ([`proxy_catalog::mark_hold_fetching`], #5223), so a release
+    /// stamped on the row by commit time was made during this fill and is
+    /// kept by the commit ([`proxy_catalog::upsert_fill`]).
+    keep_release: bool,
 }
 
 /// Bound on the in-flight chunk queue between the upstream-reader task
@@ -3664,7 +3697,7 @@ impl CachePersister {
                                     // the client stream. Written to the SEPARATE
                                     // `proxy_cache_artifacts` table, never
                                     // `artifacts`, so #1278 cannot recur.
-                                    if let Err(e) = proxy_catalog::upsert(
+                                    let upserted = proxy_catalog::upsert_fill(
                                         &catalog_db,
                                         template.repository_id,
                                         &template.path,
@@ -3678,9 +3711,10 @@ impl CachePersister {
                                         // the catalog row so the entry is
                                         // releasable via the quarantine API.
                                         metadata.quarantine_until,
+                                        template.keep_release,
                                     )
-                                    .await
-                                    {
+                                    .await;
+                                    if let Err(e) = upserted {
                                         tracing::warn!(
                                             cache_key = %cache_key_for_writer,
                                             error = %e,
@@ -3689,6 +3723,18 @@ impl CachePersister {
                                              until re-cache or lazy backfill"
                                         );
                                     } else {
+                                        // #5223: released while this fill ran;
+                                        // the sidecar just written still holds.
+                                        if upserted.unwrap_or(false)
+                                            && metadata.quarantine_until.is_some()
+                                        {
+                                            drop_released_sidecar_hold(
+                                                &storage_clone,
+                                                &metadata_key,
+                                                metadata.clone(),
+                                            )
+                                            .await;
+                                        }
                                         attribute_fill_downloads(
                                             &catalog_db,
                                             template.repository_id,
@@ -4138,7 +4184,28 @@ impl UpstreamClient {
         Box<dyn std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send + '_>,
     > {
         let audit = UpstreamAuditTarget::for_mode(&self.db, self.audit_mode, repo_id, caller);
-        Box::pin(send_upstream_audited(request, audit))
+        Box::pin(async move {
+            let env_proxy_recheck = self.uses_env_proxy(repo_id).await;
+            send_upstream_audited(request, audit, env_proxy_recheck).await
+        })
+    }
+
+    /// Whether `repo_id`'s requests go out through the shared client, which
+    /// follows the environment proxy (`inherit`, or no repository), rather
+    /// than a per-repository `direct`/`explicit` client (#5459). Read from
+    /// the egress-client cache [`Self::client_for`] fills, falling back to
+    /// the stored configuration; an unreadable one counts as `inherit`, the
+    /// stricter reading.
+    async fn uses_env_proxy(&self, repo_id: Option<Uuid>) -> bool {
+        let Some(repo_id) = repo_id else {
+            return true;
+        };
+        match self.cached_egress_client(repo_id).await {
+            Some(entry) => entry.is_none(),
+            None => crate::services::egress_proxy::load_egress_proxy(&self.db, repo_id)
+                .await
+                .map_or(true, |config| !config.overrides_default_routing()),
+        }
     }
 
     /// Apply the upstream outbound address policy to a destination named by
@@ -4244,6 +4311,11 @@ impl UpstreamClient {
     /// deliberately skipped there. See
     /// [`egress_proxy::ensure_proxied_destination_allowed`] for the residual
     /// DNS-rebinding gap this cannot close.
+    ///
+    /// A repository on `Inherit` under an environment proxy needs no check
+    /// here: the shared client checks every destination it proxies itself,
+    /// in every case spelling of the proxy variables (#5459, see
+    /// `http_client::guarded_env_proxy`).
     async fn client_for(&self, repo_id: Uuid, target_url: &str) -> Result<Client> {
         self.ensure_initial_destination_allowed(target_url)?;
         let entry = match self.cached_egress_client(repo_id).await {
@@ -6370,6 +6442,10 @@ impl ProxyService {
     /// currently held (never held, window already elapsed, or already
     /// released), mirroring the hosted release endpoint's
     /// [`quarantine_service::transition`] contract.
+    ///
+    /// A streaming fill refused under a hold records its row before the
+    /// `409` goes out (#5223), so the path is releasable while it is still
+    /// being fetched; the fill's commit keeps the release.
     pub async fn release_quarantined_cache_entry(
         &self,
         repository_id: Uuid,
@@ -6390,21 +6466,15 @@ impl ProxyService {
         // Clear the hold at the read-path authority FIRST: the sidecar. The
         // catalog row is only stamped after, so a sidecar write failure leaves
         // the release fully retryable (the row still reads as held).
-        match self.load_cache_metadata(&row.metadata_key).await {
-            Ok(Some(mut metadata)) => {
-                metadata.quarantine_until = None;
-                let json = serde_json::to_vec(&metadata).map_err(|e| {
-                    AppError::Internal(format!("Proxy cache metadata serialization failed: {e}"))
-                })?;
-                self.storage
-                    .put(&row.metadata_key, Bytes::from(json))
-                    .await?;
-                invalidate_proxy_metadata_lru(&row.metadata_key).await;
+        let sidecar_absent = match self.load_cache_metadata(&row.metadata_key).await {
+            Ok(Some(metadata)) => {
+                self.clear_sidecar_hold(&row.metadata_key, metadata).await?;
+                false
             }
             // A missing or unreadable sidecar cannot hold a read (the read
             // paths treat both as a cache miss / refetch), so there is nothing
             // to clear; the catalog row is still stamped below.
-            Ok(None) => {}
+            Ok(None) => true,
             Err(e) => {
                 tracing::warn!(
                     metadata_key = %row.metadata_key,
@@ -6412,8 +6482,9 @@ impl ProxyService {
                     "proxy-cache sidecar unreadable at quarantine release; stamping the \
                      catalog row only (the unreadable sidecar never holds a read)"
                 );
+                false
             }
-        }
+        };
 
         let released = proxy_catalog::mark_quarantine_released(&self.db, row.id).await?;
         if released == 0 {
@@ -6425,11 +6496,50 @@ impl ProxyService {
             ));
         }
 
+        // #5223: no sidecar yet means the row is a held fill still being
+        // fetched. Its commit keeps this release if the stamp above landed
+        // first; if the commit got in between our read and the stamp, it
+        // wrote the hold onto the sidecar after we looked, so look again.
+        // The LRU may hold the miss we just read, so drop it first.
+        if sidecar_absent {
+            invalidate_proxy_metadata_lru(&row.metadata_key).await;
+            if let Ok(Some(metadata)) = self.load_cache_metadata(&row.metadata_key).await {
+                if metadata.quarantine_until.is_some() {
+                    // The row is already stamped, so a retry would answer
+                    // 409; log rather than report a release that took.
+                    if let Err(e) = self.clear_sidecar_hold(&row.metadata_key, metadata).await {
+                        tracing::warn!(
+                            metadata_key = %row.metadata_key,
+                            error = %e,
+                            "could not clear the hold a concurrent fill wrote to the \
+                             proxy-cache sidecar at quarantine release"
+                        );
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             repository_id = %repository_id,
             path = %path,
             "Proxy-cache entry released from quarantine"
         );
+        Ok(())
+    }
+
+    /// Write `metadata` back to `metadata_key` without its Package Age Policy
+    /// hold, for [`Self::release_quarantined_cache_entry`].
+    async fn clear_sidecar_hold(
+        &self,
+        metadata_key: &str,
+        mut metadata: CacheMetadata,
+    ) -> Result<()> {
+        metadata.quarantine_until = None;
+        let json = serde_json::to_vec(&metadata).map_err(|e| {
+            AppError::Internal(format!("Proxy cache metadata serialization failed: {e}"))
+        })?;
+        self.storage.put(metadata_key, Bytes::from(json)).await?;
+        invalidate_proxy_metadata_lru(metadata_key).await;
         Ok(())
     }
 
@@ -8245,6 +8355,36 @@ impl ProxyService {
             .invalidate(&(repo.id, cache_path.to_string()))
             .await;
 
+        // #5223: under a hold the 409 goes out long before the tee commits
+        // the catalog row, and the release endpoint reads that row. Record
+        // the held row first so the path is releasable as soon as it is
+        // refused; the commit keeps a release that lands in between.
+        let keep_release = match quarantine_until.filter(|_| hold_active) {
+            Some(until) => match proxy_catalog::mark_hold_fetching(
+                &self.db,
+                repo.id,
+                cache_path,
+                &cache_key,
+                &metadata_key,
+                until,
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        repository = %repo.key,
+                        path = %cache_path,
+                        error = %e,
+                        "could not record the held proxy-cache entry before refusing it; \
+                         it is releasable once the fetch commits"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+
         // #4013: the cross-replica coordinator releases its lock on the tee
         // writer's completion, so capture that signal before the key moves.
         let publish_key = metadata_key.clone();
@@ -8266,6 +8406,7 @@ impl ProxyService {
                 repository_id: repo.id,
                 path: cache_path.to_string(),
                 upstream_url: Some(full_url.clone()),
+                keep_release,
             },
             upstream.content_length,
             max_cache_bytes,
@@ -15226,6 +15367,7 @@ mod tests {
             repository_id: Uuid::nil(),
             path: "test/path".to_string(),
             upstream_url: None,
+            keep_release: false,
         }
     }
 
@@ -18310,6 +18452,7 @@ mod tests {
             repository_id: Uuid::nil(),
             path: "test/path".to_string(),
             upstream_url: None,
+            keep_release: false,
         };
         let mut client = tee_upstream_to_cache(
             upstream,
@@ -24608,6 +24751,147 @@ mod tests {
             upstream_hits, 1,
             "the second refusal must come from the cached hold, not a re-fetch"
         );
+
+        tdh::cleanup(&pool, repo.id, repo.id).await;
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A one-shot HTTP/1.1 upstream that answers `GET` with the response
+    /// headers and the FIRST `head_len` body bytes at once, then holds the
+    /// rest of the body until `gate` is notified (#5223). The streaming leader
+    /// sees its headers and first byte (so it decides the hold and answers
+    /// 409) while the background tee is parked mid-body, which pins the
+    /// window between the 409 and the cache commit open for as long as the
+    /// test needs.
+    async fn gated_upstream(
+        body: &'static [u8],
+        head_len: usize,
+        last_modified: String,
+        gate: Arc<tokio::sync::Notify>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind gated upstream");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                 content-length: {}\r\nlast-modified: {last_modified}\r\n\
+                 connection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body[..head_len]).await;
+            let _ = sock.flush().await;
+            gate.notified().await;
+            let _ = sock.write_all(&body[head_len..]).await;
+            let _ = sock.flush().await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// A committed catalog row's size and hold columns (#5223).
+    type CommittedHoldRow = (i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+    /// #5223: an admin release that arrives after the hold's 409 but BEFORE
+    /// the background tee has committed the entry must succeed (not 404 "No
+    /// cached artifact at that path"), and must still be in force once the
+    /// tee commits: the committed sidecar carries no hold, the catalog row
+    /// reads released, and the next download is served.
+    #[tokio::test]
+    async fn test_streaming_quarantine_release_during_fetch_applies_5223() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        const BODY: &[u8] = b"held-package-body-released-mid-fetch";
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let released_now = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let upstream = gated_upstream(BODY, 4, released_now, Arc::clone(&gate)).await;
+
+        let tmp = std::env::temp_dir().join(format!("s8-qrelease-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), tmp.to_str().unwrap());
+        let repo = quarantined_remote_repo(&pool, &upstream, tmp.to_str().unwrap(), 60).await;
+        let path = "pkg/held.bin";
+
+        let err = proxy
+            .fetch_artifact_streaming(&repo, path)
+            .await
+            .expect_err("a package inside the hold window must be refused");
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+
+        // The tee is parked behind the gate: nothing is committed yet.
+        let sidecar = tmp.join(format!(
+            "proxy-cache/{}/{path}/__cache_meta__.json",
+            repo.key
+        ));
+        assert!(!sidecar.exists(), "the gated tee must not have committed");
+
+        // The release lands inside the window the 409 opened.
+        proxy
+            .release_quarantined_cache_entry(repo.id, path)
+            .await
+            .expect("releasing a path the server just answered 409 for must succeed");
+
+        // Let the fetch finish; the commit must keep the release.
+        gate.notify_one();
+        let meta = read_sidecar(&tmp, &repo.key, path)
+            .await
+            .expect("the entry is cached once the fetch completes");
+        let mut meta = meta;
+        for _ in 0..100 {
+            if meta.quarantine_until.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            meta = read_sidecar(&tmp, &repo.key, path).await.expect("sidecar");
+        }
+        assert!(
+            meta.quarantine_until.is_none(),
+            "the committed sidecar must not re-impose a released hold: {:?}",
+            meta.quarantine_until
+        );
+        let mut hold = None;
+        for _ in 0..100 {
+            let row: Option<CommittedHoldRow> = sqlx::query_as(
+                "SELECT size_bytes, quarantine_until, quarantine_released_at \
+                     FROM proxy_cache_artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(repo.id)
+            .bind(path)
+            .fetch_optional(&pool)
+            .await
+            .expect("catalog query");
+            if let Some(r) = row.filter(|r| r.0 == BODY.len() as i64) {
+                hold = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_, db_until, db_released) = hold.expect("the committed catalog row");
+        assert!(db_until.is_none(), "catalog hold cleared: {db_until:?}");
+        assert!(db_released.is_some(), "catalog row records the release");
+
+        let served = proxy
+            .fetch_artifact_streaming(&repo, path)
+            .await
+            .expect("a released entry is served");
+        assert_eq!(drain_stream(served.body).await, BODY);
 
         tdh::cleanup(&pool, repo.id, repo.id).await;
         let _ = std::fs::remove_dir_all(&tmp);

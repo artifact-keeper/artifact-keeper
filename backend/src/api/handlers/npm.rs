@@ -4898,7 +4898,7 @@ async fn npm_local_fetch(
 /// Outcome of the npm virtual shadowing-guard ownership check
 /// (#1217 / #3646 / #3955) for the requested `name@version`.
 #[derive(Clone, Copy, Debug)]
-enum NpmVirtualOwnership {
+pub(crate) enum NpmVirtualOwnership {
     /// No non-Remote member owns the coordinate: Remote members serve
     /// normally.
     NotOwned,
@@ -4964,6 +4964,104 @@ async fn resolve_npm_virtual_ownership(
     })
 }
 
+/// The members of the Virtual `virtual_repo_id` that may serve the tarball
+/// `filename` of `package_name`, in resolution order, and the shadowing
+/// guard's ownership outcome: the per-member scope policy (#2424) and the
+/// priority-aware half of the shadowing guard (#3955) applied to `members`.
+/// Remote members may then serve only when
+/// [`npm_virtual_remotes_allowed`] says so. Shared by the tarball route and
+/// the MCP pin check (#5456), so the two decide which member serves a
+/// coordinate by the same code.
+///
+/// Supply-chain shadowing guard (#1217 follow-up, ak-hv3s). When a
+/// non-Remote member of this Virtual repo owns the npm package at the
+/// requested version, Remote members it OUTRANKS are blocked from satisfying
+/// the download. `package_name` is the npm-canonical name (eg. `@types/node`
+/// or `lodash`); `artifacts.name` stores the same shape, so a direct
+/// case-insensitive comparison is what the guard performs.
+///
+/// #3646: the guard is version-aware. The virtual packument merge (#2844)
+/// advertises every member's versions, so a hosted member holding one fork
+/// build of a name must suppress Remote members only for the version it
+/// actually owns. The version comes from the invariant
+/// `<basename>-<version>.tgz` filename; a filename that does not carry this
+/// package's version keeps the name-only guard (fail-safe).
+///
+/// #3955: the guard is priority-aware. The merge keeps the FIRST —
+/// highest-priority — member's entry per version (`merge_packument_into`),
+/// so the tarball leg must serve that same member's bytes or the advertised
+/// `dist.integrity` does not match. An owning non-Remote member therefore
+/// suppresses only the Remote members it outranks; a Remote member ranked at
+/// or above every owner still surfaces.
+///
+/// #2424: the per-member npm scope policy applies to the direct-tarball path
+/// exactly as the metadata/packument loops apply it, so a client that knows
+/// the exact tarball URL (a pinned lockfile) cannot stream an out-of-scope
+/// `@scope/pkg` through a Remote member. Non-Remote members are always
+/// eligible.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn npm_virtual_eligible_members(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    members: Vec<crate::models::repository::Repository>,
+    package_name: &str,
+    filename: &str,
+) -> Result<
+    (
+        NpmVirtualOwnership,
+        Vec<crate::models::repository::Repository>,
+    ),
+    Response,
+> {
+    let ownership =
+        resolve_npm_virtual_ownership(db, virtual_repo_id, package_name, filename).await?;
+    let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
+    let scope_policies = fetch_npm_scope_policies(db, &member_ids)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let members: Vec<_> = members
+        .into_iter()
+        .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
+        .collect();
+    let members = match ownership {
+        NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
+            // The priorities map is fetched only when an owner exists — one
+            // indexed query on exactly the requests the guard engages on.
+            let member_priorities =
+                proxy_helpers::fetch_virtual_member_priorities(db, virtual_repo_id).await?;
+            members
+                .into_iter()
+                .filter(|m| {
+                    m.repo_type != RepositoryType::Remote
+                        || !remote_member_outranked_by_owner(
+                            owner_min_priority,
+                            member_priorities.get(&m.id).copied(),
+                        )
+                })
+                .collect()
+        }
+        _ => members,
+    };
+    Ok((ownership, members))
+}
+
+/// Whether a Remote member of `members` (as
+/// [`npm_virtual_eligible_members`] left them) may serve at all. `false` is
+/// the load-bearing security primitive: the resolver gets no proxy service
+/// and every Remote member is skipped.
+pub(crate) fn npm_virtual_remotes_allowed(
+    ownership: NpmVirtualOwnership,
+    members: &[crate::models::repository::Repository],
+) -> bool {
+    match ownership {
+        NpmVirtualOwnership::NotOwned => true,
+        NpmVirtualOwnership::OwnedNameOnly => false,
+        NpmVirtualOwnership::OwnedAtPriority(_) => members
+            .iter()
+            .any(|m| m.repo_type == RepositoryType::Remote),
+    }
+}
+
 /// The proxy service handed to the virtual tarball resolver for a given
 /// ownership outcome, over the member list the guard already filtered.
 /// `None` is the load-bearing security primitive: it withholds every
@@ -4974,20 +5072,7 @@ fn npm_virtual_resolver_proxy<'a>(
     members: &[crate::models::repository::Repository],
     proxy: Option<&'a crate::services::proxy_service::ProxyService>,
 ) -> Option<&'a crate::services::proxy_service::ProxyService> {
-    match ownership {
-        NpmVirtualOwnership::NotOwned => proxy,
-        NpmVirtualOwnership::OwnedNameOnly => None,
-        NpmVirtualOwnership::OwnedAtPriority(_) => {
-            if members
-                .iter()
-                .any(|m| m.repo_type == RepositoryType::Remote)
-            {
-                proxy
-            } else {
-                None
-            }
-        }
-    }
+    proxy.filter(|_| npm_virtual_remotes_allowed(ownership, members))
 }
 
 /// The npm shadowing-guard suppression rule (#3955), the #2311 PyPI rule
@@ -5218,94 +5303,17 @@ async fn serve_tarball(
         let pkg = package_name.to_string();
         let fname = filename.to_string();
 
-        // Supply-chain shadowing guard (#1217 follow-up, ak-hv3s).
-        // When a non-Remote member of this Virtual repo owns the npm
-        // package at the requested version, Remote members it OUTRANKS are
-        // blocked from satisfying the download. The `package_name`
-        // parameter is the npm-canonical name (eg. `@types/node` or
-        // `lodash`) extracted by the router; `artifacts.name` stores the
-        // same shape, so a direct case-insensitive comparison is what the
-        // guard performs.
-        //
-        // #3646: the guard is version-aware. The virtual packument merge
-        // (#2844) advertises every member's versions, so a hosted member
-        // holding one fork build of a name must suppress Remote members
-        // only for the version it actually owns; the name-only guard
-        // 404'd every upstream version the merged packument had just
-        // advertised, in both member orders. The version comes from the
-        // invariant `<basename>-<version>.tgz` filename; a filename that
-        // does not carry this package's version keeps the name-only guard
-        // (fail-safe: never fan out on a shape we cannot read).
-        //
-        // #3955: the guard is priority-aware. The merge keeps the FIRST —
-        // highest-priority — member's entry per version
-        // (`merge_packument_into`), so the tarball leg must serve that
-        // same member's bytes or the advertised `dist.integrity` does not
-        // match and npm fails with EINTEGRITY. An owning non-Remote member
-        // therefore suppresses only the Remote members it outranks
-        // (applied below, after the member list is fetched); a Remote
-        // member ranked at or above every owner still surfaces, the #2311
-        // PyPI rule ported to npm.
-        //
-        // Fail-closed: skip the guard for names that fail
-        // `is_valid_npm_name` (path traversal, uppercase, homoglyphs).
-        // Such names cannot reach `artifacts.name` so the guard would
-        // always return `NotOwned`; skipping it spares the DB an existence
-        // check on every malformed request.
-        let ownership =
-            resolve_npm_virtual_ownership(&state.db, repo.id, package_name, filename).await?;
-
-        // #2424: apply the per-member npm scope policy to the direct-tarball
-        // path, exactly as the metadata/packument loops already do. Metadata
-        // filtering alone does not cover a client that already knows the exact
-        // tarball URL (a pinned lockfile), which would otherwise stream an
-        // out-of-scope `@scope/pkg` straight through a Remote member. Fetch the
-        // members once, drop Remote members the policy excludes, and resolve
-        // over the pre-filtered list via `resolve_virtual_download_from_members`
-        // — the established pre-filtered-member seam (cf. maven.rs) — so the
-        // shared generic `resolve_virtual_download` helper is left untouched and
-        // no other format (maven/hex/...) is affected. Non-Remote members are
-        // always eligible, preserving the `virtual_non_remote_owns_name`
-        // shadowing guard and the local-only primitive above.
+        // The supply-chain shadowing guard (#1217, #3646, #3955) and the
+        // per-member scope policy (#2424): see `npm_virtual_eligible_members`.
         let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
         // #3178: authorize the member set against the CALLER before any
         // format-specific filtering, so a member this caller could not read
         // directly can never reach the byte resolver.
         let members =
             proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
-        let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
-        let scope_policies = fetch_npm_scope_policies(&state.db, &member_ids)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        let members: Vec<_> = members
-            .into_iter()
-            .filter(|m| npm_member_eligible(&m.repo_type, scope_policies.get(&m.id), package_name))
-            .collect();
-
-        // #3955: apply the priority-aware half of the shadowing guard. An
-        // owning non-Remote member suppresses only the Remote members it
-        // outranks, so the tarball route serves the same member the
-        // priority-ordered packument merge drew the version's
-        // `dist.integrity` from. The priorities map is fetched only when an
-        // owner exists — one indexed query on exactly the requests the guard
-        // engages on.
-        let members: Vec<_> = match ownership {
-            NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
-                let member_priorities =
-                    proxy_helpers::fetch_virtual_member_priorities(&state.db, repo.id).await?;
-                members
-                    .into_iter()
-                    .filter(|m| {
-                        m.repo_type != RepositoryType::Remote
-                            || !remote_member_outranked_by_owner(
-                                owner_min_priority,
-                                member_priorities.get(&m.id).copied(),
-                            )
-                    })
-                    .collect()
-            }
-            _ => members,
-        };
+        let (ownership, members) =
+            npm_virtual_eligible_members(&state.db, repo.id, members, package_name, filename)
+                .await?;
 
         // Passing `None` to the resolver when the guard suppresses every
         // Remote member is the load-bearing security primitive: see
@@ -6882,6 +6890,7 @@ fn rows_not_kept<'a>(
 /// again from what is left), and invalidate the packument caches.
 async fn unpublish_npm_rows(
     state: &SharedState,
+    auth: Option<&AuthExtension>,
     repo: &RepoInfo,
     package: &str,
     rows: &[&NpmPackageRow],
@@ -6890,7 +6899,7 @@ async fn unpublish_npm_rows(
     let artifact_service = state.create_artifact_service(storage);
     let mut removed_versions: Vec<String> = Vec::new();
     for row in rows {
-        match artifact_service.delete(row.id).await {
+        match artifact_service.delete_by(row.id, auth).await {
             // A concurrent unpublish got there first: the row is gone either way.
             Ok(()) | Err(AppError::NotFound(_)) => {}
             Err(e) => return Err(e.into_response()),
@@ -6955,7 +6964,7 @@ async fn unpublish_versions_for(
         )
         .into_response());
     }
-    unpublish_npm_rows(state, &repo, package, &removed).await?;
+    unpublish_npm_rows(state, auth, &repo, package, &removed).await?;
     Ok(npm_ok_response())
 }
 
@@ -6972,7 +6981,7 @@ async fn unpublish_package_for(
         return Err(npm_package_not_found(package));
     }
     let all: Vec<&NpmPackageRow> = rows.iter().collect();
-    unpublish_npm_rows(state, &repo, package, &all).await?;
+    unpublish_npm_rows(state, auth, &repo, package, &all).await?;
     let _ = sqlx::query("DELETE FROM npm_dist_tags WHERE repository_id = $1 AND name = $2")
         .bind(repo.id)
         .bind(package)
@@ -7003,7 +7012,7 @@ async fn unpublish_tarball_for(
                 .into_response(),
         );
     }
-    unpublish_npm_rows(state, &repo, package, &matching).await?;
+    unpublish_npm_rows(state, auth, &repo, package, &matching).await?;
     Ok(npm_ok_response())
 }
 
@@ -20610,6 +20619,10 @@ mod unpublish_4025_tests {
         let gone = tarball_status(&fx, &format!("{pkg}/-/{pkg}-2.0.0.tgz")).await;
         let kept = tarball_status(&fx, &format!("{pkg}/-/{pkg}-1.1.0.tgz")).await;
         let audits = tdh::audit_count_eventually(&fx.pool, removed_id, "ARTIFACT_DELETED", 1).await;
+        let actor = tdh::audit_row_eventually(&fx.pool, removed_id, "ARTIFACT_DELETED")
+            .await
+            .user_id;
+        let owner = fx.user_id;
         fx.teardown().await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(version_keys(&after), vec!["1.0.0", "1.1.0"]);
@@ -20621,6 +20634,11 @@ mod unpublish_4025_tests {
         assert_eq!(gone, StatusCode::NOT_FOUND, "unpublished tarball 404s");
         assert_eq!(kept, StatusCode::OK, "other versions remain");
         assert_eq!(audits, 1, "the delete goes through ArtifactService (audit)");
+        assert_eq!(
+            actor,
+            Some(owner),
+            "#5455: the unpublishing principal is the actor"
+        );
     }
 
     #[tokio::test]

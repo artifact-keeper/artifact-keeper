@@ -823,7 +823,20 @@ mod tests {
         drop_session(&fx, &body).await;
         tdh::cleanup_user(&fx.pool, writer_id).await;
 
-        // Replication never takes the short-circuit, even when asked to.
+        // Replication (a peer: an administrator's token with the header,
+        // #5455) never takes the short-circuit, even when asked to.
+        let (status, body) = init_session_with(
+            &fx,
+            tdh::admin_auth(fx.user_id, &fx.username),
+            request("ferry/blob.bin", &sha, content.len(), Some(true)),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "replication: {body}");
+        drop_session(&fx, &body).await;
+
+        // #5455: a forged header (an ordinary writer, not the peer) is not a
+        // replication: it takes the short-circuit like a plain request.
         let (status, body) = init_session_with(
             &fx,
             auth.clone(),
@@ -831,8 +844,8 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::CREATED, "replication: {body}");
-        drop_session(&fx, &body).await;
+        assert_eq!(status, StatusCode::OK, "forged header: {body}");
+        assert_eq!(body["already_present"], true, "forged header: {body}");
 
         // A soft-deleted row is not "present": the upload must go through.
         set_deleted(&fx, "ferry/blob.bin", true).await;

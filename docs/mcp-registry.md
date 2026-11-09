@@ -139,11 +139,20 @@ whose newest 100 versions are all held has no `latest` (the unknown-name
 `nextCursor` is opaque, as upstream specifies: a URL-safe string to pass back
 as `cursor` unchanged. It is sealed (AES-256-GCM under a key derived from the
 instance's `jwt_secret`) and bound to the repository and listing that issued
-it, so it reveals nothing about the row it resumes after (which may be a held
-version a reader must not learn of) and a client cannot make one up. A cursor
-this instance did not issue for that listing, including one issued before an
-upgrade that introduced sealing or before a `jwt_secret` rotation, is
-`400 mcp_invalid_query` (`invalid cursor`); start again without `cursor`.
+it, so a client cannot read or make one up. It never names a version the
+reader is not served, not even sealed: it holds the last row the listing
+served and, when the request stopped at the row bound after reading only
+rows the reader is not served, the internal id of the last of those rows.
+That id is a random UUID: fixed-length, unordered and meaningless outside
+this instance, so it is not a server name or version. The next request
+looks the row up (deleted rows included) and continues strictly after it,
+so the walk moves past held rows at the cost of a keyset resume at any
+depth, and a version deleted or soft-deleted between pages moves nothing.
+If that row has been purged, the walk resumes after the last served row.
+A Virtual's composite cursor works the same way.
+A cursor this instance did not issue for that listing, including one issued
+before an upgrade that introduced sealing or before a `jwt_secret` rotation,
+is `400 mcp_invalid_query` (`invalid cursor`); start again without `cursor`.
 
 Behaviour pinned by the end-to-end suite (clients may rely on it):
 
@@ -158,6 +167,23 @@ Behaviour pinned by the end-to-end suite (clients may rely on it):
   re-renders it as problem+json (test `visibility_middleware_gates_the_surface`).
   A key that names no repository gets the same `401` anonymously, so the
   status does not reveal which private registries exist.
+- Writes keep that guarantee (#5458). A publish, a status change
+  (`PATCH .../status`) or an introspection request (`POST .../capabilities`,
+  `.../capabilities/probe`) on a private repository by an authenticated
+  caller who cannot read it (an administrator of some other repository, a
+  token minted for other repositories) is refused by the same middleware with
+  the plain unknown-name `404`, byte for byte (status, headers, body) what a
+  key naming no repository answers, before any document, namespace, OIDC or
+  policy check runs; nothing is written. A caller who can read the repository
+  but may not write it still gets `403 mcp_forbidden` (test
+  `write_denials_to_non_readers_match_an_unknown_key`). A public or
+  `internal` repository is readable by every authenticated caller, so its
+  write refusal stays `403` (except for a token scoped elsewhere on an
+  `internal` one). The rule is the same on every format route; see
+  [Repository visibility](repository-visibility.md#write-refusals-to-callers-who-cannot-read).
+  Troubleshooting: a publish to a private registry with a token scoped to
+  another repository, or by a user who lost their grant, now answers the
+  unknown-server-name `404`, not `403`; check the token's repository scope.
 - A trailing slash (`/v0.1/servers/`) is not a route: plain `404`.
 - `/versions` is not paged: it returns every servable version (at most the
   newest 1000) with no `nextCursor`.
@@ -175,7 +201,8 @@ Behaviour pinned by the end-to-end suite (clients may rely on it):
   mcp_search_too_short`.
 - A write without `write:artifacts` is `403 mcp_forbidden` ("This token does
   not carry the write:artifacts scope"); a token minted for other repositories
-  is `403 mcp_forbidden`. The `detail` text depends on which check refuses it
+  is `403 mcp_forbidden` on a public repository and the unknown-name `404` on
+  a private or `internal` one (see above). The `detail` text depends on which check refuses it
   ("This token is not scoped to this repository" or "This credential may not
   write to this repository"), so clients should match on `code`, not `detail`.
 
@@ -400,11 +427,53 @@ Each repository has a package policy (`mcp_package_policy`):
   (`mcp_package_repos`). The publish looks it up in the database; it never
   contacts the package's registry. The version is pinned, and every read
   serves the package's Artifact Keeper coordinates, gated like any download.
-- **`open`**. An explicit opt-out for a catalog of servers whose packages live
-  elsewhere: `packages[]` is stored and served verbatim after the shape
-  checks. Nothing is resolved, rewritten or gated, so a held or vulnerable
-  package does not hide the server. Treat an `open` repository as a list of
-  links, not as a control.
+- **`open`**. Foreign coordinates are accepted, nothing else is relaxed
+  (#5452). A `registryBaseUrl` naming another registry, or an OCI image on
+  another host, is not refused with `mcp_external_registry` when the package
+  resolves in a hosted (Local or Staging) backing repository, or a Virtual's
+  hosted member: the package is looked up there by name and version (an image
+  by its path and tag or digest), pinned, served at its Artifact Keeper
+  coordinates and gated exactly as under `own-repos`.
+
+  Content that reaches this instance through a Remote came from that
+  Remote's upstream, so it stands only for coordinates naming that upstream:
+  the same origin (scheme, host, port) and a path under the upstream URL's
+  path, compared by whole segments. A registry is often one path of a shared
+  host (GitLab's `/api/v4/projects/<id>/packages/pypi/simple`, Nexus or
+  Artifactory `/repository/<name>/`), so another project or repository on
+  the same host does not match; a root-path upstream such as
+  `https://registry.npmjs.org/` matches any path on its origin.
+  Foreign coordinates naming any other host are neither pinned from a Remote
+  backing repository (or a Virtual's Remote member, including its proxy
+  cache) nor filled through it: the publish is refused with
+  `mcp_external_registry`, and a Remote MCP repository's sync stores the
+  version `unresolvable`. Without this rule `@corp/tool` on
+  `npm.internal.corp` would be replaced by a same-named (possibly squatted)
+  public package the Remote proxies. The foreign registry itself is never
+  contacted and never served.
+
+  A pin of foreign coordinates records the warning
+  `foreign_coordinates_replaced`. The served package carries what was
+  replaced in `_meta["com.artifactkeeper/resolved"]` (`submittedIdentifier`,
+  `submittedRegistryBaseUrl` for npm, PyPI, NuGet and Cargo, the backing
+  repository and `warnings`), and the version's health lists the warning per
+  package. A package that does not resolve is refused at publish as under
+  `own-repos` (`mcp_package_not_found`, or `mcp_external_registry` for a
+  `registryType` with no backing repository), or `202 resolving` and filled
+  through a Remote backing repository when the coordinates allow it. A
+  package is never served unpinned or ungated under either policy.
+
+  An `open` publisher needs `read` on the backing repository, as under
+  `own-repos` (see below): the package is looked up there.
+
+  Before #5452 `open` stored and served `packages[]` verbatim, without pins
+  or gates. Versions stored that way are `unresolvable` (hidden, `404
+  mcp_unresolvable` for a holder) until they are pinned. A Remote MCP
+  repository's sync re-resolves them on every pass (the versions not
+  attempted longest first) and serves each once its packages pin. A hosted
+  version is re-resolved in place by an administrator's
+  [`PUT .../versions/{version}`](#put-versionsversion-admin-edit) of the same
+  document, or republished as a new version.
 
 Settings are part of the repository API (`POST`/`PATCH /api/v1/repositories`):
 
@@ -446,11 +515,13 @@ generic artifact upload routes (`PUT`/`POST /api/v1/repositories/{key}/artifacts
 and `/api/v1/uploads`) refuse an MCP repository with `400`, except for a
 peer replication under an instance administrator's token (an administrator
 sending the replication header, which is how a peer link is set up). A
-service account does not qualify, unlike for the other formats: the header is
+service account does not qualify, for this or any other format: the header is
 client-set and nothing binds a credential to a registered peer, so "a service
 account plus the header" let any CI account with `write` claim a
 `name@version` in another team's namespace with an unvalidated, unpinned
-document (#5368). Likewise a server version (or a bundle) leaves an MCP
+document (#5368, #5455). A server.json replicated this way writes the
+`MCP_SERVER_PUBLISHED` audit row, with the peer's principal as its actor.
+Likewise a server version (or a bundle) leaves an MCP
 repository only through `DELETE .../servers/{serverName}/versions/{version}`
 (the soft delete below) and, after it, the administrator
 [purge](#post-versionsversionpurge-admin-purge): the generic
@@ -462,14 +533,15 @@ would let a writer of one namespace delete another's server.json. Lifecycle
 policies skip MCP repositories altogether (see
 [Lifecycle policy assignments](lifecycle-policy-assignments.md#execution)).
 
-To publish a server under `own-repos`, publish (or pull through a Remote) its
+To publish a server under either policy, publish (or pull through a Remote) its
 package first, then publish the server.json. A publish answers `422` with one
 `detail` line naming the entry and the fix:
 
 | `error` | When |
 | --- | --- |
-| `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. |
+| `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. Under `open` only the first case and `registryBaseUrl` on an `mcpb` entry are refused; foreign coordinates are looked up in the backing repository. |
 | `mcp_package_not_found` | The exact package version (npm, PyPI, NuGet, Cargo) or image tag/digest (OCI) is not in a hosted backing repository, or an `mcpb` entry's `fileSha256` matches no uploaded bundle. A package missing from a Remote backing repository is not refused: it is filled (`202`, see [Write path](#write-path-phase-2-and-3)). |
+| `mcp_package_shadowed` | The backing repository is a Virtual whose download route would serve the package from another member than the one holding it: a Remote member that outranks it (or, for PyPI, any Remote member with an upstream). The detail names both members and the fixes. |
 | `mcp_bundle_signature_required` | The repository sets `mcp_require_bundle_signature` and an `mcpb` entry's bundle (uploaded here or found through `mcp_package_repos.mcpb`) has no recorded signature from a trusted signer (see [MCPB bundles](#mcpb-bundles)). |
 | `mcp_package_version_unpinned` | An npm, PyPI, NuGet or Cargo entry has no `version`. |
 | `mcp_oci_floating_tag` | An OCI identifier is `:latest` or has no tag and no digest. |
@@ -489,8 +561,82 @@ the pinned bytes are the bytes that route serves:
 | NuGet | case-insensitive | NuGet's normalised form in lowercase, as a V3 client requests it (`1.0` is requested as `1.0.0`), compared exactly with the stored version: a package stored as `1.0` or `1.0.0-Beta` is not served for `1.0.0` or `1.0.0-beta` and is not pinned. A version NuGet cannot normalise is not pinned. |
 | Cargo | case-insensitive; `-` and `_` are different crates (a Local repository can hold both) | exact |
 
-A Virtual backing repository pins the first member, by priority, that holds
-the version: the member a download through the Virtual is served from.
+A Virtual backing repository pins the member its download route serves
+the version from (#5456). npm, PyPI, NuGet and Cargo clients install from
+`registryBaseUrl`, which is the Virtual, so the pin is the member the
+Virtual's own member walk picks: nested Virtuals expanded in place, equal
+priorities broken by repository key, and each format's guard applied as the
+download route applies it:
+
+- **npm**: the tarball route's shadowing guard and scope policy. A hosted
+  member holding the exact version withholds the Remote members it outranks;
+  isolate mode withholds every Remote member for a hosted name; a Remote
+  member outside its scope policy never serves.
+- **Cargo**: a hosted member holding the exact `name@version` anywhere in
+  the Virtual withholds every Remote member.
+- **NuGet**: strict priority, no guard.
+- **PyPI**: per file. The simple index lists the files of every hosted
+  member and a download matches the file name alone, so the pin covers
+  every hosted file of the version (versions compared as PEP 440: `1.0` is
+  `1.0.0`; files matched by name, whatever project they were uploaded
+  under). A Remote member can serve other distributions of the version from
+  its upstream (a platform wheel, even when a hosted member owns the name),
+  so a PyPI package is not pinned through a Virtual that has a Remote
+  member with an upstream.
+
+A Remote member that the guard does not withhold, and that is walked before
+the hosted member holding the version, serves it from its upstream whether
+or not it has cached it. Such a publish is refused with
+`422 mcp_package_shadowed`, naming both members and the fixes (rank the
+hosted member above the Remote, enable isolate mode for npm, or map the
+hosted repository directly).
+
+The same check runs on every read. When the route would no longer serve the
+pinned rows, the version is held as `mcp_unresolvable` (the holder's body
+carries `gate: shadowed`). That happens when a hosted member walked earlier
+now holds the version (published at any quarantine state), when a Remote
+member now outranks it or is no longer withheld, or when the pinned member
+leaves the Virtual. For PyPI it also happens when another file of the
+version appears in any hosted member, when a pinned file is gone, or when a
+Remote member with an upstream joins. The pin is never moved. The version serves again
+once the route serves the pinned rows again; otherwise publish a new server
+version to pin what it serves now. A pinned row whose bytes changed in place
+(its checksum is no longer the one pinned) no longer counts as the pinned
+row.
+
+Quarantine and shadowing together, for a Virtual `[H, L]` whose pin is A in
+`L`:
+
+| State | MCP read | Download through the Virtual |
+| --- | --- | --- |
+| A quarantined, nothing in `H` | held (`mcp_backing_artifact_blocked`) | refused |
+| B published in `H`, then A quarantined | held (`mcp_unresolvable`, `gate: shadowed`) | serves B to every client; the approved document is never served with it |
+| B published in `H` and quarantined | held (`mcp_unresolvable`, `gate: shadowed`) | refused (a member refusing what it holds does not fall through to `L`) |
+
+The model walks every member of the Virtual, whoever is asking. Two of the
+route's skips only make it hold more than the route would: PyPI curation,
+and an age gate reporting that a Remote's upstream does not host the
+version. Per-caller member visibility is different and is a known caveat
+(#5536): the download route drops the members the caller cannot read, so for
+a caller who cannot read the pinned member, a lower-ranked hosted member (or,
+for NuGet, any Remote member) can serve other bytes at the pinned coordinate
+while the version is still served as approved. Until #5536 lands, give every
+reader of an MCP repository read access to the members that hold its pinned
+packages.
+
+**Upgrading.** The check also applies to versions approved before it
+existed, so some are held as soon as the upgraded server reads them: those
+pinned through an npm or NuGet Virtual with a Remote member ranked above the
+hosted member holding the package, and those pinned through a PyPI Virtual
+with any Remote member that has an upstream. They answer `404` to readers
+(`mcp_unresolvable`, `gate: shadowed` for the repository holder), drop out of
+listings and `latest`, and their health turns critical. Re-rank the hosted
+member above the Remote, enable isolate mode on an npm Virtual, or (PyPI)
+remove the Remote member from the Virtual: the hold clears on the next read,
+with no republish, because the pin is unchanged and the check is evaluated on
+every read. Mapping the hosted repository directly (`mcp_package_repos`) only
+affects versions published after the change, since an existing version's
+`registryBaseUrl` names the Virtual: publish a new server version for that.
 A proxy-cache entry ([Packages in a Remote backing
 repository](#packages-in-a-remote-backing-repository)) matches by its exact,
 case-sensitive cache path (`1.0.0-RC.1` is not `1.0.0-rc.1`); a NuGet entry by
@@ -559,8 +705,10 @@ still does). Deleting the whole MCP repository that holds the version
 job has removed its rows, none of its versions pins anything, and their
 tombstones go with it.
 
-Switching a repository from `open` to `own-repos` does not resolve versions
-already published: they are `unresolvable` until republished as a new version.
+Switching a repository between `open` and `own-repos` does not change
+versions already published: they keep the pins they were published with and
+are gated by them. A version stored unpinned (under `open` before #5452) is
+`unresolvable` under either policy until republished as a new version.
 
 ## What a client sees
 
@@ -578,10 +726,14 @@ One decision function (`decide_mcp_serve`) answers every read:
 | pinned package quarantined | omitted | skipped | `404` plain | `404` + `package`, `gate: quarantine` | `mcp_backing_artifact_blocked` |
 | pinned package refused by scan policy or rejected, or by its Remote's stored proxy-scan verdict | omitted | skipped | `404` plain | `404` + `package`, `gate: scan_policy` | `mcp_backing_artifact_blocked` |
 | pinned package younger than its Remote's age gate | omitted | skipped | `404` plain | `404` + `package`, `gate: age_gate`, `review_id`, `min_age_days`, `requested_age_days` | `mcp_age_gate_blocked` |
-| pinned package gone, or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
+| pinned package gone, no longer what its Virtual serves (`gate: shadowed`), or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
 | a gate cannot be evaluated (database error) | omitted | `503` | `503` | `503` | `mcp_gate_unavailable` |
 | `deprecated` | listed | eligible | `200` | `200` | |
 | `deleted` | omitted unless `include_deleted=true` | skipped | `404` plain; `200` with `include_deleted=true` | same | |
+
+A package with no pin (a version stored under `open` before #5452) is held
+as `mcp_unresolvable` too. Changing the package policy does not change a
+pinned version's decision: pins and gates are the same under both policies.
 
 - **`404` plain** is byte for byte the answer for a name that does not exist:
   `{"detail":"Server not found","status":404,"title":"Not Found","type":"about:blank"}`
@@ -670,6 +822,25 @@ replication write is refused, see [Package policy](#package-policy)).
   and invisible formatting characters (U+200B-U+200F, U+2060-U+2064, the
   BOM), the line and paragraph separators (U+2028/U+2029) and Unicode tag
   characters (U+E0000-U+E007F). URLs must be absolute `http`/`https`.
+- A templated transport URL (`remotes[].url`, `packages[].transport.url`)
+  is checked against what it can expand to, not only its shape (#5529).
+  Each `{variable}` is filled with every publisher value it carries
+  (`value`, `default`, `placeholder`, each `choices` entry; a remote's
+  variables come from its `variables`, a package's from every argument
+  whose `valueHint` or `name` matches and every environment variable whose
+  `name` matches, all of them), and every combination must be an absolute
+  `http`/`https` URL, or the version is refused with `400
+  mcp_invalid_server_json` at `remotes[<i>].url` (or
+  `packages[<i>].transport.url`), naming the variable and the expansion.
+  A variable that opens the URL (`{base}/sse`) picks the scheme, so it
+  needs a `default` or `choices` whether it is declared or not; a variable
+  with no value anywhere else stands in for client input and is accepted.
+  More than 256 combinations are refused rather than checked. The same
+  rule applies to upstream versions a Remote repository ingests: one with
+  such a template is not admitted (counted as invalid at sync). User-info
+  in an expanded URL is not refused (as for a literal URL). A version
+  stored before this rule is not re-validated; the `remote_url_shape` lint
+  flags it when the version is next linted.
 - Publishes are quota-admitted like any upload and capped at 256 KiB, 16
   packages, 8 remotes and 64 entries per list.
 
@@ -969,7 +1140,12 @@ quarantine exactly as a publish is); registry state is kept and `updatedAt`
 bumped. When `packages[]` is unchanged the pins are kept as they are;
 otherwise every package is resolved again (and may answer `202` with
 `status: "resolving"` exactly as a publish). Identical bytes answer `200`
-without a write. Audited `MCP_SERVER_EDITED`
+without a write, except for a version with a package no pin covers (stored
+under `open` before #5452): a `PUT` of the same document resolves its
+packages again in place, which is how such a version is made servable
+without a new version number. Like any edit it rewrites the stored bytes, so
+the repository's upload quarantine hold, if it has one, applies again; the
+audit records `repinned: true`. Audited `MCP_SERVER_EDITED`
 (`previous_sha256`, `sha256`, `packages_changed`, `resolving`).
 
 ### `DELETE .../versions/{version}` (soft delete)
@@ -1023,6 +1199,40 @@ curl -X PUT -H "Authorization: Bearer $AK_TOKEN" --data-binary @echo.mcpb \
   allowlisted namespace, `mcp_server_denied`, `mcp_namespace_not_granted`). A version already recorded (published, even
   deleted) is `409 mcp_version_exists`. Body at most 256 MiB
   (`413 mcp_bundle_too_large`); streamed to staging, not buffered.
+- A bundle's ZIP may hold at most `MAX_INGEST_ARCHIVE_ENTRIES` entries
+  (default 10,000, the shared ingest ceiling); more is
+  `400 mcp_bundle_invalid` before the manifest is looked up, so no bundle
+  row or version is written.
+- AK stores a bundle verbatim, so it vets every entry for the client that
+  later unpacks it, and refuses the bundle with `400 mcp_bundle_invalid`
+  (nothing stored: no bundle row, no facts, no storage object) unless:
+  - every entry name is valid UTF-8 (whether or not the ZIP's UTF-8 flag is
+    set; `entry N name is not UTF-8`), and the central directory and local
+    header of each entry carry the same name bytes (`central/local header
+    name mismatch for entry N`); an Info-ZIP Unicode path extra field
+    (`0x7075`) in either header naming any other path, whatever its CRC, is
+    refused as well;
+  - no name is empty, absolute (`/x`, `\x`), drive-qualified (`C:x`),
+    contains a `..` segment, a backslash, a `:` (also an NTFS alternate
+    data stream, `manifest.json::$DATA`) or a control character
+    (`unsafe entry name: <name>`), the shared archive-path policy plus the
+    backslash, colon and control-character rules;
+  - every entry is a regular file or directory: a symlink
+    (`symlink entry: <name>`) or a device, FIFO or socket
+    (`special file entry: <name>`) is refused, judged by the Unix mode in
+    the external attributes whatever host made the entry (7-Zip records a
+    Windows symlink as a FAT-made entry with a Unix link mode);
+  - no two entries unpack to the same path (empty and `.` segments ignored,
+    Unicode NFC; `duplicate entry <name>`), and exactly one entry is the root
+    manifest, compared case-insensitively (Unicode upper case, so
+    `manifeſt.json` counts), so `MANIFEST.JSON` or
+    `./manifest.json` beside `manifest.json` is
+    `duplicate entry manifest.json`;
+  - `manifest.json` repeats no member name in any object
+    (`manifest.json: duplicate key ...`).
+
+  Build bundles with `mcpb pack`: it follows symlinks, so links such as
+  `node_modules/.bin/*` are stored as regular files rather than refused.
 - AK reads `manifest.json` (at most 1 MiB, an object with string `name` and
   `version`; else `400 mcp_bundle_invalid`) and verifies the signature
   block the `mcpb sign` tool appends (`MCPB_SIG_V1`, PKCS#7 detached
@@ -1150,7 +1360,16 @@ now. Any other reader is shown the server's newest servable version instead
 row at all when no version of the server is served: `GET
 /api/v1/packages/{id}` is then `404`, and the page's `total` leaves it out.
 `GET /api/v1/packages/{id}/versions` lists only servable versions for such a
-reader. A gate that cannot be evaluated hides the row (fail closed).
+reader. A soft-deleted (`deleted`) version is never servable here: a server
+whose only version is deleted has no row for such a reader, as on the
+`/v0.1` listing. A gate that cannot be evaluated hides the row (fail closed).
+
+Every generic surface below applies one visibility rule to a caller who does
+not hold the registry, before it counts, pages, facets or serves anything: a
+version is shown only when it is not soft-deleted and the `/v0.1` listing
+gate serves it to readers now (not held through its server.json or a pinned
+package, including `gate: shadowed`, not refused by scan policy, curation or
+`mcp_server_deny`, not resolving or unresolvable).
 
 **The generic artifact routes** apply the same decision to an MCP
 registry's stored documents and bundles (`servers/<name>/<version>/server.json`,
@@ -1174,6 +1393,16 @@ resolving, unresolvable, or soft-deleted) is treated as missing:
   `GET /api/v1/artifacts/{id}` (with `/metadata` and `/stats`) answer the
   route's plain `404`. For a Virtual registry, the member that holds the
   path first (by priority) decides.
+- A served server.json on those routes is the document the registry serves,
+  every pinned package at its Artifact Keeper coordinates (#5452): the
+  download and `/api/v1/tree/content` return it, and the two metadata routes
+  return it as `metadata.server`. Its bytes differ from the stored
+  artifact's, so its size and sha256 are not the artifact's `size_bytes` and
+  `checksum_sha256`: the download carries the served bytes' sha256 in
+  `X-Checksum-Sha256`. These answers are `Cache-Control: no-store` (the
+  coordinates follow the request's base URL). The download still passes the
+  download gate (`409`/`403` for a holder of a quarantined or rejected
+  server.json) and is counted.
 
 - `/api/v1/search/*` excludes those artifacts in the database query:
   `quick` (OpenSearch hits are re-checked in PostgreSQL), `advanced` (items,
@@ -1507,7 +1736,12 @@ Base: `/api/v1/repositories/{key}/mcp`, Remote MCP repositories only (any
 other key answers `404`). Reads need an authenticated caller who can read
 the repository (token scope `read:repositories`); decisions need the
 repository `admin` action (token scope `write:repositories`). Errors use the
-API's usual `{"code", "message"}` body.
+API's usual `{"code", "message"}` body. A write (sync, seed, pin, a decision
+or a bulk decision) refused to a caller who cannot read the repository
+answers `404 Repository not found`, the same status and body as a key that
+names no repository, so a non-reader cannot learn which private Remote keys
+exist (#5458); a caller who can read it but is not its administrator gets
+`403`.
 
 | Method and path | Who | Request | Response |
 | --- | --- | --- | --- |
@@ -1919,7 +2153,7 @@ snapshot (`outcome` other than `ok`) leaves them.
 | `injection_phrase` | `review` | Instructions aimed at the model: "ignore previous instructions", "you must", "do not tell the user", "system prompt", pseudo-tags (`<important>`, `<system>`), HTML/markdown comments, `IMPORTANT:`, chat role tags (`<\|im_start\|>`, `[INST]`, `<<SYS>>`), fenced code, "before using this tool", credential file references (`~/.ssh`, `id_rsa`, `.aws/credentials`, `.npmrc`, `mcp.json`). URLs count only in descriptions and titles shown to the model (server, tools, `inputSchema`), not in `statusMessage` or variable descriptions. Decision 13: `review`, never `block`. |
 | `hidden_text` | `block` | Control (other than tab and line breaks), bidirectional, zero-width or Unicode tag characters in any linted string or object key. Stored as finding class `malicious`. |
 | `dangerous_args` | `block`, `review` | `block`: in `runtimeArguments`, flags that re-route installs around the backing repository (`--registry`, `--index-url`, `--extra-index-url`, `--find-links`, `--index`, `--default-index`, `--source`, `--pypi-mirror`); anywhere, `--privileged`, a bind mount of the host root (`-v /:/host`, `--mount source=/`) or of the Docker socket. `review`: the same re-routing flags in `packageArguments`, other host bind mounts, `--network/--net/--pid/--ipc/--uts/--userns=host`, `--cap-add`, `--security-opt`, `--device`, `--unsafe-perm`, `--trusted-host`, `--insecure`, `-A`/`--allow-*`, and `LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH` and other code-injecting variables (as `-e`/`--env` values, positional `NAME=value` arguments or environment variable names). Both `--flag value` and `--flag=value` spellings. |
-| `remote_url_shape` | `review`, `warn` | `remotes[].url` only. `review`: a template variable in the host, user-info, an IP literal (private or public), `localhost`. `warn`: plain `http`, a non-default port on a public host, an internal host name (`.internal`, `.local`, `.corp`, `.lan`, `.intranet`, `.home.arpa`, `.localdomain`) in a public registry. |
+| `remote_url_shape` | `review`, `warn` | `remotes[].url` (and `packages[].transport.url` for templates). `review`: a template variable in the host, user-info, an IP literal (private or public), `localhost`, a URL template that can expand to a non-`http(s)` URL (refused at publish since #5529; a version stored before is flagged when it is next linted, and one with more than 256 expansions has its scheme-position values checked on their own). `warn`: plain `http`, a non-default port on a public host, an internal host name (`.internal`, `.local`, `.corp`, `.lan`, `.intranet`, `.home.arpa`, `.localdomain`) in a public registry. |
 | `oci_tag_digest_mismatch` | `warn` | A submitted `:tag@sha256:D` whose tag currently resolves to another digest (`D` is pinned). |
 | `oci_label_mismatch` | `warn` | The pinned image's config has no `io.modelcontextprotocol.server.name` label, a label naming another server, or a config that is not stored in the backing repository (labels are read from the stored manifest and config blob, never fetched). Under `mcp_require_oci_label: true` this refuses the publish instead (see below). |
 | `mcpb_missing_sha` | `block`, `review` | `block`: an `mcpb` package without `fileSha256`. `review`: an `mcpb` `fileSha256` that matches no bundle stored with the version (when bundles are stored). |
@@ -1942,7 +2176,7 @@ the rule and the field: re-linting the same version keeps it acknowledged.
 ### Where findings are stored
 
 One completed `scan_results` row with `scan_type = "mcp_lint"` and
-`scanner_version = "ak-mcp-lint/2"` per lint run of the server.json artifact,
+`scanner_version = "ak-mcp-lint/3"` per lint run of the server.json artifact,
 listed by `GET /api/v1/security/artifacts/{artifact_id}/scans` like any scan.
 Each finding:
 
@@ -2030,7 +2264,8 @@ body. `?include_deleted=true` answers a soft-deleted version's health too
   (`age_gate`, or a high/medium finding), `unknown` (no completed scan, or
   gate `unavailable`), else `ok`; the lint `critical` (`block` > 0),
   `warning` (`review` > 0), `unknown` (never ran); `unknown` for a version
-  with packages but no pins (published under `open`). Order:
+  with packages but no pins (stored under `open` before #5452; such a
+  version is also held `unresolvable`). Order:
   `critical` > `warning` > `unknown` > `ok`.
 
 ## Capabilities and introspection
@@ -2052,9 +2287,20 @@ a `notice` member.
 | `remote_probe` | the `ak-mcp-introspector` worker against a `remotes[]` URL | observed (remote) |
 | `sandbox_run` | the `ak-mcp-introspector` worker running a stdio package in a sandbox | observed (sandbox) |
 
-The **current** snapshot is the newest successful (`outcome: ok`) one of the
-best source in this order: `sandbox_run`, `remote_probe`, `gateway_reported`,
-`ci_reported`, `publisher_declared`.
+The **current** snapshot is the freshest successful (`outcome: ok`) one of
+the best source in this order: `sandbox_run`, `remote_probe`,
+`gateway_reported`, `ci_reported`, `publisher_declared`. Freshness is the
+latest time the content was validly seen (`lastSeenAt`, else `observedAt`),
+then arrival, then id, never arrival alone (#5464): a result or report that
+arrives later but was observed earlier than the current snapshot is kept as
+history and does not replace it, raises no `tool_drift` finding and is not
+linted (its tool text carries no lint finding in the diff view). History
+(`snapshots[]`) and the diff's default `from` follow the same order.
+"Newest" below means freshest in this order. A result or report dated up to
+5 minutes ahead (clock skew) is stored as of its arrival. CI and gateway
+reports have no lower bound on `observedAt`: a pipeline that reports a build
+or commit time older than the current snapshot of its source stores history
+and does not update the current view.
 
 History is kept, deduplicated and bounded (#5386):
 
@@ -2180,7 +2426,7 @@ default 50, max 200).
     "createdAt": "2026-11-03T10:00:01Z",
     "tools": [], "resources": [], "prompts": [], "instructions": null
   },
-  "snapshots": [ /* summaries, newest first: `current` without tools/resources/prompts/instructions */ ],
+  "snapshots": [ /* summaries, freshest first: `current` without tools/resources/prompts/instructions */ ],
   "introspection": {
     "remoteProbe": "off", "probeEnabled": false,
     "sandbox": "off", "sandboxEnabled": false,
@@ -2199,7 +2445,9 @@ declarations); `outcome` `ok` | `auth_required` | `rate_limited` | `timeout`
 the engine exited 125-127, the runtime, network or image was missing;
 retried) | `needs_config` (the sandboxed server would not start or
 answer without configuration) | `refused` (redirect, private address, over
-the size cap) | `unsupported` | `error`. Failed attempts are listed in
+the size cap, or a protocol violation: `details.protocolViolation` names it,
+see [the worker](#the-ak-mcp-introspector-worker)) | `unsupported` |
+`error`. Failed attempts are listed in
 `snapshots` (with empty lists and `details.error`) but are never `current`.
 `details` by source: declared `{generatedBy}` or `{bundleArtifactId,
 fileSha256, signature, toolsGenerated, promptsGenerated}`; observed `{era:
@@ -2334,7 +2582,29 @@ the audit, lint and drift side effects run only after it commits. Of two
 completions of one claim, or a completion racing the reaper or a re-claim,
 exactly one stores a snapshot; the other stores nothing and is answered
 `409 mcp_claim_invalid`. A retry (`status: "retry"`) likewise only counts
-when it ended the current claim.
+when it ended the current claim, so a retry racing a successful result
+never leaves a stored snapshot behind a pending job (#5461).
+
+The same transaction also requires a live lease: a claim whose
+`leaseExpiresAt` has passed cannot complete or retry, whether or not the
+reaper has run yet (`409 mcp_claim_invalid`, nothing stored, the job left for
+the reaper) (#5462). And it revalidates the target (#5463): the reader serve
+gate a claim passes is evaluated once more just before the transaction, and
+inside it these are re-read under lock: the version row's quarantine,
+rejection and deletion, its registry status (`deleted`), and every backing
+package's pinned rows (quarantined, rejected, deleted, or a cache pin under
+its hold). The other gates (scan policy, curation and age gates, Remote
+proxy verdicts, OCI manifest presence) are evaluated only by the
+pre-transaction check (#5533 tracks evaluating the whole gate on the
+transaction). A target that no longer qualifies answers `409
+mcp_target_ineligible` with a `reason`, stores nothing and cancels the job,
+as a claim of a held version does. A gate that cannot be evaluated is no
+hold: a claim returns the job to the queue and tries the next candidate
+(answering `503 mcp_gate_unavailable` only when nothing servable was found),
+and a completion answers `503 mcp_gate_unavailable` and leaves the claim as it
+was. A released job is due again after 1, 2, 4 ... up to 64 minutes; its first
+five releases give the attempt back, later ones spend it, so a gate that never
+becomes evaluable fails the job once its attempts are used up.
 
 Claim order is fair across repositories: a claim hands out a due job from the
 repository with the fewest jobs claimed at that moment, and within it the
@@ -2348,8 +2618,39 @@ Authenticated with an API token minted with the **`mcp:introspect`** scope
 (admin-only to mint; a token with `*`/`admin` or an interactive session does
 not qualify: `403 mcp_forbidden`). Mint it for a dedicated service account.
 
+A token minted with a repository restriction only works that repository's
+jobs (#5460): a claim hands it only jobs of repositories it is scoped to
+(another repository's due job is left untouched, so the answer is `204` when
+nothing of its own is due), and a completion re-checks the token's scope
+against the job's repository, and that the job belongs to the repository of
+the server version it introspects, inside the transaction that ends the
+claim. Holding a valid claim token is not enough: a completion by a token
+that does not cover the job's repository answers `403 mcp_forbidden` and
+stores nothing, leaving the claim as it was. A change to a token's
+repository restriction takes effect once the API-token validation cache
+(up to 5 minutes) has expired; until then requests run with the scope
+the token was last validated with.
+
+A claim is bound to the worker identity that took it (#5465): the principal
+(user or service account) of the `mcp:introspect` token that sent `POST
+/jobs/claim`. Only that principal can complete the job; another worker that
+holds the claim token gets the same `409 mcp_claim_invalid`, with the same
+body, as a wrong token (checked before the result is read, and again under
+the claim's row lock), and nothing is stored or changed. The binding is to
+the principal, not to the API token, so a worker that rotates its token, or
+uses another `mcp:introspect` token of the same service account, mid-claim
+can still complete its claim; workers that must not complete each other's
+jobs need separate service accounts. `workerId` is a self-chosen label, not
+an identity, and is not checked. The stored snapshot (`reportedBy`) and its
+`MCP_CAPABILITIES_INGESTED` audit record name the completing worker's
+principal. A claim taken before the upgrade that introduced the binding
+(migration 338) has no recorded owner and cannot be completed by anyone; its
+lease expires and the reaper returns the job to the queue.
+
 `POST /jobs/claim` with `{"kinds": ["remote_probe", "sandbox_run"],
-"workerId": "pod-a"}` (both optional) answers `204` when nothing is due, or
+"workerId": "pod-a"}` (both optional) answers `204` when nothing is due,
+`503 mcp_gate_unavailable` when nothing servable was found and a
+candidate's gates could not be evaluated (it goes back to the queue), or
 `200`:
 
 ```json
@@ -2394,12 +2695,39 @@ OCI identifier rewritten to akBaseUrl */ }}` with limits `{"wallClockMs":
 }
 ```
 
-A failed outcome carries no lists. `200 {"status": "stored", "snapshotId",
-"contentHash", "drift": {"scanId"} | null}` (`snapshotId` is the existing
-snapshot when the result repeats it) or `200 {"status": "retry",
-"notBefore"}`; `409 mcp_claim_invalid` when the token does not match the
-current claim (expired, re-claimed or already completed); `400` for a
-malformed result.
+A failed outcome carries no lists. The result's metadata is validated
+before anything is stored or changed (#5464, #5466); a refusal answers `400
+mcp_invalid_result_metadata` with the offending `field`. Every check but
+`observedAt`'s lower bound (which needs the claim time, read under the
+claim's lock) runs before anything is locked, for every outcome, a retry
+included:
+
+| Field | Accepted |
+| --- | --- |
+| `observedAt` | default: the arrival time. At most 5 minutes (the clock-skew window) ahead of the registry's clock, and no more than 5 minutes before the job's claim. One inside the window but ahead of arrival is stored as of its arrival. |
+| `cacheScope` | absent, `public` or `private` (exact, lower case). |
+| `ttlMs` | absent, or an integer from `0` to `2592000000` (30 days): it only spaces re-probes (`max(ttlMs, 6 h)`). |
+
+A refused result stores no snapshot, changes no current view, writes no
+audit record and leaves the job claimed with its lease running: the worker
+can post a corrected result before the lease expires, or the reaper returns
+the job to the queue. The reference worker normalises a remote's hints
+before posting: a `cacheScope` other than `public` is sent as `private`
+(with `authState: caller_specific`) and `ttlMs` is capped at 30 days.
+
+`200 {"status": "stored", "snapshotId", "contentHash", "current", "drift":
+{"scanId"} | null}` (`snapshotId` is the existing snapshot when the result
+repeats it; `current`: whether that snapshot is the version's current view
+after the commit) or `200 {"status": "retry", "notBefore"}`;
+`409 mcp_claim_invalid` when the token does not match the current claim
+(lease expired, re-claimed or already completed) or the claim is held by
+another worker identity; `409
+mcp_target_ineligible` when the version or a backing package stopped being
+eligible after the claim (the job is cancelled); `503 mcp_gate_unavailable`
+when its gates could not be evaluated (the claim is unchanged); `403
+mcp_forbidden` when the token is not scoped to the job's repository; `400
+mcp_invalid_result_metadata` for refused metadata (above) and `400
+mcp_invalid_capabilities` for a malformed result.
 
 ### The `ak-mcp-introspector` worker
 
@@ -2459,13 +2787,35 @@ the lists. `401`/`403` -> `auth_required`; `429` -> `rate_limited` with
 list methods: `tools/call`, `resources/read` and `prompts/get` are refused in
 code. Server-to-client requests over stdio are answered "method not found".
 
+Response and session integrity. Every response is matched to the one
+outstanding request; a violation ends the probe `refused`, is not retried, and
+nothing the server sent in that probe (capabilities, `serverInfo`,
+`instructions`, list items) is reported. `details.protocolViolation`:
+
+| Code | Cause |
+|---|---|
+| `response_id_mismatch` | A response (JSON body or SSE event) whose `id` is absent, `null` or not the outstanding request's; the type counts (`1` and `"1"` differ). A non-2xx body read as the request's JSON-RPC error (a modern error code, which steers the fallback) may carry `"id": null` or none, but not another request's `id`; any other non-2xx body is an HTTP-level error whose `id` is not looked at (only its status is used). |
+| `duplicate_response` | A response to a request already answered, or a second response for the same `id` in the same read of an SSE stream. The stream is not read past the first response, so a duplicate sent later is never seen and never accepted. |
+| `unexpected_batch` | A JSON-RPC batch carrying a response (the worker never sends a batch). A batch of only notifications or server requests is skipped. |
+| `session_id_changed` | After `initialize` established an `Mcp-Session-Id`, a response carried a different one. The worker never switches sessions. |
+| `session_id_invalid` | `initialize` assigned an `Mcp-Session-Id` that is not 1 to 256 visible ASCII characters. |
+
+Notifications and server-to-client requests on an SSE stream are skipped.
+An `Mcp-Session-Id` is adopted only from the successful `initialize`
+response; one on any other response before that (including a modern
+server's, which has no sessions) or introduced later without one is ignored
+and never sent. A redirect is refused before its headers are read, so a
+session id never follows one to another origin.
+
 **Sandbox runner** (`--sandbox`). A pluggable `SandboxRunner` renders a
 runner-neutral guest spec:
 
 - npm: image `AK_MCP_SANDBOX_NODE_IMAGE` (default
   `docker.io/library/node:22-alpine` pinned by digest),
-  `npx --yes --registry=<registryBaseUrl> <identifier>@<version> <args>` and
-  `npm_config_registry=<registryBaseUrl>`;
+  `npx --yes --registry=<registry> <identifier>@<version> <args>` and
+  `npm_config_registry=<registry>`, where `<registry>` (here and for PyPI
+  below) is the canonical form of the checked `registryBaseUrl` (see "npm
+  and PyPI package sources");
 - pypi: image `AK_MCP_SANDBOX_PYTHON_IMAGE` (default
   `ghcr.io/astral-sh/uv:python3.12-alpine` pinned by digest), `uvx --no-config
   --default-index <registryBaseUrl>/simple <identifier>@<version> <args>`;
@@ -2482,15 +2832,85 @@ without a default and every `{template}` value is the placeholder
 When the run ends, whatever the outcome, the engine client (or launcher)
 gets `SIGTERM`, then `SIGKILL` 5 s later, and the container is removed
 through the engine (`<engine> rm -f <name>`): killing the client alone
-leaves the container running. An OCI package's image is removed after its
+leaves the container running. An npm or PyPI guest's own network is removed
+after it (`<engine> network disconnect -f <name> <gateway>`, `<engine>
+network rm <name>`). An OCI package's image is removed after its
 run (`<engine> rmi`); the runner images are kept. At startup the worker
-removes any container labelled `com.artifactkeeper.mcp-sandbox.owner=<worker
-id>` that a crashed or killed earlier run left behind, and warns about
+removes any container, then any network, labelled
+`com.artifactkeeper.mcp-sandbox.owner=<worker id>` that a crashed or killed
+earlier run left behind, and warns about
 runner images that are not pinned by digest. A guest that exits before
 answering is reported `needs_config`, unless the engine exited `125`, `126`
 or `127` (the engine failed: runtime, network or image missing, pull failed,
 name in use), which is `start_failed` with the engine's message, and
 retried.
+
+**npm and PyPI package sources** (#5446). For npm and PyPI jobs the rules
+in this section take precedence over the general ones above: where they
+refuse something the paragraph above says is dropped, the job is refused.
+Before any guest starts, an npm or PyPI job is refused (`unsupported`, with a
+`registryBaseUrl: ...`, `package identifier: ...`, `package version: ...`,
+`packageArguments: ...`, `runtimeArguments: ...` or
+`environmentVariables: ...` reason naming the rule, never the submitted name
+or value) when what it submits would make `npx`/`uvx` fetch the package from
+anywhere but the AK repository it was served from; nothing is stripped to
+make a job fit:
+
+- `registryBaseUrl` is parsed as a URL and must be exactly
+  `<akBaseUrl>/npm/<repository>` (npm) or `<akBaseUrl>/pypi/<repository>`
+  (PyPI): the same scheme, the same host (compared lower-cased and
+  IDNA-normalised), the same effective port (`:443` on `https` is the same
+  origin as no port; another port is not) and that path, an optional
+  trailing slash aside, at most 2048 bytes. It is never compared as a string
+  prefix. Userinfo (`user@`), any percent-encoding (`%40`, `%2F`, `%3A`,
+  `%2e`, ...), a backslash, a `.`/`..` segment, whitespace, a query or a
+  fragment is refused, and so is the lenient `https:host/...` or
+  `https:///host/...` form. The spec carries the canonical URL, not the
+  submitted string.
+- The package must be a plain name and one exact version: npm `name` or
+  `@scope/name` (at most 214 bytes) with a SemVer version without build
+  metadata (`1.2.3`, `1.2.3-rc.1`; npm reads `1.2.3+x.tgz` as a file); PyPI
+  a PEP 508 project name (at most 200 bytes) with a PEP 440 version.
+  Versions are at most 256 bytes and never end in `.tgz`, `.tar` or
+  `.tar.gz`. A URL, path, `git+`/`github:`/`file:`/`npm:` spec, `name@url`,
+  `name @ url` direct reference, extras, a range, a tag such as `latest`,
+  or a marker is refused.
+- `environmentVariables` may not name a variable the job's package manager
+  reads for its registry, index or configuration (any case). npm:
+  `NPM_CONFIG*` / `npm_config_*` (including `NPM_CONFIG_REGISTRY` and
+  `NPM_CONFIG_USERCONFIG`), `YARN_*`, `PNPM_*`, `COREPACK_*` and
+  `NODE_OPTIONS`. PyPI: `UV_*` (`UV_INDEX` beats `--default-index`),
+  `PIP_*` (`PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_FIND_LINKS`,
+  `PIP_CONFIG_FILE`, `PIP_TRUSTED_HOST`, ...) and `PIPX_*`. The other
+  manager's variables, proxy variables, `HOME`, `XDG_*` and the rest listed
+  above are dropped with a note, as for any job.
+- In `packageArguments` (as rendered) and `runtimeArguments`, a source
+  option whose value (`--opt=<v>`, `-i<v>`, or the next argument) is a URL
+  (`scheme://...`), a `git+` or a `file:` reference is refused (option
+  names compared case-insensitively, `_` read as `-`). npm: `--registry`,
+  `--@<scope>:registry`. PyPI: `--index-url`/`-i`, `--extra-index-url`,
+  `--find-links`/`-f`, `--default-index`, `--index`, `--from`, `--with`,
+  `--with-requirements`, `--with-editable`. `npx` and `uvx` stop reading
+  options at the package spec, so everything else, including these options
+  with any other value (`--index products`, `-f out.json`), is the server's
+  own argument; other `runtimeArguments` are still dropped.
+
+The rendered command pins the canonical registry itself (`npx
+--registry=<registry>` plus `npm_config_registry=<registry>`; `uvx
+--no-config --default-index <registry>/simple` with `UV_NO_CONFIG=1`), and no
+publisher argument or variable can override it. For npm and PyPI guests, a
+package or environment input whose name ends in a credential word (`TOKEN`,
+`SECRET`, `PASSWORD`, `PASSWD`, `APIKEY`, `API_KEY`, `ACCESS_KEY`,
+`PRIVATE_KEY`, as whole `_`/`-` separated words: `GITHUB_TOKEN`,
+`--password`, but not `MAX_TOKENS` or `TOKENIZER`) gets the
+`AK_PLACEHOLDER_<NAME>` placeholder even when it is not marked `isSecret`.
+An `akBaseUrl` with userinfo, a query or a fragment is refused for every
+job.
+
+These checks cover only what the job document names. What the installed
+package pulls in itself (a `git+`, tarball or `file:` dependency, an install
+script) is contained by the guest's network, which reaches only AK, not by
+them.
 
 Each stdio read is bounded: a line is read only up to what is left of the
 1 MiB budget, so a guest printing one endless line costs the worker 1 MiB,
@@ -2518,11 +2938,29 @@ Runners:
   `crun` or any runtime that is not gVisor (`runsc*`) or Kata (`kata*`) is
   refused unless `AK_MCP_SANDBOX_ALLOW_DEFAULT_RUNTIME=true`, because a
   plain container is not a boundary for attacker-chosen install scripts),
-  `AK_MCP_SANDBOX_NETWORK` (default `ak-mcp-sandbox`), `AK_MCP_SANDBOX_MEMORY`
-  (`1g`), `AK_MCP_SANDBOX_CPUS` (`1`). Rendered as `<engine> run --rm -i
+  `AK_MCP_SANDBOX_GATEWAY` (the AK forwarder's container, default
+  `ak-gateway`), `AK_MCP_SANDBOX_MEMORY` (`1g`), `AK_MCP_SANDBOX_CPUS`
+  (`1`). `AK_MCP_SANDBOX_NETWORK` is retired: guests that share a network
+  can reach each other (#5447), so `run --sandbox` with it set (or with an
+  empty `AK_MCP_SANDBOX_GATEWAY`) exits with an error before claiming
+  anything. For an npm or PyPI guest the runner first creates the
+  guest's own network, `<engine> network create --internal --label=...
+  <name>`, and attaches the forwarder to it under the host of the job's
+  `akBaseUrl` (the backend's public base URL; `AK_URL` only when the job
+  has none), `<engine> network connect --alias <AK host> <name>
+  <gateway>`, then reads the forwarder's address on it (`<engine>
+  container inspect --format '{{(index .NetworkSettings.Networks
+  "<name>").IPAddress}}' <gateway>`) and gives the guest
+  `--add-host=<AK host>:<address>`, so the guest does not depend on the
+  engine's DNS; if any of these fails the guest is not started
+  (`start_failed`, retried). An `akBaseUrl` with an IP address instead of a host name is
+  `start_failed` too. Workers sharing a host need distinct
+  `AK_MCP_INTROSPECTOR_ID`s: leftovers are reaped by that id, at startup
+  and every 10 minutes while idle.
+  The guest is rendered as `<engine> run --rm -i
   --name=ak-mcp-sbx-<job>-<random> --label=com.artifactkeeper.mcp-sandbox=<job>
   --label=com.artifactkeeper.mcp-sandbox.owner=<worker id> --runtime=runsc
-  --network=<net | none> --read-only
+  --network=<its own network | none> --read-only
   --tmpfs=/tmp:rw,exec,nosuid,nodev,size=512m --user=65532:65532
   --cap-drop=ALL --security-opt=no-new-privileges --pids-limit=256
   --memory=1g --cpus=1 --pull=missing --stop-timeout=1 --log-driver=none
@@ -2561,8 +2999,8 @@ probe looks the same from the server's side:
 - remote probes send `User-Agent: ak-mcp-introspector/<version> (...;
   capability probe; never calls tools)`;
 - sandbox runs set `CI=1`, pass `AK_PLACEHOLDER_<NAME>` for every secret,
-  required or templated value, run on the sandbox network, which reaches
-  only AK, and end at the 120 s wall clock.
+  required or templated value, run on a network of their own, which
+  reaches only AK, and end at the 120 s wall clock.
 
 A server that checks any of these can show AK one tool list and its clients
 another, or behave only after the probe has gone. `remote_probe` and
@@ -2585,8 +3023,8 @@ scanned, not the tool list the probe saw.
 3. Sandbox (optional, `--sandbox`): follow the reference deployment in
    [docs/security/mcp-sandbox.md](security/mcp-sandbox.md), which covers the
    threat model, a dedicated host with rootless Podman and gVisor (no engine
-   socket in any container), the internal `ak-mcp-sandbox` network whose
-   only peer forwards to AK, and a Kubernetes variant (gVisor
+   socket in any container), an internal network per guest whose only
+   other member forwards to AK, and a Kubernetes variant (gVisor
    `RuntimeClass`, one guest pod per job through the API, RBAC and
    NetworkPolicies). The files are in `deploy/mcp-introspector/`. Check the
    deployment with `sandbox-probe` before turning the sandbox on.

@@ -76,6 +76,12 @@ pub struct Pending {
     pub fill_repository: String,
     pub fill_repository_id: Uuid,
     pub fill_format: String,
+    /// The submitted `registryBaseUrl` (accepted under `open` when foreign,
+    /// #5452), so the pin a fill produces records
+    /// [`mcp_packages::FOREIGN_COORDINATES_WARNING`] as a direct pin does.
+    /// Never fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_base_url: Option<String>,
 }
 
 impl Pending {
@@ -84,6 +90,7 @@ impl Pending {
             "registryType": self.registry_type,
             "identifier": self.identifier,
             "version": self.version,
+            "registryBaseUrl": self.registry_base_url,
             "transport": {"type": "stdio"},
         }))
         .expect("a pending package is a valid package")
@@ -118,10 +125,9 @@ pub async fn resolve_document(
     server: &fmt::ServerJson,
     base_url: &str,
 ) -> Result<Resolution, McpError> {
+    // `open` resolves exactly as `own-repos` does (#5452): it only accepts
+    // foreign coordinates (`mcp_packages::resolve_package`).
     let mut out = Resolution::default();
-    if settings.policy == fmt::PackagePolicy::Open {
-        return Ok(out);
-    }
     for (index, pkg) in server.packages.iter().enumerate() {
         if pkg.registry_type == "mcpb" {
             out.pins
@@ -135,8 +141,16 @@ pub async fn resolve_document(
                 let Some(remote) = fill_target(&state.db, repo).await? else {
                     return Err(McpError::PackageNotFound { index, detail });
                 };
+                // Foreign coordinates (`open`) are neither pinned from nor
+                // filled through a Remote of another upstream (#5452).
+                if !mcp_packages::remote_may_serve(pkg, repo, &remote, base_url) {
+                    return Err(mcp_packages::foreign_through_remote(index, pkg, &remote));
+                }
                 match cached_pin(&state.db, repo, &remote, index, pkg).await? {
-                    Some(pin) => out.pins.push(pin),
+                    Some(mut pin) => {
+                        mcp_packages::note_foreign_coordinates(&mut pin, pkg, repo, base_url);
+                        out.pins.push(pin)
+                    }
                     None => out.pending.push(Pending {
                         index,
                         registry_type: pkg.registry_type.clone(),
@@ -145,6 +159,7 @@ pub async fn resolve_document(
                         fill_repository: remote.key.clone(),
                         fill_repository_id: remote.id,
                         fill_format: remote.format.clone(),
+                        registry_base_url: pkg.registry_base_url.clone(),
                     }),
                 }
             }
@@ -280,7 +295,19 @@ async fn find_cached(
     let Some(version) = pkg.version.as_deref() else {
         return Ok(None);
     };
-    let Some(key) = cache_key(&pkg.registry_type, &pkg.identifier, version) else {
+    cached_entry(db, remote.id, &pkg.registry_type, &pkg.identifier, version).await
+}
+
+/// The proxy-cache entry of `registry_type` `identifier@version` in the
+/// Remote `remote_id`, as `(path, sha256)`: [`find_cached`] by its parts.
+pub(crate) async fn cached_entry(
+    db: &PgPool,
+    remote_id: Uuid,
+    registry_type: &str,
+    identifier: &str,
+    version: &str,
+) -> Result<Option<(String, String)>, McpError> {
+    let Some(key) = cache_key(registry_type, identifier, version) else {
         return Ok(None);
     };
     // Proxy-cache paths are exact, case-sensitive storage keys (the format
@@ -310,7 +337,7 @@ async fn find_cached(
            AND (path LIKE $2 ESCAPE '\\' OR path = $3) \
          ORDER BY path LIMIT 200",
     )
-    .bind(remote.id)
+    .bind(remote_id)
     .bind(&pattern)
     .bind(exact)
     .fetch_all(db)
@@ -320,7 +347,7 @@ async fn find_cached(
         CacheKey::PypiFiles { .. } => path
             .rsplit('/')
             .next()
-            .is_some_and(|f| pypi_file_matches(f, &pkg.identifier, version)),
+            .is_some_and(|f| pypi_file_matches(f, identifier, version)),
         _ => true,
     }))
 }
@@ -331,20 +358,35 @@ async fn find_cached(
 /// Remote MCP ingest uses it after the `artifacts` lookup misses: npm, PyPI,
 /// NuGet and Cargo packages pulled through a Remote live only in its proxy
 /// cache.
+///
+/// Foreign coordinates (`open`) naming another registry than the Remote's
+/// upstream are refused ([`mcp_packages::remote_may_serve`]); the pin records
+/// [`mcp_packages::FOREIGN_COORDINATES_WARNING`] when they name it.
 pub async fn cached_pin_through(
     db: &PgPool,
     mapped: &BackingRepo,
     index: usize,
     pkg: &fmt::Package,
+    base_url: &str,
 ) -> Result<Option<PackagePin>, McpError> {
-    match fill_target(db, mapped).await? {
-        Some(remote) => cached_pin(db, mapped, &remote, index, pkg).await,
-        None => Ok(None),
+    let Some(remote) = fill_target(db, mapped).await? else {
+        return Ok(None);
+    };
+    if !mcp_packages::remote_may_serve(pkg, mapped, &remote, base_url) {
+        return Err(mcp_packages::foreign_through_remote(index, pkg, &remote));
     }
+    let mut found = cached_pin(db, mapped, &remote, index, pkg).await?;
+    if let Some(pin) = found.as_mut() {
+        mcp_packages::note_foreign_coordinates(pin, pkg, mapped, base_url);
+    }
+    Ok(found)
 }
 
 /// A pin on a package `remote` (the mapped repository or its Remote member)
-/// has in its proxy cache.
+/// has in its proxy cache. Every path that pins a proxy-cache entry (the
+/// publish, the asynchronous fill, Remote MCP ingest) comes through here, so
+/// each refuses a pin the mapped Virtual would not serve from `remote`
+/// (`mcp_package_shadowed`, #5456).
 async fn cached_pin(
     db: &PgPool,
     mapped: &BackingRepo,
@@ -355,7 +397,7 @@ async fn cached_pin(
     let Some((path, sha256)) = find_cached(db, remote, pkg).await? else {
         return Ok(None);
     };
-    Ok(Some(PackagePin {
+    let pin = PackagePin {
         index,
         registry_type: pkg.registry_type.clone(),
         submitted: SubmittedRef {
@@ -366,6 +408,7 @@ async fn cached_pin(
             repository: mapped.key.clone(),
             repository_id: remote.id,
             artifact_ids: Vec::new(),
+            artifact_sha256s: Vec::new(),
             sha256: Some(sha256),
             name: None,
             tag: None,
@@ -379,7 +422,9 @@ async fn cached_pin(
             download_path: None,
         },
         drift: None,
-    }))
+    };
+    mcp_packages::refuse_shadowed_cache_pin(db, mapped, &pin).await?;
+    Ok(Some(pin))
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +470,7 @@ fn bundle_pin(
             repository: repo_key.to_string(),
             repository_id: repo_id,
             artifact_ids: vec![artifact_id],
+            artifact_sha256s: Vec::new(),
             sha256: Some(sha256.to_string()),
             name: None,
             tag: None,
@@ -1248,7 +1294,18 @@ async fn resolve_pending(
                 Err(e) => Err(e),
             }
         } else {
-            cached_pin(&state.db, mapped, &remote, p.index, &pkg).await
+            // No policy re-check here: a pin does not depend on the policy
+            // (#5452), only the hostname check does, and that ran at publish.
+            // What can change since is the Remote, so the foreign-coordinate
+            // rule is checked against the fill target again.
+            if !mcp_packages::remote_may_serve(&pkg, mapped, &remote, base) {
+                return Err(mcp_packages::foreign_through_remote(p.index, &pkg, &remote));
+            }
+            let mut found = cached_pin(&state.db, mapped, &remote, p.index, &pkg).await;
+            if let Ok(Some(pin)) = found.as_mut() {
+                mcp_packages::note_foreign_coordinates(pin, &pkg, mapped, base);
+            }
+            found
         }
     };
     let to_step = |e: McpError| match e {
@@ -1491,6 +1548,41 @@ pub fn spawn(state: SharedState, shutdown: CancellationToken) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5452: a pending package keeps its submitted `registryBaseUrl` through
+    /// the job record, so the filled pin can record the coordinates it
+    /// replaced; a record written before the field existed still loads.
+    #[test]
+    fn pending_keeps_the_submitted_registry_base_url() {
+        let p = Pending {
+            index: 1,
+            registry_type: "npm".into(),
+            identifier: "@acme/echo".into(),
+            version: Some("2.0.0".into()),
+            fill_repository: "npm-remote".into(),
+            fill_repository_id: Uuid::nil(),
+            fill_format: "npm".into(),
+            registry_base_url: Some("https://registry.npmjs.org".into()),
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["registryBaseUrl"], "https://registry.npmjs.org");
+        assert_eq!(serde_json::from_value::<Pending>(v).unwrap(), p);
+        assert_eq!(
+            p.package().registry_base_url.as_deref(),
+            Some("https://registry.npmjs.org")
+        );
+        let legacy = serde_json::json!({
+            "index": 0, "registryType": "npm", "identifier": "@acme/echo", "version": "1.0.0",
+            "fillRepository": "npm-remote", "fillRepositoryId": Uuid::nil(), "fillFormat": "npm",
+        });
+        let old: Pending = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.registry_base_url, None);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("registryBaseUrl")
+            .is_none());
+        assert_eq!(old.package().registry_base_url, None);
+    }
 
     /// Review finding 12: the asynchronous fill runs with the publishing
     /// token's scope (repository allowlist, scopes), recorded on the

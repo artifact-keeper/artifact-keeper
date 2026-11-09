@@ -49,8 +49,27 @@ pub const DRIFT_FINDING_SOURCE: &str = "mcp-capabilities";
 /// ([`prune_snapshots`], #5386), newest first. Rows still referenced are kept
 /// on top of these.
 pub const SNAPSHOT_KEEP: i64 = 20;
+/// The freshest snapshots of a version read when choosing its current view
+/// ([`pick_current`]) or listing its history.
+pub const HISTORY_WINDOW: i64 = 200;
 /// Snapshots deleted per retention pass at most.
 pub const SNAPSHOT_PRUNE_BATCH: i64 = 1000;
+/// How far a reported or observed `observedAt` may lie ahead of the
+/// backend's clock (or, for an introspection result, before the job's claim)
+/// and still be accepted: the clock skew between the reporter and the
+/// backend.
+pub const OBSERVED_AT_SKEW_SECS: i64 = 300;
+/// The `cacheScope` values a report or an introspection result may carry
+/// (#5466): the MCP list pages' cache scope (`private`: the list may differ
+/// per caller).
+pub const CACHE_SCOPES: &[&str] = &["public", "private"];
+/// The freshness order of snapshots, freshest first (#5464): the latest time
+/// the content was validly seen (`last_seen_at`, else `observed_at`), then
+/// arrival, then id, so ties are deterministic. Every "newest" question (the
+/// current view, the drift baseline, the deduplication check, retention)
+/// asks it in this order: an observation that arrives late but was made
+/// earlier never ranks above a fresher one.
+const FRESHEST_FIRST: &str = "COALESCE(last_seen_at, observed_at) DESC, created_at DESC, id DESC";
 
 // ---------------------------------------------------------------------------
 // Vocabulary
@@ -863,6 +882,29 @@ impl SnapshotRow {
         Source::parse(&self.source)
     }
 
+    /// The latest time this content was validly seen: `last_seen_at`, else
+    /// `observed_at` (#5464).
+    pub fn freshness(&self) -> DateTime<Utc> {
+        self.last_seen_at.unwrap_or(self.observed_at)
+    }
+
+    /// The [`FRESHEST_FIRST`] sort key, greatest first.
+    fn freshness_key(&self) -> (DateTime<Utc>, DateTime<Utc>, Uuid) {
+        (self.freshness(), self.created_at, self.id)
+    }
+
+    /// What [`pick_current`] ranks this snapshot by.
+    pub fn rank(&self) -> SnapshotRank {
+        SnapshotRank {
+            id: self.id,
+            source: self.source.clone(),
+            outcome: self.outcome.clone(),
+            observed_at: self.observed_at,
+            last_seen_at: self.last_seen_at,
+            created_at: self.created_at,
+        }
+    }
+
     pub fn set(&self) -> CapabilitySet {
         CapabilitySet {
             tools: arr(&self.tools),
@@ -927,6 +969,11 @@ pub struct Inserted {
     /// source, origin) has the same content, outcome and auth state and only
     /// its `last_seen_at` was bumped (#5386). No audit, lint or drift then.
     pub created: bool,
+    /// The snapshot was stored as history only: a successful snapshot of the
+    /// same source (`previous`) was seen more recently than this one was
+    /// observed, so this one does not become current, raises no drift and is
+    /// not linted (#5464).
+    pub superseded: bool,
 }
 
 impl Inserted {
@@ -934,6 +981,7 @@ impl Inserted {
     /// successful one of the same source: `tool_drift`.
     pub fn drifted(&self) -> bool {
         self.created
+            && !self.superseded
             && self.snapshot.outcome == Outcome::Ok.as_str()
             && self
                 .previous
@@ -956,7 +1004,7 @@ async fn previous_ok(
          WHERE artifact_id = $1 AND source = $2 AND outcome = 'ok' \
            AND ($3::text IS NULL OR source <> 'publisher_declared' OR origin IS NOT DISTINCT FROM $3) \
            AND ($4::uuid IS NULL OR id <> $4) \
-         ORDER BY created_at DESC, id DESC LIMIT 1"
+         ORDER BY {FRESHEST_FIRST} LIMIT 1"
     );
     sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(artifact_id)
@@ -985,7 +1033,7 @@ async fn repeat_of_latest(
     let sql = format!(
         "SELECT {SNAPSHOT_COLUMNS} FROM mcp_capability_snapshots \
          WHERE artifact_id = $1 AND source = $2 AND origin IS NOT DISTINCT FROM $3 \
-         ORDER BY created_at DESC, id DESC LIMIT 1"
+         ORDER BY {FRESHEST_FIRST} LIMIT 1"
     );
     let latest: Option<SnapshotRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(s.artifact_id)
@@ -1041,12 +1089,16 @@ pub async fn insert_snapshot_in(
                 snapshot,
                 previous: None,
                 created: false,
+                superseded: false,
             });
         }
     }
     let origin_scope =
         (s.source == Source::PublisherDeclared).then(|| s.origin.as_deref().unwrap_or(""));
     let previous = previous_ok(&mut *db, s.artifact_id, s.source, origin_scope, None).await?;
+    let superseded = previous
+        .as_ref()
+        .is_some_and(|p| p.freshness() > s.observed_at);
     let sql = format!(
         "INSERT INTO mcp_capability_snapshots (repository_id, artifact_id, server_name, \
            server_version, source, provenance, origin, reported_by, auth_state, outcome, \
@@ -1085,6 +1137,7 @@ pub async fn insert_snapshot_in(
             snapshot,
             previous,
             created: true,
+            superseded,
         }),
         // An identical declaration exists: return it, nothing new happened.
         None => {
@@ -1103,6 +1156,7 @@ pub async fn insert_snapshot_in(
                 snapshot,
                 previous: None,
                 created: false,
+                superseded: false,
             })
         }
     }
@@ -1127,9 +1181,10 @@ pub async fn get_snapshot(db: &PgPool, id: Uuid) -> sqlx::Result<Option<Snapshot
         .await
 }
 
-/// Snapshots of one server version, newest first, optionally of one source.
+/// Snapshots of one server version, freshest first ([`FRESHEST_FIRST`]),
+/// optionally of one source.
 pub async fn list_snapshots(
-    db: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     artifact_id: Uuid,
     source: Option<Source>,
     limit: i64,
@@ -1137,7 +1192,7 @@ pub async fn list_snapshots(
     let sql = format!(
         "SELECT {SNAPSHOT_COLUMNS} FROM mcp_capability_snapshots \
          WHERE artifact_id = $1 AND ($2::text IS NULL OR source = $2) \
-         ORDER BY created_at DESC, id DESC LIMIT $3"
+         ORDER BY {FRESHEST_FIRST} LIMIT $3"
     );
     sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(artifact_id)
@@ -1147,12 +1202,12 @@ pub async fn list_snapshots(
         .await
 }
 
-/// Delete snapshot history beyond the newest [`SNAPSHOT_KEEP`] of each
+/// Delete snapshot history beyond the freshest [`SNAPSHOT_KEEP`] of each
 /// (version, source, origin), at most [`SNAPSHOT_PRUNE_BATCH`] rows (#5386).
 /// Run by the introspection scheduler pass; idempotent.
 ///
 /// Never deleted, whatever its rank:
-/// * the newest successful snapshot of each (version, source, origin): the
+/// * the freshest successful snapshot of each (version, source, origin): the
 ///   current view ([`pick_current`]) and the baseline the next snapshot is
 ///   compared against for drift;
 /// * a snapshot a `tool_drift` finding names (its description carries both
@@ -1162,14 +1217,14 @@ pub async fn list_snapshots(
 ///   `snapshot_id` is cleared by the foreign key (`ON DELETE SET NULL`);
 ///   the job row itself keeps its status and timestamps.
 pub async fn prune_snapshots(db: &PgPool) -> sqlx::Result<u64> {
-    let r = sqlx::query(
+    let sql = format!(
         "WITH ranked AS ( \
            SELECT id, artifact_id, outcome, \
              row_number() OVER (PARTITION BY artifact_id, source, COALESCE(origin, '') \
-                                ORDER BY created_at DESC, id DESC) AS rn, \
+                                ORDER BY {FRESHEST_FIRST}) AS rn, \
              row_number() OVER (PARTITION BY artifact_id, source, COALESCE(origin, ''), \
                                   outcome = 'ok' \
-                                ORDER BY created_at DESC, id DESC) AS rn_outcome \
+                                ORDER BY {FRESHEST_FIRST}) AS rn_outcome \
            FROM mcp_capability_snapshots), \
          victims AS ( \
            SELECT r.id FROM ranked r \
@@ -1187,38 +1242,102 @@ pub async fn prune_snapshots(db: &PgPool) -> sqlx::Result<u64> {
                                                      AND n.target_key = j.target_key \
                                                      AND n.created_at > j.created_at))) \
            LIMIT $2) \
-         DELETE FROM mcp_capability_snapshots s USING victims v WHERE s.id = v.id",
-    )
-    .bind(SNAPSHOT_KEEP)
-    .bind(SNAPSHOT_PRUNE_BATCH)
-    .bind(DRIFT_FINDING_SOURCE)
-    .execute(db)
-    .await?;
+         DELETE FROM mcp_capability_snapshots s USING victims v WHERE s.id = v.id"
+    );
+    let r = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(SNAPSHOT_KEEP)
+        .bind(SNAPSHOT_PRUNE_BATCH)
+        .bind(DRIFT_FINDING_SOURCE)
+        .execute(db)
+        .await?;
     Ok(r.rows_affected())
 }
 
-/// The current snapshot: the newest successful one of the source with the
-/// best [`Source::precedence`] (or of `source` when given).
+/// The current snapshot: the freshest successful one ([`FRESHEST_FIRST`],
+/// not the last to arrive, #5464) of the source with the best
+/// [`Source::precedence`] (or of `source` when given).
 pub fn pick_current(rows: &[SnapshotRow], source: Option<Source>) -> Option<&SnapshotRow> {
-    rows.iter()
+    let ranks: Vec<SnapshotRank> = rows.iter().map(SnapshotRow::rank).collect();
+    let id = pick_current_rank(&ranks, source)?.id;
+    rows.iter().find(|r| r.id == id)
+}
+
+/// The columns [`pick_current`] ranks a snapshot by, without its lists.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct SnapshotRank {
+    pub id: Uuid,
+    pub source: String,
+    pub outcome: String,
+    pub observed_at: DateTime<Utc>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl SnapshotRank {
+    fn freshness_key(&self) -> (DateTime<Utc>, DateTime<Utc>, Uuid) {
+        (
+            self.last_seen_at.unwrap_or(self.observed_at),
+            self.created_at,
+            self.id,
+        )
+    }
+}
+
+/// The current one of `ranks` (see [`pick_current`]): the freshest
+/// successful one of the source with the best [`Source::precedence`], or of
+/// `source` when given. The one ranking both [`pick_current`] and
+/// [`is_current_in`] apply.
+pub fn pick_current_rank(ranks: &[SnapshotRank], source: Option<Source>) -> Option<&SnapshotRank> {
+    ranks
+        .iter()
         .filter(|r| r.outcome == Outcome::Ok.as_str())
         .filter(|r| source.is_none_or(|s| r.source == s.as_str()))
         .min_by(|a, b| {
-            let rank = |r: &SnapshotRow| r.source().map(Source::precedence).unwrap_or(u8::MAX);
-            rank(a).cmp(&rank(b)).then(b.created_at.cmp(&a.created_at))
+            let rank = |r: &SnapshotRank| {
+                Source::parse(&r.source)
+                    .map(Source::precedence)
+                    .unwrap_or(u8::MAX)
+            };
+            rank(a)
+                .cmp(&rank(b))
+                .then(b.freshness_key().cmp(&a.freshness_key()))
         })
 }
 
-/// The snapshot before `to` among `rows` of the same source (newest first),
-/// for a declaration of the same origin.
+/// Whether snapshot `id` is the current view of `artifact_id`
+/// ([`pick_current`] over the freshest [`HISTORY_WINDOW`]), read on `conn`
+/// (the transaction that stored it). Reads only the ranking columns: this
+/// runs while the job row is locked.
+pub async fn is_current_in(
+    conn: &mut sqlx::PgConnection,
+    artifact_id: Uuid,
+    id: Uuid,
+) -> sqlx::Result<bool> {
+    let sql = format!(
+        "SELECT id, source, outcome, observed_at, last_seen_at, created_at \
+         FROM mcp_capability_snapshots WHERE artifact_id = $1 \
+         ORDER BY {FRESHEST_FIRST} LIMIT $2"
+    );
+    let ranks: Vec<SnapshotRank> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(artifact_id)
+        .bind(HISTORY_WINDOW)
+        .fetch_all(conn)
+        .await?;
+    Ok(pick_current_rank(&ranks, None).is_some_and(|c| c.id == id))
+}
+
+/// The successful snapshot just before `to` in freshness order among `rows`
+/// of the same source, for a declaration of the same origin.
 pub fn pick_previous<'a>(rows: &'a [SnapshotRow], to: &SnapshotRow) -> Option<&'a SnapshotRow> {
-    rows.iter().find(|r| {
-        r.id != to.id
-            && r.source == to.source
-            && r.outcome == Outcome::Ok.as_str()
-            && (r.created_at, r.id) < (to.created_at, to.id)
-            && (to.source != Source::PublisherDeclared.as_str() || r.origin == to.origin)
-    })
+    rows.iter()
+        .filter(|r| {
+            r.id != to.id
+                && r.source == to.source
+                && r.outcome == Outcome::Ok.as_str()
+                && r.freshness_key() < to.freshness_key()
+                && (to.source != Source::PublisherDeclared.as_str() || r.origin == to.origin)
+        })
+        .max_by_key(|r| r.freshness_key())
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,7 +1499,9 @@ pub async fn store(
 /// The side effects of a stored snapshot, run after its transaction
 /// committed: audit `MCP_CAPABILITIES_INGESTED`, lint the tools and raise
 /// `tool_drift`. Nothing when `ins.created` is false (an idempotent
-/// declaration or a deduplicated repeat). Returns the drift scan id.
+/// declaration or a deduplicated repeat); only the audit for a superseded
+/// snapshot, which is history and never the current view (#5464). Returns
+/// the drift scan id.
 pub async fn record_stored(
     db: &PgPool,
     s: &NewSnapshot,
@@ -1389,7 +1510,7 @@ pub async fn record_stored(
 ) -> crate::error::Result<Option<Uuid>> {
     if ins.created {
         audit_ingested(db, s.reported_by, &ins.snapshot, repo_key);
-        if let Some(source) = lint_source(s) {
+        if let Some(source) = lint_source(s).filter(|_| !ins.superseded) {
             let findings = crate::services::mcp_lint::lint_capabilities(&s.set);
             crate::services::mcp_lint::record_after_write(db, s.artifact_id, &findings, &source)
                 .await;
@@ -1418,7 +1539,13 @@ pub struct VersionRef {
     pub metadata: Value,
 }
 
-pub async fn version_ref(db: &PgPool, artifact_id: Uuid) -> sqlx::Result<Option<VersionRef>> {
+/// The server version `artifact_id` with its repository, through any
+/// executor: a pool, or the transaction that holds a job's claim locked, so a
+/// completion reads it on its one connection (#5460).
+pub async fn version_ref(
+    db: impl sqlx::PgExecutor<'_>,
+    artifact_id: Uuid,
+) -> sqlx::Result<Option<VersionRef>> {
     sqlx::query_as(
         "SELECT a.id AS artifact_id, a.repository_id, r.key AS repository_key, a.name, a.version, \
                 m.metadata \
@@ -1786,6 +1913,36 @@ mod tests {
             pick_previous(&rows, &rows[3]).is_none(),
             "other origin is not previous"
         );
+        // #5464: freshness, not arrival, picks the current one: a probe that
+        // arrived last but was observed first is history, unless its content
+        // was seen again since (`last_seen_at`).
+        let mut late = row(Source::RemoteProbe, 60, Outcome::Ok, None);
+        late.observed_at = DateTime::from_timestamp(5, 0).unwrap();
+        let mut rows = rows;
+        rows.insert(0, late.clone());
+        assert_eq!(pick_current(&rows, None).unwrap().id, rows[3].id);
+        assert_eq!(pick_previous(&rows, &rows[3]).unwrap().id, rows[6].id);
+        assert_eq!(
+            pick_previous(&rows, &rows[6]).unwrap().id,
+            late.id,
+            "the late arrival is the oldest observation"
+        );
+        rows[0].last_seen_at = DateTime::from_timestamp(35, 0);
+        assert_eq!(pick_current(&rows, None).unwrap().id, late.id);
+        // The ranking-columns path picks the same row.
+        let ranks: Vec<SnapshotRank> = rows.iter().map(SnapshotRow::rank).collect();
+        for source in [
+            None,
+            Some(Source::RemoteProbe),
+            Some(Source::PublisherDeclared),
+        ] {
+            assert_eq!(
+                pick_current_rank(&ranks, source).map(|r| r.id),
+                pick_current(&rows, source).map(|r| r.id),
+                "{source:?}"
+            );
+        }
+        let rows = &rows[1..];
         let j = rows[2].to_json();
         assert_eq!(j["observed"], true);
         assert_eq!(j["counts"]["tools"], 1);
@@ -1801,6 +1958,7 @@ mod tests {
             snapshot: cur.clone(),
             previous: Some(prev.clone()),
             created: true,
+            superseded: false,
         };
         assert!(ins.drifted());
         let same = Inserted {
@@ -1810,14 +1968,23 @@ mod tests {
                 ..prev.clone()
             }),
             created: true,
+            superseded: false,
         };
         assert!(!same.drifted());
         let failed = Inserted {
             snapshot: row(Source::RemoteProbe, 30, Outcome::Timeout, None),
             previous: Some(prev.clone()),
             created: true,
+            superseded: false,
         };
         assert!(!failed.drifted());
+        // #5464: a snapshot stored as history behind a fresher one is no
+        // drift from it.
+        let stale = Inserted {
+            superseded: true,
+            ..ins.clone()
+        };
+        assert!(!stale.drifted());
         let f = drift_finding(&cur, &prev, &diff(Some(&prev.set()), &cur.set()));
         assert!(f
             .title
