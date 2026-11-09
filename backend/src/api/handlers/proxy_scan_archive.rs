@@ -333,8 +333,7 @@ where
                 runs.default_content_type,
                 runs.disposition,
             )),
-            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => Some(Err(resp)),
-            Err(_) => None,
+            Err(resp) => proxy_helpers::unscanned_run_failure(resp),
         }
     };
     proxy_helpers::walk_virtual_members_with_scan(

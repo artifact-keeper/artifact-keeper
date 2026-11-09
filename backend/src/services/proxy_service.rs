@@ -1029,11 +1029,80 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
     }
     if !status.is_success() {
         return Err(AppError::BadGateway(format!(
-            "Upstream returned error status {}: {}",
+            "{UPSTREAM_ERROR_STATUS_PREFIX}{}: {}",
             status, diagnostic_url
         )));
     }
     Ok(())
+}
+
+/// How every upstream-status error of this module begins: the status follows
+/// it (`"Upstream returned error status 403 Forbidden: <url>"`). The errors
+/// carry no status field, so [`upstream_error_status`] reads it back from here.
+const UPSTREAM_ERROR_STATUS_PREFIX: &str = "Upstream returned error status ";
+
+/// The upstream HTTP status behind a proxy fetch error, when the error is one
+/// this module produced for a non-success upstream answer: the
+/// [`AppError::BadGateway`] [`validate_upstream_status`] maps a 4xx to, the
+/// [`AppError::Storage`] a `401` without a usable Bearer challenge becomes, or
+/// the [`AppError::ServiceUnavailable`] a 5xx becomes.
+pub(crate) fn upstream_error_status(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(message)
+    | AppError::Storage(message)
+    | AppError::ServiceUnavailable(message)) = err
+    else {
+        return None;
+    };
+    let digits = message
+        .strip_prefix(UPSTREAM_ERROR_STATUS_PREFIX)?
+        .get(..3)?;
+    StatusCode::from_bytes(digits.as_bytes()).ok()
+}
+
+/// How a virtual repository's member walk reads a member fetch that failed
+/// (#5495, #5504).
+///
+/// The distinction is between an answer that will not change if the client
+/// retries and one that might. Both let the walk go on to the next member;
+/// they differ only when NO member serves: then a walk that saw an
+/// [`MemberFetchFailure::Unavailable`] member answers a retryable `503`
+/// instead of the definitive `404` that Maven and Gradle cache as "this
+/// artifact does not exist".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberFetchFailure {
+    /// A permanent answer: the member does not have the object, or will never
+    /// hand it out. An upstream `404`/`410` ([`AppError::NotFound`]), a path
+    /// the proxy rejects (`Validation`, `400`), and any other upstream `4xx`,
+    /// which [`validate_upstream_status`] maps to [`AppError::BadGateway`]:
+    /// `401`/`403` from stale credentials, or an S3-hosted repository that
+    /// answers `403` for a key it does not hold. Retrying yields the same
+    /// answer, so it reads as a miss.
+    Miss,
+    /// The member could not answer: an upstream `5xx`
+    /// ([`AppError::ServiceUnavailable`]), a transport failure or timeout
+    /// ([`AppError::Storage`] / [`AppError::BadGateway`] without an upstream
+    /// status), or a fault on this server's side (storage, database). The
+    /// member may hold the object, so "not found" is unknowable.
+    Unavailable,
+}
+
+/// Classify a member fetch error for a virtual walk; see
+/// [`MemberFetchFailure`]. Anything not recognised as permanent is
+/// [`MemberFetchFailure::Unavailable`]: a retry costs a client one round
+/// trip, a wrong `404` is cached by the build tool.
+pub(crate) fn classify_member_fetch_failure(err: &AppError) -> MemberFetchFailure {
+    match err {
+        AppError::NotFound(_)
+        | AppError::Validation(_)
+        | AppError::CodedValidation { .. }
+        | AppError::UpstreamAuth(_)
+        | AppError::Conflict(_)
+        | AppError::Authorization(_) => MemberFetchFailure::Miss,
+        _ if upstream_error_status(err).is_some_and(|s| s.is_client_error()) => {
+            MemberFetchFailure::Miss
+        }
+        _ => MemberFetchFailure::Unavailable,
+    }
 }
 
 /// The error for an OCI token endpoint that answered `status` (not 2xx).
@@ -1307,12 +1376,11 @@ pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
 /// [`crate::api::handlers::proxy_helpers::upstream_refusal_status`], which
 /// preserves this through the proxy-error mapping (#4929).
 pub(crate) fn upstream_refusal_status(err: &AppError) -> Option<StatusCode> {
-    let (AppError::BadGateway(message) | AppError::Storage(message)) = err else {
+    if !matches!(err, AppError::BadGateway(_) | AppError::Storage(_)) {
         return None;
-    };
-    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
-        .into_iter()
-        .find(|status| message.starts_with(&format!("Upstream returned error status {status}")))
+    }
+    upstream_error_status(err)
+        .filter(|status| matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
 }
 
 /// The Hugging Face Hub's machine-readable refusal codes, as it sends them in
@@ -19131,6 +19199,69 @@ mod tests {
         let mut coded = reqwest::header::HeaderMap::new();
         coded.insert("x-error-code", "GatedRepo".parse().unwrap());
         assert!(is_hub_refusal(&coded));
+    }
+
+    /// #5504: what a virtual member walk may treat as a miss. Every answer
+    /// `validate_upstream_status` produces for a 4xx is permanent (a miss);
+    /// every 5xx, and every failure without an upstream status, is transient.
+    #[test]
+    fn member_fetch_failure_reads_permanent_4xx_as_a_miss_and_5xx_as_unavailable_5504() {
+        use MemberFetchFailure::{Miss, Unavailable};
+        for (code, want) in [
+            (404, Miss),
+            (410, Miss),
+            (400, Miss),
+            (401, Miss),
+            (403, Miss),
+            (418, Miss),
+            (429, Miss),
+            (500, Unavailable),
+            (502, Unavailable),
+            (503, Unavailable),
+            (504, Unavailable),
+        ] {
+            let status = StatusCode::from_u16(code).unwrap();
+            let err = validate_upstream_status(status, "http://x/y").expect_err("non-2xx");
+            assert_eq!(classify_member_fetch_failure(&err), want, "{code}: {err:?}");
+            if code != 404 && code != 410 {
+                assert_eq!(upstream_error_status(&err), Some(status), "{err:?}");
+            }
+        }
+        // A 401 without a Bearer challenge is a `Storage` error carrying the
+        // status; a transport failure or timeout carries none.
+        let no_challenge = AppError::Storage(format!(
+            "{UPSTREAM_ERROR_STATUS_PREFIX}401 Unauthorized: http://x/y"
+        ));
+        assert_eq!(classify_member_fetch_failure(&no_challenge), Miss);
+        assert_eq!(
+            upstream_refusal_status(&no_challenge),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        for transient in [
+            AppError::Storage("Failed to fetch from upstream http://x: operation timed out".into()),
+            AppError::BadGateway(format!("{HYDRATION_WAIT_TIMEOUT_MESSAGE}: k")),
+            AppError::Database("pool timed out".into()),
+        ] {
+            assert_eq!(
+                classify_member_fetch_failure(&transient),
+                Unavailable,
+                "{transient:?}"
+            );
+            assert_eq!(upstream_error_status(&transient), None);
+        }
+        for permanent in [
+            AppError::Validation("bad path".into()),
+            AppError::UpstreamAuth("refused".into()),
+        ] {
+            assert_eq!(
+                classify_member_fetch_failure(&permanent),
+                Miss,
+                "{permanent:?}"
+            );
+        }
+        // A 5xx is never a refusal, even though it carries the status.
+        let down = validate_upstream_status(StatusCode::BAD_GATEWAY, "http://x").unwrap_err();
+        assert_eq!(upstream_refusal_status(&down), None);
     }
 
     #[test]

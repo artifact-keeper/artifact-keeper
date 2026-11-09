@@ -670,7 +670,12 @@ fn map_proxy_error_classified(
     anonymous_refusal: bool,
 ) -> Response {
     let diagnostic_path = redact_proxy_path_for_diagnostics(path);
-    match &e {
+    // #5504: carry the transient/permanent classification on the response, so
+    // a virtual walk that only sees the `Response` can tell an upstream 5xx or
+    // timeout (the member may hold the object) from a permanent 4xx (a miss).
+    // Both can render as the same 502.
+    let unavailable = is_member_unavailable_error(&e);
+    let mut response = match &e {
         crate::error::AppError::NotFound(_) => {
             tracing::info!(
                 repo_key = %repo_key,
@@ -803,7 +808,39 @@ fn map_proxy_error_classified(
             }
             response
         }
+    };
+    if unavailable {
+        response.extensions_mut().insert(MemberUnavailable);
     }
+    response
+}
+
+/// Response extension marking a member fetch failure that says nothing about
+/// whether the member holds the object (#5504): an upstream 5xx, a transport
+/// failure or timeout, or a storage/database fault, as
+/// [`crate::services::proxy_service::classify_member_fetch_failure`] decides.
+/// [`map_proxy_error`] attaches it; [`member_unavailable_response`] carries it
+/// too, so a walk nested inside another walk passes it on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemberUnavailable;
+
+/// Whether a member fetch failure `Response` is transient
+/// ([`MemberUnavailable`]) rather than a miss or a permanent refusal.
+pub(crate) fn is_member_unavailable_response(response: &Response) -> bool {
+    response.extensions().get::<MemberUnavailable>().is_some()
+}
+
+/// The `503` a virtual repository answers when no member served and at least
+/// one member was unavailable rather than missing (#5495, #5504): "not found"
+/// is unknowable, so the client is told to retry instead of being handed a
+/// `404` it would cache.
+pub fn member_unavailable_response() -> Response {
+    let mut response = crate::error::AppError::ServiceUnavailable(
+        "A repository member is temporarily unavailable, retry shortly".to_string(),
+    )
+    .into_response();
+    response.extensions_mut().insert(MemberUnavailable);
+    response
 }
 
 /// Response extension [`map_proxy_error`] attaches to the 502 it returns for
@@ -3114,6 +3151,12 @@ pub(crate) enum MemberResolveOutcome<T, E> {
     Quarantine(E),
     /// The member does not have the artifact; try the next by priority.
     Miss,
+    /// The member could not answer (#5504): an upstream 5xx, a timeout, or a
+    /// storage/database fault ([`crate::services::proxy_service::MemberFetchFailure::Unavailable`]).
+    /// The walk goes on exactly as for [`MemberResolveOutcome::Miss`], so a
+    /// lower-priority member can still serve; but when none does, the walk
+    /// answers [`member_unavailable_response`] (503) instead of a 404.
+    Unavailable,
 }
 
 impl<T, E> MemberResolveOutcome<T, E> {
@@ -3128,7 +3171,17 @@ impl<T, E> MemberResolveOutcome<T, E> {
             MemberResolveOutcome::Hit(t) => MemberResolveOutcome::Hit(f(t)),
             MemberResolveOutcome::Quarantine(e) => MemberResolveOutcome::Quarantine(e),
             MemberResolveOutcome::Miss => MemberResolveOutcome::Miss,
+            MemberResolveOutcome::Unavailable => MemberResolveOutcome::Unavailable,
         }
+    }
+
+    /// Whether the walk moves past this member: a miss, or a member that
+    /// could not answer (#5504).
+    fn passes(&self) -> bool {
+        matches!(
+            self,
+            MemberResolveOutcome::Miss | MemberResolveOutcome::Unavailable
+        )
     }
 }
 
@@ -3202,8 +3255,11 @@ pub(crate) const MAX_VIRTUAL_FANOUT: usize = 16;
 /// [`MemberCacheClass::NeedsUpstream`] AND could still outrank the
 /// highest-priority Pass-1 hit (see [`upstream_candidate_indices`]). The winner
 /// is the first member in priority order that produced a hit or a quarantine
-/// block; `None` means every member missed. The caller maps that to its own
-/// success/`NOT_FOUND` response.
+/// block; `None` means every member missed. A member that could not answer
+/// ([`MemberResolveOutcome::Unavailable`], #5504) is passed over like a miss,
+/// and only when nothing else serves does the walk return
+/// `Some(Unavailable)`, which the caller maps to a retryable 503 rather than
+/// its `NOT_FOUND`.
 ///
 /// Concurrency / fan-out semantics (the load-bearing tradeoff):
 /// * The **warm path stays upstream-free**: when a high-priority member is a
@@ -3265,8 +3321,20 @@ where
     // resolvers, wasted storage round-trips / body reads on the warm path).
     let mut classes: Vec<MemberCacheClass> = Vec::with_capacity(members.len());
     let mut pass1_hits: Vec<Option<MemberResolveOutcome<T, E>>> = Vec::with_capacity(members.len());
+    // #5504: did any member fail rather than miss? Decides 503 over 404 only
+    // when nothing serves.
+    let mut any_unavailable = false;
     for member in members {
         let (class, hit) = probe(member).await;
+        // A probe that could not answer is a definite non-winner here; it is
+        // remembered, not offered as the Pass-1 fallback winner.
+        let hit = match hit {
+            Some(MemberResolveOutcome::Unavailable) => {
+                any_unavailable = true;
+                None
+            }
+            hit => hit,
+        };
         let is_definite_hit = class == MemberCacheClass::DefiniteHit;
         classes.push(class);
         pass1_hits.push(hit);
@@ -3281,10 +3349,15 @@ where
     // priority than (below) the first DefiniteHit, so any candidate hit
     // outranks this fallback.
     let pass1_winner: Option<MemberResolveOutcome<T, E>> = pass1_hits.into_iter().flatten().next();
+    // What the walk answers when no upstream candidate serves: the Pass-1
+    // winner, else `Unavailable` if any member failed, else `None` (a miss).
+    let fallback = |any_unavailable: bool| {
+        pass1_winner.or(any_unavailable.then_some(MemberResolveOutcome::Unavailable))
+    };
 
     let candidates = upstream_candidate_indices(&classes);
     let Some((&first, rest)) = candidates.split_first() else {
-        return pass1_winner;
+        return fallback(any_unavailable);
     };
 
     let upstream = &upstream;
@@ -3296,11 +3369,12 @@ where
     // first request for an artifact the top remote member holds costs exactly
     // one upstream request, not one per member.
     let first_outcome = upstream(&members[first]).await;
-    if !matches!(first_outcome, MemberResolveOutcome::Miss) {
+    if !first_outcome.passes() {
         return Some(first_outcome);
     }
+    any_unavailable |= matches!(first_outcome, MemberResolveOutcome::Unavailable);
     if rest.is_empty() {
-        return pass1_winner;
+        return fallback(any_unavailable);
     }
 
     // Pass 2, step 2 — the top candidate missed, so the remaining candidates are
@@ -3338,6 +3412,10 @@ where
         while next < buffer.len() {
             match buffer[next] {
                 Some(MemberResolveOutcome::Miss) => next += 1,
+                Some(MemberResolveOutcome::Unavailable) => {
+                    any_unavailable = true;
+                    next += 1;
+                }
                 // A higher-priority candidate is still pending: must wait.
                 None => break,
                 // First non-miss in priority order wins; dropping `running`
@@ -3348,7 +3426,7 @@ where
     }
 
     // Every candidate resolved to a miss → fall back to the best Pass-1 hit.
-    pass1_winner
+    fallback(any_unavailable)
 }
 
 /// Map a cache-only proxy probe (`streaming_cached_artifact_by_path`) to a
@@ -3365,7 +3443,10 @@ where
 ///   held cache entry and surfaces the block through `classify_stream_upstream`
 ///   WITHOUT contacting upstream (the held entry is a cache hit).
 /// * `Err(other)` — a negative-cached 404 or an unusable cache key: a definite
-///   miss we must NOT re-fetch.
+///   miss we must NOT re-fetch. A transient error (#5504: e.g. the database
+///   read behind the member's origin policy failing) is a definite non-winner
+///   too, but reported [`MemberResolveOutcome::Unavailable`] so a walk nothing
+///   else serves answers 503, not 404.
 ///
 /// (A transient sidecar read/parse error is mapped to `Ok(None)` upstream of
 /// this in `read_cached_with_revalidation_streaming`, so it falls through to an
@@ -3381,14 +3462,31 @@ pub(crate) fn classify_cache_probe<T, E>(
         Ok(None) => (MemberCacheClass::NeedsUpstream, None),
         // A quarantine block must surface (#1770): re-resolve in Pass 2.
         Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
-        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+        Err(e) => (MemberCacheClass::DefiniteMiss, member_failure_outcome(&e)),
     }
+}
+
+/// The Pass-1 outcome of a member probe that failed with `e` (#5504): `None`
+/// (an ordinary miss) for a permanent failure, `Unavailable` for a transient
+/// one.
+fn member_failure_outcome<T, E>(e: &crate::error::AppError) -> Option<MemberResolveOutcome<T, E>> {
+    is_member_unavailable_error(e).then_some(MemberResolveOutcome::Unavailable)
+}
+
+/// Whether a member fetch error is transient (#5504); see
+/// [`crate::services::proxy_service::MemberFetchFailure`].
+fn is_member_unavailable_error(e: &crate::error::AppError) -> bool {
+    crate::services::proxy_service::classify_member_fetch_failure(e)
+        == crate::services::proxy_service::MemberFetchFailure::Unavailable
 }
 
 /// Map a Remote member's buffered/streaming upstream fetch result to its final
 /// [`MemberResolveOutcome`] (#2069). A Package-Age-Policy quarantine block
-/// (#1770) surfaces as [`MemberResolveOutcome::Quarantine`]; any other error is
-/// an ordinary miss.
+/// (#1770) surfaces as [`MemberResolveOutcome::Quarantine`]. Any other error
+/// lets the walk move on: a permanent one (upstream 404 or other 4xx, a
+/// rejected path) is a miss, a transient one (upstream 5xx, timeout,
+/// transport failure) is [`MemberResolveOutcome::Unavailable`] (#5504), see
+/// [`crate::services::proxy_service::classify_member_fetch_failure`].
 pub(crate) fn classify_stream_upstream(
     result: Result<StreamingFetchResult, crate::error::AppError>,
     member_key: &str,
@@ -3399,7 +3497,19 @@ pub(crate) fn classify_stream_upstream(
         Err(e) if is_quarantine_block(&e) => {
             MemberResolveOutcome::Quarantine(map_proxy_error(member_key, path, e))
         }
-        Err(_) => MemberResolveOutcome::Miss,
+        Err(e) => {
+            if is_member_unavailable_error(&e) {
+                tracing::warn!(
+                    member = %member_key,
+                    path = %redact_proxy_path_for_diagnostics(path),
+                    "virtual member could not answer, trying the next member: {}",
+                    e
+                );
+                MemberResolveOutcome::Unavailable
+            } else {
+                MemberResolveOutcome::Miss
+            }
+        }
     }
 }
 
@@ -3433,7 +3543,7 @@ pub(crate) fn classify_streaming_cache_probe(
         Ok(None) => (MemberCacheClass::NeedsUpstream, None),
         // A quarantine block must surface (#1770): re-resolve in Pass 2.
         Err(e) if is_quarantine_block(&e) => (MemberCacheClass::NeedsUpstream, None),
-        Err(_) => (MemberCacheClass::DefiniteMiss, None),
+        Err(e) => (MemberCacheClass::DefiniteMiss, member_failure_outcome(&e)),
     }
 }
 
@@ -3483,7 +3593,9 @@ pub(crate) fn classify_streaming_local(
 
 /// Map a Remote member's streaming upstream fetch (already mapped to a
 /// [`Response`] by [`proxy_fetch_streaming_member`]) to its final outcome
-/// (#2069). A quarantine 409/403 surfaces; any other error Response is a miss.
+/// (#2069). A quarantine 409/403 surfaces; a transient failure the mapping
+/// marked [`MemberUnavailable`] is [`MemberResolveOutcome::Unavailable`]
+/// (#5504); any other error Response is a miss.
 pub(crate) fn classify_streaming_upstream(
     result: Result<Response, Response>,
 ) -> MemberResolveOutcome<Response, Response> {
@@ -3492,6 +3604,7 @@ pub(crate) fn classify_streaming_upstream(
         Err(resp) if is_member_policy_block_response(&resp) => {
             MemberResolveOutcome::Quarantine(resp)
         }
+        Err(resp) if is_member_unavailable_response(&resp) => MemberResolveOutcome::Unavailable,
         Err(_) => MemberResolveOutcome::Miss,
     }
 }
@@ -3806,6 +3919,7 @@ where
             Ok((result, origin))
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        Some(MemberResolveOutcome::Unavailable) => Err(member_unavailable_response()),
         _ => Err(member_miss_response()),
     }
 }
@@ -4088,6 +4202,7 @@ where
             Ok(response)
         }
         Some(MemberResolveOutcome::Quarantine(response)) => Err(response),
+        Some(MemberResolveOutcome::Unavailable) => Err(member_unavailable_response()),
         _ => Err(member_miss_response()),
     }
 }
@@ -11845,6 +11960,11 @@ fn combined_member_policy(
 /// verdict on bytes it holds and ends the walk; any other failure falls
 /// through to the next member. So a lower-priority remote can never shadow a
 /// hosted copy, and no unscanned path ever serves a scanning member's bytes.
+/// A member that could not answer ([`is_member_unavailable_response`]) is
+/// passed over too, and when nothing serves the walk answers
+/// [`member_unavailable_response`] (503) instead of a 404 (#5504);
+/// `unscanned_run` reports such a run as `Some(Err(_))` through
+/// [`unscanned_run_failure`].
 pub(crate) async fn walk_virtual_members_with_scan<U, UFut, S, SFut>(
     db: &PgPool,
     virtual_id: Uuid,
@@ -11891,6 +12011,9 @@ where
     if policies.iter().all(Option::is_none) {
         return None;
     }
+    // #5504: whether a member could not answer; decides 503 over 404 when
+    // nothing serves.
+    let mut unavailable = false;
     let mut unscanned = Vec::new();
     for (member, policy) in members.into_iter().zip(policies) {
         let Some(policy) = policy else {
@@ -11899,8 +12022,10 @@ where
         };
         let run = std::mem::take(&mut unscanned);
         if !run.is_empty() {
-            if let Some(served) = unscanned_run(run).await {
-                return Some(served);
+            match unscanned_run(run).await {
+                Some(Err(resp)) if is_member_unavailable_response(&resp) => unavailable = true,
+                Some(served) => return Some(served),
+                None => {}
             }
         }
         let member_key = member.key.clone();
@@ -11913,6 +12038,7 @@ where
                 return Some(Err(resp))
             }
             Err(resp) => {
+                unavailable |= is_member_unavailable_response(&resp);
                 tracing::debug!(
                     member_key = %member_key, status = %resp.status(),
                     "scanned virtual member did not serve; trying next member"
@@ -11921,11 +12047,27 @@ where
         }
     }
     if !unscanned.is_empty() {
-        if let Some(served) = unscanned_run(unscanned).await {
-            return Some(served);
+        match unscanned_run(unscanned).await {
+            Some(Err(resp)) if is_member_unavailable_response(&resp) => unavailable = true,
+            Some(served) => return Some(served),
+            None => {}
         }
     }
-    Some(Err(member_miss_response()))
+    Some(Err(if unavailable {
+        member_unavailable_response()
+    } else {
+        member_miss_response()
+    }))
+}
+
+/// How the unscanned half of a scan-aware Virtual walk reports a run that
+/// served nothing (#4100, #5504): a member policy block (403/409) ends the
+/// walk, a run in which a member could not answer is carried to
+/// [`walk_virtual_members_with_scan`] so it can answer 503 if nothing else
+/// serves, and anything else is a miss (`None`).
+pub(crate) fn unscanned_run_failure(resp: Response) -> Option<Result<Response, Response>> {
+    (is_member_policy_block_response(&resp) || is_member_unavailable_response(&resp))
+        .then_some(Err(resp))
 }
 
 /// The unscanned half of a scan-aware Virtual walk (#4100), shared by the
@@ -11966,8 +12108,7 @@ where
             }
             Some(stream_fetch_result(result, default_content_type, None))
         }
-        Err(resp) if is_member_policy_block_response(&resp) => Some(Err(resp)),
-        Err(_) => None,
+        Err(resp) => unscanned_run_failure(resp),
     }
 }
 
@@ -12075,6 +12216,39 @@ mod virtual_scan_walk_tests {
         let resp = result.expect("walked").expect("served");
         assert_eq!(body_of(resp).await, "local");
         assert_eq!(log, ["run[local]"]);
+    }
+
+    /// #5504: a member that could not answer, in an unscanned run or as a
+    /// scanning member, is passed over; a later member still serves, and when
+    /// none does the walk answers 503 instead of 404.
+    #[tokio::test]
+    async fn unavailable_members_pass_and_turn_the_final_miss_into_503_5504() {
+        for last_serves in [false, true] {
+            let members = vec![member("run1"), member("scanning"), member("run2")];
+            let policies = vec![None, SCAN, None];
+            let unscanned_run = |run: Vec<Repository>| {
+                let first = run[0].key.clone();
+                async move {
+                    match first.as_str() {
+                        "run1" => Some(Err(member_unavailable_response())),
+                        _ if last_serves => Some(Ok(ok_from(&first))),
+                        _ => None,
+                    }
+                }
+            };
+            let scanned = |_m: Repository, _p: MemberScanPolicy| async move {
+                Err(member_unavailable_response())
+            };
+            let result = walk_members_with_policies(members, policies, unscanned_run, scanned)
+                .await
+                .expect("walked");
+            if last_serves {
+                assert_eq!(body_of(result.expect("served")).await, "run2");
+            } else {
+                let resp = result.expect_err("nothing served");
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
     }
 
     /// A scanning member that misses (404) or refuses its own bytes as not
@@ -15426,6 +15600,155 @@ mod tests {
     }
 
     // ── Two-phase virtual fan-out: probe / upstream classifiers (pure) ──
+
+    fn three_members() -> Vec<Repository> {
+        vec![
+            test_local_member("m0"),
+            test_local_member("m1"),
+            test_local_member("m2"),
+        ]
+    }
+
+    /// #5504: run the two-phase walk over [`three_members`], every member
+    /// needing upstream unless `probe_unavailable` names it (a Pass-1 failure),
+    /// with each member's Pass-2 outcome taken from `upstream`.
+    async fn two_phase_5504(
+        probe_unavailable: &'static [&'static str],
+        upstream: &'static [(&'static str, &'static str)],
+    ) -> Option<MemberResolveOutcome<String, String>> {
+        let members = three_members();
+        resolve_members_two_phase::<String, String, _, _, _, _>(
+            &members,
+            |m| {
+                let class = if probe_unavailable.contains(&m.key.as_str()) {
+                    (
+                        MemberCacheClass::DefiniteMiss,
+                        Some(MemberResolveOutcome::Unavailable),
+                    )
+                } else {
+                    (MemberCacheClass::NeedsUpstream, None)
+                };
+                async move { class }
+            },
+            |m| {
+                let outcome = match upstream.iter().find(|(k, _)| *k == m.key).map(|(_, o)| *o) {
+                    Some("hit") => MemberResolveOutcome::Hit(m.key.clone()),
+                    Some("unavailable") => MemberResolveOutcome::Unavailable,
+                    _ => MemberResolveOutcome::Miss,
+                };
+                async move { outcome }
+            },
+        )
+        .await
+    }
+
+    /// #5504: a member that could not answer is passed over like a miss, so a
+    /// lower-priority member that has the artifact still serves it, wherever
+    /// the failure happened (the confirmed top candidate, the concurrent
+    /// rest, or the Pass-1 probe).
+    #[tokio::test]
+    async fn two_phase_unavailable_member_does_not_stop_a_lower_hit_5504() {
+        for (probe, upstream) in [
+            (&[][..], &[("m0", "unavailable"), ("m2", "hit")][..]),
+            (&[][..], &[("m1", "unavailable"), ("m2", "hit")][..]),
+            (&["m0"][..], &[("m2", "hit")][..]),
+        ] {
+            match two_phase_5504(probe, upstream).await {
+                Some(MemberResolveOutcome::Hit(v)) => assert_eq!(v, "m2"),
+                other => panic!("{probe:?} {upstream:?}: expected Hit(m2), got {other:?}"),
+            }
+        }
+    }
+
+    /// #5504: when nothing serves, a walk that saw an unavailable member
+    /// reports it (the caller answers 503); one that saw only misses still
+    /// reports a miss (404).
+    #[tokio::test]
+    async fn two_phase_reports_unavailable_only_when_nothing_serves_5504() {
+        for (probe, upstream) in [
+            (&[][..], &[("m0", "unavailable")][..]),
+            (&[][..], &[("m2", "unavailable")][..]),
+            (&["m1"][..], &[][..]),
+        ] {
+            assert!(
+                matches!(
+                    two_phase_5504(probe, upstream).await,
+                    Some(MemberResolveOutcome::Unavailable)
+                ),
+                "{probe:?} {upstream:?}"
+            );
+        }
+        assert!(two_phase_5504(&[], &[]).await.is_none());
+    }
+
+    /// #5504: the error classification behind the walk. A permanent answer is
+    /// a miss, a transient one is `Unavailable`, on the cache probe and the
+    /// upstream fetch alike, and the `Response` form carries the marker.
+    #[test]
+    fn member_failures_classify_permanent_as_miss_and_transient_as_unavailable_5504() {
+        use crate::error::AppError;
+        let forbidden =
+            || AppError::BadGateway("Upstream returned error status 403 Forbidden: u".into());
+        let down = || {
+            AppError::ServiceUnavailable(
+                "Upstream returned error status 503 Service Unavailable: u".into(),
+            )
+        };
+
+        let (class, out) =
+            classify_cache_probe::<i32, String>(Err(AppError::Database("down".into())));
+        assert_eq!(class, MemberCacheClass::DefiniteMiss);
+        assert!(matches!(out, Some(MemberResolveOutcome::Unavailable)));
+        let (_, out) =
+            classify_streaming_cache_probe(Err(AppError::Database("down".into())), "x", None);
+        assert!(matches!(out, Some(MemberResolveOutcome::Unavailable)));
+        let (_, out) = classify_cache_probe::<i32, String>(Err(forbidden()));
+        assert!(out.is_none());
+
+        assert!(matches!(
+            classify_stream_upstream(Err(down()), "k", "p"),
+            MemberResolveOutcome::Unavailable
+        ));
+        assert!(matches!(
+            classify_stream_upstream(Err(forbidden()), "k", "p"),
+            MemberResolveOutcome::Miss
+        ));
+
+        let marked = map_proxy_error("k", "p", down());
+        assert_eq!(marked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(is_member_unavailable_response(&marked));
+        let timed_out = map_proxy_error(
+            "k",
+            "p",
+            AppError::Storage("Failed to fetch: timed out".into()),
+        );
+        assert_eq!(timed_out.status(), StatusCode::BAD_GATEWAY);
+        assert!(is_member_unavailable_response(&timed_out));
+        let refused = map_proxy_error("k", "p", forbidden());
+        assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+        assert!(!is_member_unavailable_response(&refused));
+        assert!(!is_member_unavailable_response(&map_proxy_error(
+            "k",
+            "p",
+            AppError::NotFound("gone".into())
+        )));
+
+        assert!(matches!(
+            classify_streaming_upstream(Err(map_proxy_error("k", "p", down()))),
+            MemberResolveOutcome::Unavailable
+        ));
+        assert!(matches!(
+            classify_streaming_upstream(Err(map_proxy_error("k", "p", forbidden()))),
+            MemberResolveOutcome::Miss
+        ));
+
+        let answer = member_unavailable_response();
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(is_member_unavailable_response(&answer));
+        assert!(unscanned_run_failure(member_unavailable_response()).is_some());
+        assert!(unscanned_run_failure(StatusCode::CONFLICT.into_response()).is_some());
+        assert!(unscanned_run_failure(member_miss_response()).is_none());
+    }
 
     #[test]
     fn classify_cache_probe_maps_hit_miss_negative() {
@@ -26435,22 +26758,23 @@ mod proxy_download_recording_tests {
     /// the set this gate has to cover.
     #[test]
     fn virtual_member_authorization_is_fallible_on_every_client_facing_path() {
-        // Call sites that may still flatten, each with the reason. `oci_v2`'s
-        // blob/manifest walk reaches the helper through its own
-        // `authorized_virtual_members`, whose `Option` return already means
-        // "stop the walk" and whose `None` is load-bearing for the virtual
-        // negative cache; making the authorization failure distinguishable
-        // there is a signature change across both resolvers and their handlers.
-        const EXEMPT: &[&str] = &["oci_v2.rs"];
-        const FLATTENING_CALL: &str = "proxy_helpers::authorize_virtual_members(";
+        // Call sites that may still flatten, as (file, enclosing function),
+        // each with the reason. `oci_v2`'s blob/manifest walk reaches the
+        // helper through its own `authorized_virtual_members`, whose `Option`
+        // return already means "stop the walk" and whose `None` is
+        // load-bearing for the virtual negative cache; making the
+        // authorization failure distinguishable there is a signature change
+        // across both resolvers and their handlers. Scoped to that one
+        // function (#5504), so a new flattening call elsewhere in `oci_v2.rs`
+        // is caught like any other.
+        const EXEMPT: &[(&str, &str)] = &[("oci_v2.rs", "authorized_virtual_members")];
 
-        let mut flattening: Vec<&str> = Vec::new();
+        let mut flattening: Vec<(&str, String)> = Vec::new();
         for (file, src) in SERVE_SOURCES {
-            if EXEMPT.contains(file) {
-                continue;
-            }
-            if src.contains(FLATTENING_CALL) {
-                flattening.push(file);
+            for site in flattening_authorization_sites(src) {
+                if !EXEMPT.contains(&(*file, site.as_str())) {
+                    flattening.push((file, site));
+                }
             }
         }
         assert!(
@@ -26461,6 +26785,21 @@ mod proxy_download_recording_tests {
              empty listing). Use `try_authorize_virtual_members` and let the caller \
              answer a retryable server error."
         );
+
+        // An exemption whose site is gone would silently cover the next one.
+        for (file, function) in EXEMPT {
+            let (_, src) = SERVE_SOURCES
+                .iter()
+                .find(|(n, _)| n == file)
+                .unwrap_or_else(|| panic!("{file} is scanned"));
+            assert!(
+                flattening_authorization_sites(src)
+                    .iter()
+                    .any(|f| f == function),
+                "#4308: the exemption for {file}::{function} no longer matches a call; \
+                 remove it"
+            );
+        }
 
         // The gate is worthless if the token stops matching anything, so pin
         // that the fallible form is genuinely in use on these paths.
@@ -26475,6 +26814,57 @@ mod proxy_download_recording_tests {
                  members through the fallible helper"
             );
         }
+    }
+
+    /// The enclosing top-level function of every production mention of the
+    /// flattening `authorize_virtual_members` in `src` (#4308, #5504): a bare
+    /// identifier, so a `use` import plus an unqualified call is caught as
+    /// well as the `proxy_helpers::` path, while the fallible
+    /// `try_authorize_virtual_members` and the `authorized_virtual_members`
+    /// wrappers are not. Comments and `#[cfg(test)]` items are skipped. A
+    /// mention outside any function (the `use` line itself) reports `"<item>"`.
+    fn flattening_authorization_sites(src: &str) -> Vec<String> {
+        const NAME: &str = "authorize_virtual_members";
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let spans = test_spans(src);
+        let fns = top_level_fns(src, &spans);
+        let mut sites = Vec::new();
+        for (pos, _) in src.match_indices(NAME) {
+            let before = src[..pos].chars().next_back();
+            let after = src[pos + NAME.len()..].chars().next();
+            if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+                continue;
+            }
+            if spans.iter().any(|(a, b)| *a <= pos && pos < *b) {
+                continue;
+            }
+            let line_start = src[..pos].rfind('\n').map_or(0, |i| i + 1);
+            if src[line_start..pos].trim_start().starts_with("//") {
+                continue;
+            }
+            let enclosing = fns
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= pos)
+                .map_or("<item>", |(_, name)| name.as_str());
+            sites.push(enclosing.to_string());
+        }
+        sites
+    }
+
+    /// #5504: the scanner behind the gate above sees the forms the old
+    /// substring match missed, and ignores the ones that are not calls of
+    /// the flattening helper.
+    #[test]
+    fn flattening_authorization_scanner_sees_imports_and_bare_calls() {
+        let src = "use super::proxy_helpers::{authorize_virtual_members, x};\n\
+                   async fn walk() {\n    \
+                   let m = authorize_virtual_members(db, auth, id, all).await;\n}\n\
+                   async fn fine() {\n    \
+                   // authorize_virtual_members( in a comment\n    \
+                   let m = proxy_helpers::try_authorize_virtual_members(db).await?;\n    \
+                   let n = authorized_virtual_members(state).await;\n}\n";
+        assert_eq!(flattening_authorization_sites(src), ["<item>", "walk"]);
     }
 
     /// The primitives that put UPSTREAM bytes in front of a client.

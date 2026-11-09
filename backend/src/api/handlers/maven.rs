@@ -1573,7 +1573,14 @@ fn maven_virtual_age_gate_answer(
     refusal: Option<Response>,
 ) -> Result<Response, Response> {
     match (result, refusal) {
-        (Err(resp), Some(refusal)) if resp.status() == StatusCode::NOT_FOUND => Err(refusal),
+        // #5504: a walk that answers 503 because a member could not answer
+        // yields to the age refusal as a 404 does, as on the checksum route.
+        (Err(resp), Some(refusal))
+            if resp.status() == StatusCode::NOT_FOUND
+                || proxy_helpers::is_member_unavailable_response(&resp) =>
+        {
+            Err(refusal)
+        }
         (result, _) => result,
     }
 }
@@ -2669,8 +2676,12 @@ async fn download(
             // skipped; if no other member answers, its 451 is the answer.
             let mut age_refusal: Option<Response> = None;
 
-            // A member that ERRORED rather than missed makes "not found"
-            // unknowable, so the walk must tell the client to retry.
+            // A member that could not answer (upstream 5xx, timeout, storage
+            // fault) rather than missed makes "not found" unknowable, so a
+            // walk nothing serves tells the client to retry (#5495). A
+            // permanent answer (upstream 404 or other 4xx, a rejected path)
+            // is a miss (#5504): an S3-hosted member answers 403 for a key it
+            // does not hold, and retrying a 503 for that never ends.
             let mut member_failed = false;
             for member in &members {
                 if member.repo_type == RepositoryType::Remote {
@@ -2706,10 +2717,10 @@ async fn download(
                                     .body(Body::from(content))
                                     .unwrap());
                             }
-                            Err(resp) if resp.status() != StatusCode::NOT_FOUND => {
-                                member_failed = true;
+                            Err(resp) => {
+                                member_failed |=
+                                    proxy_helpers::is_member_unavailable_response(&resp);
                             }
-                            Err(_) => {}
                         }
                     }
                 } else if member.repo_type.is_hosted() {
@@ -2723,7 +2734,7 @@ async fn download(
                         continue;
                     };
                     gate_checksum_target(&state.db, &target).await?;
-                    if let Ok(response) = serve_computed_checksum(
+                    match serve_computed_checksum(
                         &state,
                         &member.storage_location(),
                         &target,
@@ -2731,7 +2742,10 @@ async fn download(
                     )
                     .await
                     {
-                        return Ok(response);
+                        Ok(response) => return Ok(response),
+                        // #5504: the member HAS the row; only a missing
+                        // object is a miss, a storage fault is a failure.
+                        Err(resp) => member_failed |= resp.status() != StatusCode::NOT_FOUND,
                     }
                 }
             }
@@ -2741,10 +2755,7 @@ async fn download(
                 return Err(refusal);
             }
             if member_failed {
-                return Err(AppError::ServiceUnavailable(
-                    "A repository member is temporarily unavailable, retry shortly".to_string(),
-                )
-                .into_response());
+                return Err(proxy_helpers::member_unavailable_response());
             }
         }
 
@@ -4050,10 +4061,7 @@ async fn serve_artifact(
                                 )
                                 .await,
                             ),
-                            Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
-                                Some(Err(resp))
-                            }
-                            Err(_) => None,
+                            Err(resp) => proxy_helpers::unscanned_run_failure(resp),
                         }
                     };
                     let target = &target;
@@ -10578,6 +10586,129 @@ mod tests {
             "an erroring member must not read as a miss"
         );
         assert_eq!(missed, StatusCode::NOT_FOUND, "a genuine miss stays 404");
+    }
+
+    /// #5504: through the real router, a Virtual whose higher-priority member
+    /// misses (404) and whose other member is broken answers the artifact
+    /// and its checksum ALIKE. An upstream 5xx makes "not found" unknowable,
+    /// so both are a retryable 503 (the `.jar` used to answer the 404 Gradle
+    /// caches while its `.sha1` answered 503). A permanent upstream 4xx (S3
+    /// answers 403 for a key it does not hold; stale credentials answer 401)
+    /// is a miss, so both are 404 (the `.sha1` used to answer 503 forever).
+    #[tokio::test]
+    async fn test_virtual_artifact_and_checksum_agree_on_member_5xx_vs_4xx_5504() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let paths = [
+            "com/acme5504/lib/1.0/lib-1.0.jar",
+            "com/acme5504/lib/1.0/lib-1.0.jar.sha1",
+        ];
+        let mut got = Vec::new();
+        for broken in [503u16, 500, 403, 401] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "maven", broken).await;
+            let dir = std::env::temp_dir().join(format!("mvn5504-{}", rig.virtual_key));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+            for path in paths {
+                let (status, _) = tdh::send(
+                    tdh::router_anon(router(), state.clone()),
+                    tdh::get(format!("/{}/{path}", rig.virtual_key)),
+                )
+                .await;
+                got.push((broken, path, status));
+            }
+            rig.cleanup(&pool).await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        let want = |broken: u16| {
+            if broken >= 500 {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        };
+        let wrong: Vec<_> = got
+            .iter()
+            .filter(|(broken, _, status)| *status != want(*broken))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "member A 404 + member B 5xx must answer 503, + member B 4xx must answer 404, \
+             on the artifact and the checksum alike; wrong: {wrong:?}"
+        );
+    }
+
+    /// #5504: a hosted member that HAS the artifact row but whose storage
+    /// cannot produce the bytes is a failure, not a miss: the checksum walk
+    /// answers 503 rather than a 404 the client caches. The stored SHA-256
+    /// needs no storage read and is still served, which pins that the row is
+    /// found.
+    #[tokio::test]
+    async fn test_virtual_checksum_503s_when_a_hosted_member_storage_fails_5504() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let path = "com/hosted5504/lib/1.0/lib-1.0.jar";
+        let (local_id, _, local_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "maven").await;
+        tdh::publish_repo(&pool, local_id).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        tdh::link_virtual_member(&pool, virtual_id, local_id, 0).await;
+        // The row names a storage key no object exists under: every read of
+        // the bytes fails, as on a storage outage.
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, version, size_bytes, checksum_sha256, \
+              content_type, storage_key) \
+             VALUES ($1, $2, 'lib', '1.0', 3, $3, 'application/java-archive', $4)",
+        )
+        .bind(local_id)
+        .bind(path)
+        .bind("ab".repeat(32))
+        .bind(format!("maven/{path}.unreadable"))
+        .execute(&pool)
+        .await
+        .expect("seed hosted artifact row");
+
+        let state = tdh::build_state(pool.clone(), virtual_dir.to_str().unwrap());
+        let mut got = Vec::new();
+        for suffix in ["sha1", "md5", "sha256"] {
+            let (status, _) = tdh::send(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get(format!("/{virtual_key}/{path}.{suffix}")),
+            )
+            .await;
+            got.push((suffix, status));
+        }
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(local_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, local_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+
+        assert_eq!(
+            got,
+            vec![
+                ("sha1", StatusCode::SERVICE_UNAVAILABLE),
+                ("md5", StatusCode::SERVICE_UNAVAILABLE),
+                ("sha256", StatusCode::OK),
+            ],
+            "a hosted member's storage failure must not read as a miss"
+        );
     }
 
     #[tokio::test]
