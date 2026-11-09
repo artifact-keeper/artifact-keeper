@@ -37,18 +37,28 @@ const QUEUE_RESTORED_PUSH_SQL: &str = r#"
         claimed_by = NULL,
         claim_token = NULL,
         claim_expires_at = NULL
+    -- An in-flight push is left alone: it is already delivering the artifact.
+    -- Known gap: if a delete for the same peer is also in flight, the push and
+    -- the delete race and their order on the peer is not guaranteed. That
+    -- needs three overlapping operations (in-flight push, in-flight delete and
+    -- the restore), so it is not handled here.
     WHERE sync_tasks.status <> 'in_progress'
     "#;
 
-/// Cancel the delete tasks a restore supersedes. A worker that already claimed
-/// one is left alone: its push is queued as well and delivered after the
-/// in-flight delete finishes.
+/// Cancel the delete tasks a restore supersedes, for the peers `$2` the
+/// restore re-pushes to. A delete for any other peer stays: it may have been
+/// queued because the peer dropped out of a sync policy's scope (the same
+/// `(peer, artifact, 'delete')` row as the trash delete), or its subscription
+/// was disabled or removed, and that peer gets no push to replace it. A worker
+/// that already claimed a delete is left alone: its push is queued as well and
+/// delivered after the in-flight delete finishes.
 const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
     UPDATE sync_tasks
     SET status = 'cancelled',
         completed_at = NOW(),
         error_message = 'superseded by artifact restore'
     WHERE artifact_id = $1
+      AND peer_instance_id = ANY($2)
       AND task_type = 'delete'
       AND status IN ('pending', 'failed')
     "#;
@@ -1217,9 +1227,10 @@ impl PeerInstanceService {
         queued
     }
 
-    /// Replicate a just-restored artifact: cancel the delete tasks the trash
-    /// restore supersedes and queue a push to every eligible peer, forcing a
-    /// finished push back to `pending` (#5505).
+    /// Replicate a just-restored artifact: queue a push to every eligible
+    /// peer, forcing a finished push back to `pending`, and cancel those
+    /// peers' delete tasks the restore supersedes (#5505). Deletes for peers
+    /// outside the push set still run.
     ///
     /// Runs on the caller's connection so the restore and its replication side
     /// effects commit together: a crash cannot leave the restored artifact live
@@ -1228,12 +1239,13 @@ impl PeerInstanceService {
         conn: &mut sqlx::PgConnection,
         artifact: &PublishedArtifact<'_>,
     ) -> Result<usize> {
-        sqlx::query(CANCEL_SUPERSEDED_DELETE_TASKS_SQL)
-            .bind(artifact.id)
-            .execute(&mut *conn)
+        let peers = Self::push_sync_peers(&mut *conn, artifact)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        let peers = Self::push_sync_peers(&mut *conn, artifact)
+        sqlx::query(CANCEL_SUPERSEDED_DELETE_TASKS_SQL)
+            .bind(artifact.id)
+            .bind(&peers)
+            .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 

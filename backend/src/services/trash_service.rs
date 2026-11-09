@@ -657,14 +657,20 @@ pub(crate) mod tests {
 
     /// Register a peer with a `push` subscription to the fixture repository.
     async fn subscribe_peer(fx: &tdh::Fixture, tag: &str) -> Uuid {
+        subscribe_peer_with_mode(fx, tag, "push").await
+    }
+
+    /// Register a peer subscribed to the fixture repository in `mode`.
+    async fn subscribe_peer_with_mode(fx: &tdh::Fixture, tag: &str, mode: &str) -> Uuid {
         let peer_id = tdh::register_test_peer(&fx.pool, "trash-restore", tag).await;
         sqlx::query(
             "INSERT INTO peer_repo_subscriptions \
                  (peer_instance_id, repository_id, sync_enabled, replication_mode) \
-             VALUES ($1, $2, true, 'push')",
+             VALUES ($1, $2, true, $3::text::replication_mode)",
         )
         .bind(peer_id)
         .bind(fx.repo_id)
+        .bind(mode)
         .execute(&fx.pool)
         .await
         .expect("subscribe peer");
@@ -811,10 +817,41 @@ pub(crate) mod tests {
         let completed = subscribe_peer(&fx, &format!("{uid}-completed")).await;
         let clean = subscribe_peer(&fx, &format!("{uid}-clean")).await;
 
+        // Peers outside the push set: a pull-mode subscriber, and a push
+        // subscriber whose sync policy now excludes the artifact (the policy
+        // queued its delete when the peer dropped out of scope). The restore
+        // pushes nothing to them, so their deletes must still run.
+        let pull = subscribe_peer_with_mode(&fx, &format!("{uid}-pull"), "pull").await;
+        let excluded = subscribe_peer(&fx, &format!("{uid}-excluded")).await;
+        let policy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_policies \
+                 (name, repo_selector, peer_selector, artifact_filter, precedence) \
+             VALUES ($1, $2, $3, $4, 0) RETURNING id",
+        )
+        .bind(format!("trash-restore-exclude-{uid}"))
+        .bind(serde_json::json!({ "match_repos": [fx.repo_id] }))
+        .bind(serde_json::json!({ "match_peers": [excluded] }))
+        .bind(serde_json::json!({ "exclude_paths": [path.clone()] }))
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert sync policy");
+        sqlx::query(
+            "UPDATE peer_repo_subscriptions SET policy_id = $1 \
+             WHERE peer_instance_id = $2 AND repository_id = $3",
+        )
+        .bind(policy_id)
+        .bind(excluded)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("attach sync policy");
+
         seed_sync_task(&fx, offline, id, "delete", "pending").await;
         seed_sync_task(&fx, failed, id, "delete", "failed").await;
         seed_sync_task(&fx, inflight, id, "delete", "in_progress").await;
         seed_sync_task(&fx, completed, id, "push", "completed").await;
+        seed_sync_task(&fx, pull, id, "delete", "pending").await;
+        seed_sync_task(&fx, excluded, id, "delete", "pending").await;
 
         let restored = service(&fx, 0).restore(id).await;
         let offline_delete = sync_task_state(&fx, offline, id, "delete").await;
@@ -824,6 +861,18 @@ pub(crate) mod tests {
         for peer_id in [offline, failed, inflight, completed, clean] {
             pushes.push((peer_id, sync_task_state(&fx, peer_id, id, "push").await));
         }
+        let mut out_of_scope = Vec::new();
+        for (label, peer_id) in [("pull-mode", pull), ("policy-excluded", excluded)] {
+            out_of_scope.push((
+                label,
+                sync_task_state(&fx, peer_id, id, "delete").await,
+                sync_task_state(&fx, peer_id, id, "push").await,
+            ));
+        }
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(policy_id)
+            .execute(&fx.pool)
+            .await;
         fx.teardown().await;
 
         assert!(restored.is_ok(), "{restored:?}");
@@ -846,6 +895,14 @@ pub(crate) mod tests {
                 Some("pending"),
                 "restore must queue a pending push for peer {peer_id}"
             );
+        }
+        for (label, delete, push) in out_of_scope {
+            assert_eq!(
+                delete,
+                Some(("pending".to_string(), None)),
+                "a {label} peer gets no push, so its delete must still run"
+            );
+            assert_eq!(push, None, "restore must not push to a {label} peer");
         }
     }
 
