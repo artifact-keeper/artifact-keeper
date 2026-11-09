@@ -69,11 +69,13 @@
 //! inclusion proof ([`Check::RekorInclusion`]) that proves the entry is really
 //! in the log. Both are required here, so neither stands alone.
 
+// sigstore-rs boundary (#5585): the verifier consumes its own `sha2::Sha256`
+// hasher type; see docs/fips.md, "Non-security algorithm inventory".
+#![allow(clippy::disallowed_types)]
 use serde_json::Value;
 // sigstore-rs verifies the subject digest against its own `sha2::Sha256`
 // hasher type, so this boundary keeps RustCrypto SHA-256 (#5585; listed in
 // docs/fips.md as the one non-module SHA-2 use, verification-only).
-#[allow(clippy::disallowed_types)]
 use sha2::{Digest, Sha256};
 
 pub mod bundle_convert;

@@ -151,6 +151,15 @@ API_URL=http://localhost:8080 ./scripts/native-tests/test-wasm-plugins.sh
 gh workflow run e2e.yml -f profile=all -f include_stress=true
 ```
 
+## Cryptography
+
+All security cryptography goes through `backend/src/crypto/` on the single
+`aws-lc-rs` provider; clippy refuses direct RustCrypto, `bcrypt`, `rsa`,
+`ed25519-dalek` and `rand` entropy use elsewhere. Read `docs/fips.md` before
+touching anything that hashes, signs, encrypts or generates a secret, and
+before adding a dependency with a `native-tls` or `ring` feature
+(`scripts/ci/check-crypto-provider.sh` fails the build on either).
+
 ## Code Style
 
 Rust 1.75+: Follow standard conventions

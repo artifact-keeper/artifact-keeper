@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn provider_name_matches_build_feature() {
-        assert_eq!(provider_name().starts_with("AWS-LC"), true);
+        assert!(provider_name().starts_with("AWS-LC"));
         assert_eq!(cfg!(feature = "fips"), provider_name().ends_with("FIPS"));
     }
 

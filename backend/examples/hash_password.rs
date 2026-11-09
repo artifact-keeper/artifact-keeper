@@ -1,8 +1,11 @@
-use bcrypt::{hash, verify, DEFAULT_COST};
+//! Mint a bcrypt hash and verify a known one through the crypto facade
+//! (`crate::crypto::password`), the only place bcrypt is used (#5579).
+
+use artifact_keeper_backend::crypto::password::{hash_bcrypt, verify, BCRYPT_DEFAULT_COST};
 
 fn main() {
     let password = "admin123";
-    let hashed = hash(password, DEFAULT_COST).unwrap();
+    let hashed = hash_bcrypt(password, BCRYPT_DEFAULT_COST).unwrap();
     println!("New hash: {}", hashed);
 
     // Verify the old hash

@@ -686,6 +686,69 @@ jobs:
   # "🧪 Backend Unit Tests" is `test-backend-unit` below, which passes only
   # when every leg here passed AND the integration job passed or was
   # skipped by design.
+  # FIPS lane (#5580, #5581): the second half of the two-lane matrix. Builds
+  # the backend against the AWS-LC FIPS module, proves the dependency graph
+  # and module manifest hold for that feature set, and runs the crypto and
+  # gate unit tests with FIPS_MODE=strict. Not yet in ci-complete's `needs`:
+  # it reports, it does not block, until the -fips image lane has baked.
+  test-backend-fips:
+    name: 🔐 FIPS build and gate tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    needs: [changes, release-bump]
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_NET_RETRY: "10"
+      SQLX_OFFLINE: "true"
+      JWT_SECRET: ci-fips-lane-secret-at-least-32-bytes-long
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - name: Assert the pinned Rust toolchain is in force
+        run: ./scripts/ci/check-toolchain-pin.sh --active
+
+      # The AWS-LC FIPS module builds with cmake and Go (aws-lc-fips-sys).
+      - name: Install protoc, cmake and Go
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v2-rust
+          shared-key: fips
+          save-if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+
+      - name: Module manifest matches Cargo.lock
+        run: ./scripts/ci/check-fips-module-manifest.sh
+
+      - name: Single crypto provider (fips feature set)
+        run: ./scripts/ci/check-crypto-provider.sh --features fips
+
+      - name: Crypto facade and gate tests under FIPS_MODE=strict
+        env:
+          FIPS_MODE: strict
+        run: |
+          cargo nextest run -p artifact-keeper-backend --lib --features fips \
+            -E 'test(/^(crypto|fips)::/) | test(/password|api_token|dummy_bcrypt|encryption::|saml_non_approved/)'
+
+      - name: Strict mode refuses a non-FIPS build
+        run: |
+          cargo build -p artifact-keeper-backend --bin artifact-keeper
+          set +e
+          FIPS_MODE=strict DATABASE_URL=postgres://invalid timeout 60 ./target/debug/artifact-keeper >out.log 2>&1
+          code=$?
+          set -e
+          grep -q 'non-fips-build\|not built with the FIPS module' out.log || { cat out.log; echo "::error::default build did not refuse FIPS_MODE=strict"; exit 1; }
+          echo "default build refused strict mode (exit $code) as required"
+
   test-backend-unit-shard:
     name: 🧪 Unit Tests (${{ matrix.shard }})
     runs-on: ubuntu-24.04
@@ -1212,6 +1275,7 @@ jobs:
           cargo nextest run --workspace --no-run \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
+            --test fips_dual_format_tests \
             --test image_builds_tests \
             --test grpc_sbom_tests \
             --test search_reindex_tests \
@@ -1301,6 +1365,7 @@ jobs:
             --run-ignored ignored-only \
             --test lifecycle_policy_tests \
             --test api_token_cache_flush_tests \
+            --test fips_dual_format_tests \
             --test image_builds_tests \
             --test grpc_sbom_tests \
             --test search_reindex_tests \

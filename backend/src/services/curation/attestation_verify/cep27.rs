@@ -46,11 +46,13 @@
 //! refuses any attestation that does not verify, storing nothing. Only an
 //! explicit operator opt-out accepts an unverified attestation, and then the
 //! failed record is stored with it so the gap stays auditable.
+// sigstore-rs boundary (#5585): the verifier consumes its own `sha2::Sha256`
+// hasher type; see docs/fips.md, "Non-security algorithm inventory".
+#![allow(clippy::disallowed_types)]
 use serde_json::Value;
 // sigstore-rs verifies the subject digest against its own `sha2::Sha256`
 // hasher type, so this boundary keeps RustCrypto SHA-256 (#5585; listed in
 // docs/fips.md as the one non-module SHA-2 use, verification-only).
-#[allow(clippy::disallowed_types)]
 use sha2::{Digest, Sha256};
 
 use base64::Engine;

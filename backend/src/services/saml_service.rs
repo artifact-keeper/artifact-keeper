@@ -17,6 +17,104 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+
+/// XML-DSig algorithm URIs the FIPS policy accepts (#5584): SHA-2 digests
+/// and RSA (PKCS#1 v1.5 and PSS) or ECDSA signatures over them.
+const APPROVED_XMLDSIG_ALGORITHMS: &[&str] = &[
+    "http://www.w3.org/2001/04/xmlenc#sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#sha384",
+    "http://www.w3.org/2001/04/xmlenc#sha512",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+    "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1",
+    "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1",
+    "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1",
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
+];
+
+/// Every `SignatureMethod` / `DigestMethod` `Algorithm` URI in `xml` that is
+/// not in [`APPROVED_XMLDSIG_ALGORITHMS`], de-duplicated, in document order.
+///
+/// A textual scan rather than a parse: the signature library parses the
+/// document afterwards and rejects anything malformed, and this check only
+/// has to be conservative (an algorithm attribute it cannot read is treated
+/// as non-approved, so a response can never slip past it by being odd).
+pub(crate) fn saml_non_approved_algorithms(xml: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in ["SignatureMethod", "DigestMethod"] {
+        let mut rest = xml;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            // The element's own attributes end at the first `>`.
+            let Some(end) = after.find('>') else { break };
+            let attrs = &after[..end];
+            let algorithm = attrs
+                .find("Algorithm")
+                .and_then(|a| {
+                    let v = &attrs[a..];
+                    let q = v.find(['"', '\''])?;
+                    let quote = v.as_bytes()[q] as char;
+                    let v = &v[q + 1..];
+                    v.find(quote).map(|e| v[..e].trim().to_string())
+                })
+                .unwrap_or_else(|| "<unreadable>".to_string());
+            if !APPROVED_XMLDSIG_ALGORITHMS.contains(&algorithm.as_str())
+                && !found.contains(&algorithm)
+            {
+                found.push(algorithm);
+            }
+            rest = &after[end..];
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod algorithm_policy_tests {
+    use super::saml_non_approved_algorithms;
+
+    #[test]
+    fn sha256_rsa_and_ecdsa_responses_are_approved() {
+        let xml = r#"<ds:SignedInfo><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <ds:Reference><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/></ds:Reference></ds:SignedInfo>"#;
+        assert!(saml_non_approved_algorithms(xml).is_empty());
+        let ecdsa = r#"<SignatureMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384' /><DigestMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#sha384'/>"#;
+        assert!(saml_non_approved_algorithms(ecdsa).is_empty());
+        let pss = r#"<SignatureMethod Algorithm="http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1"/>"#;
+        assert!(saml_non_approved_algorithms(pss).is_empty());
+    }
+
+    #[test]
+    fn sha1_in_either_position_is_reported_once_each() {
+        let xml = r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
+            <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+            <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>"#;
+        assert_eq!(
+            saml_non_approved_algorithms(xml),
+            vec![
+                "http://www.w3.org/2000/09/xmldsig#rsa-sha1".to_string(),
+                "http://www.w3.org/2000/09/xmldsig#sha1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unreadable_algorithm_attribute_is_non_approved_and_no_signature_is_fine() {
+        assert_eq!(
+            saml_non_approved_algorithms("<SignatureMethod Algorithm=>"),
+            vec!["<unreadable>".to_string()]
+        );
+        assert_eq!(
+            saml_non_approved_algorithms("<SignatureMethod />"),
+            vec!["<unreadable>".to_string()]
+        );
+        assert!(saml_non_approved_algorithms("<samlp:Response/>").is_empty());
+        assert!(saml_non_approved_algorithms("").is_empty());
+    }
+}
 use crate::models::user::{AuthProvider, User};
 use crate::services::federated_email::{resolve_federated_email, SAML_NO_EMAIL_DOMAIN};
 
@@ -1007,6 +1105,28 @@ impl SamlService {
             let mut ctx = bergshamra::DsigContext::new(keys_manager);
             ctx.strict_verification = true;
             ctx.trusted_keys_only = true;
+
+            // FIPS algorithm policy (#5584): SHA-1 (or anything outside SHA-2
+            // RSA / RSA-PSS / ECDSA) in SignatureMethod or DigestMethod is
+            // refused in strict mode and reported in warn mode, before the
+            // signature is even checked.
+            let non_approved = saml_non_approved_algorithms(xml);
+            if !non_approved.is_empty() {
+                let mode = crate::fips::mode();
+                if mode.is_strict() {
+                    return Err(AppError::Authentication(format!(
+                        "SAML response uses non-approved signature algorithm(s) {}; \
+                         configure the IdP for RSA-SHA256 or ECDSA-SHA256 (FIPS_MODE=strict)",
+                        non_approved.join(", ")
+                    )));
+                }
+                if mode.checks_enabled() {
+                    tracing::warn!(
+                        algorithms = %non_approved.join(", "),
+                        "FIPS_MODE=warn: SAML response uses algorithms strict mode would refuse"
+                    );
+                }
+            }
 
             match bergshamra::verify(&ctx, xml) {
                 Ok(bergshamra::VerifyResult::Valid { references, .. }) => {

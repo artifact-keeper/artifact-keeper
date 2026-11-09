@@ -1615,6 +1615,16 @@ created_at:{created_at}\n",
         data: &[u8],
         digest: RsaDigest,
     ) -> Result<Option<Vec<u8>>> {
+        // FIPS strict mode never generates a SHA-1 signature (#5586). The
+        // only caller asking for one is apk's legacy `.SIGN.RSA` index
+        // signature; the SHA-256 variant stays available.
+        if digest == RsaDigest::Sha1 && crate::fips::strict() {
+            return Err(AppError::Validation(
+                "SHA-1 repository signatures are refused in FIPS_MODE=strict; \
+                 apk clients must verify the SHA-256 (.SIGN.RSA256) signature"
+                    .to_string(),
+            ));
+        }
         let key = match self.get_active_key_for_repo(repo_id).await? {
             Some(k) => k,
             None => return Ok(None),

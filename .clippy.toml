@@ -49,9 +49,10 @@ disallowed-types = [
     { path = "aes_gcm::Aes128Gcm", reason = "CRYPTO: use crate::crypto::aead (AES-256-GCM); see #5579" },
     { path = "ed25519_dalek::SigningKey", reason = "CRYPTO: use crate::crypto::signature::Ed25519KeyPair; see #5579" },
     { path = "ed25519_dalek::VerifyingKey", reason = "CRYPTO: use crate::crypto::signature::ed25519_verify; see #5579" },
-    { path = "rsa::RsaPrivateKey", reason = "CRYPTO: RSA keys are generated and used through crate::crypto::signature; see #5579, #5586" },
+    # `rsa::RsaPrivateKey` joins this list with #5586, when repository RSA
+    # signing moves onto the module. Until then the `rsa` crate does the RSA
+    # arithmetic over digests the facade computes.
     { path = "rand::rngs::SysRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
-    { path = "rand::rngs::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
     { path = "rand08::rngs::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
     { path = "rsa::rand_core::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
 ]

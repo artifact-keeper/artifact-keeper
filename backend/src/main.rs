@@ -120,6 +120,14 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     let fips_mode = artifact_keeper_backend::fips::FipsMode::from_env()
         .map_err(artifact_keeper_backend::error::AppError::Config)?;
     let rustls_fips = artifact_keeper_backend::fips::install_rustls_provider(fips_mode);
+    // Fail fast on the one violation that needs no configuration or database
+    // to detect: strict mode on a binary without the FIPS module. The full
+    // gate runs after the database is up (below).
+    if fips_mode.is_strict() {
+        let module = artifact_keeper_backend::fips::module_violations(fips_mode);
+        artifact_keeper_backend::fips::decide(fips_mode, &module)
+            .map_err(artifact_keeper_backend::error::AppError::Config)?;
+    }
 
     // Resolve the shutdown token early so background workers spawned during
     // startup (email dispatcher, webhook producer) share the same

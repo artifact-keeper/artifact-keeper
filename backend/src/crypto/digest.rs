@@ -244,7 +244,7 @@ macro_rules! sha2_compat {
 
         impl digest::FixedOutputReset for $name {
             fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
-                let done = std::mem::replace(self, Self::new());
+                let done = std::mem::take(self);
                 out.copy_from_slice(done.0.finish().as_ref());
             }
         }
@@ -283,7 +283,7 @@ macro_rules! sha2_compat {
             }
 
             pub fn finalize_reset(&mut self) -> Output<$len> {
-                let done = std::mem::replace(self, Self::new());
+                let done = std::mem::take(self);
                 done.finalize()
             }
 
