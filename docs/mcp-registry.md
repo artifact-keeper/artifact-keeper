@@ -1082,6 +1082,36 @@ curl -X PUT -H "Authorization: Bearer $AK_TOKEN" --data-binary @echo.mcpb \
   (default 10,000, the shared ingest ceiling); more is
   `400 mcp_bundle_invalid` before the manifest is looked up, so no bundle
   row or version is written.
+- AK stores a bundle verbatim, so it vets every entry for the client that
+  later unpacks it, and refuses the bundle with `400 mcp_bundle_invalid`
+  (nothing stored: no bundle row, no facts, no storage object) unless:
+  - every entry name is valid UTF-8 (whether or not the ZIP's UTF-8 flag is
+    set; `entry N name is not UTF-8`), and the central directory and local
+    header of each entry carry the same name bytes (`central/local header
+    name mismatch for entry N`); an Info-ZIP Unicode path extra field
+    (`0x7075`) in either header naming any other path, whatever its CRC, is
+    refused as well;
+  - no name is empty, absolute (`/x`, `\x`), drive-qualified (`C:x`),
+    contains a `..` segment, a backslash, a `:` (also an NTFS alternate
+    data stream, `manifest.json::$DATA`) or a control character
+    (`unsafe entry name: <name>`), the shared archive-path policy plus the
+    backslash, colon and control-character rules;
+  - every entry is a regular file or directory: a symlink
+    (`symlink entry: <name>`) or a device, FIFO or socket
+    (`special file entry: <name>`) is refused, judged by the Unix mode in
+    the external attributes whatever host made the entry (7-Zip records a
+    Windows symlink as a FAT-made entry with a Unix link mode);
+  - no two entries unpack to the same path (empty and `.` segments ignored,
+    Unicode NFC; `duplicate entry <name>`), and exactly one entry is the root
+    manifest, compared case-insensitively (Unicode upper case, so
+    `manifeſt.json` counts), so `MANIFEST.JSON` or
+    `./manifest.json` beside `manifest.json` is
+    `duplicate entry manifest.json`;
+  - `manifest.json` repeats no member name in any object
+    (`manifest.json: duplicate key ...`).
+
+  Build bundles with `mcpb pack`: it follows symlinks, so links such as
+  `node_modules/.bin/*` are stored as regular files rather than refused.
 - AK reads `manifest.json` (at most 1 MiB, an object with string `name` and
   `version`; else `400 mcp_bundle_invalid`) and verifies the signature
   block the `mcpb sign` tool appends (`MCPB_SIG_V1`, PKCS#7 detached

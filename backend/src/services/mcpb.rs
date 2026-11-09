@@ -253,8 +253,8 @@ pub fn read_manifest(archive: &[u8]) -> Result<serde_json::Value, BundleError> {
     read_manifest_from(std::io::Cursor::new(archive))
 }
 
-fn read_manifest_from(
-    archive: impl std::io::Read + std::io::Seek,
+fn read_manifest_from<R: std::io::Read + std::io::Seek>(
+    archive: R,
 ) -> Result<serde_json::Value, BundleError> {
     let mut zip =
         zip::ZipArchive::new(archive).map_err(|e| bad(format!("not a ZIP archive: {e}")))?;
@@ -262,24 +262,35 @@ fn read_manifest_from(
         crate::error::AppError::Validation(message) => bad(message),
         other => bad(other.to_string()),
     })?;
-    let mut entry = zip
-        .by_name("manifest.json")
-        .map_err(|_| bad("the bundle has no manifest.json at its root"))?;
-    if entry.size() > MANIFEST_MAX_BYTES {
-        return Err(bad("manifest.json is larger than 1 MiB"));
-    }
-    let mut raw = Vec::new();
-    entry
-        .by_ref()
-        .take(MANIFEST_MAX_BYTES + 1)
-        .read_to_end(&mut raw)
-        .map_err(|e| bad(format!("manifest.json could not be read: {e}")))?;
+    let entries = vet_entry_names(&zip)?;
+    let has_duplicates = zip.has_duplicate_names();
+    let dir_start = zip.central_directory_start();
+    let raw = {
+        let mut entry = zip
+            .by_name("manifest.json")
+            .map_err(|_| bad("the bundle has no manifest.json at its root"))?;
+        if entry.size() > MANIFEST_MAX_BYTES {
+            return Err(bad("manifest.json is larger than 1 MiB"));
+        }
+        let mut raw = Vec::new();
+        entry
+            .by_ref()
+            .take(MANIFEST_MAX_BYTES + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| bad(format!("manifest.json could not be read: {e}")))?;
+        raw
+    };
+    // The manifest bytes are only held in memory until every header has been
+    // vetted: nothing is accepted from an archive that fails below.
+    vet_entry_headers(&mut zip.into_inner(), &entries, dir_start, has_duplicates)?;
     if raw.len() as u64 > MANIFEST_MAX_BYTES {
         return Err(bad("manifest.json is larger than 1 MiB"));
     }
     if crate::formats::mcp::json_depth_exceeds(&raw, crate::formats::mcp::MAX_DEPTH) {
         return Err(bad("manifest.json nests too deeply"));
     }
+    crate::formats::mcp::reject_duplicate_json_keys(&raw)
+        .map_err(|e| bad(format!("manifest.json: {e}")))?;
     let manifest: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|e| bad(format!("manifest.json: {e}")))?;
     for field in ["name", "version"] {
@@ -288,6 +299,234 @@ fn read_manifest_from(
         }
     }
     Ok(manifest)
+}
+
+// ---------------------------------------------------------------------------
+// Archive entries (#5468, #5469, #5470)
+// ---------------------------------------------------------------------------
+//
+// AK stores a bundle verbatim, so every entry is vetted for the client that
+// later unpacks it: one unambiguous, relative, UTF-8 name per entry (the same
+// in the central directory and the local header), regular files and
+// directories only, and a single root `manifest.json`.
+
+const LOCAL_MAGIC: &[u8] = b"PK\x03\x04";
+/// Unix file-type bits (`S_IFMT`) of an entry's mode, and the types a bundle
+/// may hold besides "none recorded" (0).
+const S_IFMT: u32 = 0o170000;
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFLNK: u32 = 0o120000;
+
+use crate::formats::mcp::shown;
+
+/// Refuse a name a client could resolve outside, or ambiguously inside, the
+/// directory it unpacks into: the shared archive policy
+/// ([`crate::util::bounded_archive::is_unsafe_archive_entry_name`]: absolute,
+/// drive-qualified, `..` segments), plus any backslash (a separator on
+/// Windows, a file-name character elsewhere), any `:` (a drive prefix, or
+/// an NTFS alternate data stream such as `manifest.json::$DATA` that Windows
+/// writes into `manifest.json`), control character, or an empty name.
+fn check_entry_name(name: &str) -> Result<(), BundleError> {
+    if name.is_empty()
+        || crate::util::bounded_archive::is_unsafe_archive_entry_name(name)
+        || name.contains(['\\', ':'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(bad(format!("unsafe entry name: {}", shown(name))));
+    }
+    Ok(())
+}
+
+/// Refuse a symlink or other special file (device, FIFO, socket); a mode
+/// with no file-type bits (as many archivers write) is a regular file. Both
+/// the mode the ZIP reader derives (`unix_mode`) and the Unix mode in the
+/// high 16 bits of the external attributes are checked, whatever host made
+/// the entry: 7-Zip writes a Windows-side symlink as a FAT-made entry with
+/// its Unix mode there, which `unix_mode` ignores, and 7-Zip on Linux
+/// re-creates the link.
+fn check_entry_type(
+    name: &str,
+    unix_mode: Option<u32>,
+    external_attributes: u32,
+) -> Result<(), BundleError> {
+    let high = external_attributes >> 16;
+    for mode in unix_mode.into_iter().chain((high != 0).then_some(high)) {
+        match mode & S_IFMT {
+            S_IFLNK => return Err(bad(format!("symlink entry: {}", shown(name)))),
+            0 | S_IFREG | S_IFDIR => {}
+            _ => return Err(bad(format!("special file entry: {}", shown(name)))),
+        }
+    }
+    Ok(())
+}
+
+/// The path a client would unpack `name` to, for collision checks: empty and
+/// `.` segments dropped, Unicode NFC (what a normalizing file system stores).
+fn entry_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+        .nfc()
+        .collect()
+}
+
+/// Where an entry's two headers are, and the name the ZIP reader took for it.
+struct EntryHeaders {
+    central: u64,
+    local: u64,
+    name: Vec<u8>,
+}
+
+/// Vet every entry's name and type from the central directory (nothing is
+/// opened or inflated) and return where its headers are for
+/// [`vet_entry_headers`].
+fn vet_entry_names<R: std::io::Read + std::io::Seek>(
+    zip: &zip::ZipArchive<R>,
+) -> Result<Vec<EntryHeaders>, BundleError> {
+    let mut out = Vec::with_capacity(zip.len());
+    let mut keys = std::collections::HashSet::with_capacity(zip.len());
+    let mut manifests = 0usize;
+    for i in 0..zip.len() {
+        let entry = zip
+            .by_index_data(i)
+            .map_err(|e| bad(format!("entry {i} could not be read: {e}")))?;
+        let name = std::str::from_utf8(entry.name_raw())
+            .map_err(|_| bad(format!("entry {i} name is not UTF-8")))?;
+        check_entry_name(name)?;
+        check_entry_type(name, entry.unix_mode(), entry.external_attributes())?;
+        let key = entry_key(name);
+        // Upper-casing, unlike lower-casing, folds `ſ` (U+017F) and `ﬆ`
+        // to `S`/`ST`, as NTFS and other case-insensitive file systems do.
+        if key.to_uppercase() == "MANIFEST.JSON" {
+            manifests += 1;
+            if manifests > 1 {
+                return Err(bad("duplicate entry manifest.json"));
+            }
+        }
+        if !keys.insert(key) {
+            return Err(bad(format!("duplicate entry {}", shown(name))));
+        }
+        out.push(EntryHeaders {
+            central: entry.central_header_start(),
+            local: entry.header_start(),
+            name: entry.name_raw().to_vec(),
+        });
+    }
+    Ok(out)
+}
+
+/// A raw ZIP header's file name and extra field, and where the header after
+/// it starts.
+struct RawHeader {
+    name: Vec<u8>,
+    extra: Vec<u8>,
+    next: u64,
+}
+
+/// The central (`central`) or local header at `at`; `None` when no such
+/// header is there.
+fn raw_header<R: std::io::Read + std::io::Seek>(
+    r: &mut R,
+    at: u64,
+    central: bool,
+) -> std::io::Result<Option<RawHeader>> {
+    let (magic, fixed, name_len_at) = if central {
+        (CDIR_MAGIC, 46, 28)
+    } else {
+        (LOCAL_MAGIC, 30, 26)
+    };
+    let mut head = [0u8; 46];
+    r.seek(std::io::SeekFrom::Start(at))?;
+    r.read_exact(&mut head[..fixed])?;
+    if &head[..4] != magic {
+        return Ok(None);
+    }
+    let field = |i: usize| u16::from_le_bytes([head[i], head[i + 1]]) as usize;
+    let mut name = vec![0u8; field(name_len_at)];
+    r.read_exact(&mut name)?;
+    let mut extra = vec![0u8; field(name_len_at + 2)];
+    r.read_exact(&mut extra)?;
+    let comment = if central { field(32) } else { 0 };
+    let next = at + (fixed + name.len() + extra.len() + comment) as u64;
+    Ok(Some(RawHeader { name, extra, next }))
+}
+
+/// Info-ZIP Unicode Path extra field (APPNOTE 4.6.9).
+const UNICODE_PATH_FIELD: u16 = 0x7075;
+
+/// Whether `extra` carries a Unicode Path field whose path is not `name`
+/// (whatever its CRC: readers differ on when they honour it), or is too
+/// short to hold one.
+fn has_foreign_unicode_path(extra: &[u8], name: &[u8]) -> bool {
+    let mut rest = extra;
+    while rest.len() >= 4 {
+        let id = u16::from_le_bytes([rest[0], rest[1]]);
+        let len = u16::from_le_bytes([rest[2], rest[3]]) as usize;
+        let data = &rest[4..(4 + len).min(rest.len())];
+        if id == UNICODE_PATH_FIELD && data.get(5..) != Some(name) {
+            return true;
+        }
+        rest = &rest[(4 + len).min(rest.len())..];
+    }
+    false
+}
+
+/// Vet the raw headers behind the ZIP reader's view: an exact duplicate name
+/// (which the reader collapses to its last entry) is refused by name; each
+/// entry's central-directory name must be the name the reader used and the
+/// same bytes as its local header's, and neither header may carry a Unicode
+/// path extra field naming another path. Two short reads per entry, bounded by the entry ceiling.
+fn vet_entry_headers<R: std::io::Read + std::io::Seek>(
+    r: &mut R,
+    entries: &[EntryHeaders],
+    dir_start: u64,
+    has_duplicates: bool,
+) -> Result<(), BundleError> {
+    if has_duplicates {
+        let mut seen = std::collections::HashSet::new();
+        let mut at = dir_start;
+        while let Ok(Some(h)) = raw_header(r, at, true) {
+            if !seen.insert(h.name.clone()) {
+                let name = String::from_utf8_lossy(&h.name);
+                return Err(bad(format!("duplicate entry {}", shown(&name))));
+            }
+            at = h.next;
+        }
+        return Err(bad("duplicate entry names in the archive"));
+    }
+    for (i, e) in entries.iter().enumerate() {
+        let foreign_path = || {
+            bad(format!(
+                "entry {i} has a Unicode path extra field naming another path"
+            ))
+        };
+        let central = match raw_header(r, e.central, true) {
+            Ok(Some(h)) => h,
+            _ => return Err(bad(format!("entry {i} has no central directory header"))),
+        };
+        if std::str::from_utf8(&central.name).is_err() {
+            return Err(bad(format!("entry {i} name is not UTF-8")));
+        }
+        if central.name != e.name || has_foreign_unicode_path(&central.extra, &central.name) {
+            return Err(foreign_path());
+        }
+        let local = match raw_header(r, e.local, false) {
+            Ok(Some(h)) => h,
+            _ => return Err(bad(format!("entry {i} has no local header"))),
+        };
+        if local.name != central.name {
+            return Err(bad(format!(
+                "central/local header name mismatch for entry {i}"
+            )));
+        }
+        if has_foreign_unicode_path(&local.extra, &local.name) {
+            return Err(foreign_path());
+        }
+    }
+    Ok(())
 }
 
 /// The manifest kept in `metadata.bundles[].manifest`: the whole manifest
@@ -962,6 +1201,378 @@ pub fn valid_file_name(file: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Hostile MCPB archives for the archive-entry regressions (#5468, #5469,
+/// #5470), shared by the inspection tests here and the upload-route tests.
+/// The `zip` writer refuses most of these names, so each archive is written
+/// with a same-length placeholder name and then patched byte-for-byte.
+/// Ungated by shard: both the `services-1` and `handlers-1` legs use it.
+#[cfg(test)]
+pub(crate) mod hostile_zips {
+    /// A valid manifest.
+    pub const MANIFEST: &[u8] = br#"{"name":"x","version":"1"}"#;
+
+    /// A ZIP of `entries` (`(name, body)`), written by the `zip` crate.
+    pub fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, body) in entries {
+                z.start_file(*name, options).unwrap();
+                std::io::Write::write_all(&mut z, body).unwrap();
+            }
+            z.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// Every header (`PK\x01\x02` central, `PK\x03\x04` local) whose name
+    /// is `name`, as `(offset, is_central)`.
+    fn headers(bytes: &[u8], name: &[u8]) -> Vec<(usize, bool)> {
+        let mut out = Vec::new();
+        for at in 0..bytes.len().saturating_sub(4) {
+            let (central, fixed) = match &bytes[at..at + 4] {
+                b"PK\x01\x02" => (true, 46),
+                b"PK\x03\x04" => (false, 30),
+                _ => continue,
+            };
+            let len_at = at + if central { 28 } else { 26 };
+            let Some(len) = bytes.get(len_at..len_at + 2) else {
+                continue;
+            };
+            let len = u16::from_le_bytes([len[0], len[1]]) as usize;
+            if bytes.get(at + fixed..at + fixed + len) == Some(name) {
+                out.push((at, central));
+            }
+        }
+        out
+    }
+
+    /// Rename entry `from` to the same-length `to` in its central header
+    /// (`central`) and/or local header (`local`).
+    pub fn rename(
+        mut bytes: Vec<u8>,
+        from: &str,
+        to: &[u8],
+        central: bool,
+        local: bool,
+    ) -> Vec<u8> {
+        assert_eq!(from.len(), to.len());
+        let found = headers(&bytes, from.as_bytes());
+        assert_eq!(found.len(), 2, "{from}: one local and one central header");
+        for (at, is_central) in found {
+            if (is_central && central) || (!is_central && local) {
+                let start = at + if is_central { 46 } else { 30 };
+                bytes[start..start + to.len()].copy_from_slice(to);
+            }
+        }
+        bytes
+    }
+
+    /// Give entry `name` a made-by `host` and `external` attributes in its
+    /// central header.
+    pub fn set_attributes(mut bytes: Vec<u8>, name: &str, host: u8, external: u32) -> Vec<u8> {
+        for (at, central) in headers(&bytes, name.as_bytes()) {
+            if central {
+                bytes[at + 5] = host;
+                bytes[at + 38..at + 42].copy_from_slice(&external.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// Give entry `name` the Unix `mode` (Unix-made, central attributes).
+    pub fn set_mode(bytes: Vec<u8>, name: &str, mode: u32) -> Vec<u8> {
+        set_attributes(bytes, name, 3, mode << 16)
+    }
+
+    /// Break the local header signature of entry `name`.
+    pub fn break_local_header(mut bytes: Vec<u8>, name: &str) -> Vec<u8> {
+        for (at, central) in headers(&bytes, name.as_bytes()) {
+            if !central {
+                bytes[at + 3] = 0x09;
+            }
+        }
+        bytes
+    }
+
+    /// CRC-32 (IEEE), for Unicode Path fields the reader honours.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for b in bytes {
+            crc ^= u32::from(*b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+
+    /// A bundle whose second entry `name` carries an Info-ZIP Unicode Path
+    /// field naming `path` (with the CRC of `name` when `crc_ok`), in both
+    /// headers or only the central one; `local_only` then hides the central
+    /// copy by renaming its field id.
+    pub fn with_unicode_path(
+        name: &str,
+        path: &str,
+        crc_ok: bool,
+        central_only: bool,
+        local_only: bool,
+    ) -> Vec<u8> {
+        let crc = if crc_ok { crc32(name.as_bytes()) } else { 0 };
+        let mut field = vec![1u8];
+        field.extend_from_slice(&crc.to_le_bytes());
+        field.extend_from_slice(path.as_bytes());
+        let mut options = zip::write::FullFileOptions::default();
+        options
+            .add_extra_field(0x7075, &field, central_only)
+            .unwrap();
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut z = zip::ZipWriter::new(&mut buf);
+            z.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut z, MANIFEST).unwrap();
+            z.start_file(name, options).unwrap();
+            std::io::Write::write_all(&mut z, b"x").unwrap();
+            z.finish().unwrap();
+        }
+        let mut bytes = buf.into_inner();
+        if local_only {
+            for (at, central) in headers(&bytes, name.as_bytes()) {
+                if central {
+                    let extra = at + 46 + name.len();
+                    assert_eq!(&bytes[extra..extra + 2], &[0x75, 0x70]);
+                    bytes[extra] = 0x76;
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Set the UTF-8 (language encoding) flag of entry `name` in both headers.
+    pub fn set_utf8_flag(mut bytes: Vec<u8>, name: &[u8]) -> Vec<u8> {
+        for (at, central) in headers(&bytes, name) {
+            let flags = at + if central { 8 } else { 6 };
+            bytes[flags + 1] |= 0x08; // bit 11
+        }
+        bytes
+    }
+
+    /// `(case, archive, detail the refusal must contain)`; every archive is
+    /// otherwise a valid bundle with a root `manifest.json`.
+    pub fn cases() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+        let with = |name: &'static str| zip(&[("manifest.json", MANIFEST), (name, b"x")]);
+        let renamed = |from: &'static str, to: &[u8]| rename(with(from), from, to, true, true);
+        vec![
+            // #5468: duplicate manifests, duplicate names, duplicate keys.
+            (
+                "duplicate-manifest",
+                rename(
+                    zip(&[
+                        ("manifest.json", MANIFEST),
+                        ("manifesX.json", br#"{"name":"y","version":"2"}"#),
+                    ]),
+                    "manifesX.json",
+                    b"manifest.json",
+                    true,
+                    true,
+                ),
+                "duplicate entry manifest.json",
+            ),
+            (
+                "case-variant-manifest",
+                with("MANIFEST.JSON"),
+                "duplicate entry manifest.json",
+            ),
+            (
+                "dot-segment-manifest",
+                with("./manifest.json"),
+                "duplicate entry manifest.json",
+            ),
+            (
+                "duplicate-file",
+                rename(
+                    zip(&[
+                        ("manifest.json", MANIFEST),
+                        ("a.txt", b"1"),
+                        ("b.txt", b"2"),
+                    ]),
+                    "b.txt",
+                    b"a.txt",
+                    true,
+                    true,
+                ),
+                "duplicate entry a.txt",
+            ),
+            (
+                "duplicate-json-key",
+                zip(&[("manifest.json", br#"{"name":"x","version":"1","name":"y"}"#)]),
+                "duplicate key `name`",
+            ),
+            (
+                "duplicate-nested-json-key",
+                zip(&[(
+                    "manifest.json",
+                    br#"{"name":"x","version":"1","server":{"a":1,"a":2}}"#,
+                )]),
+                "duplicate key `a`",
+            ),
+            (
+                "duplicate-json-key-escaped-in-detail",
+                zip(&[(
+                    "manifest.json",
+                    br#"{"name":"x","version":"1","a\u001b[31m\n":1,"a\u001b[31m\n":2}"#,
+                )]),
+                r"duplicate key `a\u{1b}[31m\n`",
+            ),
+            // #5469: traversal, absolute, drive, backslash, links, devices.
+            (
+                "parent-traversal",
+                renamed("AAAA", b"../x"),
+                "unsafe entry name: ../x",
+            ),
+            (
+                "nested-traversal",
+                renamed("AAAAAAA", b"a/../.."),
+                "unsafe entry name: a/../..",
+            ),
+            (
+                "absolute",
+                renamed("AAAA", b"/etc"),
+                "unsafe entry name: /etc",
+            ),
+            ("drive", renamed("AAAA", b"C:/x"), "unsafe entry name: C:/x"),
+            (
+                "backslash",
+                renamed("AAA", b"a\\b"),
+                r"unsafe entry name: a\\b",
+            ),
+            (
+                "backslash-root",
+                renamed("AAA", b"\\ab"),
+                r"unsafe entry name: \\ab",
+            ),
+            (
+                "symlink",
+                set_mode(with("link"), "link", 0o120777),
+                "symlink entry: link",
+            ),
+            (
+                "fifo",
+                set_mode(with("fifo"), "fifo", 0o010644),
+                "special file entry: fifo",
+            ),
+            (
+                "char-device",
+                set_mode(with("tty0"), "tty0", 0o020644),
+                "special file entry: tty0",
+            ),
+            (
+                "symlink-fat-made",
+                set_attributes(with("link"), "link", 0, (0o120777 << 16) | 0x20),
+                "symlink entry: link",
+            ),
+            (
+                "socket",
+                set_mode(with("sock"), "sock", 0o140644),
+                "special file entry: sock",
+            ),
+            (
+                "ntfs-alternate-stream",
+                with("manifest.json::$DATA"),
+                "unsafe entry name: manifest.json::$DATA",
+            ),
+            (
+                "colon-inside",
+                with("server/C:evil"),
+                "unsafe entry name: server/C:evil",
+            ),
+            (
+                "control-char",
+                renamed("AAA", b"a\x07b"),
+                r"unsafe entry name: a\u{7}b",
+            ),
+            (
+                "long-s-manifest",
+                with("manife\u{17f}t.json"),
+                "duplicate entry manifest.json",
+            ),
+            (
+                "nfc-duplicate",
+                zip(&[
+                    ("manifest.json", MANIFEST),
+                    ("caf\u{e9}.txt", b"1"),
+                    ("cafe\u{301}.txt", b"2"),
+                ]),
+                "duplicate entry cafe",
+            ),
+            // #5470: malformed names and central/local disagreement.
+            (
+                "unicode-path-override",
+                with_unicode_path("plain.txt", "other.txt", true, false, false),
+                "entry 1 has a Unicode path extra field naming another path",
+            ),
+            (
+                "unicode-path-bad-crc",
+                with_unicode_path("plain.txt", "other.txt", false, true, false),
+                "entry 1 has a Unicode path extra field naming another path",
+            ),
+            (
+                "unicode-path-local-only",
+                with_unicode_path("aaaaaaaaaaaaa", "manifest.json", true, false, true),
+                "entry 1 has a Unicode path extra field naming another path",
+            ),
+            (
+                "no-local-header",
+                break_local_header(with("plain"), "plain"),
+                "entry 1 has no local header",
+            ),
+            (
+                "non-utf8-name",
+                renamed("AAA", b"a\xffb"),
+                "entry 1 name is not UTF-8",
+            ),
+            (
+                "non-utf8-name-flagged-utf8",
+                set_utf8_flag(renamed("AAA", b"a\xffb"), b"a\xffb"),
+                "entry 1 name is not UTF-8",
+            ),
+            (
+                "central-local-mismatch",
+                rename(with("PLAIN"), "PLAIN", b"OTHER", true, false),
+                "central/local header name mismatch for entry 1",
+            ),
+            (
+                "local-central-mismatch",
+                rename(with("PLAIN"), "PLAIN", b"OTHER", false, true),
+                "central/local header name mismatch for entry 1",
+            ),
+            (
+                "manifest-local-name-differs",
+                rename(
+                    zip(&[("manifest.json", MANIFEST)]),
+                    "manifest.json",
+                    b"evil00000.exe",
+                    false,
+                    true,
+                ),
+                "central/local header name mismatch for entry 0",
+            ),
+        ]
+    }
+
+    /// A benign bundle with directories and nested files, for the controls.
+    pub fn benign() -> Vec<u8> {
+        zip(&[
+            ("manifest.json", MANIFEST),
+            ("server/index.js", b"console.log(1)"),
+            ("server/lib/a..b.js", b"1"),
+            ("README.md", b"hi"),
+        ])
+    }
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {
@@ -1222,6 +1833,38 @@ mod tests {
         assert!(file_err.0.contains("too many entries"), "{file_err}");
 
         assert!(inspect(UNSIGNED).is_ok());
+    }
+
+    /// #5468, #5469, #5470: every hostile archive is refused, in memory and
+    /// from a staged file, with a detail naming its defect; the benign
+    /// control and the fixtures still inspect.
+    #[test]
+    fn hostile_archive_entries_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (case, bytes, detail) in super::hostile_zips::cases() {
+            let err = inspect_with(&bytes, &[]).expect_err(case);
+            assert!(err.0.contains(detail), "{case}: {err}");
+            let path = dir.path().join(format!("{case}.mcpb"));
+            std::fs::write(&path, &bytes).unwrap();
+            let file_err = inspect_file_with(&path, "x", &[]).expect_err(case);
+            assert_eq!(file_err, err, "{case}: both paths refuse alike");
+        }
+        let benign = inspect_with(&super::hostile_zips::benign(), &[]).unwrap();
+        assert_eq!(benign.manifest["name"], "x");
+        for fixture in [UNSIGNED, SIGNED, LEGACY] {
+            assert!(inspect_with(fixture, &[]).is_ok());
+        }
+        assert!(check_entry_type("f", None, 0).is_ok());
+        assert!(check_entry_type("d/", Some(0o040755), 0o040755 << 16).is_ok());
+        assert!(check_entry_type("f", Some(0o100644), 0x20).is_ok());
+        let identical =
+            super::hostile_zips::with_unicode_path("a.txt", "a.txt", true, false, false);
+        assert!(
+            inspect_with(&identical, &[]).is_ok(),
+            "an identical Unicode path is fine"
+        );
+        assert!(check_entry_name("").is_err());
+        assert!(check_entry_name("a\u{7}b").is_err());
     }
 
     #[test]
