@@ -1840,6 +1840,48 @@ mod db_tests {
         env.fx.teardown().await;
     }
 
+    /// #5543: through the endpoint, a CI or gateway report whose
+    /// observation or cache metadata is out of bounds answers `400
+    /// mcp_invalid_result_metadata` with the offending `field`, like a worker
+    /// result (#5466), and stores no snapshot.
+    #[tokio::test]
+    async fn invalid_report_metadata_stores_nothing() {
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.publish("1.0.0").await;
+        let version = env.artifact("1.0.0").await;
+        let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+        let far = (Utc::now() + skew + chrono::Duration::seconds(60)).to_rfc3339();
+        let tools = json!([{"name": "tainted"}]);
+        for (source, report, field) in [
+            (
+                Source::CiReported,
+                json!({"source": "ci_reported", "tools": tools, "ttlMs": jobs::MAX_TTL_MS + 1}),
+                "ttlMs",
+            ),
+            (
+                Source::GatewayReported,
+                json!({"source": "gateway_reported", "tools": tools, "observedAt": far}),
+                "observedAt",
+            ),
+            (
+                Source::CiReported,
+                json!({"source": "ci_reported", "tools": tools, "cacheScope": "shared"}),
+                "cacheScope",
+            ),
+        ] {
+            let (s, b) = call(env.admin(), "POST", &env.url(""), Some(report.clone())).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{report}: {b}");
+            assert_eq!(b["error"], "mcp_invalid_result_metadata", "{b}");
+            assert_eq!(b["field"], field, "{b}");
+            assert_eq!(env.snapshots(version, source).await, 0, "{report}");
+        }
+        assert_eq!(env.current().await["source"], "publisher_declared");
+        env.cleanup().await;
+    }
+
     /// Review finding 13: a remote probe of a held version is never handed
     /// to the worker (the same servability gate as a sandbox run).
     #[tokio::test]
