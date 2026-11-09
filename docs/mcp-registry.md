@@ -2484,11 +2484,16 @@ document). Body at most 1 MiB, nesting at most 64 levels.
 ```
 
 `source` is required and must be `ci_reported` or `gateway_reported`; every
-other member is optional (`observedAt` defaults to now and may not be more
-than 5 minutes in the future; `authState` defaults to `unknown`;
-`cacheScope` is `public` or `private`; `ttlMs` a non-negative integer). Item
-rules are the declaration rules above. The display label is set by AK, never
-by the caller: `reported by CI (<username>[, <generatedBy>])` /
+other member is optional (`observedAt` defaults to now, `authState` to
+`unknown`). `observedAt`, `cacheScope` and `ttlMs` follow the worker result's
+metadata rules (#5543), except that a report has no lower bound on
+`observedAt`, since it may describe an older build: an `observedAt` at most 5
+minutes (the clock-skew window) ahead of the registry's clock is accepted and
+stored as of its arrival; `cacheScope` is `public` or `private`; `ttlMs` an
+integer from `0` to `2592000000` (30 days). A refused report answers `400
+mcp_invalid_result_metadata` with the offending `field`. Item rules are the
+declaration rules above. The display label is set by AK, never by the caller:
+`reported by CI (<username>[, <generatedBy>])` /
 `reported by a gateway (...)`.
 
 `201`:
@@ -2502,8 +2507,10 @@ by the caller: `reported by CI (<username>[, <generatedBy>])` /
 same source. `created` is `false` when the report repeats the newest one of
 the same source and `generatedBy` (same content, outcome and auth state):
 nothing new is stored, the existing snapshot's `lastSeenAt` is bumped and it
-is returned, without audit or drift. Errors: `400 mcp_invalid_capabilities` (`detail` names the
-field), `401 mcp_unauthorized`, `403 mcp_forbidden`, `404` (unknown or
+is returned, without audit or drift. Errors: `400
+mcp_invalid_result_metadata` for refused metadata (above), `400
+mcp_invalid_capabilities` for a malformed body (`detail` names the field),
+`401 mcp_unauthorized`, `403 mcp_forbidden`, `404` (unknown or
 invisible version), `413 mcp_too_large`. Audited `MCP_CAPABILITIES_INGESTED`.
 
 ### `GET .../servers/{serverName}/versions/{version}/capabilities/diff`

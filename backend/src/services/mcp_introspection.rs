@@ -338,31 +338,34 @@ pub fn parse_result(r: &WorkerResult) -> Result<ParsedResult, caps::CapError> {
 /// stop a remote from being re-probed.
 pub const MAX_TTL_MS: i64 = 30 * 24 * 3600 * 1000;
 
-/// Validate a worker result's observation and cache metadata (#5466), from
-/// the result alone and the registry clock `now`, before anything about the
-/// job is read under lock or changed: an `observedAt` more than
+/// Validate observation and cache metadata (#5466, #5543), from the values
+/// alone and the registry clock `now`, before anything about the job is read
+/// under lock or changed: an `observedAt` more than
 /// [`caps::OBSERVED_AT_SKEW_SECS`] ahead of `now`, a `cacheScope` outside
 /// [`caps::CACHE_SCOPES`], or a `ttlMs` that is negative or above
-/// [`MAX_TTL_MS`] is refused. Checked for every outcome, a retry included,
-/// so a worker cannot slip invalid metadata past it by its outcome. The
-/// lower bound of `observedAt` (the claim) needs the locked claim and is
-/// checked in the transaction ([`validated_observed_at`]).
-pub fn validate_metadata(r: &WorkerResult, now: DateTime<Utc>) -> Result<(), caps::CapError> {
-    if r.observed_at
-        .is_some_and(|t| t > now + chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS))
+/// [`MAX_TTL_MS`] is refused. Shared by worker results and CI/gateway
+/// reports, so both answer the same bounds, code and `field`. A worker
+/// result is checked for every outcome, a retry included, so it cannot slip
+/// invalid metadata past by its outcome. The lower bound of `observedAt`
+/// (the claim, or a report's arrival) needs more context and is checked by
+/// the caller ([`validated_observed_at`]).
+pub fn validate_metadata(
+    observed_at: Option<DateTime<Utc>>,
+    cache_scope: Option<&str>,
+    ttl_ms: Option<i64>,
+    now: DateTime<Utc>,
+) -> Result<(), caps::CapError> {
+    if observed_at.is_some_and(|t| t > now + chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS))
     {
         return Err(caps::CapError::new("observedAt", "is in the future"));
     }
-    if r.cache_scope
-        .as_deref()
-        .is_some_and(|c| !caps::CACHE_SCOPES.contains(&c))
-    {
+    if cache_scope.is_some_and(|c| !caps::CACHE_SCOPES.contains(&c)) {
         return Err(caps::CapError::new(
             "cacheScope",
             "must be `public` or `private`",
         ));
     }
-    if r.ttl_ms.is_some_and(|t| !(0..=MAX_TTL_MS).contains(&t)) {
+    if ttl_ms.is_some_and(|t| !(0..=MAX_TTL_MS).contains(&t)) {
         return Err(caps::CapError::new(
             "ttlMs",
             format!("must be an integer from 0 to {MAX_TTL_MS}"),
@@ -988,7 +991,12 @@ pub async fn complete(
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
-    if let Err(e) = validate_metadata(result, Utc::now()) {
+    if let Err(e) = validate_metadata(
+        result.observed_at,
+        result.cache_scope.as_deref(),
+        result.ttl_ms,
+        Utc::now(),
+    ) {
         return Ok(Completed::Invalid(e));
     }
     let mut tx = db.begin().await.map_err(db_err)?;
@@ -1474,7 +1482,7 @@ mod tests {
                 ..Default::default()
             };
             f(&mut r);
-            validate_metadata(&r, now)
+            validate_metadata(r.observed_at, r.cache_scope.as_deref(), r.ttl_ms, now)
         };
         assert_eq!(r(|_| {}), Ok(()));
         let ok: [Edit; 7] = [

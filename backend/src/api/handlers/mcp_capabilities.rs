@@ -352,36 +352,27 @@ pub fn parse_report(body: &[u8], now: DateTime<Utc>) -> Result<Report, Response>
     };
     let observed_at = match opt_string(o, "observedAt", 64)? {
         None => now,
-        Some(s) => {
-            let t = DateTime::parse_from_rfc3339(&s)
-                .map_err(|_| bad_request("observedAt", "must be an RFC 3339 timestamp"))?
-                .with_timezone(&Utc);
-            if t > now + chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS) {
-                return Err(bad_request("observedAt", "is in the future"));
-            }
-            // Skew is tolerated, never ranked above arrival (#5464).
-            t.min(now)
-        }
+        Some(s) => DateTime::parse_from_rfc3339(&s)
+            .map_err(|_| bad_request("observedAt", "must be an RFC 3339 timestamp"))?
+            .with_timezone(&Utc),
     };
     let auth_state = match opt_string(o, "authState", 32)? {
         None => AuthState::Unknown,
         Some(s) => AuthState::parse(&s).ok_or_else(|| bad_request("authState", "unknown value"))?,
     };
     let cache_scope = opt_string(o, "cacheScope", 16)?;
-    if cache_scope
-        .as_deref()
-        .is_some_and(|c| !caps::CACHE_SCOPES.contains(&c))
-    {
-        return Err(bad_request("cacheScope", "must be `public` or `private`"));
-    }
     let ttl_ms = match o.get("ttlMs") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
             v.as_i64()
-                .filter(|n| *n >= 0)
-                .ok_or_else(|| bad_request("ttlMs", "must be a non-negative integer"))?,
+                .ok_or_else(|| bad_request("ttlMs", "must be an integer"))?,
         ),
     };
+    // A report answers the worker result's metadata bounds and code (#5543).
+    jobs::validate_metadata(Some(observed_at), cache_scope.as_deref(), ttl_ms, now)
+        .map_err(|e| invalid_metadata(&e))?;
+    // Skew is tolerated, never ranked above arrival (#5464).
+    let observed_at = observed_at.min(now);
     let set = CapabilitySet::from_doc(&doc).map_err(|e| bad_request(&e.path, &e.message))?;
     Ok(Report {
         source,
@@ -947,7 +938,13 @@ async fn complete_job(
     // Observation and cache metadata is refused before any gate is evaluated
     // or anything locked (#5466); `jobs::complete` checks it again for its
     // other callers.
-    jobs::validate_metadata(&result, Utc::now()).map_err(|e| invalid_metadata(&e))?;
+    jobs::validate_metadata(
+        result.observed_at,
+        result.cache_scope.as_deref(),
+        result.ttl_ms,
+        Utc::now(),
+    )
+    .map_err(|e| invalid_metadata(&e))?;
     // The full serve gate a claim passes, evaluated again now (#5463); the
     // version's and its backing packages' holds are re-read under lock in
     // the transaction as well.
@@ -1028,10 +1025,10 @@ async fn version_servable(
     Ok(surface::artifact_servability(state, &repo, artifact_id, base).await)
 }
 
-/// `400 mcp_invalid_result_metadata`: a worker result's `observedAt`,
-/// `cacheScope` or `ttlMs` was refused (#5464, #5466). Nothing was stored and
-/// the claim is unchanged: the worker may resubmit a corrected result while
-/// its lease lasts.
+/// `400 mcp_invalid_result_metadata`: a worker result's or a CI/gateway
+/// report's `observedAt`, `cacheScope` or `ttlMs` was refused (#5464, #5466,
+/// #5543). A refused result stores nothing and leaves the claim unchanged: the
+/// worker may resubmit a corrected result while its lease lasts.
 fn invalid_metadata(e: &caps::CapError) -> Response {
     problem(
         400,
@@ -1108,6 +1105,75 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&b)
             );
+        }
+    }
+
+    /// #5543: a report's observation and cache metadata is validated like a
+    /// worker result's (#5466): the same bounds, the same
+    /// `mcp_invalid_result_metadata` code, and the offending `field`. A report
+    /// that is merely malformed still answers `mcp_invalid_capabilities`.
+    #[tokio::test]
+    async fn report_metadata_answers_the_result_code_and_bounds() {
+        let now = Utc::now();
+        let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+        // streaming-invariant: test-only read of a small, bounded refusal body (#1608)
+        #[allow(clippy::disallowed_methods)]
+        async fn refusal(body: String, now: DateTime<Utc>) -> (StatusCode, Value) {
+            let resp = parse_report(body.as_bytes(), now).unwrap_err();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let report = |extra: Value| {
+            let mut body = json!({"source": "gateway_reported"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body.to_string()
+        };
+
+        let far = (now + skew + chrono::Duration::seconds(1)).to_rfc3339();
+        for (extra, field) in [
+            (json!({"observedAt": far}), "observedAt"),
+            (json!({"cacheScope": "shared"}), "cacheScope"),
+            (json!({"cacheScope": "PUBLIC"}), "cacheScope"),
+            (json!({"ttlMs": -1}), "ttlMs"),
+            (json!({"ttlMs": jobs::MAX_TTL_MS + 1}), "ttlMs"),
+            (json!({"ttlMs": i64::MAX}), "ttlMs"),
+        ] {
+            let (status, b) = refusal(report(extra), now).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["error"], "mcp_invalid_result_metadata", "{b}");
+            assert_eq!(b["field"], field, "{b}");
+        }
+
+        // The boundaries are accepted, and an `observedAt` inside the skew
+        // window is stored as of its arrival.
+        for extra in [
+            json!({"observedAt": (now - chrono::Duration::days(365)).to_rfc3339()}),
+            json!({"observedAt": (now + skew).to_rfc3339()}),
+            json!({"cacheScope": "public", "ttlMs": 0}),
+            json!({"cacheScope": "private", "ttlMs": jobs::MAX_TTL_MS}),
+        ] {
+            assert!(parse_report(report(extra).as_bytes(), now).is_ok());
+        }
+        let ahead = parse_report(
+            report(json!({"observedAt": (now + skew).to_rfc3339()})).as_bytes(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(ahead.observed_at, now);
+
+        for body in [
+            r#"{"source":"ci_reported","observedAt":"yesterday"}"#,
+            r#"{"source":"ci_reported","ttlMs":"5"}"#,
+            r#"{"source":"ci_reported","cacheScope":7}"#,
+        ] {
+            let (status, b) = refusal(body.to_string(), now).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+            assert_eq!(b["error"], "mcp_invalid_capabilities", "{b}");
         }
     }
 
@@ -1772,6 +1838,48 @@ mod db_tests {
                 .await;
         }
         env.fx.teardown().await;
+    }
+
+    /// #5543: through the endpoint, a CI or gateway report whose
+    /// observation or cache metadata is out of bounds answers `400
+    /// mcp_invalid_result_metadata` with the offending `field`, like a worker
+    /// result (#5466), and stores no snapshot.
+    #[tokio::test]
+    async fn invalid_report_metadata_stores_nothing() {
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.publish("1.0.0").await;
+        let version = env.artifact("1.0.0").await;
+        let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+        let far = (Utc::now() + skew + chrono::Duration::seconds(60)).to_rfc3339();
+        let tools = json!([{"name": "tainted"}]);
+        for (source, report, field) in [
+            (
+                Source::CiReported,
+                json!({"source": "ci_reported", "tools": tools, "ttlMs": jobs::MAX_TTL_MS + 1}),
+                "ttlMs",
+            ),
+            (
+                Source::GatewayReported,
+                json!({"source": "gateway_reported", "tools": tools, "observedAt": far}),
+                "observedAt",
+            ),
+            (
+                Source::CiReported,
+                json!({"source": "ci_reported", "tools": tools, "cacheScope": "shared"}),
+                "cacheScope",
+            ),
+        ] {
+            let (s, b) = call(env.admin(), "POST", &env.url(""), Some(report.clone())).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{report}: {b}");
+            assert_eq!(b["error"], "mcp_invalid_result_metadata", "{b}");
+            assert_eq!(b["field"], field, "{b}");
+            assert_eq!(env.snapshots(version, source).await, 0, "{report}");
+        }
+        assert_eq!(env.current().await["source"], "publisher_declared");
+        env.cleanup().await;
     }
 
     /// Review finding 13: a remote probe of a held version is never handed
