@@ -519,18 +519,26 @@ async fn initialize(
     ))
 }
 
-/// Fold a result's cache hints into the report: the smallest `ttlMs`, and
-/// `caller_specific` once any page is `private`.
+/// Fold a result's cache hints into the report: the smallest `ttlMs`
+/// (capped at the backend's [`MAX_TTL_MS`]), and `caller_specific` once any
+/// page is not exactly `public`. The remote's hints are normalised to what
+/// the backend accepts (#5466): an unknown scope (`shared`, `Public`) is
+/// treated as `private`, the safe reading, so the result is stored instead
+/// of being refused on every attempt.
+///
+/// [`MAX_TTL_MS`]: artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS
 fn note_cache(report: &mut ProbeReport, r: &Value) {
+    use artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS;
     if let Some(t) = r.get("ttlMs").and_then(|t| t.as_i64()).filter(|t| *t >= 0) {
+        let t = t.min(MAX_TTL_MS);
         report.ttl_ms = Some(report.ttl_ms.map_or(t, |cur| cur.min(t)));
     }
     if let Some(scope) = r.get("cacheScope").and_then(|s| s.as_str()) {
-        if scope == "private" {
+        if scope != "public" {
             report.auth_state = "caller_specific".into();
             report.cache_scope = Some("private".into());
         } else if report.cache_scope.is_none() {
-            report.cache_scope = Some(scope.to_string());
+            report.cache_scope = Some("public".into());
         }
     }
 }
@@ -925,5 +933,61 @@ pub(crate) mod tests {
         assert_eq!(j["outcome"], "timeout");
         assert!(j["tools"].is_null());
         assert_eq!(j["error"], "slow");
+    }
+
+    /// #5466: a remote's cache hints the backend would refuse are
+    /// normalised: an unknown scope is `private` (`caller_specific`), and a
+    /// huge `ttlMs` is capped at the backend's limit.
+    #[test]
+    fn remote_cache_hints_are_normalised_for_the_backend() {
+        use artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS;
+        for scope in ["shared", "Public", "PRIVATE", ""] {
+            let mut r = ProbeReport {
+                outcome: "ok".into(),
+                auth_state: "none".into(),
+                ..Default::default()
+            };
+            note_cache(
+                &mut r,
+                &json!({"cacheScope": scope, "ttlMs": 10_000_000_000_000_i64}),
+            );
+            let body = r.to_result_json();
+            assert_eq!(body["cacheScope"], "private", "{scope}");
+            assert_eq!(body["authState"], "caller_specific", "{scope}");
+            assert_eq!(body["ttlMs"], MAX_TTL_MS, "{scope}");
+        }
+        let mut r = ProbeReport {
+            outcome: "ok".into(),
+            auth_state: "none".into(),
+            ..Default::default()
+        };
+        note_cache(&mut r, &json!({"cacheScope": "public", "ttlMs": 0}));
+        let body = r.to_result_json();
+        assert_eq!(
+            (&body["cacheScope"], &body["authState"], &body["ttlMs"]),
+            (&json!("public"), &json!("none"), &json!(0))
+        );
+    }
+
+    /// #5466, through a probe: a remote answering `cacheScope: "shared"` and
+    /// `ttlMs: 1e13` yields a result the backend accepts.
+    #[tokio::test]
+    async fn a_probe_normalises_the_remotes_cache_hints() {
+        use artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS;
+        // The discovery result advertises the same oversized hint, so the
+        // smallest `ttlMs` of the probe is the oversized one.
+        let mut discover = discover_ok(json!({"tools": {}}));
+        discover["ttlMs"] = json!(10_000_000_000_000_i64);
+        let mut m = Mock::default().ok("server/discover", discover).ok(
+            "tools/list",
+            json!({"tools": [{"name": "a"}], "cacheScope": "shared",
+                       "ttlMs": 10_000_000_000_000_i64}),
+        );
+        let r = probe(&mut m, 1000).await;
+        assert_eq!(r.outcome, "ok", "{:?}", r.error);
+        let body = r.to_result_json();
+        assert_eq!(body["cacheScope"], "private");
+        assert_eq!(body["authState"], "caller_specific");
+        assert_eq!(body["ttlMs"], MAX_TTL_MS);
     }
 }

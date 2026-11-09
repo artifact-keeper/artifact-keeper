@@ -59,6 +59,10 @@ pub const SNAPSHOT_PRUNE_BATCH: i64 = 1000;
 /// and still be accepted: the clock skew between the reporter and the
 /// backend.
 pub const OBSERVED_AT_SKEW_SECS: i64 = 300;
+/// The `cacheScope` values a report or an introspection result may carry
+/// (#5466): the MCP list pages' cache scope (`private`: the list may differ
+/// per caller).
+pub const CACHE_SCOPES: &[&str] = &["public", "private"];
 /// The freshness order of snapshots, freshest first (#5464): the latest time
 /// the content was validly seen (`last_seen_at`, else `observed_at`), then
 /// arrival, then id, so ties are deterministic. Every "newest" question (the
