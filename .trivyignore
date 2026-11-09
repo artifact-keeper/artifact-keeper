@@ -197,7 +197,7 @@
 #     of the 1.11.12 image's grype reported -41567 and -42306 (HIGH, no fix),
 #     and Grype reported GO-2026-4887 against the same module.
 #   * buildctl (buildkit-bin): no docker/docker in the build info.
-#   * the scanner-adapter's trivy (ghcr.io/artifact-keeper/trivy@sha256:e324a1cc,
+#   * the scanner-adapter's trivy (ghcr.io/artifact-keeper/trivy@sha256:47199755,
 #     upstream v0.76.0): no docker/docker in the build info either (it links
 #     moby/moby/client v0.6.0), so no image main ships still carries the module.
 # None of the bump's other findings came here, which is the rule working again:

@@ -202,7 +202,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # so its tags are moving targets by design. buildx selects the TARGETPLATFORM
 # variant from the multi-arch index automatically, so the arm64 build gets the
 # arm64 trivy and the amd64 build gets amd64 — both are published.
-# This digest is the manifest-list digest of tag 0.76.0-r3 (note: no leading
+# This digest is the manifest-list digest of tag 0.76.0-r4 (note: no leading
 # `v` on the published tag — the publish job renders it with
 # docker/metadata-action `type=semver,pattern={{version}}`).
 #
@@ -234,7 +234,24 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 # v0.76.0-r3, and this FROM repoints to that published manifest-list digest
 # (verified with `skopeo inspect --raw`). docker/scanner-adapter/VERSION moves
 # 1.6.0 -> 1.6.1 with it.
-FROM ghcr.io/artifact-keeper/trivy@sha256:e324a1cc4ad525ed0a39d623a277a12cd138fd8ee2a88f60f776ae5a40b5b0ce AS trivy
+#
+# 0.76.0-r3 -> 0.76.0-r4 (#5571): Docker Publish's gate reported HIGH
+# CVE-2026-78661 (GO-2026-6860, golang.org/x/net v0.60.0, fixed in v0.62.0,
+# denial of service in x/net/html) in the bundled trivy on main from
+# 2026-11-07, alongside the same finding in the backend image's grype and
+# buildctl (fixed by #5567). Upstream Trivy v0.76.2 pins x/net v0.62.0, but
+# the adapter must run the same Trivy release as its server sidecar, so the
+# server-side release is not moved for a client-only dependency fix:
+# artifact-keeper/trivy added an x/net override on top of the unchanged
+# v0.76.0 source (trivy#21, with the four minimum-version-selection
+# companions x/net v0.62.0 pulls in), tagged v0.76.0-r4, and this FROM
+# repoints to that published manifest-list digest (read back from the
+# registry's Docker-Content-Digest for the tag; the build's own CVE gate ran
+# on those exact bytes). Go stays 1.27.3; the binary still reports `Version:
+# 0.76.0`. docker/scanner-adapter/VERSION stays 1.7.0: that version is not
+# published yet (scripts/ci/check-version-pin-bump.sh), so the cut creates
+# it.
+FROM ghcr.io/artifact-keeper/trivy@sha256:47199755ccf75b3c6776b0e6bca8a95ed8ca83fe330c7458bec30e661ded5835 AS trivy
 
 # ---------- Stage 3: minimal runtime ----------
 # alpine 3.20 reached EOL; 3.24 is the current stable with active security
