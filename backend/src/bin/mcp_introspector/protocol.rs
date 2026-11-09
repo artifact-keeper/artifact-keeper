@@ -8,7 +8,11 @@
 //!   `tools/call`, `resources/read` or `prompts/get`;
 //! * every list is paginated with a page and item cap;
 //! * whatever the server returns is untrusted: items without a usable key
-//!   are dropped, duplicates are dropped, and nothing is interpreted.
+//!   are dropped, duplicates are dropped, and nothing is interpreted;
+//! * every response is correlated with the one outstanding request: a
+//!   response whose `id` is missing or differs (in type or value), a second
+//!   response to an answered request, or a batch (this client never sends
+//!   one) is a [`Violation`] that fails the probe with nothing accepted.
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -54,6 +58,40 @@ pub enum TransportError {
     Redirect,
     Closed,
     Io(String),
+    /// The server broke the protocol's response or session integrity.
+    Protocol(Violation),
+}
+
+/// A protocol-integrity failure (#5450, #5451). Not transient: the probe
+/// ends `refused` with `details.protocolViolation` set to [`Violation::code`],
+/// and nothing the server sent in that probe is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Violation {
+    /// A response whose `id` is absent, `null`, or not the outstanding
+    /// request's (`1` and `"1"` differ).
+    ResponseIdMismatch,
+    /// A second response to a request that was already answered.
+    DuplicateResponse,
+    /// A JSON-RPC batch, although this client never sends one.
+    UnexpectedBatch,
+    /// A response carried an `Mcp-Session-Id` other than the one
+    /// `initialize` established.
+    SessionIdChanged,
+    /// `initialize` assigned an `Mcp-Session-Id` that is not 1-256 visible
+    /// ASCII characters.
+    SessionIdInvalid,
+}
+
+impl Violation {
+    pub fn code(self) -> &'static str {
+        match self {
+            Violation::ResponseIdMismatch => "response_id_mismatch",
+            Violation::DuplicateResponse => "duplicate_response",
+            Violation::UnexpectedBatch => "unexpected_batch",
+            Violation::SessionIdChanged => "session_id_changed",
+            Violation::SessionIdInvalid => "session_id_invalid",
+        }
+    }
 }
 
 impl std::fmt::Display for TransportError {
@@ -64,6 +102,7 @@ impl std::fmt::Display for TransportError {
             TransportError::Redirect => write!(f, "redirect refused"),
             TransportError::Closed => write!(f, "server closed the connection"),
             TransportError::Io(e) => write!(f, "{e}"),
+            TransportError::Protocol(v) => write!(f, "protocol violation: {}", v.code()),
         }
     }
 }
@@ -222,7 +261,36 @@ pub fn accept_items(
 pub struct Client<'t> {
     transport: &'t mut dyn Transport,
     next_id: i64,
+    /// The ids of the requests already answered.
+    answered: Vec<Value>,
     pub max_items: usize,
+}
+
+/// Whether `m` is a JSON-RPC response (as opposed to a request or a
+/// notification).
+pub fn is_response(m: &Value) -> bool {
+    m.get("result").is_some() || m.get("error").is_some()
+}
+
+/// Whether `m` is a batch that carries a response: this client never sends
+/// a batch, so nothing can answer one. A batch of only notifications or
+/// server requests answers nothing and is not a violation.
+pub fn is_response_batch(m: &Value) -> bool {
+    m.as_array().is_some_and(|a| a.iter().any(is_response))
+}
+
+/// Check that `m`, delivered for the request `id`, is that request's
+/// response: one object (never a batch) whose `id` is exactly `id`. A
+/// response to an earlier, answered request is a duplicate.
+fn correlate(m: &Value, id: &Value, answered: &[Value]) -> Result<(), Violation> {
+    if is_response_batch(m) {
+        return Err(Violation::UnexpectedBatch);
+    }
+    match m.get("id") {
+        Some(got) if got == id => Ok(()),
+        Some(got) if answered.contains(got) => Err(Violation::DuplicateResponse),
+        _ => Err(Violation::ResponseIdMismatch),
+    }
 }
 
 impl<'t> Client<'t> {
@@ -230,6 +298,7 @@ impl<'t> Client<'t> {
         Self {
             transport,
             next_id: 1,
+            answered: Vec::new(),
             max_items,
         }
     }
@@ -249,6 +318,13 @@ impl<'t> Client<'t> {
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         match self.transport.send(method, version, msg).await? {
             Reply::Message(m) => {
+                if m.is_array() && !is_response_batch(&m) {
+                    // Notifications or requests only: no answer at all.
+                    return Err(TransportError::Io("malformed JSON-RPC response".into()));
+                }
+                let id = json!(id);
+                correlate(&m, &id, &self.answered).map_err(TransportError::Protocol)?;
+                self.answered.push(id);
                 if let Some(r) = m.get("result") {
                     Ok(Rpc::Result(r.clone()))
                 } else if let Some((code, data)) = rpc_error(&m) {
@@ -267,9 +343,27 @@ impl<'t> Client<'t> {
                     .and_then(rpc_error)
                     .is_some_and(|(c, _)| MODERN_ERRORS.contains(&c));
                 if modern && status != 401 && status != 403 && status != 429 {
+                    // The body is consumed as this request's JSON-RPC error
+                    // (its code and `data` steer the fallback), so it must
+                    // not name another request. `"id": null` (or none) is
+                    // what an error raised before the request was read
+                    // carries, and is tolerated.
+                    if let Some(got) = body
+                        .as_ref()
+                        .and_then(|b| b.get("id"))
+                        .filter(|g| !g.is_null())
+                    {
+                        correlate(&json!({ "id": got }), &json!(id), &self.answered)
+                            .map_err(TransportError::Protocol)?;
+                    }
                     let (code, data) = body.as_ref().and_then(rpc_error).unwrap_or((0, None));
                     return Ok(Rpc::Error { code, data });
                 }
+                // Otherwise only the HTTP status is used, and the body's id
+                // is not looked at: an HTTP-level error carries nothing the
+                // probe accepts. (The MCP Python SDK v1.x answers these with
+                // `"id": "server-error"`, e.g. a pre-initialize request's
+                // 400 "Missing session ID".)
                 Ok(Rpc::Http {
                     status,
                     modern,
@@ -315,6 +409,12 @@ fn transport_failure(e: &TransportError) -> ProbeReport {
         TransportError::TooLarge => ProbeReport::failed("refused", e.to_string()),
         TransportError::Closed => ProbeReport::failed("start_failed", e.to_string()),
         TransportError::Io(_) => ProbeReport::failed("error", e.to_string()),
+        TransportError::Protocol(v) => {
+            let mut r = ProbeReport::failed("refused", e.to_string());
+            r.details
+                .insert("protocolViolation".into(), json!(v.code()));
+            r
+        }
     }
 }
 
@@ -519,18 +619,26 @@ async fn initialize(
     ))
 }
 
-/// Fold a result's cache hints into the report: the smallest `ttlMs`, and
-/// `caller_specific` once any page is `private`.
+/// Fold a result's cache hints into the report: the smallest `ttlMs`
+/// (capped at the backend's [`MAX_TTL_MS`]), and `caller_specific` once any
+/// page is not exactly `public`. The remote's hints are normalised to what
+/// the backend accepts (#5466): an unknown scope (`shared`, `Public`) is
+/// treated as `private`, the safe reading, so the result is stored instead
+/// of being refused on every attempt.
+///
+/// [`MAX_TTL_MS`]: artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS
 fn note_cache(report: &mut ProbeReport, r: &Value) {
+    use artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS;
     if let Some(t) = r.get("ttlMs").and_then(|t| t.as_i64()).filter(|t| *t >= 0) {
+        let t = t.min(MAX_TTL_MS);
         report.ttl_ms = Some(report.ttl_ms.map_or(t, |cur| cur.min(t)));
     }
     if let Some(scope) = r.get("cacheScope").and_then(|s| s.as_str()) {
-        if scope == "private" {
+        if scope != "public" {
             report.auth_state = "caller_specific".into();
             report.cache_scope = Some("private".into());
         } else if report.cache_scope.is_none() {
-            report.cache_scope = Some(scope.to_string());
+            report.cache_scope = Some("public".into());
         }
     }
 }
@@ -617,6 +725,11 @@ pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    /// Stands for "the id of the request being answered" in a scripted
+    /// reply: [`Mock::ok`] and [`Mock::err`] answer with the right id, while
+    /// [`Mock::on`] sends exactly what it was given (a wrong id included).
+    const ECHO_ID: &str = "<echo request id>";
+
     /// A scripted transport: answers by method, records what was sent.
     #[derive(Default)]
     pub(crate) struct Mock {
@@ -633,14 +746,14 @@ pub(crate) mod tests {
             self.on(
                 method,
                 Ok(Reply::Message(
-                    json!({"jsonrpc": "2.0", "id": 1, "result": result}),
+                    json!({"jsonrpc": "2.0", "id": ECHO_ID, "result": result}),
                 )),
             )
         }
         pub(crate) fn err(self, method: &str, code: i64, data: Value) -> Self {
             self.on(
                 method,
-                Ok(Reply::Message(json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": "x", "data": data}}))),
+                Ok(Reply::Message(json!({"jsonrpc": "2.0", "id": ECHO_ID, "error": {"code": code, "message": "x", "data": data}}))),
             )
         }
         pub(crate) fn status(self, method: &str, status: u16, body: Option<Value>) -> Self {
@@ -663,14 +776,20 @@ pub(crate) mod tests {
             v: Option<&str>,
             msg: Value,
         ) -> Result<Reply, TransportError> {
+            let id = msg.get("id").cloned();
             self.sent
                 .push((method.to_string(), v.map(String::from), msg));
             if method.starts_with("notifications/") {
                 return Ok(Reply::Message(Value::Null));
             }
             match self.answers.pop_front() {
-                Some((m, r)) => {
+                Some((m, mut r)) => {
                     assert_eq!(m, method, "unexpected request order");
+                    if let Ok(Reply::Message(reply)) = &mut r {
+                        if reply.get("id") == Some(&json!(ECHO_ID)) {
+                            reply["id"] = id.unwrap_or(Value::Null);
+                        }
+                    }
                     r
                 }
                 None => Err(TransportError::Closed),
@@ -918,6 +1037,203 @@ pub(crate) mod tests {
         assert_eq!((out.len(), dropped), (1, 1));
     }
 
+    /// A reply to `method` carrying exactly `id` (`None`: no `id` member).
+    fn reply_with_id(id: Option<Value>, result: Value) -> Result<Reply, TransportError> {
+        let mut m = json!({"jsonrpc": "2.0", "result": result});
+        if let Some(id) = id {
+            m["id"] = id;
+        }
+        Ok(Reply::Message(m))
+    }
+
+    /// The probe failed closed on a protocol violation: `refused`, the code
+    /// in `details.protocolViolation`, and nothing the server said kept.
+    fn assert_violation(r: &ProbeReport, code: &str) {
+        assert_eq!(r.outcome, "refused", "{r:?}");
+        assert_eq!(
+            r.details.get("protocolViolation"),
+            Some(&json!(code)),
+            "{r:?}"
+        );
+        assert!(r.details.get("capabilities").is_none(), "{r:?}");
+        assert!(r.details.get("serverInfo").is_none(), "{r:?}");
+        assert!(r.tools.is_empty() && r.resources.is_empty() && r.prompts.is_empty());
+        assert_eq!(
+            (r.protocol_version.as_ref(), r.instructions.as_ref()),
+            (None, None)
+        );
+        let j = r.to_result_json();
+        assert!(j["tools"].is_null() && j["instructions"].is_null());
+    }
+
+    /// #5450: a discover answer naming another id (or the right number as a
+    /// string, or no id at all) is not the discover answer.
+    #[tokio::test]
+    async fn wrong_id_discovery_fails_closed() {
+        for id in [
+            Some(json!(7)),
+            Some(json!("1")),
+            Some(json!(1.0)),
+            Some(Value::Null),
+            None,
+        ] {
+            let mut m = Mock::default()
+                .on(
+                    "server/discover",
+                    reply_with_id(id.clone(), discover_ok(json!({"tools": {}}))),
+                )
+                .ok("tools/list", json!({"tools": [{"name": "t"}]}));
+            let r = probe(&mut m, 10).await;
+            assert_violation(&r, "response_id_mismatch");
+            assert_eq!(
+                methods(&m),
+                vec!["server/discover"],
+                "{id:?}: nothing after"
+            );
+        }
+        // The legacy path: an initialize answer for another id.
+        let mut m = Mock::default()
+            .err("server/discover", METHOD_NOT_FOUND, json!(null))
+            .on(
+                "initialize",
+                reply_with_id(
+                    Some(json!(9)),
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}),
+                ),
+            );
+        assert_violation(&probe(&mut m, 10).await, "response_id_mismatch");
+        assert_eq!(methods(&m), vec!["server/discover", "initialize"]);
+    }
+
+    /// #5450: a tools/list answer for another request, or a second answer to
+    /// the (answered) discover request, accepts no tool.
+    #[tokio::test]
+    async fn wrong_id_or_duplicate_tools_list_fails_closed() {
+        let mut m = Mock::default()
+            .ok("server/discover", discover_ok(json!({"tools": {}})))
+            .on(
+                "tools/list",
+                reply_with_id(Some(json!(42)), json!({"tools": [{"name": "evil"}]})),
+            );
+        assert_violation(&probe(&mut m, 10).await, "response_id_mismatch");
+        // discover was id 1: answering tools/list (id 2) with id 1 again.
+        let mut m = Mock::default()
+            .ok("server/discover", discover_ok(json!({"tools": {}})))
+            .on(
+                "tools/list",
+                reply_with_id(Some(json!(1)), json!({"tools": [{"name": "evil"}]})),
+            );
+        assert_violation(&probe(&mut m, 10).await, "duplicate_response");
+        // A later page of a paginated list, too.
+        let mut m = Mock::default()
+            .ok("server/discover", discover_ok(json!({"tools": {}})))
+            .ok(
+                "tools/list",
+                json!({"tools": [{"name": "a"}], "nextCursor": "c"}),
+            )
+            .on(
+                "tools/list",
+                reply_with_id(Some(json!("3")), json!({"tools": [{"name": "b"}]})),
+            );
+        assert_violation(&probe(&mut m, 10).await, "response_id_mismatch");
+    }
+
+    /// #5450: this client never sends a batch, so a batch is no answer; an
+    /// HTTP error body naming another request is refused too, while the
+    /// common `"id": null` of an HTTP-level error is tolerated.
+    #[tokio::test]
+    async fn batches_and_foreign_error_bodies_fail_closed() {
+        let mut m = Mock::default().on(
+            "server/discover",
+            Ok(Reply::Message(json!([
+                {"jsonrpc": "2.0", "id": 1, "result": discover_ok(json!({"tools": {}}))}
+            ]))),
+        );
+        assert_violation(&probe(&mut m, 10).await, "unexpected_batch");
+        let mut m = Mock::default().status(
+            "server/discover",
+            400,
+            Some(
+                json!({"jsonrpc": "2.0", "id": 5, "error": {"code": UNSUPPORTED_VERSION,
+                "data": {"supported": ["2025-06-18"]}}}),
+            ),
+        );
+        assert_violation(&probe(&mut m, 10).await, "response_id_mismatch");
+        let mut m = Mock::default()
+            .status(
+                "server/discover",
+                400,
+                Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": METHOD_NOT_FOUND}})),
+            )
+            .ok(
+                "initialize",
+                json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}),
+            )
+            .ok("tools/list", json!({"tools": [{"name": "t"}]}));
+        let r = probe(&mut m, 10).await;
+        assert_eq!(r.outcome, "ok", "{r:?}");
+        assert_eq!(r.tools.len(), 1);
+        // An HTTP-level error whose body is not consumed as a JSON-RPC error
+        // (only its status is used): its id is not looked at. The MCP Python
+        // SDK v1.x sends `"id": "server-error"` on a pre-initialize 400.
+        for status in [400, 401, 429] {
+            let mut m = Mock::default()
+                .status(
+                    "server/discover",
+                    status,
+                    Some(json!({"jsonrpc": "2.0", "id": "server-error",
+                        "error": {"code": -32600, "message": "Bad Request: Missing session ID"}})),
+                )
+                .ok(
+                    "initialize",
+                    json!({"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}),
+                )
+                .ok("tools/list", json!({"tools": [{"name": "t"}]}));
+            let r = probe(&mut m, 10).await;
+            assert!(
+                r.details.get("protocolViolation").is_none(),
+                "{status}: {r:?}"
+            );
+            if status == 400 {
+                assert_eq!((r.outcome.as_str(), r.tools.len()), ("ok", 1), "{r:?}");
+            }
+        }
+        // A batch of only notifications answers nothing: malformed, not a
+        // violation (and nothing accepted).
+        let mut m = Mock::default().on(
+            "server/discover",
+            Ok(Reply::Message(
+                json!([{"jsonrpc": "2.0", "method": "notifications/progress"}]),
+            )),
+        );
+        let r = probe(&mut m, 10).await;
+        assert_eq!(r.outcome, "error", "{r:?}");
+        assert!(r.details.get("protocolViolation").is_none());
+    }
+
+    /// The benign control: answers that echo each request's id (numbers, as
+    /// sent) are accepted, request ids are never reused.
+    #[tokio::test]
+    async fn matching_ids_are_accepted() {
+        let mut m = Mock::default()
+            .ok(
+                "server/discover",
+                discover_ok(json!({"tools": {}, "prompts": {}})),
+            )
+            .ok(
+                "tools/list",
+                json!({"tools": [{"name": "a"}], "nextCursor": "c"}),
+            )
+            .ok("tools/list", json!({"tools": [{"name": "b"}]}))
+            .ok("prompts/list", json!({"prompts": [{"name": "p"}]}));
+        let r = probe(&mut m, 10).await;
+        assert_eq!(r.outcome, "ok", "{r:?}");
+        assert_eq!((r.tools.len(), r.prompts.len()), (2, 1));
+        assert!(r.details.get("protocolViolation").is_none());
+        let ids: Vec<&Value> = m.sent.iter().map(|(_, _, msg)| &msg["id"]).collect();
+        assert_eq!(ids, vec![&json!(1), &json!(2), &json!(3), &json!(4)]);
+    }
+
     #[test]
     fn failed_report_json_has_no_items() {
         let r = ProbeReport::failed("timeout", "slow");
@@ -925,5 +1241,61 @@ pub(crate) mod tests {
         assert_eq!(j["outcome"], "timeout");
         assert!(j["tools"].is_null());
         assert_eq!(j["error"], "slow");
+    }
+
+    /// #5466: a remote's cache hints the backend would refuse are
+    /// normalised: an unknown scope is `private` (`caller_specific`), and a
+    /// huge `ttlMs` is capped at the backend's limit.
+    #[test]
+    fn remote_cache_hints_are_normalised_for_the_backend() {
+        use artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS;
+        for scope in ["shared", "Public", "PRIVATE", ""] {
+            let mut r = ProbeReport {
+                outcome: "ok".into(),
+                auth_state: "none".into(),
+                ..Default::default()
+            };
+            note_cache(
+                &mut r,
+                &json!({"cacheScope": scope, "ttlMs": 10_000_000_000_000_i64}),
+            );
+            let body = r.to_result_json();
+            assert_eq!(body["cacheScope"], "private", "{scope}");
+            assert_eq!(body["authState"], "caller_specific", "{scope}");
+            assert_eq!(body["ttlMs"], MAX_TTL_MS, "{scope}");
+        }
+        let mut r = ProbeReport {
+            outcome: "ok".into(),
+            auth_state: "none".into(),
+            ..Default::default()
+        };
+        note_cache(&mut r, &json!({"cacheScope": "public", "ttlMs": 0}));
+        let body = r.to_result_json();
+        assert_eq!(
+            (&body["cacheScope"], &body["authState"], &body["ttlMs"]),
+            (&json!("public"), &json!("none"), &json!(0))
+        );
+    }
+
+    /// #5466, through a probe: a remote answering `cacheScope: "shared"` and
+    /// `ttlMs: 1e13` yields a result the backend accepts.
+    #[tokio::test]
+    async fn a_probe_normalises_the_remotes_cache_hints() {
+        use artifact_keeper_backend::services::mcp_introspection::MAX_TTL_MS;
+        // The discovery result advertises the same oversized hint, so the
+        // smallest `ttlMs` of the probe is the oversized one.
+        let mut discover = discover_ok(json!({"tools": {}}));
+        discover["ttlMs"] = json!(10_000_000_000_000_i64);
+        let mut m = Mock::default().ok("server/discover", discover).ok(
+            "tools/list",
+            json!({"tools": [{"name": "a"}], "cacheScope": "shared",
+                       "ttlMs": 10_000_000_000_000_i64}),
+        );
+        let r = probe(&mut m, 1000).await;
+        assert_eq!(r.outcome, "ok", "{:?}", r.error);
+        let body = r.to_result_json();
+        assert_eq!(body["cacheScope"], "private");
+        assert_eq!(body["authState"], "caller_specific");
+        assert_eq!(body["ttlMs"], MAX_TTL_MS);
     }
 }

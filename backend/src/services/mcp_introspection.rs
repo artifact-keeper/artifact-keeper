@@ -333,6 +333,44 @@ pub fn parse_result(r: &WorkerResult) -> Result<ParsedResult, caps::CapError> {
     })
 }
 
+/// The largest `ttlMs` a worker result may carry (#5466): 30 days. The hint
+/// only spaces re-probes (`max(ttlMs, 6 h)`); a longer one would silently
+/// stop a remote from being re-probed.
+pub const MAX_TTL_MS: i64 = 30 * 24 * 3600 * 1000;
+
+/// Validate a worker result's observation and cache metadata (#5466), from
+/// the result alone and the registry clock `now`, before anything about the
+/// job is read under lock or changed: an `observedAt` more than
+/// [`caps::OBSERVED_AT_SKEW_SECS`] ahead of `now`, a `cacheScope` outside
+/// [`caps::CACHE_SCOPES`], or a `ttlMs` that is negative or above
+/// [`MAX_TTL_MS`] is refused. Checked for every outcome, a retry included,
+/// so a worker cannot slip invalid metadata past it by its outcome. The
+/// lower bound of `observedAt` (the claim) needs the locked claim and is
+/// checked in the transaction ([`validated_observed_at`]).
+pub fn validate_metadata(r: &WorkerResult, now: DateTime<Utc>) -> Result<(), caps::CapError> {
+    if r.observed_at
+        .is_some_and(|t| t > now + chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS))
+    {
+        return Err(caps::CapError::new("observedAt", "is in the future"));
+    }
+    if r.cache_scope
+        .as_deref()
+        .is_some_and(|c| !caps::CACHE_SCOPES.contains(&c))
+    {
+        return Err(caps::CapError::new(
+            "cacheScope",
+            "must be `public` or `private`",
+        ));
+    }
+    if r.ttl_ms.is_some_and(|t| !(0..=MAX_TTL_MS).contains(&t)) {
+        return Err(caps::CapError::new(
+            "ttlMs",
+            format!("must be an integer from 0 to {MAX_TTL_MS}"),
+        ));
+    }
+    Ok(())
+}
+
 /// The `observedAt` a result is stored with (#5464): the worker's, when it
 /// lies between the job's claim and now (each give or take
 /// [`caps::OBSERVED_AT_SKEW_SECS`] of clock skew), else refused, and never
@@ -378,6 +416,12 @@ pub struct JobRow {
     pub max_attempts: i32,
     pub not_before: DateTime<Utc>,
     pub claimed_by: Option<String>,
+    /// The authenticated principal that holds the claim (#5465): only it can
+    /// complete the job. `None` before the first claim, and for a claim
+    /// taken before migration 338 (completable by no one; it is reaped).
+    /// Once the claim ends (`claim_token_hash` cleared) it is history: the
+    /// last claimant, matched by nothing.
+    pub claimed_by_user_id: Option<Uuid>,
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub claim_token_hash: Option<String>,
     pub last_error: Option<String>,
@@ -387,8 +431,8 @@ pub struct JobRow {
 }
 
 const JOB_COLUMNS: &str = "id, repository_id, artifact_id, kind, target_key, status, attempts, \
-     max_attempts, not_before, claimed_by, lease_expires_at, claim_token_hash, last_error, \
-     snapshot_id, completed_at, created_at";
+     max_attempts, not_before, claimed_by, claimed_by_user_id, lease_expires_at, \
+     claim_token_hash, last_error, snapshot_id, completed_at, created_at";
 
 impl JobRow {
     pub fn kind(&self) -> Option<JobKind> {
@@ -558,10 +602,16 @@ fn repo_authorized(j: &str, n: u8) -> String {
 /// Only jobs of repositories `scope` covers are candidates (#5460): a worker
 /// credential restricted to repository A is never handed repository B's job,
 /// and B's job is left exactly as it was.
+///
+/// The claim is bound to `worker_user`, the authenticated principal of the
+/// claim request (#5465): only that principal can complete it
+/// ([`claim_matches`], [`lock_claim`]). `worker_id` is the worker's
+/// self-chosen label (`workerId`), recorded for display only.
 pub async fn claim(
     db: &PgPool,
     kinds: &[JobKind],
     worker_id: &str,
+    worker_user: Uuid,
     scope: &AccessScope,
 ) -> crate::error::Result<Option<Claim>> {
     let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
@@ -578,7 +628,7 @@ pub async fn claim(
            ORDER BY COALESCE(b.claimed, 0), p.not_before, p.created_at \
            LIMIT 1 FOR UPDATE OF p SKIP LOCKED) \
          UPDATE mcp_introspection_jobs j SET status = 'claimed', attempts = j.attempts + 1, \
-           claimed_by = $2, claimed_at = NOW(), \
+           claimed_by = $2, claimed_by_user_id = $6, claimed_at = NOW(), \
            lease_expires_at = NOW() + make_interval(secs => $3), claim_token_hash = $4, \
            updated_at = NOW() \
          FROM next WHERE j.id = next.id RETURNING {}",
@@ -595,6 +645,7 @@ pub async fn claim(
         .bind(LEASE_SECS as f64)
         .bind(caps::sha256_hex(token.as_bytes()))
         .bind(scope.as_allowed_repo_ids())
+        .bind(worker_user)
         .fetch_optional(db)
         .await
         .map_err(db_err)?;
@@ -639,6 +690,22 @@ pub fn token_matches(job: &JobRow, token: &str) -> bool {
             .claim_token_hash
             .as_deref()
             .is_some_and(|h| ct_eq(h.as_bytes(), caps::sha256_hex(token.as_bytes()).as_bytes()))
+}
+
+/// Whether `token`, presented by the authenticated principal `worker_user`,
+/// proves the current claim of `job` (#5465): the token must match and the
+/// principal must be the one that took the claim. A claim without a recorded
+/// owner (taken before migration 338) matches no one. The caller answers a
+/// mismatch of either kind with the same `409 mcp_claim_invalid`, so a token
+/// held by the wrong worker is indistinguishable from a wrong token.
+///
+/// The owner is the principal (user / service account), not the API token:
+/// a worker that rotates its `mcp:introspect` token, or authenticates with
+/// another token of the same service account, mid-claim can still complete
+/// its claim. Two workers that must not complete each other's jobs need
+/// separate service accounts.
+pub fn claim_matches(job: &JobRow, token: &str, worker_user: Uuid) -> bool {
+    token_matches(job, token) && job.claimed_by_user_id == Some(worker_user)
 }
 
 mod subtle_eq {
@@ -761,13 +828,14 @@ pub enum Completed {
     /// the job was cancelled with `reason`, as a claim of such a job is.
     /// `409 mcp_target_ineligible` (#5463).
     Ineligible { reason: String },
-    /// The result itself was refused (an `observedAt` outside the claim's
-    /// window, #5464): nothing was stored and the claim was left as it was.
-    /// `400`.
+    /// The result's metadata was refused: an `observedAt` outside the
+    /// claim's window (#5464), an unknown `cacheScope` or an out-of-range
+    /// `ttlMs` (#5466). Nothing was stored and the claim was left as it was.
+    /// `400 mcp_invalid_result_metadata`.
     Invalid(caps::CapError),
 }
 
-/// A claim [`lock_claim`] found current.
+/// A claim [`lock_claim`] found current and held by the completing worker.
 #[derive(Debug, Clone, Copy, sqlx::FromRow)]
 struct LockedClaim {
     /// Whether the worker's scope authorizes the job's repository.
@@ -777,18 +845,22 @@ struct LockedClaim {
 
 /// Lock the current claim of `job` in the transaction that will end it, and
 /// re-check the repository authorization ([`repo_authorized`]) under that
-/// same lock: `None` when the claim is no longer current (#5389) or its lease
-/// has expired, whether or not the reaper has run yet (#5462). The lease is
-/// read against the clock when the row is locked, so a completion and the
-/// reaper (which locks the same row) have exactly one outcome.
+/// same lock: `None` when the claim is no longer current (#5389), its lease
+/// has expired, whether or not the reaper has run yet (#5462), or it is not
+/// held by `worker_user` (#5465; a claim with no recorded owner is held by
+/// no one). The lease is read against the clock when the row is locked, so a
+/// completion and the reaper (which locks the same row) have exactly one
+/// outcome.
 async fn lock_claim(
     tx: &mut sqlx::PgConnection,
     job: &JobRow,
+    worker_user: Uuid,
     scope: &AccessScope,
 ) -> crate::error::Result<Option<LockedClaim>> {
     let sql = format!(
         "SELECT ({}) AS authorized, j.claimed_at FROM mcp_introspection_jobs j \
          WHERE j.id = $1 AND j.status = 'claimed' AND j.claim_token_hash = $2 \
+           AND j.claimed_by_user_id = $4 \
            AND j.lease_expires_at > clock_timestamp() FOR UPDATE OF j",
         repo_authorized("j", 3)
     );
@@ -796,6 +868,7 @@ async fn lock_claim(
         .bind(job.id)
         .bind(&job.claim_token_hash)
         .bind(scope.as_allowed_repo_ids())
+        .bind(worker_user)
         .fetch_optional(tx)
         .await
         .map_err(db_err)
@@ -872,14 +945,20 @@ async fn revalidate(
     Ok(Ok(v))
 }
 
-/// Record a worker result for a claimed job (token already checked by the
-/// caller, but the claim may end concurrently), as a worker whose credential
-/// carries repository `scope`. `servable` is the full serve gate of the job's
+/// Record a worker result for a claimed job (token and owner already checked
+/// by the caller, [`claim_matches`], but the claim may end concurrently), as
+/// the authenticated principal `worker_user` whose credential carries
+/// repository `scope`. `servable` is the full serve gate of the job's
 /// server version, evaluated by the caller just before (see [`revalidate`]).
 ///
+/// The result's metadata is validated first ([`validate_metadata`], #5466),
+/// before the transaction: an invalid result locks, stores and changes
+/// nothing ([`Completed::Invalid`]), and the claim stays usable until its
+/// lease expires, so the worker can resubmit a corrected result.
+///
 /// The claim check and end and the snapshot insert run in one transaction
-/// (the job row is locked with its token hash, `claimed` status and a live
-/// lease), so of two completions of one claim exactly one stores a snapshot;
+/// (the job row is locked with its token hash, `claimed` status, owner
+/// `worker_user` and a live lease, #5465), so of two completions of one claim exactly one stores a snapshot;
 /// the other, and one racing the reaper, a re-claim or its own lease expiry,
 /// gets [`Completed::ClaimLost`] (#5389, #5461, #5462). The audit, lint and
 /// drift side effects run after the commit, and only for a newly stored
@@ -902,15 +981,19 @@ pub async fn complete(
     job: &JobRow,
     result: &WorkerResult,
     parsed: ParsedResult,
+    worker_user: Uuid,
     scope: &AccessScope,
     servable: bool,
 ) -> crate::error::Result<Completed> {
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
+    if let Err(e) = validate_metadata(result, Utc::now()) {
+        return Ok(Completed::Invalid(e));
+    }
     let mut tx = db.begin().await.map_err(db_err)?;
     let hold = lock_version(&mut tx, job.artifact_id).await?;
-    let claimed_at = match lock_claim(&mut tx, job, scope).await? {
+    let claimed_at = match lock_claim(&mut tx, job, worker_user, scope).await? {
         None => return Ok(Completed::ClaimLost),
         Some(LockedClaim {
             authorized: false, ..
@@ -975,12 +1058,14 @@ pub async fn complete(
         source,
         provenance: source.default_provenance().to_string(),
         origin: Some(job.target_key.clone()),
-        reported_by: None,
+        // The completing worker's principal: the snapshot and its audit
+        // record name the worker that actually completed the job (#5465).
+        reported_by: Some(worker_user),
         auth_state: parsed.auth_state,
         outcome: parsed.outcome,
         protocol_version: result.protocol_version.clone(),
         observed_at,
-        ttl_ms: result.ttl_ms.filter(|t| *t >= 0),
+        ttl_ms: result.ttl_ms,
         cache_scope: result.cache_scope.clone(),
         set: parsed.set,
         worker_version: result
@@ -1376,6 +1461,57 @@ mod tests {
         assert_eq!(validated_observed_at(Some(old), None, now), Ok(old));
     }
 
+    /// #5466: observation and cache metadata is validated from the result
+    /// alone, with its boundaries accepted.
+    #[test]
+    fn result_metadata_is_validated() {
+        type Edit = fn(&mut WorkerResult);
+        let now = DateTime::from_timestamp(1_000_000, 0).unwrap();
+        let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+        let r = |f: Edit| {
+            let mut r = WorkerResult {
+                outcome: "ok".into(),
+                ..Default::default()
+            };
+            f(&mut r);
+            validate_metadata(&r, now)
+        };
+        assert_eq!(r(|_| {}), Ok(()));
+        let ok: [Edit; 7] = [
+            |r| r.observed_at = Some(DateTime::from_timestamp(1_000_300, 0).unwrap()),
+            |r| r.observed_at = Some(DateTime::from_timestamp(0, 0).unwrap()),
+            |r| r.ttl_ms = Some(0),
+            |r| r.ttl_ms = Some(MAX_TTL_MS),
+            |r| r.cache_scope = Some("public".into()),
+            |r| r.cache_scope = Some("private".into()),
+            |r| r.outcome = "timeout".into(),
+        ];
+        for f in ok {
+            assert_eq!(r(f), Ok(()));
+        }
+        let bad: [(Edit, &str); 6] = [
+            (
+                |r| r.observed_at = Some(DateTime::from_timestamp(1_000_301, 0).unwrap()),
+                "observedAt",
+            ),
+            (|r| r.cache_scope = Some("shared".into()), "cacheScope"),
+            (|r| r.cache_scope = Some(String::new()), "cacheScope"),
+            (|r| r.ttl_ms = Some(-1), "ttlMs"),
+            (|r| r.ttl_ms = Some(MAX_TTL_MS + 1), "ttlMs"),
+            (
+                |r| {
+                    r.outcome = "timeout".into();
+                    r.ttl_ms = Some(i64::MIN);
+                },
+                "ttlMs",
+            ),
+        ];
+        for (f, path) in bad {
+            assert_eq!(r(f).unwrap_err().path, path);
+        }
+        assert_eq!(now + skew, DateTime::from_timestamp(1_000_300, 0).unwrap());
+    }
+
     #[test]
     fn token_check() {
         let job = JobRow {
@@ -1389,6 +1525,7 @@ mod tests {
             max_attempts: 3,
             not_before: Utc::now(),
             claimed_by: None,
+            claimed_by_user_id: Some(Uuid::nil()),
             lease_expires_at: None,
             claim_token_hash: Some(caps::sha256_hex(b"tok")),
             last_error: None,
@@ -1398,6 +1535,16 @@ mod tests {
         };
         assert!(token_matches(&job, "tok"));
         assert!(!token_matches(&job, "other"));
+        // #5465: the token proves the claim only for its owner, and a claim
+        // with no recorded owner is completable by no one.
+        assert!(claim_matches(&job, "tok", Uuid::nil()));
+        assert!(!claim_matches(&job, "tok", Uuid::from_u128(1)));
+        assert!(!claim_matches(&job, "other", Uuid::nil()));
+        let unowned = JobRow {
+            claimed_by_user_id: None,
+            ..job.clone()
+        };
+        assert!(!claim_matches(&unowned, "tok", Uuid::nil()));
         let done = JobRow {
             status: "completed".into(),
             ..job.clone()
