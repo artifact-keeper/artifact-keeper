@@ -473,36 +473,58 @@ impl From<StreamHandle> for StreamingFetchResult {
 /// body is read on its own task, which runs the tee to EOF, so the fill
 /// commits and the followers receive the whole object. It stops early once
 /// the cache writer has finished (the #2928 ceiling abandoned the write).
-/// Bounded like the #5220 detached fills, from the same permits: with none
-/// free the body is dropped as before. A body dropped before its first chunk
-/// (a HEAD or a client gone before any byte) is dropped as before too.
+/// Bounded like the #5220 detached fills: from the same permits (with none
+/// free the body is dropped as before) and within the same deadline, the
+/// fetch deadline plus the commit allowance, because the read timeout restarts
+/// on every chunk and a trickling upstream would otherwise hold a permit for
+/// as long as its socket stays open. A body dropped before its first chunk (a
+/// HEAD or a client gone before any byte), or after every byte its
+/// `Content-Length` announced (hyper never polls a fixed-length body for its
+/// end), is dropped as before too.
 struct FinishFillOnDrop {
     body: Option<BoxStream<'static, Result<Bytes>>>,
-    /// Some chunk has been handed to the client.
-    started: bool,
+    /// Bytes handed to the client so far.
+    yielded: u64,
+    /// The body's advertised length, when known.
+    content_length: Option<u64>,
     /// The body yielded its last item (EOF or an error).
     ended: bool,
     cache_published: tokio::sync::watch::Receiver<bool>,
+    limits: FinishFillLimits,
+}
+
+/// How many [`FinishFillOnDrop`] drains may run at once (shared with the
+/// #5220 detached buffered fills) and for how long each may run.
+#[derive(Clone)]
+struct FinishFillLimits {
     permits: Arc<Semaphore>,
+    deadline: Duration,
 }
 
 impl FinishFillOnDrop {
     /// Wrap a leader handle that feeds a cache write; other handles (follower
     /// replays, the over-quota bypass) are returned unchanged.
-    fn wrap(handle: StreamHandle, permits: &Arc<Semaphore>) -> StreamHandle {
+    fn wrap(handle: StreamHandle, limits: FinishFillLimits) -> StreamHandle {
         let Some(cache_published) = handle.cache_published.clone() else {
             return handle;
         };
         StreamHandle {
             body: Box::pin(Self {
                 body: Some(handle.body),
-                started: false,
+                yielded: 0,
+                content_length: handle.headers.content_length,
                 ended: false,
                 cache_published,
-                permits: Arc::clone(permits),
+                limits,
             }),
             ..handle
         }
+    }
+
+    /// Whether dropping the body now would cut a fill short: some bytes went
+    /// out, the body did not end, and not every advertised byte was read.
+    fn unfinished(&self) -> bool {
+        !self.ended && self.yielded > 0 && self.content_length != Some(self.yielded)
     }
 
     /// Read `body` to its end, or until the cache writer has finished.
@@ -535,7 +557,7 @@ impl futures::Stream for FinishFillOnDrop {
         };
         let item = futures::ready!(body.as_mut().poll_next(cx));
         match &item {
-            Some(Ok(_)) => this.started = true,
+            Some(Ok(chunk)) => this.yielded += chunk.len() as u64,
             Some(Err(_)) | None => this.ended = true,
         }
         std::task::Poll::Ready(item)
@@ -544,7 +566,7 @@ impl futures::Stream for FinishFillOnDrop {
 
 impl Drop for FinishFillOnDrop {
     fn drop(&mut self) {
-        if self.ended || !self.started {
+        if !self.unfinished() {
             return;
         }
         let Some(body) = self.body.take() else {
@@ -553,14 +575,25 @@ impl Drop for FinishFillOnDrop {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&self.limits.permits).try_acquire_owned() else {
             tracing::debug!(
                 "no detached-fill permit free; a streaming fill its client stopped \
                  reading is dropped unfinished (#5509)"
             );
             return;
         };
-        let drain = Self::drain(body, self.cache_published.clone());
+        let deadline = self.limits.deadline;
+        let cache_published = self.cache_published.clone();
+        let drain = async move {
+            let drained = tokio::time::timeout(deadline, Self::drain(body, cache_published)).await;
+            if drained.is_err() {
+                tracing::debug!(
+                    deadline_secs = deadline.as_secs(),
+                    "a streaming fill its client stopped reading did not finish within the \
+                     detached-fill deadline; abandoned unfinished (#5509)"
+                );
+            }
+        };
         let correlation = crate::api::middleware::tracing::current_correlation_id();
         runtime.spawn(async move {
             let _permit = permit;
@@ -7797,6 +7830,15 @@ impl ProxyService {
     /// either a late would-be follower that would miss leading bytes, or a
     /// follower whose leader vanished before publishing headers. The caller
     /// loops; a re-enter typically lands on the now-warm cache.
+    /// The bounds of a [`FinishFillOnDrop`] drain: the #5220 detached-fill
+    /// permits and deadline.
+    fn finish_fill_limits(&self) -> FinishFillLimits {
+        FinishFillLimits {
+            permits: Arc::clone(&self.detached_fill_permits),
+            deadline: self.upstream_timeouts.fetch_deadline() + DETACHED_FILL_COMMIT_ALLOWANCE,
+        }
+    }
+
     async fn try_fetch_artifact_streaming_once(
         &self,
         repo: &Repository,
@@ -7849,7 +7891,7 @@ impl ProxyService {
         match handle {
             Some(handle) => Ok(Some(StreamingFetchResult::from(FinishFillOnDrop::wrap(
                 handle,
-                &self.detached_fill_permits,
+                self.finish_fill_limits(),
             )))),
             None => {
                 forget_cached_sidecar_miss(&metadata_key).await;
@@ -8857,7 +8899,7 @@ impl ProxyService {
             .await?;
         Ok(StreamingFetchResult::from(FinishFillOnDrop::wrap(
             handle,
-            &self.detached_fill_permits,
+            self.finish_fill_limits(),
         )))
     }
 
@@ -30339,6 +30381,23 @@ mod finish_fill_on_drop_5509 {
         (handle, read, published_tx)
     }
 
+    fn limits(permits: &Arc<Semaphore>) -> FinishFillLimits {
+        FinishFillLimits {
+            permits: Arc::clone(permits),
+            deadline: Duration::from_secs(30),
+        }
+    }
+
+    async fn permits_back(permits: &Semaphore, want: usize) -> usize {
+        for _ in 0..200 {
+            if permits.available_permits() == want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        permits.available_permits()
+    }
+
     async fn read_eventually(read: &AtomicUsize, want: usize) -> usize {
         for _ in 0..200 {
             if read.load(Ordering::SeqCst) >= want {
@@ -30353,7 +30412,7 @@ mod finish_fill_on_drop_5509 {
     async fn a_body_dropped_mid_object_is_read_to_its_end() {
         let permits = Arc::new(Semaphore::new(1));
         let (handle, read, _published) = leader(8);
-        let mut wrapped = FinishFillOnDrop::wrap(handle, &permits);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
         assert!(wrapped.body.next().await.unwrap().is_ok());
         drop(wrapped);
         assert_eq!(read_eventually(&read, 8).await, 8);
@@ -30371,7 +30430,7 @@ mod finish_fill_on_drop_5509 {
     async fn without_a_free_permit_the_body_is_dropped_as_before() {
         let permits = Arc::new(Semaphore::new(0));
         let (handle, read, _published) = leader(8);
-        let mut wrapped = FinishFillOnDrop::wrap(handle, &permits);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
         assert!(wrapped.body.next().await.unwrap().is_ok());
         drop(wrapped);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -30382,7 +30441,7 @@ mod finish_fill_on_drop_5509 {
     async fn a_body_dropped_before_its_first_chunk_is_not_read() {
         let permits = Arc::new(Semaphore::new(1));
         let (handle, read, _published) = leader(8);
-        drop(FinishFillOnDrop::wrap(handle, &permits));
+        drop(FinishFillOnDrop::wrap(handle, limits(&permits)));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(read.load(Ordering::SeqCst), 0);
     }
@@ -30393,7 +30452,7 @@ mod finish_fill_on_drop_5509 {
     async fn a_finished_cache_writer_stops_the_drain() {
         let permits = Arc::new(Semaphore::new(1));
         let (handle, read, published) = leader(1000);
-        let mut wrapped = FinishFillOnDrop::wrap(handle, &permits);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
         assert!(wrapped.body.next().await.unwrap().is_ok());
         published.send_replace(true);
         drop(wrapped);
@@ -30407,7 +30466,7 @@ mod finish_fill_on_drop_5509 {
         let permits = Arc::new(Semaphore::new(1));
         let (mut handle, read, _published) = leader(8);
         handle.cache_published = None;
-        let mut wrapped = FinishFillOnDrop::wrap(handle, &permits);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
         assert!(wrapped.body.next().await.unwrap().is_ok());
         drop(wrapped);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -30419,10 +30478,124 @@ mod finish_fill_on_drop_5509 {
     async fn a_body_read_to_its_end_takes_no_permit() {
         let permits = Arc::new(Semaphore::new(1));
         let (handle, read, _published) = leader(3);
-        let mut wrapped = FinishFillOnDrop::wrap(handle, &permits);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
         while wrapped.body.next().await.is_some() {}
         drop(wrapped);
         assert_eq!(read.load(Ordering::SeqCst), 3);
         assert_eq!(permits.available_permits(), 1);
+    }
+
+    /// A drain is bounded like a #5220 detached fill: an upstream that sends
+    /// one chunk and then stalls gives its permit back at the deadline.
+    #[tokio::test]
+    async fn a_stalled_drain_returns_its_permit_at_the_deadline() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (_published_tx, published_rx) = tokio::sync::watch::channel(false);
+        let body = futures::stream::once(async { Ok(Bytes::from_static(b"chunk")) })
+            .chain(futures::stream::pending())
+            .boxed();
+        let handle = StreamHandle {
+            body,
+            headers: StreamHeaders::default(),
+            cache_published: Some(published_rx),
+        };
+        let mut wrapped = FinishFillOnDrop::wrap(
+            handle,
+            FinishFillLimits {
+                permits: Arc::clone(&permits),
+                deadline: Duration::from_millis(50),
+            },
+        );
+        assert!(wrapped.body.next().await.unwrap().is_ok());
+        drop(wrapped);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(permits.available_permits(), 0, "the drain holds the permit");
+        assert_eq!(permits_back(&permits, 1).await, 1);
+    }
+
+    /// hyper never polls a fixed-length body for its end: a body dropped once
+    /// every advertised byte is out has nothing left to fill.
+    #[tokio::test]
+    async fn a_fully_read_fixed_length_body_takes_no_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (mut handle, read, _published) = leader(3);
+        handle.headers.content_length = Some(3 * b"chunk".len() as u64);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        for _ in 0..3 {
+            assert!(wrapped.body.next().await.unwrap().is_ok());
+        }
+        drop(wrapped);
+        assert_eq!(permits.available_permits(), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 3);
+    }
+
+    /// A follower that joined the leader's fan-out before the leader's client
+    /// stopped reading: the drain carries the rest of the object to it, and
+    /// an upstream failure during the drain releases it to re-enter (`None`)
+    /// instead of leaving it waiting.
+    async fn follower_of_a_dropped_leader(fail_midway: bool) -> Option<Vec<u8>> {
+        let lease_key = format!("proxy-stream:finish-fill-test:{}", Uuid::new_v4());
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Bytes>>();
+        let (_published_tx, published_rx) = tokio::sync::watch::channel(false);
+        let leader =
+            crate::services::proxy_hydration::coordinate_stream_fanout(&lease_key, || async move {
+                Ok(StreamHandle {
+                    body: rx.boxed(),
+                    headers: StreamHeaders {
+                        content_length: Some(15),
+                        ..StreamHeaders::default()
+                    },
+                    cache_published: Some(published_rx),
+                })
+            })
+            .await
+            .expect("leader opens")
+            .expect("first caller leads");
+        let follower_key = lease_key.clone();
+        let follower = tokio::spawn(async move {
+            crate::services::proxy_hydration::coordinate_stream_fanout(&follower_key, || async {
+                Err::<StreamHandle, _>(AppError::Internal("a follower never opens".into()))
+            })
+            .await
+        });
+        // Let the follower subscribe before the leader emits anything.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let mut wrapped = FinishFillOnDrop::wrap(leader, limits(&permits));
+        tx.unbounded_send(Ok(Bytes::from_static(b"aaaaa"))).unwrap();
+        assert_eq!(&wrapped.body.next().await.unwrap().unwrap()[..], b"aaaaa");
+        // The client took its window and went away.
+        drop(wrapped);
+        tx.unbounded_send(Ok(Bytes::from_static(b"bbbbb"))).unwrap();
+        if fail_midway {
+            tx.unbounded_send(Err(AppError::BadGateway("upstream reset".into())))
+                .unwrap();
+        } else {
+            tx.unbounded_send(Ok(Bytes::from_static(b"ccccc"))).unwrap();
+        }
+        drop(tx);
+
+        let handle = tokio::time::timeout(Duration::from_secs(10), follower)
+            .await
+            .expect("the follower is released, not left waiting")
+            .expect("follower task")
+            .expect("follower result")?;
+        let body: Vec<Bytes> = handle.body.map(|c| c.unwrap()).collect().await;
+        Some(body.concat())
+    }
+
+    #[tokio::test]
+    async fn a_follower_gets_the_whole_object_through_the_drain() {
+        assert_eq!(
+            follower_of_a_dropped_leader(false).await.as_deref(),
+            Some(&b"aaaaabbbbbccccc"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_fails_midway_releases_the_follower_to_re_enter() {
+        assert_eq!(follower_of_a_dropped_leader(true).await, None);
     }
 }
