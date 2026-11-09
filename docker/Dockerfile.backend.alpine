@@ -104,7 +104,7 @@ ARG GRYPE_VERSION=0.120.1
 ARG GRYPE_COMMIT=6f8d854af29d3a3086b11a84afa51554a2a245fe
 ARG GO_MIN_PATCH=1.27.3
 ARG XNET_FROM=v0.59.0
-ARG XNET_TO=v0.60.0
+ARG XNET_TO=v0.62.0
 ARG GOJOSE_FROM=v4.1.5
 ARG GOJOSE_TO=v4.1.6
 ARG XCRYPTO_MIN=v0.56.0
@@ -134,6 +134,8 @@ RUN set -eu; \
 # Dependency override — golang.org/x/net, CVE-2026-78669. See Dockerfile.backend
 # for the levers checked, the policy exception, the reachability finding and
 # the MVS set (seven modules on v0.118.0; only x/net itself on v0.120.1, #3698).
+# Raised to v0.62.0 for CVE-2026-78661 (#5571), which moves seven go.mod
+# requirements again, x/tools among them, declared below.
 RUN set -eu; \
     xnet_pin() { sed -n 's|^[[:space:]]*golang\.org/x/net \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
     have="$(xnet_pin)"; \
@@ -153,7 +155,7 @@ RUN set -eu; \
     fi; \
     moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-xnet go.mod \
              | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
-    expected="golang.org/x/net "; \
+    expected="golang.org/x/crypto golang.org/x/net golang.org/x/sync golang.org/x/sys golang.org/x/term golang.org/x/text golang.org/x/tools "; \
     if [ "${moved}" != "${expected}" ]; then \
       echo "ERROR: go get moved an undeclared set of modules." >&2; \
       echo "       expected: ${expected}" >&2; \

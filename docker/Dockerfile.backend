@@ -405,7 +405,7 @@ ARG GO_MIN_PATCH=1.27.3
 # go-jose). See the override blocks below the clone for their justification
 # and removal conditions.
 ARG XNET_FROM=v0.59.0
-ARG XNET_TO=v0.60.0
+ARG XNET_TO=v0.62.0
 ARG GOJOSE_FROM=v4.1.5
 ARG GOJOSE_TO=v4.1.6
 # Not an override: a floor asserted against the compiled binary's build info.
@@ -449,7 +449,7 @@ RUN set -eu; \
 # ARGs and its build-info assertion are gone and grpc is upstream's choice
 # again. The full history is in CHANGELOG.md under #3655 and #3790.
 
-# ---- Dependency override: golang.org/x/net ${XNET_FROM} -> ${XNET_TO} (2026-10-10, re-based #3698)
+# ---- Dependency override: golang.org/x/net ${XNET_FROM} -> ${XNET_TO} (2026-10-10, re-based #3698, raised #5571)
 #
 # CVE-2026-78669 (HIGH; HTTP/2 denial of service via excessive SETTINGS
 # frames in golang.org/x/net/http2, fixed in x/net v0.60.0 alongside the same
@@ -460,6 +460,16 @@ RUN set -eu; \
 # advisory did not appear, because the floating FROM had already resolved
 # go1.27.2 (GO_MIN_PATCH above now makes that a floor rather than luck).
 #
+# XNET_TO v0.60.0 -> v0.62.0 (2026-11-09, #5571). CVE-2026-78661 / GO-2026-6860
+# (HIGH, denial of service in golang.org/x/net/html: quadratic allocation when
+# the parser coalesces text nodes, fixed in v0.62.0) was reported against
+# `usr/local/bin/grype` at the v0.60.0 this block shipped, and against buildctl
+# and the scanner adapter's trivy at the same version, and has failed Docker
+# Publish's `Security Scan` on main since 2026-11-07 (run 42579583951 on
+# e71b17ab). v0.61.0 is still in the vulnerable range, so the target is
+# v0.62.0 (tagged 2026-10-27). x/net is a module, so GO_MIN_PATCH does not
+# move.
+#
 # The three levers, in order (bump the tag, raise GO_MIN_PATCH, override a
 # module; the retired grpc note above and CHANGELOG #3655 explain the order):
 #   1. Bump GRYPE_VERSION. Checked against the RELEASE, 2026-10-10: the newest
@@ -469,7 +479,10 @@ RUN set -eu; \
 #      been taken, for grpc and x/crypto; it still pins x/net v0.59.0, so
 #      this block stays with XNET_FROM moved v0.58.0 -> v0.59.0. anchore/grype
 #      `main` now pins x/net v0.61.0, so upstream HAS made the bump; no
-#      release carries it yet.]
+#      release carries it yet.] [#5571, 2026-11-09: the newest release is
+#      v0.121.2 (2026-11-05) and it pins x/net v0.61.0, as do v0.121.0 and
+#      v0.121.1, all inside CVE-2026-78661's range. `main` (606a3dd5,
+#      2026-11-06) still pins v0.61.0. No release reaches v0.62.0.]
 #   2. GO_MIN_PATCH. Does not apply: x/net is a module, not the stdlib.
 #   3. Override. Only this one is left.
 #
@@ -483,7 +496,11 @@ RUN set -eu; \
 # anchore/grype v0.120.1 already ships (below). The alternative is a
 # .trivyignore entry, and its header rules that out: a fixed version exists
 # and we can build against it. [Since #3698 the policy is met outright:
-# anchore/grype `main` pins x/net v0.61.0.]
+# anchore/grype `main` pins x/net v0.61.0.] [#5571: for v0.62.0 it is the same
+# exception again, stated the same way. anchore/grype `main` stops at v0.61.0,
+# and v0.62.0 is the Go team's fix release for CVE-2026-78661. moby/buildkit
+# `master` and aquasecurity/trivy `main` already pin v0.62.0, and trivy
+# release v0.76.2 ships it.]
 #
 # REACHABILITY: x/net/http2 IS linked into cmd/grype. `go mod why -m
 # golang.org/x/net` answers grype/internal/file -> hashicorp/go-getter ->
@@ -494,6 +511,13 @@ RUN set -eu; \
 # HTTP/2 framing code, and its only outbound HTTP (the DB fetch) is disabled
 # at runtime (GRYPE_DB_AUTO_UPDATE=false). That narrows the exposure; it does
 # not remove the vulnerable code, and the gate is not reachability-aware.
+# [#5571: x/net/html is one of those 14 packages on the v0.120.1 tree. Its
+# only linked importer is golang.org/x/net/html/charset, pulled in by syft's
+# Java Maven cataloger (syft/pkg/cataloger/java/internal/maven), and charset
+# only calls html.NewTokenizer. GO-2026-6860 (CVE-2026-78661) lists html.Parse,
+# ParseFragment and their WithOptions variants, which nothing linked calls. So
+# grype most likely never runs the vulnerable code, but the gate scores the
+# module version in the build info, not symbols, and fails on it anyway.]
 #
 # MVS consequences, measured 2026-10-10 on the v0.118.0 tree after the grpc
 # override: `go get golang.org/x/net@v0.60.0` moves SEVEN golang.org/x
@@ -514,12 +538,28 @@ RUN set -eu; \
 #
 # On v0.120.1 (#3698, measured 2026-10-17) the same `go get` moves EXACTLY ONE
 # module, x/net v0.59.0 -> v0.60.0: v0.120.1 already pins every module x/net
-# v0.60.0 drags along at the version listed above. The assertion declares that
-# single-module set, so a resolution that moves anything else fails the build.
+# v0.60.0 drags along at the version listed above. The assertion declared that
+# single-module set until #5571.
+#
+# At v0.62.0 (#5571, measured 2026-11-09 on the v0.120.1 tree with go1.27.3)
+# `go get golang.org/x/net@v0.62.0` moves SEVEN go.mod requirements again,
+# because x/net v0.62.0 requires x/crypto v0.58.0, x/sys v0.49.0, x/term
+# v0.47.0 and x/text v0.43.0, and x/text v0.43.0 in turn requires x/sync
+# v0.24.0 and x/tools v0.51.0:
+#   x/crypto v0.57.0 -> v0.58.0    x/sys   v0.48.0 -> v0.49.0
+#   x/net    v0.59.0 -> v0.62.0    x/term  v0.46.0 -> v0.47.0
+#   x/sync   v0.23.0 -> v0.24.0    x/text  v0.42.0 -> v0.43.0
+#   x/tools  v0.50.0 -> v0.51.0
+# x/crypto, x/sync, x/sys, x/term and x/text land on exactly the versions
+# anchore/grype v0.121.2 pins. x/tools stops at v0.51.0, the version x/text
+# asks for, one minor below v0.121.2's v0.52.0. golang.org/x/telemetry also
+# moves in the module graph (x/tools v0.51.0 wants a newer pseudo-version) but
+# not in go.mod, which is what the assertion diffs. The assertion declares the
+# seven, so a resolution that moves anything else fails the build.
 #
 # REMOVAL CONDITION: delete this block, and the XNET_FROM/XNET_TO ARGs, when
 # GRYPE_VERSION moves to a grype release whose go.mod pins golang.org/x/net
-# >= v0.60.0:
+# >= v0.62.0 (>= v0.60.0 before #5571):
 #   git show <tag>:go.mod | grep golang.org/x/net
 # The guard fails the build when the pinned source no longer requires
 # ${XNET_FROM}, exactly as the retired grpc guard did, so the bump cannot ship with
@@ -547,7 +587,7 @@ RUN set -eu; \
     fi; \
     moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-xnet go.mod \
              | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
-    expected="golang.org/x/net "; \
+    expected="golang.org/x/crypto golang.org/x/net golang.org/x/sync golang.org/x/sys golang.org/x/term golang.org/x/text golang.org/x/tools "; \
     if [ "${moved}" != "${expected}" ]; then \
       echo "ERROR: go get moved an undeclared set of modules." >&2; \
       echo "       expected: ${expected}" >&2; \
@@ -755,6 +795,18 @@ RUN set -eu; \
 # configure, so the exposure is narrow, but unlike grype this binary really
 # does speak HTTP/2 at runtime.
 #
+# XNET_TO v0.60.0 -> v0.62.0 (2026-11-09, #5571), for CVE-2026-78661 (HIGH,
+# denial of service in golang.org/x/net/html, fixed in v0.62.0), reported
+# against usr/local/bin/buildctl at x/net v0.60.0 in the same runs as grype
+# (from 2026-11-07, latest run 42579583951). No moby/buildkit release reaches
+# it: v0.34.2 (2026-11-03, the newest) pins x/net v0.59.0. Unlike grype,
+# upstream HAS made this bump: `master` pins v0.62.0 (checked at cedaeca8,
+# 2026-11-06), so this raise is inside the override policy. REACHABILITY:
+# x/net/html is NOT linked into buildctl (`go list -deps ./cmd/buildctl` on
+# the v0.33.1 tree lists 8 x/net packages, none of them html), so this is
+# a module-level finding only, but the gate reads the module version from the
+# build info and fails on it all the same.
+#
 # MVS consequences, measured 2026-10-10 on the v0.33.0 tree: the same seven
 # golang.org/x modules move, from the same versions to the same versions, as
 # in grype-bin (x/crypto v0.57.0, x/mod v0.41.0, x/net v0.60.0, x/sync
@@ -762,14 +814,18 @@ RUN set -eu; \
 # v0.33.0 pins the same x/ versions grype v0.118.0 does. Re-measured
 # 2026-10-18 on the v0.33.1 tree: the same seven modules move to the same
 # versions; the one difference is that x/crypto starts from v0.56.0, not
-# v0.55.0, so the declared set in the guard is unchanged. BuildKit VENDORS its
+# v0.55.0, so the declared set in the guard is unchanged. Re-measured
+# 2026-11-09 (#5571) on the v0.33.1 tree with x/net v0.62.0: still the same
+# seven go.mod requirements, now at x/crypto v0.58.0, x/mod v0.41.0, x/net
+# v0.62.0, x/sync v0.24.0, x/sys v0.49.0, x/term v0.47.0 and x/text v0.43.0,
+# so the declared set is unchanged again. BuildKit VENDORS its
 # dependencies, so `go mod vendor` re-materializes vendor/ from the
 # checksum-verified graph after `go get`, and the build keeps upstream's
 # default -mod=vendor.
 #
 # REMOVAL CONDITION for the override: delete it, and the XNET_FROM/XNET_TO
 # ARGs, when BUILDKIT_VERSION moves to a release whose go.mod pins
-# golang.org/x/net >= v0.60.0:
+# golang.org/x/net >= v0.62.0 (>= v0.60.0 before #5571):
 #   git show <tag>:go.mod | grep golang.org/x/net
 # The guard fails the build when the source stops pinning ${XNET_FROM}, as in
 # grype-bin. Going back to copying moby/buildkit's binary is NOT the removal
@@ -783,7 +839,7 @@ ARG BUILDKIT_COMMIT=8c91502cf280bd70a0c50912ce251c46a8881d9f
 ARG GO_MIN_PATCH=1.27.3
 # The one declared divergence from upstream buildkit at this tag.
 ARG XNET_FROM=v0.58.0
-ARG XNET_TO=v0.60.0
+ARG XNET_TO=v0.62.0
 # Floor for the vendored containerd (#4780), asserted on the build info below.
 ARG CONTAINERD_MIN=v2.3.6
 
