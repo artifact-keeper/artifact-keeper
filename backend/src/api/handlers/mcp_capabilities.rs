@@ -370,7 +370,7 @@ pub fn parse_report(body: &[u8], now: DateTime<Utc>) -> Result<Report, Response>
     let cache_scope = opt_string(o, "cacheScope", 16)?;
     if cache_scope
         .as_deref()
-        .is_some_and(|c| !matches!(c, "public" | "private"))
+        .is_some_and(|c| !caps::CACHE_SCOPES.contains(&c))
     {
         return Err(bad_request("cacheScope", "must be `public` or `private`"));
     }
@@ -796,7 +796,8 @@ async fn claim_job(
 ) -> HandlerResult {
     // The token's repository scope bounds which jobs it may be handed
     // (#5460): a token restricted to repository A never claims B's job.
-    let scope = require_introspector(auth)?.access_scope();
+    let auth = require_introspector(auth)?;
+    let scope = auth.access_scope();
     let (kinds, worker) = parse_claim(&body)?;
     // A job that cannot run any more is cancelled, one whose gates cannot be
     // evaluated now is released to the queue, and the next one tried. Only
@@ -804,7 +805,8 @@ async fn claim_job(
     // answer `503` rather than `204`.
     let mut unavailable = false;
     for _ in 0..10 {
-        let Some(claim) = jobs::claim(&state.db, &kinds, &worker, &scope)
+        // The claim is bound to this principal (#5465).
+        let Some(claim) = jobs::claim(&state.db, &kinds, &worker, auth.user_id, &scope)
             .await
             .map_err(app_error)?
         else {
@@ -900,10 +902,10 @@ async fn claim_payload(
     request_body(content = Object, description = "The worker's result: claimToken, outcome, the lists on success"),
     responses(
         (status = 200, body = Object, description = "`{status: \"stored\", snapshotId, contentHash, current, drift}` (`current`: whether the stored snapshot is the version's current view now) or `{status: \"retry\", notBefore}`"),
-        (status = 400, description = "Malformed result, or an `observedAt` outside the claim's window"),
+        (status = 400, description = "Malformed result (`mcp_invalid_capabilities`), or invalid result metadata (`mcp_invalid_result_metadata`: an `observedAt` outside the claim's window, an unknown `cacheScope`, a negative or too large `ttlMs`); nothing was stored and the claim is unchanged"),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not an `mcp:introspect` API token, or the token is not scoped to the job's repository (`mcp_forbidden`)"),
-        (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim, or its lease expired; `mcp_target_ineligible`: the server version or a backing package stopped being eligible after the claim, and the job was cancelled"),
+        (status = 409, description = "`mcp_claim_invalid`: the token does not match the current claim, the claim is held by another worker identity, or its lease expired; `mcp_target_ineligible`: the server version or a backing package stopped being eligible after the claim, and the job was cancelled"),
         (status = 503, description = "`mcp_gate_unavailable`: the server version's gates could not be evaluated; nothing was stored and the claim is unchanged"),
     )
 )]
@@ -914,7 +916,8 @@ async fn complete_job(
     base: RequestBaseUrl,
     body: Bytes,
 ) -> HandlerResult {
-    let scope = require_introspector(auth)?.access_scope();
+    let auth = require_introspector(auth)?;
+    let scope = auth.access_scope();
     if fmt::json_depth_exceeds(&body, INGEST_MAX_DEPTH) {
         return Err(bad_request(
             "",
@@ -931,12 +934,20 @@ async fn complete_job(
             json!({}),
         )
     };
+    // The claim is single-owner (#5465): a token presented by a principal
+    // other than the one that claimed the job is the same `409` as a wrong
+    // token, answered before the result is even read, so it reveals nothing
+    // about the token or the job.
     let job = jobs::get_job(&state.db, id)
         .await
         .map_err(app_error)?
-        .filter(|j| jobs::token_matches(j, &result.claim_token))
+        .filter(|j| jobs::claim_matches(j, &result.claim_token, auth.user_id))
         .ok_or_else(claim_invalid)?;
     let parsed = jobs::parse_result(&result).map_err(|e| bad_request(&e.path, &e.message))?;
+    // Observation and cache metadata is refused before any gate is evaluated
+    // or anything locked (#5466); `jobs::complete` checks it again for its
+    // other callers.
+    jobs::validate_metadata(&result, Utc::now()).map_err(|e| invalid_metadata(&e))?;
     // The full serve gate a claim passes, evaluated again now (#5463); the
     // version's and its backing packages' holds are re-read under lock in
     // the transaction as well.
@@ -950,7 +961,15 @@ async fn complete_job(
     // The claim token proves only the claim; the repository scope is
     // re-checked against the job's repository inside the transaction that
     // ends the claim (#5460).
-    let out = match jobs::complete(&state.db, &job, &result, parsed, &scope, servable)
+    let out = match jobs::complete(
+        &state.db,
+        &job,
+        &result,
+        parsed,
+        auth.user_id,
+        &scope,
+        servable,
+    )
         .await
         .map_err(app_error)?
     {
@@ -985,7 +1004,7 @@ async fn complete_job(
                 json!({"reason": reason}),
             ))
         }
-        jobs::Completed::Invalid(e) => return Err(bad_request(&e.path, &e.message)),
+        jobs::Completed::Invalid(e) => return Err(invalid_metadata(&e)),
     };
     Ok(json_resp(StatusCode::OK, &out))
 }
@@ -1007,6 +1026,19 @@ async fn version_servable(
     };
     let repo = surface::mcp_repo(&state.db, &v.repository_key).await?;
     Ok(surface::artifact_servability(state, &repo, artifact_id, base).await)
+}
+
+/// `400 mcp_invalid_result_metadata`: a worker result's `observedAt`,
+/// `cacheScope` or `ttlMs` was refused (#5464, #5466). Nothing was stored and
+/// the claim is unchanged: the worker may resubmit a corrected result while
+/// its lease lasts.
+fn invalid_metadata(e: &caps::CapError) -> Response {
+    problem(
+        400,
+        "mcp_invalid_result_metadata",
+        &format!("{}: {}", e.path, e.message),
+        json!({"field": e.path}),
+    )
 }
 
 /// `503 mcp_gate_unavailable`: a gate could not be evaluated.
@@ -1259,6 +1291,41 @@ mod db_tests {
         fn introspector(&self) -> Router {
             self.worker(Some(vec![INTROSPECT_SCOPE.into()]))
         }
+        /// An `mcp:introspect` token, unrestricted, of another principal
+        /// `user` (#5465).
+        fn introspector_as(&self, user: Uuid, username: &str) -> Router {
+            let mut a = tdh::make_auth(user, username);
+            a.is_api_token = true;
+            a.is_service_account = true;
+            a.scopes = Some(vec![INTROSPECT_SCOPE.into()]);
+            a.allowed_repo_ids = AccessScope::Admin;
+            tdh::router_with_auth(worker_router(), self.fx.state.clone(), a)
+        }
+        /// Users recorded on the `MCP_CAPABILITIES_INGESTED` audit rows of
+        /// `artifact_id`'s `remote_probe` snapshots, waiting up to `wait` for the fire-and-forget write.
+        async fn ingest_audits(
+            &self,
+            artifact_id: Uuid,
+            want: usize,
+            wait: std::time::Duration,
+        ) -> Vec<Option<Uuid>> {
+            let deadline = std::time::Instant::now() + wait;
+            loop {
+                let users: Vec<Option<Uuid>> = sqlx::query_scalar(
+                    "SELECT user_id FROM audit_log \
+                     WHERE action = 'MCP_CAPABILITIES_INGESTED' AND resource_id = $1 \
+                       AND details->>'source' = 'remote_probe'",
+                )
+                .bind(artifact_id)
+                .fetch_all(&self.fx.pool)
+                .await
+                .unwrap();
+                if users.len() >= want || std::time::Instant::now() >= deadline {
+                    return users;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
         /// `POST /jobs/{job}/complete` as the introspector.
         async fn complete(&self, job: Uuid, result: Value) -> (StatusCode, Value) {
             let uri = format!("/jobs/{job}/complete");
@@ -1287,15 +1354,29 @@ mod db_tests {
             self.claim_target(artifact_id, "remote:0", token).await
         }
         /// [`Self::claim_probe`] of the probe of remote `target`, queueing it
-        /// first when no job of it is open.
+        /// first when no job of it is open. The claim is held by this
+        /// fixture's user, the principal of [`Self::introspector`] (#5465).
         async fn claim_target(&self, artifact_id: Uuid, target: &str, token: &str) -> jobs::JobRow {
+            self.claim_target_as(artifact_id, target, token, Some(self.fx.user_id))
+                .await
+        }
+        /// [`Self::claim_target`], held by `owner` (`None`: a claim taken
+        /// before migration 338 recorded owners).
+        async fn claim_target_as(
+            &self,
+            artifact_id: Uuid,
+            target: &str,
+            token: &str,
+            owner: Option<Uuid>,
+        ) -> jobs::JobRow {
             jobs::enqueue_for_artifact(&self.fx.pool, artifact_id, None)
                 .await
                 .unwrap();
             let id: Uuid = sqlx::query_scalar(
                 "UPDATE mcp_introspection_jobs SET status = 'claimed', \
                    attempts = attempts + 1, claimed_by = 'test', claimed_at = NOW(), \
-                   lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $3 \
+                   lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $3, \
+                   claimed_by_user_id = $4 \
                  WHERE artifact_id = $1 AND kind = 'remote_probe' AND target_key = $2 \
                    AND status = 'pending' \
                  RETURNING id",
@@ -1303,6 +1384,7 @@ mod db_tests {
             .bind(artifact_id)
             .bind(target)
             .bind(caps::sha256_hex(token.as_bytes()))
+            .bind(owner)
             .fetch_one(&self.fx.pool)
             .await
             .unwrap();
@@ -1823,6 +1905,7 @@ mod db_tests {
             &job,
             &r1,
             jobs::parse_result(&r1).unwrap(),
+            env.fx.user_id,
             &AccessScope::Admin,
             true,
         )
@@ -1839,6 +1922,7 @@ mod db_tests {
             &job,
             &r2,
             jobs::parse_result(&r2).unwrap(),
+            env.fx.user_id,
             &AccessScope::Admin,
             true,
         )
@@ -1878,6 +1962,7 @@ mod db_tests {
             &job,
             &timeout,
             parsed.clone(),
+            env.fx.user_id,
             &AccessScope::Admin,
             true,
         )
@@ -1889,6 +1974,7 @@ mod db_tests {
             &job,
             &timeout,
             parsed,
+            env.fx.user_id,
             &AccessScope::Admin,
             true,
         )
@@ -1969,9 +2055,12 @@ mod db_tests {
         assert_eq!(job_state(pool, job_b).await, before, "B's job unchanged");
         assert_eq!(before.0, "pending");
 
-        // Completion: with B's claim token in hand (here forged), the
-        // A-scoped worker still stores nothing, for a result or a retry.
-        b.claim_probe(art_b, "tok-b").await;
+        // Completion: with B's claim token in hand (here forged, and held by
+        // the A worker's own principal, so the claim-owner check of #5465
+        // passes and the repository scope is what refuses), the A-scoped
+        // worker still stores nothing, for a result or a retry.
+        b.claim_target_as(art_b, "remote:0", "tok-b", Some(a.fx.user_id))
+            .await;
         let claimed = job_state(pool, job_b).await;
         let complete_b = format!("/jobs/{job_b}/complete");
         for result in [
@@ -1989,8 +2078,8 @@ mod db_tests {
         assert_eq!(caps_b["current"]["source"], "publisher_declared");
 
         // The denials left B's claim current: its token still proves it.
-        // (Whether a worker other than the claimant may complete it is
-        // #5465's concern, so this test does not complete it as anyone.)
+        // (A worker other than the claimant cannot complete it either:
+        // `a_claim_completes_only_for_its_owner`, #5465.)
         let still = jobs::get_job(pool, job_b).await.unwrap().unwrap();
         assert!(
             jobs::token_matches(&still, "tok-b"),
@@ -2061,11 +2150,13 @@ mod db_tests {
         );
         sqlx::query(
             "UPDATE mcp_introspection_jobs SET status = 'claimed', attempts = 1, \
-               lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $2 \
+               lease_expires_at = NOW() + INTERVAL '10 minutes', claim_token_hash = $2, \
+               claimed_by_user_id = $3 \
              WHERE id = $1",
         )
         .bind(forged)
         .bind(caps::sha256_hex(b"tok-forged"))
+        .bind(a.fx.user_id)
         .execute(pool)
         .await
         .unwrap();
@@ -2547,9 +2638,17 @@ mod db_tests {
             .await;
             let r: jobs::WorkerResult = serde_json::from_value(result(&token)).unwrap();
             let parsed = jobs::parse_result(&r).unwrap();
-            let out = jobs::complete(&pool, &job, &r, parsed, &AccessScope::Admin, true)
-                .await
-                .unwrap();
+            let out = jobs::complete(
+                &pool,
+                &job,
+                &r,
+                parsed,
+                env.fx.user_id,
+                &AccessScope::Admin,
+                true,
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(out, jobs::Completed::Ineligible { .. }),
                 "{what}: {out:?}"
@@ -2699,6 +2798,293 @@ mod db_tests {
             "{b}"
         );
         assert_eq!(env.current().await["tools"][0]["name"], "newest");
+        env.cleanup().await;
+    }
+
+    /// #5465: a claim is bound to the principal that took it. Another
+    /// `mcp:introspect` worker holding the claim token gets exactly the
+    /// wrong-token `409 mcp_claim_invalid`, for a result or a retry, valid
+    /// or invalid, through the handler and the service alike; nothing is
+    /// stored, audited or ended, and the claimant still completes, audited
+    /// as itself. A claim with no recorded owner (taken before migration
+    /// 338) is completable by no one and is reaped as usual.
+    #[tokio::test]
+    async fn a_claim_completes_only_for_its_owner() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let version = env.artifact("1.0.0").await;
+        let pool = env.fx.pool.clone();
+        let (b_user, b_name) = tdh::create_service_account(&pool).await;
+        let worker_b = || env.introspector_as(b_user, &b_name);
+
+        // Worker A claims through the API: the claim records A.
+        let (s, job) = call(
+            env.introspector(),
+            "POST",
+            "/jobs/claim",
+            Some(json!({"kinds": ["remote_probe"], "workerId": "worker-a"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{job}");
+        assert_eq!(job["server"]["artifactId"], version.to_string());
+        let id = Uuid::parse_str(job["jobId"].as_str().unwrap()).unwrap();
+        let token = job["claimToken"].as_str().unwrap().to_string();
+        let row = jobs::get_job(&pool, id).await.unwrap().unwrap();
+        assert_eq!(row.claimed_by_user_id, Some(env.fx.user_id));
+        let complete = format!("/jobs/{id}/complete");
+
+        // The reference answer: a token that is not this job's.
+        let (s, wrong_token) = call(
+            worker_b(),
+            "POST",
+            &complete,
+            Some(ok_result("not-the-token", json!([{"name": "x"}]))),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{wrong_token}");
+        assert_eq!(wrong_token["error"], "mcp_claim_invalid");
+
+        let claimed = job_state(&pool, id).await;
+        for result in [
+            ok_result(&token, json!([{"name": "foreign"}])),
+            json!({"claimToken": token, "outcome": "timeout"}),
+            // Invalid metadata is not even read: no oracle either way.
+            json!({"claimToken": token, "outcome": "ok", "ttlMs": -1}),
+            json!({"claimToken": token, "outcome": "nope"}),
+        ] {
+            let (s, body) = call(worker_b(), "POST", &complete, Some(result.clone())).await;
+            assert_eq!(
+                (s, &body),
+                (StatusCode::CONFLICT, &wrong_token),
+                "{result}: indistinguishable from a wrong token"
+            );
+            assert_eq!(job_state(&pool, id).await, claimed, "{result}");
+        }
+        // Past the handler (a caller that skipped `claim_matches`), the
+        // transaction's claim lock refuses B too.
+        let r: jobs::WorkerResult =
+            serde_json::from_value(ok_result(&token, json!([{"name": "foreign"}]))).unwrap();
+        let out = jobs::complete(
+            &pool,
+            &row,
+            &r,
+            jobs::parse_result(&r).unwrap(),
+            b_user,
+            &AccessScope::Admin,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, jobs::Completed::ClaimLost), "{out:?}");
+        assert_eq!(job_state(&pool, id).await, claimed);
+        assert_eq!(snapshot_count(&env, version).await, 0);
+        assert_eq!(env.current().await["source"], "publisher_declared");
+
+        // A, the owner, completes its claim; the snapshot and the audit
+        // record name A.
+        let (s, body) = call(
+            env.introspector(),
+            "POST",
+            &complete,
+            Some(ok_result(&token, json!([{"name": "get_weather"}]))),
+        )
+        .await;
+        assert_eq!(
+            (s, body["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{body}"
+        );
+        let reported_by: Option<Uuid> =
+            sqlx::query_scalar("SELECT reported_by FROM mcp_capability_snapshots WHERE id = $1")
+                .bind(Uuid::parse_str(body["snapshotId"].as_str().unwrap()).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reported_by, Some(env.fx.user_id));
+        let audits = env
+            .ingest_audits(version, 1, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            audits,
+            vec![Some(env.fx.user_id)],
+            "audited as the completing worker"
+        );
+        assert_eq!(snapshot_count(&env, version).await, 1);
+
+        // A claim without a recorded owner: no one completes it, and the
+        // reaper returns it to the queue once its lease expires.
+        let unowned = env
+            .claim_target_as(version, "remote:0", "tok-legacy", None)
+            .await;
+        let claimed = job_state(&pool, unowned.id).await;
+        for worker in [env.introspector(), worker_b()] {
+            let (s, body) = call(
+                worker,
+                "POST",
+                &format!("/jobs/{}/complete", unowned.id),
+                Some(ok_result("tok-legacy", json!([{"name": "legacy"}]))),
+            )
+            .await;
+            assert_eq!((s, &body), (StatusCode::CONFLICT, &wrong_token));
+        }
+        assert_eq!(job_state(&pool, unowned.id).await, claimed);
+        env.exec(
+            "UPDATE mcp_introspection_jobs SET lease_expires_at = NOW() - INTERVAL '1 second' \
+             WHERE id = $1",
+            unowned.id,
+        )
+        .await;
+        jobs::reap_expired(&pool).await.unwrap();
+        let reaped = jobs::get_job(&pool, unowned.id).await.unwrap().unwrap();
+        assert_eq!(reaped.status, "pending");
+        assert_eq!(snapshot_count(&env, version).await, 1);
+
+        env.cleanup().await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(b_user)
+            .execute(&pool)
+            .await;
+    }
+
+    /// #5466: a result whose observation or cache metadata is invalid (an
+    /// `observedAt` beyond the clock-skew window, an unknown `cacheScope`, a
+    /// negative or too large `ttlMs`) is refused with `400
+    /// mcp_invalid_result_metadata` before anything is locked: no snapshot,
+    /// no current-view change, no audit, no job transition, and the claim
+    /// stays usable, so the worker's corrected result then completes. The
+    /// boundaries (in-window future `observedAt`, `ttlMs` 0 and the cap, both
+    /// scopes) are accepted.
+    #[tokio::test]
+    async fn invalid_result_metadata_stores_nothing() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let version = env.artifact("1.0.0").await;
+        let pool = env.fx.pool.clone();
+        let job = env.claim_probe(version, "tok-meta").await;
+        let claimed = job_state(&pool, job.id).await;
+        let skew = chrono::Duration::seconds(caps::OBSERVED_AT_SKEW_SECS);
+        let with = |extra: Value| {
+            let mut r = ok_result("tok-meta", json!([{"name": "tainted"}]));
+            for (k, v) in extra.as_object().unwrap() {
+                r[k] = v.clone();
+            }
+            r
+        };
+        let far = Utc::now() + chrono::Duration::days(365);
+        let past_skew = Utc::now() + skew + chrono::Duration::seconds(60);
+        for (result, field) in [
+            (with(json!({"cacheScope": "shared"})), "cacheScope"),
+            (with(json!({"cacheScope": "PUBLIC"})), "cacheScope"),
+            (with(json!({"ttlMs": -1})), "ttlMs"),
+            (with(json!({"ttlMs": jobs::MAX_TTL_MS + 1})), "ttlMs"),
+            (with(json!({"ttlMs": i64::MAX})), "ttlMs"),
+            (with(json!({"observedAt": far})), "observedAt"),
+            (with(json!({"observedAt": past_skew})), "observedAt"),
+            // A retry carries no snapshot, but its metadata is checked too.
+            (
+                json!({"claimToken": "tok-meta", "outcome": "timeout", "ttlMs": -5}),
+                "ttlMs",
+            ),
+        ] {
+            let (s, b) = env.complete(job.id, result.clone()).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{result}: {b}");
+            assert_eq!(b["error"], "mcp_invalid_result_metadata", "{b}");
+            assert_eq!(b["field"], field, "{b}");
+            assert_eq!(job_state(&pool, job.id).await, claimed, "{result}");
+            assert_eq!(snapshot_count(&env, version).await, 0, "{result}");
+        }
+        // The service entry point refuses before it locks anything: with the
+        // job row locked elsewhere it still answers at once.
+        let side = crate::testing::try_pool_with(1).await.expect("side pool");
+        let mut holder = side.begin().await.unwrap();
+        sqlx::query("SELECT id FROM mcp_introspection_jobs WHERE id = $1 FOR UPDATE")
+            .bind(job.id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let r: jobs::WorkerResult =
+            serde_json::from_value(with(json!({"cacheScope": "shared"}))).unwrap();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            jobs::complete(
+                &pool,
+                &job,
+                &r,
+                jobs::parse_result(&r).unwrap(),
+                env.fx.user_id,
+                &AccessScope::Admin,
+                true,
+            ),
+        )
+        .await
+        .expect("refused without waiting on the claim lock")
+        .unwrap();
+        assert!(
+            matches!(&out, jobs::Completed::Invalid(e) if e.path == "cacheScope"),
+            "{out:?}"
+        );
+        holder.rollback().await.unwrap();
+        assert_eq!(env.current().await["source"], "publisher_declared");
+        assert!(
+            env.ingest_audits(version, 1, std::time::Duration::from_millis(500))
+                .await
+                .is_empty(),
+            "no audit record for a refused result"
+        );
+
+        // The claim stayed usable: the corrected result completes. An
+        // `observedAt` inside the skew window is stored as of its arrival;
+        // `ttlMs` 0 and `private` are valid.
+        let ahead = Utc::now() + chrono::Duration::seconds(60);
+        let (s, b) = env
+            .complete(
+                job.id,
+                with(json!({"observedAt": ahead, "ttlMs": 0, "cacheScope": "private"})),
+            )
+            .await;
+        assert_eq!(
+            (s, b["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{b}"
+        );
+        let (observed_at, ttl_ms, scope): (DateTime<Utc>, Option<i64>, Option<String>) =
+            sqlx::query_as(
+                "SELECT observed_at, ttl_ms, cache_scope FROM mcp_capability_snapshots \
+                 WHERE id = $1",
+            )
+            .bind(Uuid::parse_str(b["snapshotId"].as_str().unwrap()).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(observed_at < ahead, "clamped to arrival: {observed_at}");
+        assert_eq!((ttl_ms, scope.as_deref()), (Some(0), Some("private")));
+        // The cap and `public` are valid too.
+        let job = env.claim_probe(version, "tok-cap").await;
+        let (s, b) = env
+            .complete(
+                job.id,
+                json!({"claimToken": "tok-cap", "outcome": "ok", "tools": [{"name": "capped"}],
+                       "ttlMs": jobs::MAX_TTL_MS, "cacheScope": "public"}),
+            )
+            .await;
+        assert_eq!(
+            (s, b["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{b}"
+        );
+        assert_eq!(snapshot_count(&env, version).await, 2);
         env.cleanup().await;
     }
 
