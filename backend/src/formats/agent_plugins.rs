@@ -946,7 +946,7 @@ pub fn build_versions_index(
 
 /// A strong ETag over a serialised document.
 pub fn document_etag(body: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
     format!("\"{:x}\"", Sha256::digest(body))
 }
 
@@ -1243,7 +1243,7 @@ impl FormatHandler for AgentPluginsHandler {
     async fn parse_metadata(&self, path: &str, content: &Bytes) -> Result<Value> {
         let mut meta = Self::inspect(path, content)?;
         {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             meta.sha256 = format!("{:x}", Sha256::digest(content));
         }
         meta.size_bytes = content.len() as i64;

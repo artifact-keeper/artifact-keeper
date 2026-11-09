@@ -573,6 +573,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # One cryptographic provider in the whole graph (#5578): no ring, no
+      # OpenSSL, no native-tls. A crate with a `native-tls` default feature
+      # is the usual way this regresses, so it runs before clippy on every PR.
+      - name: Assert a single crypto provider (aws-lc-rs)
+        run: ./scripts/ci/check-crypto-provider.sh
+
       # Forbidden-pattern gate (#1316): authorization on API-token scopes must
       # use the canonical `token_service::scopes_grant_access` helper, never an
       # inline `== "admin"` / `.any(|s| s == "admin")` raw-string scope match.

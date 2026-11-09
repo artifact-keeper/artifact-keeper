@@ -3011,7 +3011,8 @@ mod tests {
         // hardcoded credential-looking string, so the fixture password is
         // assembled at runtime.
         let test_password = ["real", "test", "password"].join("-");
-        let pwd_hash = bcrypt::hash(&test_password, 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt(&test_password, 4).expect("bcrypt hash");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&pwd_hash)
             .bind(user_id)

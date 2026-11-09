@@ -9,6 +9,7 @@
 //!   POST /alpine/{repo_key}/upload                                        - Upload package (alternative)
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -19,10 +20,10 @@ use axum::Extension;
 use axum::Router;
 use base64::Engine as _;
 use bytes::Bytes;
+use digest::Digest as _;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::StreamExt as _;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
 use tracing::info;
@@ -3615,7 +3616,7 @@ mod tests {
 
     /// A 2048-bit RSA key pair, as `(private, public)`.
     fn test_rsa_keypair() -> (rsa::RsaPrivateKey, rsa::RsaPublicKey) {
-        let mut rng = rsa::rand_core::OsRng;
+        let mut rng = crate::crypto::rng::ModuleRng;
         let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
         let public = rsa::RsaPublicKey::from(&private);
         (private, public)
@@ -3769,7 +3770,8 @@ mod tests {
 
         // The digest is not interchangeable: apk maps the `RSA` infix to SHA-1
         // only, so a SHA-256 signature under the same entry name is rejected.
-        let sha256_verifier = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(public);
+        let sha256_verifier =
+            rsa::pkcs1v15::VerifyingKey::<crate::crypto::digest::Sha256>::new(public);
         assert!(
             sha256_verifier
                 .verify(

@@ -6,6 +6,7 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
+use crate::crypto::digest::Sha256;
 use crate::models::migration::{MigrationItemType, MigrationJobStatus};
 use crate::services::artifact_service::ArtifactService;
 use crate::services::artifactory_client::ArtifactoryClient;
@@ -15,8 +16,8 @@ use crate::services::migration_service::{
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::source_registry::SourceRegistry;
 use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
+use digest::Digest as _;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;

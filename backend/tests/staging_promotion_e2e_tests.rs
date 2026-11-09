@@ -222,7 +222,7 @@ struct Uploaded {
 /// Write `content` into `repo`'s storage and insert the matching `artifacts`
 /// row, the way an upload would.
 async fn upload_artifact(pool: &PgPool, repo: &Repo, name: &str, content: &[u8]) -> Uploaded {
-    use sha2::{Digest, Sha256};
+    use artifact_keeper_backend::crypto::digest::Sha256;
 
     let id = Uuid::new_v4();
     let path = format!("e2e/{}", name);
@@ -1820,7 +1820,7 @@ async fn test_validation_refusal_matches_its_published_status() {
 /// Write one content-addressed OCI object into `repo`'s storage and return its
 /// `sha256:` digest.
 fn write_oci_object(repo: &Repo, prefix: &str, content: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use artifact_keeper_backend::crypto::digest::Sha256;
     let digest = format!("sha256:{:x}", Sha256::digest(content));
     let path = repo.object_path(&format!("{}{}", prefix, digest));
     std::fs::create_dir_all(path.parent().expect("object path has a parent"))

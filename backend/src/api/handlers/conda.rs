@@ -43,7 +43,8 @@ use axum::Router;
 use bytes::Bytes;
 
 use super::upload_body::UploadBody;
-use sha2::{Digest, Sha256};
+use crate::crypto::digest::Sha256;
+use digest::Digest as _;
 use tracing::info;
 
 use crate::api::handlers::cache_headers::{check_conditional_request, compute_etag};
@@ -8947,7 +8948,9 @@ async fn store_attestation(
         );
         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
     })?;
-    let mut artifact_digest = Sha256::new();
+    // sigstore-rs boundary (#5585): the verifier consumes its own hasher type.
+    #[allow(clippy::disallowed_types)]
+    let mut artifact_digest = <sha2::Sha256 as sha2::Digest>::new();
     {
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
@@ -8958,7 +8961,7 @@ async fn store_attestation(
                 );
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             })?;
-            artifact_digest.update(&chunk);
+            sha2::Digest::update(&mut artifact_digest, &chunk);
         }
     }
 
@@ -15065,7 +15068,7 @@ mod tests {
         use rsa::{RsaPrivateKey, RsaPublicKey};
 
         // Generate a fresh RSA-2048 key pair
-        let mut rng = rsa::rand_core::OsRng;
+        let mut rng = crate::crypto::rng::ModuleRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
         let public_key = RsaPublicKey::from(&private_key);
 
@@ -15094,12 +15097,12 @@ mod tests {
 
         // Sign with the private key (compact JSON, matching repodata_json_sig handler)
         let json_bytes = serde_json::to_vec(&repodata).unwrap();
-        let signing_key = RsaSigningKey::<sha2::Sha256>::new(private_key);
+        let signing_key = RsaSigningKey::<crate::crypto::digest::Sha256>::new(private_key);
         let signature = signing_key.sign(&json_bytes);
 
         // Verify with the public key (PEM round-trip)
         let parsed_pub = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
-        let verifying_key = VerifyingKey::<sha2::Sha256>::new(parsed_pub);
+        let verifying_key = VerifyingKey::<crate::crypto::digest::Sha256>::new(parsed_pub);
         assert!(
             verifying_key.verify(&json_bytes, &signature).is_ok(),
             "Signature should verify against the public key"
@@ -23433,7 +23436,7 @@ mod virtual_channel_tests {
         );
         let public = rsa::RsaPublicKey::from_public_key_pem(std::str::from_utf8(&pem).unwrap())
             .expect("repo.pub parses");
-        let verifier = VerifyingKey::<sha2::Sha256>::new(public);
+        let verifier = VerifyingKey::<crate::crypto::digest::Sha256>::new(public);
         let signature = Signature::try_from(&sig[..]).expect("signature bytes");
         assert!(
             verifier.verify(&repodata, &signature).is_ok(),

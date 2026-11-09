@@ -44,14 +44,13 @@
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
 //! ```
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bytes::{Bytes, BytesMut};
 use chrono::{Duration as ChronoDuration, Utc};
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -62,8 +61,6 @@ use crate::storage::public_endpoint::{public_endpoint_from_env, EndpointPath};
 use crate::storage::{
     PresignedUrl, PresignedUrlSource, PutStreamResult, StorageBackend, StoragePathFormat,
 };
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// How the backend authenticates to Azure Blob Storage.
 #[derive(Debug, Clone)]
@@ -962,10 +959,10 @@ impl AzureBackend {
         account_name: &str,
         string_to_sign: &str,
     ) -> Result<String> {
-        let mut mac = HmacSha256::new_from_slice(decoded_key)
-            .map_err(|e| AppError::Storage(format!("Failed to create HMAC: {}", e)))?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = BASE64.encode(mac.finalize().into_bytes());
+        let signature = BASE64.encode(crate::crypto::hmac::sha256(
+            decoded_key,
+            string_to_sign.as_bytes(),
+        ));
         Ok(format!("SharedKey {}:{}", account_name, signature))
     }
 
@@ -1323,10 +1320,10 @@ impl AzureBackend {
             // rscc, rscd, rsce, rscl, rsct - empty
         );
 
-        let mut mac = HmacSha256::new_from_slice(decoded_key)
-            .map_err(|e| AppError::Storage(format!("Failed to create HMAC: {}", e)))?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = BASE64.encode(mac.finalize().into_bytes());
+        let signature = BASE64.encode(crate::crypto::hmac::sha256(
+            decoded_key,
+            string_to_sign.as_bytes(),
+        ));
 
         let sas_token = format!(
             "sv={}&st={}&se={}&sr={}&sp={}&spr={}&sig={}",
@@ -1752,10 +1749,10 @@ impl AzureBackend {
             signed_version,
             signed_resource,
         );
-        let mut mac = HmacSha256::new_from_slice(decoded_key)
-            .map_err(|e| AppError::Storage(format!("Failed to create HMAC: {}", e)))?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = BASE64.encode(mac.finalize().into_bytes());
+        let signature = BASE64.encode(crate::crypto::hmac::sha256(
+            decoded_key,
+            string_to_sign.as_bytes(),
+        ));
         Ok(format!(
             "sv={}&st={}&se={}&sr={}&sp={}&spr={}&sig={}",
             urlencoding::encode(signed_version),

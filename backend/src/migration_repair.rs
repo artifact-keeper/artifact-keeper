@@ -81,7 +81,7 @@ pub async fn repair_legacy_073_checksum(db: &PgPool) -> Result<()> {
     }
 
     let current_file = include_str!("../migrations/073_account_lockout.sql");
-    use sha2::{Digest, Sha384};
+    use crate::crypto::digest::Sha384;
     let mut hasher = Sha384::new();
     hasher.update(current_file.as_bytes());
     let current_checksum = hasher.finalize().to_vec();
@@ -304,7 +304,7 @@ pub async fn repair_release_1_1_9_divergence(db: &PgPool) -> Result<()> {
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     // 4. Rewrite the stored checksums to the current main file SHA-384s.
-    use sha2::{Digest, Sha384};
+    use crate::crypto::digest::Sha384;
     for (version, file) in [
         (73i64, include_str!("../migrations/073_account_lockout.sql")),
         (
@@ -335,7 +335,7 @@ pub async fn repair_release_1_1_9_divergence(db: &PgPool) -> Result<()> {
 /// keys below directly from the embedded migration files, so they can
 /// never drift out of sync with what the migrator computes.
 fn migration_sha384(sql: &str) -> Vec<u8> {
-    use sha2::{Digest, Sha384};
+    use crate::crypto::digest::Sha384;
     let mut hasher = Sha384::new();
     hasher.update(sql.as_bytes());
     hasher.finalize().to_vec()
@@ -704,7 +704,7 @@ mod tests {
     /// reproduced verbatim here so the test runs without git access.
     #[test]
     fn v1_1_9_checksum_constants_match_release_files() {
-        use sha2::{Digest, Sha384};
+        use crate::crypto::digest::Sha384;
 
         // Verbatim contents of backend/migrations/073_download_tickets_cascade.sql at v1.1.9.
         let v1_1_9_073 = "-- Add ON DELETE CASCADE to download_tickets.user_id.\n--\n-- Migration 039 created the table with a plain `REFERENCES users(id)`, which\n-- defaults to `ON DELETE NO ACTION`. That meant deleting a user with\n-- outstanding (typically about-to-expire) tickets would fail with a foreign-key\n-- violation. Tickets are short-lived (30s TTL) and single-use, so cascading on\n-- delete is correct: the tickets become invalid the moment the user does.\n--\n-- We drop the old constraint by inspecting the system catalog rather than\n-- naming it explicitly, because Postgres auto-generates the constraint name\n-- (`download_tickets_user_id_fkey` is conventional but not guaranteed).\nDO $$\nDECLARE\n    fk_name text;\nBEGIN\n    SELECT con.conname INTO fk_name\n    FROM pg_constraint con\n    JOIN pg_class rel ON rel.oid = con.conrelid\n    JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey)\n    WHERE rel.relname = 'download_tickets'\n      AND att.attname = 'user_id'\n      AND con.contype = 'f';\n\n    IF fk_name IS NOT NULL THEN\n        EXECUTE format('ALTER TABLE download_tickets DROP CONSTRAINT %I', fk_name);\n    END IF;\nEND $$;\n\nALTER TABLE download_tickets\n    ADD CONSTRAINT download_tickets_user_id_fkey\n    FOREIGN KEY (user_id)\n    REFERENCES users(id)\n    ON DELETE CASCADE;\n";
@@ -927,7 +927,7 @@ mod tests {
         //    SHA-384s (i.e. what sqlx::migrate will compute against
         //    the on-disk files), so the next `sqlx::migrate!().run()`
         //    no longer aborts with VersionMismatch.
-        use sha2::{Digest, Sha384};
+        use crate::crypto::digest::Sha384;
         for (version, file) in [
             (73i64, include_str!("../migrations/073_account_lockout.sql")),
             (

@@ -55,7 +55,8 @@ fn basic_auth_header(username: &str, password: &str) -> String {
 
 async fn create_test_user(pool: &PgPool, username: &str, password: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let hash = bcrypt::hash(password, 4).expect("bcrypt hash failed");
+    let hash = artifact_keeper_backend::crypto::password::hash_bcrypt(password, 4)
+        .expect("bcrypt hash failed");
     sqlx::query(
         r#"
         INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
@@ -133,7 +134,7 @@ async fn cleanup(pool: &PgPool, repo_ids: &[Uuid], user_id: Uuid) {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use artifact_keeper_backend::crypto::digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())

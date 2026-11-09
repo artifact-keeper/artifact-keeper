@@ -60,6 +60,7 @@
 //!   - "artifactory": 1-level sharding {sha[0:2]}/{sha} (JFrog Artifactory format)
 //!   - "migration": Write native, read from both (for zero-downtime migration)
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
@@ -68,7 +69,6 @@ use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer};
 use object_store::multipart::{MultipartStore, PartId};
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
-use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -4608,11 +4608,8 @@ mod tests {
     /// Independent of object_store's signer, so it proves which host the
     /// signature actually covers.
     fn presigned_signature_valid_for_host(url: &url::Url, host: &str, secret: &str) -> bool {
-        use hmac::{Hmac, Mac};
         fn hmac(key: &[u8], data: &str) -> Vec<u8> {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
-            mac.update(data.as_bytes());
-            mac.finalize().into_bytes().to_vec()
+            crate::crypto::hmac::sha256(key, data.as_bytes()).to_vec()
         }
         let mut pairs: Vec<(String, String)> = url
             .query_pairs()
@@ -4738,7 +4735,7 @@ mod tests {
 
     fn test_cloudfront_config() -> CloudFrontConfig {
         use rsa::pkcs8::EncodePrivateKey;
-        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut crate::crypto::rng::ModuleRng, 1024).unwrap();
         CloudFrontConfig {
             distribution_url: "https://d1234.cloudfront.net".to_string(),
             key_pair_id: "KTEST4417".to_string(),

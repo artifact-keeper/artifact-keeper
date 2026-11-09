@@ -40,11 +40,10 @@
 //! `UPDATE webhook_signing_keys SET retired_at = NOW() WHERE retired_at IS NULL;`
 //! a new key is created on next use, and receivers pick it up from the JWKS.
 
+use crate::crypto::digest::Sha256;
+use crate::crypto::signature::Ed25519KeyPair;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::Rng;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -99,7 +98,7 @@ fn classify_crypto_error(e: WebhookSecretError) -> SigningKeyError {
 #[derive(Clone)]
 pub struct InstanceSigningKey {
     kid: String,
-    signing_key: SigningKey,
+    signing_key: Ed25519KeyPair,
 }
 
 impl std::fmt::Debug for InstanceSigningKey {
@@ -114,16 +113,15 @@ impl std::fmt::Debug for InstanceSigningKey {
 impl InstanceSigningKey {
     /// Build a key from its 32-byte Ed25519 seed (the RFC 8032 private key).
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes(seed);
-        let kid = jwk_thumbprint(&signing_key.verifying_key().to_bytes());
+        let signing_key = Ed25519KeyPair::from_seed(seed).expect("a 32-byte seed is always valid");
+        let kid = jwk_thumbprint(&signing_key.public_key());
         Self { kid, signing_key }
     }
 
     /// Generate a fresh key from the OS CSPRNG.
     pub fn generate() -> Self {
-        let mut seed = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(seed.as_mut());
-        Self::from_seed(&seed)
+        // Seed from the module DRBG (#5585); the key pair holds the only copy.
+        Self::from_seed(Ed25519KeyPair::generate().seed())
     }
 
     /// RFC 7638 thumbprint of the public key; the `kid` in JWKS and `v2=`.
@@ -133,7 +131,7 @@ impl InstanceSigningKey {
 
     /// Raw 32-byte Ed25519 public key.
     pub fn public_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.verifying_key().to_bytes()
+        self.signing_key.public_key()
     }
 
     /// Sign `"<unix_secs>.<webhook_id>.<body>"` and return the signature
@@ -143,7 +141,7 @@ impl InstanceSigningKey {
         let sig = self
             .signing_key
             .sign(&signed_message(unix_secs, webhook_id, body));
-        B64URL.encode(sig.to_bytes())
+        B64URL.encode(sig)
     }
 
     /// The public JWK for this key.
@@ -223,20 +221,17 @@ impl Jwk {
         let Ok(x) = B64URL.decode(&self.x) else {
             return false;
         };
-        let Ok(x) = <[u8; 32]>::try_from(x.as_slice()) else {
-            return false;
-        };
-        let Ok(key) = VerifyingKey::from_bytes(&x) else {
-            return false;
-        };
         let Ok(sig) = B64URL.decode(sig_b64url) else {
             return false;
         };
-        let Ok(sig) = Signature::from_slice(&sig) else {
-            return false;
-        };
-        key.verify(&signed_message(unix_secs, webhook_id, body), &sig)
-            .is_ok()
+        // Verification on the module (#5585); key and signature lengths are
+        // checked inside.
+        crate::crypto::signature::ed25519_verify(
+            &x,
+            &signed_message(unix_secs, webhook_id, body),
+            &sig,
+        )
+        .is_ok()
     }
 }
 
@@ -293,7 +288,7 @@ pub async fn ensure_instance_key(db: &PgPool) -> Result<InstanceSigningKey, Sign
     }
 
     let fresh = InstanceSigningKey::generate();
-    let encrypted = webhook_secret_crypto::encrypt_bytes(fresh.signing_key.as_bytes())
+    let encrypted = webhook_secret_crypto::encrypt_bytes(fresh.signing_key.seed())
         .map_err(classify_crypto_error)?;
     sqlx::query(
         "INSERT INTO webhook_signing_keys (kid, public_key, private_key_encrypted) \

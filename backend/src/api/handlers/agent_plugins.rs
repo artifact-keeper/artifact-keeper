@@ -646,7 +646,7 @@ mod remote {
             return false;
         }
         tokio::task::spawn_blocking(move || {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             format!("{:x}", Sha256::digest(&content)) == expected
         })
         .await
@@ -1197,7 +1197,7 @@ mod tests {
     /// Publish -> 201 fields -> download headers and bytes -> 409.
     #[tokio::test]
     async fn publish_download_and_conflict_5251() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let Some(fx) = tdh::Fixture::setup("local", "agentplugins").await else {
             return;
         };
@@ -1294,7 +1294,7 @@ mod tests {
         };
         let zip_bytes = claude_zip("counted", "1.0.0");
         let sha = {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             format!("{:x}", Sha256::digest(&zip_bytes))
         };
         let (status, body) = publish(&fx, "counted", "1.0.0", zip_bytes).await;
@@ -1469,7 +1469,7 @@ mod tests {
                 .await
                 .unwrap();
         // A correct checksum is accepted.
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let mut req = put_zip(&fx, "p", "1.0.0", ok.clone());
         req.headers_mut().insert(
             CHECKSUM_HEADER,
@@ -2057,7 +2057,7 @@ mod tests {
 
     /// One version as the central AK lists it.
     fn central_version(name: &str, version: &str, zip: &[u8]) -> IndexedVersion {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         IndexedVersion {
             name: name.into(),
             version: version.into(),

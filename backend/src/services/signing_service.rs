@@ -3,6 +3,7 @@
 //! Provides key generation, storage (encrypted), and signing operations
 //! for Debian/APT, RPM/YUM, Alpine/APK, and Conda repositories.
 
+use crate::crypto::digest::{Sha256, Sha512};
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{
     RepositorySigningConfig, SigningKey, SigningKeyPublic, SigningKeyTrustAttestation,
@@ -22,7 +23,6 @@ use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
 use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -1204,7 +1204,7 @@ impl SigningService {
         // under load. Run on the blocking pool so the async runtime stays free
         // to service other requests.
         run_blocking("rsa_keygen", move || {
-            let mut rng = rsa::rand_core::OsRng;
+            let mut rng = crate::crypto::rng::ModuleRng;
             let private_key = RsaPrivateKey::new(&mut rng, bits)
                 .map_err(|e| AppError::Internal(format!("Failed to generate RSA key: {}", e)))?;
             let public_key = RsaPublicKey::from(&private_key);
@@ -2842,7 +2842,7 @@ mod tests {
     /// Generate a real RSA key pair, encrypt the private key with the given
     /// passphrase, and return a SigningKey model struct suitable for sign_with_key.
     fn generate_test_signing_key(passphrase: &str) -> SigningKey {
-        let mut rng = rsa::rand_core::OsRng;
+        let mut rng = crate::crypto::rng::ModuleRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("keygen failed");
         let public_key = RsaPublicKey::from(&private_key);
 
@@ -2859,7 +2859,7 @@ mod tests {
         let public_der = public_key
             .to_public_key_der()
             .expect("pub der encode failed");
-        let fingerprint = hex::encode(sha2::Sha256::digest(public_der.as_ref()));
+        let fingerprint = hex::encode(crate::crypto::digest::Sha256::digest(public_der.as_ref()));
         let key_id = fingerprint[fingerprint.len() - 16..].to_string();
 
         let now = Utc::now();

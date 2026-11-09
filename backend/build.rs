@@ -68,9 +68,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rustc-env=RELEASE_DATE_FLOOR_EPOCH={release_date_floor}");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
+    emit_crypto_module_versions();
     emit_test_shard_cfg();
 
     Ok(())
+}
+
+/// Bake the resolved versions of the cryptographic provider into the binary
+/// (#5579, #5581) so `/health` and the image labels can name the exact
+/// module. Read from `Cargo.lock` rather than a dependency's own API because
+/// neither `aws-lc-rs` nor the `-sys` crates expose their version at run time.
+fn emit_crypto_module_versions() {
+    let lock = std::fs::read_to_string("../Cargo.lock").unwrap_or_default();
+    let version_of = |name: &str| -> String {
+        let header = format!("name = \"{name}\"");
+        lock.lines()
+            .skip_while(|l| l.trim() != header)
+            .nth(1)
+            .and_then(|l| l.trim().strip_prefix("version = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    println!(
+        "cargo:rustc-env=AWS_LC_RS_VERSION={}",
+        version_of("aws-lc-rs")
+    );
+    println!(
+        "cargo:rustc-env=AWS_LC_SYS_VERSION={}",
+        version_of("aws-lc-sys")
+    );
+    println!(
+        "cargo:rustc-env=AWS_LC_FIPS_SYS_VERSION={}",
+        version_of("aws-lc-fips-sys")
+    );
+    println!("cargo:rerun-if-changed=../Cargo.lock");
 }
 
 /// CI test shards, in the order scripts/ci/test-shards.py lists them. Keep

@@ -4873,7 +4873,7 @@ mod tests {
     fn test_keys() -> &'static [rsa::RsaPrivateKey; 2] {
         static KEYS: std::sync::OnceLock<[rsa::RsaPrivateKey; 2]> = std::sync::OnceLock::new();
         KEYS.get_or_init(|| {
-            let gen = || rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+            let gen = || rsa::RsaPrivateKey::new(&mut crate::crypto::rng::ModuleRng, 2048).unwrap();
             [gen(), gen()]
         })
     }

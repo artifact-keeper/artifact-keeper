@@ -477,7 +477,7 @@ mod db_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
     use bytes::Bytes;
-    use sha2::Digest;
+    use digest::Digest as _;
 
     /// #5168: a filesystem object whose name holds `.tmp.` is an object like
     /// any other: reindex recovers it, while a staging file of an atomic write
@@ -624,7 +624,10 @@ mod db_tests {
         assert_eq!(live.registered, 1, "{live:?}");
         assert_eq!(live.skipped, 1, "the .sha1 sidecar is row-less: {live:?}");
         assert_eq!(live.missing_objects, 1, "{live:?}");
-        assert_eq!(row.0.trim(), hex::encode(sha2::Sha256::digest(&body)));
+        assert_eq!(
+            row.0.trim(),
+            hex::encode(crate::crypto::digest::Sha256::digest(&body))
+        );
         assert_eq!(row.1, body.len() as i64);
         assert_eq!(row.2, format!("maven/{ghost_path}"));
         assert_eq!(

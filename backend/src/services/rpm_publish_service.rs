@@ -141,6 +141,7 @@ pub async fn create_version(
             {
                 // Brief, growing, jittered backoff so racers do not re-collide
                 // in lockstep.
+                #[allow(clippy::disallowed_methods)] // NON-SECURITY: backoff jitter
                 let jitter: f64 = rand::random();
                 tokio::time::sleep(create_version_retry_backoff(attempt, jitter)).await;
                 tracing::debug!(

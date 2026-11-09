@@ -161,7 +161,7 @@ async fn cleanup(pool: &PgPool, ids: &[Uuid]) {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use artifact_keeper_backend::crypto::digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())

@@ -24,6 +24,36 @@ disallowed-methods = [
     { path = "reqwest::Response::bytes", reason = "STREAMING: buffers the whole upstream body in memory; use .bytes_stream()/streaming copy or a capped read; see #1608" },
     { path = "axum::extract::multipart::Field::bytes", reason = "STREAMING: buffers the whole multipart field in memory; use .chunk() with an incremental hash / put_stream; see #1608" },
     { path = "axum::body::to_bytes", reason = "STREAMING: buffers the whole request/response body in memory; pass a bounded limit and prefer streaming; see #1608" },
+
+    # Cryptographic boundary (#5579). Security functions run on the single
+    # validated provider through `crate::crypto`; these are the entry points
+    # into the non-validated crates. Protocol checksums (MD5/SHA-1/BLAKE2 for
+    # Maven, npm, apk, conda, git) are not security functions and are not
+    # listed; the sha2 *types* are listed below because SHA-2 content digests
+    # feed integrity gates. A legitimate non-security use (backoff jitter,
+    # a test fixture) is annotated
+    # `#[allow(clippy::disallowed_methods)] // NON-SECURITY: <reason>`.
+    { path = "bcrypt::hash", reason = "CRYPTO: use crate::crypto::password (hash_bcrypt for the legacy write path); see #5579" },
+    { path = "bcrypt::verify", reason = "CRYPTO: use crate::crypto::password::verify, which reads both formats; see #5579" },
+    { path = "rand::rng", reason = "CRYPTO: security randomness comes from crate::crypto::rng (module DRBG); jitter may keep rand with a NON-SECURITY allow; see #5579" },
+    { path = "rand::random", reason = "CRYPTO: use crate::crypto::rng; see #5579" },
+    { path = "rand::random_range", reason = "CRYPTO: use crate::crypto::rng::below; jitter may keep rand with a NON-SECURITY allow; see #5579" },
+]
+
+disallowed-types = [
+    { path = "sha2::Sha256", reason = "CRYPTO: use crate::crypto::digest; see #5579" },
+    { path = "sha2::Sha384", reason = "CRYPTO: use crate::crypto::digest; see #5579" },
+    { path = "sha2::Sha512", reason = "CRYPTO: use crate::crypto::digest; see #5579" },
+    { path = "hmac::Hmac", reason = "CRYPTO: use crate::crypto::hmac; see #5579" },
+    { path = "aes_gcm::Aes256Gcm", reason = "CRYPTO: use crate::crypto::aead; see #5579" },
+    { path = "aes_gcm::Aes128Gcm", reason = "CRYPTO: use crate::crypto::aead (AES-256-GCM); see #5579" },
+    { path = "ed25519_dalek::SigningKey", reason = "CRYPTO: use crate::crypto::signature::Ed25519KeyPair; see #5579" },
+    { path = "ed25519_dalek::VerifyingKey", reason = "CRYPTO: use crate::crypto::signature::ed25519_verify; see #5579" },
+    { path = "rsa::RsaPrivateKey", reason = "CRYPTO: RSA keys are generated and used through crate::crypto::signature; see #5579, #5586" },
+    { path = "rand::rngs::SysRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
+    { path = "rand::rngs::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
+    { path = "rand08::rngs::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
+    { path = "rsa::rand_core::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
 ]
 
 # result_large_err threshold — see #3551.

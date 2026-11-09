@@ -2035,7 +2035,7 @@ mod tests {
         ) -> (Uuid, String) {
             // Distinct per (name, version) so several versions of one package
             // can be soft-deleted independently.
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             let checksum = format!("{:x}", Sha256::digest(format!("{name}@{version}")));
 
             sqlx::query(

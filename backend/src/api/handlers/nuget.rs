@@ -13,6 +13,7 @@
 //!   GET  /nuget/{repo_key}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg — Download
 //!   PUT  /nuget/{repo_key}/api/v2/package                                     — Push package
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -21,7 +22,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -5452,12 +5452,12 @@ fn build_nuget_search_pattern(query_term: &str) -> String {
 mod tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::crypto::digest::Sha256;
     use axum::body::to_bytes;
     use axum::http::HeaderValue;
     use bytes::Bytes;
     use chrono::Utc;
     use jsonwebtoken::{encode, EncodingKey, Header};
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
 
     fn lazy_pool() -> sqlx::PgPool {
@@ -11138,7 +11138,7 @@ mod virtual_federation_tests {
     /// A virtual must resolve imported mixed-case names in both URL spellings (#5147).
     #[tokio::test]
     async fn virtual_download_resolves_mixed_case_stored_name_5147() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         const BYTES: &[u8] = b"imported nupkg";
         let Some(fx) = tdh::Fixture::setup("virtual", "nuget").await else {

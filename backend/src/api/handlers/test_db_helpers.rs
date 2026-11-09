@@ -620,6 +620,10 @@ fn cfg(storage_path: &str) -> Config {
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        fips_mode: Default::default(),
+        fips_legacy_hash_migration: true,
+        pbkdf2_iterations: 1_000,
+        data_encryption_key: None,
         signature_expiry_seconds: 604_800,
         signing_key_rotation_overlap_secs: 1_209_600,
         signing_auto_migrate_legacy_keys: false,
@@ -2528,7 +2532,7 @@ impl Fixture {
         create_extra: serde_json::Value,
         replication: bool,
     ) -> (StatusCode, Bytes) {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         assert!(
             !payload.is_empty(),
             "chunked_upload needs a non-empty payload (one Content-Range chunk)"

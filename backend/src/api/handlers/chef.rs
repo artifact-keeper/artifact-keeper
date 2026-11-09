@@ -9,6 +9,8 @@
 //!   GET  /chef/{repo_key}/api/v1/cookbooks/{name}/versions/{version}/download - Download tarball
 //!   POST /chef/{repo_key}/api/v1/cookbooks                                  - Upload cookbook
 
+#[cfg(test)]
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Multipart, Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -17,8 +19,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Extension;
 use axum::Router;
-#[cfg(test)]
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -1000,8 +1000,8 @@ mod db_cov_tests {
 #[cfg(test)]
 mod upload_stream_tests {
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::crypto::digest::Sha256;
     use axum::http::StatusCode;
-    use sha2::{Digest, Sha256};
 
     /// Build a `knife`-style cookbook upload body: a `cookbook` JSON metadata
     /// part plus a `tarball` file part.

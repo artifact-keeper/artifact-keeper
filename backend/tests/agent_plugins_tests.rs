@@ -17,11 +17,11 @@ mod common;
 use std::io::Write;
 use std::sync::Arc;
 
+use artifact_keeper_backend::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{middleware, Router};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use artifact_keeper_backend::api::handlers::{agent_plugins, repositories};

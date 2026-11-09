@@ -2687,6 +2687,7 @@ impl ScanResultService {
                 // Another recalculation held the lock; it has finished now.
                 Ok(None) => {}
                 Err(err) if !last && is_score_recalc_conflict(&err) => {
+                    #[allow(clippy::disallowed_methods)] // NON-SECURITY: backoff jitter
                     let jitter: f64 = rand::random();
                     let base_ms = 20 * u64::from(attempt);
                     let jitter_ms = (base_ms as f64 * jitter).round() as u64;

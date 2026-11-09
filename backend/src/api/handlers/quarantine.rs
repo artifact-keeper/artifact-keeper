@@ -1080,7 +1080,7 @@ mod tests {
         let metadata_key = format!("proxy-cache/{}/{path}/__cache_meta__.json", fx.repo_key);
         let body = b"held-proxied-body";
         let checksum = {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             format!("{:x}", Sha256::digest(body.as_slice()))
         };
         let until = Utc::now() + Duration::minutes(45);

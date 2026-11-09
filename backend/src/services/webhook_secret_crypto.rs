@@ -23,7 +23,6 @@ use base64::{
     },
     Engine as _,
 };
-use rand::Rng;
 use thiserror::Error;
 
 use crate::services::encryption::{CredentialEncryption, EncryptionError};
@@ -140,7 +139,7 @@ pub fn ensure_configured() -> Result<()> {
 /// Uses the OS CSPRNG. The unprefixed body has at least 192 bits of entropy.
 pub fn generate_secret() -> String {
     let mut buf = [0u8; RAW_SECRET_BYTES];
-    rand::rng().fill_bytes(&mut buf);
+    crate::crypto::rng::fill(&mut buf);
     let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
     format!("{}{}", SECRET_PREFIX, body)
 }

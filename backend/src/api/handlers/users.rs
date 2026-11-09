@@ -165,15 +165,9 @@ pub struct CreateUserRequest {
 
 /// Generate a secure random password
 pub(crate) fn generate_password() -> String {
-    use rand::RngExt;
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%&*";
-    let mut rng = rand::rng();
-    (0..16)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
+    // Module DRBG, uniform over the alphabet (#5579).
+    crate::crypto::rng::string_from_alphabet(CHARSET, 16)
 }
 
 /// Validate a password against the configurable password policy.
@@ -4340,7 +4334,7 @@ mod password_audit_tests {
         };
         let (user_id, username) = tdh::create_user(&pool).await;
         let current = "OldPass!2026";
-        let hash = bcrypt::hash(current, 4).expect("hash password");
+        let hash = crate::crypto::password::hash_bcrypt(current, 4).expect("hash password");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&hash)
             .bind(user_id)

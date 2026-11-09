@@ -14,6 +14,7 @@ use crate::api::handlers::upload_body::UploadBody;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -23,7 +24,6 @@ use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 

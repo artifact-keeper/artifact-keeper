@@ -10,6 +10,7 @@
 //!   GET  /hex/{repo_key}/versions                      - List all packages with versions
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::CONTENT_TYPE;
@@ -19,7 +20,6 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 use uuid::Uuid;

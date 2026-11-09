@@ -850,7 +850,7 @@ mod tests {
     }
 
     fn sha256_hex_of(data: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let mut hasher = Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())

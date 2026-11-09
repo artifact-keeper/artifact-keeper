@@ -39,9 +39,9 @@
 use std::borrow::Cow;
 use std::io::Read;
 
+use crate::crypto::digest::Sha256;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 /// Largest bundle accepted on upload.
 pub const MCPB_MAX_BYTES: usize = 256 * 1024 * 1024;

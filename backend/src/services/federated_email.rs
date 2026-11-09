@@ -35,7 +35,7 @@
 //!    resolve, so a synthetic address can neither be confused with a real
 //!    mailbox nor collide against one.
 
-use sha2::{Digest, Sha256};
+use crate::crypto::digest::Sha256;
 
 /// Domain for the synthetic address stored when an OIDC provider releases no
 /// usable `email` claim.

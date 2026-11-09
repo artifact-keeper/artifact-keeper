@@ -446,7 +446,7 @@ pub async fn record_analysis(db: &PgPool, input: PackageAnalysisInput) -> Result
         if conda_scripts::classify_script_path(path).is_none() {
             continue;
         }
-        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes));
+        let digest = hex::encode(crate::crypto::digest::Sha256::digest(bytes));
         match by_digest.get(&digest) {
             // A path already seen wins only if the incumbent is the recipe's
             // copy and this one is not.
@@ -487,7 +487,7 @@ pub async fn record_analysis(db: &PgPool, input: PackageAnalysisInput) -> Result
                 .await?;
             }
             None => {
-                let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes.as_slice()));
+                let digest = hex::encode(crate::crypto::digest::Sha256::digest(bytes.as_slice()));
                 insert_script(
                     &mut tx,
                     artifact_id,

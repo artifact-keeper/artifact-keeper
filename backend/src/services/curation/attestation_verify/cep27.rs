@@ -47,7 +47,11 @@
 //! explicit operator opt-out accepts an unverified attestation, and then the
 //! failed record is stored with it so the gap stays auditable.
 use serde_json::Value;
-use sha2::Sha256;
+// sigstore-rs verifies the subject digest against its own `sha2::Sha256`
+// hasher type, so this boundary keeps RustCrypto SHA-256 (#5585; listed in
+// docs/fips.md as the one non-module SHA-2 use, verification-only).
+#[allow(clippy::disallowed_types)]
+use sha2::{Digest, Sha256};
 
 use base64::Engine;
 
@@ -383,7 +387,7 @@ fn verify_conda_key_bundle(bundle_json: &Value, input: CondaVerifyInput<'_>) -> 
     mask |= Check::BundleWellFormed.bit();
 
     // 2) Subject binding against the digest this server computed.
-    let artifact_sha256 = hex::encode(sha2::Digest::finalize(input.artifact_digest));
+    let artifact_sha256 = hex::encode(input.artifact_digest.finalize());
     match super::subject_of(&statement) {
         Some((name, sha)) if sha.eq_ignore_ascii_case(&artifact_sha256) => {
             if name != input.expected_filename {

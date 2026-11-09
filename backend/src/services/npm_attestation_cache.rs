@@ -72,9 +72,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::crypto::digest::Sha256;
 use bytes::Bytes;
 use http::StatusCode;
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 

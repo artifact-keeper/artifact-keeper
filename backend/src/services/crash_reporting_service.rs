@@ -4,9 +4,9 @@
 //! All reports are PII-scrubbed before storage or submission.
 //! Strictly opt-in: disabled by default, requires explicit admin toggle.
 
+use crate::crypto::digest::Sha256;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use utoipa::ToSchema;
 use uuid::Uuid;

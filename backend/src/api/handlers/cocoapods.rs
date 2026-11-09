@@ -21,6 +21,7 @@
 //! `Specs/{name}/{version}/...` layout and the `all_specs` JSON listing predate
 //! CDN support and are kept for existing callers.
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -30,7 +31,6 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::info;

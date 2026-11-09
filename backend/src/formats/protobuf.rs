@@ -3,11 +3,11 @@
 //! Implements Buf Schema Registry (BSR) protocol for Protobuf modules.
 //! Supports module commits, labels, label indices, and blob storage.
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::io::Read;
 use tar::Archive;
 

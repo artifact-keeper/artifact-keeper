@@ -1225,7 +1225,7 @@ async fn delete_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
 
     // -----------------------------------------------------------------------
     // #4595: the upload size limit is MAX_UPLOAD_SIZE, not a fixed 2 GiB

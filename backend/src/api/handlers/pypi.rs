@@ -2332,7 +2332,7 @@ async fn serve_remote_metadata(
 /// for them. `None` (no usable fragment) is accepted, exactly as the download
 /// path fetches unverified when the index pins nothing.
 fn wheel_matches_index_digest(wheel: &[u8], expected_sha256: Option<&str>) -> bool {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
     match expected_sha256 {
         Some(expected) => format!("{:x}", Sha256::digest(wheel)) == expected,
         None => true,
@@ -8063,7 +8063,7 @@ mod tests {
     use crate::api::handlers::proxy_helpers::{
         is_over_cap_error, scan_blocked_response, scan_pending_locked_response, sha256_hex,
     };
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
 
     /// #3290: the sibling mapping between the two content-negotiated cache
     /// paths of a Simple project index, in both directions — and `None` for
@@ -15621,7 +15621,7 @@ mod tests {
         let metadata: &[u8] = b"Metadata-Version: 2.1\nName: torch\nVersion: 2.12.0+cpu\n";
         let wheel = wheel_with_metadata("torch-2.12.0+cpu", metadata);
         let pinned = {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             format!("{:x}", Sha256::digest(&wheel))
         };
         let Some((status, body)) = pytorch_remote_metadata_e2e(
@@ -15753,7 +15753,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_metadata_fallback_accepts_wheel_matching_index_digest_3886() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -15807,7 +15807,7 @@ mod tests {
 
     #[test]
     fn wheel_matches_index_digest_pins_only_when_advertised_3886() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let bytes = b"wheel";
         let digest = format!("{:x}", Sha256::digest(bytes));
         assert!(wheel_matches_index_digest(bytes, Some(&digest)));

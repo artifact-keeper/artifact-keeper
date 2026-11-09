@@ -1716,7 +1716,7 @@ mod tests {
 
     #[test]
     fn test_sha256_computation() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let mut hasher = Sha256::new();
         hasher.update(b"test data");
         let result = format!("{:x}", hasher.finalize());
@@ -2336,10 +2336,10 @@ mod virtual_member_authz_tests {
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod multipart_publish_tests {
+    use crate::crypto::digest::Sha256;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
-    use sha2::{Digest, Sha256};
 
     use crate::api::handlers::test_db_helpers as tdh;
 

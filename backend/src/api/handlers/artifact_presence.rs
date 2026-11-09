@@ -505,7 +505,7 @@ mod tests {
     /// Store `content` under its CAS key and insert a live artifact row at
     /// `path` carrying its real SHA-256. Returns `(artifact_id, sha256)`.
     async fn seed(fx: &tdh::Fixture, path: &str, content: &[u8]) -> (Uuid, String) {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let sha = format!("{:x}", Sha256::digest(content));
         let key =
             crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&sha);

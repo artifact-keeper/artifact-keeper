@@ -22,6 +22,7 @@
 //!   DELETE /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages         - Remove every binary of a recipe revision
 //!   DELETE /conan/{repo_key}/v2/conans/{name}/{version}/{user}/{channel}/revisions/{rev}/packages/{pkg_id}/revisions/{pkg_rev} - Remove a package revision
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
@@ -32,7 +33,6 @@ use axum::Extension;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -5317,6 +5317,10 @@ mod tests {
                 s3_region: None,
                 s3_endpoint: None,
                 jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+                fips_mode: Default::default(),
+                fips_legacy_hash_migration: true,
+                pbkdf2_iterations: 1_000,
+                data_encryption_key: None,
                 signature_expiry_seconds: 604_800,
                 signing_key_rotation_overlap_secs: 1_209_600,
                 signing_auto_migrate_legacy_keys: false,
@@ -5512,7 +5516,8 @@ mod tests {
             let id = Uuid::new_v4();
             let username = format!("conan-test-u-{}", id);
             let password = "conan-test-pw".to_string();
-            let hash = bcrypt::hash(&password, 4).expect("bcrypt hash failed");
+            let hash =
+                crate::crypto::password::hash_bcrypt(&password, 4).expect("bcrypt hash failed");
             // Watermark columns backdated 60s: conan tests login via the
             // real endpoint, whose token must not race the DB-clock-stamped
             // creation watermark across node clock skew.
@@ -6963,7 +6968,7 @@ mod tests {
             .expect("format");
             assert_eq!(meta_format, "conan");
 
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             let expected = format!("{:x}", Sha256::digest(body_bytes));
             assert_eq!(checksum, expected);
 
@@ -7021,7 +7026,7 @@ mod tests {
             .expect("count query");
             assert_eq!(count, 1, "re-upload must leave exactly one live row");
 
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             let want = format!("{:x}", Sha256::digest(new_body));
             let got: String = sqlx::query_scalar(
                 "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -7987,9 +7992,9 @@ mod tests {
     #[cfg(test)]
     mod agent4_package_writes {
         use super::test_helpers::*;
+        use crate::crypto::digest::Sha256;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
-        use sha2::{Digest, Sha256};
 
         // ------------------------------------------------------------------
         // package_file_upload: fresh upload → 201 + artifact row + metadata

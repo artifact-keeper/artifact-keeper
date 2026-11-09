@@ -41,9 +41,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
-use rand::Rng;
-use sha2::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -225,13 +222,12 @@ impl Settings {
 type Tag = [u8; 32];
 
 fn credential_tag_with_key(key: &[u8], username: &str, password: &str) -> Tag {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any size");
+    let mut mac = crate::crypto::hmac::Key::sha256(key).context();
     mac.update(b"ldap-basic");
     mac.update(&(username.len() as u32).to_be_bytes());
     mac.update(username.as_bytes());
     mac.update(password.as_bytes());
-    let digest = mac.finalize().into_bytes();
+    let digest = mac.finish();
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&digest);
     tag
@@ -243,7 +239,7 @@ fn hmac_key() -> &'static [u8; 32] {
         // Per-process random key: a process restart cannot replay old tags,
         // and the key never leaves memory.
         let mut key = [0u8; 32];
-        rand::rng().fill_bytes(&mut key);
+        crate::crypto::rng::fill(&mut key);
         key
     })
 }

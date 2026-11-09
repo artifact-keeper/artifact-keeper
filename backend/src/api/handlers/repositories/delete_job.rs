@@ -1441,7 +1441,7 @@ mod tests {
         };
         let digest = format!(
             "sha256:{}",
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            hex::encode(crate::crypto::digest::Sha256::digest(
                 Uuid::new_v4().as_bytes()
             ))
         );

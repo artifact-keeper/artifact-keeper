@@ -51,6 +51,7 @@ struct GaugeStats {
 /// window so audit-log writes and metric upticks de-synchronize, even
 /// in the legitimate case where the advisory lock briefly contends.
 fn jittered_startup_delay(base_secs: u64) -> Duration {
+    #[allow(clippy::disallowed_methods)] // NON-SECURITY: backoff jitter
     let jitter = rand::random::<u64>() % 30;
     Duration::from_secs(base_secs.saturating_add(jitter))
 }

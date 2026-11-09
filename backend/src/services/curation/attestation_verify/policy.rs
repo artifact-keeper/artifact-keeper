@@ -27,9 +27,9 @@
 //! policy read) and simply absent from the policy: it can never make a bundle
 //! verify, so a typo fails closed.
 
+use crate::crypto::digest::Sha256;
 use base64::Engine;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sigstore::crypto::CosignVerificationKey;
 
 /// Verification method recorded for a keyless (Fulcio certificate) bundle.

@@ -13,6 +13,7 @@
 //!   PUT  /npm/{repo_key}/{@scope}/{package}           - Publish scoped package
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
@@ -26,7 +27,6 @@ use axum::Extension;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -7425,6 +7425,7 @@ fn build_npm_version_entry(info: &NpmArtifactInfo) -> serde_json::Value {
 mod tests {
     use super::*;
     use axum::http::header::IF_NONE_MATCH;
+    use digest::Digest as _;
 
     // -----------------------------------------------------------------------
     // npm scope policy (#2327)
@@ -8438,8 +8439,8 @@ mod tests {
         use crate::services::proxy_service::CacheCommitDigest;
         use base64::Engine as _;
 
-        let sha512_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"tarball"));
+        let sha512_b64 = base64::engine::general_purpose::STANDARD
+            .encode(crate::crypto::digest::Sha512::digest(b"tarball"));
         let sha1_b64 =
             base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(b"tarball"));
         // Weakest-first ordering must not matter: sha512 wins.
@@ -8447,7 +8448,9 @@ mod tests {
         let digest = parse_npm_sri(&sri).expect("a sha512 token must parse");
         assert_eq!(
             digest,
-            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"tarball")))
+            CacheCommitDigest::Sha512Hex(hex::encode(crate::crypto::digest::Sha512::digest(
+                b"tarball"
+            )))
         );
     }
 
@@ -8466,12 +8469,12 @@ mod tests {
         // A sha256 SRI decodes to the hex the storage-observed gate compares.
         let sha256_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
-            sha2::Sha256::digest(b"tarball"),
+            crate::crypto::digest::Sha256::digest(b"tarball"),
         );
         assert_eq!(
             parse_npm_sri(&format!("sha256-{sha256_b64}")),
             Some(CacheCommitDigest::Sha256Hex(hex::encode(
-                sha2::Sha256::digest(b"tarball")
+                crate::crypto::digest::Sha256::digest(b"tarball")
             )))
         );
     }
@@ -8518,8 +8521,8 @@ mod tests {
         use crate::services::proxy_service::CacheCommitDigest;
         use base64::Engine as _;
 
-        let sha512_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"real"));
+        let sha512_b64 = base64::engine::general_purpose::STANDARD
+            .encode(crate::crypto::digest::Sha512::digest(b"real"));
         let packument = serde_json::json!({
             "versions": {"1.0.0": {"dist": {
                 "tarball": "https://reg.example/p/-/p-1.0.0.tgz",
@@ -8529,7 +8532,7 @@ mod tests {
         assert_eq!(
             npm_integrity_for_filename(&dists(&packument), "p-1.0.0.tgz"),
             Some(CacheCommitDigest::Sha512Hex(hex::encode(
-                sha2::Sha512::digest(b"real")
+                crate::crypto::digest::Sha512::digest(b"real")
             )))
         );
     }
@@ -9693,11 +9696,13 @@ mod tests {
         let local_bytes = Bytes::from_static(b"tgz:local-1.2.3-rebuild");
         let upstream_integrity = format!(
             "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&upstream_bytes))
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::crypto::digest::Sha512::digest(&upstream_bytes))
         );
         let local_integrity = format!(
             "sha256-{}",
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&local_bytes))
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::crypto::digest::Sha256::digest(&local_bytes))
         );
 
         let upstream = MockServer::start().await;
@@ -9773,7 +9778,7 @@ mod tests {
             fx.user_id,
         )
         .await;
-        let local_sha256_hex = format!("{:x}", sha2::Sha256::digest(&local_bytes));
+        let local_sha256_hex = format!("{:x}", crate::crypto::digest::Sha256::digest(&local_bytes));
         sqlx::query("UPDATE artifacts SET checksum_sha256 = $1 WHERE id = $2")
             .bind(&local_sha256_hex)
             .bind(artifact_id)
@@ -9861,11 +9866,11 @@ mod tests {
             let verified = match advertised.split_once('-') {
                 Some(("sha512", digest)) => base64::engine::general_purpose::STANDARD
                     .decode(digest)
-                    .map(|d| d == sha2::Sha512::digest(&bytes).as_slice())
+                    .map(|d| d == crate::crypto::digest::Sha512::digest(&bytes).as_slice())
                     .unwrap_or(false),
                 Some(("sha256", digest)) => base64::engine::general_purpose::STANDARD
                     .decode(digest)
-                    .map(|d| d == sha2::Sha256::digest(&bytes).as_slice())
+                    .map(|d| d == crate::crypto::digest::Sha256::digest(&bytes).as_slice())
                     .unwrap_or(false),
                 _ => false,
             };
@@ -12539,8 +12544,8 @@ mod tests {
         use base64::Engine as _;
 
         let origin = "https://npm.pkg.github.com";
-        let sha512_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"ghp"));
+        let sha512_b64 = base64::engine::general_purpose::STANDARD
+            .encode(crate::crypto::digest::Sha512::digest(b"ghp"));
         let packument = ghp_packument(origin, &format!("sha512-{sha512_b64}"));
         let file = "example-package-1.2.3.tgz";
         assert_eq!(
@@ -12550,7 +12555,7 @@ mod tests {
         assert_eq!(
             npm_integrity_for_filename_on_upstream(&dists(&packument), file, Some(origin)),
             Some(CacheCommitDigest::Sha512Hex(hex::encode(
-                sha2::Sha512::digest(b"ghp")
+                crate::crypto::digest::Sha512::digest(b"ghp")
             )))
         );
         // A different upstream origin neither relocates nor matches.
@@ -12587,7 +12592,8 @@ mod tests {
         const BYTES: &[u8] = b"\x1f\x8b\x08github-packages-tarball-bytes";
         let integrity = format!(
             "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(BYTES))
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::crypto::digest::Sha512::digest(BYTES))
         );
         Mock::given(method("GET"))
             .and(path("/@example-org%2Fexample-package"))
@@ -13681,7 +13687,8 @@ mod tests {
         // bytes (here: the SRI of a different body entirely).
         let mismatched_sri = format!(
             "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(b"other bytes"))
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::crypto::digest::Sha512::digest(b"other bytes"))
         );
         Mock::given(method("GET"))
             .and(path("/intpkg"))

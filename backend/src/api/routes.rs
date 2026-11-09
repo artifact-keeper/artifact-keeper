@@ -2393,10 +2393,10 @@ mod tests {
     #[tokio::test]
     async fn stalled_lfs_uploads_are_bounded_and_health_stays_up() {
         use crate::api::handlers::test_db_helpers as tdh;
+        use crate::crypto::digest::Sha256;
         use axum::body::Body;
         use axum::http::StatusCode;
         use futures::StreamExt;
-        use sha2::{Digest, Sha256};
         use tower::ServiceExt;
 
         let Some(pool) = tdh::try_pool().await else {

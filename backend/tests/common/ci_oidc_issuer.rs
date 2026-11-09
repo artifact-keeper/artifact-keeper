@@ -82,7 +82,7 @@ fn server_tls_config(ip: IpAddr) -> Arc<tokio_rustls::rustls::ServerConfig> {
     let key = rcgen::KeyPair::generate().expect("leaf key");
     let leaf = params.signed_by(&key, &ca.issuer).expect("sign leaf");
 
-    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let provider = Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider());
     let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("TLS versions")

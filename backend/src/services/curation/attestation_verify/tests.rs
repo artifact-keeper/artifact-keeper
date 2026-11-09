@@ -923,7 +923,8 @@ use cep27::{
     check_statement, record_to_verdict, verification_record, verify_conda_bundle, CondaVerifyInput,
     BARE_STATEMENT_REASON, CEP27_PREDICATE_TYPE, INTOTO_STATEMENT_V1,
 };
-use sha2::Sha256;
+#[allow(clippy::disallowed_types)]
+use sha2::{Digest, Sha256};
 
 /// Every mutation fixture, with the name the assertion messages should use.
 const MUTATIONS: &[(&str, &str)] = &[

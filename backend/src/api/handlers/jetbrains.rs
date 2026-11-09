@@ -882,8 +882,8 @@ mod tests {
     #[tokio::test]
     async fn test_jetbrains_multipart_publish_preserves_binary_zip_3848() {
         use crate::api::handlers::test_db_helpers as tdh;
+        use crate::crypto::digest::Sha256;
         use axum::http::StatusCode;
-        use sha2::{Digest, Sha256};
 
         let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
             return;
@@ -1342,8 +1342,6 @@ mod tests {
     /// `DATABASE_URL`, so this is the one that runs without a database.
     #[tokio::test]
     async fn test_stage_plugin_from_multipart_stages_binary_zip_verbatim() {
-        use sha2::Digest;
-
         let (state, dir) = staging_state();
         let repo = staging_repo(&dir);
         let zip = binary_plugin_zip();
@@ -1373,7 +1371,10 @@ mod tests {
             (name.as_str(), version.as_str()),
             ("com.example.bin", "1.0.0")
         );
-        assert_eq!(sha256, format!("{:x}", sha2::Sha256::digest(&zip)));
+        assert_eq!(
+            sha256,
+            format!("{:x}", crate::crypto::digest::Sha256::digest(&zip))
+        );
         assert!(
             bytes == zip,
             "the staged bytes must equal the file part (got {} bytes, expected {})",
@@ -1438,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn test_jetbrains_raw_upload_round_trips_binary_zip() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
             return;
@@ -1608,7 +1609,7 @@ mod tests {
 
     #[test]
     fn test_sha256_computation() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         let data = b"jetbrains plugin file";
         let mut hasher = Sha256::new();

@@ -868,7 +868,7 @@ mod db_tests {
     use bytes::Bytes;
 
     fn sha_hex(b: &[u8]) -> String {
-        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b))
+        hex::encode(crate::crypto::digest::Sha256::digest(b))
     }
 
     /// Seed a live artifact with a real recorded SHA-256 of `original`, while

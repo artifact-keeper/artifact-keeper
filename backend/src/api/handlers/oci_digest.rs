@@ -6,7 +6,7 @@
 //! reference (as opposed to a tag), and the virtual-repo resolver's
 //! "verify the served bytes or fall through to the next member" decision.
 
-use sha2::{Digest, Sha256};
+use crate::crypto::digest::Sha256;
 
 pub(crate) fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();

@@ -4429,8 +4429,8 @@ mod tests {
             _key: &str,
             stream: BoxStream<'static, crate::error::Result<Bytes>>,
         ) -> crate::error::Result<PutStreamResult> {
+            use crate::crypto::digest::Sha256;
             use futures::StreamExt;
-            use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             let mut buf = Vec::new();
             let mut total: u64 = 0;
@@ -4475,7 +4475,7 @@ mod tests {
         // integrity verification capability.
         assert_eq!(result.bytes_written, payload.len() as u64);
         let expected_digest = {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             let mut h = Sha256::new();
             h.update(&payload);
             format!("{:x}", h.finalize())
@@ -4677,7 +4677,7 @@ mod tests {
             let path = format!("{}/{}", name, id);
             let bytes = bytes::Bytes::from_static(b"pr1940-artifact-content");
             let checksum = {
-                use sha2::{Digest, Sha256};
+                use crate::crypto::digest::Sha256;
                 let mut h = Sha256::new();
                 h.update(&bytes);
                 format!("{:x}", h.finalize())
@@ -4714,7 +4714,7 @@ mod tests {
             let id = Uuid::new_v4();
             let bytes = bytes::Bytes::from_static(b"pr3382-maven-artifact-content");
             let checksum = {
-                use sha2::{Digest, Sha256};
+                use crate::crypto::digest::Sha256;
                 let mut h = Sha256::new();
                 h.update(&bytes);
                 format!("{:x}", h.finalize())
@@ -4755,7 +4755,7 @@ mod tests {
             let path = format!("{}/{}", name, id);
             let bytes = bytes::Bytes::from_static(b"pr4152-artifact-content");
             let checksum = {
-                use sha2::{Digest, Sha256};
+                use crate::crypto::digest::Sha256;
                 let mut h = Sha256::new();
                 h.update(&bytes);
                 format!("{:x}", h.finalize())

@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use sha2::{Digest, Sha256};
+use crate::crypto::digest::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 

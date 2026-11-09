@@ -6,13 +6,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Instant;
 
-use bcrypt::{hash, verify};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{
     decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tracing::info;
@@ -1135,7 +1133,62 @@ static GLOBAL_AUTH_SEMAPHORE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new()
 /// holding auth permits for longer while serialised tests queue behind them.
 #[cfg(not(test))]
 pub(crate) fn bcrypt_cost() -> u32 {
-    bcrypt::DEFAULT_COST
+    crate::crypto::password::BCRYPT_DEFAULT_COST
+}
+
+/// PBKDF2 work factor for hashes written in `FIPS_MODE=strict` (#5582).
+/// Installed once from `Config::pbkdf2_iterations` at startup; the library
+/// default applies to embeddings that never install one. Tests use a low
+/// count, like [`bcrypt_cost`] does for bcrypt.
+static PBKDF2_ITERATIONS: OnceLock<u32> = OnceLock::new();
+
+pub fn install_pbkdf2_iterations(iterations: u32) {
+    let _ = PBKDF2_ITERATIONS.set(iterations.max(crate::crypto::password::MIN_ITERATIONS));
+}
+
+#[cfg(not(test))]
+pub(crate) fn pbkdf2_iterations() -> u32 {
+    *PBKDF2_ITERATIONS
+        .get()
+        .unwrap_or(&crate::crypto::kdf::PBKDF2_DEFAULT_ITERATIONS)
+}
+
+#[cfg(test)]
+pub(crate) fn pbkdf2_iterations() -> u32 {
+    *PBKDF2_ITERATIONS
+        .get()
+        .unwrap_or(&crate::crypto::password::MIN_ITERATIONS)
+}
+
+impl AuthService {
+    /// Key under which API-token secrets are stored in strict mode: derived
+    /// from the deployment secret, never the raw `JWT_SECRET` (#5582).
+    fn api_token_key(&self) -> crate::crypto::token::TokenKey {
+        crate::crypto::token::TokenKey::derive(self.config.jwt_secret.as_bytes())
+    }
+
+    /// Stored form of an API token: keyed HMAC in strict mode, bcrypt
+    /// otherwise, so a downgrade still reads every row written.
+    pub(crate) async fn hash_api_token(&self, token: &str) -> Result<String> {
+        if crate::fips::strict() {
+            Ok(self.api_token_key().hash(token))
+        } else {
+            Self::hash_password(token).await
+        }
+    }
+
+    /// Verify an API token against either stored form. The bcrypt path keeps
+    /// the auth-concurrency permit and blocking-pool handling of
+    /// [`Self::verify_password`]; the HMAC path is microseconds and runs inline.
+    pub(crate) async fn verify_api_token_hash(&self, token: &str, stored: &str) -> Result<bool> {
+        if crate::crypto::token::is_hmac(stored) {
+            self.api_token_key()
+                .verify(token, stored)
+                .map_err(|e| AppError::Internal(format!("API token verification failed: {e}")))
+        } else {
+            Self::verify_password(token, stored).await
+        }
+    }
 }
 
 /// See [`bcrypt_cost`] — test-binary work factor (#3407).
@@ -1890,6 +1943,31 @@ impl AuthService {
         }
 
         // Successful login: reset lockout counters and record last login.
+        // FIPS strict mode: a user still on a legacy (bcrypt) hash is
+        // re-hashed with PBKDF2 now that the password is in hand (#5582).
+        // Opt-out via FIPS_LEGACY_HASH_MIGRATION=false leaves it for a reset.
+        if crate::fips::strict() && self.config.fips_legacy_hash_migration {
+            if let Some(stored) = user.password_hash.as_deref() {
+                if crate::crypto::password::needs_rehash(stored, self.config.pbkdf2_iterations) {
+                    let new_hash = Self::hash_password(password).await?;
+                    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+                        .bind(user.id)
+                        .bind(&new_hash)
+                        .execute(&self.db)
+                        .await
+                        .map_err(|e| AppError::Database(e.to_string()))?;
+                    metrics::counter!("ak_crypto_hash_migrations_total", "kind" => "password")
+                        .increment(1);
+                    tracing::info!(
+                        target: "security",
+                        user_id = %user.id,
+                        username = %username,
+                        "migrated legacy password hash to PBKDF2 (FIPS strict mode)"
+                    );
+                }
+            }
+        }
+
         // last_login_at is throttled to once per 5 minutes (display-only field,
         // #2107), but the lockout counters MUST always be reset on a valid
         // login, so the row is still written whenever any counter is non-clean.
@@ -3143,16 +3221,27 @@ impl AuthService {
             .map_err(|e| AppError::Authentication(format!("Invalid token: {}", e)))
     }
 
-    /// Hash a password
+    /// Hash a password for storage.
+    ///
+    /// `FIPS_MODE=strict` writes PBKDF2-HMAC-SHA512 on the validated module
+    /// (#5582); every other mode keeps writing bcrypt, so an upgrade followed
+    /// by a downgrade never produces a hash the older binary cannot read.
+    /// Both formats verify in every build through [`Self::verify_password`].
     pub async fn hash_password(password: &str) -> Result<String> {
-        // Hold a process-wide auth-concurrency permit while bcrypt runs so
-        // hash() also participates in the load-shed cap (signup, password
-        // change, API-token creation all call this).
+        // Hold a process-wide auth-concurrency permit while the slow hash
+        // runs so hash() also participates in the load-shed cap (signup,
+        // password change, API-token creation all call this).
         let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
+        let strict = crate::fips::strict();
+        let iterations = pbkdf2_iterations();
         tokio::task::spawn_blocking(move || {
-            hash(&pwd, bcrypt_cost())
-                .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))
+            if strict {
+                Ok(crate::crypto::password::hash_pbkdf2_with(&pwd, iterations))
+            } else {
+                crate::crypto::password::hash_bcrypt(&pwd, bcrypt_cost())
+                    .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))
+            }
         })
         .await
         .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
@@ -3171,9 +3260,22 @@ impl AuthService {
         let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         let h = hash.to_string();
+        let checks_enabled = crate::fips::mode().checks_enabled();
         tokio::task::spawn_blocking(move || {
-            verify(&pwd, &h)
-                .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))
+            // Reads bcrypt and PBKDF2 alike (#5582). A bcrypt match while
+            // FIPS checks are on is a legacy verification: counted so an
+            // operator can watch the migration drain.
+            let matched = crate::crypto::password::verify(&pwd, &h)
+                .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))?;
+            if matched
+                && checks_enabled
+                && crate::crypto::password::format_of(&h)
+                    == Ok(crate::crypto::password::Format::Bcrypt)
+            {
+                metrics::counter!("ak_crypto_legacy_verifications_total", "kind" => "bcrypt")
+                    .increment(1);
+            }
+            Ok(matched)
         })
         .await
         .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
@@ -3189,11 +3291,21 @@ impl AuthService {
     /// *different* cost from real hashes would make the "not found" path take
     /// visibly different time from the "wrong password" path — reintroducing
     /// exactly the oracle the dummy exists to close.
+    ///
+    /// In `FIPS_MODE=strict` the real hashes are PBKDF2 at the configured
+    /// iteration count, so the dummy is too (#5582); the name is historical.
     fn dummy_bcrypt_hash() -> &'static str {
         static DUMMY: OnceLock<String> = OnceLock::new(); //NOSONAR - intentional dummy hash for constant-time rejection
         DUMMY.get_or_init(|| {
-            hash("__dummy_timing_pad__", bcrypt_cost())
-                .expect("bcrypt hash generation must not fail")
+            if crate::fips::strict() {
+                crate::crypto::password::hash_pbkdf2_with(
+                    "__dummy_timing_pad__",
+                    pbkdf2_iterations(),
+                )
+            } else {
+                crate::crypto::password::hash_bcrypt("__dummy_timing_pad__", bcrypt_cost())
+                    .expect("bcrypt hash generation must not fail")
+            }
         })
     }
 
@@ -3213,7 +3325,7 @@ impl AuthService {
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
         // Hash the raw token before using it as cache key so plaintext tokens
         // are never stored in memory.
-        let cache_key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let cache_key = crate::crypto::digest::sha256_hex(token.as_bytes());
 
         // Check in-memory cache before the expensive bcrypt verification.
         // Package managers like cargo send credentials on every request (index
@@ -3285,13 +3397,41 @@ impl AuthService {
         // Always run bcrypt verification regardless of token existence.
         // This is the constant-time core of the fix: an attacker cannot
         // distinguish "prefix not found" from "wrong secret" by timing.
-        let hash_matches = Self::verify_password(token, &hash_to_verify).await?;
+        let hash_matches = self.verify_api_token_hash(token, &hash_to_verify).await?;
 
-        // Check results only after bcrypt has completed
+        // Check results only after the hash check has completed
         check_token_validation_result(token_exists, is_revoked, hash_matches)?;
 
         // Unwrap is safe: token_exists is true only when stored_token_opt is Some
         let stored_token = stored_token_opt.unwrap();
+
+        // Strict mode migrates a matching legacy (bcrypt) row to the keyed
+        // HMAC form on first use (#5582), so the table drains itself. Never
+        // outside strict: a downgraded binary must still read every row.
+        if crate::fips::strict() && !crate::crypto::token::is_hmac(&stored_token.token_hash) {
+            let new_hash = self.hash_api_token(token).await?;
+            match sqlx::query("UPDATE api_tokens SET token_hash = $2 WHERE id = $1")
+                .bind(stored_token.id)
+                .bind(&new_hash)
+                .execute(&self.db)
+                .await
+            {
+                Ok(_) => {
+                    metrics::counter!("ak_crypto_hash_migrations_total", "kind" => "api_token")
+                        .increment(1);
+                    tracing::info!(
+                        target: "security",
+                        token_id = %stored_token.id,
+                        "migrated API token hash to the FIPS keyed form"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    token_id = %stored_token.id,
+                    error = %e,
+                    "could not migrate API token hash"
+                ),
+            }
+        }
 
         // Check expiration
         if let Some(expires_at) = stored_token.expires_at {
@@ -3463,13 +3603,18 @@ impl AuthService {
             .map_err(AppError::Validation)?;
 
         // Generate random token
+        // `<8 hex lookup prefix>_<secret>` from the module DRBG (#5582). The
+        // secret keeps its 32-hex (128-bit) length outside strict mode so
+        // nothing that stores or displays tokens sees a change; strict mode
+        // doubles it to 256 bits.
+        let secret_hex_bytes = if crate::fips::strict() { 32 } else { 16 };
         let token = format!(
             "{}_{}",
-            &Uuid::new_v4().to_string()[..8],
-            Uuid::new_v4().to_string().replace("-", "")
+            crate::crypto::rng::hex(4),
+            crate::crypto::rng::hex(secret_hex_bytes)
         );
         let prefix = &token[..8];
-        let token_hash = Self::hash_password(&token).await?;
+        let token_hash = self.hash_api_token(&token).await?;
 
         // Resolve the requested expiry against the instance policy (#3460).
         // The service-account lookup is skipped while the policy is inert so
@@ -4722,6 +4867,10 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "super-secret-test-key-for-unit-tests-minimum-length".to_string(),
+            fips_mode: Default::default(),
+            fips_legacy_hash_migration: true,
+            pbkdf2_iterations: 1_000,
+            data_encryption_key: None,
             signature_expiry_seconds: 604_800,
             signing_key_rotation_overlap_secs: 1_209_600,
             signing_auto_migrate_legacy_keys: false,
@@ -5954,7 +6103,7 @@ mod tests {
         // The dummy hash must be a structurally valid bcrypt hash so that
         // bcrypt::verify runs the full cost-12 computation instead of
         // returning an immediate error.
-        let result = verify("any-token-value", dummy);
+        let result = crate::crypto::password::verify("any-token-value", dummy);
         assert!(
             result.is_ok(),
             "dummy_bcrypt_hash must produce a valid bcrypt hash, got error: {:?}",
@@ -5966,7 +6115,7 @@ mod tests {
         );
 
         // Also verify with an empty string
-        let result_empty = verify("", dummy);
+        let result_empty = crate::crypto::password::verify("", dummy);
         assert!(result_empty.is_ok());
         assert!(!result_empty.unwrap());
     }
@@ -6022,8 +6171,12 @@ mod tests {
         assert_eq!(bcrypt_cost(), 4, "bcrypt_cost() must agree with the hash");
 
         // The cheap cost must still round-trip, or every auth test is broken.
-        assert!(verify("correct horse battery staple", &hashed).expect("verify must not error"));
-        assert!(!verify("wrong password", &hashed).expect("verify must not error"));
+        assert!(
+            crate::crypto::password::verify("correct horse battery staple", &hashed)
+                .expect("verify must not error")
+        );
+        assert!(!crate::crypto::password::verify("wrong password", &hashed)
+            .expect("verify must not error"));
     }
 
     /// The timing pad must be generated at the *same* cost as real hashes.
@@ -6100,7 +6253,7 @@ mod tests {
     #[test]
     fn test_token_cache_key_is_sha256_hex() {
         let token = "ak_12345678_secret_token_value";
-        let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let key = crate::crypto::digest::sha256_hex(token.as_bytes());
         // SHA-256 hex output is always 64 characters
         assert_eq!(key.len(), 64);
         // Must be lowercase hex
@@ -6110,22 +6263,22 @@ mod tests {
     #[test]
     fn test_token_cache_key_deterministic() {
         let token = "ak_abcdefgh_my_token";
-        let k1 = format!("{:x}", Sha256::digest(token.as_bytes()));
-        let k2 = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let k1 = crate::crypto::digest::sha256_hex(token.as_bytes());
+        let k2 = crate::crypto::digest::sha256_hex(token.as_bytes());
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn test_token_cache_key_different_tokens_produce_different_keys() {
-        let k1 = format!("{:x}", Sha256::digest(b"ak_aaaaaaaa_token1"));
-        let k2 = format!("{:x}", Sha256::digest(b"ak_bbbbbbbb_token2"));
+        let k1 = crate::crypto::digest::sha256_hex(b"ak_aaaaaaaa_token1");
+        let k2 = crate::crypto::digest::sha256_hex(b"ak_bbbbbbbb_token2");
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn test_token_cache_key_does_not_contain_raw_token() {
         let token = "ak_12345678_very_secret";
-        let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let key = crate::crypto::digest::sha256_hex(token.as_bytes());
         assert!(!key.contains("ak_12345678"));
         assert!(!key.contains("very_secret"));
     }
@@ -6189,7 +6342,7 @@ mod tests {
     fn test_token_cache_insert_and_read() {
         let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
-        let key = format!("{:x}", Sha256::digest(b"ak_testtest_token"));
+        let key = crate::crypto::digest::sha256_hex(b"ak_testtest_token");
         let entry = dummy_cached_entry(Uuid::nil(), "testuser", vec!["read:artifacts".to_string()]);
         cache
             .write()
@@ -6206,7 +6359,7 @@ mod tests {
     fn test_token_cache_eviction() {
         let cache: RwLock<HashMap<String, (CachedApiTokenEntry, Instant)>> =
             RwLock::new(HashMap::new());
-        let key = format!("{:x}", Sha256::digest(b"ak_stalekey_token"));
+        let key = crate::crypto::digest::sha256_hex(b"ak_stalekey_token");
         let entry = dummy_cached_entry(Uuid::nil(), "stale", vec![]);
 
         // Insert with a backdated timestamp

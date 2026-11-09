@@ -621,25 +621,17 @@ pub fn encryption_key() -> String {
 /// by `getrandom`) directly rather than via the thread-local PRNG so the
 /// provenance of the entropy is unambiguous in source review and audits.
 pub fn generate_pkce_verifier() -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    use rand::rngs::SysRng;
-    use rand::TryRng;
-
-    let mut bytes = [0u8; 48];
-    SysRng
-        .try_fill_bytes(&mut bytes)
-        .expect("OS CSPRNG must be available to mint PKCE verifiers");
-    URL_SAFE_NO_PAD.encode(bytes)
+    // 48 bytes from the module DRBG, base64url (#5579).
+    crate::crypto::rng::base64url(48)
 }
 
 /// Derive the S256 PKCE code_challenge from a verifier per RFC 7636 §4.2.
 ///
 /// `challenge = base64url(SHA256(verifier))` with no padding.
 pub fn pkce_challenge_s256(verifier: &str) -> String {
+    use crate::crypto::digest::Sha256;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use sha2::{Digest, Sha256};
 
     let digest = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)

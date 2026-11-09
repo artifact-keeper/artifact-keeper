@@ -8698,7 +8698,7 @@ fn cached_total_pages(total: usize, per_page: u32) -> u32 {
 /// listing calls for a given object and effectively never collides with the
 /// random v4 ids the database assigns to hosted artifacts.
 fn cached_artifact_id(repo_key: &str, path: &str) -> Uuid {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(format!("proxy-cache/{}/{}", repo_key, path).as_bytes());
     let digest = hasher.finalize();
@@ -22947,7 +22947,7 @@ mod tests {
     #[tokio::test]
     async fn generic_put_into_object_storage_repo_needs_no_local_scratch_3916_db() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -23146,7 +23146,7 @@ mod tests {
     #[tokio::test]
     async fn multipart_into_object_storage_repo_needs_no_local_scratch_3916_db() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -28804,7 +28804,6 @@ mod tests {
         Option<String>,
         std::result::Result<Bytes, axum::Error>,
     )> {
-        use sha2::Digest;
         let fx = tdh::Fixture::setup("local", "generic").await?;
         let repo = fx.repo_info("local", None);
         let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
@@ -28821,7 +28820,7 @@ mod tests {
             fx.user_id,
         )
         .await;
-        let recorded_hex = hex::encode(sha2::Sha256::digest(recorded));
+        let recorded_hex = hex::encode(crate::crypto::digest::Sha256::digest(recorded));
         // The row records the ORIGINAL bytes' digest and length; the stored
         // object may differ in content or in size.
         sqlx::query("UPDATE artifacts SET checksum_sha256 = $1, size_bytes = $2 WHERE id = $3")
@@ -28898,10 +28897,14 @@ mod tests {
             return;
         };
         assert_eq!(status, axum::http::StatusCode::OK);
-        use sha2::Digest;
         assert_eq!(
             checksum.as_deref(),
-            Some(hex::encode(sha2::Sha256::digest(b"intact-artifact-bytes")).as_str())
+            Some(
+                hex::encode(crate::crypto::digest::Sha256::digest(
+                    b"intact-artifact-bytes"
+                ))
+                .as_str()
+            )
         );
         assert_eq!(&body.expect("intact body")[..], b"intact-artifact-bytes");
     }
@@ -41698,10 +41701,10 @@ mod npm_cached_packument_listing_tests {
 #[cfg(test)]
 mod conditional_put_and_serve_verification_tests {
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::crypto::digest::Sha256;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use uuid::Uuid;
 

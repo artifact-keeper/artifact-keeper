@@ -81,8 +81,61 @@ async fn find_backup_code_index(hashed_codes: &[String], clean_code: &str) -> Op
 }
 
 /// Decode a base32-encoded secret string into raw bytes.
+/// Prefix of a TOTP seed stored encrypted under the dedicated data key
+/// (#5583): `enc:<base64 of 0x02 || nonce || ciphertext>`. Written only in
+/// `FIPS_MODE=strict` with `DATA_ENCRYPTION_KEY` set; read in every build.
+const ENCRYPTED_SEED_PREFIX: &str = "enc:";
+
+/// The stored form of a fresh base32 seed: encrypted when strict mode and
+/// the data key allow it, plain base32 otherwise (today's format).
+fn seal_secret_for_storage(secret_base32: &str) -> String {
+    use base64::Engine;
+    if !crate::fips::strict() {
+        return secret_base32.to_string();
+    }
+    match crate::services::encryption::data_subkey(crate::services::encryption::PURPOSE_TOTP_SEED) {
+        Some(key) => {
+            let mut out = vec![crate::services::encryption::DATA_KEY_CIPHERTEXT_VERSION];
+            out.extend_from_slice(&key.seal(secret_base32.as_bytes(), b"totp-seed"));
+            format!(
+                "{ENCRYPTED_SEED_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode(out)
+            )
+        }
+        None => secret_base32.to_string(),
+    }
+}
+
+/// Base32 seed from either stored form.
+fn stored_secret_to_base32(stored: &str) -> Result<String> {
+    use base64::Engine;
+    let Some(b64) = stored.strip_prefix(ENCRYPTED_SEED_PREFIX) else {
+        return Ok(stored.to_string());
+    };
+    let raw = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(b64.trim_end_matches('='))
+        .map_err(|_| AppError::Internal("TOTP seed ciphertext is not base64".into()))?;
+    let key =
+        crate::services::encryption::data_subkey(crate::services::encryption::PURPOSE_TOTP_SEED)
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "TOTP seed is encrypted but DATA_ENCRYPTION_KEY is not configured".into(),
+                )
+            })?;
+    if raw.first() != Some(&crate::services::encryption::DATA_KEY_CIPHERTEXT_VERSION) {
+        return Err(AppError::Internal(
+            "TOTP seed ciphertext has an unknown version".into(),
+        ));
+    }
+    let plain = key
+        .open(&raw[1..], b"totp-seed")
+        .map_err(|_| AppError::Internal("TOTP seed could not be decrypted".into()))?;
+    String::from_utf8(plain).map_err(|_| AppError::Internal("TOTP seed is not UTF-8".into()))
+}
+
 fn decode_secret(encoded: &str) -> Result<Vec<u8>> {
-    Secret::Encoded(encoded.to_string())
+    let base32 = stored_secret_to_base32(encoded)?;
+    Secret::Encoded(base32)
         .to_bytes()
         .map_err(|e| AppError::Internal(format!("Secret error: {}", e)))
 }
@@ -115,10 +168,11 @@ async fn provision_totp_secret(
     let qr_code_url = totp.get_url();
 
     // Store the secret (not yet enabled)
+    let stored_secret = seal_secret_for_storage(&secret_base32);
     sqlx::query!(
         "UPDATE users SET totp_secret = $2 WHERE id = $1",
         user_id,
-        secret_base32
+        stored_secret
     )
     .execute(db)
     .await
@@ -166,25 +220,16 @@ async fn check_provisioned_totp_code(
 /// instead of running inline and starving the runtime.
 async fn mint_backup_codes() -> Result<(Vec<String>, String)> {
     // Scoped so the rng drops before any `.await` -- the rng is not Send.
-    let backup_codes: Vec<String> = {
-        use rand::RngExt;
-        let mut rng = rand::rng();
-        (0..10)
-            .map(|_| {
-                let code: String = (0..8)
-                    .map(|_| {
-                        let idx = rng.random_range(0..36u32);
-                        if idx < 10 {
-                            (b'0' + idx as u8) as char
-                        } else {
-                            (b'A' + (idx - 10) as u8) as char
-                        }
-                    })
-                    .collect();
-                format!("{}-{}", &code[..4], &code[4..])
-            })
-            .collect()
-    };
+    let backup_codes: Vec<String> = (0..10)
+        .map(|_| {
+            // Module DRBG, uniform over 0-9A-Z (#5579).
+            let code = crate::crypto::rng::string_from_alphabet(
+                b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                8,
+            );
+            format!("{}-{}", &code[..4], &code[4..])
+        })
+        .collect();
     let mut hashed_codes: Vec<String> = Vec::with_capacity(backup_codes.len());
     for code in &backup_codes {
         let clean = code.replace('-', "");
@@ -1229,16 +1274,16 @@ mod tests {
     async fn test_find_backup_code_index_matches_first_live_slot() {
         let clean = "1YUU4B8U";
         let hashed = vec![
-            String::new(),                          // already consumed
-            bcrypt::hash(clean, 4).expect("hash"),  // the match
-            bcrypt::hash(clean, 4).expect("hash2"), // duplicate, must not win
+            String::new(),                                                  // already consumed
+            crate::crypto::password::hash_bcrypt(clean, 4).expect("hash"),  // the match
+            crate::crypto::password::hash_bcrypt(clean, 4).expect("hash2"), // duplicate, must not win
         ];
         assert_eq!(find_backup_code_index(&hashed, clean).await, Some(1));
     }
 
     #[tokio::test]
     async fn test_find_backup_code_index_no_match() {
-        let hashed = vec![bcrypt::hash("OTHERCODE", 4).expect("hash")];
+        let hashed = vec![crate::crypto::password::hash_bcrypt("OTHERCODE", 4).expect("hash")];
         assert_eq!(find_backup_code_index(&hashed, "1YUU4B8U").await, None);
     }
 
@@ -1254,7 +1299,7 @@ mod tests {
         // A pre-existing cost-10 hash (the old enable_totp default) must keep
         // verifying after the fix routes hashing through DEFAULT_COST.
         let clean = "C0ST10VR";
-        let legacy = bcrypt::hash(clean, 10).expect("legacy cost-10 hash");
+        let legacy = crate::crypto::password::hash_bcrypt(clean, 10).expect("legacy cost-10 hash");
         let hashed = vec![legacy];
         assert_eq!(find_backup_code_index(&hashed, clean).await, Some(0));
     }
@@ -1493,7 +1538,8 @@ mod totp_token_invalidation_regression_tests {
         // disable_totp wants the user to have totp_enabled=true, a real
         // password_hash to bcrypt-verify against, and a totp_secret. Set all
         // three directly.
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         let secret = totp_rs::Secret::generate_secret();
         let secret_b32 = secret.to_encoded().to_string();
         let secret_bytes = secret.to_bytes().expect("secret bytes");
@@ -1577,7 +1623,8 @@ mod totp_token_invalidation_regression_tests {
         };
         let (user_id, _) = tdh::create_user(&pool).await;
 
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         let secret = totp_rs::Secret::generate_secret();
         let secret_b32 = secret.to_encoded().to_string();
         let secret_bytes = secret.to_bytes().expect("secret bytes");
@@ -1784,7 +1831,7 @@ mod totp_verify_hardening_tests {
             return;
         };
         let backup_plain = "1YUU4B8U";
-        let hash = bcrypt::hash(backup_plain, 4).expect("hash");
+        let hash = crate::crypto::password::hash_bcrypt(backup_plain, 4).expect("hash");
         let (user, state, _secret, _pending, dir) = setup_totp_user(&pool, &[hash]).await;
         let user_id = user.id;
 
@@ -1901,7 +1948,7 @@ mod totp_audit_tests {
         let fx = tdh::create_totp_user(&pool, &[]).await;
         let user_id = fx.user.id;
         let password = "Disable!2026pw";
-        let hash = bcrypt::hash(password, 4).expect("hash password");
+        let hash = crate::crypto::password::hash_bcrypt(password, 4).expect("hash password");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&hash)
             .bind(user_id)
@@ -2257,7 +2304,8 @@ mod totp_audit_tests {
             return;
         };
         let fx = tdh::create_totp_user(&pool, &[]).await;
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&pwd_hash)
             .bind(fx.user.id)

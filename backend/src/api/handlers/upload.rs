@@ -4339,7 +4339,7 @@ mod tests {
     }
 
     fn sha256_hex(payload: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let mut hasher = Sha256::new();
         hasher.update(payload);
         hex::encode(hasher.finalize())
@@ -4734,7 +4734,7 @@ mod tests {
             auth.is_admin = as_admin;
             auth
         };
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let checksum = hex::encode(Sha256::digest(payload));
         let extra = match &replication_metadata {
             Some((format, metadata)) => serde_json::json!({
@@ -4930,7 +4930,7 @@ mod tests {
         // Compute checksum of test payload up front -- complete_session
         // verifies the temp-file SHA256 matches.
         let payload: &[u8] = b"chunked-upload-test-bytes-for-1168";
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let mut hasher = Sha256::new();
         hasher.update(payload);
         let checksum = hex::encode(hasher.finalize());
@@ -7242,7 +7242,7 @@ mod tests {
         payload: &[u8],
         replication: bool,
     ) -> (StatusCode, Option<String>) {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let body = serde_json::json!({
             "repository_key": f.repo_key,
             "artifact_path": path,
@@ -7392,7 +7392,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
         let key = crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&{
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             hex::encode(Sha256::digest(&payload))
         });
         let journal: Option<(Option<Uuid>, bool)> = sqlx::query_as(

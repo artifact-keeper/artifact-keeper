@@ -3,8 +3,8 @@
 //! against a build without the shard store (where they fail).
 
 use crate::api::handlers::test_db_helpers as tdh;
+use crate::crypto::digest::Sha256;
 use axum::http::StatusCode;
-use sha2::{Digest, Sha256};
 
 /// A minimal `.tar.bz2` conda package carrying only `info/index.json`.
 pub(super) fn conda_package(name: &str, version: &str, build: &str, subdir: &str) -> Vec<u8> {

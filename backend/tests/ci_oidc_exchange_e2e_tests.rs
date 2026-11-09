@@ -763,8 +763,10 @@ fn basic(username: &str, password: &str) -> String {
 }
 
 fn sha256_digest(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+    format!(
+        "sha256:{:x}",
+        artifact_keeper_backend::crypto::digest::Sha256::digest(bytes)
+    )
 }
 
 impl Fixture {

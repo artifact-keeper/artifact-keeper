@@ -2146,12 +2146,12 @@ fn verify_id_token_with_legacy_rsa(
     client_id: &str,
     issuer_url: &str,
 ) -> Result<serde_json::Value> {
+    use crate::crypto::digest::{Sha256, Sha384, Sha512};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
     use rsa::{BigUint, RsaPublicKey};
-    use sha2::{Sha256, Sha384, Sha512};
 
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() != 3 {
@@ -5199,7 +5199,7 @@ mod tests {
         fn shared_1024_rsa_key() -> &'static RsaPrivateKey {
             static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
             KEY.get_or_init(|| {
-                let mut rng = rsa::rand_core::OsRng;
+                let mut rng = crate::crypto::rng::ModuleRng;
                 RsaPrivateKey::new(&mut rng, 1024).expect("1024-bit RSA keygen")
             })
         }
@@ -5207,7 +5207,7 @@ mod tests {
         fn shared_2048_rsa_key() -> &'static RsaPrivateKey {
             static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
             KEY.get_or_init(|| {
-                let mut rng = rsa::rand_core::OsRng;
+                let mut rng = crate::crypto::rng::ModuleRng;
                 RsaPrivateKey::new(&mut rng, 2048).expect("2048-bit RSA keygen")
             })
         }
@@ -5241,15 +5241,15 @@ mod tests {
             let signing_input = format!("{h_b64}.{p_b64}");
             let sig_bytes = match alg {
                 jsonwebtoken::Algorithm::RS256 => {
-                    let sk = SigningKey::<sha2::Sha256>::new(priv_key.clone());
+                    let sk = SigningKey::<crate::crypto::digest::Sha256>::new(priv_key.clone());
                     sk.sign(signing_input.as_bytes()).to_bytes()
                 }
                 jsonwebtoken::Algorithm::RS384 => {
-                    let sk = SigningKey::<sha2::Sha384>::new(priv_key.clone());
+                    let sk = SigningKey::<crate::crypto::digest::Sha384>::new(priv_key.clone());
                     sk.sign(signing_input.as_bytes()).to_bytes()
                 }
                 jsonwebtoken::Algorithm::RS512 => {
-                    let sk = SigningKey::<sha2::Sha512>::new(priv_key.clone());
+                    let sk = SigningKey::<crate::crypto::digest::Sha512>::new(priv_key.clone());
                     sk.sign(signing_input.as_bytes()).to_bytes()
                 }
                 _ => unreachable!(),

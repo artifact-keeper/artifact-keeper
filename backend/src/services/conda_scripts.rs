@@ -18,8 +18,8 @@
 
 use std::sync::LazyLock;
 
+use crate::crypto::digest::Sha256;
 use regex::Regex;
-use sha2::{Digest, Sha256};
 
 /// Which install hook a script implements.
 ///

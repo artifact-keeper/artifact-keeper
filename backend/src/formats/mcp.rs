@@ -17,12 +17,12 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
@@ -1527,12 +1527,11 @@ impl CursorSeal {
     /// (HMAC-SHA256 key derivation with a label of its own, so the key is
     /// unrelated to the token-signing key).
     pub fn from_secret(secret: &str) -> Self {
-        use hmac::{Hmac, Mac};
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
-            .expect("HMAC-SHA256 accepts any key length");
-        mac.update(b"artifact-keeper/mcp-listing-cursor/aes-256-gcm/v1");
         Self {
-            key: mac.finalize().into_bytes().into(),
+            key: crate::crypto::hmac::sha256(
+                secret.as_bytes(),
+                b"artifact-keeper/mcp-listing-cursor/aes-256-gcm/v1",
+            ),
         }
     }
 
@@ -1544,25 +1543,15 @@ impl CursorSeal {
 
     /// Seal `parts` for the listing of repository `scope`.
     pub fn seal(&self, scope: Uuid, parts: &[&str]) -> String {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
-        use aes_gcm::{Aes256Gcm, Nonce};
-        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
-        let nonce: [u8; 12] = rand::random();
+        // AES-256-GCM on the module (#5585); the facade emits `nonce || ct`,
+        // which is exactly the layout after the version byte.
+        let key = crate::crypto::aead::Key::new(&self.key).expect("a 32-byte key");
         let plain = serde_json::to_vec(parts).expect("strings serialize");
         let aad = Self::aad(scope);
-        let ct = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &plain,
-                    aad: &aad,
-                },
-            )
-            .expect("AES-256-GCM encryption does not fail");
-        let mut out = Vec::with_capacity(1 + nonce.len() + ct.len());
+        let sealed = key.seal(&plain, &aad);
+        let mut out = Vec::with_capacity(1 + sealed.len());
         out.push(CURSOR_SEAL_VERSION);
-        out.extend_from_slice(&nonce);
-        out.extend_from_slice(&ct);
+        out.extend_from_slice(&sealed);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(out)
     }
 
@@ -1570,8 +1559,6 @@ impl CursorSeal {
     /// (made up, altered, issued by another repository or under another
     /// secret) is the listing's `400 invalid cursor`.
     pub fn open(&self, scope: Uuid, cursor: &str) -> std::result::Result<Vec<String>, McpError> {
-        use aes_gcm::aead::{Aead, KeyInit, Payload};
-        use aes_gcm::{Aes256Gcm, Nonce};
         let bad = || McpError::invalid_query("cursor", "invalid cursor");
         if cursor.len() > MAX_CURSOR_LEN {
             return Err(bad());
@@ -1582,17 +1569,9 @@ impl CursorSeal {
         if raw.len() < 1 + 12 + 16 || raw[0] != CURSOR_SEAL_VERSION {
             return Err(bad());
         }
-        let cipher = Aes256Gcm::new_from_slice(&self.key).expect("a 32-byte key");
+        let key = crate::crypto::aead::Key::new(&self.key).expect("a 32-byte key");
         let aad = Self::aad(scope);
-        let plain = cipher
-            .decrypt(
-                Nonce::from_slice(&raw[1..13]),
-                Payload {
-                    msg: &raw[13..],
-                    aad: &aad,
-                },
-            )
-            .map_err(|_| bad())?;
+        let plain = key.open(&raw[1..], &aad).map_err(|_| bad())?;
         serde_json::from_slice(&plain).map_err(|_| bad())
     }
 

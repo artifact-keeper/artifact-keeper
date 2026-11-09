@@ -1,10 +1,10 @@
 //! Filesystem storage backend.
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use tokio::fs;
