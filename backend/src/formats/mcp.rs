@@ -648,6 +648,272 @@ fn check_http_url(path: &str, value: Option<&str>) -> V {
     }
 }
 
+/// Cap on the expansions of one transport URL template checked at publish
+/// (#5529): the product of every variable's distinct publisher values.
+pub const MAX_URL_TEMPLATE_EXPANSIONS: usize = 256;
+
+/// What a variable with no publisher value stands for while the other
+/// variables are expanded: a client-supplied value cannot change a scheme
+/// the template spells out, and `1` is a valid host label, port and path.
+/// A variable with no value in the scheme position stands for nothing
+/// instead, so a later variable's value is checked as the scheme.
+const UNBOUND_VARIABLE_STAND_IN: &str = "1";
+
+/// Why a transport URL template can reach a client as something other than
+/// an absolute `http(s)` URL (#5529).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlTemplateIssue {
+    /// Filling the variables with these publisher values (`value`,
+    /// `default`, `placeholder`, `choices`) yields `expansion`, not an
+    /// `http(s)` URL.
+    NotHttp {
+        assignments: Vec<(String, String)>,
+        expansion: String,
+    },
+    /// The variable that opens the template (and so picks the scheme),
+    /// declared or not, has no publisher value.
+    UnboundScheme { variable: String },
+    /// More than [`MAX_URL_TEMPLATE_EXPANSIONS`] expansions (`count`
+    /// saturates).
+    TooManyExpansions { count: usize },
+}
+
+impl UrlTemplateIssue {
+    pub fn message(&self) -> String {
+        fn quoted(s: &str) -> String {
+            const MAX: usize = 120;
+            let clipped = if s.chars().count() > MAX {
+                format!("{}...", s.chars().take(MAX).collect::<String>())
+            } else {
+                s.to_string()
+            };
+            format!("\"{}\"", shown(&clipped))
+        }
+        match self {
+            UrlTemplateIssue::NotHttp {
+                assignments,
+                expansion,
+            } => {
+                let with = assignments
+                    .iter()
+                    .map(|(k, v)| format!("variable `{k}` = {}", quoted(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "with {with} this URL expands to {}, which is not an absolute http or https URL",
+                    quoted(expansion)
+                )
+            }
+            UrlTemplateIssue::UnboundScheme { variable } => format!(
+                "variable `{variable}` picks the URL scheme and needs a `default` or `choices` \
+                 that are absolute http or https URLs"
+            ),
+            UrlTemplateIssue::TooManyExpansions { count } => format!(
+                "the URL template's variables expand to {count} URLs, more than the \
+                 {MAX_URL_TEMPLATE_EXPANSIONS} checked: offer fewer `choices`"
+            ),
+        }
+    }
+}
+
+/// How much of a URL template [`remote_url_issue`] / [`package_url_issue`]
+/// expand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlExpansion {
+    /// Every combination of every variable's values, refused past
+    /// [`MAX_URL_TEMPLATE_EXPANSIONS`] (publish).
+    All,
+    /// Each value of the scheme-position variable on its own, the others
+    /// standing in for client input: linear, never too many (the lint of a
+    /// stored template that publish would refuse as too large).
+    SchemeOnly,
+}
+
+/// The values a client that takes the publisher's word fills a URL
+/// variable with: `value`, `default`, `placeholder` (clients pre-fill it)
+/// and every `choices` entry.
+fn publisher_values(input: &Input) -> impl Iterator<Item = &str> {
+    input
+        .value
+        .iter()
+        .chain(input.default.iter())
+        .chain(input.placeholder.iter())
+        .chain(input.choices.iter().flatten())
+        .map(String::as_str)
+}
+
+/// The distinct publisher values of every input in `inputs`; `None` when
+/// there is no input (an undeclared variable).
+fn union_values<'a>(inputs: impl Iterator<Item = &'a Input>) -> Option<Vec<&'a str>> {
+    let mut declared = false;
+    let mut out: Vec<&str> = Vec::new();
+    for input in inputs {
+        declared = true;
+        for v in publisher_values(input) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    declared.then_some(out)
+}
+
+/// Every expansion of the `{variable}` template `template` against the
+/// publisher values `values_of` finds (`None`: undeclared) must be an
+/// absolute `http(s)` URL ([`is_http_url`], as for every other URL in a
+/// server.json). A variable with no value stands in for client input; one
+/// in the scheme position, declared or not, is refused, since whatever the
+/// client fills in picks the scheme (the later variables are still
+/// expanded, so a value of theirs that reaches the scheme is named). A
+/// template with no publisher value and a literal scheme is left to the
+/// shape check alone.
+pub fn url_template_issue<'a>(
+    template: &str,
+    values_of: impl Fn(&str) -> Option<Vec<&'a str>>,
+    mode: UrlExpansion,
+) -> Option<UrlTemplateIssue> {
+    enum Seg<'s> {
+        Lit(&'s str),
+        Var(&'s str),
+    }
+    let mut segs = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let Some(len) = rest[open..].find('}') else {
+            break;
+        };
+        if open > 0 {
+            segs.push(Seg::Lit(&rest[..open]));
+        }
+        segs.push(Seg::Var(&rest[open + 1..open + len]));
+        rest = &rest[open + len + 1..];
+    }
+    if !rest.is_empty() {
+        segs.push(Seg::Lit(rest));
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for s in &segs {
+        if let Seg::Var(n) = s {
+            if !names.contains(n) {
+                names.push(n);
+            }
+        }
+    }
+    let mut values: Vec<Vec<&str>> = names
+        .iter()
+        .map(|n| values_of(n).unwrap_or_default())
+        .collect();
+    // The variable in the scheme position, if the template opens with one.
+    let scheme = match segs.first() {
+        Some(Seg::Var(n)) => names.iter().position(|m| m == n),
+        _ => None,
+    };
+    let unbound_scheme = scheme.filter(|&i| values[i].is_empty()).map(|i| names[i]);
+    if mode == UrlExpansion::SchemeOnly {
+        // Only the scheme variable varies; the others take one value each.
+        for (i, v) in values.iter_mut().enumerate() {
+            if Some(i) != scheme {
+                v.truncate(1);
+            }
+        }
+    }
+    if unbound_scheme.is_none() && values.iter().all(Vec::is_empty) {
+        return None;
+    }
+    let count = values
+        .iter()
+        .fold(1usize, |acc, v| acc.saturating_mul(v.len().max(1)));
+    if count > MAX_URL_TEMPLATE_EXPANSIONS {
+        return Some(UrlTemplateIssue::TooManyExpansions { count });
+    }
+    let mut pick = vec![0usize; names.len()];
+    for _ in 0..count {
+        let value_of = |i: usize| values[i].get(pick[i]).copied();
+        let expansion: String = segs
+            .iter()
+            .map(|s| match s {
+                Seg::Lit(l) => *l,
+                Seg::Var(n) => {
+                    let i = names.iter().position(|m| m == n).unwrap_or(0);
+                    value_of(i).unwrap_or(if Some(i) == scheme {
+                        ""
+                    } else {
+                        UNBOUND_VARIABLE_STAND_IN
+                    })
+                }
+            })
+            .collect();
+        // With no scheme variable value, an expansion that is not a URL at
+        // all is the unbound scheme (reported below), not a later value's
+        // fault; one a later value gave a scheme is that value's.
+        let blamed = unbound_scheme.is_none() || url::Url::parse(&expansion).is_ok();
+        if blamed && (!is_http_url(&expansion) || has_forbidden_chars(&expansion)) {
+            let assignments = (0..names.len())
+                .filter_map(|i| value_of(i).map(|v| (names[i].to_string(), v.to_string())))
+                .collect();
+            return Some(UrlTemplateIssue::NotHttp {
+                assignments,
+                expansion,
+            });
+        }
+        for (i, p) in pick.iter_mut().enumerate() {
+            *p += 1;
+            if *p < values[i].len() {
+                break;
+            }
+            *p = 0;
+        }
+    }
+    unbound_scheme.map(|v| UrlTemplateIssue::UnboundScheme {
+        variable: v.to_string(),
+    })
+}
+
+/// [`url_template_issue`] for a remote: its variables are the remote's
+/// `variables` map.
+pub fn remote_url_issue(remote: &Transport, mode: UrlExpansion) -> Option<UrlTemplateIssue> {
+    let url = remote.url.as_deref()?;
+    url_template_issue(
+        url,
+        |n| union_values(remote.variables.as_ref()?.get(n).into_iter()),
+        mode,
+    )
+}
+
+/// [`url_template_issue`] for a package transport: its variables are the
+/// package's arguments (by `valueHint` or `name`) and environment variables
+/// (by `name`), as the upstream schema describes `transport.url`. Every
+/// matching input counts (several may share a name), so the values are the
+/// union of all of theirs.
+pub fn package_url_issue(p: &Package, mode: UrlExpansion) -> Option<UrlTemplateIssue> {
+    let url = p.transport.url.as_deref()?;
+    url_template_issue(
+        url,
+        |n| {
+            let envs = p
+                .environment_variables
+                .iter()
+                .filter(move |e| e.name.as_deref() == Some(n));
+            let args = p
+                .runtime_arguments
+                .iter()
+                .chain(&p.package_arguments)
+                .filter(move |a| {
+                    a.value_hint.as_deref() == Some(n) || a.name.as_deref() == Some(n)
+                });
+            union_values(envs.chain(args))
+        },
+        mode,
+    )
+}
+
+fn check_url_template(path: &str, issue: Option<UrlTemplateIssue>) -> V {
+    match issue {
+        Some(i) => Err(McpError::invalid(path, i.message())),
+        None => Ok(()),
+    }
+}
+
 /// A version string a publisher may use: 1..=255 characters, not `latest`,
 /// not a range, and safe as one path segment.
 pub fn check_version(path: &str, v: &str) -> V {
@@ -946,6 +1212,10 @@ fn validate_package(i: usize, p: &Package, allow_floating_oci: bool) -> V {
         &format!("{path}.environmentVariables"),
         &p.environment_variables,
         InputRole::KeyValue,
+    )?;
+    check_url_template(
+        &format!("{path}.transport.url"),
+        package_url_issue(p, UrlExpansion::All),
     )
 }
 
@@ -1071,6 +1341,10 @@ fn validate_document(s: &ServerJson, allow_floating_oci: bool, require_install: 
     }
     for (i, r) in s.remotes.iter().enumerate() {
         validate_transport(&format!("remotes[{i}]"), r, true)?;
+        check_url_template(
+            &format!("remotes[{i}].url"),
+            remote_url_issue(r, UrlExpansion::All),
+        )?;
     }
     Ok(())
 }
@@ -2811,7 +3085,7 @@ mod tests {
             "packages[0].transport.type"
         );
         assert!(check(with(npm(
-            serde_json::json!({"transport": {"type": "streamable-http", "url": "{baseUrl}/mcp"}})
+            serde_json::json!({"transport": {"type": "streamable-http", "url": "{baseUrl}/mcp"}, "environmentVariables": [{"name": "baseUrl", "default": "https://mcp.acme.test"}]})
         )))
         .is_ok());
         assert_eq!(
@@ -2934,6 +3208,210 @@ mod tests {
             )),
             "packages[0].runtimeArguments[0].variables.bad-key"
         );
+    }
+
+    /// The refusal `check` gives one remote (`url`, `variables`), as
+    /// `(path, detail)`; `None` when it publishes.
+    fn remote_refusal(url: &str, variables: serde_json::Value) -> Option<(String, String)> {
+        let mut remote = serde_json::json!({"type": "sse", "url": url});
+        if !variables.is_null() {
+            remote["variables"] = variables;
+        }
+        match check(doc(serde_json::json!({"remotes": [remote]}))) {
+            Ok(_) => None,
+            Err(e @ McpError::Invalid { .. }) => {
+                assert_eq!(e.code(), "mcp_invalid_server_json");
+                let McpError::Invalid { path, msg } = e else {
+                    unreachable!()
+                };
+                Some((path, msg))
+            }
+            Err(other) => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn templated_remote_urls_expand_to_http_only() {
+        // #5529: the issue's rig, a `choices`-only variant, and every
+        // active scheme, all refused with the literal path's code and path.
+        for (vars, var, value) in [
+            (
+                serde_json::json!({"base": {"default": "javascript:alert(1)//"}}),
+                "base",
+                "javascript:alert(1)//",
+            ),
+            (
+                serde_json::json!({"base": {"choices": ["https://ok.example", "javascript:alert(1)//"]}}),
+                "base",
+                "javascript:alert(1)//",
+            ),
+            (
+                serde_json::json!({"base": {"default": "data:text/html,<b>x</b>"}}),
+                "base",
+                "data:text/html,<b>x</b>",
+            ),
+            (
+                serde_json::json!({"base": {"default": "https://ok.example", "choices": ["vbscript:msgbox(1)"]}}),
+                "base",
+                "vbscript:msgbox(1)",
+            ),
+        ] {
+            let (path, msg) = remote_refusal("{base}/sse", vars.clone())
+                .unwrap_or_else(|| panic!("{vars} published"));
+            assert_eq!(path, "remotes[0].url");
+            assert!(
+                msg.contains(&format!("variable `{var}` = \"{value}\""))
+                    && msg.contains(&format!("\"{value}/sse\"")),
+                "{msg}"
+            );
+        }
+        // The literal form, for the code and path the expansion reuses.
+        assert_eq!(
+            remote_refusal("javascript:alert(1)//sse", serde_json::Value::Null)
+                .unwrap()
+                .0,
+            "remotes[0].url"
+        );
+        // A declared variable in the scheme position with no value: the
+        // client's input picks the scheme.
+        let (path, msg) = remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"isRequired": true}}),
+        )
+        .unwrap();
+        assert_eq!(path, "remotes[0].url");
+        assert!(
+            msg.contains("variable `base` picks the URL scheme"),
+            "{msg}"
+        );
+        // A variable that is only the scheme segment, with a non-http
+        // choice, beside a value-less path variable.
+        assert!(remote_refusal(
+            "{scheme}://x.example/{path}",
+            serde_json::json!({"scheme": {"choices": ["https", "javascript"]}, "path": {}})
+        )
+        .is_some());
+        // An undeclared variable in the scheme position is refused too; one
+        // anywhere else stands for client input and publishes.
+        let (_, msg) = remote_refusal("{base}/sse", serde_json::Value::Null).unwrap();
+        assert!(
+            msg.contains("variable `base` picks the URL scheme"),
+            "{msg}"
+        );
+        // A later variable's value that reaches the scheme is named.
+        let (_, msg) = remote_refusal(
+            "{a}{b}",
+            serde_json::json!({"b": {"default": "javascript:x"}}),
+        )
+        .unwrap();
+        assert!(msg.contains(r#"variable `b` = "javascript:x""#), "{msg}");
+        // An undeclared scheme variable whose neighbour supplies an http(s)
+        // scheme still picks it.
+        let (_, msg) = remote_refusal(
+            "{a}{b}",
+            serde_json::json!({"b": {"default": "https://x.example"}}),
+        )
+        .unwrap();
+        assert!(msg.contains("variable `a` picks the URL scheme"), "{msg}");
+        // A placeholder is pre-filled by clients, so it is a value too.
+        assert!(remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"placeholder": "javascript:alert(1)//"}})
+        )
+        .is_some());
+        assert!(remote_refusal("https://x.example/{tenant}", serde_json::Value::Null).is_none());
+        // More than 256 expansions: refused rather than enumerated.
+        let choices = |n: usize| serde_json::json!({"choices": (0..n).map(|i| format!("v{i}")).collect::<Vec<_>>()});
+        let (path, msg) = remote_refusal(
+            "https://x.example/{a}/{b}/{c}",
+            serde_json::json!({"a": choices(10), "b": choices(10), "c": choices(3)}),
+        )
+        .unwrap();
+        assert_eq!(path, "remotes[0].url");
+        assert!(
+            msg.contains("expand to 300 URLs, more than the 256"),
+            "{msg}"
+        );
+        assert!(remote_refusal(
+            "https://x.example/{a}/{b}",
+            serde_json::json!({"a": choices(16), "b": choices(16)})
+        )
+        .is_none());
+        // Benign controls.
+        assert!(remote_refusal(
+            "https://{host}/sse",
+            serde_json::json!({"host": {"default": "mcp.acme.test"}})
+        )
+        .is_none());
+        assert!(remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"default": "https://x.example", "choices": ["https://x.example", "http://y.example:8080"]}})
+        )
+        .is_none());
+        assert!(remote_refusal(
+            "https://x.example/{tenant}/sse",
+            serde_json::json!({"tenant": {"isRequired": true}})
+        )
+        .is_none());
+        assert!(remote_refusal(
+            "https://{host}:{port}/{tenant}",
+            serde_json::json!({"host": {}, "port": {"default": "8443"}, "tenant": {}})
+        )
+        .is_none());
+        // A host default cannot leave the template's scheme; it only names
+        // the authority, as a literal URL could.
+        assert!(remote_refusal(
+            "https://{host}/sse",
+            serde_json::json!({"host": {"default": "bad host"}})
+        )
+        .is_some());
+        // A long offending value is clipped in the detail.
+        let long = format!("javascript:{}", "a".repeat(200));
+        let (_, msg) =
+            remote_refusal("{base}", serde_json::json!({"base": {"default": long}})).unwrap();
+        assert!(msg.contains("...\"") && msg.len() < 400, "{msg}");
+        // Quotes and backticks in a value cannot unbalance the detail.
+        let (_, msg) = remote_refusal(
+            "{base}/sse",
+            serde_json::json!({"base": {"default": "javascript:`x`\"y\""}}),
+        )
+        .unwrap();
+        assert!(msg.contains(r#"= "javascript:`x`\"y\"""#), "{msg}");
+        // An unclosed brace is literal text, as before.
+        assert_eq!(
+            url_template_issue("https://x.example/{a", |_| None, UrlExpansion::All),
+            None
+        );
+    }
+
+    #[test]
+    fn templated_package_transport_urls_expand_to_http_only() {
+        let with = |p: serde_json::Value| doc(serde_json::json!({"remotes": [], "packages": [p]}));
+        let transport = |url: &str| serde_json::json!({"type": "streamable-http", "url": url});
+        for extra in [
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "environmentVariables": [{"name": "baseUrl", "default": "javascript:alert(1)//"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "packageArguments": [{"type": "positional", "valueHint": "baseUrl", "choices": ["data:text/html,x"]}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "environmentVariables": [{"name": "baseUrl"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp")}),
+            // Every input matching the variable counts, not the first.
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"),
+                "environmentVariables": [{"name": "baseUrl", "default": "https://ok.example"}],
+                "packageArguments": [{"type": "positional", "valueHint": "baseUrl", "default": "javascript:alert(1)//"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"),
+                "environmentVariables": [{"name": "baseUrl", "default": "https://ok.example"}, {"name": "baseUrl", "default": "javascript:alert(1)//"}]}),
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"),
+                "runtimeArguments": [{"type": "positional", "valueHint": "baseUrl", "default": "https://ok.example"}],
+                "packageArguments": [{"type": "named", "name": "baseUrl", "default": "javascript:alert(1)//"}]}),
+        ] {
+            assert_eq!(invalid_path(with(npm(extra))), "packages[0].transport.url");
+        }
+        for extra in [
+            serde_json::json!({"transport": transport("{baseUrl}/mcp"), "environmentVariables": [{"name": "baseUrl", "default": "http://localhost:3000"}]}),
+            serde_json::json!({"transport": transport("http://localhost:{port}/mcp"), "runtimeArguments": [{"type": "named", "name": "--port", "valueHint": "port", "default": "3000"}]}),
+            serde_json::json!({"transport": transport("http://localhost:{port}/mcp"), "environmentVariables": [{"name": "port"}]}),
+        ] {
+            assert!(check(with(npm(extra.clone()))).is_ok(), "{extra}");
+        }
     }
 
     #[test]
