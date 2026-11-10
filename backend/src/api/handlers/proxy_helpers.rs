@@ -10394,14 +10394,14 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
 
 /// Why [`proxy_scan_and_record`] could not produce a verdict (#3455).
 ///
-/// Exactly three things make a scan inconclusive, and they collapse to this
-/// one discriminated result instead of `Option`'s single `None` so a caller
-/// that cares WHICH one fired -- the rescan endpoint (#3396) -- can say so.
-/// The inline download gate's two call sites map every arm back onto the SAME
-/// fail-open/fail-closed handling they had before this change
-/// (`.ok()`-shaped), because that posture is #2954's and is explicitly out of
-/// scope here. The fail-closed one only marks the `BudgetExceeded` refusal as
-/// one a retry resolves (#5273, [`ScanPendingRetryable`]).
+/// Four things make a scan inconclusive (the fourth only on a rescan), and
+/// they collapse to this one discriminated result instead of `Option`'s single
+/// `None` so a caller that cares WHICH one fired -- the rescan endpoint
+/// (#3396) -- can say so. The inline download gate's two call sites map every
+/// arm back onto the SAME fail-open/fail-closed handling they had before this
+/// change (`.ok()`-shaped), because that posture is #2954's and is explicitly
+/// out of scope here. The fail-closed one only marks the `BudgetExceeded`
+/// refusal as one a retry resolves (#5273, [`ScanPendingRetryable`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProxyScanInconclusive {
     /// No scanner is configured for this instance.
@@ -10415,6 +10415,12 @@ pub(crate) enum ProxyScanInconclusive {
     /// file scan (#5231) this also covers a scan that did not get a permit
     /// inside the queue wait, or that there was no room to start.
     BudgetExceeded,
+    /// Rescan only (#5628): the stored verdict blocks and was graded as a
+    /// request-pinned coordinate (an OS package of a release, a Go, Composer
+    /// or Conan coordinate), and the unpinned rescan did not find it at least
+    /// as severe. A rescan cannot name that coordinate, so retrying cannot
+    /// help; a pull through the proxy re-grades it.
+    RequestPinned,
 }
 
 /// Outcome of racing `scan_fut` against `budget`, before any logging or
@@ -10615,7 +10621,10 @@ fn scan_file_in_flight(
                 &digest,
                 &synthetic.name,
                 &verdict,
-                expected.as_ref(),
+                expected
+                    .as_ref()
+                    .map(crate::services::scanner_service::ExpectedComponent::pin_identity)
+                    .as_deref(),
                 Some(observed),
             ),
         )
@@ -10720,13 +10729,18 @@ async fn wait_for_file_scan(
 /// [`proxy_scan_and_record`] for the on-demand rescan of cached bytes (#3396).
 ///
 /// A rescan has no request coordinate, so it never pins. It records its
-/// verdict exactly as an inline scan would, with one exception: a `clean`
-/// result does not replace a stored `vulnerable` verdict for the same digest
-/// when the engine cataloged fewer components than that verdict was graded
-/// on (see [`rescan_may_replace_stored_verdict`]). Such a rescan saw less of
-/// the package than the scan it would overrule, so it is inconclusive
-/// ([`ProxyScanInconclusive::ScanFailed`]) and the stored verdict, inventory
-/// and findings are left as they are.
+/// verdict exactly as an inline scan would, except where it would overrule a
+/// stored blocking verdict it graded less of (see [`rescan_replacement`]):
+///
+/// * one graded as a request-pinned coordinate (a `.deb`, `.rpm` or `.apk`
+///   of a release, a Go, Composer or Conan coordinate, #5628) is replaced
+///   only by a blocking result at least as severe, under the stored pin;
+///   otherwise the rescan is [`ProxyScanInconclusive::RequestPinned`];
+/// * any other one is not replaced by a `clean` result that cataloged fewer
+///   components ([`ProxyScanInconclusive::ScanFailed`]).
+///
+/// An inconclusive rescan leaves the stored verdict, inventory and findings
+/// as they are.
 pub(crate) async fn proxy_rescan_and_record(
     state: &crate::api::SharedState,
     repo_id: Uuid,
@@ -10743,28 +10757,84 @@ pub(crate) async fn proxy_rescan_and_record(
     .await
 }
 
+/// The stored row a rescan would replace (#3396, #5628).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoredRescanRow<'a> {
+    pub verdict: &'a str,
+    pub components_cataloged: Option<i32>,
+    pub pin_identity: Option<&'a str>,
+    pub max_severity: Option<&'a str>,
+}
+
+/// What a rescan may do with the stored verdict for the same digest.
+#[derive(Debug, Clone)]
+pub(crate) enum RescanReplacement {
+    /// Record the rescan's verdict as an unpinned one.
+    Replace,
+    /// Record the rescan's verdict under the stored pin (#5628): the stored
+    /// verdict was graded as a request-pinned coordinate and the rescan finds
+    /// the bytes at least as severe, so the coordinate it was graded as still
+    /// stands.
+    ReplaceKeepingPin(String),
+    /// Leave the stored verdict, inventory and findings as they are.
+    Refuse(ProxyScanInconclusive),
+}
+
 /// Whether a rescan verdict `new` may replace the stored verdict for the same
-/// digest (#3396), given the stored row's `(verdict, components_cataloged)`
-/// when one exists.
+/// digest (#3396, #5628).
 ///
-/// A `vulnerable` verdict is replaced by a `clean` one only when the rescan
-/// cataloged at least as many components as the stored verdict was graded
-/// on. Every other replacement (no stored row, a stored `clean`, a rescan
-/// that finds vulnerabilities, a stored verdict with no recorded catalog
-/// size) is allowed, as before. A rescan that reported no catalog counts as
-/// having cataloged nothing.
-pub(crate) fn rescan_may_replace_stored_verdict(
-    stored: Option<(&str, Option<i32>)>,
+/// * **A blocking verdict graded as a request-pinned coordinate**
+///   ([`ExpectedComponent::pin_identity_is_request_pinned`](crate::services::scanner_service::ExpectedComponent::pin_identity_is_request_pinned),
+///   #5628). An OS package is graded against the release its request names
+///   (`rpm|openssl-libs|…|rhel:9`), and a Go, Composer or Conan archive as
+///   the coordinate its request names. The rescan has no request, so it
+///   grades the bytes as no release and no coordinate: a `.rpm` still
+///   catalogs its own header and finds nothing without a release feed. Such
+///   a rescan replaces the verdict only when it is blocking too and at least
+///   as severe, and the stored pin is kept. Anything less (a `clean`, or a
+///   lower severity that an opted-in severity threshold would serve) is
+///   [`ProxyScanInconclusive::RequestPinned`].
+/// * **Any other blocking verdict** is replaced by a `clean` one only when
+///   the rescan cataloged at least as many components as the stored verdict
+///   was graded on; otherwise [`ProxyScanInconclusive::ScanFailed`]. A rescan
+///   that reported no catalog counts as having cataloged nothing.
+/// * Every other replacement (no stored row, a stored `clean`, a rescan that
+///   finds vulnerabilities) is allowed, as before.
+///
+/// Severities rank as the download gate ranks them: a blocking verdict with
+/// no recorded severity counts as the most severe.
+pub(crate) fn rescan_replacement(
+    stored: Option<StoredRescanRow<'_>>,
     new: &crate::services::scanner_service::ProxyScanVerdict,
-) -> bool {
-    use crate::services::proxy_scan_service::{verdict_blocks, VERDICT_CLEAN};
-    let Some((stored_verdict, stored_cataloged)) = stored else {
-        return true;
+) -> RescanReplacement {
+    use crate::services::proxy_scan_service::verdict_blocks;
+    use crate::services::scanner_service::ExpectedComponent;
+    let Some(stored) = stored.filter(|s| verdict_blocks(s.verdict)) else {
+        return RescanReplacement::Replace;
     };
-    if new.verdict_token() != VERDICT_CLEAN || !verdict_blocks(stored_verdict) {
-        return true;
+    let new_blocks = verdict_blocks(new.verdict_token());
+    if let Some(pin) = stored
+        .pin_identity
+        .filter(|p| ExpectedComponent::pin_identity_is_request_pinned(p))
+    {
+        // `Severity` orders Critical first; `None` ranks above all of it.
+        let rank = |s: Option<crate::models::security::Severity>| s.map_or(-1, |s| s as i32);
+        let stored_severity = stored
+            .max_severity
+            .and_then(crate::models::security::Severity::from_str_loose);
+        return if new_blocks && rank(new.max_severity) <= rank(stored_severity) {
+            RescanReplacement::ReplaceKeepingPin(pin.to_string())
+        } else {
+            RescanReplacement::Refuse(ProxyScanInconclusive::RequestPinned)
+        };
     }
-    new.components_cataloged.unwrap_or(0) >= stored_cataloged.unwrap_or(0)
+    if new_blocks
+        || new.components_cataloged.unwrap_or(0) >= stored.components_cataloged.unwrap_or(0)
+    {
+        RescanReplacement::Replace
+    } else {
+        RescanReplacement::Refuse(ProxyScanInconclusive::ScanFailed)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10787,9 +10857,10 @@ async fn scan_and_record(
     .await?;
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
+    let mut pin = expected.map(crate::services::scanner_service::ExpectedComponent::pin_identity);
     if rescan {
-        // #3396: see `rescan_may_replace_stored_verdict`. An unreadable
-        // stored row cannot be compared, so it is inconclusive too.
+        // #3396, #5628: see `rescan_replacement`. An unreadable stored row
+        // cannot be compared, so it is inconclusive too.
         let stored = match pss.lookup_verdict_catalog(digest, PROXY_SCAN_TYPE).await {
             Ok(stored) => stored,
             Err(e) => {
@@ -10800,19 +10871,43 @@ async fn scan_and_record(
                 return Err(ProxyScanInconclusive::ScanFailed);
             }
         };
-        let stored_ref = stored.as_ref().map(|(v, c)| (v.as_str(), *c));
-        if !rescan_may_replace_stored_verdict(stored_ref, &verdict) {
-            tracing::warn!(
-                repo_id = %repo_id, file = %filename, digest = %digest,
-                stored_components = ?stored_ref.and_then(|(_, c)| c),
-                rescan_components = ?verdict.components_cataloged,
-                "proxy rescan cataloged fewer components than the stored vulnerable \
-                 verdict was graded on; inconclusive, stored verdict unchanged"
-            );
-            return Err(ProxyScanInconclusive::ScanFailed);
+        let stored_row = stored.as_ref().map(|(v, c, p, sev)| StoredRescanRow {
+            verdict: v,
+            components_cataloged: *c,
+            pin_identity: p.as_deref(),
+            max_severity: sev.as_deref(),
+        });
+        match rescan_replacement(stored_row, &verdict) {
+            RescanReplacement::Replace => {}
+            RescanReplacement::ReplaceKeepingPin(stored_pin) => pin = Some(stored_pin),
+            RescanReplacement::Refuse(reason) => {
+                tracing::warn!(
+                    repo_id = %repo_id, file = %filename, digest = %digest,
+                    reason = ?reason,
+                    stored_components = ?stored_row.and_then(|s| s.components_cataloged),
+                    stored_pin = ?stored_row.and_then(|s| s.pin_identity),
+                    stored_severity = ?stored_row.and_then(|s| s.max_severity),
+                    rescan_verdict = %verdict.verdict_token(),
+                    rescan_severity = ?verdict.max_severity_token(),
+                    rescan_components = ?verdict.components_cataloged,
+                    "proxy rescan cannot overrule the stored blocking verdict (graded as a \
+                     request-pinned coordinate, or on more components); inconclusive, \
+                     stored verdict unchanged"
+                );
+                return Err(reason);
+            }
         }
     }
-    record_verdict_row(&pss, repo_id, digest, &filename, &verdict, expected, None).await;
+    record_verdict_row(
+        &pss,
+        repo_id,
+        digest,
+        &filename,
+        &verdict,
+        pin.as_deref(),
+        None,
+    )
+    .await;
     record_verdict_detail(&pss, repo_id, digest, &filename, &verdict).await;
     Ok(verdict)
 }
@@ -10891,7 +10986,7 @@ async fn record_verdict_row(
     digest: &str,
     filename: &str,
     verdict: &crate::services::scanner_service::ProxyScanVerdict,
-    expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    pin_identity: Option<&str>,
     observed: Option<Option<chrono::DateTime<Utc>>>,
 ) -> bool {
     // #4594: the cataloged-component count is written with the verdict, so
@@ -10911,9 +11006,7 @@ async fn record_verdict_row(
             verdict.scanner_version.as_deref(),
             Some(repo_id),
             verdict.components_cataloged,
-            expected
-                .map(crate::services::scanner_service::ExpectedComponent::pin_identity)
-                .as_deref(),
+            pin_identity,
             observed,
         )
         .await
@@ -11213,9 +11306,9 @@ pub(crate) async fn stored_vulnerable_verdict_blocks(
 /// Pulled out (#3455) so this decision is provable WITHOUT a DB or a scanner
 /// subprocess -- including for [`ProxyScanInconclusive::BudgetExceeded`],
 /// which is otherwise only reachable by actually exceeding a 30s+ budget.
-/// Every one of [`ProxyScanInconclusive`]'s three reasons (NoScanner /
-/// ScanFailed / BudgetExceeded) is the same `423 scan_pending` here, and none
-/// of them ever serves. `BudgetExceeded` alone is marked
+/// Every one of [`ProxyScanInconclusive`]'s reasons (NoScanner / ScanFailed /
+/// BudgetExceeded, and the rescan-only RequestPinned of #5628) is the same
+/// `423 scan_pending` here, and none of them ever serves. `BudgetExceeded` alone is marked
 /// [`ScanPendingRetryable`] (#5273): the scan goes on without this request, so
 /// a retry finds its verdict, and a format route whose client gives up on a
 /// `423` can say so with [`scan_pending_as_retryable_503`].
@@ -11239,7 +11332,7 @@ fn scan_inline_serve_decision(
         }
         Ok(_) => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         // Inconclusive under fail-closed => 423, never unscanned bytes.
-        // Logged because all three reasons render as the same 423 "retry shortly",
+        // Logged because every reason renders as the same 423 "retry shortly",
         // but only BudgetExceeded resolves on its own.
         Err(why) => {
             tracing::warn!(
@@ -11248,9 +11341,11 @@ fn scan_inline_serve_decision(
             );
             ProxyScanServeOutcome::Deny(match why {
                 ProxyScanInconclusive::BudgetExceeded => scan_pending_retryable_response(filename),
-                ProxyScanInconclusive::NoScanner | ProxyScanInconclusive::ScanFailed => {
-                    scan_pending_locked_response(filename)
-                }
+                // RequestPinned is rescan-only (#5628) and never reaches this
+                // gate; a retry could not resolve it, so it is not retryable.
+                ProxyScanInconclusive::NoScanner
+                | ProxyScanInconclusive::ScanFailed
+                | ProxyScanInconclusive::RequestPinned => scan_pending_locked_response(filename),
             })
         }
     }
@@ -13537,80 +13632,221 @@ mod tests {
 
     // ── #3396: rescan of already-cached bytes ──
 
+    /// A rescan verdict at `severity` (`None` is clean) cataloging `cataloged`
+    /// components.
+    fn rescan_verdict(
+        severity: Option<crate::models::security::Severity>,
+        cataloged: Option<i32>,
+    ) -> crate::services::scanner_service::ProxyScanVerdict {
+        use crate::services::scanner_service::aggregate_proxy_verdict;
+        let findings: Vec<crate::models::security::RawFinding> = severity
+            .map(|severity| crate::models::security::RawFinding {
+                severity,
+                title: "CVE-2026-3396 test".to_string(),
+                description: None,
+                cve_id: Some("CVE-2026-3396".to_string()),
+                affected_component: Some("x".to_string()),
+                affected_version: Some("1.0".to_string()),
+                fixed_version: None,
+                source: Some("grype".to_string()),
+                source_url: None,
+                finding_class: crate::models::security::FindingClass::Vulnerability,
+            })
+            .into_iter()
+            .collect();
+        let mut v = aggregate_proxy_verdict(&findings, Some("grype-test".to_string()));
+        v.components_cataloged = cataloged;
+        v
+    }
+
+    fn stored_row<'a>(
+        verdict: &'a str,
+        components_cataloged: Option<i32>,
+        pin_identity: Option<&'a str>,
+        max_severity: Option<&'a str>,
+    ) -> StoredRescanRow<'a> {
+        StoredRescanRow {
+            verdict,
+            components_cataloged,
+            pin_identity,
+            max_severity,
+        }
+    }
+
+    fn decide(
+        stored: Option<StoredRescanRow<'_>>,
+        new: &crate::services::scanner_service::ProxyScanVerdict,
+    ) -> String {
+        format!("{:?}", rescan_replacement(stored, new))
+    }
+
     /// A rescan replaces a stored `vulnerable` verdict with `clean` only when
     /// it cataloged at least as many components as that verdict was graded
     /// on; every other replacement stands.
     #[test]
     fn rescan_replaces_a_vulnerable_verdict_only_with_an_equal_or_larger_catalog() {
-        use crate::services::scanner_service::aggregate_proxy_verdict;
-        let clean = |cataloged: Option<i32>| {
-            let mut v = aggregate_proxy_verdict(&[], Some("grype-test".to_string()));
-            v.components_cataloged = cataloged;
-            v
-        };
-        let vulnerable = {
-            let mut v = aggregate_proxy_verdict(
-                &[crate::models::security::RawFinding {
-                    severity: crate::models::security::Severity::High,
-                    title: "CVE-2026-3396 test".to_string(),
-                    description: None,
-                    cve_id: Some("CVE-2026-3396".to_string()),
-                    affected_component: Some("x".to_string()),
-                    affected_version: Some("1.0".to_string()),
-                    fixed_version: None,
-                    source: Some("grype".to_string()),
-                    source_url: None,
-                    finding_class: crate::models::security::FindingClass::Vulnerability,
-                }],
-                Some("grype-test".to_string()),
-            );
-            v.components_cataloged = Some(0);
-            v
-        };
+        use crate::models::security::Severity;
+        let clean = |cataloged| rescan_verdict(None, cataloged);
+        let vulnerable = rescan_verdict(Some(Severity::High), Some(0));
         assert_eq!(clean(None).verdict_token(), "clean");
         assert_eq!(vulnerable.verdict_token(), "vulnerable");
+        let vuln = |cataloged| Some(stored_row("vulnerable", cataloged, None, Some("critical")));
+        let stored_clean = || Some(stored_row("clean", Some(5), None, None));
 
         // Fewer components than the stored vulnerable verdict: kept.
-        assert!(!rescan_may_replace_stored_verdict(
-            Some(("vulnerable", Some(1))),
-            &clean(Some(0))
-        ));
-        assert!(!rescan_may_replace_stored_verdict(
-            Some(("vulnerable", Some(1))),
-            &clean(None)
-        ));
-        assert!(!rescan_may_replace_stored_verdict(
-            Some(("vulnerable", Some(12))),
-            &clean(Some(3))
-        ));
+        assert_eq!(decide(vuln(Some(1)), &clean(Some(0))), "Refuse(ScanFailed)");
+        assert_eq!(decide(vuln(Some(1)), &clean(None)), "Refuse(ScanFailed)");
+        assert_eq!(
+            decide(vuln(Some(12)), &clean(Some(3))),
+            "Refuse(ScanFailed)"
+        );
         // As many or more: replaced.
-        assert!(rescan_may_replace_stored_verdict(
-            Some(("vulnerable", Some(3))),
-            &clean(Some(3))
-        ));
-        assert!(rescan_may_replace_stored_verdict(
-            Some(("vulnerable", Some(0))),
-            &clean(Some(0))
-        ));
+        assert_eq!(decide(vuln(Some(3)), &clean(Some(3))), "Replace");
+        assert_eq!(decide(vuln(Some(0)), &clean(Some(0))), "Replace");
         // Nothing to overrule, or nothing to compare against.
-        assert!(rescan_may_replace_stored_verdict(None, &clean(Some(0))));
-        assert!(rescan_may_replace_stored_verdict(
-            Some(("clean", Some(5))),
-            &clean(Some(0))
-        ));
-        assert!(rescan_may_replace_stored_verdict(
-            Some(("vulnerable", None)),
-            &clean(Some(0))
-        ));
+        assert_eq!(decide(None, &clean(Some(0))), "Replace");
+        assert_eq!(decide(stored_clean(), &clean(Some(0))), "Replace");
+        assert_eq!(decide(vuln(None), &clean(Some(0))), "Replace");
         // A rescan that finds vulnerabilities is recorded whatever it saw.
-        assert!(rescan_may_replace_stored_verdict(
-            Some(("vulnerable", Some(5))),
-            &vulnerable
-        ));
-        assert!(rescan_may_replace_stored_verdict(
-            Some(("clean", Some(5))),
-            &vulnerable
-        ));
+        assert_eq!(decide(vuln(Some(5)), &vulnerable), "Replace");
+        assert_eq!(decide(stored_clean(), &vulnerable), "Replace");
+    }
+
+    /// #5628: a `vulnerable` verdict graded as a request-pinned coordinate (an
+    /// OS package of a release, a Go/Composer/Conan coordinate) is replaced by
+    /// an unpinned rescan only when the rescan is blocking and at least as
+    /// severe, and then under the stored pin. A `clean`, or a lower severity
+    /// that an opted-in severity threshold would serve, is inconclusive
+    /// (`RequestPinned`) however many components it cataloged. A pin the bytes
+    /// carry themselves (npm) keeps the catalog-size rule.
+    #[test]
+    fn rescan_never_weakens_a_vulnerable_verdict_graded_under_a_request_pin_5628() {
+        use crate::models::security::Severity;
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+        let os_pin = |ecosystem, name: &str, version: &str, id: &str, release: &str| {
+            ExpectedComponent::os_package(
+                ecosystem,
+                name,
+                version,
+                OsPackageContext {
+                    release: OsRelease::new(id, release).expect("release"),
+                    arch: "x86_64".to_string(),
+                    source: None,
+                },
+            )
+            .expect("pin")
+            .pin_identity()
+        };
+        let rpm = os_pin(
+            ComponentEcosystem::Rpm,
+            "openssl-libs",
+            "1:3.0.7-17.el9_2",
+            "rhel",
+            "9",
+        );
+        let deb = os_pin(
+            ComponentEcosystem::Debian,
+            "openssl",
+            "3.0.11-1~deb12u2",
+            "debian",
+            "12",
+        );
+        let apk = os_pin(
+            ComponentEcosystem::Alpine,
+            "libcurl",
+            "8.14.1-r4",
+            "alpine",
+            "3.22",
+        );
+        let go = ExpectedComponent::new(ComponentEcosystem::Go, "golang.org/x/net", "v0.1.0")
+            .pin_identity();
+        let refused = "Refuse(RequestPinned)";
+        for pin in [&rpm, &deb, &apk, &go] {
+            let critical = || {
+                Some(stored_row(
+                    "vulnerable",
+                    Some(1),
+                    Some(pin),
+                    Some("critical"),
+                ))
+            };
+            for cataloged in [Some(1), Some(5), None] {
+                assert_eq!(
+                    decide(critical(), &rescan_verdict(None, cataloged)),
+                    refused,
+                    "{pin}: an unpinned clean rescan ({cataloged:?} components) must not clear it"
+                );
+            }
+            // The review case: vulnerable-critical -> vulnerable-low keeps
+            // critical and the pin.
+            for lower in [
+                Severity::High,
+                Severity::Medium,
+                Severity::Low,
+                Severity::Info,
+            ] {
+                assert_eq!(
+                    decide(critical(), &rescan_verdict(Some(lower), Some(1))),
+                    refused,
+                    "{pin}: a {lower:?} rescan must not lower a critical verdict"
+                );
+            }
+            // At least as severe: recorded, under the stored pin.
+            let kept = format!("ReplaceKeepingPin({pin:?})");
+            assert_eq!(
+                decide(
+                    critical(),
+                    &rescan_verdict(Some(Severity::Critical), Some(1))
+                ),
+                kept
+            );
+            let high = || Some(stored_row("vulnerable", Some(1), Some(pin), Some("high")));
+            assert_eq!(
+                decide(high(), &rescan_verdict(Some(Severity::High), Some(9))),
+                kept
+            );
+            assert_eq!(
+                decide(high(), &rescan_verdict(Some(Severity::Critical), Some(0))),
+                kept
+            );
+            // A blocking verdict with no recorded severity ranks as the most
+            // severe, as the download gate ranks it.
+            let unrated = Some(stored_row("vulnerable", Some(1), Some(pin), None));
+            assert_eq!(
+                decide(unrated, &rescan_verdict(Some(Severity::Critical), Some(1))),
+                refused
+            );
+            // A stored clean is not protected.
+            assert_eq!(
+                decide(
+                    Some(stored_row("clean", Some(1), Some(pin), None)),
+                    &rescan_verdict(None, Some(1))
+                ),
+                "Replace"
+            );
+        }
+        // A pin the bytes carry themselves keeps the catalog-size rule.
+        let npm =
+            ExpectedComponent::new(ComponentEcosystem::Npm, "minimist", "1.2.5").pin_identity();
+        let npm_row = || {
+            Some(stored_row(
+                "vulnerable",
+                Some(1),
+                Some(&npm),
+                Some("critical"),
+            ))
+        };
+        assert_eq!(decide(npm_row(), &rescan_verdict(None, Some(1))), "Replace");
+        assert_eq!(
+            decide(npm_row(), &rescan_verdict(None, Some(0))),
+            "Refuse(ScanFailed)"
+        );
+        assert_eq!(
+            decide(npm_row(), &rescan_verdict(Some(Severity::Low), Some(1))),
+            "Replace"
+        );
     }
 
     /// The recorder must be bounded and must DEGRADE, not queue: an over-cap

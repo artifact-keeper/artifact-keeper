@@ -3601,6 +3601,14 @@ fn rescan_inconclusive_response(
             code: "RESCAN_SCAN_FAILED".to_string(),
             message: "The scan failed. The stored verdict is unchanged.".to_string(),
         },
+        // #5628: no retry can succeed, so no `Retry-After` either (below).
+        ProxyScanInconclusive::RequestPinned => ErrorResponse {
+            code: "RESCAN_REQUEST_PINNED".to_string(),
+            message: "This verdict was graded against the release or coordinate the \
+                      request named; a rescan cannot re-grade it. Pull the package \
+                      through the proxy to re-grade it. The stored verdict is unchanged."
+                .to_string(),
+        },
         ProxyScanInconclusive::BudgetExceeded => {
             // The ACTUAL budget this request ran under, which is derived from
             // the configured global request timeout (#3455 review, F2) -- not
@@ -3619,6 +3627,8 @@ fn rescan_inconclusive_response(
     };
     let mut resp = (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response();
 
+    let retry_after =
+        retry_after.filter(|_| !matches!(reason, ProxyScanInconclusive::RequestPinned));
     if let Some(remaining) = retry_after {
         let secs = retry_after_delay_seconds(remaining);
         let value = axum::http::HeaderValue::from_str(&secs.to_string())
@@ -3677,10 +3687,16 @@ pub struct ProxyRescanResponse {
             `NO_SCANNER_CONFIGURED` (no scanner is configured for this instance), \
             `RESCAN_SCAN_FAILED` (the scan ran and errored, cataloged nothing \
             gradeable in an object it could not pin, or cataloged fewer \
-            components than a stored vulnerable verdict was graded on), or \
+            components than a stored vulnerable verdict was graded on), \
+            `RESCAN_REQUEST_PINNED` (the stored vulnerable verdict was graded \
+            against the release or coordinate the request named -- a `.deb`, \
+            `.rpm` or `.apk` of a release, a Go, Composer or Conan coordinate -- \
+            and the rescan, which cannot name it, did not find the package at \
+            least as severe; a rescan cannot re-grade it, so pull the package \
+            through the proxy to re-grade it; never carries `Retry-After`), or \
             `RESCAN_BUDGET_EXCEEDED` (the scan did not finish inside its budget). \
-            `Retry-After` is set only when cooldown time actually remains. \
-            The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
+            `Retry-After` is set only when cooldown time actually remains and a \
+            retry can succeed. The stored verdict is unchanged in every case.", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -3795,9 +3811,10 @@ async fn rescan_proxy_cached_path(
     let budget = crate::services::scanner_service::proxy_rescan_budget(
         state.config.global_request_timeout_secs,
     );
-    // A `clean` result does not replace a stored `vulnerable` verdict graded
-    // on more components than this rescan cataloged (see
-    // `rescan_may_replace_stored_verdict`); that is inconclusive too.
+    // A rescan does not overrule a stored blocking verdict it graded less of
+    // (a `clean` on fewer components, or a request-pinned verdict it did not
+    // find at least as severe, #5628; see `rescan_replacement`); that is
+    // inconclusive too.
     let verdict = match crate::api::handlers::proxy_helpers::proxy_rescan_and_record(
         &state, repo.id, &digest, &synthetic, &bytes, &mode, budget,
     )
@@ -3817,7 +3834,9 @@ async fn rescan_proxy_cached_path(
                 // pre-#3455 window (#3455 review, F5): the common case here
                 // is a misconfigured scanner erroring instantly, and a full
                 // 120s lockout per attempt makes that debug loop 4x worse.
-                ProxyScanInconclusive::ScanFailed => {
+                // A scan that ran but cannot overrule a request-pinned verdict
+                // (#5628) spent the same scanner time as a failed one.
+                ProxyScanInconclusive::ScanFailed | ProxyScanInconclusive::RequestPinned => {
                     shorten_rescan_slot(repo.id, PROXY_RESCAN_FAILURE_COOLDOWN)
                 }
                 // By definition consumed (up to) the whole budget: the claim
@@ -6274,6 +6293,265 @@ mod tests {
         assert_eq!(body["code"], serde_json::json!("RESCAN_SCAN_FAILED"));
         assert_eq!(status_b, axum::http::StatusCode::OK);
         assert_eq!(stored_b, PROXY_STATE_CLEAN);
+    }
+
+    /// #5628: a Debian or RPM Remote holds a `vulnerable` verdict graded as
+    /// the package of a release (`rpm|…|rhel:9`, `debian|…|debian:12`). A
+    /// rescan cannot pin the release, so the engine catalogs the package's
+    /// own header (one component, as many as the stored verdict) and, with no
+    /// release feed to match it against, finds nothing. That `clean` must not
+    /// replace the verdict: the rescan is inconclusive (503
+    /// `RESCAN_REQUEST_PINNED`, with no `Retry-After`, since no retry can
+    /// succeed), the stored verdict and its pin stand, and a fail_closed pull
+    /// of the pinned package is still refused (403).
+    #[tokio::test]
+    async fn rescan_without_the_release_pin_keeps_a_vulnerable_os_package_verdict_5628() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let cases = [
+            (
+                "rpm",
+                ComponentEcosystem::Rpm,
+                "9/BaseOS/x86_64/os/Packages/o/openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+                "openssl-libs-3.0.7-17.el9_2.x86_64.rpm",
+                "openssl-libs",
+                "1:3.0.7-17.el9_2",
+                ("rhel", "9"),
+            ),
+            (
+                "debian",
+                ComponentEcosystem::Debian,
+                "pool/main/o/openssl/openssl_3.0.11-1~deb12u2_amd64.deb",
+                "openssl_3.0.11-1~deb12u2_amd64.deb",
+                "openssl",
+                "3.0.11-1~deb12u2",
+                ("debian", "12"),
+            ),
+        ];
+        let mut outcomes = Vec::new();
+        for (format, ecosystem, path, filename, name, version, (id, release)) in cases {
+            let fx = ProxyScanFixture::with_format(pool.clone(), format).await;
+            let pin = ExpectedComponent::os_package(
+                ecosystem,
+                name,
+                version,
+                OsPackageContext {
+                    release: OsRelease::new(id, release).expect("a release with a feed"),
+                    arch: "x86_64".to_string(),
+                    source: None,
+                },
+            )
+            .expect("an OS package pin");
+            let content = bytes::Bytes::from(format!("{format} package {}", Uuid::new_v4()));
+            let digest = seed_cached_verdict_3396(
+                &fx,
+                path,
+                &content,
+                None,
+                PROXY_STATE_VULNERABLE,
+                Some(1),
+                Some(&pin.pin_identity()),
+            )
+            .await;
+            // Cataloged as itself, nothing found: what the engine reports for
+            // a lone package with no release to grade it against.
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::Cataloged("openssl", "3.0.7"),
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state = scanner_state_with(&fx, vec![scanner], path, content.clone(), |_| {}).await;
+
+            let resp = call_rescan(state.clone(), &fx, path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER).cloned();
+            let body = json_body(resp).await;
+            let stored = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone())
+                .lookup_verdict_with_pin(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict")
+                .expect("a stored verdict");
+            let pull = gate_pull_3396(
+                &state,
+                &fx,
+                filename,
+                None,
+                &digest,
+                &content,
+                crate::services::proxy_scan_service::ProxyScanAction::FailClosed,
+                crate::api::handlers::proxy_helpers::ProxyScanIdentity::Established(pin.clone()),
+            )
+            .await;
+
+            release_rescan_slot(fx.repo_id);
+            fx.cleanup(&[digest]).await;
+            outcomes.push((
+                format,
+                status,
+                retry_after,
+                body,
+                stored,
+                pin.pin_identity(),
+                pull,
+            ));
+        }
+
+        for (format, status, retry_after, body, (row, stored_pin, cataloged), pin, pull) in outcomes
+        {
+            assert_eq!(
+                status,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{format}: an unpinned clean rescan must be inconclusive: {body}"
+            );
+            assert_eq!(
+                body["code"],
+                serde_json::json!("RESCAN_REQUEST_PINNED"),
+                "{format}"
+            );
+            assert_eq!(
+                retry_after, None,
+                "{format}: a retry cannot succeed, so none is advertised"
+            );
+            assert_eq!(
+                (row.verdict.as_str(), stored_pin.as_deref(), cataloged),
+                (PROXY_STATE_VULNERABLE, Some(pin.as_str()), Some(1)),
+                "{format}: the stored verdict and its pin must stand"
+            );
+            assert_eq!(pull, "403", "{format}: the pinned pull is still refused");
+        }
+    }
+
+    /// #5628 review: an unpinned rescan that finds a release-pinned `critical`
+    /// package vulnerable at a LOWER severity (`high`) must not replace it
+    /// either. Recorded, it would have dropped the pin and the severity, and
+    /// an opted-in severity threshold above `high` would then serve the
+    /// package. It is inconclusive (503 `RESCAN_REQUEST_PINNED`), and the
+    /// `critical` verdict and its pin stand. A rescan that finds the package
+    /// at least as severe (stored `high`, rescan `high`) is recorded, under
+    /// the stored pin.
+    #[tokio::test]
+    async fn rescan_at_a_lower_severity_keeps_a_release_pinned_verdict_and_its_pin_5628() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::scanner_service::test_helpers::{MockCveRescan, VersionedCveScanner};
+        use crate::services::scanner_service::{
+            ComponentEcosystem, ExpectedComponent, OsPackageContext, OsRelease,
+        };
+
+        let pool = match tdh::try_pool().await {
+            Some(pool) => pool,
+            None if std::env::var_os("CI").is_some() => {
+                panic!("this CI regression requires Postgres; refusing to skip it")
+            }
+            None => return,
+        };
+        let fx = ProxyScanFixture::with_format(pool.clone(), "rpm").await;
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Rpm,
+            "openssl-libs",
+            "1:3.0.7-17.el9_2",
+            OsPackageContext {
+                release: OsRelease::new("rhel", "9").expect("a release with a feed"),
+                arch: "x86_64".to_string(),
+                source: None,
+            },
+        )
+        .expect("an OS package pin")
+        .pin_identity();
+        let pss = crate::services::proxy_scan_service::ProxyScanService::new(pool.clone());
+        let mut digests = Vec::new();
+        let mut outcomes = Vec::new();
+        for (n, stored_severity) in ["critical", "high"].into_iter().enumerate() {
+            let path = format!("Packages/o/openssl-libs-3.0.7-17.el9_2.{n}.x86_64.rpm");
+            let content = bytes::Bytes::from(format!("rpm package {}", Uuid::new_v4()));
+            let digest = seed_cached_verdict_3396(
+                &fx,
+                &path,
+                &content,
+                None,
+                PROXY_STATE_VULNERABLE,
+                Some(1),
+                Some(&pin),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE proxy_scan_results SET max_severity = $2 WHERE checksum_sha256 = $1",
+            )
+            .bind(&digest)
+            .bind(stored_severity)
+            .execute(&pool)
+            .await
+            .expect("set the stored severity");
+            // One `High` finding, cataloged as itself.
+            let scanner = std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-test"),
+                MockCveRescan::CatalogedVulnerable("openssl-libs", "3.0.7"),
+            ))
+                as std::sync::Arc<dyn crate::services::scanner_service::Scanner>;
+            let state =
+                scanner_state_with(&fx, vec![scanner], &path, content.clone(), |_| {}).await;
+            let resp = call_rescan(state, &fx, &path)
+                .await
+                .expect("a rescan answers with a built response");
+            let status = resp.status();
+            let body = json_body(resp).await;
+            let (row, stored_pin, _) = pss
+                .lookup_verdict_with_pin(
+                    &digest,
+                    crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE,
+                )
+                .await
+                .expect("read the stored verdict")
+                .expect("a stored verdict");
+            release_rescan_slot(fx.repo_id);
+            outcomes.push((stored_severity, status, body, row, stored_pin));
+            digests.push(digest);
+        }
+        fx.cleanup(&digests).await;
+
+        let (_, status, body, row, stored_pin) = &outcomes[0];
+        assert_eq!(
+            *status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], serde_json::json!("RESCAN_REQUEST_PINNED"));
+        assert_eq!(
+            (
+                row.verdict.as_str(),
+                row.max_severity.as_deref(),
+                stored_pin.as_deref()
+            ),
+            (PROXY_STATE_VULNERABLE, Some("critical"), Some(pin.as_str())),
+            "a lower-severity rescan must keep the critical verdict and its pin"
+        );
+
+        let (_, status, body, row, stored_pin) = &outcomes[1];
+        assert_eq!(*status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            (
+                row.verdict.as_str(),
+                row.max_severity.as_deref(),
+                stored_pin.as_deref()
+            ),
+            (PROXY_STATE_VULNERABLE, Some("high"), Some(pin.as_str())),
+            "an at-least-as-severe rescan is recorded under the stored pin"
+        );
     }
 
     /// A CVE-authoritative scanner that does not apply to the rescanned
