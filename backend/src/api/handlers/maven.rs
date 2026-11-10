@@ -2884,8 +2884,12 @@ async fn download(
         return Err(AppError::NotFound("File not found".to_string()).into_response());
     }
 
-    // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await
+    // 4. Serve the artifact file. Every serve (hosted, proxied, virtual)
+    // honours the client's `Range` through the shared helper (#5668): a
+    // segmented download (Maven Resolver's, a download manager's) of a
+    // 200-with-the-whole-body otherwise stitches the file together wrong.
+    let served = serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await?;
+    proxy_helpers::apply_range_to_streamed_serve(served, &headers, ctx.is_head)
 }
 
 /// One virtual member's answer to a Maven metadata fetch in a merge (#5621).
@@ -10247,6 +10251,56 @@ mod tests {
             "expected 200 for .meta/prefixes.txt.sha1"
         );
         assert_eq!(String::from_utf8_lossy(&sha1_body), expected);
+    }
+
+    /// #5668: the native `/maven/` route ignored `Range` and answered 200
+    /// with the whole body and no `Accept-Ranges`, so a segmented download
+    /// stitched every segment from byte 0. A hosted serve now answers 206
+    /// with the window, 416 past the end, and advertises `Accept-Ranges`.
+    #[tokio::test]
+    async fn test_native_route_honours_range_5668() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::{header, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+        let path = "com/acme/range5668/lib/1.0/lib-1.0.jar";
+        let jar = bytes::Bytes::from_static(b"0123456789abcdefghij");
+        let uri = format!("/{}/{path}", fx.repo_key);
+        let (put_status, _) = tdh::send(router.clone(), tdh::put(uri.clone(), jar.clone())).await;
+        let ranged = |range: &'static str| {
+            let mut req = tdh::get(uri.clone());
+            req.headers_mut()
+                .insert(header::RANGE, header::HeaderValue::from_static(range));
+            req
+        };
+        let (full_status, full_body, full_headers) =
+            tdh::send_with_headers(router.clone(), tdh::get(uri.clone())).await;
+        let (part_status, part_body, part_headers) =
+            tdh::send_with_headers(router.clone(), ranged("bytes=2-5")).await;
+        let (past_status, _, _) = tdh::send_with_headers(router, ranged("bytes=100-")).await;
+        fx.teardown().await;
+
+        assert_eq!(put_status, StatusCode::CREATED);
+        assert_eq!(full_status, StatusCode::OK);
+        assert_eq!(&full_body[..], &jar[..]);
+        assert_eq!(
+            full_headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(part_status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&part_body[..], b"2345");
+        assert_eq!(
+            part_headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 2-5/20")
+        );
+        assert_eq!(past_status, StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
     /// #5668: a new hosted repo served a header-only `.meta/prefixes.txt`.
