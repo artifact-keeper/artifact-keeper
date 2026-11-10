@@ -1408,12 +1408,7 @@ mod tests {
             (version, arch): (Option<&str>, Option<&str>),
         ) -> crate::services::curation_service::RuleEvaluation {
             CurationService::evaluate_rules(
-                rules,
-                "default",
-                "pkg",
-                version,
-                arch,
-                false,
+                rules, "default", "pkg", version, arch, false,
                 false, // the generic comparator, not conda's
             )
         }
