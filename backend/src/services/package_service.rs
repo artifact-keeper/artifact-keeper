@@ -515,6 +515,25 @@ pub async fn register_published_package_with_metadata(
     emit_artifact_uploaded(db, event_bus, repository_id, name, version, checksum_sha256).await;
 }
 
+/// Finds the `artifacts` row an `artifact.uploaded` event names: the newest
+/// live row of the repository that holds the published bytes.
+///
+/// `$2::bpchar` because `artifacts.checksum_sha256` is `CHAR(64)` and sqlx
+/// binds `&str` as `text`. Without the cast Postgres compares
+/// `checksum_sha256::text = $2`, which `idx_artifacts_checksum` cannot serve,
+/// and reads every row of the repository to return one. On an instance with
+/// several million artifacts that cost each publish about a second of
+/// database time, nearly all of it CPU (#5573; the same trap as #4426).
+const UPLOADED_ARTIFACT_LOOKUP_SQL: &str = r#"
+    SELECT id, uploaded_by
+      FROM artifacts
+     WHERE repository_id = $1
+       AND checksum_sha256 = $2::bpchar
+       AND is_deleted = false
+     ORDER BY created_at DESC
+     LIMIT 1
+"#;
+
 /// Publish `artifact.uploaded` for one freshly published asset (#3411).
 ///
 /// Before this existed the event had exactly one producer,
@@ -533,7 +552,8 @@ pub async fn register_published_package_with_metadata(
 /// `entity_id` and an actor, and the shared registration is handed neither, so
 /// the artifacts row the handler INSERTed immediately before is resolved by its
 /// `(repository_id, checksum_sha256)` — the same pair the catalog liveness join
-/// uses — to reproduce exactly what `finalize_upload`'s event carries.
+/// uses — to reproduce exactly what `finalize_upload`'s event carries. It is
+/// one probe of the checksum index ([`UPLOADED_ARTIFACT_LOOKUP_SQL`]).
 async fn emit_artifact_uploaded(
     db: &PgPool,
     event_bus: &Arc<EventBus>,
@@ -542,25 +562,15 @@ async fn emit_artifact_uploaded(
     version: &str,
     checksum_sha256: &str,
 ) {
-    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
-        r#"
-        SELECT id, uploaded_by
-          FROM artifacts
-         WHERE repository_id = $1
-           AND checksum_sha256 = $2
-           AND is_deleted = false
-         ORDER BY created_at DESC
-         LIMIT 1
-        "#,
-    )
-    .bind(repository_id)
-    .bind(checksum_sha256)
-    .fetch_optional(db)
-    .await
-    .unwrap_or_else(|e| {
-        warn!("Failed to resolve artifact for artifact.uploaded event: {e}");
-        None
-    });
+    let row: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(UPLOADED_ARTIFACT_LOOKUP_SQL)
+        .bind(repository_id)
+        .bind(checksum_sha256)
+        .fetch_optional(db)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to resolve artifact for artifact.uploaded event: {e}");
+            None
+        });
 
     // A format whose publish writes no `artifacts` row (or writes it after the
     // catalog) still fires the event — the coordinate identifies the asset well
@@ -1285,6 +1295,125 @@ mod tests {
                  hosted publish entry point, which emits artifact.uploaded (#3411)"
             );
         }
+    }
+
+    /// #5573: the lookup compares the digest as `bpchar`. Needs no database, so
+    /// a revert of the cast fails in every local run; the plan test below
+    /// shows what the cast buys.
+    #[test]
+    fn uploaded_artifact_lookup_compares_the_checksum_as_bpchar() {
+        assert!(
+            UPLOADED_ARTIFACT_LOOKUP_SQL.contains("checksum_sha256 = $2::bpchar"),
+            "artifacts.checksum_sha256 is CHAR(64) and sqlx binds &str as text: without \
+             `::bpchar` the checksum index cannot serve this lookup (#5573), got:\n\
+             {UPLOADED_ARTIFACT_LOOKUP_SQL}"
+        );
+    }
+
+    /// EXPLAIN `sql` as sqlx runs it: PREPAREd with a `text` checksum
+    /// parameter and planned generically. PREPARE outlives the transaction, so
+    /// the caller deallocates `name` once it has rolled back.
+    async fn generic_plan_with_text_checksum(
+        conn: &mut sqlx::PgConnection,
+        name: &str,
+        sql: &str,
+    ) -> Vec<String> {
+        sqlx::query(sqlx::AssertSqlSafe(&*format!(
+            "PREPARE {name} (uuid, text) AS {sql}"
+        )))
+        .execute(&mut *conn)
+        .await
+        .expect("prepare the lookup");
+        sqlx::query_scalar(sqlx::AssertSqlSafe(&*format!(
+            "EXPLAIN EXECUTE {name} ('00000000-0000-0000-0000-000000005573', 'abc')"
+        )))
+        .fetch_all(&mut *conn)
+        .await
+        .expect("explain the lookup")
+    }
+
+    /// True when the plan uses `checksum_sha256` as an index condition.
+    fn checksum_is_an_index_condition(plan: &[String]) -> bool {
+        plan.iter()
+            .any(|line| line.contains("Index Cond") && line.contains("checksum_sha256"))
+    }
+
+    /// #5573: the lookup behind the `artifact.uploaded` that
+    /// `register_published_package` emits reaches its row through the checksum
+    /// index instead of reading the whole repository.
+    ///
+    /// Planned against a session-local copy of `artifacts` (same columns and
+    /// indexes, 2000 analyzed rows in one repository), so the plan follows
+    /// this table's statistics and not whatever the shared test database
+    /// holds. Every row is in the one repository, so `repository_id` selects
+    /// nothing and only the checksum can make the lookup cheap.
+    ///
+    /// The same statement without the cast is the control. It is the query
+    /// this fix replaces, and it must plan as the demoted
+    /// `checksum_sha256::text` filter with no checksum index condition, or the
+    /// first assertion would prove nothing about the cast.
+    #[tokio::test]
+    async fn uploaded_artifact_lookup_uses_the_checksum_index_5573() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let uncast = UPLOADED_ARTIFACT_LOOKUP_SQL.replace("$2::bpchar", "$2");
+        assert_ne!(
+            uncast, UPLOADED_ARTIFACT_LOOKUP_SQL,
+            "the control must differ from the real statement"
+        );
+
+        let mut conn = pool.acquire().await.expect("conn");
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("tx");
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE artifacts
+                (LIKE public.artifacts INCLUDING DEFAULTS INCLUDING INDEXES)
+                ON COMMIT DROP;
+            INSERT INTO artifacts
+                (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key)
+            SELECT '00000000-0000-0000-0000-000000005573'::uuid, 'p/' || g::text, 'n', 1,
+                   lpad(g::text, 64, '0'), 'application/octet-stream', 'k/' || g::text
+              FROM generate_series(1, 2000) AS g;
+            ANALYZE artifacts;
+            SET LOCAL plan_cache_mode = force_generic_plan;
+            "#,
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed the session-local artifacts copy");
+        let cast_plan =
+            generic_plan_with_text_checksum(&mut tx, "ak5573_cast", UPLOADED_ARTIFACT_LOOKUP_SQL)
+                .await;
+        let uncast_plan = generic_plan_with_text_checksum(&mut tx, "ak5573_uncast", &uncast).await;
+        tx.rollback().await.expect("rollback");
+        for name in ["ak5573_cast", "ak5573_uncast"] {
+            sqlx::query(sqlx::AssertSqlSafe(&*format!("DEALLOCATE {name}")))
+                .execute(&mut *conn)
+                .await
+                .expect("deallocate");
+        }
+
+        let cast = cast_plan.join("\n");
+        assert!(
+            checksum_is_an_index_condition(&cast_plan),
+            "the lookup must use checksum_sha256 as an index condition, got:\n{cast}"
+        );
+        assert!(
+            !cast.contains("(checksum_sha256)::text"),
+            "the lookup must compare the bare CHAR(64) column, got:\n{cast}"
+        );
+
+        let uncast = uncast_plan.join("\n");
+        assert!(
+            uncast.contains("(checksum_sha256)::text"),
+            "without the cast a text parameter demotes the column to text, got:\n{uncast}"
+        );
+        assert!(
+            !checksum_is_an_index_condition(&uncast_plan),
+            "without the cast no index can take the checksum as a condition, got:\n{uncast}"
+        );
     }
 
     // -----------------------------------------------------------------------
