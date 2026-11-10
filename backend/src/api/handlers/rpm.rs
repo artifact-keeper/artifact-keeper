@@ -4349,11 +4349,17 @@ pub async fn rebuild_repodata(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     crate::api::handlers::repositories::require_repo_write_access(&auth, &repo, &service).await?;
-    crate::api::handlers::repositories::require_repo_action(
+    // A refusal to a caller who cannot read the repository is the unknown-key
+    // 404, like the write gate's own refusals (#5458, #5645).
+    let write = crate::api::handlers::repositories::require_repo_action(
         &auth,
         repo.id,
         "write",
         &state.permission_service,
+    )
+    .await;
+    crate::api::handlers::repositories::hide_write_denial_from_non_readers(
+        write, &auth, &repo, &service,
     )
     .await?;
     if repo.format != RepositoryFormat::Rpm || repo.repo_type != RepositoryType::Local {

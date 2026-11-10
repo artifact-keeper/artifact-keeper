@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::api::handlers::repositories::{require_repo_admin, require_repo_write_access};
+use crate::api::handlers::repositories::{
+    hide_write_denial_from_non_readers, require_repo_admin, require_repo_write_access,
+};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
@@ -223,7 +225,10 @@ async fn authorize_subscription_repo(
     // instance mail arbitrary addresses, deleting one silences
     // notifications. So all three need the repository `admin` action, like
     // the other repository-configuration routes (GHSA-mvmh-g8wm-r3cp).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &repo_service).await?;
     Ok((auth, repo.id))
 }
 
