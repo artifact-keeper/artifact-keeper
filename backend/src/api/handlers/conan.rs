@@ -32,13 +32,11 @@ use axum::Extension;
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
 use crate::api::handlers::error_helpers::{map_db_err, map_storage_err};
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
-use crate::api::handlers::upload_body::UploadBody;
 use crate::api::middleware::auth::{require_auth_basic, require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::models::repository::RepositoryType;
@@ -2163,43 +2161,204 @@ async fn recipe_file_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
+    serve_stored_conan_file(
+        &state,
+        &repo,
+        storage.as_ref(),
+        StoredConanFile {
+            artifact_id: artifact.id,
+            storage_key: &artifact.storage_key,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: &artifact.checksum_sha256,
+            file_path: &file_path,
+            reference: (&name, &version),
+        },
+        &ctx,
+    )
+    .await
+}
 
-    let ct = content_type_for_conan_file(&file_path);
-    // #4514: a row a scanning Remote holds goes through the scan gate, for
-    // the same files a proxied pull would be gated on.
-    let scan = if conan_file_serve_key(&file_path).scannable {
-        let filename = file_path.rsplit('/').next().unwrap_or(&file_path);
-        proxy_helpers::gate_stored_content(
-            &state,
-            &repo,
-            filename,
-            &content,
+// ---------------------------------------------------------------------------
+// Streaming a hosted file in and out (#5364)
+// ---------------------------------------------------------------------------
+
+/// The largest `conanmanifest.txt` read into memory for the revision
+/// admission (#4329, #5364). A manifest lists one `path: md5` line per file of
+/// the revision, so even a recipe with tens of thousands of exported files
+/// stays far below this; every other Conan file is never held on the heap.
+const CONAN_MANIFEST_MAX_BYTES: i64 = 16 * 1024 * 1024;
+
+/// A stored Conan file a download route is about to serve.
+struct StoredConanFile<'a> {
+    artifact_id: uuid::Uuid,
+    storage_key: &'a str,
+    size_bytes: i64,
+    checksum_sha256: &'a str,
+    file_path: &'a str,
+    /// `(name, version)` of the recipe, for the scan gate's identity.
+    reference: (&'a str, &'a str),
+}
+
+/// Serve a stored Conan file as a stream (#5364).
+///
+/// `conan_package.tgz` files are often hundreds of MB, and this read the
+/// whole object into memory before the response started, so a burst of
+/// parallel `conan install` jobs got the backend OOMKilled. The body is now
+/// the storage backend's own stream. A scannable file of a Remote that scans
+/// on proxy still goes through the #4514 gate ([`proxy_helpers::open_stored_row`],
+/// which reads it into memory up to the scan cap, exactly as before); every
+/// other file streams.
+async fn serve_stored_conan_file(
+    state: &SharedState,
+    repo: &RepoInfo,
+    storage: &dyn crate::storage::StorageBackend,
+    file: StoredConanFile<'_>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    let ct = content_type_for_conan_file(file.file_path);
+    let opened = if conan_file_serve_key(file.file_path).scannable {
+        let filename = file.file_path.rsplit('/').next().unwrap_or(file.file_path);
+        let (name, version) = file.reference;
+        proxy_helpers::open_stored_row(
+            state,
+            storage,
+            &proxy_helpers::StoredRow {
+                repo,
+                filename,
+                storage_key: file.storage_key,
+                size_bytes: file.size_bytes,
+            },
             ConanArchive {
-                reference: Some((name.clone(), version.clone())),
+                reference: Some((name.to_string(), version.to_string())),
             },
         )
         .await?
     } else {
-        None
+        proxy_helpers::StoredRowBody {
+            body: storage
+                .get_stream(file.storage_key)
+                .await
+                .map_err(map_storage_err)?,
+            scan: None,
+        }
     };
 
-    // Record download
-    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
+    crate::services::artifact_service::record_download(&state.db, file.artifact_id, ctx).await;
 
     Ok(proxy_helpers::StoredRowBody::stamp(
-        scan,
+        opened.scan,
         Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, ct)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-            .body(Body::from(content))
+            .header(CONTENT_LENGTH, file.size_bytes.to_string())
+            .header("X-Checksum-SHA256", file.checksum_sha256)
+            .body(Body::from_stream(opened.body))
             .unwrap(),
     ))
+}
+
+/// A Conan file upload spooled off the heap (#5364): to local scratch, or to
+/// a staging object on the repository's own backend, with its SHA-256
+/// computed over exactly the bytes staged. Those bytes are what
+/// [`proxy_helpers::put_staged_body`] later writes to the file's key, so the
+/// checksum recorded on the row always describes the stored object, and
+/// nothing reaches the final key before the upload's checks pass.
+struct StagedConanFile {
+    staged: super::repositories::GenericStagedBody,
+    digests: crate::services::artifact_service::ContentDigests,
+    /// The bytes of a `conanmanifest.txt`, which the revision admission
+    /// parses (#4329); `None` for every other file.
+    manifest: Option<Bytes>,
+}
+
+impl StagedConanFile {
+    fn size_bytes(&self) -> i64 {
+        self.staged.size_bytes()
+    }
+
+    /// The body the revision admission reads: the manifest's bytes, or
+    /// nothing for any other file (the admission only parses the manifest).
+    fn admission_body(&self) -> &[u8] {
+        self.manifest.as_deref().unwrap_or_default()
+    }
+}
+
+/// Stage a Conan file upload's body (#5364). It used to arrive through the
+/// buffered `UploadBody` extractor, so every upload held the whole file on
+/// the heap, however large the package archive.
+async fn stage_conan_file(
+    state: &SharedState,
+    repo: &RepoInfo,
+    headers: &HeaderMap,
+    file_path: &str,
+    body: Body,
+) -> Result<StagedConanFile, Response> {
+    let (staged, digests) = super::repositories::GenericStagedBody::stage_for_repo(
+        state,
+        repo,
+        body.into_data_stream(),
+    )
+    .await?;
+    // A body shorter (or longer) than its `Content-Length` is refused as
+    // incomplete (408) and never stored, as the buffered extractor refused it.
+    if let Some(expected) = super::upload_body::declared_content_length(headers) {
+        let received = staged.size_bytes().max(0) as u64;
+        if received != expected {
+            return Err(super::upload_body::UploadBodyError::Incomplete {
+                received,
+                expected: Some(expected),
+            }
+            .into_response());
+        }
+    }
+    let manifest = if file_path.trim_start_matches('/') == CONAN_MANIFEST_FILE {
+        if staged.size_bytes() > CONAN_MANIFEST_MAX_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{CONAN_MANIFEST_FILE} exceeds the maximum of {CONAN_MANIFEST_MAX_BYTES} bytes"
+                ),
+            )
+                .into_response());
+        }
+        let storage = state
+            .storage_for_repo(&repo.storage_location())
+            .map_err(|e| e.into_response())?;
+        Some(
+            staged
+                .read_all(storage.as_ref())
+                .await
+                .map_err(map_storage_err)?,
+        )
+    } else {
+        None
+    };
+    Ok(StagedConanFile {
+        staged,
+        digests,
+        manifest,
+    })
+}
+
+/// Write a staged Conan file to `storage_key` (#5364), with the quota
+/// preflight and cross-repository write guard the buffered write ran.
+async fn put_staged_conan_file(
+    state: &SharedState,
+    repo: &RepoInfo,
+    artifact_path: &str,
+    storage_key: &str,
+    file: StagedConanFile,
+) -> Result<(), Response> {
+    proxy_helpers::put_staged_body(
+        state,
+        repo,
+        super::publish_quota::PublishAt::Path(artifact_path),
+        storage_key,
+        file.staged,
+        &file.digests,
+    )
+    .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -2219,7 +2378,7 @@ async fn recipe_file_upload(
         String,
     )>,
     headers: HeaderMap,
-    UploadBody(body): UploadBody,
+    body: Body,
 ) -> Result<Response, Response> {
     // Reject path segments that exceed the filesystem NAME_MAX before any
     // DB, auth, or storage-backend call, so deeply-nested or fuzzing-style
@@ -2260,12 +2419,10 @@ async fn recipe_file_upload(
         &recipe_storage_path(&name, &version, &user, &channel, &revision, &file_path),
     );
 
-    // Compute SHA-256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum_sha256 = format!("{:x}", hasher.finalize());
-
-    let size_bytes = body.len() as i64;
+    // Spool the body off the heap, hashing it on the way (#5364).
+    let staged = stage_conan_file(&state, &repo, &headers, &file_path, body).await?;
+    let checksum_sha256 = staged.digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
     let ct = content_type_for_conan_file(&file_path);
 
     // #4329: a recipe revision is published by its manifest.
@@ -2278,7 +2435,14 @@ async fn recipe_file_upload(
         package: None,
     };
     let is_manifest = file_path.trim_start_matches('/') == CONAN_MANIFEST_FILE;
-    let pending = conan_upload_admission(&state.db, repo.id, &rev, &file_path, &body).await?;
+    let pending = conan_upload_admission(
+        &state.db,
+        repo.id,
+        &rev,
+        &file_path,
+        staged.admission_body(),
+    )
+    .await?;
 
     // Refuse an over-quota upload before the previous file at this path is
     // retired or any bytes are written (#4422).
@@ -2325,16 +2489,9 @@ async fn recipe_file_upload(
     .await
     .map_err(|e| e.into_response())?;
 
-    // Store the file
-    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(map_storage_err)?;
+    // Store the file: the staged bytes, streamed or copied server-side, behind
+    // the cross-repository write guard (#5364).
+    put_staged_conan_file(&state, &repo, &artifact_path, &storage_key, staged).await?;
 
     // Insert the artifact record and its metadata together; the manifest
     // publishes the revision (#4329).
@@ -3512,43 +3669,21 @@ async fn package_file_download(
         .await
         .map_err(|e| e.into_response())?;
 
-    let content = storage
-        .get(&artifact.storage_key)
-        .await
-        .map_err(map_storage_err)?;
-
-    let ct = content_type_for_conan_file(&file_path);
-    // #4514: a row a scanning Remote holds goes through the scan gate, for
-    // the same files a proxied pull would be gated on.
-    let scan = if conan_file_serve_key(&file_path).scannable {
-        let filename = file_path.rsplit('/').next().unwrap_or(&file_path);
-        proxy_helpers::gate_stored_content(
-            &state,
-            &repo,
-            filename,
-            &content,
-            ConanArchive {
-                reference: Some((name.clone(), version.clone())),
-            },
-        )
-        .await?
-    } else {
-        None
-    };
-
-    // Record download
-    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
-
-    Ok(proxy_helpers::StoredRowBody::stamp(
-        scan,
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, ct)
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .header("X-Checksum-SHA256", &artifact.checksum_sha256)
-            .body(Body::from(content))
-            .unwrap(),
-    ))
+    serve_stored_conan_file(
+        &state,
+        &repo,
+        storage.as_ref(),
+        StoredConanFile {
+            artifact_id: artifact.id,
+            storage_key: &artifact.storage_key,
+            size_bytes: artifact.size_bytes,
+            checksum_sha256: &artifact.checksum_sha256,
+            file_path: &file_path,
+            reference: (&name, &version),
+        },
+        &ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3571,7 +3706,7 @@ async fn package_file_upload(
         String,
     )>,
     headers: HeaderMap,
-    UploadBody(body): UploadBody,
+    body: Body,
 ) -> Result<Response, Response> {
     // Reject excessively long path segments up front (before any DB, auth,
     // or storage-backend call) so the storage backend and DB never see paths
@@ -3623,12 +3758,10 @@ async fn package_file_upload(
         ),
     );
 
-    // Compute SHA-256
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let checksum_sha256 = format!("{:x}", hasher.finalize());
-
-    let size_bytes = body.len() as i64;
+    // Spool the body off the heap, hashing it on the way (#5364).
+    let staged = stage_conan_file(&state, &repo, &headers, &file_path, body).await?;
+    let checksum_sha256 = staged.digests.sha256.clone();
+    let size_bytes = staged.size_bytes();
     let ct = content_type_for_conan_file(&file_path);
 
     // #4329: a package revision is published by its manifest, which needs
@@ -3642,7 +3775,14 @@ async fn package_file_upload(
         package: Some((&package_id, &pkg_revision)),
     };
     let is_manifest = file_path.trim_start_matches('/') == CONAN_MANIFEST_FILE;
-    let pending = conan_upload_admission(&state.db, repo.id, &rev, &file_path, &body).await?;
+    let pending = conan_upload_admission(
+        &state.db,
+        repo.id,
+        &rev,
+        &file_path,
+        staged.admission_body(),
+    )
+    .await?;
 
     // Refuse an over-quota upload before the previous file at this path is
     // retired or any bytes are written (#4422).
@@ -3688,16 +3828,9 @@ async fn package_file_upload(
     .await
     .map_err(|e| e.into_response())?;
 
-    // Store the file
-    proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, body.clone())
-        .await
-        .map_err(map_storage_err)?;
+    // Store the file: the staged bytes, streamed or copied server-side, behind
+    // the cross-repository write guard (#5364).
+    put_staged_conan_file(&state, &repo, &artifact_path, &storage_key, staged).await?;
 
     let metadata = build_package_metadata(
         &name,
@@ -12752,5 +12885,305 @@ mod duplicate_entry_tests {
             check(&single).1,
             ProxyScanIdentity::Established(_)
         ));
+    }
+}
+
+/// #5364: hosted Conan file uploads and downloads stream instead of holding
+/// the whole file on the heap.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod streaming_5364 {
+    use super::tests::test_helpers::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const RREV: &str = "5364rrev";
+    const PID: &str = "5364pid";
+    const PREV: &str = "5364prev";
+    /// Served in chunks of this size, the way an object store answers.
+    const CHUNK: usize = 64 * 1024;
+
+    /// A cloud backend that records how each object was written and read: a
+    /// buffered `put` / `get` holds the whole object in memory at once, a
+    /// `put_stream` / `get_stream` moves it chunk by chunk.
+    #[derive(Default)]
+    struct StreamObservingStorage {
+        objects: Mutex<HashMap<String, Bytes>>,
+        buffered_puts: AtomicUsize,
+        buffered_gets: AtomicUsize,
+        streamed_puts: AtomicUsize,
+        streamed_gets: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for StreamObservingStorage {
+        async fn put(&self, key: &str, content: Bytes) -> crate::error::Result<()> {
+            self.buffered_puts.fetch_add(1, Ordering::SeqCst);
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), content);
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> crate::error::Result<Bytes> {
+            self.buffered_gets.fetch_add(1, Ordering::SeqCst);
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))
+        }
+        async fn get_stream(
+            &self,
+            key: &str,
+        ) -> crate::error::Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>>
+        {
+            use futures::StreamExt;
+            self.streamed_gets.fetch_add(1, Ordering::SeqCst);
+            let object = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| crate::error::AppError::NotFound(key.to_string()))?;
+            let chunks: Vec<crate::error::Result<Bytes>> = (0..object.len())
+                .step_by(CHUNK)
+                .map(|at| Ok(object.slice(at..(at + CHUNK).min(object.len()))))
+                .collect();
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+        async fn exists(&self, key: &str) -> crate::error::Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+        async fn delete(&self, key: &str) -> crate::error::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn copy(&self, source: &str, dest: &str) -> crate::error::Result<()> {
+            let mut objects = self.objects.lock().unwrap();
+            let object = objects
+                .get(source)
+                .cloned()
+                .ok_or_else(|| crate::error::AppError::NotFound(source.to_string()))?;
+            objects.insert(dest.to_string(), object);
+            Ok(())
+        }
+        async fn put_stream(
+            &self,
+            key: &str,
+            mut stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+        ) -> crate::error::Result<crate::storage::PutStreamResult> {
+            use futures::StreamExt;
+            self.streamed_puts.fetch_add(1, Ordering::SeqCst);
+            let mut object = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                object.extend_from_slice(&chunk?);
+            }
+            let result = crate::storage::PutStreamResult {
+                checksum_sha256: format!("{:x}", Sha256::digest(&object)),
+                bytes_written: object.len() as u64,
+            };
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), Bytes::from(object));
+            Ok(result)
+        }
+        fn supports_streamed_assembly(&self) -> bool {
+            true
+        }
+    }
+
+    /// A package archive spanning many of the backend's chunks (kept under
+    /// the test router's default 2 MiB body limit, so the buffered extractor
+    /// on `main` accepts it and the assertions below are what refuse it).
+    fn large_package() -> Vec<u8> {
+        (0..3 * 512 * 1024 + 17)
+            .map(|i: usize| (i % 251) as u8)
+            .collect()
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: test exempt — collecting a response body in an
+    // assertion is not an artifact path (#1608).
+    async fn download(state: &crate::api::SharedState, uri: String) -> (StatusCode, Bytes, String) {
+        use tower::ServiceExt;
+        let response = router_anon(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = response.status();
+        let checksum = response
+            .headers()
+            .get("X-Checksum-SHA256")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("collect body");
+        (status, body, checksum)
+    }
+
+    /// Before the fix both routes took the body through the buffered
+    /// `UploadBody` extractor and wrote it with `storage.put`, and both
+    /// download routes read the object with `storage.get` before the response
+    /// started, so a large `conan_package.tgz` sat in memory whole on the way
+    /// in and again on every download: a burst of parallel `conan install`
+    /// jobs OOMKilled the backend. Every write and read of the file must now
+    /// go through the backend's streaming calls, and the row's checksum must
+    /// still describe exactly the stored bytes.
+    #[tokio::test]
+    async fn hosted_file_upload_and_download_stream_5364() {
+        let Some(pool) = try_pool().await else {
+            return;
+        };
+        let (user_id, username, _p) = create_user(&pool).await;
+        let (repo_id, repo_key, dir) = create_conan_repo(&pool, "local").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("move repository onto the observing backend");
+        let observed = Arc::new(StreamObservingStorage::default());
+        let mut backends: HashMap<String, Arc<dyn crate::storage::StorageBackend>> = HashMap::new();
+        backends.insert("s3".to_string(), observed.clone());
+        let base = build_state(pool.clone(), dir.to_str().unwrap());
+        let mut next = (*base).clone();
+        next.storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+            backends,
+            "s3".to_string(),
+        ));
+        let state: crate::api::SharedState = Arc::new(next);
+        let auth = make_auth(user_id, &username);
+
+        let package = large_package();
+        let mut statuses = Vec::new();
+        for (file, body) in [
+            ("conanfile.py", sample_conanfile_py().to_vec()),
+            ("conanmanifest.txt", sample_conanmanifest_txt().to_vec()),
+        ] {
+            let status = upload_recipe_file(
+                &state, &auth, &repo_key, "big5364", "1.0", "_", "_", RREV, file, &body,
+            )
+            .await;
+            statuses.push((format!("recipe {file}"), status));
+        }
+        for (file, body) in [
+            ("conan_package.tgz", package.clone()),
+            ("conaninfo.txt", sample_conaninfo_txt().to_vec()),
+            ("conanmanifest.txt", b"1700000000\nlib/a.txt: 00\n".to_vec()),
+        ] {
+            let status = upload_package_file(
+                &state, &auth, &repo_key, "big5364", "1.0", "_", "_", RREV, PID, PREV, file, &body,
+            )
+            .await;
+            statuses.push((format!("package {file}"), status));
+        }
+        let uploads_buffered = observed.buffered_puts.load(Ordering::SeqCst);
+        // The two manifests are read back for the revision admission; nothing
+        // else is.
+        let upload_reads = observed.buffered_gets.load(Ordering::SeqCst);
+
+        let (package_status, package_body, package_checksum) = download(
+            &state,
+            format!(
+                "/{repo_key}/v2/conans/big5364/1.0/_/_/revisions/{RREV}/packages/{PID}/revisions/{PREV}/files/conan_package.tgz"
+            ),
+        )
+        .await;
+        let (recipe_status, recipe_body, _) = download(
+            &state,
+            format!("/{repo_key}/v2/conans/big5364/1.0/_/_/revisions/{RREV}/files/conanfile.py"),
+        )
+        .await;
+        let stored_checksum: Option<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = false AND path LIKE '%conan_package.tgz'",
+        )
+        .bind(repo_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("package row");
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (what, status) in statuses {
+            assert_eq!(status, StatusCode::CREATED, "{what}");
+        }
+        assert_eq!(
+            uploads_buffered, 0,
+            "a Conan file upload must reach storage through put_stream/copy, never a buffered put"
+        );
+        assert!(observed.streamed_puts.load(Ordering::SeqCst) >= 5);
+        assert_eq!(package_status, StatusCode::OK);
+        assert_eq!(recipe_status, StatusCode::OK);
+        assert_eq!(package_body.as_ref(), package.as_slice());
+        assert_eq!(recipe_body.as_ref(), sample_conanfile_py());
+        let want = format!("{:x}", Sha256::digest(&package));
+        assert_eq!(package_checksum, want, "served checksum");
+        assert_eq!(
+            stored_checksum.as_deref(),
+            Some(want.as_str()),
+            "row checksum"
+        );
+        assert_eq!(upload_reads, 2, "only the two manifests are read back");
+        assert_eq!(
+            observed.buffered_gets.load(Ordering::SeqCst) - upload_reads,
+            0,
+            "a hosted Conan download must stream the object, never read it whole"
+        );
+        assert_eq!(observed.streamed_gets.load(Ordering::SeqCst), 2);
+    }
+
+    /// The revision admission still reads a `conanmanifest.txt` (#4329), so
+    /// that file is the one read back into memory; an oversized one is
+    /// refused before anything reaches its key.
+    #[tokio::test]
+    async fn oversized_manifest_is_refused_413_5364() {
+        let Some(f) = TestFixture::setup("local").await else {
+            return;
+        };
+        let manifest = vec![b'a'; (super::CONAN_MANIFEST_MAX_BYTES + 1) as usize];
+        let status = upload_recipe_file(
+            &f.state,
+            &f.auth,
+            &f.repo_key,
+            "huge5364",
+            "1.0",
+            "_",
+            "_",
+            RREV,
+            "conanmanifest.txt",
+            &manifest,
+        )
+        .await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(f.repo_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("count rows");
+        f.teardown().await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(rows, 0);
     }
 }
