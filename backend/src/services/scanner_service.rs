@@ -6875,8 +6875,7 @@ pub(crate) fn format_trivy_version(raw: &str) -> Option<String> {
 /// metadata timestamp (#3287). Accepts both the space-separated shape
 /// (`2026-08-10 01:31:31 +0000 UTC`) and the ISO shape
 /// (`2026-08-10T01:31:31Z`), reducing either to the date. Day resolution
-/// matches the daily CVE-DB release cadence of both Grype and Trivy, and keeps
-/// the composed token within `scan_results.scanner_version`'s `VARCHAR(50)`.
+/// matches the daily CVE-DB release cadence of both Grype and Trivy.
 pub(crate) fn db_build_date_token(value: &str) -> Option<String> {
     let first = value.split_whitespace().next()?;
     let date = first.split('T').next().unwrap_or(first);
@@ -10444,7 +10443,13 @@ impl ScannerService {
                     } else {
                         (effective_completeness, completeness_reason.clone())
                     };
-                    self.scan_result_service
+                    // #5564: a `complete_scan` write the schema still refuses
+                    // (before 342, an over-long scanner version or vuln-db
+                    // identity) must fail THIS scan, named, and the set moves
+                    // on. The `?` here used to abandon the row `running` and
+                    // skip every later scanner.
+                    if let Err(e) = self
+                        .scan_result_service
                         .complete_scan(
                             scan_result.id,
                             total,
@@ -10462,7 +10467,21 @@ impl ScannerService {
                             written_reason.as_deref(),
                             vuln_db.as_ref(),
                         )
+                        .await
+                    {
+                        let reason =
+                            format!("{} could not record its scan result: {e}", scanner.name());
+                        error!("Scan of artifact {}: {}", artifact_id, reason);
+                        self.record_failed_scan(
+                            artifact_id,
+                            scan_result.id,
+                            scanner.as_ref(),
+                            &reason,
+                            started_at,
+                        )
                         .await?;
+                        continue;
+                    }
                     catalog_set.record_completed(
                         scan_result.id,
                         contributed,
@@ -13999,9 +14018,6 @@ mod tests {
         assert_eq!(format_grype_db_build("no such database"), None);
         assert_eq!(db_build_date_token("  "), None);
         assert_eq!(db_build_date_token("unknown"), None);
-        // The composed grype token stays within scan_results.scanner_version's
-        // VARCHAR(50).
-        assert!("grype-0.83.0+db-2026-08-10".len() <= 50);
     }
 
     /// #3296: the shared `trivy filesystem` severity allowlist must admit
@@ -30713,6 +30729,8 @@ tonic-build = "0.12"
             scanner_name: String,
             scan_type: &'static str,
             outcome: FakeOutcome,
+            version: Option<String>,
+            vuln_db: Option<VulnDbProvenance>,
         }
 
         impl FakeScanner {
@@ -30721,10 +30739,24 @@ tonic-build = "0.12"
                 findings: Vec<RawFinding>,
                 packages: Vec<RawPackage>,
             ) -> Arc<dyn Scanner> {
+                Self::completed_with_provenance(scan_type, findings, packages, None, None)
+            }
+
+            /// A completed scan that also reports the provenance the
+            /// orchestrator persists on `scan_results` (#5564).
+            fn completed_with_provenance(
+                scan_type: &'static str,
+                findings: Vec<RawFinding>,
+                packages: Vec<RawPackage>,
+                version: Option<String>,
+                vuln_db: Option<VulnDbProvenance>,
+            ) -> Arc<dyn Scanner> {
                 Arc::new(FakeScanner {
                     scanner_name: format!("fake-{scan_type}"),
                     scan_type,
                     outcome: FakeOutcome::Complete { findings, packages },
+                    version,
+                    vuln_db,
                 })
             }
 
@@ -30745,6 +30777,8 @@ tonic-build = "0.12"
                         packages,
                         cataloged,
                     },
+                    version: None,
+                    vuln_db: None,
                 })
             }
 
@@ -30753,6 +30787,8 @@ tonic-build = "0.12"
                     scanner_name: format!("fake-{scan_type}"),
                     scan_type,
                     outcome: FakeOutcome::Fail(reason.to_string()),
+                    version: None,
+                    vuln_db: None,
                 })
             }
         }
@@ -30765,6 +30801,14 @@ tonic-build = "0.12"
 
             fn scan_type(&self) -> &str {
                 self.scan_type
+            }
+
+            async fn version(&self) -> Option<String> {
+                self.version.clone()
+            }
+
+            async fn vuln_db(&self) -> Option<VulnDbProvenance> {
+                self.vuln_db.clone()
             }
 
             async fn scan(
@@ -31224,6 +31268,102 @@ tonic-build = "0.12"
             assert!(
                 message.contains("`cve_id` is 46 characters") && message.contains(&overlong_id),
                 "the error must name the column and the finding, got: {message}"
+            );
+            assert_eq!(
+                grype_row.status, "completed",
+                "the next scanner in the set must still run"
+            );
+            assert_eq!(grype_row.findings_count, 2);
+        }
+
+        /// #5564: both provenance columns were bounded (`scanner_version`
+        /// `VARCHAR(50)`, `vuln_db_version` `VARCHAR(100)`). A longer
+        /// scanner-supplied value made `complete_scan` fail, which stranded
+        /// the scan `running` until the janitor failed it and skipped every
+        /// later scanner. Both are `TEXT` now: the values must persist whole
+        /// and the scan must complete with its real counts.
+        #[tokio::test]
+        async fn test_long_scanner_and_vuln_db_versions_complete_and_persist_whole() {
+            let scanner_version = format!("scanner-adapter/trivy:{}", "a".repeat(80));
+            let vuln_db_version = format!("grype-db-v6.1.10+{}", "b".repeat(200));
+            assert!(scanner_version.len() > 50);
+            assert!(vuln_db_version.len() > 100);
+            let scanner = FakeScanner::completed_with_provenance(
+                "image",
+                two_cve_findings(),
+                two_packages(),
+                Some(scanner_version.clone()),
+                Some(
+                    VulnDbProvenance::new(vuln_db_version.clone(), None)
+                        .expect("non-empty db identity"),
+                ),
+            );
+            let Some((fx, artifact_id)) =
+                setup_and_scan("image-long-provenance", vec![scanner], None).await
+            else {
+                return;
+            };
+
+            let row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let scan_id = latest_scan_id(&fx.pool, artifact_id, "image").await;
+            let stored: (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT scanner_version, vuln_db_version FROM scan_results WHERE id = $1",
+            )
+            .bind(scan_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("read the provenance back");
+            finish(fx).await;
+
+            assert_eq!(
+                row.status, "completed",
+                "a long provenance string must not fail the scan: {:?}",
+                row.error_message
+            );
+            assert_eq!(row.findings_count, 2);
+            assert_eq!(
+                stored,
+                (Some(scanner_version), Some(vuln_db_version)),
+                "both provenance values are stored whole, never truncated"
+            );
+        }
+
+        /// #5564: a `complete_scan` the schema still refuses must fail THIS
+        /// scan, named, and the set moves on. A NUL cannot be stored in a
+        /// PostgreSQL text column, so it stands in for any remaining refusal
+        /// now that the width limits are gone. The `?` used to abandon the row
+        /// `running` and skip every later scanner.
+        #[tokio::test]
+        async fn test_unstorable_provenance_fails_its_scan_by_name_and_set_continues() {
+            let image = FakeScanner::completed_with_provenance(
+                "image",
+                two_cve_findings(),
+                Vec::new(),
+                Some("image-1.0.0".to_string()),
+                Some(
+                    VulnDbProvenance::new("grype-db\u{0}corrupt", None)
+                        .expect("non-empty db identity"),
+                ),
+            );
+            let Some((fx, artifact_id)) = setup_and_scan(
+                "image-unstorable-provenance",
+                vec![image, grype_completed()],
+                None,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let image_row = latest_scan_row(&fx.pool, artifact_id, "image").await;
+            let grype_row = latest_scan_row(&fx.pool, artifact_id, "grype").await;
+            finish(fx).await;
+
+            assert_failed_closed(&image_row, "could not record its scan result");
+            let message = image_row.error_message.unwrap_or_default();
+            assert!(
+                message.contains("fake-image"),
+                "the error must name the scanner, got: {message}"
             );
             assert_eq!(
                 grype_row.status, "completed",
