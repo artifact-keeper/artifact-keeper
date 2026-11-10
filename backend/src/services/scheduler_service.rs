@@ -2971,6 +2971,14 @@ pub(crate) fn ondemand_curation_family(format: &str) -> Option<&'static str> {
     crate::services::curation::popularity_source::ecosystem_for_format(format)
 }
 
+/// Whether [`run_curation_sync_cycle`] does anything for a staging repository
+/// of this format (#5207): rpm and debian walk the upstream index, the
+/// on-demand families evaluate what the proxy enqueued. Every other format
+/// falls through the sync's `_ => continue` arm without a request.
+pub(crate) fn curation_sync_supported(format: &str) -> bool {
+    matches!(format, "rpm" | "debian") || ondemand_curation_family(format).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_ondemand_curation(
     db: &PgPool,
@@ -3425,6 +3433,19 @@ mod tests {
         }
         for f in ["conda", "rpm", "debian", "maven", "docker", "generic", ""] {
             assert_eq!(super::ondemand_curation_family(f), None, "{f}");
+        }
+    }
+
+    #[test]
+    fn curation_sync_supported_matches_the_sync_dispatch() {
+        // #5207: exactly the formats the sync loop has an arm for.
+        for f in [
+            "rpm", "debian", "pypi", "poetry", "jupyter", "npm", "yarn", "pnpm",
+        ] {
+            assert!(super::curation_sync_supported(f), "{f}");
+        }
+        for f in ["conda", "maven", "docker", "generic", "helm", ""] {
+            assert!(!super::curation_sync_supported(f), "{f}");
         }
     }
 

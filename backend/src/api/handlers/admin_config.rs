@@ -159,6 +159,7 @@ async fn export_repository(
         custom_user_agent: repo.custom_user_agent,
         curation_enabled: repo.curation_enabled,
         curation_default_action: repo.curation_default_action,
+        curation_source_repository_key: None,
         members: Vec::new(),
         upstream_mode: None,
         cache_ttl_seconds: None,
@@ -170,6 +171,14 @@ async fn export_repository(
         upstream_auth: None,
         npm_scope_policy: None,
     };
+
+    if let Some(source_id) = repo.curation_source_repo_id {
+        // By key, as the create and update routes take it (#5207).
+        let source = RepositoryService::new(state.db.clone())
+            .get_by_id(source_id)
+            .await?;
+        out.curation_source_repository_key = Some(source.key);
+    }
 
     match out.repo_type.as_str() {
         "remote" => {
@@ -920,5 +929,73 @@ mod tests {
             .await;
         tdh::cleanup_user(&pool, user_id).await;
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// #5207: a staging repository's curation source round-trips through
+    /// export and apply by key, and the staging repository is applied after
+    /// its source even when its key sorts first.
+    #[tokio::test]
+    async fn curation_source_round_trips_by_key_5207() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ak-5207-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = tdh::admin_auth(user_id, &username);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let staging_key = format!("cfg-5207-a-staging-{suffix}");
+        let remote_key = format!("cfg-5207-z-remote-{suffix}");
+        let keys = format!("{staging_key},{remote_key}");
+        for body in [
+            serde_json::json!({
+                "key": remote_key, "name": remote_key, "format": "pypi",
+                "repo_type": "remote", "upstream_url": "https://pypi.example.com/simple/",
+            }),
+            serde_json::json!({
+                "key": staging_key, "name": staging_key, "format": "pypi",
+                "repo_type": "staging", "curation_source_repository_key": remote_key,
+            }),
+        ] {
+            repos::create_repository(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .expect("create");
+        }
+
+        let first = export_keys(&state, &auth, &keys).await;
+        assert_eq!(first.repositories[0].key, staging_key);
+        assert_eq!(
+            first.repositories[0]
+                .curation_source_repository_key
+                .as_deref(),
+            Some(remote_key.as_str())
+        );
+        assert!(first.repositories[1]
+            .curation_source_repository_key
+            .is_none());
+
+        delete_repo_by_key(&pool, &staging_key).await;
+        delete_repo_by_key(&pool, &remote_key).await;
+        let applied = import(
+            &state,
+            &auth,
+            ConfigImportMode::Apply,
+            false,
+            serde_json::to_value(&first).unwrap(),
+        )
+        .await
+        .expect("apply");
+        assert!(applied.applied);
+        let second = export_keys(&state, &auth, &keys).await;
+        delete_repo_by_key(&pool, &staging_key).await;
+        delete_repo_by_key(&pool, &remote_key).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        assert_eq!(content(&first), content(&second));
     }
 }
