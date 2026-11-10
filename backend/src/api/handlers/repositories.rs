@@ -21678,6 +21678,86 @@ mod tests {
         );
     }
 
+    /// #5624: `?permanent=true` soft-deletes (queueing the peer deletes) and
+    /// purges in one request. The purge used to cascade the just-queued
+    /// deletes away before any sync worker could see them, so push peers kept
+    /// the artifact; the delete now stays queued, addressed by key and path.
+    #[tokio::test]
+    async fn permanent_delete_keeps_the_peer_delete_queued_5624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let peer_id = tdh::register_test_peer(&pool, "permanent-delete", "5624").await;
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, 'push')",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("subscribe peer");
+        let path = "secret/leaked.env".to_string();
+
+        let up = upload_artifact(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Body::from(Bytes::from_static(b"TOKEN=do-not-ship")),
+        )
+        .await;
+        let purged = delete_artifact(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery { permanent: true }),
+            HeaderMap::new(),
+        )
+        .await;
+        let rows_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        type DeleteRow = (Option<Uuid>, String, Option<String>, Option<String>);
+        let deletes: Vec<DeleteRow> = sqlx::query_as(
+            "SELECT artifact_id, status::TEXT, target_repository_key, target_path \
+                 FROM sync_tasks WHERE peer_instance_id = $1 AND task_type = 'delete'",
+        )
+        .bind(peer_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(up.is_ok(), "{up:?}");
+        assert!(purged.is_ok(), "{purged:?}");
+        assert_eq!(rows_left, 0, "the artifact is purged");
+        assert_eq!(
+            deletes,
+            vec![(None, "pending".to_string(), Some(key.clone()), Some(path))],
+            "the peer delete must survive the purge, addressed by key and path"
+        );
+    }
+
     /// PF-002 (#2519): the remote cached-artifact listing pages out of the
     /// `proxy_cache_artifacts` catalog — exact page contents and an
     /// authoritative `has_more` across a full cursor walk — WITHOUT touching

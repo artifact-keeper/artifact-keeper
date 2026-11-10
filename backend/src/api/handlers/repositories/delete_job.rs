@@ -612,7 +612,8 @@ async fn delete_rows(
     for table in ["artifacts", "artifact_versions"] {
         loop {
             check(lost)?;
-            let (deleted, bytes) = delete_batch(&state.db, table, repo_id, &scope).await?;
+            let (deleted, bytes) =
+                delete_batch(&state.db, table, repo_id, &job.row.repository_key, &scope).await?;
             if table == "artifacts" {
                 add_counts(&state.db, job, deleted, bytes, 0, 0).await?;
             }
@@ -633,17 +634,44 @@ async fn delete_rows(
 
 /// One batch: journal the keys of up to [`DELETE_BATCH`] rows of `table` and
 /// delete those rows, in one transaction. Returns `(rows, bytes)`.
+///
+/// For `artifacts`, the batch's rows are locked first and a delete task per
+/// push/mirror peer is queued for them in the same transaction, addressed by
+/// `repository_key` (the key the repository had before the job renamed it)
+/// and path, so the peers lose the repository's contents too (#5624).
 async fn delete_batch(
     db: &PgPool,
     table: &'static str,
     repo_id: Uuid,
+    repository_key: &str,
     scope: &StorageLocation,
 ) -> Result<(i64, i64)> {
     let mut tx = db.begin().await.map_err(db_err)?;
+    let ids: Option<Vec<Uuid>> = if table == "artifacts" {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM artifacts WHERE repository_id = $1 ORDER BY id LIMIT $2 FOR UPDATE",
+        )
+        .bind(repo_id)
+        .bind(DELETE_BATCH)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        crate::services::peer_instance_service::PeerInstanceService::queue_deletes_before_removal(
+            &mut tx,
+            repo_id,
+            repository_key,
+            &ids,
+        )
+        .await?;
+        Some(ids)
+    } else {
+        None
+    };
     let sql = format!(
         "WITH batch AS ( \
              SELECT id, storage_key, size_bytes FROM {table} \
-              WHERE repository_id = $1 ORDER BY id LIMIT $4 FOR UPDATE), \
+              WHERE repository_id = $1 AND ($5::uuid[] IS NULL OR id = ANY($5)) \
+              ORDER BY id LIMIT $4 FOR UPDATE), \
          journal AS ( \
              INSERT INTO oci_gc_candidates \
                  (storage_key, storage_backend, storage_path, source_repository_id) \
@@ -660,6 +688,7 @@ async fn delete_batch(
         .bind(&scope.backend)
         .bind(&scope.path)
         .bind(DELETE_BATCH)
+        .bind(ids)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1079,6 +1108,85 @@ mod tests {
             .execute(&fx.pool)
             .await;
         fx.teardown().await;
+    }
+
+    /// #5624: deleting a repository removes its contents from its push and
+    /// mirror peers too. Each batch queues a delete per subscriber and
+    /// artifact before the rows go, addressed by the key the repository had
+    /// before the job renamed it; the cascade used to drop even the deletes
+    /// already queued, so the peers kept everything.
+    #[tokio::test]
+    async fn repository_delete_queues_peer_deletes_by_path_5624() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let n = DELETE_BATCH + 3;
+        seed(&fx, n, 0).await;
+        let mut peers = Vec::new();
+        for mode in ["push", "mirror", "pull"] {
+            let peer_id = tdh::register_test_peer(&fx.pool, "repo-delete", mode).await;
+            sqlx::query(
+                "INSERT INTO peer_repo_subscriptions \
+                     (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+                 VALUES ($1, $2, true, $3::text::replication_mode)",
+            )
+            .bind(peer_id)
+            .bind(fx.repo_id)
+            .bind(mode)
+            .execute(&fx.pool)
+            .await
+            .expect("subscribe peer");
+            peers.push(peer_id);
+        }
+        let repo = fx
+            .state
+            .create_repository_service()
+            .get_by_id(fx.repo_id)
+            .await
+            .unwrap();
+        let (job, _) = enqueue(&fx.pool, &repo, fx.user_id).await.unwrap();
+        let done = run_to_completion(&fx.state, job.id).await;
+        let mut counts = Vec::new();
+        for peer_id in &peers {
+            let row: (i64, i64, i64) = sqlx::query_as(
+                "SELECT COUNT(*), \
+                        COUNT(*) FILTER (WHERE artifact_id IS NULL AND status = 'pending' \
+                                           AND target_repository_key = $2 \
+                                           AND target_path LIKE 'bulk/%'), \
+                        COUNT(DISTINCT target_path) \
+                 FROM sync_tasks WHERE peer_instance_id = $1 AND task_type = 'delete'",
+            )
+            .bind(peer_id)
+            .bind(&fx.repo_key)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+            counts.push(row);
+        }
+        for peer_id in &peers {
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer_id)
+                .execute(&fx.pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(done.status, "completed", "{done:?}");
+        assert_eq!(
+            counts[0],
+            (n, n, n),
+            "push peer: one addressed delete per artifact"
+        );
+        assert_eq!(
+            counts[1],
+            (n, n, n),
+            "mirror peer: one addressed delete per artifact"
+        );
+        assert_eq!(counts[2], (0, 0, 0), "a pull peer gets no deletes");
     }
 
     /// #4311: a job whose replica died mid-delete (claim lapsed, phase

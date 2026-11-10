@@ -52,15 +52,87 @@ const QUEUE_RESTORED_PUSH_SQL: &str = r#"
 /// was disabled or removed, and that peer gets no push to replace it. A worker
 /// that already claimed a delete is left alone: its push is queued as well and
 /// delivered after the in-flight delete finishes.
+///
+/// A delete is matched by its artifact, or by its address when its artifact
+/// row is gone (#5624): a purged artifact that held the restored one's path
+/// left a delete addressed to the key of repository `$3` and path `$4`, and
+/// the push queued here replaces the peer's copy anyway. Matched by key, not
+/// repository id: the peer addresses repositories by key, and a repository
+/// deleted and re-created under the same key has a new id.
 const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
     UPDATE sync_tasks
     SET status = 'cancelled',
         completed_at = NOW(),
         error_message = 'superseded by artifact restore'
-    WHERE artifact_id = $1
-      AND peer_instance_id = ANY($2)
+    WHERE peer_instance_id = ANY($2)
       AND task_type = 'delete'
       AND status IN ('pending', 'failed')
+      AND (
+          artifact_id = $1
+          OR (
+              artifact_id IS NULL
+              AND target_repository_key = (SELECT key FROM repositories WHERE id = $3)
+              AND target_path = $4
+          )
+      )
+    "#;
+
+/// Fill in the peer address of the delete tasks already queued for the
+/// artifacts `$1` of repository `$2` (key `$3`) that do not carry one yet (a
+/// task queued before migration 340, or by an older replica), so they still
+/// reach the peer once the row is gone (#5624). Scoped by peer so the
+/// `(peer_instance_id, artifact_id, task_type)` index serves it.
+const ADDRESS_QUEUED_DELETE_TASKS_SQL: &str = r#"
+    UPDATE sync_tasks st
+    SET target_repository_id = $2,
+        target_repository_key = $3,
+        target_path = a.path
+    FROM artifacts a
+    WHERE st.peer_instance_id = ANY(SELECT id FROM peer_instances WHERE is_local = false)
+      AND st.artifact_id = ANY($1)
+      AND st.task_type = 'delete'
+      AND st.target_path IS NULL
+      AND a.id = st.artifact_id
+    "#;
+
+/// Queue an addressed delete for every artifact `$1` of repository `$2` (key
+/// `$3`) to every push/mirror subscriber, before the rows are hard-deleted
+/// (#5624). A finished delete of a trashed artifact is kept (the peer already
+/// removed it); any other delete that is not in flight is re-armed.
+const QUEUE_REMOVAL_DELETE_TASKS_SQL: &str = r#"
+    INSERT INTO sync_tasks (
+        peer_instance_id, artifact_id, task_type, status, priority,
+        target_repository_id, target_repository_key, target_path
+    )
+    SELECT prs.peer_instance_id, a.id, 'delete', 'pending', 0, $2, $3, a.path
+    FROM artifacts a
+    JOIN peer_repo_subscriptions prs ON prs.repository_id = a.repository_id
+    JOIN peer_instances pi ON pi.id = prs.peer_instance_id
+    WHERE a.id = ANY($1)
+      AND a.repository_id = $2
+      AND pi.is_local = false
+      AND prs.sync_enabled = true
+      AND prs.replication_mode::text IN ('push', 'mirror')
+    ON CONFLICT (peer_instance_id, artifact_id, task_type) DO UPDATE SET
+        status = 'pending',
+        retry_count = 0,
+        error_message = NULL,
+        started_at = NULL,
+        completed_at = NULL,
+        claimed_by = NULL,
+        claim_token = NULL,
+        claim_expires_at = NULL,
+        target_repository_id = EXCLUDED.target_repository_id,
+        target_repository_key = EXCLUDED.target_repository_key,
+        target_path = EXCLUDED.target_path
+    WHERE sync_tasks.status <> 'in_progress'
+      AND (
+          sync_tasks.status <> 'completed'
+          OR EXISTS (
+              SELECT 1 FROM artifacts x
+              WHERE x.id = sync_tasks.artifact_id AND x.is_deleted = false
+          )
+      )
     "#;
 
 /// Queue one pending sync task per artifact of repository `$2` for peer `$1`,
@@ -1245,6 +1317,8 @@ impl PeerInstanceService {
         sqlx::query(CANCEL_SUPERSEDED_DELETE_TASKS_SQL)
             .bind(artifact.id)
             .bind(&peers)
+            .bind(artifact.repository_id)
+            .bind(artifact.path)
             .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1268,6 +1342,41 @@ impl PeerInstanceService {
                 queued
             );
         }
+        Ok(queued)
+    }
+
+    /// Make sure the peers lose `artifact_ids` (rows of repository
+    /// `repository_id`, addressed on the peers as `repository_key`) when the
+    /// caller hard-deletes them in the same transaction (#5624): queue an
+    /// addressed delete per push/mirror subscriber, and address the deletes
+    /// already queued for other peers (a policy-scoped delete, say). The
+    /// tasks outlive the rows (`ON DELETE SET NULL`), so the sync worker
+    /// delivers them after the rows are gone. Returns the tasks queued or
+    /// re-armed.
+    pub async fn queue_deletes_before_removal(
+        conn: &mut sqlx::PgConnection,
+        repository_id: Uuid,
+        repository_key: &str,
+        artifact_ids: &[Uuid],
+    ) -> Result<u64> {
+        if artifact_ids.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query(ADDRESS_QUEUED_DELETE_TASKS_SQL)
+            .bind(artifact_ids)
+            .bind(repository_id)
+            .bind(repository_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let queued = sqlx::query(QUEUE_REMOVAL_DELETE_TASKS_SQL)
+            .bind(artifact_ids)
+            .bind(repository_id)
+            .bind(repository_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected();
         Ok(queued)
     }
 
@@ -1302,7 +1411,7 @@ impl PeerInstanceService {
             SyncTask,
             r#"
             SELECT
-                st.id, st.peer_instance_id, st.artifact_id,
+                st.id, st.peer_instance_id, st.artifact_id as "artifact_id!",
                 st.status as "status: SyncStatus",
                 st.priority, st.bytes_transferred, st.error_message,
                 st.started_at, st.completed_at, st.created_at,

@@ -599,6 +599,7 @@ pub const CONCURRENT_INDEX_MIGRATIONS: &[(i64, &str)] = &[
     (315, "idx_proxy_dl_stats_downloaded_at"),
     (335, "idx_mcp_introspection_jobs_snapshot"),
     (336, "idx_mcp_version_tombstones_name_ci"),
+    (341, "idx_sync_tasks_artifact_id"),
 ];
 
 /// The index names from `table` whose migration version is not in
