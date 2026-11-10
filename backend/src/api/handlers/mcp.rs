@@ -7386,6 +7386,76 @@ mod tests {
         hold_committed_during_a_tag_move_is_carried(Refusal::Scanner).await;
     }
 
+    /// #5619: the generic download through a Virtual OCI repository gates a
+    /// member's manifest row with every alias of its digest, as the hosted
+    /// generic download and `/v2` do. D1 is pushed as `1.0` and pinned (so it
+    /// also has a digest-path row); the digest row alone is refused, and the
+    /// clean tag row must not serve D1 through the Virtual, on HEAD or GET,
+    /// by tag or by digest.
+    async fn virtual_generic_download_gates_every_alias(how: Refusal) {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("generic").await;
+        rig.publish("1.0.0").await;
+        let send = |method: &'static str, key: String, reference: String| {
+            let router = rig
+                .env
+                .fx
+                .router_with_auth(crate::api::handlers::repositories::download_router());
+            async move {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(format!(
+                        "/{key}/download/v2/{ALIAS_IMAGE}/manifests/{reference}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap();
+                tdh::send(router, req).await.0
+            }
+        };
+        assert_eq!(
+            send("HEAD", rig.oci_virtual.key.clone(), "1.0".into()).await,
+            StatusCode::OK,
+            "control: the Virtual answers for D1 before any refusal"
+        );
+        rig.refuse(rig.row_id(&d1).await, how).await;
+        assert_eq!(
+            rig.hold_at("1.0").await.and_then(|h| h.0),
+            None,
+            "precondition: the tag row itself is clean"
+        );
+        let refused = match how {
+            Refusal::Manual => StatusCode::CONFLICT,
+            Refusal::Scanner => StatusCode::FORBIDDEN,
+        };
+        for method in ["HEAD", "GET"] {
+            for reference in ["1.0", d1.as_str()] {
+                assert_eq!(
+                    send(method, rig.docker.key.clone(), reference.to_string()).await,
+                    refused,
+                    "hosted {method} {reference}"
+                );
+                assert_eq!(
+                    send(method, rig.oci_virtual.key.clone(), reference.to_string()).await,
+                    refused,
+                    "Virtual {method} {reference}"
+                );
+            }
+        }
+        rig.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn virtual_generic_download_refuses_a_quarantined_digest_5619() {
+        virtual_generic_download_gates_every_alias(Refusal::Manual).await;
+    }
+
+    #[tokio::test]
+    async fn virtual_generic_download_refuses_a_rejected_digest_5619() {
+        virtual_generic_download_gates_every_alias(Refusal::Scanner).await;
+    }
+
     /// `isLatest` is the newest servable version on every read, and
     /// `version=latest` picks the newest before `updated_since` filters.
     #[tokio::test]
