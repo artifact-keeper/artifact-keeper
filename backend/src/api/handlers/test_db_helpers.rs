@@ -4091,6 +4091,43 @@ pub fn npm_tarball(name: &str, version: &str) -> Vec<u8> {
     gz.finish().unwrap()
 }
 
+/// Install an `INSERT OR UPDATE` row trigger on `artifacts`, fired at
+/// `timing` (`"BEFORE"` or `"AFTER"`), that runs the PL/pgSQL `body` for the
+/// row whose SHA-256 is `checksum_sha256` (#4892, #5399). A test uses it to
+/// park one publish inside its publishing transaction, while it holds the
+/// per-key publish lock, without delaying any other artifact. An `AFTER`
+/// trigger parks it with its row already in the unique index, so a competing
+/// insert of the same path waits for it instead of committing first. Returns
+/// the SQL that removes it again.
+pub async fn install_artifact_row_fault(
+    pool: &sqlx::PgPool,
+    suffix: &str,
+    checksum_sha256: &str,
+    timing: &str,
+    body: &str,
+) -> String {
+    let func = format!("ak_test_artifact_fault_{suffix}");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger AS $$ \
+         BEGIN \
+           IF NEW.checksum_sha256 = '{checksum_sha256}' THEN {body} END IF; \
+           RETURN NEW; \
+         END; \
+         $$ LANGUAGE plpgsql"
+    )))
+    .execute(pool)
+    .await
+    .expect("create artifact fault function");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER {func} {timing} INSERT OR UPDATE ON artifacts \
+         FOR EACH ROW EXECUTE FUNCTION {func}()"
+    )))
+    .execute(pool)
+    .await
+    .expect("create artifact fault trigger");
+    format!("DROP TRIGGER IF EXISTS {func} ON artifacts; DROP FUNCTION IF EXISTS {func}()")
+}
+
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
 // #1315 token-mint surface gate, which skips test modules, does not count the
 // API-token mint below as a production endpoint.

@@ -4639,6 +4639,9 @@ fn should_enqueue_maven_sync_tasks(headers: &HeaderMap) -> bool {
     !super::is_replication_request(headers)
 }
 
+/// Lock-name namespace of [`lock_maven_publish_key`].
+const MAVEN_PUBLISH_LOCK_NAMESPACE: &str = "maven-publish";
+
 /// Take the transaction-scoped lock that serialises every decision about the
 /// object at one hosted Maven storage key (#4837).
 ///
@@ -4656,18 +4659,14 @@ async fn lock_maven_publish_key(
     storage_backend: &str,
     storage_key: &str,
 ) -> Result<(), sqlx::Error> {
-    let scope = if crate::storage::registry::backend_is_repo_isolated(storage_backend) {
-        repository_id.to_string()
-    } else {
-        String::new()
-    };
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!(
-            "maven-publish\u{1f}{storage_backend}\u{1f}{scope}\u{1f}{storage_key}"
-        ))
-        .execute(conn)
-        .await?;
-    Ok(())
+    super::publish_lock::lock_publish_key(
+        conn,
+        MAVEN_PUBLISH_LOCK_NAMESPACE,
+        repository_id,
+        storage_backend,
+        storage_key,
+    )
+    .await
 }
 
 /// Discard the object a hosted Maven upload wrote when the publish it was
@@ -4727,21 +4726,12 @@ async fn discard_failed_maven_publish(
         lock_maven_publish_key(&mut tx, repository_id, storage_backend, storage_key)
             .await
             .map_err(|e| e.to_string())?;
-        // On a repo-isolated backend the same key string in another
-        // repository is a different object, so only this repository's rows
-        // count there. On a shared namespace any live row naming the key
-        // shares the object.
-        let still_published = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM artifacts \
-             WHERE storage_key = $1 AND is_deleted = false \
-               AND (repository_id = $2 OR NOT $3))",
-        )
-        .bind(storage_key)
-        .bind(repository_id)
-        .bind(crate::storage::registry::backend_is_repo_isolated(
+        let still_published = super::publish_lock::object_still_published(
+            &mut tx,
+            repository_id,
             storage_backend,
-        ))
-        .fetch_one(&mut *tx)
+            storage_key,
+        )
         .await
         .map_err(|e| e.to_string())?;
         if still_published {
@@ -8367,26 +8357,14 @@ mod tests {
         checksum_sha256: &str,
         body: &str,
     ) -> String {
-        let func = format!("ak_test_artifact_fault_{suffix}");
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE OR REPLACE FUNCTION {func}() RETURNS trigger AS $$ \
-             BEGIN \
-               IF NEW.checksum_sha256 = '{checksum_sha256}' THEN {body} END IF; \
-               RETURN NEW; \
-             END; \
-             $$ LANGUAGE plpgsql"
-        )))
-        .execute(pool)
+        crate::api::handlers::test_db_helpers::install_artifact_row_fault(
+            pool,
+            suffix,
+            checksum_sha256,
+            "BEFORE",
+            body,
+        )
         .await
-        .expect("create artifact fault function");
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE ON artifacts \
-             FOR EACH ROW EXECUTE FUNCTION {func}()"
-        )))
-        .execute(pool)
-        .await
-        .expect("create artifact fault trigger");
-        format!("DROP TRIGGER IF EXISTS {func} ON artifacts; DROP FUNCTION IF EXISTS {func}()")
     }
 
     /// #4837 (a): a hosted upload on the repo-scoped key scheme whose ledger
