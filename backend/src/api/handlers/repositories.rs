@@ -21173,6 +21173,74 @@ mod tests {
         tdh::cleanup(&pool, Uuid::nil(), user_id).await;
     }
 
+    /// #5649 / #5650: the generic upload (`PUT /repositories/{key}/artifacts/
+    /// {path}`) against an object store that is out of space answers
+    /// `507 STORAGE_FULL`, and against one that cannot be reached
+    /// `503 STORAGE_UNAVAILABLE` with `Retry-After`. Neither body carries the
+    /// store's own error text (MinIO's XML, the bucket, request ids). Before
+    /// the fix both were `500 STORAGE_ERROR`.
+    #[tokio::test]
+    async fn upload_artifact_maps_storage_full_and_outage_5650() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let base = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        for (message, want_status, want_code) in [
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "STORAGE_FULL",
+            ),
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "STORAGE_UNAVAILABLE",
+            ),
+        ] {
+            let state = tdh::route_repo_to_failing_storage(&pool, &base, repo_id, &message).await;
+            let response = match upload_artifact(
+                State(state),
+                Extension(Some(tdh::make_auth(user_id, &username))),
+                Path((key.clone(), "full5650/1.0.0/pkg.bin".to_string())),
+                HeaderMap::new(),
+                Body::from(Bytes::from_static(b"BYTES-5650")),
+            )
+            .await
+            {
+                Ok(r) | Err(r) => r,
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            assert_eq!(
+                status,
+                want_status,
+                "generic upload: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+            assert_eq!(json["code"], want_code);
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want_status == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After goes on the 503 only"
+            );
+            tdh::assert_no_storage_backend_text("generic upload", &body);
+        }
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
     /// fine-grained `write` action AFTER the tenant gate. A read-only grantee on
     /// a rules-bearing private repo is DENIED; adding `write` lets them through;

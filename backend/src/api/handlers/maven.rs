@@ -6308,6 +6308,70 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #5649 / #5650: a Maven deploy against an object store that is out of
+    /// space answers `507 STORAGE_FULL`, and against one that cannot be
+    /// reached `503 STORAGE_UNAVAILABLE` with `Retry-After`; neither body
+    /// carries the store's own error text. Before the fix both were
+    /// `500 STORAGE_ERROR`.
+    #[tokio::test]
+    async fn test_maven_put_maps_storage_full_and_outage_5650() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let base = tdh::build_state(pool.clone(), dir.to_str().unwrap());
+        let path = "com/example/full5650/demo/1.0.0/demo-1.0.0.jar";
+
+        for (message, want_status, want_code) in [
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                "STORAGE_FULL",
+            ),
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "STORAGE_UNAVAILABLE",
+            ),
+        ] {
+            let state = tdh::route_repo_to_failing_storage(&pool, &base, repo_id, &message).await;
+            let router =
+                tdh::router_with_auth(super::router(), state, tdh::make_auth(user_id, &username));
+            let (status, body, headers) = tdh::send_with_headers(
+                router,
+                tdh::put(
+                    format!("/{repo_key}/{path}"),
+                    bytes::Bytes::from_static(b"jar-bytes-5650"),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                want_status,
+                "Maven PUT: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+            assert_eq!(json["code"], want_code);
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want_status == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After goes on the 503 only"
+            );
+            tdh::assert_no_storage_backend_text("Maven PUT", &body);
+        }
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+    }
+
     /// #2624: on a shared cloud namespace (registered "s3" backend) Maven
     /// uploads must write REPO-SCOPED storage keys (`maven/{repo_id}/{path}`)
     /// so the same coordinate in two repositories can never collide on one
