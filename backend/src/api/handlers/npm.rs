@@ -1878,14 +1878,15 @@ fn filter_bulk_advisory_request(body: &[u8], policy: &NpmScopePolicy) -> Option<
 
 /// Filter a bulk-advisories response (`{name: [advisories]}`) against the
 /// policy — defence in depth in case upstream returns advisories for names that
-/// were not requested. Parse failure yields an empty object (fail-closed).
-fn filter_bulk_advisory_response(bytes: &[u8], policy: &NpmScopePolicy) -> String {
+/// were not requested. `None` when the body is not an object: the caller reports
+/// the audit as failed rather than as clean (#5631).
+fn filter_bulk_advisory_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(serde_json::Value::Object(obj)) => {
             let (filtered, _) = filter_pkg_name_map(&obj, policy);
-            serde_json::Value::Object(filtered).to_string()
+            Some(serde_json::Value::Object(filtered).to_string())
         }
-        _ => serde_json::Value::Object(serde_json::Map::new()).to_string(),
+        _ => None,
     }
 }
 
@@ -1914,7 +1915,7 @@ fn filter_quick_audit_request(body: &[u8], policy: &NpmScopePolicy) -> Option<(B
 
 /// Filter a quick-audit response: keep only `advisories` whose `module_name`
 /// the policy allows. Returns the re-serialised body; `None` when the body is
-/// not an object (caller falls back to the empty audit report).
+/// not an object (the caller reports the audit as failed, #5631).
 fn filter_quick_audit_response(bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let obj = value.as_object_mut()?;
@@ -2190,100 +2191,317 @@ fn empty_scoped_meta_body(meta_path: &str) -> Bytes {
     }
 }
 
-/// Forward an npm audit POST request to the configured upstream registry.
+/// Wall-clock bound on one npm audit POST to one Remote's upstream (#5631).
 ///
-/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
-/// whichever upstream is configured) so `npm audit` works for cached/mirrored
-/// dependencies. The full client body is forwarded verbatim. On any upstream
-/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
-/// well-formed response so the audit degrades gracefully instead of failing
-/// the client command. See issue #1400.
-/// POST an npm audit body upstream and return the raw 2xx JSON bytes plus the
-/// upstream content-type. Returns `None` on a non-success status or any
-/// transport/read error, mirroring the empty-fallback semantics of
-/// [`proxy_npm_audit_post`]. Split out so the scope-policy path (#2424) can
-/// post-filter the response before serving it.
-#[allow(clippy::disallowed_methods)] // the exempt call is marked inline below (#1608)
-async fn npm_audit_upstream_json(
-    upstream_url: &str,
-    path: &str,
-    body: Bytes,
-) -> Option<(String, Bytes)> {
-    let base = upstream_url.trim_end_matches('/');
-    let url = format!("{}{}", base, path);
-    let client = crate::services::http_client::default_client();
-    let req = client
-        .post(&url)
-        .header(CONTENT_TYPE, "application/json")
-        .body(body);
+/// The audit runs inside `npm install` as well as `npm audit`, so a stalled
+/// upstream must not hold the client for the shared client's full read
+/// timeout. On expiry the Remote counts as unreachable.
+const NPM_AUDIT_UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    let resp = match send_upstream(req).await {
-        Ok(r) => r,
-        Err(err) => {
-            debug!(
-                target: "npm_audit",
-                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
-                error = %err,
-                "failed to reach npm audit upstream; serving empty advisories"
-            );
-            return None;
+/// Byte ceiling on an upstream audit answer (advisory JSON, not an artifact).
+const MAX_AUDIT_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Which of the two npm audit APIs a request is for (#1400, #5631).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpmAuditApi {
+    /// `POST /-/npm/v1/security/advisories/bulk` (npm >= 7).
+    Bulk,
+    /// `POST /-/npm/v1/security/audits/quick` (npm 6, some yarn versions).
+    Quick,
+}
+
+impl NpmAuditApi {
+    /// The wire path relative to the upstream root, as sent and as the
+    /// upstream filter matches it.
+    fn upstream_path(self) -> &'static str {
+        match self {
+            NpmAuditApi::Bulk => "-/npm/v1/security/advisories/bulk",
+            NpmAuditApi::Quick => "-/npm/v1/security/audits/quick",
         }
-    };
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    // STREAMING-EXEMPT: capped metadata read (upstream npm audit advisory JSON, not an artifact blob); bounded to <=16 MiB via axum::body::to_bytes so a hostile/broken upstream cannot OOM us; over-cap degrades to empty advisories; tracked under #1608
-    match axum::body::to_bytes(Body::from_stream(resp.bytes_stream()), 16 * 1024 * 1024).await {
-        Ok(bytes) => {
-            if !status.is_success() {
-                debug!(
-                    target: "npm_audit",
-                    upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
-                    status = %status,
-                    "npm audit upstream returned non-success; serving empty advisories"
-                );
-                return None;
-            }
-            Some((content_type, bytes))
+    }
+
+    /// The empty answer for a request with no in-scope package (#2424).
+    fn empty_response(self) -> Response {
+        match self {
+            NpmAuditApi::Bulk => empty_advisories_bulk_response(),
+            NpmAuditApi::Quick => empty_audits_quick_response(),
         }
-        Err(err) => {
-            debug!(
-                target: "npm_audit",
-                upstream = %crate::services::proxy_service::redact_url_for_diagnostics(&url),
-                error = %err,
-                "failed to read npm audit upstream body; serving empty advisories"
-            );
-            None
+    }
+
+    fn filter_request(self, body: &[u8], policy: &NpmScopePolicy) -> Option<(Bytes, bool)> {
+        match self {
+            NpmAuditApi::Bulk => filter_bulk_advisory_request(body, policy),
+            NpmAuditApi::Quick => filter_quick_audit_request(body, policy),
+        }
+    }
+
+    fn filter_response(self, bytes: &[u8], policy: &NpmScopePolicy) -> Option<String> {
+        match self {
+            NpmAuditApi::Bulk => filter_bulk_advisory_response(bytes, policy),
+            NpmAuditApi::Quick => filter_quick_audit_response(bytes, policy),
         }
     }
 }
 
-/// Forward an npm audit POST request to the configured upstream registry.
+/// How one Remote answered an npm audit request (#5631).
+#[derive(Debug)]
+enum RemoteAuditOutcome {
+    /// The audit was performed: the upstream's answer, or the empty answer
+    /// for a request none of whose packages the Remote's scope policy serves.
+    Answered(Response),
+    /// This Remote cannot perform the audit without contacting anything: no
+    /// upstream URL, an upstream filter or cache-only mode that refuses the
+    /// audit path, an origin policy that refuses the upstream, or an upstream
+    /// that does not implement the audit API (`404`/`405`/`410`/`501`).
+    NotAvailable(String),
+    /// The upstream was contacted and failed (transport error, timeout, `5xx`,
+    /// an unparseable or over-cap answer). A retry may succeed.
+    Failed(String),
+}
+
+/// Perform an npm audit against the upstream of Remote `remote` (#5631).
 ///
-/// Used by Remote repos to proxy advisory and audit calls to npmjs.org (or
-/// whichever upstream is configured) so `npm audit` works for cached/mirrored
-/// dependencies. The full client body is forwarded verbatim. On any upstream
-/// transport failure (timeout, DNS, TLS, etc.) the helper returns an empty
-/// well-formed response so the audit degrades gracefully instead of failing
-/// the client command. See issue #1400.
-async fn proxy_npm_audit_post(
-    upstream_url: &str,
-    path: &str,
+/// Goes through [`ProxyService::post_json_uncached_capped`], so the Remote's
+/// configured upstream credentials, egress proxy, custom User-Agent and
+/// outbound address policy apply exactly as on its artifact fetches, and
+/// nothing is cached. The Remote's npm scope policy (#2424) filters the
+/// request and the answer.
+///
+/// [`ProxyService::post_json_uncached_capped`]: crate::services::proxy_service::ProxyService::post_json_uncached_capped
+async fn remote_npm_audit(
+    state: &SharedState,
+    remote: &crate::models::repository::Repository,
+    api: NpmAuditApi,
     body: Bytes,
-    empty_fallback: fn() -> Response,
-) -> Response {
-    match npm_audit_upstream_json(upstream_url, path, body).await {
-        Some((content_type, bytes)) => Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, content_type)
-            .body(Body::from(bytes))
-            .unwrap_or_else(|_| empty_fallback()),
-        None => empty_fallback(),
+) -> Result<RemoteAuditOutcome, Response> {
+    let Some(ref upstream_url) = remote.upstream_url else {
+        return Ok(RemoteAuditOutcome::NotAvailable(format!(
+            "remote repository '{}' has no upstream URL",
+            remote.key
+        )));
+    };
+    let path = api.upstream_path();
+    // #840 / #5282: a refused path never reaches the upstream. Checked here as
+    // well as inside the proxy service so the refusal is told apart from an
+    // upstream 404.
+    if !crate::services::upstream_filter::upstream_allows(
+        &state.db,
+        remote.id,
+        &remote.key,
+        upstream_url,
+        path,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?
+    {
+        return Ok(RemoteAuditOutcome::NotAvailable(format!(
+            "the upstream filter or cache-only mode of remote repository '{}' refuses the \
+             audit path",
+            remote.key
+        )));
     }
+    let policy = fetch_npm_scope_policy(&state.db, remote.id)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    let body = if policy.is_active() {
+        // Active policy (#2424): never ask upstream about out-of-scope names.
+        let Some((filtered, kept)) = api.filter_request(&body, &policy) else {
+            return Ok(RemoteAuditOutcome::Answered(audit_request_error(
+                StatusCode::BAD_REQUEST,
+                "audit request body is not a JSON object",
+            )));
+        };
+        if !kept {
+            return Ok(RemoteAuditOutcome::Answered(api.empty_response()));
+        }
+        filtered
+    } else {
+        body
+    };
+    let Some(proxy) = state.proxy_service.as_ref() else {
+        return Ok(RemoteAuditOutcome::Failed(
+            "the proxy service is not configured".to_string(),
+        ));
+    };
+    let sent = tokio::time::timeout(
+        NPM_AUDIT_UPSTREAM_TIMEOUT,
+        proxy.post_json_uncached_capped(remote, path, body, MAX_AUDIT_RESPONSE_BYTES),
+    )
+    .await;
+    let (bytes, content_type) = match sent {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(err)) => {
+            debug!(
+                target: "npm_audit",
+                repo_key = %remote.key,
+                error = %err,
+                "npm audit upstream request failed"
+            );
+            return Ok(classify_audit_upstream_error(&remote.key, &err));
+        }
+        Err(_) => {
+            return Ok(RemoteAuditOutcome::Failed(format!(
+                "the upstream of remote repository '{}' did not answer within {}s",
+                remote.key,
+                NPM_AUDIT_UPSTREAM_TIMEOUT.as_secs()
+            )));
+        }
+    };
+    if !policy.is_active() {
+        // Unset/inactive policy: verbatim proxy (#1400).
+        return Ok(RemoteAuditOutcome::Answered(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    content_type.unwrap_or_else(|| "application/json".to_string()),
+                )
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        ));
+    }
+    Ok(match api.filter_response(&bytes, &policy) {
+        Some(filtered) => RemoteAuditOutcome::Answered(build_json_metadata_response(filtered)),
+        None => RemoteAuditOutcome::Failed(format!(
+            "the upstream of remote repository '{}' answered the audit with a body that is \
+             not a JSON object",
+            remote.key
+        )),
+    })
+}
+
+/// Sort a failed upstream audit POST into "this upstream has no audit API"
+/// and "the upstream failed" (#5631).
+fn classify_audit_upstream_error(repo_key: &str, err: &AppError) -> RemoteAuditOutcome {
+    if let AppError::Authorization(_) = err {
+        // #4506: an applicable scan policy refuses this Remote's origin.
+        return RemoteAuditOutcome::NotAvailable(format!(
+            "a scan policy refuses the upstream origin of remote repository '{repo_key}'"
+        ));
+    }
+    let status = crate::services::proxy_service::upstream_error_status(err);
+    let not_implemented = matches!(err, AppError::NotFound(_))
+        || matches!(
+            status,
+            Some(StatusCode::NOT_FOUND)
+                | Some(StatusCode::METHOD_NOT_ALLOWED)
+                | Some(StatusCode::GONE)
+                | Some(StatusCode::NOT_IMPLEMENTED)
+        );
+    if not_implemented {
+        RemoteAuditOutcome::NotAvailable(format!(
+            "the upstream of remote repository '{repo_key}' does not serve the npm audit API"
+        ))
+    } else {
+        RemoteAuditOutcome::Failed(match status {
+            Some(status) => {
+                format!("the upstream of remote repository '{repo_key}' answered {status}")
+            }
+            None => format!("the upstream of remote repository '{repo_key}' could not be reached"),
+        })
+    }
+}
+
+/// Answer an npm audit request on any repository type (#5631).
+///
+/// * Remote: performed against its own upstream.
+/// * Virtual: performed against the first Remote member, in resolution order
+///   and among the members this caller may read (#3323), whose upstream
+///   answers the audit API. Members that cannot answer are skipped.
+/// * Local / Staging: hold no advisory data.
+///
+/// When nothing answers, the reply is an error, never an empty advisory set:
+/// npm renders `{}` as "found 0 vulnerabilities", a false all-clear (#3644,
+/// #5631). `503` when an upstream was contacted and failed (a retry may
+/// succeed), otherwise `501` saying audits are not available through this
+/// repository.
+async fn npm_audit(
+    state: &SharedState,
+    auth: Option<&AuthExtension>,
+    repo_key: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+    api: NpmAuditApi,
+) -> Result<Response, Response> {
+    // npm gzips these POSTs; decode before anything inspects or forwards them (#3644).
+    let body = decode_audit_request_body(headers, body)?;
+    let repo = resolve_npm_repo(&state.db, repo_key).await?;
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut unavailable: Vec<String> = Vec::new();
+    if repo.repo_type == RepositoryType::Remote {
+        let outcome = match repo.upstream_url {
+            Some(ref upstream_url) => {
+                let remote = proxy_helpers::build_remote_repo_with_format(
+                    repo.id,
+                    &repo.key,
+                    upstream_url,
+                    RepositoryFormat::Npm,
+                );
+                remote_npm_audit(state, &remote, api, body).await?
+            }
+            None => RemoteAuditOutcome::NotAvailable(format!(
+                "remote repository '{repo_key}' has no upstream URL"
+            )),
+        };
+        match outcome {
+            RemoteAuditOutcome::Answered(resp) => return Ok(resp),
+            RemoteAuditOutcome::NotAvailable(reason) => unavailable.push(reason),
+            RemoteAuditOutcome::Failed(reason) => failures.push(reason),
+        }
+    } else if repo.repo_type == RepositoryType::Virtual {
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth, repo.id).await?;
+        for member in members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote)
+        {
+            match remote_npm_audit(state, member, api, body.clone()).await? {
+                RemoteAuditOutcome::Answered(resp) => return Ok(resp),
+                RemoteAuditOutcome::NotAvailable(reason) => unavailable.push(reason),
+                RemoteAuditOutcome::Failed(reason) => failures.push(reason),
+            }
+        }
+        if unavailable.is_empty() && failures.is_empty() {
+            unavailable.push(format!(
+                "virtual repository '{repo_key}' has no Remote member"
+            ));
+        }
+    } else {
+        unavailable.push(format!(
+            "'{repo_key}' is a hosted repository and holds no advisory data; audit through a \
+             Remote or Virtual repository that proxies a registry with the npm audit API"
+        ));
+    }
+    Err(npm_audit_unavailable(repo_key, &failures, &unavailable))
+}
+
+/// The error answer of an npm audit nothing could perform (#5631).
+fn npm_audit_unavailable(repo_key: &str, failures: &[String], unavailable: &[String]) -> Response {
+    let (status, lead) = if failures.is_empty() {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            format!("npm audit is not available through repository '{repo_key}'"),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "npm audit could not be performed through repository '{repo_key}': upstream \
+                 unavailable"
+            ),
+        )
+    };
+    let reasons: Vec<&str> = failures
+        .iter()
+        .chain(unavailable)
+        .map(String::as_str)
+        .collect();
+    let message = if reasons.is_empty() {
+        lead
+    } else {
+        format!("{lead}: {}", reasons.join("; "))
+    };
+    audit_request_error(status, &message)
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,145 +3062,49 @@ fn npm_meta_fetch_path(meta_path: &str, query: Option<&str>) -> String {
     }
 }
 
-/// Whether the upstream filter of a Remote admits an npm audit POST to
-/// `path` (#840).
-async fn npm_audit_upstream_allowed(
-    state: &SharedState,
-    repo_id: uuid::Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-    path: &str,
-) -> Result<bool, Response> {
-    crate::services::upstream_filter::upstream_allows(
-        &state.db,
-        repo_id,
-        repo_key,
-        upstream_url,
-        path,
-    )
-    .await
-    .map_err(IntoResponse::into_response)
-}
-
 /// Handler for `POST /npm/{repo_key}/-/npm/v1/security/advisories/bulk`.
 ///
 /// This endpoint is used by `npm audit` (npm >= 7) to look up known security
-/// advisories for the dependency graph. Remote repositories forward the
-/// request to the configured upstream registry. Local, Staging, and Virtual
-/// repositories return an empty advisory map so `npm audit` reports zero
-/// vulnerabilities instead of failing with a 404. See issue #1400.
+/// advisories for the dependency graph. See [`npm_audit`] for how each
+/// repository type answers (#1400, #5631).
 async fn security_advisories_bulk(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    const PATH: &str = "/-/npm/v1/security/advisories/bulk";
-    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
-    let body = decode_audit_request_body(&headers, body)?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
-
-    if repo.repo_type == RepositoryType::Remote {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            // #840: a path the Remote's upstream filter refuses is never sent
-            // upstream; the audit answers as for a repository with none.
-            if !npm_audit_upstream_allowed(&state, repo.id, &repo_key, upstream_url, PATH).await? {
-                return Ok(empty_advisories_bulk_response());
-            }
-            let policy = fetch_npm_scope_policy(&state.db, repo.id)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
-            if !policy.is_active() {
-                return Ok(proxy_npm_audit_post(
-                    upstream_url,
-                    PATH,
-                    body,
-                    empty_advisories_bulk_response,
-                )
-                .await);
-            }
-            // Active policy (#2424): drop out-of-scope package names from the
-            // request so upstream is never queried about them, then filter the
-            // response as defence in depth. Unparseable body ⇒ fail closed.
-            let Some((filtered_body, kept)) = filter_bulk_advisory_request(&body, &policy) else {
-                return Ok(empty_advisories_bulk_response());
-            };
-            if !kept {
-                return Ok(empty_advisories_bulk_response());
-            }
-            return Ok(
-                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
-                    Some((_ct, bytes)) => {
-                        build_json_metadata_response(filter_bulk_advisory_response(&bytes, &policy))
-                    }
-                    None => empty_advisories_bulk_response(),
-                },
-            );
-        }
-    }
-
-    Ok(empty_advisories_bulk_response())
+    npm_audit(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &headers,
+        body,
+        NpmAuditApi::Bulk,
+    )
+    .await
 }
 
 /// Handler for `POST /npm/{repo_key}/-/npm/v1/security/audits/quick`.
 ///
 /// Legacy npm audit endpoint (npm v6) and the path some yarn versions use.
-/// Same Remote-proxy / empty-fallback behaviour as the bulk endpoint above.
-/// See issue #1400.
+/// Answered as the bulk endpoint above (#1400, #5631).
 async fn security_audits_quick(
     State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
     Path(repo_key): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    const PATH: &str = "/-/npm/v1/security/audits/quick";
-    // npm gzips this POST; decode before anything inspects or forwards it (#3644).
-    let body = decode_audit_request_body(&headers, body)?;
-    let repo = resolve_npm_repo(&state.db, &repo_key).await?;
-
-    if repo.repo_type == RepositoryType::Remote {
-        if let Some(ref upstream_url) = repo.upstream_url {
-            // #840: a path the Remote's upstream filter refuses is never sent
-            // upstream; the audit answers as for a repository with none.
-            if !npm_audit_upstream_allowed(&state, repo.id, &repo_key, upstream_url, PATH).await? {
-                return Ok(empty_audits_quick_response());
-            }
-            let policy = fetch_npm_scope_policy(&state.db, repo.id)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            // Unset/inactive policy: verbatim proxy (byte-identical, #1400).
-            if !policy.is_active() {
-                return Ok(proxy_npm_audit_post(
-                    upstream_url,
-                    PATH,
-                    body,
-                    empty_audits_quick_response,
-                )
-                .await);
-            }
-            // Active policy (#2424): strip out-of-scope names from the request's
-            // requires/dependencies, then filter the response's advisories by
-            // module_name. Unparseable body ⇒ fail closed.
-            let Some((filtered_body, kept)) = filter_quick_audit_request(&body, &policy) else {
-                return Ok(empty_audits_quick_response());
-            };
-            if !kept {
-                return Ok(empty_audits_quick_response());
-            }
-            return Ok(
-                match npm_audit_upstream_json(upstream_url, PATH, filtered_body).await {
-                    Some((_ct, bytes)) => match filter_quick_audit_response(&bytes, &policy) {
-                        Some(filtered) => build_json_metadata_response(filtered),
-                        None => empty_audits_quick_response(),
-                    },
-                    None => empty_audits_quick_response(),
-                },
-            );
-        }
-    }
-
-    Ok(empty_audits_quick_response())
+    npm_audit(
+        &state,
+        auth.as_ref(),
+        &repo_key,
+        &headers,
+        body,
+        NpmAuditApi::Quick,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -7668,7 +7790,7 @@ mod tests {
     fn bulk_advisory_response_filters_names() {
         let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
         let body = br#"{"lodash":[{"id":1}],"express":[{"id":2}]}"#;
-        let out = filter_bulk_advisory_response(body, &p);
+        let out = filter_bulk_advisory_response(body, &p).expect("object");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("lodash").is_some());
         assert!(v.get("express").is_none());
@@ -13998,51 +14120,152 @@ mod tests {
         }
     }
 
-    /// Integration: a Hosted (Local) npm repo must serve `npm audit` with an
-    /// empty advisories object instead of returning 404. Without this, npm
-    /// audit fails the entire CI build. Tests the full router path so the
-    /// route table actually includes the new endpoint.
+    /// The two audit endpoints and a request body each accepts.
+    const AUDIT_ENDPOINTS_5631: [(&str, &str); 2] = [
+        (
+            "-/npm/v1/security/advisories/bulk",
+            r#"{"express":["4.17.0"]}"#,
+        ),
+        (
+            "-/npm/v1/security/audits/quick",
+            r#"{"name":"app","version":"1.0.0","requires":{"express":"^4.17.0"},"dependencies":{"express":{"version":"4.17.0"}}}"#,
+        ),
+    ];
+
+    /// POST one audit request through the router.
+    async fn post_audit_5631(
+        state: &crate::api::SharedState,
+        repo_key: &str,
+        endpoint: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let app = tdh::router_anon(super::router(), state.clone());
+        let req = tdh::post(
+            format!("/{repo_key}/{endpoint}"),
+            "application/json",
+            Bytes::from(body.to_string()),
+        );
+        let (status, bytes) = tdh::send(app, req).await;
+        let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            panic!(
+                "audit answer must be JSON, got {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, parsed)
+    }
+
+    /// The audit answer of a request nothing could perform (#5631): an error
+    /// status with an `error` message, never an advisory set.
+    fn assert_audit_refused_5631(
+        status: StatusCode,
+        body: &serde_json::Value,
+        expected: StatusCode,
+        context: &str,
+    ) {
+        assert_eq!(status, expected, "{context}: {body}");
+        assert_ne!(
+            body,
+            &serde_json::json!({}),
+            "{context}: never the empty map"
+        );
+        assert!(
+            body.get("advisories").is_none(),
+            "{context}: never an advisory report: {body}"
+        );
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("npm audit"),
+            "{context}: the error says audits are unavailable: {body}"
+        );
+    }
+
+    /// Attach a new `repo_type` npm repository to virtual `virtual_id` at
+    /// `priority`, public, with `upstream` as its upstream URL.
+    async fn attach_audit_member_5631(
+        pool: &sqlx::PgPool,
+        virtual_id: uuid::Uuid,
+        repo_type: &str,
+        upstream: Option<&str>,
+        priority: i32,
+    ) -> uuid::Uuid {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let (member_id, _key, dir) = tdh::create_repo(pool, repo_type, "npm").await;
+        let _ = std::fs::remove_dir_all(dir);
+        sqlx::query("UPDATE repositories SET upstream_url = $1, is_public = true WHERE id = $2")
+            .bind(upstream)
+            .bind(member_id)
+            .execute(pool)
+            .await
+            .expect("configure member");
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(virtual_id)
+        .bind(member_id)
+        .bind(priority)
+        .execute(pool)
+        .await
+        .expect("attach member");
+        member_id
+    }
+
+    async fn drop_audit_members_5631(pool: &sqlx::PgPool, members: &[uuid::Uuid]) {
+        for member_id in members {
+            for sql in [
+                "DELETE FROM virtual_repo_members WHERE member_repo_id = $1",
+                "DELETE FROM repository_config WHERE repository_id = $1",
+                "DELETE FROM repositories WHERE id = $1",
+            ] {
+                let _ = sqlx::query(sql).bind(member_id).execute(pool).await;
+            }
+        }
+    }
+
+    /// State with a proxy service, as production runs: the audit forward goes
+    /// through it so a Remote's credentials and egress settings apply.
+    fn audit_state_5631(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+    ) -> crate::api::SharedState {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let storage = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &storage);
+        tdh::build_state_with_proxy(fx.pool.clone(), &storage, proxy)
+    }
+
+    /// #5631: a hosted npm repository holds no advisory data, so both audit
+    /// endpoints answer `501` saying audits are not available through it.
+    /// Before, they answered `{}` / a zero-vulnerability report with `200`,
+    /// which npm prints as "found 0 vulnerabilities".
     #[tokio::test]
-    async fn test_local_repo_advisories_bulk_returns_empty_object() {
+    async fn test_hosted_repo_audit_answers_501_not_an_empty_report_5631() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
             return;
         };
-
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let app = tdh::router_anon(super::router(), state);
-
-        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
-        let body = serde_json::json!({
-            "express": ["4.17.0"],
-        })
-        .to_string();
-        let req = tdh::post(uri, "application/json", Bytes::from(body));
-        let (status, bytes) = tdh::send(app, req).await;
-
-        let cleanup_pool = fx.pool.clone();
-        let cleanup_repo = fx.repo_id;
-        let cleanup_user = fx.user_id;
-        let cleanup_dir = fx.storage_dir.clone();
-        let cleanup = || async move {
-            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
-        };
-
-        if status != StatusCode::OK {
-            cleanup().await;
-            panic!("Local npm repo must answer audit with 200, got {status}");
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
         }
+        fx.teardown().await;
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be JSON");
-        assert!(
-            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
-            "Local repo audit must return empty object, got {parsed:?}"
-        );
-
-        cleanup().await;
+        for (endpoint, (status, body)) in answers {
+            assert_audit_refused_5631(status, &body, StatusCode::NOT_IMPLEMENTED, endpoint);
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hosted repository"),
+                "{endpoint}: {body}"
+            );
+        }
     }
 
     /// Integration: a Remote npm repo must forward the audit POST body
@@ -14074,8 +14297,8 @@ mod tests {
         });
         let client_request = serde_json::json!({"express": ["4.17.0"]});
 
-        // The audit passthrough goes through `send_upstream` (#4455): without
-        // `traceparent` the mock does not match and the test fails.
+        // The audit passthrough goes through the upstream send path (#4455):
+        // without `traceparent` the mock does not match and the test fails.
         let _otel = crate::testing::otel::trace_upstream_sends();
         Mock::given(method("POST"))
             .and(path("/-/npm/v1/security/advisories/bulk"))
@@ -14096,56 +14319,34 @@ mod tests {
             .await
             .expect("update upstream_url");
 
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let app = tdh::router_anon(super::router(), state);
+        let state = audit_state_5631(&fx);
+        let (status, parsed) = post_audit_5631(
+            &state,
+            &fx.repo_key,
+            "-/npm/v1/security/advisories/bulk",
+            &client_request.to_string(),
+        )
+        .await;
+        fx.teardown().await;
 
-        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
-        let req = tdh::post(
-            uri,
-            "application/json",
-            Bytes::from(client_request.to_string()),
-        );
-        let (status, bytes) = tdh::send(app, req).await;
-
-        let cleanup_pool = fx.pool.clone();
-        let cleanup_repo = fx.repo_id;
-        let cleanup_user = fx.user_id;
-        let cleanup_dir = fx.storage_dir.clone();
-        let cleanup = || async move {
-            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
-        };
-
-        if status != StatusCode::OK {
-            cleanup().await;
-            panic!("Remote npm repo must proxy audit to upstream with 200, got {status}");
-        }
-
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be JSON");
+        assert_eq!(status, StatusCode::OK, "{parsed}");
         assert_eq!(
             parsed, upstream_response,
             "Remote audit response must be the upstream payload verbatim"
         );
-
-        cleanup().await;
     }
 
-    /// Integration: a Remote npm repo whose upstream is unreachable must
-    /// degrade gracefully and return an empty advisories object so the
-    /// developer's `npm audit` command still exits cleanly. This is the
-    /// fallback contract callers depend on when the upstream is offline.
+    /// #5631: a Remote whose upstream is unreachable answers `503`, not the
+    /// empty advisory set it answered before (#1400's graceful degradation
+    /// reported an audit that never ran as "found 0 vulnerabilities").
     #[tokio::test]
-    async fn test_remote_repo_advisories_bulk_falls_back_when_upstream_down() {
+    async fn test_remote_repo_audit_answers_503_when_upstream_down_5631() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
             return;
         };
-
-        // Point at a localhost port that nothing is listening on. This is
-        // SSRF-safe through default_client because the request itself never
-        // completes; we just need a guaranteed connection failure.
+        // Nothing listens on port 1: a guaranteed connection failure.
         sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
             .bind("http://127.0.0.1:1")
             .bind(fx.repo_id)
@@ -14153,42 +14354,371 @@ mod tests {
             .await
             .expect("update upstream_url");
 
-        let state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
-        let app = tdh::router_anon(super::router(), state);
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+        fx.teardown().await;
 
-        let uri = format!("/{}/-/npm/v1/security/advisories/bulk", fx.repo_key);
-        let req = tdh::post(
-            uri,
-            "application/json",
-            Bytes::from(r#"{"express":["4.17.0"]}"#.as_bytes().to_vec()),
-        );
-        let (status, bytes) = tdh::send(app, req).await;
+        for (endpoint, (status, body)) in answers {
+            assert_audit_refused_5631(status, &body, StatusCode::SERVICE_UNAVAILABLE, endpoint);
+        }
+    }
 
-        let cleanup_pool = fx.pool.clone();
-        let cleanup_repo = fx.repo_id;
-        let cleanup_user = fx.user_id;
-        let cleanup_dir = fx.storage_dir.clone();
-        let cleanup = || async move {
-            tdh::cleanup(&cleanup_pool, cleanup_repo, cleanup_user).await;
-            let _ = std::fs::remove_dir_all(&cleanup_dir);
+    /// #5631: `npm audit` through a Virtual is answered by its Remote member,
+    /// with that member's upstream credentials. A Local member holds no
+    /// advisories and a Remote member whose upstream lacks the audit API
+    /// (`404`) are skipped; the first member that answers wins and its body is
+    /// served verbatim. Before, every Virtual answered `{}`.
+    #[tokio::test]
+    async fn test_virtual_audit_forwards_to_npmjs_remote_member_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
         };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
 
-        if status != StatusCode::OK {
-            cleanup().await;
-            panic!(
-                "Remote npm repo must degrade to empty advisories on upstream \
-                 failure, got {status}"
-            );
+        // A registry without the audit API (a plain mirror).
+        let mirror = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(2)
+            .mount(&mirror)
+            .await;
+
+        let npmjs = MockServer::start().await;
+        let bulk_answer = serde_json::json!({
+            "express": [{"id": 1096820, "severity": "high", "vulnerable_versions": "<4.19.2"}]
+        });
+        let quick_answer = serde_json::json!({
+            "actions": [],
+            "advisories": {"1096820": {"module_name": "express", "severity": "high"}},
+            "muted": [],
+            "metadata": {"vulnerabilities": {"info": 0, "low": 0, "moderate": 0, "high": 1, "critical": 0}}
+        });
+        for ((endpoint, body), answer) in AUDIT_ENDPOINTS_5631
+            .iter()
+            .zip([bulk_answer.clone(), quick_answer.clone()])
+        {
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            let mock = Mock::given(method("POST"))
+                .and(path(format!("/{endpoint}")))
+                .and(body_json(request));
+            let mock = if std::env::var("JWT_SECRET").is_ok()
+                || std::env::var("SSO_ENCRYPTION_KEY").is_ok()
+            {
+                mock.and(header("authorization", "Bearer npm-audit-token-5631"))
+            } else {
+                mock
+            };
+            mock.respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(answer),
+            )
+            .expect(1)
+            .mount(&npmjs)
+            .await;
         }
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response must be JSON");
-        assert!(
-            parsed.is_object() && parsed.as_object().unwrap().is_empty(),
-            "fallback response must be an empty object, got {parsed:?}"
-        );
+        let members = vec![
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "local", None, 1).await,
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&mirror.uri()), 2).await,
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&npmjs.uri()), 3).await,
+        ];
+        // `save_upstream_auth` needs an encryption key; with one configured the
+        // npmjs mock only answers a request carrying the member's token.
+        if std::env::var("JWT_SECRET").is_ok() || std::env::var("SSO_ENCRYPTION_KEY").is_ok() {
+            let creds = crate::services::upstream_auth::build_credentials_json(
+                &crate::services::upstream_auth::UpstreamAuthType::Bearer {
+                    token: "npm-audit-token-5631".to_string(),
+                },
+            );
+            crate::services::upstream_auth::save_upstream_auth(
+                &fx.pool, members[2], "bearer", &creds,
+            )
+            .await
+            .expect("save upstream auth");
+        }
 
-        cleanup().await;
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push(post_audit_5631(&state, &fx.repo_key, endpoint, body).await);
+        }
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        assert_eq!(answers[0], (StatusCode::OK, bulk_answer), "bulk audit");
+        assert_eq!(answers[1], (StatusCode::OK, quick_answer), "quick audit");
+        // wiremock verifies on drop: the mirror was asked (and skipped) once
+        // per endpoint, the npmjs member answered each endpoint once.
+    }
+
+    /// #5631: a Virtual with no member that can perform an audit answers `501`
+    /// saying audits are not available through it, never `{}`. Covers a
+    /// Virtual with no members and one whose only members are a Local and a
+    /// Remote whose upstream filter refuses the audit path.
+    #[tokio::test]
+    async fn test_virtual_audit_without_capable_member_answers_501_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
+        let state = audit_state_5631(&fx);
+
+        let mut empty_virtual = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            empty_virtual.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"leaked":[]}"#))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let members = vec![
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "local", None, 1).await,
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&upstream.uri()), 2)
+                .await,
+        ];
+        save_upstream_filter(
+            &fx.pool,
+            members[1],
+            &UpstreamFilter {
+                include_patterns: vec![],
+                exclude_patterns: vec!["^-/npm/v1/security/".to_string()],
+            },
+        )
+        .await
+        .expect("save filter");
+        crate::services::upstream_filter::invalidate_cached_filter(members[1]).await;
+
+        let mut no_capable = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            no_capable.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        for (endpoint, (status, body)) in empty_virtual {
+            assert_audit_refused_5631(status, &body, StatusCode::NOT_IMPLEMENTED, endpoint);
+            assert!(
+                body["error"].as_str().unwrap().contains("no Remote member"),
+                "{endpoint}: {body}"
+            );
+        }
+        for (endpoint, (status, body)) in no_capable {
+            assert_audit_refused_5631(status, &body, StatusCode::NOT_IMPLEMENTED, endpoint);
+            assert!(
+                body["error"].as_str().unwrap().contains("upstream filter"),
+                "{endpoint}: {body}"
+            );
+        }
+    }
+
+    /// #5631: when the Virtual's only capable member is unreachable the audit
+    /// answers `503` (a retry may succeed), not `{}`.
+    #[tokio::test]
+    async fn test_virtual_audit_member_unreachable_answers_503_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
+        let members = vec![
+            attach_audit_member_5631(
+                &fx.pool,
+                fx.repo_id,
+                "remote",
+                Some("http://127.0.0.1:1"),
+                1,
+            )
+            .await,
+        ];
+        let state = audit_state_5631(&fx);
+        let mut answers = Vec::new();
+        for (endpoint, body) in AUDIT_ENDPOINTS_5631 {
+            answers.push((
+                endpoint,
+                post_audit_5631(&state, &fx.repo_key, endpoint, body).await,
+            ));
+        }
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        for (endpoint, (status, body)) in answers {
+            assert_audit_refused_5631(status, &body, StatusCode::SERVICE_UNAVAILABLE, endpoint);
+        }
+    }
+
+    /// #2424 through the #5631 path: a Remote member's scope policy filters
+    /// the forwarded audit. Out-of-scope names never reach the upstream, the
+    /// answer is filtered as defence in depth, a request with no in-scope
+    /// package is the empty answer without upstream contact, and a body that
+    /// is not a JSON object is a `400`, not `{}`.
+    #[tokio::test]
+    async fn test_virtual_audit_applies_member_scope_policy_5631() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("public virtual");
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/advisories/bulk"))
+            .and(body_json(serde_json::json!({"@types/node": ["18.0.0"]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "@types/node": [{"id": 1}],
+                "express": [{"id": 2}]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/-/npm/v1/security/audits/quick"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let members = vec![
+            attach_audit_member_5631(&fx.pool, fx.repo_id, "remote", Some(&upstream.uri()), 1)
+                .await,
+        ];
+        for (key, value) in [
+            (NPM_ALLOWED_SCOPES_KEY, "[\"@types\"]"),
+            (NPM_ALLOW_UNSCOPED_KEY, "false"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3)",
+            )
+            .bind(members[0])
+            .bind(key)
+            .bind(value)
+            .execute(&fx.pool)
+            .await
+            .expect("store member policy");
+        }
+        let state = audit_state_5631(&fx);
+        let bulk = "-/npm/v1/security/advisories/bulk";
+        let quick = "-/npm/v1/security/audits/quick";
+        let mixed = post_audit_5631(
+            &state,
+            &fx.repo_key,
+            bulk,
+            r#"{"@types/node":["18.0.0"],"express":["4.17.0"]}"#,
+        )
+        .await;
+        let none_in_scope =
+            post_audit_5631(&state, &fx.repo_key, bulk, r#"{"express":["4.17.0"]}"#).await;
+        let not_an_object = post_audit_5631(&state, &fx.repo_key, bulk, "[]").await;
+        let quick_non_object = post_audit_5631(
+            &state,
+            &fx.repo_key,
+            quick,
+            r#"{"requires":{"@types/node":"^18"},"dependencies":{"@types/node":{"version":"18.0.0"}}}"#,
+        )
+        .await;
+        drop_audit_members_5631(&fx.pool, &members).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            mixed,
+            (
+                StatusCode::OK,
+                serde_json::json!({"@types/node": [{"id": 1}]})
+            ),
+            "only the in-scope name is asked about and answered"
+        );
+        assert_eq!(
+            none_in_scope,
+            (StatusCode::OK, serde_json::json!({})),
+            "nothing in scope: the repository serves none of the packages"
+        );
+        assert_eq!(
+            not_an_object.0,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            not_an_object.1
+        );
+        assert_audit_refused_5631(
+            quick_non_object.0,
+            &quick_non_object.1,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an upstream answer that is not an object fails the audit",
+        );
+    }
+
+    /// #5631: the request-side helpers never yield an empty advisory set on
+    /// their own; an upstream answer that is not a JSON object fails the audit.
+    #[test]
+    fn test_audit_response_filters_reject_non_object_answers_5631() {
+        let p = policy_with_patterns(&[], Some(false), &["lodash*"]);
+        for api in [super::NpmAuditApi::Bulk, super::NpmAuditApi::Quick] {
+            assert!(api.filter_response(b"not json", &p).is_none(), "{api:?}");
+            assert!(api.filter_response(b"[]", &p).is_none(), "{api:?}");
+        }
+        let failed = super::npm_audit_unavailable("r", &["boom".to_string()], &[]);
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unavailable = super::npm_audit_unavailable("r", &[], &["nope".to_string()]);
+        assert_eq!(unavailable.status(), StatusCode::NOT_IMPLEMENTED);
+        let err = AppError::BadGateway(
+            "Upstream returned error status 405 Method Not Allowed: https://u".to_string(),
+        );
+        assert!(matches!(
+            super::classify_audit_upstream_error("r", &err),
+            super::RemoteAuditOutcome::NotAvailable(_)
+        ));
+        let err = AppError::ServiceUnavailable(
+            "Upstream returned error status 502 Bad Gateway: https://u".to_string(),
+        );
+        assert!(matches!(
+            super::classify_audit_upstream_error("r", &err),
+            super::RemoteAuditOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            super::classify_audit_upstream_error("r", &AppError::Authorization("x".into())),
+            super::RemoteAuditOutcome::NotAvailable(_)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -15969,8 +16499,8 @@ mod tests {
     }
 
     /// #840: a Remote's upstream filter covers the `/-/` meta passthrough and
-    /// npm audit. A refused search is a 404 and an excluded audit answers the
-    /// empty advisories body, both without contacting the upstream; a path the
+    /// npm audit. A refused search is a 404 and an excluded audit answers 501
+    /// (#5631), both without contacting the upstream; a path the
     /// filter admits is still proxied. Before, neither passthrough consulted
     /// the filter.
     #[tokio::test]
@@ -16055,11 +16585,15 @@ mod tests {
             StatusCode::NOT_FOUND,
             "a refused search is a 404"
         );
-        assert_eq!(audit_status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&audit_body).unwrap(),
-            serde_json::json!({}),
-            "an excluded audit answers the empty advisories body, not the upstream's"
+        // #5631: an excluded audit says audits are unavailable here rather
+        // than answering the empty advisories body.
+        assert_eq!(audit_status, StatusCode::NOT_IMPLEMENTED);
+        let audit_body: serde_json::Value = serde_json::from_slice(&audit_body).unwrap();
+        assert!(
+            audit_body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("upstream filter")),
+            "an excluded audit names the refusal, not the upstream's answer: {audit_body}"
         );
         assert_eq!(after_refused, 0, "refused paths never reach the upstream");
         assert_eq!(
