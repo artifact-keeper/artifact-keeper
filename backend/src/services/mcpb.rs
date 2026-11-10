@@ -262,7 +262,7 @@ fn read_manifest_from<R: std::io::Read + std::io::Seek>(
         crate::error::AppError::Validation(message) => bad(message),
         other => bad(other.to_string()),
     })?;
-    let entries = vet_entry_names(&zip)?;
+    let (entries, folded) = vet_entry_names(&zip)?;
     let has_duplicates = zip.has_duplicate_names();
     let dir_start = zip.central_directory_start();
     let raw = {
@@ -298,7 +298,42 @@ fn read_manifest_from<R: std::io::Read + std::io::Seek>(
             return Err(bad(format!("manifest.json has no string `{field}`")));
         }
     }
+    check_entry_point_case(&manifest, &folded)?;
     Ok(manifest)
+}
+
+/// The case-insensitive form of an [`entry_key`]: upper-casing, unlike
+/// lower-casing, folds `ſ` (U+017F) and `ﬆ` to `S`/`ST`, as NTFS and other
+/// case-insensitive file systems do.
+fn folded_key(key: &str) -> String {
+    key.to_uppercase()
+}
+
+/// Refuse a bundle whose `server.entry_point` names more than one entry on a
+/// case-insensitive file system (#5541): `server/index.js` and
+/// `SERVER/INDEX.JS` unpack to one file on macOS and Windows, so which one
+/// runs depends on the unpacker. Other case-variant entries (a Linux-built
+/// `node_modules`) are left alone. `folded` counts the entries per
+/// [`folded_key`].
+fn check_entry_point_case(
+    manifest: &serde_json::Value,
+    folded: &std::collections::HashMap<String, usize>,
+) -> Result<(), BundleError> {
+    let Some(entry_point) = manifest
+        .get("server")
+        .and_then(|s| s.get("entry_point"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let key = folded_key(&entry_key(entry_point));
+    if folded.get(&key).copied().unwrap_or(0) > 1 {
+        return Err(bad(format!(
+            "duplicate entry {} (case-variant names of the entry point)",
+            shown(entry_point)
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -382,12 +417,14 @@ struct EntryHeaders {
 
 /// Vet every entry's name and type from the central directory (nothing is
 /// opened or inflated) and return where its headers are for
-/// [`vet_entry_headers`].
+/// [`vet_entry_headers`], with the number of entries per case-folded key
+/// ([`folded_key`]).
 fn vet_entry_names<R: std::io::Read + std::io::Seek>(
     zip: &zip::ZipArchive<R>,
-) -> Result<Vec<EntryHeaders>, BundleError> {
+) -> Result<(Vec<EntryHeaders>, std::collections::HashMap<String, usize>), BundleError> {
     let mut out = Vec::with_capacity(zip.len());
     let mut keys = std::collections::HashSet::with_capacity(zip.len());
+    let mut folded = std::collections::HashMap::with_capacity(zip.len());
     let mut manifests = 0usize;
     for i in 0..zip.len() {
         let entry = zip
@@ -398,14 +435,14 @@ fn vet_entry_names<R: std::io::Read + std::io::Seek>(
         check_entry_name(name)?;
         check_entry_type(name, entry.unix_mode(), entry.external_attributes())?;
         let key = entry_key(name);
-        // Upper-casing, unlike lower-casing, folds `ſ` (U+017F) and `ﬆ`
-        // to `S`/`ST`, as NTFS and other case-insensitive file systems do.
-        if key.to_uppercase() == "MANIFEST.JSON" {
+        let fold = folded_key(&key);
+        if fold == "MANIFEST.JSON" {
             manifests += 1;
             if manifests > 1 {
                 return Err(bad("duplicate entry manifest.json"));
             }
         }
+        *folded.entry(fold).or_insert(0usize) += 1;
         if !keys.insert(key) {
             return Err(bad(format!("duplicate entry {}", shown(name))));
         }
@@ -415,7 +452,7 @@ fn vet_entry_names<R: std::io::Read + std::io::Seek>(
             name: entry.name_raw().to_vec(),
         });
     }
-    Ok(out)
+    Ok((out, folded))
 }
 
 /// A raw ZIP header's file name and extra field, and where the header after
@@ -1210,6 +1247,9 @@ pub fn valid_file_name(file: &str) -> bool {
 pub(crate) mod hostile_zips {
     /// A valid manifest.
     pub const MANIFEST: &[u8] = br#"{"name":"x","version":"1"}"#;
+    /// A manifest naming `server/index.js` as its entry point.
+    pub const ENTRY_MANIFEST: &[u8] =
+        br#"{"name":"x","version":"1","server":{"type":"node","entry_point":"server/index.js"}}"#;
 
     /// A ZIP of `entries` (`(name, body)`), written by the `zip` crate.
     pub fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1389,6 +1429,26 @@ pub(crate) mod hostile_zips {
                 "dot-segment-manifest",
                 with("./manifest.json"),
                 "duplicate entry manifest.json",
+            ),
+            // #5541: the entry point and a case variant of it (or of a
+            // directory on its path) unpack to one file on macOS/Windows.
+            (
+                "case-variant-entry-point",
+                zip(&[
+                    ("manifest.json", ENTRY_MANIFEST),
+                    ("server/index.js", b"good"),
+                    ("SERVER/INDEX.JS", b"evil"),
+                ]),
+                "duplicate entry server/index.js",
+            ),
+            (
+                "case-variant-entry-point-directory",
+                zip(&[
+                    ("manifest.json", ENTRY_MANIFEST),
+                    ("Server/index.js", b"evil"),
+                    ("server/index.js", b"good"),
+                ]),
+                "duplicate entry server/index.js",
             ),
             (
                 "duplicate-file",
@@ -1865,6 +1925,32 @@ mod tests {
         );
         assert!(check_entry_name("").is_err());
         assert!(check_entry_name("a\u{7}b").is_err());
+    }
+
+    /// #5541: only the entry point is case-folded. Case-variant names
+    /// elsewhere in the bundle (a Linux-built `node_modules`) stay accepted,
+    /// and so does an entry point with no variant.
+    #[test]
+    fn only_the_entry_point_is_case_folded_5541() {
+        use super::hostile_zips::{zip, ENTRY_MANIFEST};
+        let ok = zip(&[
+            ("manifest.json", ENTRY_MANIFEST),
+            ("server/index.js", b"main"),
+            ("node_modules/a/README.md", b"1"),
+            ("node_modules/a/readme.md", b"2"),
+        ]);
+        let m = read_manifest(&ok).expect("case variants off the entry point are accepted");
+        assert_eq!(m["server"]["entry_point"], "server/index.js");
+        let dotted = zip(&[
+            (
+                "manifest.json",
+                br#"{"name":"x","version":"1","server":{"entry_point":"./server/index.js"}}"#,
+            ),
+            ("server/index.js", b"good"),
+            ("server/Index.js", b"evil"),
+        ]);
+        let err = read_manifest(&dotted).expect_err("a dotted entry point folds alike");
+        assert!(err.0.contains("duplicate entry"), "{err}");
     }
 
     #[test]

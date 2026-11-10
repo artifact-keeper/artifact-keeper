@@ -1228,6 +1228,11 @@ curl -X PUT -H "Authorization: Bearer $AK_TOKEN" --data-binary @echo.mcpb \
     `manifeſt.json` counts), so `MANIFEST.JSON` or
     `./manifest.json` beside `manifest.json` is
     `duplicate entry manifest.json`;
+  - the manifest's `server.entry_point`, compared the same case-insensitive
+    way, names exactly one entry: `server/index.js` beside `SERVER/INDEX.JS`
+    (or `Server/index.js`) unpacks to one file on macOS and Windows, so it is
+    `duplicate entry server/index.js (case-variant names of the entry
+    point)`. Case variants elsewhere in the bundle are accepted;
   - `manifest.json` repeats no member name in any object
     (`manifest.json: duplicate key ...`).
 
