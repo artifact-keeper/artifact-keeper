@@ -41,12 +41,20 @@ const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
 /// Not filtered on `pi.status`: the sync worker already skips offline peers when it claims
 /// tasks, so filtering here dropped the delete instead of deferring it, and the peer kept the
 /// artifact once it came back.
+///
+/// Each task carries the peer address (repository key and path) so it still
+/// reaches the peer after the row is purged (#5624).
 const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
-                INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+                INSERT INTO sync_tasks (
+                    id, peer_instance_id, artifact_id, task_type, status, priority,
+                    target_repository_id, target_repository_key, target_path
+                )
+                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0,
+                       r.id, r.key, a.path
                 FROM peer_instances pi
                 JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
                 JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+                JOIN repositories r ON r.id = a.repository_id
                 WHERE pi.is_local = false
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
@@ -58,7 +66,10 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                     completed_at = NULL,
                     claimed_by = NULL,
                     claim_token = NULL,
-                    claim_expires_at = NULL
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path
                 WHERE sync_tasks.status <> 'in_progress'
                 "#;
 
@@ -2957,6 +2968,41 @@ impl ArtifactService {
                     uploaded_by: artifact.uploaded_by,
                 });
             audit_fire_and_forget(self.db.clone(), entry).await;
+        }
+
+        // A deleted version must stop being advertised (#5604, #5632): move
+        // the catalog's Latest to the newest version still live and, for an
+        // npm repository only, drop the dist-tags that name it. The catalog
+        // lookup returns the repository format, so a non-npm delete costs no
+        // dist-tags round trip. Best-effort, as every step here.
+        let format = match crate::services::package_service::refresh_package_latest(
+            &self.db,
+            artifact.repository_id,
+            &artifact.name,
+        )
+        .await
+        {
+            Ok(refresh) => refresh.format,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to refresh catalog latest after deleting artifact {}: {}",
+                    id,
+                    e
+                );
+                None
+            }
+        };
+        if let (Some("npm"), Some(version)) = (format.as_deref(), artifact.version.clone()) {
+            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
+                &self.db,
+                artifact.repository_id,
+                &artifact.name,
+                &[version],
+            )
+            .await
+            {
+                tracing::warn!("Failed to drop dist-tags of deleted artifact {}: {}", id, e);
+            }
         }
 
         // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and

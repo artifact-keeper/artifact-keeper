@@ -13283,6 +13283,10 @@ pub async fn download_artifact(
     // covers the `?version=` historical-revision branch below — which serves
     // straight from content-addressed storage and never reaches
     // `ArtifactService::prepare_download`.
+    //
+    // #5457: an OCI manifest row (`v2/<name>/manifests/<ref>`) is gated with
+    // every alias of its digest, as the native pull is, so a rejected image
+    // is not downloadable here through a clean tag or digest alias.
     {
         if let Some(artifact_id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT id \
@@ -13295,8 +13299,12 @@ pub async fn download_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            crate::services::quarantine_service::enforce_download_gate(&state.db, artifact_id)
-                .await?;
+            crate::services::oci_manifests::enforce_path_download_gate(
+                &state.db,
+                artifact_id,
+                &path,
+            )
+            .await?;
         }
     }
 
@@ -13970,6 +13978,16 @@ pub async fn delete_artifact(
             )
             .await;
         }
+        // The version-level SNAPSHOT document names the newest build; drop it
+        // too so it cannot keep pointing at the build just deleted (#5667).
+        crate::api::handlers::maven::clear_stored_snapshot_version_metadata(
+            &state,
+            repo.id,
+            &repo.storage_backend,
+            &repo.storage_location(),
+            &path,
+        )
+        .await;
     }
 
     // Deleting an npm artifact changes the packument, so drop the computed
@@ -14107,27 +14125,32 @@ pub(crate) async fn visible_virtual_members(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(key).await?;
 
+    // Caller must be able to see the virtual parent itself.
+    //
+    // BOTH gates run, because they answer different questions and neither
+    // subsumes the other (#3163):
+    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
+    //    missing entirely: token scope passes for any unscoped principal, so a
+    //    browser session holding no grant on a PRIVATE virtual repository
+    //    could confirm it exists and read its membership — while `GET /{key}`
+    //    on that same repository correctly 404s. It runs FIRST (#5612): a
+    //    caller who cannot read the repository gets the unknown-key 404
+    //    before the token-scope 403 or the wrong-type 400 below, either of
+    //    which would confirm that the key exists (and the 400, that it is not
+    //    a virtual). An out-of-scope token on a private repository is refused
+    //    here too, with the same 404.
+    //  * `require_repo_access` is the TOKEN-SCOPE check. It still runs because
+    //    `require_visible` short-circuits `Ok` on a public repository, which
+    //    would otherwise let a repo-scoped token reach a public virtual
+    //    outside its allowed set.
+    require_visible(&repo, &Some(auth.clone()), &service).await?;
+    require_repo_access(auth, repo.id)?;
+
     if repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
             "Only virtual repositories have members".to_string(),
         ));
     }
-
-    // Caller must be able to see the virtual parent itself.
-    //
-    // BOTH gates run, because they answer different questions and neither
-    // subsumes the other (#3163):
-    //  * `require_repo_access` is the TOKEN-SCOPE check. It is kept ahead of
-    //    the visibility gate because `require_visible` short-circuits `Ok` on
-    //    a public repository, which would otherwise let a repo-scoped token
-    //    reach a public virtual outside its allowed set.
-    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
-    //    missing entirely: token scope passes for any unscoped principal, so a
-    //    browser session holding no grant on a PRIVATE virtual repository
-    //    could confirm it exists and read its membership — while `GET /{key}`
-    //    on that same repository correctly 404s.
-    require_repo_access(auth, repo.id)?;
-    require_visible(&repo, &Some(auth.clone()), &service).await?;
 
     // Query members with their repository info
     let members: Vec<VirtualMemberRow> = sqlx::query_as(
@@ -21662,6 +21685,86 @@ mod tests {
         assert_eq!(
             stored,
             Some(ArtifactService::calculate_sha256(b"REBUILT-RELEASE-BYTES"))
+        );
+    }
+
+    /// #5624: `?permanent=true` soft-deletes (queueing the peer deletes) and
+    /// purges in one request. The purge used to cascade the just-queued
+    /// deletes away before any sync worker could see them, so push peers kept
+    /// the artifact; the delete now stays queued, addressed by key and path.
+    #[tokio::test]
+    async fn permanent_delete_keeps_the_peer_delete_queued_5624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let peer_id = tdh::register_test_peer(&pool, "permanent-delete", "5624").await;
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, 'push')",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("subscribe peer");
+        let path = "secret/leaked.env".to_string();
+
+        let up = upload_artifact(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Body::from(Bytes::from_static(b"TOKEN=do-not-ship")),
+        )
+        .await;
+        let purged = delete_artifact(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery { permanent: true }),
+            HeaderMap::new(),
+        )
+        .await;
+        let rows_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        type DeleteRow = (Option<Uuid>, String, Option<String>, Option<String>);
+        let deletes: Vec<DeleteRow> = sqlx::query_as(
+            "SELECT artifact_id, status::TEXT, target_repository_key, target_path \
+                 FROM sync_tasks WHERE peer_instance_id = $1 AND task_type = 'delete'",
+        )
+        .bind(peer_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(up.is_ok(), "{up:?}");
+        assert!(purged.is_ok(), "{purged:?}");
+        assert_eq!(rows_left, 0, "the artifact is purged");
+        assert_eq!(
+            deletes,
+            vec![(None, "pending".to_string(), Some(key.clone()), Some(path))],
+            "the peer delete must survive the purge, addressed by key and path"
         );
     }
 
@@ -37639,10 +37742,22 @@ mod tests {
             ("POST", "/test-upstream".to_string(), None),
             ("PUT", "/members".to_string(), Some(r#"{"members": []}"#)),
             ("DELETE", format!("/members/{own_key}"), None),
+            // #5612: the member listing hid its wrong-type 400 behind nothing.
+            ("GET", "/members".to_string(), None),
+            // #5610: the proxy-cache cap (wrong-type 400 on a local key).
+            ("GET", "/proxy-cache-cap".to_string(), None),
+            (
+                "PUT",
+                "/proxy-cache-cap".to_string(),
+                Some(r#"{"cap_bytes": 1024}"#),
+            ),
+            ("DELETE", "/proxy-cache-cap".to_string(), None),
         ];
         let send = |auth: AuthExtension, method: &str, uri: String, body: Option<&str>| {
             let router = tdh::router_with_auth(
-                super::router().merge(crate::api::handlers::environments::repo_router()),
+                super::router()
+                    .merge(crate::api::handlers::environments::repo_router())
+                    .merge(crate::api::handlers::proxy_cache_cap::repo_router()),
                 state.clone(),
                 auth,
             );
@@ -37696,6 +37811,81 @@ mod tests {
             );
         }
         assert!(still_there, "the refused DELETE removed nothing");
+    }
+
+    /// #5612: `GET /{key}/members` answers a caller who cannot read a private
+    /// repository exactly as it answers an unknown key (status, headers,
+    /// body), whatever the repository's type: a user with no grant and a
+    /// token whose repository list leaves the key out (even a token of the
+    /// repository's owner). Before the fix a local or remote key answered the
+    /// wrong-type 400 and an out-of-scope token on a virtual the token-scope
+    /// 403. A reader keeps its answers: 200 with the listing on its virtual,
+    /// the wrong-type 400 on a local key it reads.
+    #[tokio::test]
+    async fn member_listing_hides_private_repositories_from_non_readers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (remote_id, remote_key, remote_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "npm").await;
+        let (stranger, stranger_name) = tdh::create_user(&pool).await;
+        let (owner, owner_name) = tdh::create_user(&pool).await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        for id in [local_id, remote_id, virtual_id] {
+            tdh::grant_repo_role(&pool, id, owner, "repository-owner").await;
+        }
+        tdh::grant_repo_role(&pool, virtual_id, reader, "reader").await;
+        tdh::grant_repo_role(&pool, local_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &local_dir.to_string_lossy());
+        let unknown = format!("ak5612-unknown-{}", Uuid::new_v4());
+        let get = |auth: AuthExtension, key: &str| {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+            tdh::send_with_headers(router, tdh::get(format!("/{key}/members")))
+        };
+        let scoped_elsewhere = AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..tdh::make_auth(owner, &owner_name)
+        };
+        let mut answers = Vec::new();
+        for (caller, auth) in [
+            ("no grant", tdh::make_auth(stranger, &stranger_name)),
+            ("token scoped elsewhere", scoped_elsewhere),
+        ] {
+            for key in [&local_key, &remote_key, &virtual_key] {
+                let existing = get(auth.clone(), key).await;
+                let missing = get(auth.clone(), &unknown).await;
+                answers.push((format!("{caller} GET {key}/members"), existing, missing));
+            }
+        }
+        let reader_auth = tdh::make_auth(reader, &reader_name);
+        let reader_virtual = get(reader_auth.clone(), &virtual_key).await;
+        let reader_local = get(reader_auth, &local_key).await;
+        let owner_virtual = get(tdh::make_auth(owner, &owner_name), &virtual_key).await;
+        for user in [stranger, owner, reader] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup_member_repo(&pool, local_id, &local_dir).await;
+        tdh::cleanup_member_repo(&pool, remote_id, &remote_dir).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, &virtual_dir).await;
+
+        for (case, existing, missing) in &answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            let v: serde_json::Value = serde_json::from_slice(&existing.1).expect("json body");
+            assert_eq!(
+                v,
+                serde_json::json!({"code": "NOT_FOUND", "message": REPOSITORY_NOT_FOUND}),
+                "{case}"
+            );
+        }
+        assert_eq!(reader_virtual.0, StatusCode::OK, "{reader_virtual:?}");
+        assert_eq!(reader_local.0, StatusCode::BAD_REQUEST, "{reader_local:?}");
+        assert_eq!(owner_virtual.0, StatusCode::OK, "{owner_virtual:?}");
     }
 }
 

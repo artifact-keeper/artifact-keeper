@@ -93,9 +93,11 @@ repository and a token scoped to other repositories. The answers are:
   credentials, egress proxy, upstream filters). It also covers `PATCH` and
   `DELETE` of the repository itself, environment ingest and delete,
   `GET .../npm-scope-policy`, the Remote-only routes (`upstream-auth`,
-  `egress-proxy`, `test-upstream`, which also hide the wrong-type `400`), the
-  virtual member routes (`PUT`/`POST .../members`, `DELETE .../members/{member}`,
-  which also hide the wrong-type `400`), the conda allowlist of a virtual
+  `egress-proxy`, `test-upstream`, and `GET`/`PUT`/`DELETE .../proxy-cache-cap`
+  (#5610), which also hide the wrong-type `400` and the token-scope and admin
+  `403`), the virtual member routes (`GET`/`PUT`/`POST .../members` (the `GET`
+  since #5612), `DELETE .../members/{member}`, which also hide the wrong-type
+  `400` and, for the `GET`, the token-scope `403`), the conda allowlist of a virtual
   conda repository, `POST /api/v1/curation/repos/{key}/sync`, and the Remote MCP
   management routes;
 - OCI (`/v2/<name>/...` push and delete): `404 NAME_UNKNOWN`, echoing the

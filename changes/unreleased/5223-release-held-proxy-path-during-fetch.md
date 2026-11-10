@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#5223]
----
-- **A proxied download refused under a Package Age Policy hold can be released straight away** (#5223). The streaming proxy answered the hold's `409` at once and finished the upstream fetch in the background, but the catalog row that `POST /api/v1/quarantine/proxy-cache/{repo_key}/release` reads was only written when that fetch committed, so a release in between answered 404 "No cached artifact at that path" for as long as the fetch took. The held row is now recorded before the `409` goes out, so the release succeeds immediately, and a release that lands while the fetch is still running is kept when it commits: the committed entry is served instead of being held again. The same fix stops a second in-flight fetch of the same path from putting back a hold that was released while it ran. A new fetch of an entry that was released earlier (for example after the cached copy expires) is still a new evaluation and is held again if it falls inside the window.

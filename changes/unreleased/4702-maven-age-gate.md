@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#4702]
----
-- **The publish-age gate covers Maven and Gradle repositories** (#4702). A Maven or Gradle Remote can now enable the age gate (`PUT /api/v1/repositories/{key}/age-gate`), in either mode, as npm, PyPI, Go, Cargo and VS Code Remotes already could. Every file of a version younger than the minimum age (jar, POM, Gradle module, sources, classifier archives) and its checksum and signature sidecars answer the same `451 age_gate_blocked` refusal and record the same pending review the other formats do; the GA-level `maven-metadata.xml` drops the version and re-points `latest` and `release`, so `LATEST`, `RELEASE` and version ranges never resolve to a version whose download would be refused, and the metadata checksum always matches the served body. A Virtual applies the gate of the Remote member a file or listing comes from. In `upstream_publish_time` mode a version's publish time is the upstream `Last-Modified` of its POM, read through the proxy cache; `-SNAPSHOT` versions are not gated. See `docs/security/maven-age-gate.md`.

@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5604, #5632]
+---
+- **Deleting an npm version no longer leaves it advertised through dist-tags or the package catalog** ([#5604], [#5632]). A version deleted through `DELETE /api/v1/repositories/{key}/artifacts/{path}` kept every dist-tag that named it, so a `latest` tag pinned to that version came back into force once the version was republished and hid every newer release (`npm install` resolved the old version). The package catalog (`/api/v1/packages`, the package detail view and the UI install snippet) also kept showing a deleted or `npm unpublish`ed version as Latest, so the suggested install failed with `ETARGET`. Every artifact soft delete (the REST delete, `npm unpublish` and the other service deletes) now drops the dist-tags that point at the deleted version, letting `latest` be derived again from the versions that are left, and moves the catalog's Latest to the newest version that still has a live artifact. The catalog read paths also report the newest live version when a stored Latest has no live artifact behind it, and the deleted version stays out of `/api/v1/packages/{id}/versions`.
