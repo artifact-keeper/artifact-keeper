@@ -168,6 +168,54 @@ FAKE_TAGS="$ALL_TAGS" \
   expect "the version being released is not its own orphan" 0 "the version being released" "$WORK/selfonly" v1.8.2
 
 echo
+echo "assert-release-bookkeeping: a newer prep on main is pending, not orphaned (#5602)"
+
+# The Release Candidate job checks out main and overlays the certified
+# commit's .github/release-notes/ with `git checkout <sha> -- <dir>`, which
+# never deletes. While main carries a merged-but-unpromoted 1.12.0 prep, a
+# 1.11.13 candidate therefore sees 1.12.0.md. Run 42728608459 refused exactly
+# this state. The fixture is that union: an older line's released notes, the
+# version being released, and the newer pending prep.
+LINE_TAGS=$'v1.11.0\nv1.11.2\nv1.11.12'
+
+# 12. THE 1.11.13 RUN: the newer prep must pass, and say why.
+make_fixture "$WORK/pending" "## [Unreleased]" 1.11.0 1.11.2 1.11.13 1.12.0
+FAKE_TAGS="$LINE_TAGS" \
+  expect "newer, untagged prep beside an older line's candidate -> OK (pending)" 0 \
+    "1.12.0: no tag or Release yet, but newer than 1.11.13 and than every existing release (newest: v1.11.12); pending a later release. OK." \
+    "$WORK/pending" v1.11.13
+
+# 13. Comparison is numeric per field. A lexical compare ranks 1.11.2 above
+#     1.11.13 (and above v1.11.12), so an untagged 1.11.2.md would pass as a
+#     prep pending after 1.11.13. It is an older orphan and must refuse.
+make_fixture "$WORK/lexical" "## [Unreleased]" 1.11.0 1.11.2 1.11.13
+FAKE_TAGS=$'v1.11.0\nv1.11.12' \
+  expect "untagged 1.11.2 while releasing 1.11.13 (lexically 'newer') -> refused" 1 \
+    "Orphaned release-notes file" "$WORK/lexical" v1.11.13
+
+# 14. An OLDER untagged version is still an orphan alongside a pending prep:
+#     the exception must not swallow the check (#3429).
+make_fixture "$WORK/pendingorphan" "## [Unreleased]" 1.11.0 1.11.2 1.11.5 1.11.13 1.12.0
+FAKE_TAGS="$LINE_TAGS" \
+  expect "older untagged notes next to a pending prep -> refused" 1 \
+    "1.11.5.md describes version 1.11.5" "$WORK/pendingorphan" v1.11.13
+
+# 15. Newer than the version being released but OVERTAKEN by a later tag is
+#     a release that was skipped -- the original 1.7.5 shape seen from an
+#     older line (v1.7.6 exists). Not pending.
+make_fixture "$WORK/overtaken" "## [Unreleased]" 1.7.4 1.7.5
+FAKE_TAGS=$'v1.7.3\nv1.7.4\nv1.7.6' \
+  expect "newer than the release but overtaken by a later tag -> refused" 1 \
+    "Orphaned release-notes file" "$WORK/overtaken" v1.7.4
+
+# 16. On main, releasing the newer version itself is unchanged: it is the
+#     version being released, not a pending one.
+make_fixture "$WORK/mainself" "## [Unreleased]" 1.11.0 1.11.2 1.12.0
+FAKE_TAGS="$LINE_TAGS" \
+  expect "releasing the prepped version itself -> OK (the version being released)" 0 \
+    "1.12.0: the version being released. OK." "$WORK/mainself" v1.12.0
+
+echo
 echo "assert-release-bookkeeping: an API we cannot read is not an API that said yes"
 
 # 9. An unreadable repository answers 404 for every lookup, which would make
