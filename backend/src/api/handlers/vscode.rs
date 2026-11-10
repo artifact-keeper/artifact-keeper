@@ -4271,13 +4271,7 @@ async fn download_vsix(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
@@ -4411,13 +4405,10 @@ async fn publish_extension(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body.clone()).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body.clone())
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     let vscode_metadata = build_vscode_metadata(&manifest);
 
@@ -8527,6 +8518,93 @@ mod tests {
         }
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
+    }
+
+    /// #5685: an extension publish (`publish_extension`'s `storage.put`)
+    /// against a store that is down answers `503` with `Retry-After`, and
+    /// against one that is full `507` without it; the legacy VSIX download of
+    /// a published extension (`download_vsix`'s `get_stream`) answers the
+    /// outage `503`. Neither body echoes the backend error. Both sites
+    /// answered a hard-coded `500`.
+    #[tokio::test]
+    async fn extension_publish_and_download_maps_storage_outage_and_full_without_echoing_the_error_5685(
+    ) {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::header::RETRY_AFTER;
+
+        let publish = |version: &'static str, body: &'static [u8], key: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{key}/api/extensions"))
+                .header("x-publisher", "outage5685")
+                .header("x-extension-name", "tools")
+                .header("x-extension-version", version)
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish("1.0.0", b"vsix-bytes-5685", &fx.repo_key),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish while storage works: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                axum::http::StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) =
+                tdh::send_with_headers(app, publish("2.0.0", b"vsix-bytes-outage", &fx.repo_key))
+                    .await;
+            assert_eq!(status, want, "publish: {}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(RETRY_AFTER),
+                want == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("vscode publish", &body);
+
+            if want == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(
+                    app,
+                    tdh::get(format!(
+                        "/{}/extensions/outage5685/tools/1.0.0/download",
+                        fx.repo_key
+                    )),
+                )
+                .await;
+                assert_eq!(status, want, "download: {}", String::from_utf8_lossy(&body));
+                assert!(headers.contains_key(RETRY_AFTER));
+                tdh::assert_no_storage_backend_text("vscode download", &body);
+            }
+        }
+        fx.teardown().await;
     }
     use super::*;
 

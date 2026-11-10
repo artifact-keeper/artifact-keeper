@@ -257,13 +257,7 @@ async fn download_plugin(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
@@ -1086,6 +1080,80 @@ mod tests {
         }
         assert_eq!(&body[..], blob, "streamed body must equal upstream bytes");
         teardown().await;
+    }
+
+    /// #5685: the download of a published plugin whose store is down answers
+    /// `503` with `Retry-After`, and one whose store is full `507` without
+    /// it, with the fixed message and no backend text or storage-class
+    /// marker. It answered a hard-coded 500.
+    #[tokio::test]
+    async fn download_plugin_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+        let boundary = "----AKBoundary5685";
+        let body = multipart_body(
+            boundary,
+            &binary_plugin_zip(),
+            "com.example.outage5685",
+            "1.0.0",
+        );
+        let (status, resp) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::post(
+                format!("/{}/plugin/uploadPlugin", fx.repo_key),
+                &format!("multipart/form-data; boundary={boundary}"),
+                body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "publish while storage works: {}",
+            String::from_utf8_lossy(&resp)
+        );
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state,
+                tdh::make_auth(fx.user_id, &fx.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::get(format!(
+                    "/{}/plugin/download/com.example.outage5685/1.0.0",
+                    fx.repo_key
+                )),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                want == StatusCode::SERVICE_UNAVAILABLE,
+                "Retry-After only on the 503"
+            );
+            tdh::assert_no_storage_backend_text("jetbrains GET plugin", &body);
+            assert_eq!(&body[..], expected.as_bytes(), "fixed message");
+        }
+        fx.teardown().await;
     }
     use super::*;
 

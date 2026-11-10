@@ -367,17 +367,75 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
 /// ENAMETOOLONG keeps its own wording for the same reason
 /// `AppError::user_message` gives it one: an over-long path segment is a
 /// client-caused condition the caller can act on, and the text names no path
-/// (#1047). The STATUS is deliberately left to the call site — these handlers
-/// answer 500 today and #3718 changes message text only.
+/// (#1047). A store that is down or full gets `AppError`'s fixed wording for
+/// that class (#5685). The STATUS is left to the call site: a route answering
+/// a storage failure builds it with [`storage_err_response`], which picks
+/// 503 / 507 / 500 from the same class.
 pub fn storage_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
+    use crate::storage::StorageFailure;
     let raw = e.to_string();
-    if crate::error::is_name_too_long(&raw) {
-        tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
-        "Path segment exceeds filesystem name length limit"
-    } else {
-        tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
-        "Storage operation failed"
+    match StorageFailure::from_message(&raw) {
+        Some(StorageFailure::Full) => {
+            tracing::error!(error = %raw, code = "STORAGE_FULL", "Request error");
+            crate::error::STORAGE_FULL_MESSAGE
+        }
+        Some(StorageFailure::Unavailable) => {
+            tracing::error!(error = %raw, code = "STORAGE_UNAVAILABLE", "Request error");
+            crate::error::STORAGE_UNAVAILABLE_MESSAGE
+        }
+        None if crate::error::is_name_too_long(&raw) => {
+            tracing::warn!(error = %raw, code = "PATH_TOO_LONG", "Request error");
+            "Path segment exceeds filesystem name length limit"
+        }
+        None => {
+            tracing::error!(error = %raw, code = "STORAGE_ERROR", "Request error");
+            "Storage operation failed"
+        }
     }
+}
+
+/// The status a format route answers for a failed storage call (#5685): `503`
+/// when the store could not be reached in time, `507` when it refused the
+/// write for lack of space, else `500`. The class comes from the backend's
+/// marker on the error, never from its wording (see
+/// [`crate::storage::failure`]), the same rule `AppError` applies.
+pub fn storage_err_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
+    use crate::storage::StorageFailure;
+    use axum::http::StatusCode;
+    match StorageFailure::from_message(&e.to_string()) {
+        Some(StorageFailure::Full) => StatusCode::INSUFFICIENT_STORAGE,
+        Some(StorageFailure::Unavailable) => StatusCode::SERVICE_UNAVAILABLE,
+        None => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// The response a format route answers for a failed storage call, built in
+/// the route's own envelope (#5685).
+///
+/// `envelope` gets the status ([`storage_err_status`]) and the fixed message
+/// ([`storage_err_message`]); the raw error is only logged. A `503` gets
+/// `Retry-After`, as `AppError`'s does, and a classified failure feeds the
+/// storage signal on `/health` and `/readyz`, so these routes report a down
+/// or full store exactly as the routes that go through `AppError::Storage`
+/// (#5649, #5650) do. Before this they answered a hard-coded `500`.
+pub fn storage_err_response<E: std::fmt::Display + ?Sized>(
+    e: &E,
+    envelope: impl FnOnce(axum::http::StatusCode, &'static str) -> axum::response::Response,
+) -> axum::response::Response {
+    let raw = e.to_string();
+    if let Some(class) = crate::storage::StorageFailure::from_message(&raw) {
+        crate::storage::failure::record_failure(class);
+    }
+    with_retry_after_on_503(envelope(
+        storage_err_status(&raw),
+        storage_err_message(&raw),
+    ))
+}
+
+/// [`storage_err_response`] for the routes whose error body is plain text.
+pub fn storage_err_plain<E: std::fmt::Display + ?Sized>(e: &E) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    storage_err_response(e, |status, message| (status, message).into_response())
 }
 
 /// Log `e` and return `context` as the client-facing message, for the
@@ -2856,6 +2914,100 @@ mod raw_error_body_class_tests {
              reason instead. Offending sites:\n{}",
             offenders.join("\n")
         );
+    }
+
+    /// #5685: a storage failure's status comes from its class. A handler that
+    /// pairs `storage_err_message` with a hard-coded `500` answers a store
+    /// that is down or full with a 500 instead of `503` + `Retry-After` /
+    /// `507`; it must build the response with `storage_err_response` /
+    /// `storage_err_plain`, or take the status from `storage_err_status`.
+    #[test]
+    fn no_handler_answers_a_storage_failure_with_a_hard_coded_500_5685() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut files = 0usize;
+        for (path, src) in rust_sources() {
+            if !path.to_string_lossy().contains("api/handlers") {
+                continue;
+            }
+            files += 1;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let tests = test_module_line_ranges(&src);
+            let lines: Vec<&str> = src.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains("storage_err_message(") || in_test_module(&tests, index + 1) {
+                    continue;
+                }
+                let window = &lines[index.saturating_sub(3)..index];
+                if window
+                    .iter()
+                    .any(|l| l.contains("StatusCode::INTERNAL_SERVER_ERROR"))
+                {
+                    offenders.push(format!("{name}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            files > 30,
+            "#5685: the handler scan found only {files} files"
+        );
+        assert!(
+            offenders.is_empty(),
+            "#5685: these sites answer a storage failure with a hard-coded 500; build \
+             the response with `crate::api::handlers::storage_err_response` (or \
+             `storage_err_plain`) so a store that is down answers 503 and a full one \
+             507:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn storage_err_response_maps_the_class_and_keeps_the_envelope_5685() {
+        use crate::storage::StorageFailure;
+        use axum::http::{header, StatusCode};
+        use axum::response::IntoResponse;
+        for (raw, want, retry_after, message) in [
+            (
+                StorageFailure::Unavailable.tag("tcp connect error: connection refused"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                StorageFailure::Full.tag("<Error><Code>XMinioAdminBucketQuotaExceeded</Code>"),
+                StatusCode::INSUFFICIENT_STORAGE,
+                false,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+            // The wording alone never picks a class: a key may say anything.
+            (
+                "Failed to write No space left on device/connection refused".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                "Storage operation failed",
+            ),
+        ] {
+            assert_eq!(
+                crate::api::handlers::storage_err_status(&raw),
+                want,
+                "{raw}"
+            );
+            let response = crate::api::handlers::storage_err_response(&raw, |status, text| {
+                assert_eq!(text, message, "{raw}");
+                (status, [("x-envelope", "kept")], text).into_response()
+            });
+            assert_eq!(response.status(), want, "{raw}");
+            assert_eq!(response.headers()["x-envelope"], "kept");
+            assert_eq!(
+                response.headers().contains_key(header::RETRY_AFTER),
+                retry_after,
+                "{raw}"
+            );
+            assert_eq!(
+                crate::api::handlers::storage_err_plain(&raw).status(),
+                want,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

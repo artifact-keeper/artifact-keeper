@@ -1520,13 +1520,7 @@ async fn get_mod_file(
     let stream = storage
         .get_stream(&artifact.storage_key)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                crate::api::handlers::storage_err_message(&e),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
@@ -2146,13 +2140,10 @@ async fn upload_zip(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
@@ -2315,13 +2306,10 @@ async fn upload_mod(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    storage.put(&storage_key, body).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            crate::api::handlers::storage_err_message(&e),
-        )
-            .into_response()
-    })?;
+    storage
+        .put(&storage_key, body)
+        .await
+        .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
@@ -3985,6 +3973,90 @@ mod tests {
         )
         .await;
         rig.cleanup(&fx.pool).await;
+        fx.teardown().await;
+    }
+
+    /// #5685: a `.zip` or `.mod` publish (`upload_zip` / `upload_mod`'s
+    /// `storage.put`) against a store that is down answers `503` with
+    /// `Retry-After`, and against one that is full `507` without it; the
+    /// `.mod` download of a stored module (`get_mod_file`'s `get_stream`)
+    /// answers the same way. The body is the fixed message, with no backend
+    /// text or storage-class marker. All three answered a hard-coded 500.
+    #[allow(clippy::disallowed_methods)]
+    // streaming-invariant: buffering small error bodies in test assertions is not an artifact path (#1608)
+    #[tokio::test]
+    async fn put_and_mod_get_maps_storage_outage_and_full_without_echoing_the_error_5685() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/example.com/outage5685/@v/v1.0.0.mod", fx.repo_key),
+                bytes::Bytes::from_static(b"module example.com/outage5685\n"),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "go.mod publish while storage works: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        for (message, want, expected) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::error::STORAGE_UNAVAILABLE_MESSAGE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                crate::error::STORAGE_FULL_MESSAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&fx.pool, &fx.state, fx.repo_id, &message).await;
+            let requests = [
+                (
+                    "PUT .zip",
+                    tdh::put(
+                        format!("/{}/example.com/outage5685/@v/v2.0.0.zip", fx.repo_key),
+                        bytes::Bytes::from_static(b"not-really-a-zip-5685"),
+                    ),
+                ),
+                (
+                    "PUT .mod",
+                    tdh::put(
+                        format!("/{}/example.com/outage5685/@v/v2.0.0.mod", fx.repo_key),
+                        bytes::Bytes::from_static(b"module example.com/outage5685\n"),
+                    ),
+                ),
+                (
+                    "GET .mod",
+                    tdh::get(format!(
+                        "/{}/example.com/outage5685/@v/v1.0.0.mod",
+                        fx.repo_key
+                    )),
+                ),
+            ];
+            for (label, req) in requests {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(fx.user_id, &fx.username),
+                );
+                let (status, body, headers) = tdh::send_with_headers(app, req).await;
+                assert_eq!(status, want, "{label}: {}", String::from_utf8_lossy(&body));
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After only on the 503"
+                );
+                tdh::assert_no_storage_backend_text(&format!("goproxy {label}"), &body);
+                assert_eq!(&body[..], expected.as_bytes(), "{label}: fixed message");
+            }
+        }
         fx.teardown().await;
     }
 }

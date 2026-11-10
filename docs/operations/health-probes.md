@@ -103,6 +103,17 @@ it for API-usage quotas. The class is taken from the response status and its
 exact error code, never from the message text, so an object named after an
 error code cannot change the answer.
 
+The generic, Maven and OCI routes, and the package routes that go through the
+shared storage error mapping, answer this way. Since 1.12.0 so do the native
+routes that used to answer both conditions with a hard-coded `500`, each in its
+own error envelope: Alpine, Chef, CocoaPods, Composer, Conda (package download),
+Debian, Git LFS, Go, Incus, JetBrains, NuGet, Protobuf (Connect code
+`unavailable` / `resource_exhausted`), RPM, sbt, Swift (`problem+json`
+`detail`), VS Code and the agent-plugin marketplace. An Incus image whose
+background finalize fails on storage records the same fixed wording in the
+upload session's `finalize_error`, and the Debian backfill reports a stored
+package it cannot read with that wording too.
+
 The bounds are set in `.env.example`: `STORAGE_CONNECT_TIMEOUT_SECS`
 (default 3) for one connection attempt; `STORAGE_OPERATION_TIMEOUT_SECS`
 (default 15), the retry budget of an S3 control-plane request (head, exists,
