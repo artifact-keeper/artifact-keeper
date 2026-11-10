@@ -19,6 +19,11 @@ It is returned on the upload's `201` and on `GET` / `HEAD` of
 `/api/v1/repositories/{key}/download/{path}` (next to `X-Checksum-Sha256`,
 which carries the same value unquoted). It is a strong tag.
 
+A download through a virtual repository carries the validator of the member
+that served it: a hosted member's quoted SHA-256 as above, or a remote
+member's upstream `ETag`. A ranged `GET` with `If-Range` naming that value
+answers `206`; any other value answers `200` with the whole object (#5615).
+
 ## Preconditions
 
 | Header | Write proceeds when | Otherwise |
