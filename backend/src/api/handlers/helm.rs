@@ -1443,7 +1443,7 @@ async fn delete_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
 
     /// Build a gzip-compressed tar (`.tgz`) holding a single `path`/`body`
     /// entry, matching the on-disk layout the upload staging path reads.

@@ -35,12 +35,12 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::crypto::digest::Sha256;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 

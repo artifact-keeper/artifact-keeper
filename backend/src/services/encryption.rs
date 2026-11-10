@@ -1,37 +1,53 @@
-//! Encryption utilities for storing sensitive credentials.
+//! At-rest encryption for stored secrets (SSO client secrets, LDAP bind
+//! passwords, upstream and migration credentials, signing private keys,
+//! TOTP seeds), on the validated module through `crate::crypto` (#5583).
 //!
-//! Provides AES-256-GCM authenticated encryption for storing Artifactory
-//! credentials and other sensitive migration data.
+//! Two key sources, two ciphertext formats, every build reads both:
 //!
-//! Key derivation uses HKDF-SHA256 with a static application-level salt.
-//! Legacy data encrypted with raw SHA-256 key derivation is transparently
-//! decrypted via automatic fallback.
+//! * **Legacy / default.** The key is derived from a passphrase (the
+//!   deployment's `JWT_SECRET`) with HMAC-SHA256 over a fixed context, with a
+//!   raw-SHA-256 fallback for rows written before that. Ciphertext is
+//!   `nonce (12) || AES-256-GCM ciphertext+tag`. This is what every mode but
+//!   `strict` keeps writing, so an upgrade followed by a downgrade never
+//!   produces a row the older binary cannot read.
+//! * **Dedicated data key (v2).** When `DATA_ENCRYPTION_KEY` is configured
+//!   and `FIPS_MODE=strict`, new rows are written as
+//!   `0x02 || nonce (12) || ciphertext+tag` under a per-purpose subkey
+//!   derived from the data key with SP 800-108 KBKDF, so the token-signing
+//!   secret and the at-rest key are no longer the same material.
+//!
+//! Decryption tries v2 first when the first byte says so (a legacy nonce
+//! starting with `0x02` simply fails the tag check and falls through), then
+//! the passphrase key, then the raw-SHA-256 key. The `reencrypt-secrets`
+//! command rewrites legacy rows as v2 once an operator opts in; it is never
+//! automatic.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
+
 use thiserror::Error;
 
-type HmacSha256 = Hmac<Sha256>;
+use crate::crypto::{aead, digest, hmac, kdf};
 
 /// Errors that can occur during encryption operations
 #[derive(Error, Debug)]
 pub enum EncryptionError {
     #[error("Invalid key length: expected 32 bytes, got {0}")]
     InvalidKeyLength(usize),
-
     #[error("Invalid ciphertext: too short")]
     CiphertextTooShort,
-
     #[error("Decryption failed: invalid padding or corrupted data")]
     DecryptionFailed,
-
     #[error("Encryption failed: {0}")]
     EncryptionFailed(String),
 }
+
+/// Version byte that opens a ciphertext written under the dedicated data key.
+pub const DATA_KEY_CIPHERTEXT_VERSION: u8 = 0x02;
+
+/// KBKDF label of the subkey used for credential ciphertexts.
+pub const PURPOSE_CREDENTIALS: &[u8] = b"credential-aead";
+/// KBKDF label of the subkey used for TOTP seeds.
+pub const PURPOSE_TOTP_SEED: &[u8] = b"totp-seed";
 
 /// Derive a 32-byte key from a passphrase using HMAC-SHA256.
 ///
@@ -39,109 +55,206 @@ pub enum EncryptionError {
 /// string as the message, producing a 32-byte derived key with domain
 /// separation. This is equivalent to a single-step KDF per NIST SP 800-108.
 fn derive_key_hkdf(passphrase: &str) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(passphrase.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
-    mac.update(b"artifact-keeper/credential-encryption/aes-256-gcm/v1");
-    mac.finalize().into_bytes().into()
+    hmac::sha256(
+        passphrase.as_bytes(),
+        b"artifact-keeper/credential-encryption/aes-256-gcm/v1",
+    )
 }
 
 /// Derive a 32-byte key from a passphrase using legacy raw SHA-256 (for
 /// backward compatibility with data encrypted before the HKDF upgrade).
 fn derive_key_legacy(passphrase: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(passphrase.as_bytes());
-    hasher.finalize().into()
+    digest::sha256(passphrase.as_bytes())
+}
+
+static DATA_KEY: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+
+/// Decode `DATA_ENCRYPTION_KEY` material: 32 raw bytes as base64 (standard
+/// or URL-safe, padding optional) or 64 hex characters.
+pub fn parse_data_key(raw: &str) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    let trimmed = raw.trim();
+    let bytes = if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex::decode(trimmed).map_err(|e| e.to_string())?
+    } else {
+        let unpadded = trimmed.trim_end_matches('=');
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(unpadded)
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(unpadded))
+            .map_err(|_| {
+                "DATA_ENCRYPTION_KEY is neither base64 nor 64 hex characters".to_string()
+            })?
+    };
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        format!(
+            "DATA_ENCRYPTION_KEY must decode to 32 bytes, got {}",
+            bytes.len()
+        )
+    })
+}
+
+/// Publish the dedicated data key for this process (`None` when the operator
+/// has not configured one). Called once at startup; later calls are ignored.
+pub fn install_data_key(key: Option<[u8; 32]>) {
+    let _ = DATA_KEY.set(key);
+}
+
+/// Whether a dedicated data key is configured.
+pub fn data_key_configured() -> bool {
+    DATA_KEY.get().is_some_and(|k| k.is_some())
+}
+
+/// The per-purpose 32-byte subkey under the data key, if one is configured.
+pub fn data_subkey_raw(purpose: &[u8]) -> Option<Vec<u8>> {
+    let dk = (*DATA_KEY.get()?)?;
+    Some(kdf::kbkdf_sha256(&dk, purpose, b"", aead::KEY_LEN))
+}
+
+/// The per-purpose AEAD subkey under the data key, if one is configured.
+pub fn data_subkey(purpose: &[u8]) -> Option<aead::Key> {
+    let sub = data_subkey_raw(purpose)?;
+    Some(aead::Key::new(&sub).expect("KBKDF output is 32 bytes"))
+}
+
+/// KBKDF label of the API-token HMAC subkey.
+pub const PURPOSE_TOKEN_HMAC: &[u8] = b"token-hmac";
+
+/// The key API tokens are stored under in strict mode (#5582): the
+/// `token-hmac` subkey of the data key when one is configured, otherwise
+/// derived from `jwt_secret`. Rotating the source secret invalidates every
+/// keyed token row (docs/fips.md, "Key hierarchy").
+pub fn token_key_for(jwt_secret: &str) -> crate::crypto::token::TokenKey {
+    match data_subkey_raw(PURPOSE_TOKEN_HMAC) {
+        Some(sub) => crate::crypto::token::TokenKey::from_subkey(&sub),
+        None => crate::crypto::token::TokenKey::derive(jwt_secret.as_bytes()),
+    }
+}
+
+/// Whether any row that needs the data key exists while no data key is
+/// configured: TOTP seeds written as `enc:` under strict mode. Logged at
+/// startup in every mode so a downgrade that dropped `DATA_ENCRYPTION_KEY`
+/// is visible before the first 2FA login fails.
+pub async fn warn_if_data_key_rows_unreadable(db: &sqlx::PgPool) {
+    if data_key_configured() {
+        return;
+    }
+    match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE totp_secret LIKE 'enc:%'")
+        .fetch_one(db)
+        .await
+    {
+        Ok(n) if n > 0 => tracing::warn!(
+            users = n,
+            "{n} user(s) have TOTP seeds encrypted under DATA_ENCRYPTION_KEY but no key is \
+             configured; their TOTP logins will fail until the key is restored"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "could not check for data-key-dependent rows"),
+    }
+}
+
+/// Whether v2 rows should be written: data key present and strict mode.
+fn write_v2() -> bool {
+    crate::fips::strict() && data_key_configured()
+}
+
+/// Whether `data` is a legacy (passphrase-keyed) ciphertext that
+/// `reencrypt-secrets` should rewrite. A v2 ciphertext is recognised by its
+/// version byte *and* by opening under the data key, so a legacy row whose
+/// random nonce happens to start with `0x02` is still reported as legacy.
+pub fn is_legacy_ciphertext(data: &[u8]) -> bool {
+    if data.first() != Some(&DATA_KEY_CIPHERTEXT_VERSION) {
+        return true;
+    }
+    match data_subkey(PURPOSE_CREDENTIALS) {
+        Some(k) => k.open(&data[1..], b"").is_err(),
+        None => true,
+    }
 }
 
 /// AES-256-GCM authenticated encryption for credentials.
 ///
-/// Ciphertext format: nonce (12 bytes) || AES-GCM ciphertext+tag
+/// Ciphertext format: nonce (12 bytes) || AES-GCM ciphertext+tag, or the v2
+/// form described in the module docs when a dedicated data key is in use.
 pub struct CredentialEncryption {
-    key: [u8; 32],
+    key: aead::Key,
     /// Legacy key derived via raw SHA-256, kept for transparent decryption
     /// of data encrypted before the HKDF upgrade.
-    legacy_key: Option<[u8; 32]>,
+    legacy_key: Option<aead::Key>,
+    /// Whether this instance takes part in the data-key hierarchy (only
+    /// passphrase-derived instances do; `new(key)` callers bring their own
+    /// dedicated key already).
+    data_key_eligible: bool,
 }
 
 impl CredentialEncryption {
     /// Create a new encryption instance with the given key.
     /// Key must be exactly 32 bytes.
     pub fn new(key: &[u8]) -> Result<Self, EncryptionError> {
-        if key.len() != 32 {
-            return Err(EncryptionError::InvalidKeyLength(key.len()));
-        }
-        let mut key_array = [0u8; 32];
-        key_array.copy_from_slice(key);
+        let key = aead::Key::new(key).map_err(|e| match e {
+            aead::Error::KeyLength(n) => EncryptionError::InvalidKeyLength(n),
+            other => EncryptionError::EncryptionFailed(other.to_string()),
+        })?;
         Ok(Self {
-            key: key_array,
+            key,
             legacy_key: None,
+            data_key_eligible: false,
         })
     }
 
     /// Create from a passphrase using HKDF-SHA256 key derivation.
     ///
-    /// New encryptions use the HKDF-derived key. Decryption automatically
-    /// falls back to the legacy SHA-256-derived key if the HKDF key fails,
-    /// providing transparent backward compatibility.
+    /// New encryptions use the HKDF-derived key (or the dedicated data key
+    /// in strict mode). Decryption automatically falls back to the legacy
+    /// SHA-256-derived key if the HKDF key fails, providing transparent
+    /// backward compatibility.
     pub fn from_passphrase(passphrase: &str) -> Self {
-        let key = derive_key_hkdf(passphrase);
-        let legacy = derive_key_legacy(passphrase);
+        let key = aead::Key::new(&derive_key_hkdf(passphrase)).expect("32-byte derived key");
+        let legacy = aead::Key::new(&derive_key_legacy(passphrase)).expect("32-byte derived key");
         Self {
             key,
             legacy_key: Some(legacy),
+            data_key_eligible: true,
         }
     }
 
     /// Encrypt plaintext data using AES-256-GCM.
-    /// Returns: nonce (12 bytes) || ciphertext+tag
+    /// Returns: nonce (12 bytes) || ciphertext+tag, or the v2 form.
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .expect("AES-256-GCM key length is always 32 bytes");
-
-        // Generate random 96-bit nonce
-        let nonce_bytes: [u8; 12] = rand::random();
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .expect("AES-256-GCM encryption should not fail with valid key and nonce");
-
-        // Combine: nonce || ciphertext+tag
-        let mut result = Vec::with_capacity(12 + ciphertext.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&ciphertext);
-        result
+        if self.data_key_eligible && write_v2() {
+            if let Some(k) = data_subkey(PURPOSE_CREDENTIALS) {
+                let mut out =
+                    Vec::with_capacity(1 + aead::NONCE_LEN + plaintext.len() + aead::TAG_LEN);
+                out.push(DATA_KEY_CIPHERTEXT_VERSION);
+                out.extend_from_slice(&k.seal(plaintext, b""));
+                return out;
+            }
+        }
+        self.key.seal(plaintext, b"")
     }
 
     /// Decrypt ciphertext data using AES-256-GCM.
     ///
-    /// Tries the primary (HKDF) key first. If that fails and a legacy key is
-    /// available, retries with the legacy key for backward compatibility.
+    /// Tries the data key (v2) when the version byte matches, then the
+    /// primary (HKDF) key, then the legacy key for backward compatibility.
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, EncryptionError> {
-        // Minimum size: nonce (12) + tag (16) = 28 bytes
-        if data.len() < 28 {
+        if data.len() < aead::NONCE_LEN + aead::TAG_LEN {
             return Err(EncryptionError::CiphertextTooShort);
         }
-
-        let nonce = Nonce::from_slice(&data[0..12]);
-        let ciphertext = &data[12..];
-
-        // Try primary (HKDF) key
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
-        if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+        if self.data_key_eligible && data[0] == DATA_KEY_CIPHERTEXT_VERSION {
+            if let Some(k) = data_subkey(PURPOSE_CREDENTIALS) {
+                if let Ok(plain) = k.open(&data[1..], b"") {
+                    return Ok(plain);
+                }
+            }
+        }
+        if let Ok(plaintext) = self.key.open(data, b"") {
             return Ok(plaintext);
         }
-
-        // Fall back to legacy (SHA-256) key if available
-        if let Some(ref legacy) = self.legacy_key {
-            let legacy_cipher = Aes256Gcm::new_from_slice(legacy)
-                .map_err(|e| EncryptionError::EncryptionFailed(e.to_string()))?;
-            return legacy_cipher
-                .decrypt(nonce, ciphertext)
+        if let Some(legacy) = &self.legacy_key {
+            return legacy
+                .open(data, b"")
                 .map_err(|_| EncryptionError::DecryptionFailed);
         }
-
         Err(EncryptionError::DecryptionFailed)
     }
 }
@@ -160,6 +273,373 @@ pub fn decrypt_credentials(
     let encryptor = CredentialEncryption::from_passphrase(encryption_key);
     let plaintext = encryptor.decrypt(encrypted)?;
     String::from_utf8(plaintext).map_err(|_| EncryptionError::DecryptionFailed)
+}
+
+/// Outcome of [`reencrypt_legacy_rows`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReencryptReport {
+    /// Rows rewritten under the data key.
+    pub rewritten: usize,
+    /// Rows already in v2 form (idempotent re-runs).
+    pub already_current: usize,
+    /// Rows that could not be decrypted with the passphrase key (left as is).
+    pub failed: usize,
+}
+
+impl std::fmt::Display for ReencryptReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reencrypt-secrets: {} rewritten, {} already current, {} failed",
+            self.rewritten, self.already_current, self.failed
+        )
+    }
+}
+
+/// How a column stores its ciphertext.
+#[derive(Clone, Copy)]
+enum ColumnEncoding {
+    Bytea,
+    HexText,
+}
+
+/// Which passphrase a column's legacy ciphertext was written under.
+#[derive(Clone, Copy)]
+enum LegacyKey {
+    /// `SSO_ENCRYPTION_KEY`, falling back to `JWT_SECRET`
+    /// (`auth_config_service::encryption_key`).
+    Sso,
+    /// `JWT_SECRET` directly (`SigningService::new`).
+    Jwt,
+    /// `MIGRATION_ENCRYPTION_KEY`, falling back to the built-in dev key
+    /// (`handlers::migration::migration_encryption_key`).
+    Migration,
+}
+
+/// The passphrases the legacy columns were written under, resolved by the
+/// caller from the same sources the writers use.
+pub struct ReencryptKeys {
+    pub sso: String,
+    pub jwt: String,
+    pub migration: String,
+}
+
+/// Every passphrase-encrypted column in the schema. Webhook secrets are not
+/// here: they have their own dedicated key (`WEBHOOK_SECRET_KEY`).
+const ENCRYPTED_COLUMNS: &[(&str, &str, &str, ColumnEncoding, LegacyKey)] = &[
+    (
+        "oidc_configs",
+        "id",
+        "client_secret_encrypted",
+        ColumnEncoding::HexText,
+        LegacyKey::Sso,
+    ),
+    (
+        "ldap_configs",
+        "id",
+        "bind_password_encrypted",
+        ColumnEncoding::HexText,
+        LegacyKey::Sso,
+    ),
+    (
+        "remote_instances",
+        "id",
+        "api_key_encrypted",
+        ColumnEncoding::HexText,
+        LegacyKey::Sso,
+    ),
+    (
+        "signing_keys",
+        "id",
+        "private_key_enc",
+        ColumnEncoding::Bytea,
+        LegacyKey::Jwt,
+    ),
+    (
+        "source_connections",
+        "id",
+        "credentials_enc",
+        ColumnEncoding::Bytea,
+        LegacyKey::Migration,
+    ),
+];
+
+/// Rewrite every legacy ciphertext under the dedicated data key (#5583).
+///
+/// Idempotent and resumable: rows already in v2 form are counted and left
+/// alone, each row is its own statement, and a row that fails to decrypt is
+/// logged (table, id, never contents) and skipped so one bad row cannot
+/// stop the rest. Requires [`install_data_key`] to have run with a key and
+/// is only meaningful when strict mode is going to be enabled; it does not
+/// consult `FIPS_MODE` itself so an operator can prepare in advance.
+pub async fn reencrypt_legacy_rows(
+    db: &sqlx::PgPool,
+    keys: &ReencryptKeys,
+) -> crate::error::Result<ReencryptReport> {
+    use crate::error::AppError;
+
+    let Some(k) = data_subkey(PURPOSE_CREDENTIALS) else {
+        return Err(AppError::Config(
+            "reencrypt-secrets: no DATA_ENCRYPTION_KEY installed".into(),
+        ));
+    };
+    let sso = CredentialEncryption::from_passphrase(&keys.sso);
+    let jwt = CredentialEncryption::from_passphrase(&keys.jwt);
+    let migration = CredentialEncryption::from_passphrase(&keys.migration);
+    let mut report = ReencryptReport::default();
+
+    for (table, id_col, col, enc, key) in ENCRYPTED_COLUMNS {
+        let legacy = match key {
+            LegacyKey::Sso => &sso,
+            LegacyKey::Jwt => &jwt,
+            LegacyKey::Migration => &migration,
+        };
+        // Table and column names come from the constant list above, never
+        // from input, hence the explicit opt-in.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {id_col}::text AS id, {col} AS value FROM {table} WHERE {col} IS NOT NULL"
+        )))
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(format!("{table}.{col}: {e}")))?;
+
+        for row in rows {
+            use sqlx::Row;
+            let id: String = row.get("id");
+            let bytes: Vec<u8> = match enc {
+                ColumnEncoding::Bytea => row.get("value"),
+                ColumnEncoding::HexText => {
+                    let hex_text: String = row.get("value");
+                    match hex::decode(hex_text.trim()) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            tracing::warn!(table, id, "ciphertext column is not hex; skipped");
+                            report.failed += 1;
+                            continue;
+                        }
+                    }
+                }
+            };
+            if !is_legacy_ciphertext(&bytes) {
+                report.already_current += 1;
+                continue;
+            }
+            let plain = match legacy.decrypt(&bytes) {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(
+                        table,
+                        id,
+                        "could not decrypt with the passphrase key; skipped"
+                    );
+                    report.failed += 1;
+                    continue;
+                }
+            };
+            let mut v2 = Vec::with_capacity(1 + aead::NONCE_LEN + plain.len() + aead::TAG_LEN);
+            v2.push(DATA_KEY_CIPHERTEXT_VERSION);
+            v2.extend_from_slice(&k.seal(&plain, b""));
+
+            let sql = || {
+                sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table} SET {col} = $2 WHERE {id_col}::text = $1"
+                ))
+            };
+            let result = match enc {
+                ColumnEncoding::Bytea => sqlx::query(sql()).bind(&id).bind(v2).execute(db).await,
+                ColumnEncoding::HexText => {
+                    sqlx::query(sql())
+                        .bind(&id)
+                        .bind(hex::encode(v2))
+                        .execute(db)
+                        .await
+                }
+            };
+            match result {
+                Ok(_) => report.rewritten += 1,
+                Err(e) => {
+                    tracing::warn!(table, id, error = %e, "update failed; skipped");
+                    report.failed += 1;
+                }
+            }
+        }
+    }
+
+    // `upstream_auth_credentials` lives in a key/value table, under the SSO key.
+    let legacy = &sso;
+    let rows = sqlx::query(
+        "SELECT repository_id::text AS id, value FROM repository_config \
+         WHERE key = 'upstream_auth_credentials' AND value IS NOT NULL",
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| AppError::Database(format!("repository_config: {e}")))?;
+    for row in rows {
+        use sqlx::Row;
+        let id: String = row.get("id");
+        let hex_text: String = row.get("value");
+        let Ok(bytes) = hex::decode(hex_text.trim()) else {
+            tracing::warn!(table = "repository_config", id, "value is not hex; skipped");
+            report.failed += 1;
+            continue;
+        };
+        if !is_legacy_ciphertext(&bytes) {
+            report.already_current += 1;
+            continue;
+        }
+        let Ok(plain) = legacy.decrypt(&bytes) else {
+            tracing::warn!(
+                table = "repository_config",
+                id,
+                "could not decrypt; skipped"
+            );
+            report.failed += 1;
+            continue;
+        };
+        let mut v2 = vec![DATA_KEY_CIPHERTEXT_VERSION];
+        v2.extend_from_slice(&k.seal(&plain, b""));
+        match sqlx::query(
+            "UPDATE repository_config SET value = $2 \
+             WHERE repository_id::text = $1 AND key = 'upstream_auth_credentials'",
+        )
+        .bind(&id)
+        .bind(hex::encode(v2))
+        .execute(db)
+        .await
+        {
+            Ok(_) => report.rewritten += 1,
+            Err(e) => {
+                tracing::warn!(table = "repository_config", id, error = %e, "update failed; skipped");
+                report.failed += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        rewritten = report.rewritten,
+        already_current = report.already_current,
+        failed = report.failed,
+        "reencrypt-secrets finished"
+    );
+    Ok(report)
+}
+
+/// Data-key hierarchy and v2 ciphertext (#5583). Each test runs in its own
+/// nextest process, so installing the key and strict mode is per test.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod data_key_tests {
+    use super::*;
+    use crate::fips::FipsMode;
+
+    const KEY: [u8; 32] = [0x5a; 32];
+
+    #[test]
+    fn parse_data_key_accepts_hex_and_both_base64_alphabets() {
+        let hex_key = "5a".repeat(32);
+        assert_eq!(parse_data_key(&hex_key).unwrap(), KEY);
+        use base64::Engine;
+        let std = base64::engine::general_purpose::STANDARD.encode(KEY);
+        assert_eq!(parse_data_key(&format!(" {std}\n")).unwrap(), KEY);
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xfb; 32]);
+        assert_eq!(parse_data_key(&url).unwrap(), [0xfb; 32]);
+        assert!(parse_data_key("not base64!!")
+            .unwrap_err()
+            .contains("neither base64"));
+        assert!(
+            parse_data_key(&base64::engine::general_purpose::STANDARD.encode([1u8; 16]))
+                .unwrap_err()
+                .contains("32 bytes, got 16")
+        );
+    }
+
+    #[test]
+    fn without_a_data_key_everything_stays_legacy() {
+        install_data_key(None);
+        assert!(!data_key_configured());
+        assert!(data_subkey(PURPOSE_CREDENTIALS).is_none());
+        assert!(data_subkey_raw(PURPOSE_TOTP_SEED).is_none());
+        let enc = CredentialEncryption::from_passphrase("pass");
+        let ct = enc.encrypt(b"plain");
+        assert_ne!(
+            ct[0], DATA_KEY_CIPHERTEXT_VERSION,
+            "legacy layout has no version byte"
+        );
+        assert!(is_legacy_ciphertext(&ct));
+        assert_eq!(enc.decrypt(&ct).unwrap(), b"plain");
+        // The token key falls back to the deployment secret.
+        let k = token_key_for("jwt-secret-value-for-tokens");
+        assert_eq!(
+            k.hash("t"),
+            crate::crypto::token::TokenKey::derive(b"jwt-secret-value-for-tokens").hash("t")
+        );
+    }
+
+    #[test]
+    fn with_a_data_key_in_strict_mode_v2_is_written_and_legacy_still_reads() {
+        install_data_key(Some(KEY));
+        crate::fips::install(FipsMode::Strict, Vec::new()).unwrap();
+        assert!(data_key_configured());
+        let a = data_subkey_raw(PURPOSE_CREDENTIALS).unwrap();
+        let b = data_subkey_raw(PURPOSE_TOTP_SEED).unwrap();
+        let c = data_subkey_raw(PURPOSE_TOKEN_HMAC).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+
+        let enc = CredentialEncryption::from_passphrase("pass");
+        let v2 = enc.encrypt(b"secret value");
+        assert_eq!(v2[0], DATA_KEY_CIPHERTEXT_VERSION);
+        assert!(!is_legacy_ciphertext(&v2));
+        assert_eq!(enc.decrypt(&v2).unwrap(), b"secret value");
+        // A row from before the key existed still decrypts.
+        let legacy_key = aead::Key::new(&derive_key_hkdf("pass")).unwrap();
+        let legacy = legacy_key.seal(b"older row", b"");
+        assert!(is_legacy_ciphertext(&legacy));
+        assert_eq!(enc.decrypt(&legacy).unwrap(), b"older row");
+        // A legacy nonce that happens to start with 0x02 is still legacy.
+        let mut lookalike = legacy.clone();
+        lookalike[0] = DATA_KEY_CIPHERTEXT_VERSION;
+        assert!(is_legacy_ciphertext(&lookalike));
+        // `new(key)` instances bring their own key and never use the hierarchy.
+        let own = CredentialEncryption::new(&[9u8; 32]).unwrap();
+        let ct = own.encrypt(b"x");
+        assert_ne!(ct[0], DATA_KEY_CIPHERTEXT_VERSION);
+        assert_eq!(own.decrypt(&ct).unwrap(), b"x");
+        // The convenience functions go through the same path.
+        let ct = encrypt_credentials("{\"k\":1}", "pass");
+        assert_eq!(decrypt_credentials(&ct, "pass").unwrap(), "{\"k\":1}");
+        // The token key is the data-key subkey, not the JWT derivation.
+        let k = token_key_for("jwt");
+        assert_eq!(
+            k.hash("t"),
+            crate::crypto::token::TokenKey::from_subkey(&c).hash("t")
+        );
+        assert_ne!(
+            k.hash("t"),
+            crate::crypto::token::TokenKey::derive(b"jwt").hash("t")
+        );
+    }
+
+    #[test]
+    fn reencrypt_report_display_and_defaults() {
+        let r = ReencryptReport {
+            rewritten: 2,
+            already_current: 3,
+            failed: 1,
+        };
+        assert_eq!(
+            r.to_string(),
+            "reencrypt-secrets: 2 rewritten, 3 already current, 1 failed"
+        );
+        assert_eq!(
+            ReencryptReport::default(),
+            ReencryptReport {
+                rewritten: 0,
+                already_current: 0,
+                failed: 0
+            }
+        );
+    }
 }
 
 #[cfg(ak_test_shard = "services-1")]

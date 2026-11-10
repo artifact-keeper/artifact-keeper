@@ -751,6 +751,27 @@ pub struct Config {
     /// JWT secret key for signing tokens
     pub jwt_secret: String,
 
+    /// `FIPS_MODE`: `off` (default), `warn` or `strict` (#5580). See
+    /// `crate::fips` for what each mode does; `off` changes nothing.
+    pub fips_mode: crate::fips::FipsMode,
+
+    /// `FIPS_LEGACY_HASH_MIGRATION` (default `true`): in strict mode, a user
+    /// whose stored password hash is bcrypt is re-hashed with PBKDF2 on their
+    /// next successful login (#5582). `false` leaves legacy hashes in place,
+    /// so those users need a password reset to be FIPS-compliant.
+    pub fips_legacy_hash_migration: bool,
+
+    /// `PBKDF2_ITERATIONS` (default 210,000, minimum 1,000): work factor for
+    /// PBKDF2-HMAC-SHA512 password hashes written in strict mode (#5582).
+    pub pbkdf2_iterations: u32,
+
+    /// `DATA_ENCRYPTION_KEY` (or `DATA_ENCRYPTION_KEY_FILE`): 32 bytes, base64
+    /// or hex, the dedicated at-rest key that strict mode encrypts stored
+    /// secrets under instead of a key derived from `JWT_SECRET` (#5583).
+    /// Parsed and installed at startup by `services::encryption`; unset means
+    /// the legacy derivation and ciphertext format stay in use.
+    pub data_encryption_key: Option<String>,
+
     /// Validity window, in seconds, stamped onto every OpenPGP repository
     /// metadata signature as a `SignatureExpirationTime` subpacket (#1327).
     ///
@@ -1922,6 +1943,10 @@ impl Default for Config {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "test-secret-key-that-is-at-least-32-bytes".into(),
+            fips_mode: crate::fips::FipsMode::Off,
+            fips_legacy_hash_migration: true,
+            pbkdf2_iterations: crate::crypto::kdf::PBKDF2_DEFAULT_ITERATIONS,
+            data_encryption_key: None,
             signature_expiry_seconds:
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
             signing_key_rotation_overlap_secs:
@@ -2135,6 +2160,25 @@ impl Config {
             jwt_secret: secret_or_env("JWT_SECRET")
                 .map_err(AppError::Config)?
                 .ok_or_else(|| AppError::Config("JWT_SECRET not set".into()))?,
+            fips_mode: crate::fips::FipsMode::from_env().map_err(AppError::Config)?,
+            // Opt-out flag: anything but an explicit false/0/no keeps it on.
+            fips_legacy_hash_migration: !matches!(
+                env::var("FIPS_LEGACY_HASH_MIGRATION")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "false" | "0" | "no" | "off"
+            ),
+            // Clamped to [1_000, 10_000_000]: below the floor is not a
+            // password hash, above the ceiling a single login takes seconds
+            // and the auth-concurrency cap turns into a denial of service.
+            pbkdf2_iterations: env_parse(
+                "PBKDF2_ITERATIONS",
+                crate::crypto::kdf::PBKDF2_DEFAULT_ITERATIONS,
+            )
+            .clamp(crate::crypto::password::MIN_ITERATIONS, 10_000_000),
+            data_encryption_key: secret_or_env("DATA_ENCRYPTION_KEY").map_err(AppError::Config)?,
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",
                 crate::services::signing_service::DEFAULT_SIGNATURE_EXPIRY_SECONDS,
@@ -2259,7 +2303,7 @@ impl Config {
             peer_api_key: secret_or_env("PEER_API_KEY")
                 .map_err(AppError::Config)?
                 .unwrap_or_else(|| {
-                    let key = format!("{:032x}", rand::random::<u128>());
+                    let key = format!("{:032x}", crate::crypto::rng::u128());
                     tracing::warn!(
                         "PEER_API_KEY not set, generated random key. \
                          Set PEER_API_KEY in your environment for stable peer authentication."

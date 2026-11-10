@@ -21,9 +21,9 @@
 //! Nothing in this module opens a connection: snapshots arrive through the
 //! HTTP API or are built from stored metadata.
 
+use crate::crypto::digest::Sha256;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 

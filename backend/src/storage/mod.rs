@@ -463,8 +463,8 @@ pub(crate) async fn buffered_put_stream_fallback<B: StorageBackend + ?Sized>(
     key: &str,
     stream: BoxStream<'static, Result<Bytes>>,
 ) -> Result<PutStreamResult> {
+    use crate::crypto::digest::Sha256;
     use futures::StreamExt;
-    use sha2::{Digest, Sha256};
 
     tracing::debug!(key, "put_stream falling back to in-memory buffering");
 
@@ -969,8 +969,8 @@ mod tests {
             _key: &str,
             stream: BoxStream<'static, Result<Bytes>>,
         ) -> Result<PutStreamResult> {
+            use crate::crypto::digest::Sha256;
             use futures::StreamExt;
-            use sha2::{Digest, Sha256};
 
             let mut hasher = Sha256::new();
             let mut total: u64 = 0;
@@ -1003,7 +1003,7 @@ mod tests {
     /// file size and OOMing on multi-GB artifacts.
     #[tokio::test]
     async fn test_default_put_file_chunks_through_put_stream() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         use tokio::io::AsyncWriteExt;
 
         // Write 4 MiB of pseudo-random bytes to a temp file. We hash the

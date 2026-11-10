@@ -2054,7 +2054,7 @@ mod guest_access_oci_3854 {
         .to_string();
         let digest = format!(
             "sha256:{:x}",
-            <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes())
+            artifact_keeper_backend::crypto::digest::Sha256::digest(body.as_bytes())
         );
         let storage_key = format!(
             "{}{}",

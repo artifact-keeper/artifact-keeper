@@ -10170,7 +10170,7 @@ pub(crate) const PROXY_SCAN_TYPE: &str = "grype";
 /// digest we compute ourselves — never an index-advertised digest — so a lying
 /// upstream index cannot bind a clean verdict to malicious bytes (#2954 inv 4).
 pub(crate) fn sha256_hex(bytes: &Bytes) -> String {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
@@ -18938,6 +18938,10 @@ mod tests {
                 s3_region: None,
                 s3_endpoint: None,
                 jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+                fips_mode: Default::default(),
+                fips_legacy_hash_migration: true,
+                pbkdf2_iterations: 1_000,
+                data_encryption_key: None,
                 signature_expiry_seconds: 604_800,
                 signing_key_rotation_overlap_secs: 1_209_600,
                 signing_auto_migrate_legacy_keys: false,
@@ -19811,7 +19815,7 @@ mod tests {
             .expect("put_stream");
 
         // Checksum computed incrementally by put_stream matches a direct hash.
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let mut hasher = Sha256::new();
         hasher.update(&payload);
         assert_eq!(put.checksum_sha256, format!("{:x}", hasher.finalize()));

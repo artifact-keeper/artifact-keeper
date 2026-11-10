@@ -1803,7 +1803,7 @@ mod catalog_maintenance_tests {
 
     /// Seed one artifact plus its catalog rows and return the checksum.
     async fn seed(fx: &tdh::Fixture, name: &str, version: &str) -> String {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let checksum = format!("{:x}", Sha256::digest(format!("{name}@{version}")));
 
         sqlx::query(

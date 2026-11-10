@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -20,10 +21,10 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use digest::Digest as _;
 use futures::FutureExt;
 use moka::future::Cache as MokaCache;
 use once_cell::sync::Lazy;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -4590,7 +4591,7 @@ fn compute_checksum(data: &[u8], checksum_type: ChecksumType) -> String {
             format!("{:x}", hasher.finalize())
         }
         ChecksumType::Sha512 => {
-            use sha2::Sha512;
+            use crate::crypto::digest::Sha512;
             let mut hasher = Sha512::new();
             hasher.update(data);
             format!("{:x}", hasher.finalize())

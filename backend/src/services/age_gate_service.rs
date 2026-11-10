@@ -10,9 +10,9 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use crate::crypto::digest::Sha256;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 

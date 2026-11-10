@@ -37,7 +37,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::Serialize;
-use sha2::Digest as _;
 use sigstore::crypto::{CosignVerificationKey, Signature};
 use sigstore::rekor::models::checkpoint::SignedCheckpoint;
 use sigstore::rekor::models::InclusionProof;
@@ -327,11 +326,13 @@ pub fn dsse_envelope_hash_form(bundle_json: &serde_json::Value) -> EnvelopeHashF
     ) else {
         return EnvelopeHashForm::NotApplicable;
     };
-    let compact_sha256 = hex::encode(sha2::Sha256::digest(&compact));
+    let compact_sha256 = hex::encode(crate::crypto::digest::Sha256::digest(&compact));
     if recorded == compact_sha256 {
         return EnvelopeHashForm::Compact;
     }
-    let spaced_sha256 = hex::encode(sha2::Sha256::digest(python_spaced_json(&compact)));
+    let spaced_sha256 = hex::encode(crate::crypto::digest::Sha256::digest(python_spaced_json(
+        &compact,
+    )));
     if recorded == spaced_sha256 {
         EnvelopeHashForm::Spaced { compact_sha256 }
     } else {

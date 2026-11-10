@@ -2,10 +2,10 @@
 //!
 //! Supports filesystem and S3-compatible storage with CAS pattern.
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;

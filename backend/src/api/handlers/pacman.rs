@@ -24,6 +24,7 @@
 //! database and downloadable under every `{arch}`, as on the official mirrors.
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -34,7 +35,6 @@ use axum::{Extension, Router};
 use base64::Engine as _;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use tracing::info;

@@ -1260,7 +1260,7 @@ async fn delete_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
 
     // -----------------------------------------------------------------------
     // #4595: the upload size limit is MAX_UPLOAD_SIZE, not a fixed 2 GiB
@@ -2805,8 +2805,8 @@ mod tests {
 mod repo_scoped_keys_5659 {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::crypto::digest::Sha256;
     use crate::storage::StorageBackend;
-    use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
     const OBJECT: &[u8] = b"one LFS object shared by a fork and its upstream (#5659)";

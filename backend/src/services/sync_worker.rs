@@ -2367,7 +2367,7 @@ async fn repair_legacy_protobuf_label_index(
     storage_registry: &StorageRegistry,
     task: &TaskRow,
 ) -> Option<TaskRow> {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
 
     if !is_legacy_protobuf_label_index(task) {
         return None;
@@ -2541,7 +2541,7 @@ async fn repair_legacy_protobuf_commit_checksum(
     storage_registry: &StorageRegistry,
     task: &TaskRow,
 ) -> Option<String> {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
 
     if !is_legacy_protobuf_commit_checksum(task) {
         return None;
@@ -5623,7 +5623,7 @@ mod tests {
     /// bundle. `legacy` writes the pre-#4921 row shape (commit digest in
     /// `checksum_sha256`). Returns the bundle bytes and their sha256.
     async fn make_protobuf_commit_row(f: &ClaimFixture, legacy: bool) -> (Vec<u8>, String) {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let bundle = format!("protobuf bundle {}", Uuid::new_v4()).into_bytes();
         let sha = format!("{:x}", Sha256::digest(&bundle));
         let digest = format!("{:x}", Sha256::digest(format!("digest-{sha}")));
@@ -5755,7 +5755,7 @@ mod tests {
     /// not the commit digest held in the row, and repairs the row.
     #[tokio::test]
     async fn legacy_protobuf_commit_row_pushes_with_bundle_sha256_4921() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };
@@ -5790,7 +5790,7 @@ mod tests {
     /// peer's initial sync does not fail on a zero-byte object.
     #[tokio::test]
     async fn legacy_protobuf_label_row_is_rebuilt_before_push_4916() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };

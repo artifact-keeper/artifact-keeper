@@ -1,5 +1,6 @@
 //! SBOM (Software Bill of Materials) generation and management service.
 
+use crate::crypto::digest::Sha256;
 use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::models::sbom::{
@@ -8,7 +9,6 @@ use crate::models::sbom::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use uuid::Uuid;

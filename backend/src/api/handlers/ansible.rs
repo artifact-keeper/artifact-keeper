@@ -78,6 +78,8 @@
 //! is returned as a `4xx` from the upload itself and `_call_galaxy` raises on
 //! any non-2xx.
 
+#[cfg(test)]
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Multipart, OriginalUri, Path, State};
 use axum::http::header::CONTENT_TYPE;
@@ -88,8 +90,6 @@ use axum::Extension;
 use axum::Router;
 #[cfg(test)]
 use bytes::Bytes;
-#[cfg(test)]
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 

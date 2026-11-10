@@ -13,6 +13,7 @@
 //!   POST /composer/{repo_key}/api/packages                            - Upload/register package
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -22,7 +23,6 @@ use axum::routing::{get, put};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -511,11 +511,11 @@ fn build_version_entry(
 /// `Undefined array key "uid"` (#2250). The value must be STABLE across requests
 /// (Composer caches/dedups on it) and unique per version, so it is derived purely
 /// from the package identity plus content digest — independent of DB row order or
-/// virtual fan-out aggregation order. `sha2::Sha256` is used (not
+/// virtual fan-out aggregation order. `crate::crypto::digest::Sha256` is used (not
 /// `DefaultHasher`/`RandomState`, which are per-process randomized). Masked into
 /// the non-negative i64 range so PHP treats it as a native integer everywhere.
 fn composer_inline_uid(name: &str, version: &str, checksum_sha256: &str) -> i64 {
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(name.as_bytes());
     hasher.update([0u8]);
@@ -4194,7 +4194,7 @@ mod upload_db_tests {
     /// replication must not be fanned back out. Fails on `main` (nothing queued).
     #[tokio::test]
     async fn composer_upload_queues_push_sync_task_4725() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         let Some(f) = tdh::Fixture::setup("local", "composer").await else {
             return;

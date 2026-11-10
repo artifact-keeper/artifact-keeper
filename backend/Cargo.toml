@@ -16,7 +16,14 @@ name = "ak-mcp-introspector"
 path = "src/bin/mcp_introspector/main.rs"
 
 [features]
-vendored-openssl = ["openssl/vendored"]
+# Deprecated no-op (#5578): the backend no longer links OpenSSL at all, so
+# there is nothing to vendor. Kept so `--features vendored-openssl` in the
+# release workflows keeps building until those are cleaned up.
+vendored-openssl = []
+# FIPS 140-3 mode: build against the AWS-LC FIPS module instead of AWS-LC and
+# let `FIPS_MODE=strict` enforce approved-only configuration (#5577). Needs
+# cmake and Go on the build host.
+fips = ["aws-lc-rs/fips", "rustls/fips"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 profiling = ["jemalloc", "dep:tikv-jemalloc-ctl", "dep:tikv-jemalloc-sys", "tikv-jemallocator/profiling"]
@@ -37,7 +44,18 @@ test-shard-services-2 = []
 test-shard-router = []
 
 [dependencies]
-openssl = { workspace = true, optional = true }
+# The single cryptographic provider (#5578). Direct use is confined to
+# `src/crypto/` (the facade, #5579) and the startup provider install.
+aws-lc-rs = { workspace = true }
+rustls-pki-types = { workspace = true }
+# OS trust store for the rustls clients the backend configures itself
+# (LDAP); reqwest, lettre and redis load it through their own features.
+rustls-native-certs = "0.8"
+# The facade's SHA-2 hashers implement the RustCrypto `digest` traits so
+# crates that are generic over a hasher (`rsa`, `pgp`) hash on the module
+# without a second SHA-2 implementation (#5585). Same versions sha2 uses.
+digest = "0.10"
+const-oid = "0.9"
 # Async runtime
 tokio.workspace = true
 
@@ -86,7 +104,7 @@ http-body.workspace = true
 http-body-util.workspace = true
 
 # TLS (explicit provider selection for rustls 0.23+)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 
 # Logging/Tracing
 tracing.workspace = true
@@ -204,9 +222,12 @@ walkdir = "2.5"
 rsa = { version = "0.9", features = ["sha2"] }
 urlencoding = "2.1.3"
 url.workspace = true
-ldap3 = "0.12"
+# rustls on aws-lc-rs, not the default native-tls/OpenSSL (#5578). ldap3's
+# rustls connector loads the OS trust store via rustls-native-certs; the
+# per-provider CA (`ca_cert_pem` / `LDAP_CA_CERT_PATH`) is added on top in
+# `services/ldap_service.rs`.
+ldap3 = { version = "0.12", default-features = false, features = ["sync", "tls-rustls-aws-lc-rs"] }
 bergshamra = { workspace = true }
-native-tls = "0.2"
 
 # OpenAPI
 utoipa.workspace = true
@@ -285,10 +306,9 @@ metrics-util = { workspace = true, features = ["debugging"] }
 opentelemetry_sdk = { workspace = true, features = ["testing", "experimental_metrics_custom_reader"] }
 # Mint self-signed / non-Fulcio leaf certificates for the attestation red-team
 # suite (#2955 Stage 4, rows 3 and 8 — the Stage-1 fixtures were missing them).
-rcgen = "0.14"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Serve the CI OIDC e2e mock issuer over TLS (`ci_oidc_exchange_e2e_tests`):
 # the exchange refuses a non-https issuer, and axum 0.7's `serve` is plain TCP.
 # Both are already in the tree transitively (hyper-util is also a normal
-# dependency); `ring`, not the default aws-lc-rs, matches the provider the
-# backend's own rustls is built with.
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# dependency); aws-lc-rs matches the one provider the backend links (#5578).
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }

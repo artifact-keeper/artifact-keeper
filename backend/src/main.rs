@@ -28,8 +28,6 @@ use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use rand::RngExt;
-
 // Gallery clients identify themselves and, when telemetry is enabled, carry a
 // per-machine/session identifier. CORS_ORIGINS remains the authority for which
 // browser origins may call the API.
@@ -109,13 +107,27 @@ async fn shutdown_signal() {
 /// Core server logic extracted so it can be called from both the normal entrypoint
 /// and the Windows Service entrypoint with an externally-managed shutdown token.
 pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()> {
-    // Install a rustls CryptoProvider before any TLS operations.
-    // Required by rustls 0.23+ when multiple providers (ring, aws-lc-rs)
-    // are compiled in via transitive dependencies (object_store, reqwest, sqlx).
-    // Without this, IRSA/STS credential fetches panic at startup.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls CryptoProvider");
+    // Install the one rustls CryptoProvider before any TLS operation. The
+    // whole graph is on aws-lc-rs (#5578); installing it explicitly, rather
+    // than relying on rustls' single-provider inference, is what lets the
+    // FIPS gate (#5580) swap in `default_fips_provider()` from one place.
+    // Without an installed provider, IRSA/STS credential fetches panic at
+    // startup.
+    //
+    // `FIPS_MODE` is read here directly rather than from `Config` because the
+    // provider must be in place before anything (OTel exporters included)
+    // opens a TLS connection, and `Config::from_env` runs later.
+    let fips_mode = artifact_keeper_backend::fips::FipsMode::from_env()
+        .map_err(artifact_keeper_backend::error::AppError::Config)?;
+    let rustls_fips = artifact_keeper_backend::fips::install_rustls_provider(fips_mode);
+    // Fail fast on the one violation that needs no configuration or database
+    // to detect: strict mode on a binary without the FIPS module. The full
+    // gate runs after the database is up (below).
+    if fips_mode.is_strict() {
+        let module = artifact_keeper_backend::fips::module_violations(fips_mode);
+        artifact_keeper_backend::fips::decide(fips_mode, &module)
+            .map_err(artifact_keeper_backend::error::AppError::Config)?;
+    }
 
     // Resolve the shutdown token early so background workers spawned during
     // startup (email dispatcher, webhook producer) share the same
@@ -250,6 +262,43 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
     }
 
     // Provision admin user on first boot; returns true when setup lock is needed
+    // FIPS 140-3 gate (#5580). Collect every policy violation from the
+    // build, the environment and the database, then decide: `strict`
+    // refuses to start, `warn` logs and reports them in /health, `off`
+    // does nothing. Migrations have run, so the SSO table exists.
+    {
+        use artifact_keeper_backend::fips;
+        // Dedicated at-rest key (#5583): parsed here so a malformed value is
+        // a startup error naming the variable, never a silent fallback.
+        let data_key = match config.data_encryption_key.as_deref() {
+            Some(raw) => Some(
+                artifact_keeper_backend::services::encryption::parse_data_key(raw)
+                    .map_err(artifact_keeper_backend::error::AppError::Config)?,
+            ),
+            None => None,
+        };
+        artifact_keeper_backend::services::encryption::install_data_key(data_key);
+        let mut violations = fips::module_violations(config.fips_mode);
+        if config.fips_mode.checks_enabled() && !rustls_fips {
+            violations.push(fips::Violation {
+                code: "rustls-provider",
+                message: "the installed rustls provider is not the FIPS provider".into(),
+                hint: "run a `-fips` build; the default build cannot provide FIPS TLS",
+            });
+        }
+        violations.extend(fips::config_violations(&config));
+        violations.extend(fips::db_violations(config.fips_mode, &db_pool).await);
+        fips::install(config.fips_mode, violations)
+            .map_err(artifact_keeper_backend::error::AppError::Config)?;
+        artifact_keeper_backend::services::auth_service::install_pbkdf2_iterations(
+            config.pbkdf2_iterations,
+        );
+        // Not a violation in any mode, but loud: rows that need the data
+        // key while none is configured (a downgrade that dropped it).
+        artifact_keeper_backend::services::encryption::warn_if_data_key_rows_unreadable(&db_pool)
+            .await;
+    }
+
     let setup_required = provision_admin_user(
         &db_pool,
         &config.storage_path,
@@ -1736,7 +1785,52 @@ async fn assert_connect_info_wired(app: Router) {
 #[cfg(not(windows))]
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `artifact-keeper reencrypt-secrets` (#5583): rewrite legacy at-rest
+    // ciphertexts under the dedicated data key, then exit. Explicit by
+    // design; the server never re-encrypts rows on its own.
+    if std::env::args().nth(1).as_deref() == Some("reencrypt-secrets") {
+        return reencrypt_secrets_command().await;
+    }
     run_server(None).await
+}
+
+async fn reencrypt_secrets_command() -> Result<()> {
+    use artifact_keeper_backend::error::AppError;
+    use artifact_keeper_backend::services::encryption;
+
+    tracing_subscriber::fmt().with_env_filter("info").init();
+    // Same environment the server sees: `.env` / AK_ENV_FILE first.
+    if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
+        dotenvy::from_path(&env_file).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
+    let config = Config::from_env()?;
+    let raw = config.data_encryption_key.as_deref().ok_or_else(|| {
+        AppError::Config("reencrypt-secrets needs DATA_ENCRYPTION_KEY (or _FILE) set".into())
+    })?;
+    encryption::install_data_key(Some(
+        encryption::parse_data_key(raw).map_err(AppError::Config)?,
+    ));
+    // A plain pool: the startup-retry pool and its metrics are for the server.
+    let db_pool = sqlx::PgPool::connect(&config.database_url)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    // Each column is read back with the passphrase its writer used.
+    let keys = encryption::ReencryptKeys {
+        sso: artifact_keeper_backend::services::auth_config_service::encryption_key(),
+        jwt: config.jwt_secret.clone(),
+        migration: artifact_keeper_backend::api::handlers::migration::migration_encryption_key()?,
+    };
+    let report = encryption::reencrypt_legacy_rows(&db_pool, &keys).await?;
+    println!("{report}");
+    if report.failed > 0 {
+        return Err(AppError::Internal(format!(
+            "{} row(s) could not be re-encrypted; see the log",
+            report.failed
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1745,7 +1839,13 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "--service") {
+    if args.get(1).map(String::as_str) == Some("reencrypt-secrets") {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        runtime.block_on(reencrypt_secrets_command())
+    } else if args.iter().any(|a| a == "--service") {
         windows_service::run_as_service().map_err(|e| {
             eprintln!("Service error: {e}");
             AppError::Config(e.to_string())
@@ -2688,13 +2788,8 @@ async fn admin_password_env_ignored(
 /// Generate a random 20-character password for the admin user.
 fn generate_random_password() -> String {
     const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*";
-    let mut rng = rand::rng();
-    (0..20)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
+    // Module DRBG, uniform over the alphabet (#5579).
+    artifact_keeper_backend::crypto::rng::string_from_alphabet(CHARSET, 20)
 }
 
 /// Write the admin password and setup instructions to a file.
@@ -2754,7 +2849,7 @@ fn write_file_private(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
         ".{}.tmp.{}.{:016x}",
         file_name,
         std::process::id(),
-        rand::rng().random::<u64>(),
+        artifact_keeper_backend::crypto::rng::u64(),
     ));
 
     let mut file = open_private_new(&tmp)?;
@@ -3962,7 +4057,7 @@ mod tests {
         // The repair function recomputes that hash to detect drift; verify the
         // algorithm here so a future sqlx upgrade that switches algorithms
         // doesn't silently break the repair path.
-        use sha2::{Digest, Sha384};
+        use artifact_keeper_backend::crypto::digest::Sha384;
         let embedded = include_str!("../migrations/073_account_lockout.sql");
         let mut hasher = Sha384::new();
         hasher.update(embedded.as_bytes());

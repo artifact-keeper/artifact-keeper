@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -35,7 +36,6 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use flate2::Compression;
 use flate2::GzBuilder;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 use xz2::read::XzDecoder;
@@ -7476,7 +7476,7 @@ mod upload_db_tests {
                 .await
                 .unwrap();
         assert_eq!(rows, 0, "a refused package leaves no artifact row");
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let key = ArtifactService::storage_key_from_checksum(&hex::encode(Sha256::digest(&deb)));
         assert!(
             !f.storage_dir.join(key).exists(),
@@ -9097,7 +9097,7 @@ mod apt_release_metadata_db_tests {
 mod dists_package_content_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
-    use sha2::{Digest, Sha256};
+    use crate::crypto::digest::Sha256;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

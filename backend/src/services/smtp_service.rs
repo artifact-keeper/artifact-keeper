@@ -387,8 +387,8 @@ fn build_tls_parameters(host: &str, config: &Config) -> Result<TlsParameters, Sm
         .map_err(|e| SmtpError::Config(format!("SMTP TLS setup failed: {e}")))
 }
 
-/// Split a PEM bundle into certificates. The native-tls backend only reads
-/// the first certificate of a buffer, so each block is parsed on its own.
+/// Split a PEM bundle into certificates. `Certificate::from_pem` reads one
+/// certificate per call, so each block is parsed on its own.
 fn parse_pem_bundle(pem: &[u8]) -> Result<Vec<Certificate>, String> {
     const END: &str = "-----END CERTIFICATE-----";
     let text = String::from_utf8_lossy(pem);

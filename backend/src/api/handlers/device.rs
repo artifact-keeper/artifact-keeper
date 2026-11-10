@@ -1695,7 +1695,7 @@ mod tests {
 
     async fn session_status(pool: &sqlx::PgPool, user_code: &str) -> Option<String> {
         let code = normalize_user_code(user_code).expect("valid user code");
-        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(code.as_bytes()));
+        let digest = hex::encode(crate::crypto::digest::Sha256::digest(code.as_bytes()));
         sqlx::query_scalar("SELECT status FROM device_sessions WHERE user_code_hash = $1")
             .bind(digest)
             .fetch_optional(pool)
@@ -2039,7 +2039,7 @@ mod tests {
         let requested: Vec<String> = sqlx::query_scalar(
             "SELECT requested_scopes FROM device_sessions WHERE user_code_hash = $1",
         )
-        .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        .bind(hex::encode(crate::crypto::digest::Sha256::digest(
             normalize_user_code(user_code).unwrap().as_bytes(),
         )))
         .fetch_one(&pool)
@@ -2451,7 +2451,7 @@ mod tests {
         let state = state(pool.clone(), |_| {});
         let throttle = throttle(&state);
         let (device_code, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
-        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+        let digest = hex::encode(crate::crypto::digest::Sha256::digest(
             device_code.as_bytes(),
         ));
         sqlx::query(
@@ -2674,7 +2674,7 @@ mod tests {
         let (device_code, user_code) = start(app(&state, None, &throttle), "read:artifacts").await;
         let session_id: Uuid =
             sqlx::query_scalar("SELECT id FROM device_sessions WHERE device_code_hash = $1")
-                .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                .bind(hex::encode(crate::crypto::digest::Sha256::digest(
                     device_code.as_bytes(),
                 )))
                 .fetch_one(&pool)

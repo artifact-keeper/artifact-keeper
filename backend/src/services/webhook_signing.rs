@@ -22,8 +22,6 @@
 //! which also explains why the webhook id is signed). Receivers that only
 //! know `v1=` ignore the `v2=` token.
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -34,12 +32,11 @@ use crate::services::webhook_signing_keys::InstanceSigningKey;
 /// the timestamp embedded in the header; the caller is responsible for
 /// using the same value when building the header.
 pub fn compute_v1_signature(secret: &str, unix_secs: i64, body: &[u8]) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = crate::crypto::hmac::Key::sha256(secret.as_bytes()).context();
     mac.update(unix_secs.to_string().as_bytes());
     mac.update(b".");
     mac.update(body);
-    hex::encode(mac.finalize().into_bytes())
+    hex::encode(mac.finish())
 }
 
 /// Value of the legacy `X-Webhook-Signature: sha256=<hex>` header: HMAC-SHA256
@@ -47,10 +44,9 @@ pub fn compute_v1_signature(secret: &str, unix_secs: i64, body: &[u8]) -> String
 /// `"<t>.<body>"` (as `v1=` does) would leave a receiver of it unable to
 /// verify (#5234). Removed with the legacy header set.
 pub fn compute_legacy_signature(secret: &str, body: &[u8]) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = crate::crypto::hmac::Key::sha256(secret.as_bytes()).context();
     mac.update(body);
-    hex::encode(mac.finalize().into_bytes())
+    hex::encode(mac.finish())
 }
 
 /// Render the full `X-ArtifactKeeper-Signature` header value. `secrets`

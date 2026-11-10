@@ -20,6 +20,7 @@
 //!   DELETE /uploads/{uuid}                     - Cancel chunked upload
 //!   GET    /uploads/{uuid}                     - Check upload progress
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
 use axum::http::header::CONTENT_TYPE;
@@ -30,7 +31,6 @@ use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 use std::fmt::Display;

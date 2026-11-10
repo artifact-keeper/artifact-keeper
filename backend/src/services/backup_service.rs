@@ -2,13 +2,13 @@
 //!
 //! Handles full and incremental backups of the registry data and artifacts.
 
+use crate::crypto::digest::Sha256;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
 use std::sync::Arc;

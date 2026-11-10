@@ -24,9 +24,9 @@
 //! crashed, or its purge failed), so nothing depends on the request that
 //! created the bytes surviving.
 
+use crate::crypto::digest::Sha256;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

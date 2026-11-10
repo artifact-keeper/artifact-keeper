@@ -74,6 +74,10 @@ pub struct HealthResponse {
     /// unavailable, so a repository on one of them does not look routable.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_storage_backends: Vec<SkippedStorageBackend>,
+    /// Cryptographic provider, FIPS mode and any policy violations found at
+    /// startup (#5580). Always present: an operator checking a `-fips`
+    /// deployment reads `crypto.fips_module_active` and `crypto.mode` here.
+    pub crypto: crate::fips::CryptoHealth,
 }
 
 /// One storage backend that was configured but skipped at startup (#4530).
@@ -560,6 +564,10 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         db_pool,
         commit,
         dirty,
+        // Violation texts name providers and quote database errors; like
+        // db_pool/commit above (#2226) they are only published when the
+        // operator opts in. Codes and the mode are always visible.
+        crypto: crate::fips::health_report_for(state.config.expose_detailed_health),
         skipped_storage_backends,
     };
 
@@ -1532,6 +1540,7 @@ mod tests {
             db_pool,
             commit,
             dirty,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -1562,6 +1571,7 @@ mod tests {
             db_pool: Some(sample_pool_stats()),
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
 
@@ -1595,6 +1605,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
 
@@ -1618,6 +1629,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
 
@@ -1661,6 +1673,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
 
@@ -2078,6 +2091,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: entries,
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -2120,6 +2134,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: entries,
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -2154,6 +2169,7 @@ mod tests {
             db_pool: None,
             commit: Some("abc1234def5678".to_string()),
             dirty: Some(true),
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
 
@@ -2178,6 +2194,7 @@ mod tests {
             db_pool: None,
             commit: None,
             dirty: None,
+            crypto: crate::fips::health_report(),
             skipped_storage_backends: Vec::new(),
         };
 

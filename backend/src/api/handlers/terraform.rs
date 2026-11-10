@@ -55,9 +55,9 @@ use bytes::Bytes;
 // upload handlers stream the body and take their digests from the shared
 // staging primitive (#2517), so gate this import to test builds to keep the
 // production build free of unused-import warnings.
-use futures::StreamExt;
 #[cfg(test)]
-use sha2::{Digest, Sha256};
+use crate::crypto::digest::Sha256;
+use futures::StreamExt;
 use sqlx::PgPool;
 use tracing::info;
 
@@ -2230,7 +2230,7 @@ async fn provider_shasums_signature(
     // private key, so a signature is reused for a short while per
     // (key, SHA256SUMS digest); a key rotation or a changed package set is a
     // different cache key and is signed afresh.
-    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(shasums.as_bytes()).into();
+    let digest: [u8; 32] = crate::crypto::digest::Sha256::digest(shasums.as_bytes()).into();
     let signature = SHASUMS_SIGNATURE_CACHE
         .try_get_with((key.id, digest), async {
             let svc = SigningService::new(state.db.clone(), &state.config.jwt_secret);
@@ -7430,9 +7430,9 @@ mod virtual_module_download_4598 {
 mod origin_registry_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::crypto::digest::Sha256;
     use crate::services::signing_service::{verify_detached, CreateKeyRequest};
     use axum::http::Request;
-    use sha2::{Digest, Sha256};
 
     #[test]
     fn dearmor_signature_rejects_garbage() {

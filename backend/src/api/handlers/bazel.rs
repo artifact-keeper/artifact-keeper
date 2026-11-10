@@ -23,6 +23,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+use crate::crypto::digest::Sha256;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -30,7 +31,6 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 use uuid::Uuid;

@@ -42,6 +42,10 @@ fn test_config(storage_path: &str) -> Config {
         s3_region: None,
         s3_endpoint: None,
         jwt_secret: "test-secret-at-least-32-bytes-long-for-testing".into(),
+        fips_mode: Default::default(),
+        fips_legacy_hash_migration: true,
+        pbkdf2_iterations: 1_000,
+        data_encryption_key: None,
         signature_expiry_seconds: 604_800,
         signing_key_rotation_overlap_secs: 1_209_600,
         signing_auto_migrate_legacy_keys: false,
@@ -212,7 +216,8 @@ fn basic_auth_header(username: &str, password: &str) -> String {
 /// Create a test user with bcrypt-hashed password.
 async fn create_test_user(pool: &PgPool, username: &str, password: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let hash = bcrypt::hash(password, 4).expect("bcrypt hash failed"); // cost=4 for speed in tests
+    let hash = artifact_keeper_backend::crypto::password::hash_bcrypt(password, 4)
+        .expect("bcrypt hash failed"); // cost=4 for speed in tests
     sqlx::query(
         r#"
         INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
@@ -326,7 +331,7 @@ fn test_data(size: usize) -> Vec<u8> {
 
 /// Compute SHA256 hex of bytes.
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use artifact_keeper_backend::crypto::digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())

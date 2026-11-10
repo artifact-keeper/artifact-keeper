@@ -41,9 +41,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, Mac};
-use rand::Rng;
-use sha2::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -225,13 +222,12 @@ impl Settings {
 type Tag = [u8; 32];
 
 fn credential_tag_with_key(key: &[u8], username: &str, password: &str) -> Tag {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts keys of any size");
+    let mut mac = crate::crypto::hmac::Key::sha256(key).context();
     mac.update(b"ldap-basic");
     mac.update(&(username.len() as u32).to_be_bytes());
     mac.update(username.as_bytes());
     mac.update(password.as_bytes());
-    let digest = mac.finalize().into_bytes();
+    let digest = mac.finish();
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&digest);
     tag
@@ -243,7 +239,7 @@ fn hmac_key() -> &'static [u8; 32] {
         // Per-process random key: a process restart cannot replay old tags,
         // and the key never leaves memory.
         let mut key = [0u8; 32];
-        rand::rng().fill_bytes(&mut key);
+        crate::crypto::rng::fill(&mut key);
         key
     })
 }
@@ -753,13 +749,46 @@ async fn check_login_budget(username: &str) -> Result<(), u64> {
     Ok(())
 }
 
-/// `<8 hex>_<32 hex>`: the shape of an Artifact Keeper API token.
+/// `<8 hex>_<32 hex>` or, minted under `FIPS_MODE=strict`, `<8 hex>_<64 hex>`:
+/// the shapes of an Artifact Keeper API token (#5582). Both must be
+/// recognised here, or an expired strict-mode token presented as a Basic
+/// password would be forwarded to the directory as a bind password.
 fn is_api_token_shape(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.len() == 41
+    (bytes.len() == 41 || bytes.len() == 73)
         && bytes[8] == b'_'
         && bytes[..8].iter().all(u8::is_ascii_hexdigit)
         && bytes[9..].iter().all(u8::is_ascii_hexdigit)
+}
+
+#[cfg(test)]
+mod api_token_shape_tests {
+    use super::is_api_token_shape;
+
+    #[test]
+    fn both_token_lengths_are_recognised_and_nothing_else() {
+        assert!(is_api_token_shape(&format!(
+            "{}_{}",
+            "ab12cd34",
+            "0".repeat(32)
+        )));
+        assert!(is_api_token_shape(&format!(
+            "{}_{}",
+            "ab12cd34",
+            "f".repeat(64)
+        )));
+        assert!(!is_api_token_shape(&format!(
+            "{}_{}",
+            "ab12cd34",
+            "0".repeat(48)
+        )));
+        assert!(!is_api_token_shape(&format!(
+            "{}_{}",
+            "ab12cd3g",
+            "0".repeat(32)
+        )));
+        assert!(!is_api_token_shape("hunter2"));
+    }
 }
 
 /// Three non-empty base64url segments with a JSON header: a compact JWS.

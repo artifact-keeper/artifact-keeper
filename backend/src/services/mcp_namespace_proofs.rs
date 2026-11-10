@@ -19,8 +19,6 @@
 
 use std::time::Duration;
 
-use rand::RngExt as _;
-
 /// TXT record label prefix.
 pub const DNS_LABEL: &str = "_ak-mcp-challenge";
 /// HTTP well-known path.
@@ -55,8 +53,7 @@ pub fn domain_of(namespace: &str) -> Result<String, String> {
 
 /// A fresh challenge token (32 random bytes, hex).
 pub fn new_token() -> String {
-    let bytes: [u8; 32] = rand::rng().random();
-    hex::encode(bytes)
+    crate::crypto::rng::hex(32)
 }
 
 /// The value the owner publishes.

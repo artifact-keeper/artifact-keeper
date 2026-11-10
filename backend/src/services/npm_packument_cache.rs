@@ -50,9 +50,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::config::Config;

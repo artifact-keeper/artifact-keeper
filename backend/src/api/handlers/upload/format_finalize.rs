@@ -1459,9 +1459,9 @@ mod tests {
     /// change the completion always answered 200 in the request.
     #[tokio::test]
     async fn respond_async_completion_answers_202_and_polls_to_completed_1846() {
+        use crate::crypto::digest::Sha256;
         use axum::body::Body;
         use axum::http::Request;
-        use sha2::{Digest, Sha256};
         let Some(f) = tdh::Fixture::setup("local", "npm").await else {
             return;
         };
@@ -1680,7 +1680,7 @@ mod tests {
         .expect("refused session");
         let cas_key =
             crate::services::artifact_service::ArtifactService::storage_key_from_checksum(&{
-                use sha2::{Digest, Sha256};
+                use crate::crypto::digest::Sha256;
                 hex::encode(Sha256::digest(&refused))
             });
         {
@@ -1735,7 +1735,7 @@ mod tests {
         };
         let bytes = format!("pre-1846 chunked jar {}", Uuid::new_v4()).into_bytes();
         let sha = {
-            use sha2::{Digest, Sha256};
+            use crate::crypto::digest::Sha256;
             hex::encode(Sha256::digest(&bytes))
         };
         let key =

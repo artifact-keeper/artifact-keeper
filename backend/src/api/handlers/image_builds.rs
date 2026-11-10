@@ -1351,7 +1351,7 @@ mod tests {
     const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
     fn sha256_digest(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         format!("sha256:{:x}", Sha256::digest(bytes))
     }
 

@@ -20,6 +20,9 @@
 //! exercises the checkpoint↔proof root binding. Those two assert on the specific
 //! error so they cannot be satisfied by an incidental parse failure.
 
+// sigstore-rs boundary (#5585): the verifier consumes its own `sha2::Sha256`
+// hasher type; see docs/fips.md, "Non-security algorithm inventory".
+#![allow(clippy::disallowed_types)]
 use super::*;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -923,7 +926,7 @@ use cep27::{
     check_statement, record_to_verdict, verification_record, verify_conda_bundle, CondaVerifyInput,
     BARE_STATEMENT_REASON, CEP27_PREDICATE_TYPE, INTOTO_STATEMENT_V1,
 };
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 /// Every mutation fixture, with the name the assertion messages should use.
 const MUTATIONS: &[(&str, &str)] = &[

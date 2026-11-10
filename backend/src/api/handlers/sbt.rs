@@ -10,6 +10,7 @@
 //!   PUT  /ivy/{repo_key}/*path                                             - Upload artifact
 //!   HEAD /ivy/{repo_key}/*path                                             - Check existence
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -19,7 +20,6 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -1097,7 +1097,7 @@ mod tests {
 
     #[test]
     fn test_sha256_computation() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let body = b"hello world";
         let mut hasher = Sha256::new();
         hasher.update(body);
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[test]
     fn test_sha256_empty_body() {
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
         let body = b"";
         let mut hasher = Sha256::new();
         hasher.update(body);

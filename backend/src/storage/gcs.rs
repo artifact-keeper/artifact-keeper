@@ -41,6 +41,7 @@
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
 //! ```
 
+use crate::crypto::digest::Sha256;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
 use bytes::Bytes;
@@ -48,10 +49,8 @@ use chrono::Utc;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use rsa::pkcs8::DecodePrivateKey;
-use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::RsaPrivateKey;
-use sha2::Digest;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -1571,7 +1570,7 @@ impl GcsBackend {
     async fn stream_resumable_chunks(
         &self,
         session_url: &str,
-        hasher: &mut sha2::Sha256,
+        hasher: &mut crate::crypto::digest::Sha256,
         initial: Vec<u8>,
         stream: &mut BoxStream<'static, Result<Bytes>>,
         mut stream_done: bool,
@@ -1688,7 +1687,7 @@ impl StorageBackend for GcsBackend {
         key: &str,
         mut stream: BoxStream<'static, Result<Bytes>>,
     ) -> Result<PutStreamResult> {
-        use sha2::Sha256 as Sha256Inner;
+        use crate::crypto::digest::Sha256 as Sha256Inner;
 
         let mut hasher = Sha256Inner::new();
         // Accumulate enough to decide whether this is a small object. We buffer
@@ -3171,7 +3170,7 @@ mod tests {
         assert_eq!(result.bytes_written, data.len() as u64);
         // sha256 of the payload must match.
         let expected = {
-            let mut h = sha2::Sha256::new();
+            let mut h = crate::crypto::digest::Sha256::new();
             h.update(&data);
             format!("{:x}", h.finalize())
         };

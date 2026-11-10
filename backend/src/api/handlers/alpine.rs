@@ -9,6 +9,7 @@
 //!   POST /alpine/{repo_key}/upload                                        - Upload package (alternative)
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -19,10 +20,10 @@ use axum::Extension;
 use axum::Router;
 use base64::Engine as _;
 use bytes::Bytes;
+use digest::Digest as _;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::StreamExt as _;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::io::Read;
 use tracing::info;
@@ -748,8 +749,22 @@ fn build_apkindex_segment(apkindex_text: &str, mtime: u64) -> std::io::Result<Ve
 /// * The signature tar is **cut**: it ends immediately after the padded entry,
 ///   with no end-of-archive blocks (`abuild-tar --cut`). The zero blocks would
 ///   terminate apk's tar reader before it ever reached the index entry.
+// The SHA-1 (`.SIGN.RSA.`) form, what every non-strict deployment serves;
+// production code picks the form from the signing digest.
+#[cfg(test)]
 fn build_apk_signature_segment(signature: &[u8], mtime: u64) -> std::io::Result<Vec<u8>> {
-    let entry_name = format!(".SIGN.RSA.{APK_SIGNING_KEY_FILENAME}");
+    build_apk_signature_segment_with(signature, mtime, "RSA")
+}
+
+/// `kind` is `RSA` (SHA-1, apk-tools' original contract) or `RSA256`
+/// (SHA-256, what `FIPS_MODE=strict` produces, #5586); apk derives the
+/// digest from the entry-name prefix.
+fn build_apk_signature_segment_with(
+    signature: &[u8],
+    mtime: u64,
+    kind: &str,
+) -> std::io::Result<Vec<u8>> {
+    let entry_name = format!(".SIGN.{kind}.{APK_SIGNING_KEY_FILENAME}");
     let header = apk_tar_header(&entry_name, signature.len(), mtime)?;
 
     let mut tar = Vec::with_capacity(TAR_BLOCK_SIZE * 2 + signature.len());
@@ -815,9 +830,9 @@ fn apkindex_build_error(what: &str, e: std::io::Error) -> Response {
 ///   500, never be collapsed into "serve unsigned": apk clients that require
 ///   signatures would otherwise be handed an unsigned index under a 200 (#2660).
 #[allow(clippy::result_large_err)]
-fn resolve_apkindex_signature(
-    result: crate::error::Result<Option<Vec<u8>>>,
-) -> Result<Option<Vec<u8>>, Response> {
+fn resolve_apkindex_signature<T>(
+    result: crate::error::Result<Option<T>>,
+) -> Result<Option<T>, Response> {
     result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -941,7 +956,13 @@ async fn apk_index(
         resolve_apkindex_signature(signing_svc.sign_apk_index(repo.id, &index_segment).await)?;
 
     let signature_segment = signature
-        .map(|sig| build_apk_signature_segment(&sig, mtime))
+        .map(|(sig, digest)| {
+            let kind = match digest {
+                crate::services::signing_service::RsaDigest::Sha1 => "RSA",
+                _ => "RSA256",
+            };
+            build_apk_signature_segment_with(&sig, mtime, kind)
+        })
         .transpose()
         .map_err(|e| apkindex_build_error("the APKINDEX signature segment", e))?;
 
@@ -3615,7 +3636,7 @@ mod tests {
 
     /// A 2048-bit RSA key pair, as `(private, public)`.
     fn test_rsa_keypair() -> (rsa::RsaPrivateKey, rsa::RsaPublicKey) {
-        let mut rng = rsa::rand_core::OsRng;
+        let mut rng = crate::crypto::rng::ModuleRng;
         let private = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
         let public = rsa::RsaPublicKey::from(&private);
         (private, public)
@@ -3675,7 +3696,8 @@ mod tests {
     #[test]
     fn signed_apkindex_is_a_signature_stream_prepended_to_the_index() {
         let index = build_apkindex_segment(SAMPLE_APKINDEX, 0).expect("build index");
-        let sig_segment = build_apk_signature_segment(&[0x5au8; 256], 0).expect("build sig");
+        let sig_segment =
+            build_apk_signature_segment_with(&[0x5au8; 256], 0, "RSA").expect("build sig");
         let signed = assemble_apkindex(index.clone(), Some(sig_segment.clone()));
 
         let (_, first_len) = first_gzip_member(&signed);
@@ -3769,7 +3791,8 @@ mod tests {
 
         // The digest is not interchangeable: apk maps the `RSA` infix to SHA-1
         // only, so a SHA-256 signature under the same entry name is rejected.
-        let sha256_verifier = rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(public);
+        let sha256_verifier =
+            rsa::pkcs1v15::VerifyingKey::<crate::crypto::digest::Sha256>::new(public);
         assert!(
             sha256_verifier
                 .verify(

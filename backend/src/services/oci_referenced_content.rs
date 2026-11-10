@@ -44,7 +44,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
+use crate::crypto::digest::Sha256;
 use uuid::Uuid;
 
 use crate::api::handlers::oci_v2::{

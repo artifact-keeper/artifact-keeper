@@ -13,11 +13,11 @@
 // bodies in fixture tests is not an artifact path (#1608).
 #![allow(clippy::disallowed_methods)]
 
+use crate::crypto::digest::{Sha256, Sha512};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::Engine;
 use bytes::Bytes;
-use sha2::{Digest, Sha256, Sha512};
 use uuid::Uuid;
 
 use crate::api::handlers::test_db_helpers::{self as tdh, Fixture};

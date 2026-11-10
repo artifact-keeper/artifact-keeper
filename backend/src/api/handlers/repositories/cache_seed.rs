@@ -1169,7 +1169,6 @@ mod db_tests {
     use axum::body::Bytes;
     use axum::http::StatusCode;
     use serde_json::{json, Value};
-    use sha2::Digest;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1231,7 +1230,7 @@ mod db_tests {
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", sha2::Sha256::digest(bytes))
+        format!("{:x}", crate::crypto::digest::Sha256::digest(bytes))
     }
 
     #[tokio::test]

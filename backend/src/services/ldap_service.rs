@@ -577,24 +577,21 @@ impl LdapService {
         pattern.replace("{}", username)
     }
 
-    /// Parse PEM certificates from a byte buffer.
+    /// Parse every certificate in a PEM bundle into DER.
     ///
-    /// `native_tls::Certificate::from_pem` only handles a single cert, so this
-    /// splits the bundle on PEM boundaries and returns each cert individually.
+    /// Non-certificate PEM blocks (keys, CRLs) are skipped; a bundle with no
+    /// certificate at all, or with a malformed one, is a configuration error
+    /// naming `source`.
     fn parse_pem_certificates(
         pem_bytes: &[u8],
         source: &str,
-    ) -> Result<Vec<native_tls::Certificate>> {
-        let pem_str = String::from_utf8_lossy(pem_bytes);
+    ) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
+        use rustls_pki_types::pem::PemObject;
+
         let mut certs = Vec::new();
-        for block in pem_str.split("-----END CERTIFICATE-----") {
-            let trimmed = block.trim();
-            if trimmed.is_empty() || !trimmed.contains("-----BEGIN CERTIFICATE-----") {
-                continue;
-            }
-            let pem = format!("{trimmed}\n-----END CERTIFICATE-----\n");
-            let cert = native_tls::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
-                AppError::Config(format!("Failed to parse CA cert from {source}: {e}"))
+        for item in rustls_pki_types::CertificateDer::pem_slice_iter(pem_bytes) {
+            let cert = item.map_err(|e| {
+                AppError::Config(format!("Failed to parse CA cert from {source}: {e:?}"))
             })?;
             certs.push(cert);
         }
@@ -606,6 +603,34 @@ impl LdapService {
         Ok(certs)
     }
 
+    /// Build a rustls client config that trusts the OS store plus `extra`.
+    ///
+    /// This mirrors what ldap3 builds itself when no config is supplied
+    /// (`rustls-native-certs` roots), so adding a private CA never removes
+    /// the public roots a deployment may also rely on. The OS loader honours
+    /// `SSL_CERT_FILE` / `SSL_CERT_DIR` like OpenSSL did.
+    fn build_tls_config(
+        extra: &[rustls_pki_types::CertificateDer<'static>],
+    ) -> Result<Arc<rustls::ClientConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        for err in &native.errors {
+            tracing::warn!(error = %err, "Skipping an unreadable OS trust-store certificate");
+        }
+        let (added, ignored) = roots.add_parsable_certificates(native.certs);
+        tracing::debug!(added, ignored, "Loaded OS trust store for LDAP");
+        for cert in extra {
+            roots
+                .add(cert.clone())
+                .map_err(|e| AppError::Config(format!("Rejected LDAP CA certificate: {e}")))?;
+        }
+        Ok(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ))
+    }
+
     /// Build LDAP connection settings with TLS configuration.
     ///
     /// Custom CA certificates come from either an inline per-provider PEM
@@ -613,7 +638,9 @@ impl LdapService {
     /// `CUSTOM_CA_CERT_PATH`) environment fallback; the inline value takes
     /// precedence. `no_tls_verify` (per-provider skip-verify OR
     /// `LDAP_INSECURE_TLS=true`) skips certificate verification for
-    /// development environments.
+    /// development environments; when it is set the CA material is parsed
+    /// (so a typo is still reported) but ldap3's own no-verify connector is
+    /// used, because no root store matters once verification is off.
     fn build_conn_settings(&self) -> Result<ldap3::LdapConnSettings> {
         use std::time::Duration;
 
@@ -639,22 +666,19 @@ impl LdapService {
 
         if let Some((pem_bytes, source)) = ca_source {
             let certs = Self::parse_pem_certificates(&pem_bytes, &source)?;
-            let mut builder = native_tls::TlsConnector::builder();
-            for cert in &certs {
-                builder.add_root_certificate(cert.clone());
-            }
             if self.config.no_tls_verify {
-                builder.danger_accept_invalid_certs(true);
+                tracing::warn!(
+                    source = %source,
+                    "LDAP TLS verification is disabled; the configured CA certificate(s) are not used"
+                );
+            } else {
+                settings = settings.set_config(Self::build_tls_config(&certs)?);
+                tracing::info!(
+                    source = %source,
+                    count = certs.len(),
+                    "Loaded custom CA certificate(s) for LDAP"
+                );
             }
-            let connector = builder
-                .build()
-                .map_err(|e| AppError::Config(format!("Failed to build TLS connector: {e}")))?;
-            settings = settings.set_connector(connector);
-            tracing::info!(
-                source = %source,
-                count = certs.len(),
-                "Loaded custom CA certificate(s) for LDAP"
-            );
         }
 
         Ok(settings)
@@ -1397,6 +1421,10 @@ pub(crate) mod tests {
             s3_region: None,
             s3_endpoint: None,
             jwt_secret: "test-secret".into(),
+            fips_mode: Default::default(),
+            fips_legacy_hash_migration: true,
+            pbkdf2_iterations: 1_000,
+            data_encryption_key: None,
             signature_expiry_seconds: 604_800,
             signing_key_rotation_overlap_secs: 1_209_600,
             signing_auto_migrate_legacy_keys: false,

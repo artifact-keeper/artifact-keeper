@@ -10,11 +10,11 @@
 //! shared per #2079 so adding HTTP caching to a new format handler only
 //! requires importing these three helpers — no copy/paste, no divergence.
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, VARY};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use sha2::{Digest, Sha256};
 
 /// Default `Cache-Control` value used by [`cacheable_response`] for mutable
 /// metadata resources (matches typical Maven Central / Nexus TTLs and lets

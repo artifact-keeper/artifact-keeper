@@ -73,7 +73,8 @@ pub fn build_state(pool: PgPool, storage_path: &str) -> SharedState {
 /// global-admin flag (the withdrawal and scan-config paths are admin-gated).
 pub async fn create_user(pool: &PgPool, username: &str, password: &str, is_admin: bool) -> Uuid {
     let id = Uuid::new_v4();
-    let hash = bcrypt::hash(password, 4).expect("bcrypt hash failed");
+    let hash = artifact_keeper_backend::crypto::password::hash_bcrypt(password, 4)
+        .expect("bcrypt hash failed");
     sqlx::query(
         "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
          VALUES ($1, $2, $3, $4, 'local', $5, true)",

@@ -23,6 +23,7 @@
 //! * `GET    /api/v1/repositories/{key}/environments/{id}/advisories` — the
 //!   environment's current affectedness state (#4055).
 
+use crate::crypto::digest::Sha256;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -31,7 +32,6 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, OpenApi};
 use uuid::Uuid;
 

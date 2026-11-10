@@ -3,6 +3,7 @@
 //! Each adapter knows how to fetch and parse a format's upstream package index
 //! into a list of CurationPackageEntry records for insertion into curation_packages.
 
+use digest::Digest as _;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use quick_xml::XmlVersion;
@@ -818,10 +819,9 @@ pub fn extract_primary_href(repomd: &str) -> Option<String> {
 /// unsupported/unknown algorithm so the caller can fail closed. `sha` and
 /// `sha1` are treated as SHA-1 (repodata historically labels SHA-1 as `sha`).
 pub fn repodata_hex_digest(algo: &str, bytes: &[u8]) -> Option<String> {
-    use sha2::Digest;
     match algo.trim().to_ascii_lowercase().as_str() {
-        "sha256" => Some(hex::encode(sha2::Sha256::digest(bytes))),
-        "sha512" => Some(hex::encode(sha2::Sha512::digest(bytes))),
+        "sha256" => Some(hex::encode(crate::crypto::digest::Sha256::digest(bytes))),
+        "sha512" => Some(hex::encode(crate::crypto::digest::Sha512::digest(bytes))),
         "sha1" | "sha" => Some(hex::encode(sha1::Sha1::digest(bytes))),
         _ => None,
     }

@@ -268,8 +268,8 @@ fn der_cn_name(cn: &str) -> Vec<u8> {
 
 /// Build a minimal self-signed v1 certificate for `key` and PEM-wrap it.
 fn self_signed_cert_pem(key: &rsa::RsaPrivateKey) -> String {
+    use artifact_keeper_backend::crypto::digest::Sha256;
     use rsa::pkcs8::EncodePublicKey;
-    use rsa::sha2::{Digest, Sha256};
 
     let spki_der = key
         .to_public_key()
@@ -305,7 +305,7 @@ fn self_signed_cert_pem(key: &rsa::RsaPrivateKey) -> String {
     );
 
     // Genuinely self-sign the TBS (PKCS#1 v1.5 / SHA-256).
-    let digest = Sha256::digest(&tbs);
+    let digest = Sha256::digest(&tbs).to_vec();
     let signature = key
         .sign(rsa::Pkcs1v15Sign::new::<Sha256>(), &digest)
         .expect("self-sign certificate");

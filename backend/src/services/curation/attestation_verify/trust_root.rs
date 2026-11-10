@@ -15,8 +15,8 @@
 //!     exists. On any refresh failure the caller keeps the vendored snapshot;
 //!     the refresh never blocks verification.
 
+use crate::crypto::digest::Sha256;
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
 use sigstore::bundle::verify::Verifier;
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 use sigstore::trust::TrustRoot as _;

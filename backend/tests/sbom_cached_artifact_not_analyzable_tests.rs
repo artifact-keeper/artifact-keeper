@@ -22,7 +22,7 @@
 //!   cargo test --test sbom_cached_artifact_not_analyzable_tests -- --ignored
 //! ```
 
-use sha2::{Digest, Sha256};
+use artifact_keeper_backend::crypto::digest::Sha256;
 use sqlx::PgPool;
 use uuid::Uuid;
 

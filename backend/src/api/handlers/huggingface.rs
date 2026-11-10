@@ -17,6 +17,7 @@
 //! `gpt2`) and once with `:namespace/:name` (two segments, rejoined into
 //! `"namespace/name"` inside the handler). See `router()` below.
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 #[cfg(test)]
@@ -28,7 +29,6 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::time::Duration;
 use tracing::info;
@@ -5538,7 +5538,6 @@ mod range_tests {
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, RANGE};
     use axum::http::{HeaderMap, Request, StatusCode};
-    use sha2::Digest;
 
     const MODEL: &str = "acme/ranged-model";
     const COMMIT: &str = "1110a243c5cd318b8688b1e73b6ba0b9c7d6f6cf";
@@ -5549,7 +5548,7 @@ mod range_tests {
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {
-        hex::encode(sha2::Sha256::digest(bytes))
+        hex::encode(crate::crypto::digest::Sha256::digest(bytes))
     }
 
     fn with_range(mut req: Request<axum::body::Body>, range: &str) -> Request<axum::body::Body> {

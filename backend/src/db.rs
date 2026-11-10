@@ -115,6 +115,7 @@ const STARTUP_CONNECT_ATTEMPTS: u32 = 5;
 /// budget is tight — do not retry in lockstep and collide again.
 fn startup_connect_backoff(failed: u32) -> Duration {
     let base_ms = 1_000_u64 << failed.saturating_sub(1).min(3);
+    #[allow(clippy::disallowed_methods)] // NON-SECURITY: backoff jitter
     let ms = rand::rng().random_range(base_ms / 2..=base_ms + base_ms / 2);
     Duration::from_millis(ms)
 }
@@ -299,6 +300,7 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(e) if e.is_deadlock() => {
+                #[allow(clippy::disallowed_methods)] // NON-SECURITY: backoff jitter
                 let backoff =
                     Duration::from_millis(rand::rng().random_range(DEADLOCK_RETRY_BACKOFF_MS));
                 tracing::warn!(

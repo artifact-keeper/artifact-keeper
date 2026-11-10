@@ -12,6 +12,7 @@
 //!   PUT  /go/{repo_key}/*module/@v/{version}.mod     - Upload go.mod
 
 use crate::api::handlers::upload_body::UploadBody;
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -21,7 +22,6 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 

@@ -10,6 +10,7 @@
 //!   GET  /puppet/{repo_key}/v3/files/{owner}-{name}-{version}.tar.gz   - Download
 //!   POST /puppet/{repo_key}/v3/releases                                - Publish module
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, RawQuery, State};
 use axum::http::header::CONTENT_TYPE;
@@ -19,7 +20,6 @@ use axum::routing::get;
 use axum::Extension;
 use axum::Router;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::info;
 

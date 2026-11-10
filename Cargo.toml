@@ -90,7 +90,10 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "compression-br"] }
 
 # Database
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
+# `tls-rustls-aws-lc-rs`, not the `tls-rustls` alias: the alias means
+# `tls-rustls-ring`, and the backend links exactly one crypto provider
+# (aws-lc-rs, FIPS-capable) everywhere (#5578).
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls-aws-lc-rs"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -197,9 +200,15 @@ wasmtime-wasi = "36.0.20"
 # Git operations
 git2 = "0.21"
 
-# OpenSSL (vendored feature for cross-compilation in release builds)
-openssl = { version = "0.10" }
-opensearch = "2"
+# No OpenSSL anywhere in the graph (#5578): every TLS client runs on rustls
+# with the aws-lc-rs provider. `opensearch`'s default feature would pull
+# reqwest's native-tls (and with it OpenSSL) back in.
+opensearch = { version = "2", default-features = false, features = ["rustls-tls"] }
+
+# The one cryptographic provider the backend links. The `fips` cargo feature
+# (backend/Cargo.toml) swaps the underlying C library for AWS-LC-FIPS.
+aws-lc-rs = "1.18"
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # OpenAPI
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
@@ -226,7 +235,18 @@ url = "2.5"
 bergshamra = "=0.5.1"
 
 # SMTP email delivery
-lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+# rustls + aws-lc-rs, never `rustls-tls` (that alias turns `ring` on). The
+# platform verifier keeps the OS trust store in use, as native-tls did, with
+# `SMTP_TLS_CA_CERT` roots added on top (#5578).
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "pool",
+    "hostname",
+    "builder",
+    "tokio1-rustls",
+    "aws-lc-rs",
+    "rustls-platform-verifier",
+] }
 
 # In-memory cache with TTL eviction (used by #2079 Maven metadata cache).
 moka = { version = "0.12", features = ["future"] }

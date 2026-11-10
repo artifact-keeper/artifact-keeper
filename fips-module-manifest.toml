@@ -1,0 +1,20 @@
+# FIPS 140-3 module manifest (#5581).
+#
+# The exact cryptographic module a `--features fips` build links, as resolved
+# in Cargo.lock. scripts/ci/check-fips-module-manifest.sh fails CI when the
+# lockfile drifts from this file, so a module bump is always a reviewed,
+# one-line diff rather than a silent `cargo update`. backend/build.rs bakes
+# the same versions into the binary (`/health` reports them) and the image
+# labels carry them.
+#
+# `cmvp_certificate` is the CMVP certificate number of the AWS-LC FIPS module
+# release that aws-lc-fips-sys wraps. Confirm it against
+# https://csrc.nist.gov/projects/cryptographic-module-validation-program
+# before publishing a release that claims validation; until then the claim
+# is "runs the AWS-LC FIPS module in FIPS mode", not "validated".
+
+[module]
+name = "AWS-LC FIPS"
+aws_lc_rs = "1.18.1"
+aws_lc_fips_sys = "0.14.2"
+cmvp_certificate = "pending verification"

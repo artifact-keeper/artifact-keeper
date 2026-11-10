@@ -17,6 +17,197 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+
+/// XML-DSig algorithm URIs the FIPS policy accepts (#5584): SHA-2 digests
+/// and RSA (PKCS#1 v1.5 and PSS) or ECDSA signatures over them.
+const APPROVED_XMLDSIG_ALGORITHMS: &[&str] = &[
+    "http://www.w3.org/2001/04/xmlenc#sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#sha384",
+    "http://www.w3.org/2001/04/xmlenc#sha512",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
+    "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+    "http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1",
+    "http://www.w3.org/2007/05/xmldsig-more#sha384-rsa-MGF1",
+    "http://www.w3.org/2007/05/xmldsig-more#sha512-rsa-MGF1",
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384",
+    "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512",
+];
+
+/// Every `SignatureMethod` / `DigestMethod` `Algorithm` URI in `xml` that is
+/// not in [`APPROVED_XMLDSIG_ALGORITHMS`], de-duplicated, in document order.
+///
+/// A textual scan rather than a parse: the signature library parses the
+/// document afterwards and rejects anything malformed, and this check only
+/// has to be conservative (an algorithm attribute it cannot read is treated
+/// as non-approved, so a response can never slip past it by being odd).
+pub(crate) fn saml_non_approved_algorithms(xml: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in ["SignatureMethod", "DigestMethod"] {
+        let mut rest = xml;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            // Only an element *start* tag counts: the marker must be the
+            // local name right after `<` or `<prefix:`, and must end there
+            // (`<ds:SignatureMethod ` not `</ds:SignatureMethod>` and not
+            // `<SignatureMethodValue>`).
+            let is_start_tag = {
+                let before = &rest[..pos];
+                let name_start = before
+                    .rfind(|c: char| {
+                        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+                    })
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let prefix = &before[name_start..];
+                before[..name_start].ends_with('<')
+                    && (prefix.is_empty() || prefix.ends_with(':'))
+                    && after
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+            };
+            // The element's own attributes end at the first `>`.
+            let Some(end) = after.find('>') else { break };
+            if is_start_tag {
+                let attrs = &after[..end];
+                let algorithm = find_attribute(attrs, "Algorithm")
+                    .unwrap_or_else(|| "<unreadable>".to_string());
+                if !APPROVED_XMLDSIG_ALGORITHMS.contains(&algorithm.as_str())
+                    && !found.contains(&algorithm)
+                {
+                    found.push(algorithm);
+                }
+            }
+            rest = &after[end..];
+        }
+    }
+    found
+}
+
+/// The value of attribute `name` in an element's attribute text, matching
+/// the attribute *name* (preceded by whitespace, followed by `=`), so that
+/// `xAlgorithm="..."` or `Algorithm2="..."` cannot stand in for `Algorithm`.
+fn find_attribute(attrs: &str, name: &str) -> Option<String> {
+    let mut rest = attrs;
+    while let Some(pos) = rest.find(name) {
+        let before_ok = pos == 0 || rest[..pos].ends_with(|c: char| c.is_whitespace());
+        let after = &rest[pos + name.len()..];
+        let after_trim = after.trim_start();
+        if before_ok && after_trim.starts_with('=') {
+            let v = after_trim[1..].trim_start();
+            let quote = v.chars().next()?;
+            if quote != '"' && quote != '\'' {
+                return None;
+            }
+            let v = &v[1..];
+            return v.find(quote).map(|e| v[..e].trim().to_string());
+        }
+        rest = after;
+    }
+    None
+}
+
+#[cfg(test)]
+mod algorithm_policy_tests {
+    use super::saml_non_approved_algorithms;
+
+    #[test]
+    fn sha256_rsa_and_ecdsa_responses_are_approved() {
+        let xml = r#"<ds:SignedInfo><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+            <ds:Reference><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/></ds:Reference></ds:SignedInfo>"#;
+        assert!(saml_non_approved_algorithms(xml).is_empty());
+        let ecdsa = r#"<SignatureMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384' /><DigestMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#sha384'/>"#;
+        assert!(saml_non_approved_algorithms(ecdsa).is_empty());
+        let pss = r#"<SignatureMethod Algorithm="http://www.w3.org/2007/05/xmldsig-more#sha256-rsa-MGF1"/>"#;
+        assert!(saml_non_approved_algorithms(pss).is_empty());
+    }
+
+    #[test]
+    fn sha1_in_either_position_is_reported_once_each() {
+        let xml = r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
+            <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
+            <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>"#;
+        assert_eq!(
+            saml_non_approved_algorithms(xml),
+            vec![
+                "http://www.w3.org/2000/09/xmldsig#rsa-sha1".to_string(),
+                "http://www.w3.org/2000/09/xmldsig#sha1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn decoy_attributes_cannot_hide_the_real_algorithm() {
+        // A look-alike attribute before the real one (review finding on
+        // #5584): only the attribute *named* Algorithm counts.
+        let xml = r#"<ds:SignatureMethod xAlgorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>"#;
+        assert_eq!(
+            saml_non_approved_algorithms(xml),
+            vec!["http://www.w3.org/2000/09/xmldsig#rsa-sha1".to_string()]
+        );
+        let xml2 = r#"<ds:DigestMethod Algorithm2="http://www.w3.org/2001/04/xmlenc#sha256" Algorithm = 'http://www.w3.org/2000/09/xmldsig#sha1' />"#;
+        assert_eq!(
+            saml_non_approved_algorithms(xml2),
+            vec!["http://www.w3.org/2000/09/xmldsig#sha1".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_closing_tags_and_lookalike_elements_are_not_elements() {
+        // C14N serialises empty elements with an explicit closing tag; the
+        // closing tag has no attributes and must not be read as a second
+        // element with an unreadable algorithm.
+        let xml = r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"></ds:SignatureMethod>
+            <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></ds:DigestMethod>
+            <ds:SignatureMethodValue>ignored</ds:SignatureMethodValue>
+            <saml:Attribute Name="DigestMethod">a value, not an element</saml:Attribute>"#;
+        assert!(saml_non_approved_algorithms(xml).is_empty());
+    }
+
+    #[test]
+    fn find_attribute_matches_the_name_boundary_and_both_quote_styles() {
+        use super::find_attribute;
+        assert_eq!(
+            find_attribute(r#" Algorithm="a""#, "Algorithm"),
+            Some("a".into())
+        );
+        assert_eq!(
+            find_attribute(r#" Algorithm = 'b' "#, "Algorithm"),
+            Some("b".into())
+        );
+        assert_eq!(
+            find_attribute(r#"Algorithm="first""#, "Algorithm"),
+            Some("first".into())
+        );
+        assert_eq!(
+            find_attribute(r#" xAlgorithm="x" Algorithm="y""#, "Algorithm"),
+            Some("y".into())
+        );
+        assert_eq!(find_attribute(r#" Algorithm2="x""#, "Algorithm"), None);
+        assert_eq!(find_attribute(r#" Algorithm=unquoted"#, "Algorithm"), None);
+        assert_eq!(
+            find_attribute(r#" Algorithm="unterminated"#, "Algorithm"),
+            None
+        );
+        assert_eq!(find_attribute(r#" Id="1""#, "Algorithm"), None);
+    }
+
+    #[test]
+    fn unreadable_algorithm_attribute_is_non_approved_and_no_signature_is_fine() {
+        assert_eq!(
+            saml_non_approved_algorithms("<SignatureMethod Algorithm=>"),
+            vec!["<unreadable>".to_string()]
+        );
+        assert_eq!(
+            saml_non_approved_algorithms("<SignatureMethod />"),
+            vec!["<unreadable>".to_string()]
+        );
+        assert!(saml_non_approved_algorithms("<samlp:Response/>").is_empty());
+        assert!(saml_non_approved_algorithms("").is_empty());
+    }
+}
 use crate::models::user::{AuthProvider, User};
 use crate::services::federated_email::{resolve_federated_email, SAML_NO_EMAIL_DOMAIN};
 
@@ -1007,6 +1198,28 @@ impl SamlService {
             let mut ctx = bergshamra::DsigContext::new(keys_manager);
             ctx.strict_verification = true;
             ctx.trusted_keys_only = true;
+
+            // FIPS algorithm policy (#5584): SHA-1 (or anything outside SHA-2
+            // RSA / RSA-PSS / ECDSA) in SignatureMethod or DigestMethod is
+            // refused in strict mode and reported in warn mode, before the
+            // signature is even checked.
+            let non_approved = saml_non_approved_algorithms(xml);
+            if !non_approved.is_empty() {
+                let mode = crate::fips::mode();
+                if mode.is_strict() {
+                    return Err(AppError::Authentication(format!(
+                        "SAML response uses non-approved signature algorithm(s) {}; \
+                         configure the IdP for RSA-SHA256 or ECDSA-SHA256 (FIPS_MODE=strict)",
+                        non_approved.join(", ")
+                    )));
+                }
+                if mode.checks_enabled() {
+                    tracing::warn!(
+                        algorithms = %non_approved.join(", "),
+                        "FIPS_MODE=warn: SAML response uses algorithms strict mode would refuse"
+                    );
+                }
+            }
 
             match bergshamra::verify(&ctx, xml) {
                 Ok(bergshamra::VerifyResult::Valid { references, .. }) => {

@@ -655,7 +655,7 @@ fn non_utf8_setup_py(bytes: &[u8]) -> InstallScript {
     InstallScript {
         kind: ScriptKind::PythonSetupPy,
         path: "setup.py".to_string(),
-        sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)),
+        sha256: hex::encode(crate::crypto::digest::Sha256::digest(bytes)),
         body: String::from_utf8_lossy(bytes).into_owned(),
     }
 }
@@ -729,7 +729,7 @@ mod tests {
 
     fn record_line(path: &str, data: &[u8]) -> String {
         use base64::Engine as _;
-        let digest = <sha2::Sha256 as sha2::Digest>::digest(data);
+        let digest = crate::crypto::digest::Sha256::digest(data);
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         format!("{path},sha256={b64},{}\n", data.len())
     }
@@ -926,7 +926,7 @@ mod tests {
              detection_method"
         );
         assert_eq!(w_c.abi_version.as_deref(), Some("7.1.3"));
-        let expected_digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(webp));
+        let expected_digest = hex::encode(crate::crypto::digest::Sha256::digest(webp));
         assert_eq!(
             w_c.sha256.as_deref(),
             Some(expected_digest.as_str()),
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(u.script.path, "setup.py");
         assert_eq!(
             u.script.sha256,
-            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(raw)),
+            hex::encode(crate::crypto::digest::Sha256::digest(raw)),
             "the digest must be of the ORIGINAL bytes, so `sha256sum setup.py` \
              matches the stored row — not of the lossy decode"
         );

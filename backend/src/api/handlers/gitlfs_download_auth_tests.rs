@@ -14,11 +14,11 @@
 #[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
+    use crate::crypto::digest::Sha256;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use base64::Engine;
     use bytes::Bytes;
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use uuid::Uuid;
 

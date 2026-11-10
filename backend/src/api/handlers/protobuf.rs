@@ -17,6 +17,7 @@
 
 use std::io::Write;
 
+use crate::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::header::CONTENT_TYPE;
@@ -31,7 +32,6 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tracing::info;
 
@@ -3215,7 +3215,7 @@ mod tests {
     #[tokio::test]
     async fn replicated_label_document_round_trips_byte_exact_4916() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use sha2::{Digest, Sha256};
+        use crate::crypto::digest::Sha256;
 
         let Some(source) = tdh::Fixture::setup("local", "protobuf").await else {
             return;
@@ -3744,8 +3744,10 @@ pub(crate) mod integrity_tests {
         let body = body.expect("a protobuf commit bundle must download completely");
         assert_eq!(body.len() as i64, size);
         // Pin the premise: the recorded checksum is NOT the bundle's digest.
-        use sha2::Digest;
-        assert_ne!(recorded.trim(), hex::encode(sha2::Sha256::digest(&body)));
+        assert_ne!(
+            recorded.trim(),
+            hex::encode(crate::crypto::digest::Sha256::digest(&body))
+        );
     }
 
     /// #3910 review (B1): the scrub must not flag protobuf commit bundles as

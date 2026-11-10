@@ -46,11 +46,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use artifact_keeper_backend::crypto::digest::Sha256;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::middleware;
 use axum::Router;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -97,7 +97,8 @@ impl Ctx {
 
         let user_id = Uuid::new_v4();
         let username = format!("ansible-it-u-{}", short);
-        let pw_hash = bcrypt::hash("test-password", 4).expect("bcrypt hash failed");
+        let pw_hash = artifact_keeper_backend::crypto::password::hash_bcrypt("test-password", 4)
+            .expect("bcrypt hash failed");
         sqlx::query(
             "INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active) \
              VALUES ($1, $2, $3, $4, 'local', true, true)",

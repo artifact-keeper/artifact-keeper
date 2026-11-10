@@ -723,7 +723,7 @@ pub enum ExpectedCommitDigest {
 /// get one — the storage layer's observed checksum covers those.
 enum TeeDigestHasher {
     Sha1(sha1::Sha1),
-    Sha512(sha2::Sha512),
+    Sha512(crate::crypto::digest::Sha512),
 }
 
 impl TeeDigestHasher {
@@ -734,7 +734,9 @@ impl TeeDigestHasher {
     fn for_algorithm(algorithm: CommitDigestAlgorithm) -> Option<Self> {
         match algorithm {
             CommitDigestAlgorithm::Sha1 => Some(Self::Sha1(sha1::Sha1::default())),
-            CommitDigestAlgorithm::Sha512 => Some(Self::Sha512(sha2::Sha512::default())),
+            CommitDigestAlgorithm::Sha512 => {
+                Some(Self::Sha512(crate::crypto::digest::Sha512::default()))
+            }
             // SHA-256 expectations never get one — the storage layer's
             // observed checksum covers those.
             CommitDigestAlgorithm::Sha256 => None,
@@ -744,14 +746,14 @@ impl TeeDigestHasher {
     fn update(&mut self, bytes: &[u8]) {
         match self {
             Self::Sha1(h) => sha1::Digest::update(h, bytes),
-            Self::Sha512(h) => sha2::Digest::update(h, bytes),
+            Self::Sha512(h) => h.update(bytes),
         }
     }
 
     fn finalize_hex(self) -> String {
         match self {
             Self::Sha1(h) => hex::encode(sha1::Digest::finalize(h)),
-            Self::Sha512(h) => hex::encode(sha2::Digest::finalize(h)),
+            Self::Sha512(h) => hex::encode(h.finalize()),
         }
     }
 }
@@ -5343,14 +5345,13 @@ impl UpstreamClient {
         upstream_auth: &Option<crate::services::upstream_auth::UpstreamAuthType>,
     ) -> String {
         use crate::services::upstream_auth::UpstreamAuthType;
-        use sha2::Digest as _;
 
-        fn field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+        fn field(hasher: &mut crate::crypto::digest::Sha256, bytes: &[u8]) {
             hasher.update((bytes.len() as u64).to_be_bytes());
             hasher.update(bytes);
         }
 
-        let mut hasher = sha2::Sha256::new();
+        let mut hasher = crate::crypto::digest::Sha256::new();
         match upstream_auth {
             None => field(&mut hasher, b"anonymous"),
             Some(UpstreamAuthType::Basic { username, password }) => {
@@ -11873,6 +11874,7 @@ pub(crate) fn build_stale_cache_headers() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use digest::Digest as _;
 
     #[test]
     fn json_post_endpoint_accepts_only_clean_non_rooted_relative_targets() {
@@ -15350,12 +15352,12 @@ mod tests {
     // be able to keep up under realistic chunk sizes.
     // -----------------------------------------------------------------------
 
+    use crate::crypto::digest::Sha256;
     use crate::services::storage_service::{
         PutStreamResult as ServicePutStreamResult, StorageBackend as ServiceStorageBackend,
         StorageService as RealStorageService,
     };
     use futures::stream::BoxStream as ServiceBoxStream;
-    use sha2::{Digest, Sha256};
 
     /// Recording backend used by the tee tests. Tracks the chunks delivered
     /// to put_stream + a flag for whether put_stream should fail before
@@ -18061,7 +18063,9 @@ mod tests {
 
         let mut mismatched_template = template();
         mismatched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
-            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"some other body"))),
+            CacheCommitDigest::Sha512Hex(hex::encode(crate::crypto::digest::Sha512::digest(
+                b"some other body",
+            ))),
         ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
@@ -18137,7 +18141,9 @@ mod tests {
 
         let mut matched_template = template();
         matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
-            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"first-chunk"))),
+            CacheCommitDigest::Sha512Hex(hex::encode(crate::crypto::digest::Sha512::digest(
+                b"first-chunk",
+            ))),
         ));
 
         let upstream = upstream_chunks(vec![&b"first-chunk"[..]]);
@@ -18504,7 +18510,9 @@ mod tests {
 
         let mut matched_template = template();
         matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
-            CacheCommitDigest::Sha512Hex(hex::encode(sha2::Sha512::digest(b"first-chunk"))),
+            CacheCommitDigest::Sha512Hex(hex::encode(crate::crypto::digest::Sha512::digest(
+                b"first-chunk",
+            ))),
         ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(
@@ -18603,7 +18611,9 @@ mod tests {
 
         let mut matched_template = template();
         matched_template.expected_checksum = Some(ExpectedCommitDigest::Resolved(
-            CacheCommitDigest::Sha256Hex(hex::encode(sha2::Sha256::digest(b"first-chunk"))),
+            CacheCommitDigest::Sha256Hex(hex::encode(crate::crypto::digest::Sha256::digest(
+                b"first-chunk",
+            ))),
         ));
 
         let client = CachePersister::new(test_catalog_pool(), storage).tee_stream(

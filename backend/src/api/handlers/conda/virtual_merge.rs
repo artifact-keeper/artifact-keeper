@@ -34,7 +34,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use sha2::Digest;
 
 use crate::api::handlers::proxy_helpers;
 use crate::models::repository::{Repository, RepositoryType};
@@ -414,7 +413,7 @@ pub(super) async fn fetch_member_document(
                 let decoded = tokio::task::spawn_blocking(move || {
                     // Dropped with the compressed buffer once it is decoded.
                     let _budget_permit = budget_permit;
-                    let checksum = hex::encode(sha2::Sha256::digest(&content));
+                    let checksum = hex::encode(crate::crypto::digest::Sha256::digest(&content));
                     decode_member_document(
                         &content,
                         content_encoding.as_deref(),

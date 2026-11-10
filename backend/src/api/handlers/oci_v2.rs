@@ -13,6 +13,8 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::crypto::digest::Sha256;
 use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
@@ -28,8 +30,6 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -21496,7 +21496,8 @@ mod token_lockout_regression_tests {
         // the bcrypt-mismatch path that bumps the counter, rather than
         // short-circuiting on a malformed-hash Err. cost=4 keeps the test
         // sub-second.
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&pwd_hash)
             .bind(user_id)
@@ -21586,7 +21587,8 @@ mod token_lockout_regression_tests {
                 return false;
             };
             let (user_id, username) = tdh::create_user(&pool).await;
-            let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+            let pwd_hash =
+                crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
             sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
                 .bind(&pwd_hash)
                 .bind(user_id)
@@ -21659,7 +21661,8 @@ mod token_lockout_regression_tests {
         };
         let (user_id, username) = tdh::create_user(&pool).await;
 
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&pwd_hash)
             .bind(user_id)
@@ -21741,7 +21744,8 @@ mod token_lockout_regression_tests {
 
         // Real bcrypt hash so the `authenticate` arm (which bumps the
         // counter on bcrypt mismatch) is reachable, not short-circuited.
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&pwd_hash)
             .bind(user_id)
@@ -32846,7 +32850,7 @@ mod cross_repo_session_regression_tests {
         let id = Uuid::new_v4();
         let username = format!("oci1317-{}", id);
         let password = "pushpass".to_string();
-        let hash = bcrypt::hash(&password, 4).expect("bcrypt hash");
+        let hash = crate::crypto::password::hash_bcrypt(&password, 4).expect("bcrypt hash");
         // Watermark columns backdated 60s: the Basic-auth flow mints a
         // token on this process's clock; the DB-clock watermark must sit
         // strictly before it even across node clock skew.
@@ -35153,7 +35157,8 @@ mod token_refresh_grant_tests {
     ) -> Option<(sqlx::PgPool, Uuid, String, SharedState, AuthService)> {
         let pool = tdh::try_pool().await?;
         let (user_id, username) = tdh::create_user(&pool).await;
-        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        let pwd_hash =
+            crate::crypto::password::hash_bcrypt("real-test-password", 4).expect("bcrypt hash");
         sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
             .bind(&pwd_hash)
             .bind(user_id)
@@ -49443,9 +49448,9 @@ mod scan_config_unreadable_4365_tests {
 mod oci_push_replication_4790_tests {
     use super::*;
     use crate::api::handlers::test_db_helpers as tdh;
+    use crate::crypto::digest::Sha256;
     use crate::services::auth_service::AuthService;
     use axum::http::Request;
-    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use tower::ServiceExt;
 

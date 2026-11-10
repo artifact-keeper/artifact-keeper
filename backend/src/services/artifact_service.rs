@@ -4,10 +4,11 @@
 
 use std::sync::Arc;
 
+use crate::crypto::digest::Sha256;
 use bytes::Bytes;
+use digest::Digest as _;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -120,7 +121,7 @@ impl MultiHasher {
 
     /// Fold `data` into all three running digests.
     pub fn update(&mut self, data: &[u8]) {
-        Digest::update(&mut self.sha256, data);
+        self.sha256.update(data);
         sha1::Digest::update(&mut self.sha1, data);
         md5::Digest::update(&mut self.md5, data);
     }

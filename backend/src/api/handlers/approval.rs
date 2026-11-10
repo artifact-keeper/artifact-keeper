@@ -2565,7 +2565,7 @@ mod tests {
             let path = format!("{}/{}", name, id);
             let bytes = bytes::Bytes::from_static(b"pr1940-artifact-content");
             let checksum = {
-                use sha2::{Digest, Sha256};
+                use crate::crypto::digest::Sha256;
                 let mut h = Sha256::new();
                 h.update(&bytes);
                 format!("{:x}", h.finalize())
@@ -2605,7 +2605,7 @@ mod tests {
             let path = format!("{}/{}", name, id);
             let bytes = bytes::Bytes::from_static(b"pr4152-artifact-content");
             let checksum = {
-                use sha2::{Digest, Sha256};
+                use crate::crypto::digest::Sha256;
                 let mut h = Sha256::new();
                 h.update(&bytes);
                 format!("{:x}", h.finalize())

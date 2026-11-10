@@ -3,6 +3,7 @@
 //! Provides key generation, storage (encrypted), and signing operations
 //! for Debian/APT, RPM/YUM, Alpine/APK, and Conda repositories.
 
+use crate::crypto::digest::{Sha256, Sha512};
 use crate::error::{AppError, Result};
 use crate::models::signing_key::{
     RepositorySigningConfig, SigningKey, SigningKeyPublic, SigningKeyTrustAttestation,
@@ -22,7 +23,6 @@ use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
 use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -438,7 +438,7 @@ fn generate_openpgp_key_blocking(
         .primary_user_id(params.user_id)
         .passphrase(None);
 
-    let mut rng = rand08::rngs::OsRng;
+    let mut rng = crate::crypto::rng::ModuleRng;
     let secret_key = key_params
         .build()
         .map_err(|e| AppError::Internal(format!("Failed to build OpenPGP key params: {}", e)))?
@@ -611,14 +611,13 @@ fn openpgp_signature_config(
     let hash = openpgp_signature_hash(algorithm);
     let mut config = match secret_key.version() {
         KeyVersion::V4 => SignatureConfig::v4(typ, algorithm, hash),
-        KeyVersion::V6 => {
-            SignatureConfig::v6(rand08::rngs::OsRng, typ, algorithm, hash).map_err(|e| {
+        KeyVersion::V6 => SignatureConfig::v6(crate::crypto::rng::ModuleRng, typ, algorithm, hash)
+            .map_err(|e| {
                 AppError::Internal(format!(
                     "Failed to build OpenPGP v6 signature config: {}",
                     e
                 ))
-            })?
-        }
+            })?,
         other => {
             return Err(AppError::Internal(format!(
                 "Unsupported OpenPGP key version for signing: {:?}",
@@ -1204,7 +1203,7 @@ impl SigningService {
         // under load. Run on the blocking pool so the async runtime stays free
         // to service other requests.
         run_blocking("rsa_keygen", move || {
-            let mut rng = rsa::rand_core::OsRng;
+            let mut rng = crate::crypto::rng::ModuleRng;
             let private_key = RsaPrivateKey::new(&mut rng, bits)
                 .map_err(|e| AppError::Internal(format!("Failed to generate RSA key: {}", e)))?;
             let public_key = RsaPublicKey::from(&private_key);
@@ -1599,9 +1598,24 @@ created_at:{created_at}\n",
     /// Cannot reuse [`SigningService::sign_data`]: a SHA-256 signature under a
     /// `.SIGN.RSA.` entry is well-formed but apk verifies it against a SHA-1
     /// digest and fails with `BAD signature` (#3021).
-    pub async fn sign_apk_index(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.sign_data_with_digest(repo_id, data, RsaDigest::Sha1)
-            .await
+    /// Sign an APKINDEX segment. Returns the signature and the digest it was
+    /// made with, which decides the tar entry name (`.SIGN.RSA.` for SHA-1,
+    /// `.SIGN.RSA256.` for SHA-256). `FIPS_MODE=strict` always signs with
+    /// SHA-256 (#5586); apk-tools 2.12 and later verify that entry.
+    pub async fn sign_apk_index(
+        &self,
+        repo_id: Uuid,
+        data: &[u8],
+    ) -> Result<Option<(Vec<u8>, RsaDigest)>> {
+        let digest = if crate::fips::strict() {
+            RsaDigest::Sha256
+        } else {
+            RsaDigest::Sha1
+        };
+        Ok(self
+            .sign_data_with_digest(repo_id, data, digest)
+            .await?
+            .map(|sig| (sig, digest)))
     }
 
     /// Shared body of [`Self::sign_data`] / [`Self::sign_apk_index`]: resolve
@@ -1619,6 +1633,15 @@ created_at:{created_at}\n",
             Some(k) => k,
             None => return Ok(None),
         };
+        // FIPS strict mode never generates a SHA-1 signature (#5586). Checked
+        // after the key lookup so a repository with no signing key keeps
+        // serving unsigned, as it does in every other mode. apk callers go
+        // through `sign_apk_index`, which picks SHA-256 in strict mode.
+        if digest == RsaDigest::Sha1 && crate::fips::strict() {
+            return Err(AppError::Validation(
+                "SHA-1 repository signatures are refused in FIPS_MODE=strict".to_string(),
+            ));
+        }
 
         let signature = self.sign_with_key_digest(&key, data, digest)?;
 
@@ -2842,7 +2865,7 @@ mod tests {
     /// Generate a real RSA key pair, encrypt the private key with the given
     /// passphrase, and return a SigningKey model struct suitable for sign_with_key.
     fn generate_test_signing_key(passphrase: &str) -> SigningKey {
-        let mut rng = rsa::rand_core::OsRng;
+        let mut rng = crate::crypto::rng::ModuleRng;
         let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("keygen failed");
         let public_key = RsaPublicKey::from(&private_key);
 
@@ -2859,7 +2882,7 @@ mod tests {
         let public_der = public_key
             .to_public_key_der()
             .expect("pub der encode failed");
-        let fingerprint = hex::encode(sha2::Sha256::digest(public_der.as_ref()));
+        let fingerprint = hex::encode(crate::crypto::digest::Sha256::digest(public_der.as_ref()));
         let key_id = fingerprint[fingerprint.len() - 16..].to_string();
 
         let now = Utc::now();

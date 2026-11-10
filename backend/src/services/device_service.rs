@@ -15,9 +15,8 @@
 
 use std::net::IpAddr;
 
+use crate::crypto::digest::Sha256;
 use chrono::{DateTime, Utc};
-use rand::RngExt;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -147,19 +146,14 @@ impl DeviceService {
     /// 32 random bytes, hex-encoded: 256 bits, never guessable, and never
     /// typed by a human.
     fn generate_device_code() -> String {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        hex::encode(bytes)
+        crate::crypto::rng::hex(32)
     }
 
     /// A canonical user code: [`USER_CODE_LEN`] characters drawn uniformly
     /// from [`USER_CODE_ALPHABET`] (`random_range` rejects rather than
     /// taking a biased modulus).
     fn generate_user_code() -> String {
-        let mut rng = rand::rng();
-        (0..USER_CODE_LEN)
-            .map(|_| USER_CODE_ALPHABET[rng.random_range(0..USER_CODE_ALPHABET.len())] as char)
-            .collect()
+        crate::crypto::rng::string_from_alphabet(USER_CODE_ALPHABET, USER_CODE_LEN)
     }
 
     /// Start a device authorization. `scopes` must already be validated.

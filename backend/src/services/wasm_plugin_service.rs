@@ -59,7 +59,6 @@ fn sig_path_for(wasm_path: &Path) -> PathBuf {
 /// failure or signature mismatch — never panics, never trusts malformed input.
 fn verify_ed25519(pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
     use base64::Engine;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
     let engine = base64::engine::general_purpose::STANDARD;
 
@@ -67,26 +66,17 @@ fn verify_ed25519(pubkey_b64: &str, msg: &[u8], sig_b64: &str) -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    let key_arr: [u8; 32] = match key_bytes.as_slice().try_into() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let verifying_key = match VerifyingKey::from_bytes(&key_arr) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-
     let sig_bytes = match engine.decode(sig_b64.trim()) {
         Ok(b) => b,
         Err(_) => return false,
     };
-    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let signature = Signature::from_bytes(&sig_arr);
-
-    verifying_key.verify(msg, &signature).is_ok()
+    if key_bytes.len() != crate::crypto::signature::ED25519_PUBLIC_KEY_LEN
+        || sig_bytes.len() != crate::crypto::signature::ED25519_SIGNATURE_LEN
+    {
+        return false;
+    }
+    // Verification on the module (#5585).
+    crate::crypto::signature::ed25519_verify(&key_bytes, msg, &sig_bytes).is_ok()
 }
 
 /// Pure gate decision for the plugin signature policy (fail-closed).
@@ -2903,18 +2893,16 @@ timeout_secs = 30
     // -----------------------------------------------------------------------
 
     use base64::Engine as _;
-    use ed25519_dalek::{Signer, SigningKey};
 
     /// Build a deterministic test keypair from a fixed 32-byte seed and produce
     /// (base64 pubkey, base64 signature) over `msg`. No RNG / network needed.
     fn test_keypair_sign(seed: u8, msg: &[u8]) -> (String, String) {
-        let signing_key = SigningKey::from_bytes(&[seed; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let signature = signing_key.sign(msg);
+        let signing_key =
+            crate::crypto::signature::Ed25519KeyPair::from_seed(&[seed; 32]).expect("seed");
         let engine = base64::engine::general_purpose::STANDARD;
         (
-            engine.encode(verifying_key.to_bytes()),
-            engine.encode(signature.to_bytes()),
+            engine.encode(signing_key.public_key()),
+            engine.encode(signing_key.sign(msg)),
         )
     }
 

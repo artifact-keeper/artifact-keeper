@@ -140,7 +140,7 @@ async fn cleanup(pool: &PgPool, repo_ids: &[Uuid], user_id: Uuid) {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use artifact_keeper_backend::crypto::digest::Sha256;
     format!("{:x}", Sha256::digest(data))
 }
 

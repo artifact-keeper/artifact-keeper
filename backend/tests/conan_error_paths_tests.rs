@@ -77,7 +77,8 @@ async fn connect_pool() -> PgPool {
 
 async fn create_test_user(pool: &PgPool, username: &str, password: &str) -> Uuid {
     let id = Uuid::new_v4();
-    let hash = bcrypt::hash(password, 4).expect("bcrypt hash failed");
+    let hash = artifact_keeper_backend::crypto::password::hash_bcrypt(password, 4)
+        .expect("bcrypt hash failed");
     sqlx::query(
         r#"
         INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)

@@ -15,10 +15,10 @@
 //! instead, which aborts the HTTP response before `Content-Length` bytes were
 //! delivered, so no client can mistake the corrupted body for a complete one.
 
+use crate::crypto::digest::Sha256;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, Result};
 use crate::util::byte_budget::{budget_from_env, ByteBudget};
