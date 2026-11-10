@@ -93,6 +93,30 @@ func TestBuildArgs(t *testing.T) {
 	}
 }
 
+// TestNoLookupArgsOnEveryScan: connected or offline, standalone or client
+// mode, no image or filesystem scan resolves POMs against Maven Central or
+// calls check.trivy.dev (#5666).
+func TestNoLookupArgsOnEveryScan(t *testing.T) {
+	for _, cfg := range []*Config{
+		{Severity: "LOW", ScanTimeout: time.Minute, FsScanTimeout: time.Minute, CacheDir: "/c"},
+		{Severity: "LOW", ScanTimeout: time.Minute, FsScanTimeout: time.Minute, CacheDir: "/c",
+			Offline: true, SkipDBUpdate: true, TrivyServer: "http://trivy:4954"},
+	} {
+		s := NewScanner(cfg)
+		for name, args := range map[string][]string{
+			"image":      s.buildArgs("backend:8080/repo:tag"),
+			"filesystem": s.buildFsArgs("/work"),
+		} {
+			joined := strings.Join(args, " ")
+			for _, want := range []string{"--offline-scan", "--skip-version-check", "--disable-telemetry"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("%s args (offline=%v) missing %s: %s", name, cfg.Offline, want, joined)
+				}
+			}
+		}
+	}
+}
+
 func TestBuildArgsOmitsOptionalFlags(t *testing.T) {
 	cfg := &Config{Severity: "LOW", ScanTimeout: time.Minute, CacheDir: "/c"}
 	args := strings.Join(NewScanner(cfg).buildArgs("ref"), " ")
@@ -119,7 +143,7 @@ func TestBuildArgsIncludesDBRepository(t *testing.T) {
 func TestDownloadDBArgs(t *testing.T) {
 	// Default: no --db-repository.
 	got := strings.Join(downloadDBArgs(&Config{CacheDir: "/c"}), " ")
-	want := "image --download-db-only --cache-dir /c"
+	want := "image --download-db-only --cache-dir /c --skip-version-check --disable-telemetry"
 	if got != want {
 		t.Errorf("downloadDBArgs = %q, want %q", got, want)
 	}

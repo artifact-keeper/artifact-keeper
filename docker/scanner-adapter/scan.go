@@ -80,6 +80,7 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 		args = append(args, "--insecure")
 	}
 	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, noLookupArgs...)
 	if s.cfg.DBRepository != "" {
 		args = append(args, "--db-repository", s.cfg.DBRepository)
 	}
@@ -88,18 +89,35 @@ func (s *Scanner) buildArgs(imageRef string) []string {
 	return args
 }
 
-// dbUpdateArgs returns the DB-update and offline flags shared by image and
-// filesystem scans: --skip-db-update when DB updates are off (always in
-// offline mode), and in offline mode (#5287) --skip-java-db-update and
-// --offline-scan so no scan contacts a DB registry, the Java DB registry or
-// any other network API.
+// noLookupArgs are on every trivy invocation, connected or not (#5666):
+//
+//   - --offline-scan stops trivy's pom.xml parser from fetching parent POMs
+//     and unpinned dependency versions from repo.maven.apache.org. Every
+//     extracted jar carries a pom.xml under META-INF/maven/, so a filesystem
+//     scan failed on an air-gapped install (a 429 from Central failed one on
+//     a connected one), went around AK's own proxy, and disclosed the
+//     artifact's dependency coordinates to Maven Central. The versions it
+//     recovered were the ones a parent or BOM manages, not the ones bundled;
+//     the backend now hands the bundled versions over in the workspace
+//     (.ak-scan-jar-inventory/pom.xml, read from the jars' pom.properties).
+//   - --skip-version-check and --disable-telemetry together stop the per-run
+//     request to check.trivy.dev (either alone still sends it).
+//
+// The vulnerability and Java DB downloads are not affected; SCANNER_OFFLINE
+// governs those (dbUpdateArgs).
+var noLookupArgs = []string{"--offline-scan", "--skip-version-check", "--disable-telemetry"}
+
+// dbUpdateArgs returns the DB-update flags shared by image and filesystem
+// scans: --skip-db-update when DB updates are off (always in offline mode),
+// and in offline mode (#5287) --skip-java-db-update, so no scan contacts a
+// DB registry or the Java DB registry. Every scan adds noLookupArgs as well.
 func (c *Config) dbUpdateArgs() []string {
 	var args []string
 	if c.SkipDBUpdate || c.Offline {
 		args = append(args, "--skip-db-update")
 	}
 	if c.Offline {
-		args = append(args, "--skip-java-db-update", "--offline-scan")
+		args = append(args, "--skip-java-db-update")
 	}
 	return args
 }
@@ -252,7 +270,8 @@ func DBReady(cfg *Config) bool { return dbPresent(cfg.CacheDir) }
 // honouring cfg.DBRepository (--db-repository) so the DB can be pulled from an
 // AK-controlled mirror instead of the shared public mirror.gcr.io endpoint.
 func downloadDBArgs(cfg *Config) []string {
-	args := []string{"image", "--download-db-only", "--cache-dir", cfg.CacheDir}
+	args := []string{"image", "--download-db-only", "--cache-dir", cfg.CacheDir,
+		"--skip-version-check", "--disable-telemetry"}
 	if cfg.DBRepository != "" {
 		args = append(args, "--db-repository", cfg.DBRepository)
 	}
@@ -404,6 +423,7 @@ func (s *Scanner) buildFsArgs(dir string) []string {
 		"--quiet",
 	}
 	args = append(args, s.cfg.dbUpdateArgs()...)
+	args = append(args, noLookupArgs...)
 	args = append(args, s.cfg.clientArgs()...)
 	return append(args, dir)
 }

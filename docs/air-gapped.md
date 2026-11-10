@@ -428,7 +428,7 @@ The adapter (`docker/scanner-adapter`) has its own settings:
 
 | Variable | What it does | Offline value |
 | --- | --- | --- |
-| `SCANNER_OFFLINE` | The single air-gap switch (adapter 1.7.0 and later). Implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true`, skips the startup database download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update --offline-scan`, so trivy contacts no database registry, no Java DB registry and no other network API. | `true` |
+| `SCANNER_OFFLINE` | The single air-gap switch (adapter 1.7.0 and later). Implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true`, skips the startup database download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update`, so trivy contacts no database registry and no Java DB registry. | `true` |
 | `SCANNER_ADAPTER_TOKEN` | Shared bearer token for the adapter's own `vulndb` route (`PUT` imports a database, `GET` reports it). Unset, both answer 403. | A secret you generate |
 | `SCANNER_TRIVY_SKIP_DB_UPDATE` | Skip the startup download and pass `--skip-db-update` to image and filesystem scans. | `true` (implied by `SCANNER_OFFLINE`) |
 | `SCANNER_TRIVY_DB_REPOSITORY` | OCI repository the database is pulled from (`--db-repository`). Default is trivy's public mirror. | An OCI repository in your Artifact Keeper that holds a copy of the trivy DB artifact |
@@ -456,6 +456,21 @@ With `SCANNER_OFFLINE=true` the Java DB is never downloaded, so JAR files are
 matched only if a Java DB is already in `SCANNER_TRIVY_CACHE_DIR`. Seed it
 while connected if you scan Java.
 
+**No lookups during a scan, in any mode (1.12.0, adapter 1.7.0).** Every trivy
+scan -- the adapter's image and filesystem scans and the backend's own
+`trivy filesystem` runs -- passes `--offline-scan` and turns off trivy's
+version check and telemetry (`--skip-version-check --disable-telemetry`, or
+`TRIVY_SKIP_VERSION_CHECK` / `TRIVY_DISABLE_TELEMETRY` for a locally
+installed trivy). Before that, trivy resolved the parent POM and unpinned
+dependency versions of every `pom.xml` in an extracted JAR against
+`repo.maven.apache.org`, which failed the scan on a disconnected install,
+went around your Maven remote, and told Maven Central which dependencies the
+artifact uses; each run also called `check.trivy.dev`. `trivy filesystem`
+does not open JAR files, so the libraries bundled in a fat jar
+(`BOOT-INF/lib/`) or a war (`WEB-INF/lib/`) are now handed to it as a
+synthesized `.ak-scan-jar-inventory/pom.xml` built from their own
+`pom.properties`, and graded at the versions the archive ships.
+
 ### Dependency scanner (OSV)
 
 The built-in dependency scanner looks up advisories at scan time on
@@ -463,6 +478,14 @@ The built-in dependency scanner looks up advisories at scan time on
 Offline these lookups fail and the result is recorded as degraded, not clean.
 Leave `GITHUB_TOKEN` unset on a sealed instance. There is no switch to turn
 this scanner off.
+
+For a JAR, WAR or EAR (1.12.0, #5666) it reads the coordinates of the
+libraries bundled inside -- each `META-INF/maven/<groupId>/<artifactId>/pom.properties`
+in the archive and in the jars nested one level down (`BOOT-INF/lib/`,
+`WEB-INF/lib/`) -- and looks those up, at the versions the archive ships.
+Only those coordinates leave the instance, and only to the advisory feeds
+above; nothing is resolved against Maven Central. A library built without a
+`pom.properties` (some Gradle and sbt builds) is not named this way.
 
 ### Dependency-Track and OpenSCAP
 

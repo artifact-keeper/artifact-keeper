@@ -66,11 +66,27 @@ For a disconnected install, set one switch:
 
 | Variable | Effect |
 |---|---|
-| `SCANNER_OFFLINE` | Default `false`. `true` implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true` (even if that is set to `false`), skips the startup DB download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update --offline-scan`, so trivy contacts no DB registry, no Java DB registry and no other network API. Logged once at startup. JAR files are matched only if a Java DB is already in the cache. |
+| `SCANNER_OFFLINE` | Default `false`. `true` implies `SCANNER_TRIVY_SKIP_DB_UPDATE=true` (even if that is set to `false`), skips the startup DB download, and runs every image and filesystem scan with `--skip-db-update --skip-java-db-update`, so trivy contacts no DB registry and no Java DB registry. `--offline-scan --skip-version-check --disable-telemetry` are on for every scan in every mode (see below). Logged once at startup. JAR files are matched only if a Java DB is already in the cache. |
 | `SCANNER_ADAPTER_TOKEN` | Shared bearer token for `GET`/`PUT /api/v1/vulndb`. Unset (default): both routes answer 403. The scan routes are not affected. |
 | `SCANNER_TRIVY_DB_SCHEMA_VERSION` | Default `2`. The `Version` an imported `metadata.json` must carry. trivy does not report the schema it expects, so it is configured; it is the major tag of the DB artifact (`trivy-db:2`) and only changes with a trivy release that moves to a new schema. |
 | `SCANNER_VULNDB_MAX_UPLOAD_BYTES` | Default 2 GiB. Cap on the compressed upload (413 above it). |
 | `SCANNER_VULNDB_MAX_EXTRACTED_BYTES` | Default 8 GiB. Cap on the unpacked files (400 above it). |
+
+### No lookups during a scan (adapter >= 1.7.0)
+
+Connected or not, every scan runs with `--offline-scan`,
+`--skip-version-check` and `--disable-telemetry` (#5666). trivy therefore
+never resolves a `pom.xml` parent or unpinned version against
+`repo.maven.apache.org` (which failed scans on air-gapped installs, went
+around AK's own proxy, and disclosed the artifact's dependency coordinates),
+and never calls `check.trivy.dev`. The vulnerability and Java DB downloads
+are unchanged; `SCANNER_OFFLINE` governs those.
+
+`trivy filesystem` does not open `.jar` files. For JVM archives the backend
+adds `.ak-scan-jar-inventory/pom.xml` to the uploaded workspace, naming every
+library bundled in it (a fat jar's `BOOT-INF/lib/`, a war's `WEB-INF/lib/`)
+at the version its `pom.properties` declares, so those are graded with no
+remote resolution.
 
 Offline, a standalone adapter with an empty cache starts and stays
 not-ready (`/probe/ready` 503) until a DB is imported, then becomes ready
