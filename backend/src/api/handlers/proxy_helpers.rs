@@ -559,6 +559,15 @@ pub(crate) fn internal_error(label: &str, e: impl std::fmt::Display) -> Response
     if crate::error::is_pool_timeout(&text) {
         return map_db_err(text);
     }
+    // A storage error must not reach the client as text (#5649, #5650): it
+    // names keys and backends, quotes the object store's own XML, and can
+    // carry the storage-class marker, whose token is what keeps a key from
+    // spoofing a class. `AppError::Storage` answers with a fixed message and
+    // the class's status: 503 STORAGE_UNAVAILABLE + Retry-After, 507
+    // STORAGE_FULL, PATH_TOO_LONG, else 500 STORAGE_ERROR.
+    if label == "Storage" || crate::storage::StorageFailure::from_message(&text).is_some() {
+        return AppError::Storage(text).into_response();
+    }
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("{} error: {}", label, text),
@@ -7636,7 +7645,8 @@ pub async fn put_artifact_bytes(
         .map_err(|e| e.into_response())?;
     storage.put(storage_key, body).await.map_err(|e| {
         // #4609: a full disk is 507 + Retry-After, not an opaque 500.
-        super::upload_body::disk_full_response(&e).unwrap_or_else(|| internal_error("Storage", e))
+        super::upload_body::storage_failure_response(&e)
+            .unwrap_or_else(|| internal_error("Storage", e))
     })?;
     Ok(())
 }
@@ -7801,7 +7811,7 @@ pub async fn put_artifact_stream(
     // and backends and must not reach the client (#3718).
     let result = storage.put_stream(storage_key, stream).await.map_err(|e| {
         // #4609: a full disk is 507 + Retry-After, not an opaque 500.
-        super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+        super::upload_body::storage_failure_response(&e).unwrap_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 crate::api::handlers::storage_err_message(&e),
@@ -14621,6 +14631,38 @@ mod tests {
     fn test_internal_error_returns_500() {
         let response = internal_error("Storage", "disk full");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// #5649 / #5650 review: a storage error reaching `internal_error` answers
+    /// with its class's status and a fixed message: never its text, which
+    /// would hand a client the backend's XML and the marker token.
+    #[tokio::test]
+    async fn test_internal_error_maps_storage_classes_without_text_5649() {
+        use crate::storage::StorageFailure;
+        for (class, want) in [
+            (StorageFailure::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+            (StorageFailure::Full, StatusCode::INSUFFICIENT_STORAGE),
+        ] {
+            let inner = AppError::Storage(
+                class.tag("S3 connection refused. caused by: <Error><Code>X</Code></Error>"),
+            );
+            for label in ["Storage", "Reading staged upload"] {
+                let response = internal_error(label, &inner);
+                assert_eq!(response.status(), want, "{label}");
+                let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                let body = String::from_utf8_lossy(&body);
+                for needle in [class.marker(), "<Error>", "caused by", "connection refused"] {
+                    assert!(!body.contains(needle), "{label}: {needle} in {body}");
+                }
+            }
+        }
+        let plain = internal_error("Storage", "Failed to read 'generic/secret-key.bin'");
+        let body = axum::body::to_bytes(plain.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("secret-key"));
     }
 
     #[test]

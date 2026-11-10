@@ -628,28 +628,38 @@ pub fn spool_write_error(label: &str, err: &io::Error) -> UploadBodyError {
 }
 
 /// Whether an I/O error means the disk (or the user's quota on it) is full.
+/// One definition with the storage layer's (#5650), so a full scratch disk
+/// and a full storage volume are recognised the same way.
 pub fn is_disk_full_io(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
-    ) || matches!(err.raw_os_error(), Some(28) | Some(122))
+    crate::storage::StorageFailure::from_io(err) == Some(crate::storage::StorageFailure::Full)
 }
 
-/// Whether a storage-layer error message reports a full disk. Storage
-/// backends flatten I/O errors into text, so this looks for the OS wording.
-pub fn is_disk_full_message(msg: &str) -> bool {
-    msg.contains("No space left on device")
-        || msg.contains("os error 28")
-        || msg.contains("Disk quota exceeded")
-        || msg.contains("os error 122")
-        || msg.contains("StorageFull")
-}
-
-/// `507` + `Retry-After` when a storage write failed on a full disk, else
-/// `None` so the caller keeps its own mapping.
-pub fn disk_full_response(err: &impl std::fmt::Display) -> Option<Response> {
-    let text = err.to_string();
-    is_disk_full_message(&text).then(|| UploadBodyError::DiskFull { cause: text }.into_response())
+/// The classified response for a failed storage write, or `None` so the
+/// caller keeps its own mapping (#4609, #5649, #5650).
+///
+/// The class comes from [`crate::error::AppError::storage_failure`]: the
+/// `io::Error` kind, or the marker the storage backend put on the message.
+/// Never from the message wording, which carries client-chosen keys: a key
+/// named `No space left on device` must not make a 507. Out of space is
+/// `507` + `Retry-After` with the upload-body wording, and feeds the storage
+/// health signal; an unreachable store is `503 STORAGE_UNAVAILABLE` +
+/// `Retry-After`. Neither body carries the error text.
+pub fn storage_failure_response(err: &crate::error::AppError) -> Option<Response> {
+    use crate::storage::StorageFailure;
+    match err.storage_failure()? {
+        StorageFailure::Full => {
+            crate::storage::failure::record_failure(StorageFailure::Full);
+            Some(
+                UploadBodyError::DiskFull {
+                    cause: err.to_string(),
+                }
+                .into_response(),
+            )
+        }
+        StorageFailure::Unavailable => {
+            Some(crate::error::AppError::Storage(err.to_string()).into_response())
+        }
+    }
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
@@ -824,9 +834,32 @@ mod tests {
     }
 
     #[test]
-    fn storage_message_disk_full_detection() {
-        assert!(disk_full_response(&"IO error: No space left on device (os error 28)").is_some());
-        assert!(disk_full_response(&"IO error: permission denied").is_none());
+    fn storage_failure_response_uses_the_class_not_the_wording() {
+        use crate::error::AppError;
+        use crate::storage::StorageFailure;
+        let full = storage_failure_response(&AppError::Io(io::Error::from_raw_os_error(28)))
+            .expect("ENOSPC is classified");
+        assert_eq!(full.status(), StatusCode::INSUFFICIENT_STORAGE);
+        let tagged = AppError::Storage(StorageFailure::Full.tag("Write error"));
+        assert_eq!(
+            storage_failure_response(&tagged).map(|r| r.status()),
+            Some(StatusCode::INSUFFICIENT_STORAGE)
+        );
+        let down = AppError::Storage(StorageFailure::Unavailable.tag("S3 connection refused"));
+        let down = storage_failure_response(&down).expect("unavailable is classified");
+        assert_eq!(down.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(down.headers().contains_key(header::RETRY_AFTER));
+        // Wording alone (a key named that way) is not a class (#5650).
+        for msg in [
+            "IO error: No space left on device (os error 28)",
+            "Failed to write 'StorageFull.bin'",
+            "IO error: permission denied",
+        ] {
+            assert!(
+                storage_failure_response(&AppError::Storage(msg.into())).is_none(),
+                "{msg}"
+            );
+        }
     }
 
     #[test]

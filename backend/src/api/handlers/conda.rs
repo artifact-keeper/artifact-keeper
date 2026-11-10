@@ -8881,7 +8881,7 @@ async fn store_conda_package(
         .map_err(|e| {
             // #4609: a full disk is the server's capacity, not a bad request
             // and not an opaque 500: 507 + Retry-After, logged with the cause.
-            super::upload_body::disk_full_response(&e).unwrap_or_else(|| {
+            super::upload_body::storage_failure_response(&e).unwrap_or_else(|| {
                 tracing::error!("Storage error writing conda package: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             })

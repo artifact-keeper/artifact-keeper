@@ -916,6 +916,124 @@ impl crate::storage::StorageBackend for FallbackProbeStorage {
     }
 }
 
+/// A cloud backend whose every read and write fails with one storage error:
+/// the stand-in for an object store that is down or out of space (#5649,
+/// #5650). `exists` answers "absent", so upload paths go on to write, which
+/// is where a stopped or full store refuses them.
+pub struct FailingStorage {
+    message: String,
+}
+
+impl FailingStorage {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    fn fail<T>(&self) -> crate::error::Result<T> {
+        Err(crate::error::AppError::Storage(self.message.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for FailingStorage {
+    async fn put(&self, _key: &str, _content: Bytes) -> crate::error::Result<()> {
+        self.fail()
+    }
+    async fn get(&self, _key: &str) -> crate::error::Result<Bytes> {
+        self.fail()
+    }
+    async fn exists(&self, _key: &str) -> crate::error::Result<bool> {
+        Ok(false)
+    }
+    async fn delete(&self, _key: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+    async fn copy(&self, _source: &str, _dest: &str) -> crate::error::Result<()> {
+        self.fail()
+    }
+    async fn put_stream(
+        &self,
+        _key: &str,
+        _stream: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+    ) -> crate::error::Result<crate::storage::PutStreamResult> {
+        self.fail()
+    }
+    async fn health_check(&self) -> crate::error::Result<()> {
+        self.fail()
+    }
+}
+
+/// `state` with its registry replaced by one whose `"s3"` backend is a
+/// [`FailingStorage`] failing with `message`, plus the repository moved onto
+/// it. Every request against `repo_id` then reaches the failing store.
+pub async fn route_repo_to_failing_storage(
+    pool: &PgPool,
+    state: &SharedState,
+    repo_id: Uuid,
+    message: &str,
+) -> SharedState {
+    sqlx::query("UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("move repository onto the failing backend");
+    let failing: Arc<dyn crate::storage::StorageBackend> = Arc::new(FailingStorage::new(message));
+    let mut backends: std::collections::HashMap<String, Arc<dyn crate::storage::StorageBackend>> =
+        std::collections::HashMap::new();
+    backends.insert("s3".to_string(), failing);
+    let mut next = (**state).clone();
+    next.storage_registry = Arc::new(crate::storage::StorageRegistry::new(
+        backends,
+        "s3".to_string(),
+    ));
+    Arc::new(next)
+}
+
+/// What MinIO answers a PUT into a bucket at its quota, as the S3 backend
+/// tags and renders it (#5650): the XML names the bucket and carries the
+/// request ids, none of which may reach a client.
+pub fn minio_quota_exceeded_error() -> String {
+    crate::storage::StorageFailure::Full.tag(
+        "S3 request failed. caused by: Client error with status 400 Bad Request: \
+         <?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>XMinioAdminBucketQuotaExceeded\
+         </Code><Message>Bucket quota exceeded</Message><BucketName>ak-quota-bucket-5650\
+         </BucketName><RequestId>187A0F1E2D3C4B5A</RequestId></Error>",
+    )
+}
+
+/// What the S3 backend reports once its retry budget runs out against a
+/// stopped MinIO (#5649).
+pub fn minio_unreachable_error() -> String {
+    crate::storage::StorageFailure::Unavailable.tag(
+        "S3 connection refused. caused by: Error performing PUT <url> in 10.4s, after 6 \
+         retries - HTTP error: error sending request: tcp connect error: connection refused",
+    )
+}
+
+/// Assert a response body carries none of the backend text in
+/// [`minio_quota_exceeded_error`] / [`minio_unreachable_error`].
+pub fn assert_no_storage_backend_text(label: &str, body: &[u8]) {
+    let body = String::from_utf8_lossy(body);
+    for needle in [
+        "XMinio",
+        "<Error>",
+        "<?xml",
+        "ak-quota-bucket-5650",
+        "187A0F1E2D3C4B5A",
+        "caused by",
+        "connection refused",
+        crate::storage::StorageFailure::Full.marker(),
+        crate::storage::StorageFailure::Unavailable.marker(),
+    ] {
+        assert!(
+            !body.contains(needle),
+            "{label}: response body must not carry backend text {needle:?}: {body}"
+        );
+    }
+}
+
 /// Like [`build_state`], but the registry carries an in-memory backend
 /// registered under `backend_name` (e.g. `"s3"`), simulating a shared cloud
 /// namespace. Returns the state plus the backing [`MemStorage`] so tests can

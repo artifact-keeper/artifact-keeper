@@ -64,6 +64,38 @@ The probes run at the same time, each with a 2 second deadline, and share the
 5 second result cache that `/health` uses, so polling `/readyz` does not add
 load on the dependencies and a dead dependency cannot make the probe slow.
 
+## Storage outages and full storage
+
+Storage never gates readiness: every replica shares the same object store, so
+taking them all out of rotation would turn a storage outage into a total one.
+Instead the requests that need storage answer promptly with a retryable or a
+definite status (#5649, #5650):
+
+| Condition | Requests answer |
+|---|---|
+| The object store cannot be reached or does not answer in time (stopped MinIO, refused connection, DNS failure, timeout, 502/503/504, throttling) | `503 STORAGE_UNAVAILABLE` with `Retry-After: 1` (OCI: `503 UNAVAILABLE`); with the defaults in about 15-20 s for a control-plane request and about 30 s for an upload or download |
+| The store refuses a write for lack of space (MinIO bucket quota `XMinioAdminBucketQuotaExceeded` / `XMinioStorageFull`, S3-compatible `QuotaExceeded`, HTTP 507, filesystem `ENOSPC` / `EDQUOT`) | `507 STORAGE_FULL` (OCI: `507 INSUFFICIENT_STORAGE`) |
+
+Neither body carries the store's own error text: the bucket name, request ids
+and XML error documents go to the server log only, on every route including
+the OCI `/v2` error envelope. `507 STORAGE_FULL` is distinct from
+`507 QUOTA_EXCEEDED`, which is Artifact Keeper's own per-repository quota. A
+GCS `quotaExceeded` is treated as retryable (`503`), because GCS also answers
+it for API-usage quotas. The class is taken from the response status and its
+exact error code, never from the message text, so an object named after an
+error code cannot change the answer.
+
+The bounds are set in `.env.example`: `STORAGE_CONNECT_TIMEOUT_SECS`
+(default 3) for one connection attempt; `STORAGE_OPERATION_TIMEOUT_SECS`
+(default 15), the retry budget of an S3 control-plane request (head, exists,
+list, delete); and `STORAGE_BULK_RETRY_TIMEOUT_SECS` (default 180), the retry
+budget of an S3 upload, download or copy. The S3 client counts a retry budget
+from the start of the request, so the payload budget stays long enough for a
+long transfer to keep its retries; against a gone store a payload request is
+bounded by its fixed 5 retries instead. The pause between retries is capped
+at 2 s. Compare a database outage,
+which answers `503 DATABASE_UNAVAILABLE` and does make `/readyz` fail.
+
 ## Making search part of readiness
 
 By default an unhealthy OpenSearch is reported but does not gate readiness:

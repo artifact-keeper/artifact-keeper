@@ -629,7 +629,14 @@ async fn sign_artifact(
     let location = crate::storage::StorageLocation { backend, path };
     let storage = state.storage_for_repo(&location)?;
     let content = storage.get(&storage_key).await.map_err(|e| {
-        AppError::NotFound(format!("Artifact content unavailable for signing: {e}"))
+        // An outage or full store keeps its own status (#5649); any other
+        // failure is "not available", without the storage error's text,
+        // which names keys and backends and can carry the class marker.
+        if e.storage_failure().is_some() {
+            return e;
+        }
+        tracing::warn!(error = %e, storage_key = %storage_key, "artifact content unavailable for signing");
+        AppError::NotFound("Artifact content unavailable for signing".to_string())
     })?;
 
     let svc = signing_service(&state);
