@@ -11,36 +11,31 @@
 pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p = pattern.chars().collect::<Vec<_>>();
     let t = text.chars().collect::<Vec<_>>();
-    glob_match_inner(&p, &t, 0, 0)
-}
 
-fn glob_match_inner(pattern: &[char], text: &[char], pi: usize, ti: usize) -> bool {
-    if pi == pattern.len() && ti == text.len() {
-        return true;
-    }
-    if pi == pattern.len() {
-        return false;
-    }
-
-    if pattern[pi] == '*' {
-        // Try matching * against 0..n characters
-        for skip in 0..=(text.len() - ti) {
-            if glob_match_inner(pattern, text, pi + 1, ti + skip) {
-                return true;
-            }
+    // Two cursors and one remembered `*`: on a mismatch, go back to the most
+    // recent `*` and let it take one more character. An earlier `*` never
+    // needs revisiting (if the later one cannot finish the match, giving the
+    // earlier one more text cannot either), so this is O(pattern * text)
+    // where trying every split of every `*` was exponential in the number of
+    // stars (#5716).
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None; // (index after `*`, text index it resumes from)
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some((after_star, resume)) = star {
+            pi = after_star;
+            ti = resume + 1;
+            star = Some((after_star, resume + 1));
+        } else {
+            return false;
         }
-        return false;
     }
-
-    if ti == text.len() {
-        return false;
-    }
-
-    if pattern[pi] == '?' || pattern[pi] == text[ti] {
-        return glob_match_inner(pattern, text, pi + 1, ti + 1);
-    }
-
-    false
+    p[pi..].iter().all(|c| *c == '*')
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -68,5 +63,22 @@ mod tests {
     fn literal_match() {
         assert!(glob_match("lodash", "lodash"));
         assert!(!glob_match("lodash", "lodashx"));
+    }
+
+    /// Many wildcards against a long non-matching name used to take seconds
+    /// (six stars against 120 characters: 10 s). It is now linear enough that
+    /// a generous bound holds even on a loaded CI runner.
+    #[test]
+    fn many_wildcards_do_not_blow_up() {
+        let pattern = format!("{}b", "*a".repeat(12));
+        let text = "a".repeat(400);
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pattern, &text));
+        assert!(glob_match(&"*a".repeat(12), &text));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }
