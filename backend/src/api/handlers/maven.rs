@@ -479,11 +479,17 @@ fn snapshot_alias_build(alias: &str, candidate: &str) -> Option<(String, u32)> {
     if dir != cand_dir {
         return None;
     }
-    let version_dir = dir.rsplit('/').next()?;
+    let mut dir_segments = dir.rsplit('/');
+    let version_dir = dir_segments.next()?;
+    let artifact_id = dir_segments.next()?;
     let base_version = version_dir.strip_suffix("-SNAPSHOT")?;
-    let (prefix, tail) = filename.split_once(version_dir)?;
+    // The filename is `<artifactId>-<version><tail>`, with the artifactId
+    // taken from the directory. Splitting on the first `<version>` in the
+    // filename mis-split an artifactId that itself contains it (#5678).
+    let prefix = format!("{artifact_id}-");
+    let tail = filename.strip_prefix(&prefix)?.strip_prefix(version_dir)?;
     let rest = cand_filename
-        .strip_prefix(prefix)?
+        .strip_prefix(prefix.as_str())?
         .strip_prefix(base_version)?
         .strip_prefix('-')?;
     let rest = rest.strip_suffix(tail)?;
@@ -4873,7 +4879,7 @@ async fn upload(
         // #5665: a sidecar of a stored artifact is held to that artifact's
         // rules: immutable once its release coordinate is published, and
         // never allowed to name a digest the stored bytes do not have.
-        if let Err(refusal) = check_checksum_sidecar_upload(
+        match check_checksum_sidecar_upload(
             &state.db,
             storage.as_ref(),
             &staged,
@@ -4884,8 +4890,20 @@ async fn upload(
         )
         .await
         {
-            staged.discard().await;
-            return Err(refusal);
+            Ok(SidecarUpload::Store) => {}
+            // #5678: a retried PUT of the value already stored is a success,
+            // not a conflict, and leaves the stored bytes untouched.
+            Ok(SidecarUpload::AlreadyStored) => {
+                staged.discard().await;
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("OK"))
+                    .unwrap());
+            }
+            Err(refusal) => {
+                staged.discard().await;
+                return Err(refusal);
+            }
         }
         // Atomically claim the flat key BEFORE writing its bytes: exactly one
         // concurrent first-publisher wins, the rest are refused, so the stored
@@ -5375,7 +5393,11 @@ fn sidecar_digest_token(body: &[u8]) -> Option<String> {
 ///   a sidecar sent before its file): stored as before; there is nothing to
 ///   hold it to.
 /// * The base is a release coordinate and a sidecar is already stored at
-///   `storage_key`: 409, exactly what re-uploading the released file answers.
+///   `storage_key` (#5678): the same value again is [`SidecarUpload::AlreadyStored`]
+///   (a retried PUT after a lost response succeeds); the artifact's own digest
+///   replacing a stored value that does not match it is stored (a wrong
+///   sidecar uploaded before its file does not lock the release); anything
+///   else is 409, exactly what re-uploading the released file answers.
 /// * The body does not name the digest the artifact row stores for this
 ///   algorithm: 400. Maven and Gradle upload each sidecar after its file, so
 ///   the row is there to compare against. SHA-512 has no stored digest and
@@ -5388,11 +5410,11 @@ async fn check_checksum_sidecar_upload(
     storage_key: &str,
     base_path: &str,
     checksum_type: ChecksumType,
-) -> Result<(), Response> {
+) -> Result<SidecarUpload, Response> {
     use sqlx::Row;
 
     if MavenHandler::is_metadata(base_path) {
-        return Ok(());
+        return Ok(SidecarUpload::Store);
     }
     let row = sqlx::query(
         "SELECT checksum_sha256, checksum_sha1, checksum_md5 FROM artifacts \
@@ -5404,20 +5426,8 @@ async fn check_checksum_sidecar_upload(
     .await
     .map_err(map_db_err)?;
     let Some(row) = row else {
-        return Ok(());
+        return Ok(SidecarUpload::Store);
     };
-
-    if !crate::services::cache_classifier::maven_coordinate_is_republishable(base_path)
-        && storage
-            .exists(storage_key)
-            .await
-            .map_err(|e| e.into_response())?
-    {
-        return Err(AppError::Conflict(format!(
-            "Checksum for released artifact '{base_path}' already exists"
-        ))
-        .into_response());
-    }
 
     let expected: Option<String> = match checksum_type {
         ChecksumType::Sha256 => row.try_get("checksum_sha256").ok(),
@@ -5431,10 +5441,7 @@ async fn check_checksum_sidecar_upload(
             .flatten(),
         ChecksumType::Sha512 => None,
     };
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let expected = expected.trim().to_ascii_lowercase();
+    let expected = expected.map(|e| e.trim().to_ascii_lowercase());
     let suffix = checksum_suffix(checksum_type);
     let uploaded = if staged.size_bytes() <= MAX_CHECKSUM_SIDECAR_BYTES {
         let body = staged
@@ -5445,6 +5452,30 @@ async fn check_checksum_sidecar_upload(
     } else {
         None
     };
+
+    if !crate::services::cache_classifier::maven_coordinate_is_republishable(base_path)
+        && storage
+            .exists(storage_key)
+            .await
+            .map_err(|e| e.into_response())?
+    {
+        let stored = read_stored_sidecar_token(storage, storage_key).await;
+        if uploaded.is_some() && uploaded == stored {
+            return Ok(SidecarUpload::AlreadyStored);
+        }
+        let corrects_stored = expected.is_some() && uploaded == expected && stored != expected;
+        if !corrects_stored {
+            return Err(AppError::Conflict(format!(
+                "Checksum for released artifact '{base_path}' already exists \
+                 with a different value"
+            ))
+            .into_response());
+        }
+    }
+
+    let Some(expected) = expected else {
+        return Ok(SidecarUpload::Store);
+    };
     if uploaded.as_deref() != Some(expected.as_str()) {
         return Err(AppError::Validation(format!(
             "Checksum mismatch: the uploaded .{suffix} does not match the {suffix} \
@@ -5452,7 +5483,38 @@ async fn check_checksum_sidecar_upload(
         ))
         .into_response());
     }
-    Ok(())
+    Ok(SidecarUpload::Store)
+}
+
+/// What [`check_checksum_sidecar_upload`] decided for an allowed upload.
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarUpload {
+    /// Write the uploaded sidecar.
+    Store,
+    /// The stored sidecar already names the uploaded digest: answer success
+    /// without rewriting it (#5678).
+    AlreadyStored,
+}
+
+/// The digest token of the sidecar stored at `storage_key`, `None` when it
+/// cannot be read, is not a hex digest, or is larger than any real sidecar.
+/// `None` never matches an upload, so an unreadable stored sidecar keeps the
+/// release's 409 (fail closed) rather than being treated as identical.
+async fn read_stored_sidecar_token(
+    storage: &dyn crate::storage::StorageBackend,
+    storage_key: &str,
+) -> Option<String> {
+    let limit = MAX_CHECKSUM_SIDECAR_BYTES as u64;
+    if let Ok(Some(size)) = storage.stored_size(storage_key).await {
+        if size > limit {
+            return None;
+        }
+    }
+    let body = storage.get(storage_key).await.ok()?;
+    if body.len() as u64 > limit {
+        return None;
+    }
+    sidecar_digest_token(&body)
 }
 
 /// Bound on the maven-metadata.xml body inspected for plugin-prefix entries.
@@ -13944,12 +14006,8 @@ mod tests {
         let (s, b) = put(format!("{jar_path}.sha1"), forged.clone()).await;
         steps.push(("overwriting the released .sha1", StatusCode::CONFLICT, s, b));
         let (s, b) = put(format!("{jar_path}.sha1"), good_sha1.clone()).await;
-        steps.push((
-            "re-uploading the released .sha1",
-            StatusCode::CONFLICT,
-            s,
-            b,
-        ));
+        // #5678: the same value again (a retried PUT) is idempotent.
+        steps.push(("re-uploading the released .sha1", StatusCode::OK, s, b));
         let app = fx.router_with_auth(super::router());
         let (s, _) = tdh::send(
             app,
@@ -14014,6 +14072,116 @@ mod tests {
             String::from_utf8_lossy(&served).trim(),
             good_sha1,
             "the served .sha1 is the deploy's, never the forged one"
+        );
+    }
+
+    /// #5678: a released artifact's stored sidecar answered 409 even to a
+    /// byte-identical retry (Maven and Gradle retry a PUT after a lost
+    /// response), and a wrong sidecar uploaded BEFORE its artifact locked the
+    /// release so the deploy's own correct `.sha1` got 409. Now an identical
+    /// value is 200 and leaves the stored object alone, the artifact's own
+    /// digest replaces a stored value that does not match it, and any other
+    /// value is still 409.
+    #[tokio::test]
+    async fn test_released_sidecar_reupload_is_idempotent_5678() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let jar_path = "com/example/shop5678/shop-core/1.0.0/shop-core-1.0.0.jar";
+        let jar = bytes::Bytes::from_static(b"released shop-core 1.0.0 jar bytes 5678");
+        let good_sha1 = sha1_hex(&jar);
+        let good_sha512 = compute_checksum(&jar, ChecksumType::Sha512);
+        let forged = "0".repeat(40);
+        let other = "1".repeat(40);
+
+        let put = |leaf: String, body: bytes::Bytes| {
+            let app = fx.router_with_auth(super::router());
+            let uri = format!("/{}/{leaf}", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(app, tdh::put(uri, body)).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+        let text = |v: &str| bytes::Bytes::from(v.to_string());
+
+        let mut steps: Vec<(&str, StatusCode, StatusCode, String)> = Vec::new();
+        let (s, b) = put(format!("{jar_path}.sha1"), text(&forged)).await;
+        steps.push(("a wrong .sha1 before its jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(jar_path.to_string(), jar.clone()).await;
+        steps.push(("deploy the release jar", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{jar_path}.sha1"), text(&good_sha1)).await;
+        steps.push(("the deploy's own .sha1", StatusCode::CREATED, s, b));
+        let (s, b) = put(
+            format!("{jar_path}.sha1"),
+            text(&format!(
+                "{}  shop-core-1.0.0.jar\n",
+                good_sha1.to_uppercase()
+            )),
+        )
+        .await;
+        steps.push(("a retried .sha1, other spelling", StatusCode::OK, s, b));
+        let (s, b) = put(format!("{jar_path}.sha1"), text(&other)).await;
+        steps.push(("a different .sha1", StatusCode::CONFLICT, s, b));
+        let (s, b) = put(format!("{jar_path}.sha512"), text(&good_sha512)).await;
+        steps.push(("the .sha512", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{jar_path}.sha512"), text(&good_sha512)).await;
+        steps.push(("a retried .sha512", StatusCode::OK, s, b));
+        let (s, b) = put(format!("{jar_path}.sha512"), text(&"2".repeat(128))).await;
+        steps.push(("a different .sha512", StatusCode::CONFLICT, s, b));
+
+        let app = fx.router_with_auth(super::router());
+        let (gs, served) =
+            tdh::send(app, tdh::get(format!("/{}/{jar_path}.sha1", fx.repo_key))).await;
+        fx.teardown().await;
+
+        for (what, want, got, body) in &steps {
+            assert_eq!(got, want, "{what}: body={body}");
+        }
+        assert_eq!(gs, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&served).trim(),
+            good_sha1,
+            "the stored .sha1 is the deploy's, and the retry left it untouched"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_alias_build_artifact_id_containing_version_5678() {
+        let dir = "com/example/x-1.0-SNAPSHOT-y/1.0-SNAPSHOT";
+        let main = format!("{dir}/x-1.0-SNAPSHOT-y-1.0-SNAPSHOT.jar");
+        let sources = format!("{dir}/x-1.0-SNAPSHOT-y-1.0-SNAPSHOT-sources.jar");
+        assert_eq!(
+            snapshot_alias_build(
+                &main,
+                &format!("{dir}/x-1.0-SNAPSHOT-y-1.0-20261101.101010-4.jar")
+            ),
+            Some(("20261101.101010".to_string(), 4))
+        );
+        assert_eq!(
+            snapshot_alias_build(
+                &sources,
+                &format!("{dir}/x-1.0-SNAPSHOT-y-1.0-20261101.101010-4-sources.jar")
+            ),
+            Some(("20261101.101010".to_string(), 4))
+        );
+        assert_eq!(
+            snapshot_alias_build(
+                &main,
+                &format!("{dir}/x-1.0-SNAPSHOT-y-1.0-20261101.101010-4-sources.jar")
+            ),
+            None
+        );
+        // A filename that does not start with the directory's artifactId is
+        // not an alias of it.
+        assert_eq!(
+            snapshot_alias_build(
+                &format!("{dir}/other-1.0-SNAPSHOT.jar"),
+                &format!("{dir}/other-1.0-20261101.101010-4.jar")
+            ),
+            None
         );
     }
 
