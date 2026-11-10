@@ -366,6 +366,11 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
             // Periodically check for stale peers and mark them offline.
             if plan.stale_check {
                 run_stale_peer_detection(&db, stale_threshold_min).await;
+                match sweep_orphaned_sync_tasks(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!("Swept {n} sync task(s) of removed artifacts"),
+                    Err(e) => tracing::warn!("{e}"),
+                }
             }
 
             // Queue due `mirror` passes before dispatch so their tasks go
@@ -382,6 +387,40 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
             }
         }
     });
+}
+
+/// Rows one [`sweep_orphaned_sync_tasks`] pass removes at most.
+const ORPHAN_SWEEP_BATCH: i64 = 1000;
+
+/// Remove sync tasks whose artifact row is gone and that have nothing left to
+/// deliver (#5624). `artifact_id` is `ON DELETE SET NULL` so a delete task
+/// outlives a purged artifact; the cascade used to remove the push tasks with
+/// it, and this does now: a push of a removed artifact is never claimed, and a
+/// delete that finished, was cancelled or carries no peer address is done.
+/// Bounded per pass; the rest go on the next stale-check tick.
+async fn sweep_orphaned_sync_tasks(db: &PgPool) -> Result<u64, String> {
+    sqlx::query(
+        r#"
+        DELETE FROM sync_tasks
+        WHERE id IN (
+            SELECT id
+            FROM sync_tasks
+            WHERE artifact_id IS NULL
+              AND (
+                  task_type <> 'delete'
+                  OR status IN ('completed', 'cancelled')
+                  OR target_path IS NULL
+                  OR target_repository_key IS NULL
+              )
+            LIMIT $1
+        )
+        "#,
+    )
+    .bind(ORPHAN_SWEEP_BATCH)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected())
+    .map_err(|e| format!("Failed to sweep orphaned sync tasks: {e}"))
 }
 
 /// Detect peers that have not sent a heartbeat within the threshold and
@@ -602,7 +641,8 @@ struct PeerHeartbeatRow {
 struct TaskRow {
     id: Uuid,
     peer_instance_id: Uuid,
-    artifact_id: Uuid,
+    /// `None` for a delete whose artifact row is gone (#5624).
+    artifact_id: Option<Uuid>,
     priority: i32,
     storage_key: String,
     artifact_size: i64,
@@ -615,7 +655,9 @@ struct TaskRow {
     package_description: Option<String>,
     package_metadata: Option<serde_json::Value>,
     repository_key: String,
-    repository_id: Uuid,
+    /// `None` only for a delete whose artifact row is gone and that carries no
+    /// repository id (#5624).
+    repository_id: Option<Uuid>,
     repository_storage_backend: String,
     repository_storage_path: String,
     content_type: String,
@@ -760,16 +802,52 @@ async fn claim_pending_sync_tasks(
         .await
         .map_err(|e| format!("Failed to take claim lock for peer {peer_id}: {e}"))?;
 
+    // #5624: a delete whose artifact row is gone (purged, or its repository
+    // deleted) is addressed by the repository key and path it carries. When a
+    // live artifact holds that path again (re-uploaded or restored), the
+    // peer's copy there is that artifact's to replace, so the delete is
+    // superseded rather than sent after (or racing) its push.
+    sqlx::query(
+        r#"
+        UPDATE sync_tasks st
+        SET status = 'cancelled',
+            completed_at = NOW(),
+            error_message = 'superseded by a live artifact at the same path'
+        WHERE st.peer_instance_id = $1
+          AND st.status = 'pending'
+          AND st.task_type = 'delete'
+          AND st.artifact_id IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM artifacts l
+              WHERE l.repository_id = st.target_repository_id
+                AND l.path = st.target_path
+                AND l.is_deleted = false
+          )
+        "#,
+    )
+    .bind(peer_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("Failed to supersede deletes for peer {peer_id}: {e}"))?;
+
     let rows = sqlx::query(
         r#"
         WITH candidate AS (
             SELECT st.id
             FROM sync_tasks st
-            JOIN artifacts a ON a.id = st.artifact_id
+            LEFT JOIN artifacts a ON a.id = st.artifact_id
+            LEFT JOIN repositories ar ON ar.id = a.repository_id
             WHERE st.peer_instance_id = $1
               AND st.status = 'pending'
               AND (st.claim_expires_at IS NULL OR st.claim_expires_at <= NOW())
-              AND (st.task_type = 'delete' OR a.is_deleted = false)
+              AND (
+                  (st.task_type = 'delete' AND (
+                      a.id IS NOT NULL
+                      OR (st.target_repository_key IS NOT NULL AND st.target_path IS NOT NULL)
+                  ))
+                  OR (st.task_type <> 'delete' AND a.is_deleted = false)
+              )
               AND (
                   st.task_type = 'delete'
                   OR NOT EXISTS (
@@ -778,6 +856,24 @@ async fn claim_pending_sync_tasks(
                       WHERE d.peer_instance_id = st.peer_instance_id
                         AND d.artifact_id = st.artifact_id
                         AND d.task_type = 'delete'
+                        AND (
+                            d.status IN ('pending', 'in_progress')
+                            OR (d.status = 'failed' AND d.retry_count < GREATEST(d.max_retries, $4))
+                        )
+                  )
+              )
+              -- A push waits for an undelivered delete of a removed artifact
+              -- that held its path, so the peer applies them in order.
+              AND (
+                  st.task_type = 'delete'
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM sync_tasks d
+                      WHERE d.peer_instance_id = st.peer_instance_id
+                        AND d.artifact_id IS NULL
+                        AND d.task_type = 'delete'
+                        AND d.target_repository_id = a.repository_id
+                        AND d.target_path = a.path
                         AND (
                             d.status IN ('pending', 'in_progress')
                             OR (d.status = 'failed' AND d.retry_count < GREATEST(d.max_retries, $4))
@@ -817,11 +913,13 @@ async fn claim_pending_sync_tasks(
             c.peer_instance_id,
             c.artifact_id,
             c.priority,
-            a.storage_key,
-            a.size_bytes AS artifact_size,
-            a.name AS artifact_name,
+            -- #5624: a delete whose artifact row is gone is addressed by the
+            -- repository key and path it carries; nothing else is read.
+            COALESCE(a.storage_key, '') AS storage_key,
+            COALESCE(a.size_bytes, 0) AS artifact_size,
+            COALESCE(a.name, '') AS artifact_name,
             a.version AS artifact_version,
-            a.path AS artifact_path,
+            COALESCE(c.target_path, a.path) AS artifact_path,
             am.format AS artifact_metadata_format,
             -- #4424: a pacman file list lives in pacman_file_lists; the
             -- payload carries it inside the document, where a peer of any
@@ -840,12 +938,12 @@ async fn claim_pending_sync_tasks(
                 WHEN p.version = a.version THEN p.metadata
                 ELSE NULL
             END AS package_metadata,
-            r.key AS repository_key,
-            r.id AS repository_id,
-            r.storage_backend AS repository_storage_backend,
-            r.storage_path AS repository_storage_path,
-            a.content_type,
-            a.checksum_sha256,
+            COALESCE(c.target_repository_key, r.key) AS repository_key,
+            COALESCE(r.id, c.target_repository_id) AS repository_id,
+            COALESCE(r.storage_backend, '') AS repository_storage_backend,
+            COALESCE(r.storage_path, '') AS repository_storage_path,
+            COALESCE(a.content_type, '') AS content_type,
+            COALESCE(a.checksum_sha256, c.target_checksum_sha256, '') AS checksum_sha256,
             c.task_type,
             prs.replication_filter,
             c.retry_count,
@@ -854,8 +952,8 @@ async fn claim_pending_sync_tasks(
             c.claimed_by,
             c.claim_expires_at
         FROM claimed c
-        JOIN artifacts a ON a.id = c.artifact_id
-        JOIN repositories r ON r.id = a.repository_id
+        LEFT JOIN artifacts a ON a.id = c.artifact_id
+        LEFT JOIN repositories r ON r.id = a.repository_id
         LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
         LEFT JOIN pacman_file_lists fl ON fl.artifact_id = a.id
         LEFT JOIN packages p
@@ -1028,11 +1126,19 @@ async fn process_pending_tasks(
             claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
         WHERE status = 'failed'
           AND retry_count < GREATEST(max_retries, $1)
-          AND EXISTS (
-              SELECT 1
-              FROM artifacts a
-              WHERE a.id = sync_tasks.artifact_id
-                AND (sync_tasks.task_type = 'delete' OR a.is_deleted = false)
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM artifacts a
+                  WHERE a.id = sync_tasks.artifact_id
+                    AND (sync_tasks.task_type = 'delete' OR a.is_deleted = false)
+              )
+              -- #5624: a delete that outlived its artifact row.
+              OR (
+                  sync_tasks.task_type = 'delete'
+                  AND sync_tasks.artifact_id IS NULL
+                  AND sync_tasks.target_path IS NOT NULL
+              )
           )
           AND peer_instance_id = ANY(
               SELECT id FROM peer_instances
@@ -1145,10 +1251,14 @@ async fn process_pending_tasks(
 
             // Attempt scored peer selection: if a better-scoring peer is available
             // for this artifact, use its endpoint instead of the task's default.
+            let scored = match task.artifact_id {
+                Some(artifact_id) => {
+                    resolve_scored_peer(db, local_peer_id, artifact_id, &peer.name).await
+                }
+                None => None,
+            };
             let (peer_endpoint, peer_api_key) =
-                resolve_scored_peer(db, local_peer_id, task.artifact_id, &peer.name)
-                    .await
-                    .unwrap_or_else(|| (peer.endpoint_url.clone(), peer.api_key.clone()));
+                scored.unwrap_or_else(|| (peer.endpoint_url.clone(), peer.api_key.clone()));
 
             let db = db.clone();
             let client = client.clone();
@@ -1536,7 +1646,10 @@ async fn execute_oci_transfer(
         storage_key: task.storage_key.clone(),
         content_type: task.content_type.clone(),
     };
-    let plan = match build_oci_transfer_plan(db, task.repository_id, &top).await {
+    // A push is only claimed while its artifact row exists, so it always
+    // carries the repository id; only an orphaned delete may lack one.
+    let repository_id = task.repository_id.unwrap_or_default();
+    let plan = match build_oci_transfer_plan(db, repository_id, &top).await {
         Ok(plan) => plan,
         Err(e) => {
             handle_transfer_failure(db, task, &e, retry_policy).await;
@@ -2102,7 +2215,7 @@ async fn rearm_if_superseded(db: &PgPool, task: &Claimed<TaskRow>) {
         .await;
     if matches!(rearmed, Ok(true)) {
         tracing::info!(
-            "Artifact {} changed while sync task {} was in flight; queued it again",
+            "Artifact {:?} changed while sync task {} was in flight; queued it again",
             task.artifact_id,
             task.id
         );
@@ -3143,7 +3256,7 @@ mod tests {
         TaskRow {
             id: Uuid::new_v4(),
             peer_instance_id: Uuid::new_v4(),
-            artifact_id: Uuid::new_v4(),
+            artifact_id: Some(Uuid::new_v4()),
             priority: 0,
             storage_key: "object-key".to_string(),
             artifact_size: 26,
@@ -3156,7 +3269,7 @@ mod tests {
             package_description: None,
             package_metadata: None,
             repository_key: "repo".to_string(),
-            repository_id: Uuid::new_v4(),
+            repository_id: Some(Uuid::new_v4()),
             repository_storage_backend: storage_backend.to_string(),
             repository_storage_path: String::new(),
             content_type: "application/octet-stream".to_string(),
@@ -5268,7 +5381,7 @@ mod tests {
         let metadata_of = |id: Uuid| {
             claimed
                 .iter()
-                .find(|t| t.artifact_id == id)
+                .find(|t| t.artifact_id == Some(id))
                 .and_then(|t| t.artifact_metadata.clone())
                 .unwrap()
         };
@@ -5342,7 +5455,7 @@ mod tests {
             .await
             .expect("re-upload");
         crate::services::peer_instance_service::PeerInstanceService::new(f.pool.clone())
-            .queue_sync_task(f.peer_id, task.artifact_id, 0)
+            .queue_sync_task(f.peer_id, task.artifact_id.expect("push artifact"), 0)
             .await
             .expect("enqueue re-upload");
 
@@ -5807,6 +5920,190 @@ mod tests {
         assert!(transient_backoff, "a 503 still backs the peer off");
     }
 
+    /// `(artifact path, repository id, repository key)` of the fixture's task.
+    async fn task_address(f: &ClaimFixture, task_id: Uuid) -> (String, Uuid, String) {
+        sqlx::query_as(
+            "SELECT a.path, r.id, r.key FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id \
+             JOIN repositories r ON r.id = a.repository_id WHERE st.id = $1",
+        )
+        .bind(task_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("task address")
+    }
+
+    /// #5624: a delete task outlives its artifact row (purge, `?permanent`,
+    /// repository delete): the row's removal nulls `artifact_id` instead of
+    /// cascading, and the worker still claims the task and sends the delete
+    /// to the peer by the repository key and path the task carries.
+    #[tokio::test]
+    async fn delete_of_a_removed_artifact_reaches_the_peer_by_path_5624() {
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, ResponseTemplate};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let task_id = f.task_ids[0];
+        let (path, repo_id, repo_key) = task_address(&f, task_id).await;
+        sqlx::query(
+            "UPDATE sync_tasks SET task_type = 'delete', target_repository_id = $2, \
+                 target_repository_key = $3, target_path = $4, target_checksum_sha256 = 'cafe' \
+             WHERE id = $1",
+        )
+        .bind(task_id)
+        .bind(repo_id)
+        .bind(&repo_key)
+        .bind(&path)
+        .execute(&f.pool)
+        .await
+        .expect("address the delete");
+        sqlx::query(
+            "DELETE FROM artifacts WHERE id = (SELECT artifact_id FROM sync_tasks WHERE id = $1)",
+        )
+        .bind(task_id)
+        .execute(&f.pool)
+        .await
+        .expect("hard-delete the artifact");
+        let survived: Option<Option<Uuid>> =
+            sqlx::query_scalar("SELECT artifact_id FROM sync_tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_optional(&f.pool)
+                .await
+                .expect("read task");
+
+        let server = wiremock::MockServer::start().await;
+        let expected = format!("/api/v1/repositories/{repo_key}/artifacts/{path}");
+        Mock::given(method("DELETE"))
+            .and(url_path(expected.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = run_claimed_transfer(&f, &server).await;
+        let status: String =
+            sqlx::query_scalar("SELECT status::TEXT FROM sync_tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("task");
+        teardown_claim_fixture(&f).await;
+
+        assert_eq!(
+            survived,
+            Some(None),
+            "removing the artifact must keep its delete task, with artifact_id NULL"
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(status, "completed");
+        server.verify().await;
+    }
+
+    /// #5624: after a purge, a re-upload to the same path is pushed only once
+    /// the removed artifact's delete is no longer in flight, and a delete
+    /// still queued when the path is live again is superseded instead of
+    /// taking the new artifact off the peer after its push.
+    #[tokio::test]
+    async fn push_after_a_purge_waits_for_and_supersedes_the_old_delete_5624() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let push_id = f.task_ids[0];
+        let (path, repo_id, repo_key) = task_address(&f, push_id).await;
+        let delete_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+                 target_repository_id, target_repository_key, target_path) \
+             VALUES ($1, NULL, 'delete', 'in_progress', $2, $3, $4) RETURNING id",
+        )
+        .bind(f.peer_id)
+        .bind(repo_id)
+        .bind(&repo_key)
+        .bind(&path)
+        .fetch_one(&f.pool)
+        .await
+        .expect("insert removed artifact's delete");
+
+        let while_in_flight = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        sqlx::query("UPDATE sync_tasks SET status = 'pending' WHERE id = $1")
+            .bind(delete_id)
+            .execute(&f.pool)
+            .await
+            .expect("delete back to pending");
+        let after = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        let delete_state: (String, Option<String>) =
+            sqlx::query_as("SELECT status::TEXT, error_message FROM sync_tasks WHERE id = $1")
+                .bind(delete_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("delete state");
+        teardown_claim_fixture(&f).await;
+
+        assert!(
+            while_in_flight.is_empty(),
+            "a push must not race an in-flight delete of the same path"
+        );
+        assert_eq!(after.iter().map(|t| t.id).collect::<Vec<_>>(), [push_id]);
+        assert_eq!(
+            delete_state,
+            (
+                "cancelled".to_string(),
+                Some("superseded by a live artifact at the same path".to_string())
+            )
+        );
+    }
+
+    /// #5624: with `ON DELETE SET NULL` the rows the cascade used to remove
+    /// stay behind; the sweep removes the ones with nothing to deliver and
+    /// keeps a delete still on its way to the peer.
+    #[tokio::test]
+    async fn sweep_removes_finished_tasks_of_removed_artifacts_5624() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let insert = |task_type: &'static str, status: &'static str, addressed: bool| {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+                     target_repository_key, target_path) \
+                 VALUES ($1, NULL, $2, $3::text::sync_status, \
+                         CASE WHEN $4 THEN 'repo' END, CASE WHEN $4 THEN 'gone.bin' END) \
+                 RETURNING id",
+            )
+            .bind(f.peer_id)
+            .bind(task_type)
+            .bind(status)
+            .bind(addressed)
+            .fetch_one(&f.pool)
+        };
+        let push = insert("push", "completed", false).await.unwrap();
+        let done = insert("delete", "completed", true).await.unwrap();
+        let unaddressed = insert("delete", "pending", false).await.unwrap();
+        let pending = insert("delete", "pending", true).await.unwrap();
+        let failed = insert("delete", "failed", true).await.unwrap();
+
+        // Other tests' rows may be swept too; loop until this fixture's are.
+        while sweep_orphaned_sync_tasks(&f.pool).await.expect("sweep") > 0 {}
+        let left: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM sync_tasks WHERE peer_instance_id = $1 AND artifact_id IS NULL \
+             ORDER BY id",
+        )
+        .bind(f.peer_id)
+        .fetch_all(&f.pool)
+        .await
+        .expect("left");
+        let live_push_kept: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sync_tasks WHERE id = $1)")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("live push");
+        teardown_claim_fixture(&f).await;
+
+        let mut kept = vec![pending, failed];
+        kept.sort();
+        assert_eq!(left, kept, "swept {push}, {done} and {unaddressed}");
+        assert!(live_push_kept, "a task of a live artifact is never swept");
+    }
+
     /// #5455: a receiver that refuses a mirrored delete of a released
     /// artifact (the peer key is not an administrator's token there, so the
     /// delete is an ordinary writer's) fails that delete task only; the peer
@@ -6038,7 +6335,7 @@ mod tests {
             .await
             .expect("seed active transfer counter");
 
-        svc.evaluate_for_artifact(task.artifact_id)
+        svc.evaluate_for_artifact(task.artifact_id.expect("push artifact"))
             .await
             .expect("re-evaluate artifact policy");
 

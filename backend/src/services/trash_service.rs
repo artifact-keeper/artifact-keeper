@@ -38,7 +38,10 @@
 //! shared, so the object (and its Maven checksum sidecars) is deleted only when
 //! no other `artifacts` row or `artifact_versions` revision in the same storage
 //! scope still references it; otherwise GC reclaims it later. Proxy-cache
-//! objects are never deleted: only the stale row goes.
+//! objects are never deleted: only the stale row goes. Before the row goes,
+//! the purge queues (or re-arms) a delete for every push/mirror peer in the
+//! same transaction; the task outlives the row and carries the repository key
+//! and path the sync worker sends it to (#5624).
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -461,6 +464,18 @@ impl TrashService {
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
+
+        // The peers must lose the artifact too (#5624). Its delete tasks
+        // outlive the row (`ON DELETE SET NULL`) and carry the peer address,
+        // so queue (or re-arm) one per push/mirror subscriber before the row
+        // goes, in this transaction: a purge cannot commit without them.
+        PeerInstanceService::queue_deletes_before_removal(
+            &mut tx,
+            candidate.row.repository_id,
+            &candidate.row.repository_key,
+            &[id],
+        )
+        .await?;
 
         // promotion_approvals has no ON DELETE CASCADE.
         sqlx::query("DELETE FROM promotion_approvals WHERE artifact_id = $1")
@@ -977,6 +992,111 @@ pub(crate) mod tests {
         assert!(!row_left, "the trashed row is hard-deleted");
         assert!(!object_left, "an unshared object is deleted");
         assert!(matches!(again, Err(AppError::NotFound(_))), "{again:?}");
+    }
+
+    /// `(artifact_id, status, target_repository_key, target_path)` of every
+    /// delete task queued for `peer_id`.
+    async fn peer_deletes(
+        fx: &tdh::Fixture,
+        peer_id: Uuid,
+    ) -> Vec<(Option<Uuid>, String, Option<String>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT artifact_id, status::TEXT, target_repository_key, target_path \
+             FROM sync_tasks WHERE peer_instance_id = $1 AND task_type = 'delete' \
+             ORDER BY target_path",
+        )
+        .bind(peer_id)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read peer deletes")
+    }
+
+    /// #5624: purging a trashed artifact used to take its queued peer
+    /// deletes with it (`ON DELETE CASCADE`), so push peers kept serving it.
+    /// The deletes now survive the row, addressed by repository key and path:
+    /// one queued at trash time (without an address, as before migration
+    /// 340) keeps its place, and a subscriber that had none gets one.
+    #[tokio::test]
+    async fn purge_keeps_the_peer_deletes_addressed_by_path_5624() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let path = format!("generic/purge-peers-{uid}");
+        let id = seed_trashed(&fx, &path, true).await;
+
+        let queued = subscribe_peer(&fx, &format!("{uid}-queued")).await;
+        let unqueued = subscribe_peer(&fx, &format!("{uid}-unqueued")).await;
+        let pull = subscribe_peer_with_mode(&fx, &format!("{uid}-pull"), "pull").await;
+        seed_sync_task(&fx, queued, id, "delete", "pending").await;
+
+        let purged = service(&fx, 30).purge(id).await;
+        let queued_deletes = peer_deletes(&fx, queued).await;
+        let unqueued_deletes = peer_deletes(&fx, unqueued).await;
+        let pull_deletes = peer_deletes(&fx, pull).await;
+        for peer in [queued, unqueued, pull] {
+            let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                .bind(peer)
+                .execute(&fx.pool)
+                .await;
+        }
+        fx.teardown().await;
+
+        assert!(purged.is_ok(), "{purged:?}");
+        let expected = vec![(
+            None,
+            "pending".to_string(),
+            Some(fx.repo_key.clone()),
+            Some(path.clone()),
+        )];
+        assert_eq!(
+            queued_deletes, expected,
+            "the delete queued at trash time must outlive the purged row"
+        );
+        assert_eq!(
+            unqueued_deletes, expected,
+            "a push subscriber without a queued delete gets one"
+        );
+        assert!(pull_deletes.is_empty(), "a pull subscriber gets nothing");
+    }
+
+    /// #5624: a delete left by a purged artifact is addressed by path only;
+    /// restoring a later artifact at that path still cancels it for the
+    /// peers the restore re-pushes to.
+    #[tokio::test]
+    async fn restore_cancels_a_purged_predecessors_delete_by_path_5624() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let uid = Uuid::new_v4().simple().to_string();
+        let path = format!("generic/restore-after-purge-{uid}");
+        let peer = subscribe_peer(&fx, &format!("{uid}-push")).await;
+        let svc = service(&fx, 30);
+        let first = seed_trashed(&fx, &path, true).await;
+        let purged = svc.purge(first).await;
+        let second = seed_trashed(&fx, &path, true).await;
+        let restored = svc.restore(second).await;
+        let deletes = peer_deletes(&fx, peer).await;
+        let push = sync_task_state(&fx, peer, second, "push").await;
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert!(purged.is_ok(), "{purged:?}");
+        assert!(restored.is_ok(), "{restored:?}");
+        assert_eq!(
+            deletes,
+            vec![(
+                None,
+                "cancelled".to_string(),
+                Some(fx.repo_key.clone()),
+                Some(path)
+            )],
+            "the purged artifact's delete must not take the restored one off the peer"
+        );
+        assert_eq!(push.map(|(s, _)| s).as_deref(), Some("pending"));
     }
 
     #[tokio::test]

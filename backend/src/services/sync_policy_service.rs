@@ -950,18 +950,29 @@ impl SyncPolicyService {
             .execute(&self.db)
             .await;
 
-            // Queue delete
+            // Queue delete, addressed so it survives a purge of the row (#5624)
             let _ = sqlx::query(
                 r#"
-                INSERT INTO sync_tasks (peer_instance_id, artifact_id, priority, task_type)
-                VALUES ($1, $2, 0, 'delete')
+                INSERT INTO sync_tasks (
+                    peer_instance_id, artifact_id, priority, task_type,
+                    target_repository_id, target_repository_key, target_path,
+                    target_checksum_sha256
+                )
+                SELECT $1, a.id, 0, 'delete', r.id, r.key, a.path, a.checksum_sha256
+                FROM artifacts a
+                JOIN repositories r ON r.id = a.repository_id
+                WHERE a.id = $2
                 ON CONFLICT (peer_instance_id, artifact_id, task_type)
                 DO UPDATE SET
                     status = 'pending',
                     priority = GREATEST(sync_tasks.priority, 0),
                     claimed_by = NULL,
                     claim_token = NULL,
-                    claim_expires_at = NULL
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path,
+                    target_checksum_sha256 = EXCLUDED.target_checksum_sha256
                 WHERE sync_tasks.status != 'in_progress'
                 "#,
             )

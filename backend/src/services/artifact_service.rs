@@ -40,12 +40,20 @@ const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
 /// Not filtered on `pi.status`: the sync worker already skips offline peers when it claims
 /// tasks, so filtering here dropped the delete instead of deferring it, and the peer kept the
 /// artifact once it came back.
+///
+/// Each task carries the peer address (repository key and path) so it still
+/// reaches the peer after the row is purged (#5624).
 const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
-                INSERT INTO sync_tasks (id, peer_instance_id, artifact_id, task_type, status, priority)
-                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0
+                INSERT INTO sync_tasks (
+                    id, peer_instance_id, artifact_id, task_type, status, priority,
+                    target_repository_id, target_repository_key, target_path, target_checksum_sha256
+                )
+                SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0,
+                       r.id, r.key, a.path, a.checksum_sha256
                 FROM peer_instances pi
                 JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
                 JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
+                JOIN repositories r ON r.id = a.repository_id
                 WHERE pi.is_local = false
                   AND prs.replication_mode::text IN ('push', 'mirror')
                   AND prs.sync_enabled = true
@@ -57,7 +65,11 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                     completed_at = NULL,
                     claimed_by = NULL,
                     claim_token = NULL,
-                    claim_expires_at = NULL
+                    claim_expires_at = NULL,
+                    target_repository_id = EXCLUDED.target_repository_id,
+                    target_repository_key = EXCLUDED.target_repository_key,
+                    target_path = EXCLUDED.target_path,
+                    target_checksum_sha256 = EXCLUDED.target_checksum_sha256
                 WHERE sync_tasks.status <> 'in_progress'
                 "#;
 

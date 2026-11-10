@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                st.id, st.peer_instance_id, st.artifact_id,\n                st.status as \"status: SyncStatus\",\n                st.priority, st.bytes_transferred, st.error_message,\n                st.started_at, st.completed_at, st.created_at,\n                a.storage_key, a.size_bytes as artifact_size\n            FROM sync_tasks st\n            JOIN artifacts a ON a.id = st.artifact_id\n            WHERE st.peer_instance_id = $1\n              AND st.status = 'pending'\n            ORDER BY st.priority DESC, st.created_at\n            LIMIT $2\n            ",
+  "query": "\n            SELECT\n                st.id, st.peer_instance_id, st.artifact_id as \"artifact_id!\",\n                st.status as \"status: SyncStatus\",\n                st.priority, st.bytes_transferred, st.error_message,\n                st.started_at, st.completed_at, st.created_at,\n                a.storage_key, a.size_bytes as artifact_size\n            FROM sync_tasks st\n            JOIN artifacts a ON a.id = st.artifact_id\n            WHERE st.peer_instance_id = $1\n              AND st.status = 'pending'\n            ORDER BY st.priority DESC, st.created_at\n            LIMIT $2\n            ",
   "describe": {
     "columns": [
       {
@@ -27,7 +27,7 @@
       },
       {
         "ordinal": 2,
-        "name": "artifact_id",
+        "name": "artifact_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -158,7 +158,7 @@
     "nullable": [
       false,
       false,
-      false,
+      true,
       false,
       false,
       false,
@@ -170,5 +170,5 @@
       false
     ]
   },
-  "hash": "87a2d66a7d76cb4cca35cede1822ad1cba8a63d4b9af44428ddd805ac9c8fed1"
+  "hash": "2a83d8d0cf3e92f54a59e0afeaa41d6726ee960bb5847a3942ced00ae5cc7c65"
 }
