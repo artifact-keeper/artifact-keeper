@@ -2829,16 +2829,90 @@ pub(crate) fn dpkg_status_pin(name: &str, version: &str, os: &OsPackageContext) 
     stanza
 }
 
-/// The one-record `lib/apk/db/installed` for an Alpine package pin (#4113):
-/// `P` (pkgname), `V` (pkgver), `A` (arch) and `o` (origin) from the
-/// package's own `.PKGINFO`.
+/// The `lib/apk/db/installed` for an Alpine package pin (#4113): `P`
+/// (pkgname), `V` (pkgver), `A` (arch) and `o` (origin) from the package's
+/// own `.PKGINFO`.
+///
+/// A subpackage (`libcurl`, origin `curl`) gets a second record for its
+/// origin at the same version (#5236; every package an APKBUILD builds shares
+/// its `pkgver-pkgrel`). The engine matches the distribution feed through the
+/// `o:` origin, but its NVD CPE search for the origin only rewrites the
+/// subpackage's own generated CPE (`libcurl:libcurl` becomes `curl:curl`),
+/// which misses a product NVD files under another vendor (`haxx:curl`):
+/// measured on grype 0.121.3, `libcurl 8.14.1-r4` matched 0 advisories and
+/// `curl` 40. Cataloged as itself, the origin gets the CPEs the engine's
+/// dictionary knows for it. What the engine reports for that synthetic
+/// record is attributed back to the served package by
+/// [`fold_apk_origin_record`].
 pub(crate) fn apk_installed_pin(name: &str, version: &str, os: &OsPackageContext) -> String {
-    let mut record = format!("P:{name}\nV:{version}\nA:{}\n", os.arch);
-    if let Some(origin) = os.source.as_deref() {
-        record.push_str(&format!("o:{origin}\n"));
+    let record = |pkgname: &str| {
+        let mut record = format!("P:{pkgname}\nV:{version}\nA:{}\n", os.arch);
+        if let Some(origin) = os.source.as_deref() {
+            record.push_str(&format!("o:{origin}\n"));
+        }
+        record.push('\n');
+        record
+    };
+    let mut db = record(name);
+    if let Some(origin) = apk_synthetic_origin(name, os) {
+        db.push_str(&record(origin));
     }
-    record.push('\n');
-    record
+    db
+}
+
+/// The origin [`apk_installed_pin`] writes a second record for (#5236): the
+/// pin's source package, when it names a package other than the pin itself.
+fn apk_synthetic_origin<'a>(name: &str, os: &'a OsPackageContext) -> Option<&'a str> {
+    os.source
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty() && *origin != name.trim())
+}
+
+/// Attribute what a scanner reported for the synthetic origin record of an
+/// Alpine subpackage pin (#5236, see [`apk_installed_pin`]) to the package
+/// being graded.
+///
+/// The bytes being scanned are the subpackage, so a finding against the
+/// origin record is a finding against the subpackage: it is renamed, and the
+/// callers' per-pin dedup then collapses it with the same advisory matched
+/// through the origin's distribution feed. The record is dropped from the
+/// inventory and the catalog, so the SBOM lists no component the package
+/// does not ship and the verdict records the components it graded as before.
+/// A no-op for every other pin.
+pub(crate) fn fold_apk_origin_record(output: &mut ScanOutput, pin: Option<&ExpectedComponent>) {
+    let Some(pin) = pin.filter(|p| p.ecosystem == ComponentEcosystem::Alpine) else {
+        return;
+    };
+    let Some(origin) = pin
+        .os
+        .as_ref()
+        .and_then(|os| apk_synthetic_origin(&pin.name, os))
+    else {
+        return;
+    };
+    let version = pin.version.trim();
+    let is_origin = |name: &str, v: Option<&str>| {
+        name.trim() == origin && v.is_none_or(|v| v.trim() == version)
+    };
+    for finding in &mut output.findings {
+        let Some(component) = finding.affected_component.as_deref() else {
+            continue;
+        };
+        if !is_origin(component, finding.affected_version.as_deref()) {
+            continue;
+        }
+        if let Some(advisory) = finding.title.strip_suffix(&format!(" in {origin}")) {
+            finding.title = format!("{advisory} in {}", pin.name);
+        }
+        finding.affected_component = Some(pin.name.clone());
+    }
+    output
+        .packages
+        .retain(|p| !is_origin(&p.name, p.version.as_deref()));
+    if let Some(cataloged) = output.cataloged.as_mut() {
+        cataloged.retain(|c| !is_origin(&c.name, Some(&c.version)));
+    }
 }
 
 /// The `package-lock.json` (lockfileVersion 3) body that pins exactly one
@@ -17299,9 +17373,156 @@ mod tests {
             .unwrap();
         assert_eq!(
             installed,
-            "P:libcrypto3\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n"
+            "P:libcrypto3\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n\
+             P:openssl\nV:3.1.4-r0\nA:x86_64\no:openssl\n\n",
+            "a subpackage is written with its origin's record too (#5236)"
         );
         assert!(!ws.join(DPKG_STATUS_PATH).exists());
+    }
+
+    /// #5236: an Alpine subpackage's synthetic installed db carries a second
+    /// record for its origin at the same version, so the engine catalogs the
+    /// origin as itself and searches the CPEs it knows for it (`haxx:curl`
+    /// for `curl`; `libcurl` alone generated only `libcurl:libcurl`). A
+    /// package that is its own origin, or names none, gets one record.
+    #[test]
+    fn apk_installed_pin_adds_the_origin_record_for_a_subpackage_5236() {
+        let ctx = |source: Option<&str>| os_context("alpine", "3.22", "x86_64", source);
+        assert_eq!(
+            apk_installed_pin("libcurl", "8.14.1-r4", &ctx(Some("curl"))),
+            "P:libcurl\nV:8.14.1-r4\nA:x86_64\no:curl\n\n\
+             P:curl\nV:8.14.1-r4\nA:x86_64\no:curl\n\n"
+        );
+        assert_eq!(
+            apk_installed_pin("curl", "8.14.1-r4", &ctx(Some("curl"))),
+            "P:curl\nV:8.14.1-r4\nA:x86_64\no:curl\n\n"
+        );
+        assert_eq!(
+            apk_installed_pin("busybox", "1.36.1-r15", &ctx(None)),
+            "P:busybox\nV:1.36.1-r15\nA:x86_64\n\n"
+        );
+        assert_eq!(
+            apk_installed_pin("busybox", "1.36.1-r15", &ctx(Some(" "))),
+            "P:busybox\nV:1.36.1-r15\nA:x86_64\no: \n\n",
+            "a blank origin names no second package"
+        );
+    }
+
+    /// #5236: what a scanner reports for the synthetic origin record is the
+    /// subpackage's. Its findings are renamed to the served package (so the
+    /// per-pin dedup collapses an advisory matched both through the origin's
+    /// feed and on the record), and the record leaves the inventory and the
+    /// catalog. Other components, and every non-Alpine pin, are untouched.
+    #[test]
+    fn fold_apk_origin_record_attributes_the_origin_record_to_the_subpackage_5236() {
+        let finding = |component: &str, version: &str, cve: &str| RawFinding {
+            severity: Severity::Critical,
+            title: format!("{cve} in {component}"),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some(component.to_string()),
+            affected_version: Some(version.to_string()),
+            fixed_version: None,
+            source: Some("grype".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        };
+        let package = |name: &str, version: &str| RawPackage {
+            name: name.to_string(),
+            version: Some(version.to_string()),
+            purl: None,
+            license: None,
+            source_target: None,
+        };
+        let cataloged = |name: &str, version: &str| CatalogedComponent {
+            name: name.to_string(),
+            version: version.to_string(),
+        };
+        let output = || ScanOutput {
+            findings: vec![
+                finding("libcurl", "8.14.1-r4", "CVE-2025-0001"),
+                finding("curl", "8.14.1-r4", "CVE-2025-0001"),
+                finding("curl", "8.14.1-r4", "CVE-2025-0002"),
+                finding("curl", "7.0.0-r0", "CVE-2025-0003"),
+            ],
+            packages: vec![
+                package("libcurl", "8.14.1-r4"),
+                package("curl", "8.14.1-r4"),
+                package("alpine-baselayout", "3.7.0-r0"),
+            ],
+            scan_completeness: ScanCompleteness::Complete,
+            cataloged: Some(vec![
+                cataloged("libcurl", "8.14.1-r4"),
+                cataloged("curl", "8.14.1-r4"),
+            ]),
+            vuln_db: None,
+        };
+        let pin = ExpectedComponent::os_package(
+            ComponentEcosystem::Alpine,
+            "libcurl",
+            "8.14.1-r4",
+            os_context("alpine", "3.22", "x86_64", Some("curl")),
+        )
+        .unwrap();
+
+        let mut folded = output();
+        fold_apk_origin_record(&mut folded, Some(&pin));
+        let named: Vec<(&str, &str)> = folded
+            .findings
+            .iter()
+            .map(|f| (f.affected_component.as_deref().unwrap(), f.title.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("libcurl", "CVE-2025-0001 in libcurl"),
+                ("libcurl", "CVE-2025-0001 in libcurl"),
+                ("libcurl", "CVE-2025-0002 in libcurl"),
+                // Another version of the origin is not the synthetic record.
+                ("curl", "CVE-2025-0003 in curl"),
+            ]
+        );
+        assert_eq!(
+            folded
+                .packages
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["libcurl", "alpine-baselayout"]
+        );
+        assert_eq!(
+            folded.cataloged,
+            Some(vec![cataloged("libcurl", "8.14.1-r4")])
+        );
+        // The pin's dedup then counts the doubly matched advisory once.
+        let deduped = dedupe_findings(folded.findings, Some(ComponentEcosystem::Alpine));
+        assert_eq!(deduped.len(), 3, "{deduped:?}");
+
+        // No-ops: a package that is its own origin, a Debian pin, no pin.
+        let own = ExpectedComponent::os_package(
+            ComponentEcosystem::Alpine,
+            "curl",
+            "8.14.1-r4",
+            os_context("alpine", "3.22", "x86_64", Some("curl")),
+        )
+        .unwrap();
+        let deb = ExpectedComponent::os_package(
+            ComponentEcosystem::Debian,
+            "libcurl4",
+            "8.14.1-r4",
+            os_context("debian", "12", "amd64", Some("curl")),
+        )
+        .unwrap();
+        for pin in [Some(&own), Some(&deb), None] {
+            let mut untouched = output();
+            fold_apk_origin_record(&mut untouched, pin);
+            assert_eq!(
+                format!("{:?}", untouched.findings),
+                format!("{:?}", output().findings)
+            );
+            assert_eq!(untouched.packages, output().packages);
+            assert_eq!(untouched.cataloged, output().cataloged);
+        }
     }
 
     /// An OS package pin with no release would catalog the package and grade

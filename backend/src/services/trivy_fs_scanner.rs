@@ -348,6 +348,8 @@ impl TrivyFsScanner {
         );
         // #3014: the adapter's DB for this scan (None in CLI mode).
         output.vuln_db = vuln_db;
+        // #5236: an Alpine subpackage pin's synthetic origin record.
+        crate::services::scanner_service::fold_apk_origin_record(&mut output, pin);
 
         info!(
             "Trivy filesystem scan complete for {}: {} vulnerabilities, {} packages, completeness={}",
