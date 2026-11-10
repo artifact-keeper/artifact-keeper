@@ -84,7 +84,9 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # the toolchain and stays suppressed in /.trivyignore — see Dockerfile.backend
 # for why no override version exists to point at. Still true at v0.118.0 (#3655) and
 # at v0.120.1 (#3698): the pin is unchanged and the override still fails to
-# resolve.
+# resolve. No longer true at v0.121.3 (#5565): upstream dropped docker/docker
+# for github.com/moby/moby/client, and the five .trivyignore tokens are
+# tombstoned.
 #
 # The golang.org/x/mod override #3465 added here is GONE at #3655: grype
 # v0.118.0 pins x/mod v0.40.0 itself, so the tag bump replaced it.
@@ -97,16 +99,18 @@ RUN if [ -n "${APP_VERSION}" ]; then \
 # floor asserted on the compiled binary. The full justification lives in
 # Dockerfile.backend — read it there rather than duplicating a second copy
 # that can drift.
+#
+# The v0.120.1 -> v0.121.3 bump at #5565 retired both remaining overrides:
+# v0.121.3 pins golang.org/x/net v0.62.0 and github.com/go-jose/go-jose/v4
+# v4.1.6 itself (and brotli v1.2.8 / klauspost/compress v1.20.3, the GO-2026-6888
+# / GO-2026-6865 fixes). What remains is the x/crypto floor; this stage now
+# builds upstream's module graph unmodified.
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS grype-bin
 ARG TARGETOS
 ARG TARGETARCH
-ARG GRYPE_VERSION=0.120.1
-ARG GRYPE_COMMIT=6f8d854af29d3a3086b11a84afa51554a2a245fe
+ARG GRYPE_VERSION=0.121.3
+ARG GRYPE_COMMIT=cd1f23eb50dfb52647090158f453c7359172591f
 ARG GO_MIN_PATCH=1.27.3
-ARG XNET_FROM=v0.59.0
-ARG XNET_TO=v0.60.0
-ARG GOJOSE_FROM=v4.1.5
-ARG GOJOSE_TO=v4.1.6
 ARG XCRYPTO_MIN=v0.56.0
 
 RUN apk add --no-cache git ca-certificates
@@ -131,71 +135,10 @@ RUN set -eu; \
       exit 1; \
     fi
 
-# Dependency override — golang.org/x/net, CVE-2026-78669. See Dockerfile.backend
-# for the levers checked, the policy exception, the reachability finding and
-# the MVS set (seven modules on v0.118.0; only x/net itself on v0.120.1, #3698).
-RUN set -eu; \
-    xnet_pin() { sed -n 's|^[[:space:]]*golang\.org/x/net \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
-    have="$(xnet_pin)"; \
-    if [ "${have}" != "${XNET_FROM}" ]; then \
-      echo "ERROR: grype v${GRYPE_VERSION} pins golang.org/x/net ${have}, not ${XNET_FROM}." >&2; \
-      echo "       This override was written against ${XNET_FROM}. If upstream now" >&2; \
-      echo "       ships >= ${XNET_TO}, DELETE the x/net override block in this stage." >&2; \
-      echo "       If it moved to some other version, re-review it." >&2; \
-      exit 1; \
-    fi; \
-    cp go.mod /tmp/go.mod.before-xnet; \
-    go get "golang.org/x/net@${XNET_TO}"; \
-    got="$(xnet_pin)"; \
-    if [ "${got}" != "${XNET_TO}" ]; then \
-      echo "ERROR: override did not take: go.mod pins golang.org/x/net ${got}." >&2; \
-      exit 1; \
-    fi; \
-    moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-xnet go.mod \
-             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
-    expected="golang.org/x/net "; \
-    if [ "${moved}" != "${expected}" ]; then \
-      echo "ERROR: go get moved an undeclared set of modules." >&2; \
-      echo "       expected: ${expected}" >&2; \
-      echo "       actual:   ${moved}" >&2; \
-      echo "       Re-review the x/net override and update the declared set." >&2; \
-      exit 1; \
-    fi; \
-    go mod verify; \
-    echo "grype build: override applied — golang.org/x/net ${XNET_FROM} -> ${XNET_TO}"
-
-# Dependency override: github.com/go-jose/go-jose/v4, CVE-2026-116587 (#5041).
-# See Dockerfile.backend for the levers checked, the upstream bump it follows
-# (anchore/grype#3854), the reachability note and the removal condition.
-RUN set -eu; \
-    jose_pin() { sed -n 's|^[[:space:]]*github\.com/go-jose/go-jose/v4 \(v[^ ]*\).*|\1|p' go.mod | head -n1; }; \
-    have="$(jose_pin)"; \
-    if [ "${have}" != "${GOJOSE_FROM}" ]; then \
-      echo "ERROR: grype v${GRYPE_VERSION} pins github.com/go-jose/go-jose/v4 ${have}, not ${GOJOSE_FROM}." >&2; \
-      echo "       This override was written against ${GOJOSE_FROM}. If upstream now" >&2; \
-      echo "       ships >= ${GOJOSE_TO}, DELETE the go-jose override block in this stage." >&2; \
-      echo "       If it moved to some other version, re-review it." >&2; \
-      exit 1; \
-    fi; \
-    cp go.mod /tmp/go.mod.before-gojose; \
-    go get "github.com/go-jose/go-jose/v4@${GOJOSE_TO}"; \
-    got="$(jose_pin)"; \
-    if [ "${got}" != "${GOJOSE_TO}" ]; then \
-      echo "ERROR: override did not take: go.mod pins github.com/go-jose/go-jose/v4 ${got}." >&2; \
-      exit 1; \
-    fi; \
-    moved="$(git --no-pager diff --no-index --unified=0 /tmp/go.mod.before-gojose go.mod \
-             | sed -n 's|^+[[:space:]]*\([^ ]*\) v.*|\1|p' | sort -u | tr '\n' ' ')"; \
-    expected="github.com/go-jose/go-jose/v4 "; \
-    if [ "${moved}" != "${expected}" ]; then \
-      echo "ERROR: go get moved an undeclared set of modules." >&2; \
-      echo "       expected: ${expected}" >&2; \
-      echo "       actual:   ${moved}" >&2; \
-      echo "       Re-review the go-jose override and update the declared set." >&2; \
-      exit 1; \
-    fi; \
-    go mod verify; \
-    echo "grype build: override applied: github.com/go-jose/go-jose/v4 ${GOJOSE_FROM} -> ${GOJOSE_TO}"
+# RETIRED: golang.org/x/net override (CVE-2026-78669; removed at #5565, v0.121.3
+# pins v0.62.0) and github.com/go-jose/go-jose/v4 override (CVE-2026-116587,
+# #5041; removed at #5565, v0.121.3 pins v4.1.6). See the tombstones in
+# Dockerfile.backend.
 
 RUN set -eu; \
     build_date="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)"; \
@@ -209,23 +152,15 @@ RUN set -eu; \
         ./cmd/grype; \
     install -Dm644 LICENSE /licenses/grype/LICENSE
 
-# Prove the override reached the compiled binary's build info, which is what
-# Trivy actually reads, and that x/crypto is at or above the #3698 floor — see
-# Dockerfile.backend (#3655, #3698).
+# Prove x/crypto is at or above the #3698 floor in the compiled binary's build
+# info, which is what Trivy actually reads — see Dockerfile.backend (#3698,
+# #5565: the x/net and go-jose checks left with their overrides).
 RUN set -eu; \
     info="$(go version -m /grype)"; \
     deps="$(printf '%s\n' "${info}" | grep -c '^[[:space:]]*dep[[:space:]]')"; \
     if [ "${deps}" -lt 50 ]; then \
       echo "ERROR: /grype reports only ${deps} dependency records; build info is" >&2; \
-      echo "       unreadable or implausible, so the override is unverified." >&2; \
-      exit 1; \
-    fi; \
-    xnet="$(printf '%s\n' "${info}" \
-            | sed -n 's|^[[:space:]]*dep[[:space:]]*golang\.org/x/net[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
-            | head -n1)"; \
-    if [ "${xnet}" != "${XNET_TO}" ]; then \
-      echo "ERROR: compiled grype records golang.org/x/net '${xnet}', want ${XNET_TO}." >&2; \
-      echo "       The Trivy gate reads this build info; the override did not ship." >&2; \
+      echo "       unreadable or implausible, so the x/crypto floor is unverified." >&2; \
       exit 1; \
     fi; \
     xcrypto="$(printf '%s\n' "${info}" \
@@ -237,15 +172,7 @@ RUN set -eu; \
       echo "       That re-ships CVE-2026-56855 / CVE-2026-78662 (#3698)." >&2; \
       exit 1; \
     fi; \
-    jose="$(printf '%s\n' "${info}" \
-            | sed -n 's|^[[:space:]]*dep[[:space:]]*github\.com/go-jose/go-jose/v4[[:space:]]*\(v[^[:space:]]*\).*|\1|p' \
-            | head -n1)"; \
-    if [ "${jose}" != "${GOJOSE_TO}" ]; then \
-      echo "ERROR: compiled grype records github.com/go-jose/go-jose/v4 '${jose}', want ${GOJOSE_TO}." >&2; \
-      echo "       The Trivy gate reads this build info; the override did not ship (#5041)." >&2; \
-      exit 1; \
-    fi; \
-    echo "grype build: build info verified: golang.org/x/net ${xnet}, golang.org/x/crypto ${xcrypto}, go-jose ${jose} across ${deps} deps"
+    echo "grype build: build info verified: golang.org/x/crypto ${xcrypto} across ${deps} deps"
 
 # ---------- Stage 4b: Pre-seed the Grype vulnerability DB ----------
 # Populates the Grype DB at build time so the image works on egress-restricted

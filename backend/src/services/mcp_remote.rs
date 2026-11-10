@@ -553,6 +553,83 @@ fn db_err(e: impl std::fmt::Display) -> String {
     format!("database: {e}")
 }
 
+/// Why an ingest failed.
+///
+/// A failure to write the version's bytes to the repository's storage is
+/// kept apart from the rest (#5660): an approval answers it instead of
+/// reporting the approval done and deferring the ingest to the next sync,
+/// which is right for an unreachable upstream but hid a storage refusal that
+/// every retry repeats.
+#[derive(Debug)]
+pub enum IngestError {
+    /// Upstream unreachable or answering something unusable, a database
+    /// error: the next sync retries.
+    Deferred(String),
+    /// The version's bytes could not be stored (the cross-repository write
+    /// guard's 409, a quota refusal, a backend failure).
+    Store(crate::error::AppError),
+}
+
+impl std::fmt::Display for IngestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deferred(e) => f.write_str(e),
+            Self::Store(e) => write!(f, "storage: {e}"),
+        }
+    }
+}
+
+impl From<String> for IngestError {
+    fn from(e: String) -> Self {
+        Self::Deferred(e)
+    }
+}
+
+impl From<IngestError> for String {
+    fn from(e: IngestError) -> Self {
+        e.to_string()
+    }
+}
+
+/// The error a failed storage write of `key` answered with `status`, as the
+/// service-layer error an approval returns.
+fn store_failure(key: &str, status: axum::http::StatusCode) -> crate::error::AppError {
+    use crate::error::AppError;
+    use axum::http::StatusCode;
+    let message = format!("storing '{key}' failed ({status})");
+    match status {
+        StatusCode::CONFLICT => AppError::Conflict(message),
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::INSUFFICIENT_STORAGE => {
+            AppError::QuotaExceeded(message)
+        }
+        _ => AppError::Storage(message),
+    }
+}
+
+/// Write the bytes of an ingested version under `key`.
+///
+/// The cross-repository write guard runs here first so its refusal keeps
+/// its message ("already owned by another repository") for the approval to
+/// answer; `put_artifact_bytes` runs it again, with the quota preflight.
+async fn store_version_bytes(
+    state: &SharedState,
+    repo: &RepoInfo,
+    key: &str,
+    bytes: axum::body::Bytes,
+) -> Result<(), IngestError> {
+    crate::services::artifact_service::guard_foreign_storage_key_for_backend(
+        &state.db,
+        repo.id,
+        &repo.storage_backend,
+        key,
+    )
+    .await
+    .map_err(IngestError::Store)?;
+    proxy_helpers::put_artifact_bytes(state, repo, key, bytes)
+        .await
+        .map_err(|r| IngestError::Store(store_failure(key, r.status())))
+}
+
 /// Everything one run (or one approval-triggered ingest) reads once.
 pub struct RunCtx<'a> {
     pub state: &'a SharedState,
@@ -1012,22 +1089,28 @@ async fn insert_version(
     admitted: &Admitted,
     metadata: &serde_json::Value,
     pins: &[PackagePin],
-) -> Result<Uuid, String> {
+) -> Result<Uuid, IngestError> {
     let db = &run.state.db;
     let repo = run.repo;
     let name = &admitted.server.name;
     let version = &admitted.server.version;
     let path = fmt::storage_path(name, version);
-    let key = fmt::storage_key(name, version, &admitted.sha256);
+    // Repo-scoped on a shared cloud namespace (#5660): two Remotes of one
+    // upstream hold the same version without sharing its object.
+    let key = fmt::storage_key(
+        fmt::KeyScope::of(&repo.storage_backend, repo.id),
+        name,
+        version,
+        &admitted.sha256,
+    );
     let size = admitted.bytes.len() as i64;
-    proxy_helpers::put_artifact_bytes(
+    store_version_bytes(
         run.state,
         repo,
         &key,
         axum::body::Bytes::from(admitted.bytes.clone()),
     )
-    .await
-    .map_err(|r| format!("storage: {}", r.status()))?;
+    .await?;
     let mut tx =
         crate::api::handlers::publish_quota::begin_admitted_publish(db, repo.id, &path, size)
             .await
@@ -1240,7 +1323,7 @@ async fn mark_drifted(db: &PgPool, id: Uuid) -> Result<(), String> {
 pub async fn ingest_entry(
     run: &RunCtx<'_>,
     entry: &UpstreamEntry,
-) -> Result<IngestOutcome, String> {
+) -> Result<IngestOutcome, IngestError> {
     let admitted = match admit_upstream(entry) {
         Ok(a) => a,
         Err(e) => {
@@ -1333,7 +1416,7 @@ pub async fn ingest_entry(
 /// lacks and that is not stored yet is read on its own with
 /// `include_deleted=true`: a version already deleted upstream is then stored
 /// with status `deleted`, as in `mirror` mode.
-pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, String> {
+pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, IngestError> {
     // A name whose every version is deleted upstream has no list (`404`):
     // its summarised versions are still read one by one.
     let (page, list_err) = match run.fetch(&versions_path(name)).await {
@@ -1386,7 +1469,7 @@ pub async fn ingest_name(run: &RunCtx<'_>, name: &str) -> Result<SyncSummary, St
         }
     }
     match list_err {
-        Some(e) if read_alone == 0 => Err(e),
+        Some(e) if read_alone == 0 => Err(e.into()),
         _ => Ok(summary),
     }
 }
@@ -1427,7 +1510,7 @@ pub async fn ingest_version(
     run: &RunCtx<'_>,
     name: &str,
     version: &str,
-) -> Result<IngestOutcome, String> {
+) -> Result<IngestOutcome, IngestError> {
     let bytes = run.fetch(&version_path(name, version)).await?;
     let doc: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("upstream sent invalid JSON: {e}"))?;
@@ -1576,7 +1659,7 @@ async fn apply_page(
                 Err(e) => {
                     // An approved name retries through `backfill`.
                     mark_needs_ingest(&run.state.db, row.id).await?;
-                    summary.errors.push(e);
+                    summary.errors.push(e.into());
                 }
             }
         }
@@ -1766,7 +1849,7 @@ async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), Str
                 summary.backfilled_names += 1;
                 clear_needs_ingest(&run.state.db, row.id).await?;
             }
-            Err(e) => summary.errors.push(e),
+            Err(e) => summary.errors.push(e.into()),
         }
     }
     Ok(())
@@ -2139,7 +2222,7 @@ pub async fn ingest_after_approval(
     repo: &RepoInfo,
     name: &str,
     version: &str,
-) -> Result<SyncSummary, String> {
+) -> Result<SyncSummary, IngestError> {
     let run = RunCtx::load(state, repo).await.map_err(|e| e.to_string())?;
     if run.denied(name) {
         return Ok(SyncSummary::default());

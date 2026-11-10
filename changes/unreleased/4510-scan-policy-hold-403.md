@@ -1,5 +1,0 @@
----
-section: Changed
-issues: [#4510]
----
-- **A download refused by a scan-policy hold now answers 403, not 409** (#4510). A scan policy that refused an artifact after a scan stored the refusal as a quarantine hold, so every download route answered the quarantine `409` ("pending security review"), and a client or CI job that retries on `409` waited for a release that waiting never brings. Hosted holds now record where they came from (`artifacts.quarantine_source`, migration 299: `upload`, `admin` or `scan_policy`), and the gate answers a scan-policy hold with the same `403` and neutral body the scan-policy gate already used. A hold that recorded no source (written before 1.12.0, by a 1.11 replica during a rolling upgrade, or by the scanner) answers `403` exactly when a scan policy refuses the artifact now, so the change needs no backfill. Upload-period and administrator holds still answer `409`. **Client impact:** treat `403` on a held artifact as final until the findings are resolved; see docs/security/download-holds.md. During a rolling upgrade, replicas still on 1.11 keep answering `409` for these holds until they are upgraded.

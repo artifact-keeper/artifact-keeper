@@ -10,7 +10,7 @@ use thiserror::Error;
 
 /// Retry-After hint (seconds) sent on 503 Service Unavailable responses so
 /// well-behaved clients back off instead of hammering a saturated server.
-const RETRY_AFTER_SECS_ON_503: &str = "1";
+pub(crate) const RETRY_AFTER_SECS_ON_503: &str = "1";
 
 /// Application result type alias
 pub type Result<T> = std::result::Result<T, AppError>;

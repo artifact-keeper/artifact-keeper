@@ -75,6 +75,56 @@ reached through:
 A repository the caller may not read never appears in a listing or in search
 results for that caller.
 
+### Write refusals to callers who cannot read
+
+A write or delete refused to an authenticated caller who cannot read the
+repository answers exactly what a key naming no repository answers, on every
+surface (#5458). Examples of such callers are an owner of some other
+repository and a token scoped to other repositories. The answers are:
+
+- native package-manager routes (`/pypi/...`, `/npm/...`, `/maven/...`, the
+  MCP registry, ...): `404 Repository not found`, the same status, headers and
+  body as an unknown key;
+- the REST API under `/api/v1/repositories/{key}`: `404`
+  `{"code": "NOT_FOUND", "message": "Repository not found"}`, as for an unknown
+  key. This covers every route behind the shared write gate
+  (`require_repo_write_access`: artifact uploads and deletes, chunked upload
+  sessions, labels, security and scan settings, cache TTL, upstream
+  credentials, egress proxy, upstream filters). It also covers `PATCH` and
+  `DELETE` of the repository itself, environment ingest and delete,
+  `GET .../npm-scope-policy`, the Remote-only routes (`upstream-auth`,
+  `egress-proxy`, `test-upstream`, and `GET`/`PUT`/`DELETE .../proxy-cache-cap`
+  (#5610), which also hide the wrong-type `400` and the token-scope and admin
+  `403`), the virtual member routes (`GET`/`PUT`/`POST .../members` (the `GET`
+  since #5612), `DELETE .../members/{member}`, which also hide the wrong-type
+  `400` and, for the `GET`, the token-scope `403`), the conda allowlist of a virtual
+  conda repository, `POST /api/v1/curation/repos/{key}/sync`, and the Remote MCP
+  management routes;
+- OCI (`/v2/<name>/...` push and delete): `404 NAME_UNKNOWN`, echoing the
+  requested key exactly as a miss does. The `/v2` format check runs after the
+  write gate, so a push to a non-OCI key the caller cannot read is not told
+  the key's format. Docker-mirror mode (`AK_DEFAULT_DOCKER_MIRROR_REPO`) does
+  not apply to writes: a push to a key naming no repository is `404
+  NAME_UNKNOWN`, never the mirror's answer, because a pull-through mirror
+  never accepts a push.
+
+Before this, such a write answered `403` for an existing private repository
+(or an `internal` one, for a token scoped elsewhere) and `404` for an unknown
+key, so trying to write
+enumerated private repository keys. The refusal is decided before anything
+repository-specific runs, and nothing is written.
+
+A caller who **can** read the repository but may not write it still gets
+`403`: it already knows the repository exists. So does every caller on a
+`public` repository, and every authenticated caller on an `internal` one,
+except a token scoped elsewhere, which cannot read it either.
+
+**Troubleshooting.** A CI job whose token is scoped to the wrong repository,
+or a user who lost their grant, now sees "not found" (`404 Repository not
+found`, `NAME_UNKNOWN`, or on the MCP registry the unknown-server-name `404`)
+when publishing to a private repository, not "forbidden". Check the token's
+repository scope and the caller's grants before checking the key's spelling.
+
 Changing a repository's visibility is propagated to every serving instance
 immediately: the change fires the repository-changed `NOTIFY` trigger, which
 evicts the cached repository record. Without that, a repository narrowed from

@@ -6,9 +6,11 @@
 //! which command, which environment. The rules it applies:
 //!
 //! * install only from AK: `npx --registry=<registryBaseUrl>`, `uvx
-//!   --default-index <registryBaseUrl>/simple`, or the AK-served OCI digest;
-//!   publisher `runtimeArguments` are dropped (they are where `--registry`
-//!   and `-v /:/host` would go), and environment variables that steer a
+//!   --default-index <registryBaseUrl>/simple`, or a canonical AK-served OCI
+//!   reference with exactly one lower-case SHA-256 digest; an OCI package's
+//!   legacy source fields are refused. Publisher `runtimeArguments` are
+//!   dropped (they are where `--registry` and `-v /:/host` would go), and
+//!   environment variables that steer a
 //!   package manager (`NPM_CONFIG_*`, `UV_*`, `PIP_*`, ...) are refused;
 //! * no real secrets: every `isSecret` value, every required value without
 //!   a default, and every `{template}` value becomes `AK_PLACEHOLDER_<NAME>`;
@@ -30,8 +32,11 @@
 
 use std::time::Duration;
 
+use artifact_keeper_backend::formats::mcp::{host_of, parse_oci_reference, OciRefError};
 use serde::Serialize;
 use serde_json::Value;
+
+mod source;
 
 pub const WALL_CLOCK: Duration = Duration::from_secs(120);
 pub const PLACEHOLDER_PREFIX: &str = "AK_PLACEHOLDER_";
@@ -233,9 +238,14 @@ fn flag(v: &Value, k: &str) -> bool {
 }
 
 /// The value an input (argument or environment variable) gets in the guest.
-fn input_value(input: &Value, label: &str) -> Option<String> {
+/// With `credential_names` (npm and PyPI guests), an input whose name ends in
+/// a credential word (`*_TOKEN`, `--password`, ...) gets a placeholder even
+/// when the publisher did not mark it secret.
+fn input_value(input: &Value, label: &str, credential_names: bool) -> Option<String> {
     let given = s(input, "value").or_else(|| s(input, "default"));
-    if flag(input, "isSecret") || given.is_some_and(|g| g.contains('{')) {
+    let credential =
+        credential_names && s(input, "name").is_some_and(source::looks_like_credential);
+    if flag(input, "isSecret") || credential || given.is_some_and(|g| g.contains('{')) {
         return Some(placeholder(label));
     }
     match given {
@@ -256,7 +266,11 @@ fn valid_env_name(n: &str) -> bool {
 
 /// The guest environment: [`BASE_ENV`] plus the package's
 /// `environmentVariables` (placeholders for secrets, refused names dropped).
-pub fn guest_env(package: &Value, notes: &mut Vec<String>) -> Vec<(String, String)> {
+pub fn guest_env(
+    package: &Value,
+    credential_names: bool,
+    notes: &mut Vec<String>,
+) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = BASE_ENV
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -273,7 +287,7 @@ pub fn guest_env(package: &Value, notes: &mut Vec<String>) -> Vec<(String, Strin
             notes.push(format!("environment variable `{name}` dropped"));
             continue;
         }
-        if let Some(v) = input_value(var, name) {
+        if let Some(v) = input_value(var, name, credential_names) {
             env.retain(|(k, _)| k != name);
             env.push((name.to_string(), v));
         }
@@ -282,7 +296,7 @@ pub fn guest_env(package: &Value, notes: &mut Vec<String>) -> Vec<(String, Strin
 }
 
 /// The package's `packageArguments` for the guest command.
-pub fn package_args(package: &Value) -> Vec<String> {
+pub fn package_args(package: &Value, credential_names: bool) -> Vec<String> {
     let args = package
         .get("packageArguments")
         .and_then(|a| a.as_array())
@@ -297,7 +311,7 @@ pub fn package_args(package: &Value) -> Vec<String> {
         match s(a, "type") {
             Some("named") => {
                 let Some(name) = s(a, "name") else { continue };
-                if let Some(v) = input_value(a, &label) {
+                if let Some(v) = input_value(a, &label, credential_names) {
                     out.push(name.to_string());
                     out.push(v);
                 } else if flag(a, "isRequired") || a.get("value").is_none() {
@@ -305,13 +319,87 @@ pub fn package_args(package: &Value) -> Vec<String> {
                 }
             }
             _ => {
-                if let Some(v) = input_value(a, &label) {
+                if let Some(v) = input_value(a, &label, credential_names) {
                     out.push(v);
                 }
             }
         }
     }
     out
+}
+
+/// The one image an OCI job may run: a canonical reference on the job's AK
+/// origin with exactly one SHA-256 digest. The returned string is handed to
+/// the engine verbatim, so no other field or argument can choose the source.
+fn oci_image(identifier: &str, ak_base_url: &str) -> Result<String, SandboxError> {
+    let invalid = |m: &str| SandboxError::Invalid(format!("OCI identifier: {m}"));
+    let base = url::Url::parse(ak_base_url)
+        .map_err(|_| SandboxError::Invalid("AK base URL is not a URL".into()))?;
+    if base.host_str().is_none() {
+        return Err(SandboxError::Invalid("AK base URL has no host".into()));
+    }
+    let ak_host = host_of(ak_base_url);
+    // An image reference only names a registry host whose first component
+    // contains `.` or `:` or is `localhost`; any other first component is a
+    // Docker Hub namespace, so a bare service name can never be this AK.
+    if !(ak_host.contains('.') || ak_host.contains(':') || ak_host == "localhost") {
+        return Err(SandboxError::Invalid(format!(
+            "AK host `{ak_host}` cannot name an OCI registry: it must contain `.` or `:`, \
+             or be `localhost`"
+        )));
+    }
+    if identifier.matches('@').count() != 1 {
+        return Err(invalid("exactly one `@sha256:<digest>` is required"));
+    }
+    // `parse_oci_reference` resolves a floating tag rather than refusing it,
+    // so `Invalid` is the only error it returns.
+    let (image, _) = parse_oci_reference(identifier).map_err(|e| {
+        invalid(match &e {
+            OciRefError::Invalid(m) => m,
+            OciRefError::Floating => "not an image reference",
+        })
+    })?;
+    // The parser has checked the digest's length and lower-case hex; only
+    // the algorithm is left.
+    let digest = image
+        .digest
+        .as_deref()
+        .filter(|d| d.starts_with("sha256:"))
+        .ok_or_else(|| invalid("the digest must be SHA-256"))?;
+    if image.host != ak_host {
+        return Err(invalid("the image host is not this AK instance"));
+    }
+    // An AK OCI reference is `<ak host>/<repository>/<name>[...]`; a bare
+    // image name is not a repository path this instance serves.
+    if image.path.split('/').count() < 2 {
+        return Err(invalid("the path is not an AK repository/image path"));
+    }
+    let mut canonical = format!("{}/{}", image.host, image.path);
+    if let Some(tag) = &image.tag {
+        canonical.push(':');
+        canonical.push_str(tag);
+    }
+    canonical.push('@');
+    canonical.push_str(digest);
+    if canonical != identifier {
+        return Err(invalid("the reference is not canonical"));
+    }
+    Ok(canonical)
+}
+
+/// OCI keeps its source in `identifier`. Refuse the legacy source fields
+/// instead of letting a second value compete with the validated reference.
+/// (Publisher `runtimeArguments` are dropped with a note, as for npm/PyPI:
+/// the engine arguments are fixed by the runner.)
+fn reject_oci_source_overrides(package: &Value) -> Result<(), SandboxError> {
+    for field in ["version", "registryBaseUrl", "fileSha256"] {
+        if package.get(field).is_some_and(|v| !v.is_null()) {
+            return Err(SandboxError::Invalid(format!(
+                "OCI package must put its tag or digest in `identifier`, not `{field}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The claimed job's `target` and AK origin as a runner-neutral spec.
@@ -329,6 +417,17 @@ pub fn guest_spec(
         .filter(|i| !i.is_empty() && !i.starts_with('-'))
         .ok_or_else(|| SandboxError::Invalid("package has no identifier".into()))?;
     let mut notes = Vec::new();
+    let ak = ak_base_url.trim_end_matches('/');
+    source::ak_base(ak)?;
+    // npm and PyPI install from the AK registry only (#5446): whatever could
+    // name another source is refused here, before a runner sees the spec.
+    let confined = matches!(kind, "npm" | "pypi");
+    if confined {
+        source::check_coordinates(kind, identifier, s(package, "version"))?;
+        let runtime = source::raw_arg_tokens(package, "runtimeArguments");
+        source::check_args(kind, "runtimeArguments", &runtime)?;
+        source::check_env(kind, package)?;
+    }
     if package
         .get("runtimeArguments")
         .and_then(|a| a.as_array())
@@ -336,15 +435,12 @@ pub fn guest_spec(
     {
         notes.push("runtimeArguments ignored".into());
     }
-    let env = guest_env(package, &mut notes);
-    let args = package_args(package);
-    let ak = ak_base_url.trim_end_matches('/');
-    let registry = || {
-        s(package, "registryBaseUrl")
-            .filter(|r| r.starts_with(ak))
-            .map(|r| r.trim_end_matches('/').to_string())
-            .ok_or_else(|| SandboxError::Invalid("registryBaseUrl is not this AK instance".into()))
-    };
+    let env = guest_env(package, confined, &mut notes);
+    let args = package_args(package, confined);
+    if confined {
+        source::check_args(kind, "packageArguments", &args)?;
+    }
+    let registry = || source::registry_url(kind, s(package, "registryBaseUrl"), ak);
     let version = || {
         s(package, "version")
             .filter(|v| !v.is_empty())
@@ -373,13 +469,8 @@ pub fn guest_spec(
             "ak-only",
         ),
         "oci" => {
-            let host = artifact_keeper_backend::formats::mcp::host_of(ak);
-            if !identifier.starts_with(&format!("{host}/")) || !identifier.contains("@sha256:") {
-                return Err(SandboxError::Invalid(
-                    "OCI identifier is not a digest served by this AK instance".into(),
-                ));
-            }
-            (identifier.to_string(), Vec::new(), "none")
+            reject_oci_source_overrides(package)?;
+            (oci_image(identifier, ak)?, Vec::new(), "none")
         }
         other => {
             return Err(SandboxError::Unsupported(format!(
@@ -1191,12 +1282,16 @@ mod tests {
 
     const AK: &str = "https://ak.example.test";
 
+    fn oci_digest() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
     fn npm_target() -> Value {
         json!({"type": "package", "index": 0, "registryType": "npm", "package": {
             "registryType": "npm", "identifier": "@acme/weather", "version": "1.2.3",
             "registryBaseUrl": "https://ak.example.test/npm/npm-virtual",
             "transport": {"type": "stdio"},
-            "runtimeArguments": [{"type": "named", "name": "--registry", "value": "https://evil.test"}],
+            "runtimeArguments": [{"type": "named", "name": "-v", "value": "/:/host-evil"}],
             "packageArguments": [
                 {"type": "positional", "value": "serve"},
                 {"type": "named", "name": "--token", "isSecret": true},
@@ -1211,9 +1306,8 @@ mod tests {
                 {"name": "LOG_LEVEL", "default": "debug"},
                 {"name": "OPTIONAL"},
                 {"name": "REQUIRED_NO_DEFAULT", "isRequired": true},
-                {"name": "NPM_CONFIG_REGISTRY", "value": "https://evil.test"},
-                {"name": "npm_config_registry", "value": "https://evil.test"},
-                {"name": "HOME", "value": "/root"},
+                {"name": "LD_PRELOAD", "value": "/tmp/evil.so"},
+                {"name": "PATH", "value": "/tmp/evil"},
                 {"name": "BAD NAME", "value": "x"},
             ],
         }})
@@ -1257,7 +1351,8 @@ mod tests {
             "AK_PLACEHOLDER_REQUIRED_NO_DEFAULT"
         );
         assert!(!env.contains_key("OPTIONAL"));
-        assert!(!env.contains_key("NPM_CONFIG_REGISTRY"));
+        assert!(!env.contains_key("LD_PRELOAD"));
+        assert!(!env.contains_key("PATH"));
         assert_eq!(
             env["npm_config_registry"],
             "https://ak.example.test/npm/npm-virtual"
@@ -1266,7 +1361,7 @@ mod tests {
         assert_eq!(spec.network, "ak-only");
         assert_eq!(spec.wall_clock_ms, 120_000);
         assert!(spec.notes.iter().any(|n| n == "runtimeArguments ignored"));
-        assert!(spec.notes.iter().any(|n| n.contains("NPM_CONFIG_REGISTRY")));
+        assert!(spec.notes.iter().any(|n| n.contains("LD_PRELOAD")));
     }
 
     #[test]
@@ -1284,13 +1379,10 @@ mod tests {
                 "acme-mcp@2.0"
             ]
         );
-        let t = json!({"package": {"registryType": "oci",
-            "identifier": "ak.example.test/oci-local/acme/mcp:1.0@sha256:abc"}});
+        let identifier = format!("ak.example.test/oci-local/acme/mcp:1.0@{}", oci_digest());
+        let t = json!({"package": {"registryType": "oci", "identifier": identifier}});
         let spec = guest_spec("j3", &t, AK, &Images::default()).unwrap();
-        assert_eq!(
-            spec.image,
-            "ak.example.test/oci-local/acme/mcp:1.0@sha256:abc"
-        );
+        assert_eq!(spec.image, identifier);
         assert!(spec.argv.is_empty());
         assert_eq!(spec.network, "none");
     }
@@ -1305,7 +1397,8 @@ mod tests {
                                "registryBaseUrl": "https://registry.npmjs.org"}}),
             json!({"package": {"registryType": "npm", "identifier": "x",
                                "registryBaseUrl": "https://ak.example.test/npm/r"}}),
-            json!({"package": {"registryType": "oci", "identifier": "ghcr.io/acme/mcp@sha256:abc"}}),
+            json!({"package": {"registryType": "oci",
+                               "identifier": format!("ghcr.io/acme/mcp@{}", oci_digest())}}),
             json!({"package": {"registryType": "oci", "identifier": "ak.example.test/oci/acme/mcp:1"}}),
             json!({"package": {"registryType": "cargo", "identifier": "x"}}),
         ];
@@ -1321,6 +1414,287 @@ mod tests {
             ),
             Err(SandboxError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn oci_spec_refuses_malformed_references_and_source_overrides() {
+        let d = "a".repeat(64);
+        let bad = vec![
+            // Malformed digest.
+            format!("ak.example.test/oci/acme/mcp@sha256:{}", &d[..63]),
+            format!("ak.example.test/oci/acme/mcp@sha256:{}", "a".repeat(65)),
+            format!("ak.example.test/oci/acme/mcp@sha256:{}", "A".repeat(64)),
+            format!("ak.example.test/oci/acme/mcp@sha256:{}", "g".repeat(64)),
+            "ak.example.test/oci/acme/mcp@sha256:abc".to_string(),
+            format!("ak.example.test/oci/acme/mcp@sha512:{}", "a".repeat(128)),
+            format!("ak.example.test/oci/acme/mcp@md5:{}", "a".repeat(32)),
+            format!("ak.example.test/oci/acme/mcp@sha256:{d}:x"),
+            // More than one digest delimiter, or trailing data.
+            format!("ak.example.test/oci/acme/mcp@sha256:{d}@sha256:{d}"),
+            format!("ak.example.test/oci/acme/mcp@sha256:{d}@"),
+            format!("ak.example.test/oci/acme/mcp@@sha256:{d}"),
+            format!("ak.example.test/oci/acme/mcp@sha256:{d}@evil"),
+            // Unsafe, ambiguous or non-canonical repository paths.
+            format!("ak.example.test/../acme/mcp@sha256:{d}"),
+            format!("ak.example.test/oci//acme/mcp@sha256:{d}"),
+            format!("ak.example.test/oci/./acme/mcp@sha256:{d}"),
+            format!("ak.example.test/oci/acme/../mcp@sha256:{d}"),
+            format!("ak.example.test/oci/Acme/mcp@sha256:{d}"),
+            format!("ak.example.test/oci/acme/mcp%2f..@sha256:{d}"),
+            format!("ak.example.test\\oci\\acme\\mcp@sha256:{d}"),
+            format!("/ak.example.test/oci/acme/mcp@sha256:{d}"),
+            format!("ak.example.test/oci/acme/mcp/@sha256:{d}"),
+            format!("ak.example.test/oci/acme/mcp@sha256:{d}\n"),
+            format!("ak.example.test/oci/acme/mcp@sha256:{d} --network=host"),
+            format!("ak.example.test/oci/acme/mcp:1:2@sha256:{d}"),
+            // Not an AK repository/image path.
+            format!("ak.example.test/mcp@sha256:{d}"),
+            // Another origin, including host-prefix and user-info confusion.
+            format!("ak.example.test.evil/oci/acme/mcp@sha256:{d}"),
+            format!("evil.test/ak.example.test/oci/acme/mcp@sha256:{d}"),
+            format!("AK.EXAMPLE.TEST/oci/acme/mcp@sha256:{d}"),
+            format!("ak.example.test@evil/oci/acme/mcp@sha256:{d}"),
+            format!("ak.example.test:8443/oci/acme/mcp@sha256:{d}"),
+            format!("localhost/oci/acme/mcp@sha256:{d}"),
+        ];
+        for id in bad {
+            let t = json!({"package": {"registryType": "oci", "identifier": id}});
+            assert!(guest_spec("j", &t, AK, &Images::default()).is_err(), "{id}");
+        }
+
+        let canonical = format!("ak.example.test/oci/acme/mcp@{}", oci_digest());
+        for field in ["version", "registryBaseUrl", "fileSha256"] {
+            let mut package = json!({"registryType": "oci", "identifier": canonical.clone()});
+            package
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), json!("https://evil.test"));
+            assert!(
+                guest_spec("j", &json!({"package": package}), AK, &Images::default()).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn oci_spec_drops_runtime_arguments_like_npm_and_pypi() {
+        // Docker-style server.json files carry `-e VAR=...` and mounts; publish
+        // accepts them, so the job must still run, with them dropped.
+        let canonical = format!("ak.example.test/oci/acme/mcp@{}", oci_digest());
+        let t = json!({"package": {
+            "registryType": "oci", "identifier": canonical.clone(),
+            "runtimeArguments": [
+                {"type": "named", "name": "-e", "value": "EVIL_VAR=1"},
+                {"type": "named", "name": "-v", "value": "/:/host"},
+                {"type": "named", "name": "--image", "value": "evil.test/x"},
+                {"type": "named", "name": "--registry", "value": "https://evil.test"},
+                {"type": "positional", "value": "--pull=always"},
+            ],
+        }});
+        let spec = guest_spec("j", &t, AK, &Images::default()).unwrap();
+        assert_eq!(spec.image, canonical);
+        assert!(spec.argv.is_empty());
+        assert!(spec.notes.iter().any(|n| n == "runtimeArguments ignored"));
+        let plan = OciRunner::default().plan(&spec).unwrap();
+        // The runner passes its own `-e NAME=value` pairs; none of the
+        // publisher's names, values or flags is among the engine arguments.
+        assert!(!plan.args.iter().any(|a| a == "-v"));
+        for dropped in [
+            "EVIL_VAR",
+            "/:/host",
+            "--image",
+            "evil.test",
+            "--registry",
+            "--pull=always",
+        ] {
+            assert!(
+                !plan.args.iter().any(|a| a.contains(dropped)),
+                "{dropped} reached the engine: {:?}",
+                plan.args
+            );
+        }
+    }
+
+    fn oci_err(identifier: &str, ak: &str) -> String {
+        let t = json!({"package": {"registryType": "oci", "identifier": identifier}});
+        match guest_spec("j", &t, ak, &Images::default()) {
+            Err(SandboxError::Invalid(m)) => m,
+            other => panic!("{identifier} on {ak}: expected Invalid, got {other:?}"),
+        }
+    }
+
+    fn oci_ok(identifier: &str, ak: &str) -> String {
+        let t = json!({"package": {"registryType": "oci", "identifier": identifier}});
+        guest_spec("j", &t, ak, &Images::default())
+            .unwrap_or_else(|e| panic!("{identifier} on {ak}: {e}"))
+            .image
+    }
+
+    #[test]
+    fn oci_spec_refuses_an_unusable_ak_base_url() {
+        let id = format!("ak.example.test/oci/acme/mcp@{}", oci_digest());
+        assert_eq!(oci_err(&id, "not a url"), "AK base URL is not a URL");
+        assert_eq!(oci_err(&id, "unix:/run/ak.sock"), "AK base URL has no host");
+        // A bare service name is read as a Docker Hub namespace by every
+        // image-reference parser, so it can never name this AK as a registry.
+        let d = oci_digest();
+        for (base, id) in [
+            (
+                "http://artifact-keeper",
+                format!("artifact-keeper/oci/acme/mcp@{d}"),
+            ),
+            ("https://ak:443", format!("ak/oci/acme/mcp@{d}")),
+            ("https://ak:443", format!("ak:443/oci/acme/mcp@{d}")),
+        ] {
+            let m = oci_err(&id, base);
+            assert!(
+                m.contains("must contain `.` or `:`, or be `localhost`"),
+                "{base}: {m}"
+            );
+        }
+        // `localhost` and a dotless host with a non-default port are hosts.
+        let id = format!("localhost/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, "http://localhost"), id);
+        let id = format!("artifact-keeper:8080/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, "http://artifact-keeper:8080"), id);
+    }
+
+    #[test]
+    fn oci_spec_edge_references_never_change_the_source() {
+        let d = oci_digest();
+        // IPv6 origin: only the exact bracketed host and port is this AK.
+        let base = "http://[::1]:8080";
+        let id = format!("[::1]:8080/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, base), id);
+        for other in [
+            format!("[::1]/oci/acme/mcp@{d}"),
+            format!("[::1]:8081/oci/acme/mcp@{d}"),
+            format!("[::2]:8080/oci/acme/mcp@{d}"),
+            format!("::1:8080/oci/acme/mcp@{d}"),
+        ] {
+            oci_err(&other, base);
+        }
+        // A written-out default port is dropped from the AK host, as it is
+        // from the served identifier, so only the port-less form matches.
+        let base = "https://ak.example.test:443";
+        let id = format!("ak.example.test/oci/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, base), id);
+        assert!(
+            oci_err(&format!("ak.example.test:443/oci/acme/mcp@{d}"), base)
+                .contains("not this AK instance")
+        );
+        // `:latest` beside a digest is still pinned by the digest: AK serves a
+        // resolved floating tag this way, and the engine runs the digest.
+        let id = format!("ak.example.test/oci/acme/mcp:latest@{d}");
+        assert_eq!(oci_ok(&id, AK), id);
+        oci_err("ak.example.test/oci/acme/mcp:latest", AK);
+        oci_err("ak.example.test/oci/acme/mcp:latest@", AK);
+        // Homoglyphs in the host (Cyrillic `а`) or the path.
+        assert!(
+            oci_err(&format!("\u{430}k.example.test/oci/acme/mcp@{d}"), AK)
+                .contains("not this AK instance")
+        );
+        oci_err(&format!("ak.example.test/oci/\u{430}cme/mcp@{d}"), AK);
+        oci_err(&format!("ak.example.test/oci/acme/mcp:1\u{2024}0@{d}"), AK);
+        // An identifier longer than 512 characters, even on this AK.
+        let id = format!("ak.example.test/oci/{}/mcp@{d}", "a".repeat(480));
+        assert!(id.len() > 512);
+        oci_err(&id, AK);
+        // SHA-512 is a valid OCI digest but not the pin AK serves.
+        assert!(oci_err(
+            &format!("ak.example.test/oci/acme/mcp@sha512:{}", "a".repeat(128)),
+            AK
+        )
+        .contains("must be SHA-256"));
+    }
+
+    #[test]
+    fn oci_spec_refuses_repository_keys_outside_the_image_path_grammar() {
+        // AK repository keys may hold upper case or end in `_`/`.`/`-`; such a
+        // key is not a valid image path component, and podman would refuse the
+        // reference too, so the job fails as invalid rather than running.
+        let d = oci_digest();
+        for key in [
+            "Docker_Local",
+            "docker-local_",
+            "docker-local.",
+            "docker-local-",
+        ] {
+            let m = oci_err(&format!("ak.example.test/{key}/acme/mcp@{d}"), AK);
+            assert!(m.contains("not a valid image name"), "{key}: {m}");
+        }
+        let id = format!("ak.example.test/docker_local/acme/mcp@{d}");
+        assert_eq!(oci_ok(&id, AK), id);
+    }
+
+    #[test]
+    fn oci_spec_keeps_guest_data_off_the_validated_source() {
+        let digest = oci_digest();
+        let tag_ref = format!("ak.example.test/oci-local/acme/mcp:1.0@{digest}");
+        let spec = guest_spec(
+            "j",
+            &json!({"package": {"registryType": "oci", "identifier": tag_ref}}),
+            AK,
+            &Images::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.image, tag_ref);
+        assert!(spec.argv.is_empty());
+
+        let bare_ref = format!("ak.example.test/oci-local/acme/mcp@{digest}");
+        let spec = guest_spec(
+            "j",
+            &json!({"package": {"registryType": "oci", "identifier": bare_ref}}),
+            AK,
+            &Images::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.image, bare_ref);
+
+        // The matching non-default port is part of this AK origin.
+        let port_ref = format!("ak.example.test:8443/oci/acme/mcp@{digest}");
+        let spec = guest_spec(
+            "j",
+            &json!({"package": {"registryType": "oci", "identifier": port_ref}}),
+            "https://ak.example.test:8443",
+            &Images::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.image, port_ref);
+
+        let canonical = format!("ak.example.test/oci/acme/mcp@{digest}");
+        let target = json!({"package": {
+            "registryType": "oci",
+            "identifier": canonical.clone(),
+            "packageArguments": [
+                {"type": "named", "name": "--image", "value": "evil.test/x"},
+                {"type": "named", "name": "--registry", "value": "https://evil.test"},
+            ],
+            "environmentVariables": [
+                {"name": "DOCKER_HOST", "value": "tcp://evil.test:2375"},
+                {"name": "IMAGE", "value": "evil.test/x"},
+            ],
+        }});
+        let spec = guest_spec("j", &target, AK, &Images::default()).unwrap();
+        assert_eq!(spec.image, canonical);
+        assert_eq!(spec.network, "none");
+        assert!(spec.argv.iter().any(|a| a == "evil.test/x"));
+        let env: std::collections::HashMap<_, _> = spec.env.iter().cloned().collect();
+        assert_eq!(env["DOCKER_HOST"], "tcp://evil.test:2375");
+
+        // The package arguments are guest argv after the image, never engine
+        // options before it.
+        let plan = OciRunner::default().plan(&spec).unwrap();
+        let image_at = plan.args.iter().position(|a| *a == canonical).unwrap();
+        assert_eq!(
+            plan.args
+                .iter()
+                .filter(|a| a.as_str() == canonical.as_str())
+                .count(),
+            1
+        );
+        assert!(plan.args[..image_at].iter().all(|a| a != "evil.test/x"));
+        assert!(plan.args[image_at + 1..].iter().any(|a| a == "evil.test/x"));
     }
 
     #[test]
@@ -1393,7 +1767,7 @@ mod tests {
         assert_eq!(docker.cleanup[0].program, "/usr/bin/docker");
         // An OCI guest gets no network at all.
         let t = json!({"package": {"registryType": "oci",
-            "identifier": "ak.example.test/oci/acme/mcp@sha256:abc"}});
+            "identifier": format!("ak.example.test/oci/acme/mcp@{}", oci_digest())}});
         let spec = guest_spec("j3", &t, AK, &Images::default()).unwrap();
         let plan = OciRunner::default().plan(&spec).unwrap();
         assert!(plan.args.iter().any(|a| a == "--network=none"));
@@ -1664,7 +2038,7 @@ mod tests {
         // hostname alias carries no port.
         let spec = guest_spec(
             "j9",
-            &json!({"package": {"registryType": "npm", "identifier": "x", "version": "1",
+            &json!({"package": {"registryType": "npm", "identifier": "x", "version": "1.0.0",
                 "registryBaseUrl": "https://ak.example.test:8443/npm/r"}}),
             "https://ak.example.test:8443",
             &Images::default(),
@@ -1742,7 +2116,7 @@ mod tests {
         let oci = guest_spec(
             "j3",
             &json!({"package": {"registryType": "oci",
-                "identifier": "ak.example.test/oci/acme/mcp@sha256:abc"}}),
+                "identifier": format!("ak.example.test/oci/acme/mcp@{}", oci_digest())}}),
             AK,
             &Images::default(),
         )

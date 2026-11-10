@@ -4629,9 +4629,11 @@ mod tests {
             "checksum_sha256": "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567",
         }));
         let (status, _body) = tdh::send(app, req).await;
+        // #5458: the non-member cannot read this private repository, so the
+        // denial is the unknown-key 404, not a 403 that confirms the key.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "non-member on a ruled repo must be denied"
         );
         // No session must have been created for this repo.

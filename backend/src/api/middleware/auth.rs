@@ -2729,6 +2729,80 @@ fn not_found_response() -> Response {
         .unwrap()
 }
 
+/// A request on the MCP registry surface (`/mcp/{key}/...`) of an MCP
+/// repository.
+fn is_mcp_surface(format: &str, path: &str) -> bool {
+    format == "mcp" && path.starts_with("/mcp/")
+}
+
+/// A retryable 503 for a permission lookup that could not run (the
+/// database is unreachable). Neutral on purpose: unlike
+/// [`service_unavailable_response`] it does not blame authentication
+/// capacity.
+fn permission_unavailable_response() -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::RETRY_AFTER, "1")
+        .header(axum::http::header::CONTENT_TYPE, "text/plain")
+        .body(axum::body::Body::from(
+            "permission service temporarily unavailable",
+        ))
+        .unwrap()
+}
+
+/// The answer to a write or delete the caller may not make (#5458).
+///
+/// A caller who cannot even READ the repository gets the existence-hiding
+/// [`not_found_response`], byte for byte what a key naming no repository
+/// answers (the no-repository branch of [`repo_visibility_middleware`]), so
+/// an owner of some other repository cannot tell an existing private key from
+/// an unknown one by trying to publish to it on any format route. "Can read"
+/// is the REST visibility gate's own predicate (`require_visible`): an
+/// `internal` or `public` repository is readable by every resolved principal,
+/// a `private` one needs a grant carrying `read` (`RepoAccess::READ`). A
+/// caller who CAN read keeps the 403 (#3524): it already knows the repository
+/// exists, and the refusal says why. A lookup error fails closed with a
+/// retryable 503, never a 403 that would re-open the oracle.
+async fn write_denial(
+    db: &sqlx::PgPool,
+    ext: &AuthExtension,
+    repo_id: Uuid,
+    visibility: RepositoryVisibility,
+    action: &str,
+) -> Response {
+    if visibility.allows_authenticated_read() {
+        return forbidden_permission_response();
+    }
+    let readable = crate::services::repository_service::RepositoryService::new(db.clone())
+        .user_can_access_repo(
+            repo_id,
+            ext.user_id,
+            crate::services::repository_service::RepoAccess::READ,
+        )
+        .await;
+    match readable {
+        Ok(true) => forbidden_permission_response(),
+        Ok(false) => {
+            tracing::warn!(
+                repository_id = %repo_id,
+                user_id = %ext.user_id,
+                action,
+                "repository write denied to a caller who cannot read the repository; \
+                 answering the existence-hiding 404"
+            );
+            not_found_response()
+        }
+        Err(_) => {
+            tracing::error!(
+                repository_id = %repo_id,
+                user_id = %ext.user_id,
+                "repo access check failed: database unreachable"
+            );
+            permission_unavailable_response()
+        }
+    }
+}
+
 /// Map an HTTP method to a permission action string.
 ///
 /// Used by [`repo_visibility_middleware`] to determine the required permission
@@ -3228,7 +3302,7 @@ pub async fn repo_visibility_middleware(
             // Repository-scoped tokens are self-service, so a 403 here handed
             // any user holding a token to a repository of their own a
             // 200/403/404 existence oracle over every other private key.
-            // Writes keep the 403, matching #3524's decision for the ACL arm.
+            // Writes and deletes take the same 404 since #5458 (below).
             //
             // "Read" here is the set the ACL arm below calls a read: the
             // method-derived action plus the `non_mutating_post` routes
@@ -3241,15 +3315,22 @@ pub async fn repo_visibility_middleware(
             // public repository (the short-circuit above), but the two POSTs
             // do, and a public repository has no existence to hide: they keep
             // the 403 there, as `test_3648` pins.
-            if !visibility.allows_anonymous_read()
-                && (scope_gate_action == "read" || non_mutating_post)
-            {
+            //
+            // #5458: a WRITE (or delete) outside the token's scope is refused
+            // the same way on such a repository. The token cannot read it, so
+            // a 403 here, against the no-repository 404, told an existing
+            // private key from an unknown one on every format route. A public
+            // repository has no existence to hide and keeps the 403.
+            if !visibility.allows_anonymous_read() {
                 // Same fields and level as the two ACL read denials below, so
                 // the operator can still tell this from a missing repository.
-                tracing::info!(
+                let read = scope_gate_action == "read" || non_mutating_post;
+                tracing::warn!(
                     repository_id = %repo.id,
                     user_id = %ext.user_id,
-                    "token repository scope denied read; answering the existence-hiding 404"
+                    action = if read { "read" } else { scope_gate_action },
+                    "token repository scope denied the request; answering the \
+                     existence-hiding 404"
                 );
                 return not_found_response();
             }
@@ -3291,7 +3372,7 @@ pub async fn repo_visibility_middleware(
                 // rule counts here; the MCP write handler then decides the
                 // server name (`services::mcp_namespaces`). Anywhere else
                 // such a rule grants nothing.
-                let mcp_surface = repo.format == "mcp" && path.starts_with("/mcp/");
+                let mcp_surface = is_mcp_surface(&repo.format, &path);
                 let decision = if mcp_surface {
                     vis_state
                         .permission_service
@@ -3305,7 +3386,9 @@ pub async fn repo_visibility_middleware(
                 };
                 match decision {
                     Ok(true) => {}
-                    Ok(false) => return forbidden_permission_response(),
+                    Ok(false) => {
+                        return write_denial(&vis_state.db, ext, repo.id, visibility, action).await
+                    }
                     Err(_) => {
                         tracing::error!("permission check failed: database unreachable");
                         return service_unavailable_response();
@@ -3472,9 +3555,9 @@ pub async fn repo_visibility_middleware(
                             // answered `not_found_response()`. All three are now
                             // byte-identical, matching REST `require_visible`,
                             // which returns `NotFound` for every denial. Writes
-                            // are deliberately unchanged: a caller doing a PUT
-                            // has generally already read the repository, and 403
-                            // is the more useful answer there.
+                            // follow the same rule since #5458 (`write_denial`):
+                            // a caller who cannot read gets this 404, and only a
+                            // caller who CAN read keeps the more useful 403.
                             return not_found_response();
                         }
                     }
@@ -9786,9 +9869,11 @@ mod tests {
         let status = run_through_visibility(state, req).await.status();
 
         api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        // Refused, and (#5458) with the existence-hiding 404: the token
+        // cannot read the private `othercrates` either.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a token scoped to the repository `cargo` must not publish into \
              another repository through /api/cargo"
         );
@@ -9814,11 +9899,195 @@ mod tests {
         let status = run_through_visibility(state, req).await.status();
 
         api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+        // Refused, and (#5458) with the existence-hiding 404: the token
+        // cannot read the private `helm-priv` either.
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
             "a token scoped to the repository `helm` must not delete a chart \
              in another repository through /api/helm"
+        );
+    }
+
+    /// #5458: a write with a token scoped to another repository answers an
+    /// existing private key exactly as it answers an unknown one (the
+    /// existence-hiding 404), on the MCP surface and on every other format
+    /// route alike.
+    #[tokio::test]
+    async fn test_5458_write_outside_token_scope_matches_an_unknown_key() {
+        let decoy = format!("ak5458-decoy-{}", Uuid::new_v4());
+        let victim = format!("ak5458-victim-{}", Uuid::new_v4());
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let Some((pool, state, bearer, user_id, decoy_id)) =
+            api_alias_scoped_token_fixture(&decoy, &victim, &["read", "write"]).await
+        else {
+            return;
+        };
+        {
+            let mut cache = state.repo_cache.write().await;
+            for key in [&decoy, &victim] {
+                cache.get_mut(key.as_str()).unwrap().0.format = "mcp".to_string();
+            }
+        }
+        let send = |method: Method, path: String| {
+            let state = state.clone();
+            let bearer = bearer.clone();
+            async move {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = run_through_visibility(state, req).await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let mut answers = Vec::new();
+        for (method, tail) in [
+            (Method::POST, "/mcp/{key}/v0.1/publish"),
+            (Method::POST, "/pypi/{key}/"),
+            (Method::PUT, "/npm/{key}/pkg"),
+            (Method::DELETE, "/npm/{key}/pkg/-/pkg-1.0.0.tgz"),
+        ] {
+            let existing = send(method.clone(), tail.replace("{key}", &victim)).await;
+            let missing = send(method.clone(), tail.replace("{key}", &unknown)).await;
+            answers.push((tail, existing, missing));
+        }
+        api_alias_scoped_token_cleanup(&pool, user_id, decoy_id).await;
+
+        for (tail, existing, missing) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{tail}");
+            assert_eq!(existing, missing, "{tail}: existing private vs unknown key");
+            assert_eq!(&existing.2[..], b"Repository not found", "{tail}");
+        }
+    }
+
+    /// #5458: through the real middleware, a write by an owner of ANOTHER
+    /// repository (no token scope involved) answers an existing private
+    /// pypi / npm key exactly (status, headers, body) as an unknown key; a
+    /// member who can read but not write keeps the 403; an `internal`
+    /// repository, readable by every authenticated caller, keeps the 403.
+    #[tokio::test]
+    async fn test_5458_write_denial_to_a_non_reader_matches_an_unknown_key() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::permission_service::PermissionService;
+        use std::sync::Arc;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (pypi_id, pypi_key, pypi_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (npm_id, npm_key, npm_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (int_id, int_key, int_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        sqlx::query("UPDATE repositories SET visibility = 'internal' WHERE id = $1")
+            .bind(int_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (foreign, _) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, _) = tdh::create_user(&pool).await;
+        for id in [pypi_id, npm_id] {
+            tdh::grant_repo_role(&pool, id, reader, "reader").await;
+        }
+        let tstate = tdh::build_state(pool.clone(), &own_dir.to_string_lossy());
+        let foreign_bearer = tdh::bearer_for(&tstate, foreign).await;
+        let reader_bearer = tdh::bearer_for(&tstate, reader).await;
+        let vis = RepoVisibilityState {
+            auth_service: Arc::new(AuthService::new(
+                pool.clone(),
+                Arc::new(tstate.config.clone()),
+            )),
+            db: pool.clone(),
+            repo_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            repo_miss_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            permission_service: Arc::new(PermissionService::new(pool.clone())),
+        };
+        let send = |method: Method, path: String, bearer: String| {
+            let vis = vis.clone();
+            async move {
+                let req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("authorization", bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let resp = run_through_visibility(vis, req).await;
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, headers, body)
+            }
+        };
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let cases = [
+            (Method::POST, format!("/pypi/{pypi_key}/"), "/pypi/{u}/"),
+            (Method::PUT, format!("/npm/{npm_key}/pkg"), "/npm/{u}/pkg"),
+            (
+                Method::DELETE,
+                format!("/npm/{npm_key}/pkg/-/pkg-1.0.0.tgz"),
+                "/npm/{u}/pkg/-/pkg-1.0.0.tgz",
+            ),
+        ];
+        let mut answers = Vec::new();
+        for (method, existing_path, unknown_path) in &cases {
+            let existing = send(
+                method.clone(),
+                existing_path.clone(),
+                foreign_bearer.clone(),
+            )
+            .await;
+            let missing = send(
+                method.clone(),
+                unknown_path.replace("{u}", &unknown),
+                foreign_bearer.clone(),
+            )
+            .await;
+            let as_reader = send(method.clone(), existing_path.clone(), reader_bearer.clone())
+                .await
+                .0;
+            answers.push((existing_path.clone(), existing, missing, as_reader));
+        }
+        let internal = send(
+            Method::PUT,
+            format!("/npm/{int_key}/pkg"),
+            foreign_bearer.clone(),
+        )
+        .await
+        .0;
+        for (id, dir) in [
+            (pypi_id, &pypi_dir),
+            (npm_id, &npm_dir),
+            (int_id, &int_dir),
+            (own_id, &own_dir),
+        ] {
+            tdh::cleanup_member_repo(&pool, id, dir).await;
+        }
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+
+        for (path, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(existing, missing, "{path}: existing private vs unknown key");
+            assert_eq!(&existing.2[..], b"Repository not found", "{path}");
+            assert_eq!(
+                as_reader,
+                StatusCode::FORBIDDEN,
+                "{path}: a reader keeps the 403"
+            );
+        }
+        assert_eq!(
+            internal,
+            StatusCode::FORBIDDEN,
+            "an internal repository is readable by every authenticated caller"
         );
     }
 
@@ -11891,8 +12160,9 @@ mod tests {
         );
         assert_eq!(
             private_put,
-            scope_denied(),
-            "#3648: private + out of scope + write stays refused by the scope gate"
+            not_found(),
+            "#3648: private + out of scope + write stays refused by the scope gate; since \
+             #5458 as the existence-hiding 404, like the read"
         );
         assert_eq!(
             vscode_private,
@@ -11930,8 +12200,8 @@ mod tests {
     /// compares the ACL branches. The caller is GRANTED on C so the scope gate
     /// is the only thing that can refuse it (drop the gate and it answers 200),
     /// and the in-scope control reads a PRIVATE repository through the same
-    /// rules-less branch. Writes are deliberately unchanged (#3524): the PUT on
-    /// C still answers the scope gate's 403.
+    /// rules-less branch. Since #5458 writes are unified too: the PUT on C
+    /// answers the same existence-hiding 404 as a key naming no repository.
     #[tokio::test]
     async fn test_3717_private_repo_scope_denial_matches_the_no_repo_answer() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -12027,6 +12297,7 @@ mod tests {
         let private_head = probe(&state, Method::HEAD, &key_c, &bearer).await;
         let missing_get = probe(&state, Method::GET, &key_missing, &bearer).await;
         let private_put = probe(&state, Method::PUT, &key_c, &bearer).await;
+        let missing_put = probe(&state, Method::PUT, &key_missing, &bearer).await;
 
         // The two `non_mutating_post` routes: POSTs the ACL arm reclassifies as
         // reads (git-lfs `objects/batch` is how an LFS client READS; conan
@@ -12116,15 +12387,18 @@ mod tests {
             "and that shared answer is the existence-hiding 404, not a shared 403"
         );
 
-        // The security half: writes are NOT unified (#3524).
+        // #5458: writes are unified too. A PUT to a private repository outside
+        // the token's scope is still refused by the scope gate, now with the
+        // same existence-hiding 404 a key naming no repository gets.
         assert_eq!(
             private_put,
-            (
-                StatusCode::FORBIDDEN,
-                "Token does not have access to this repository".to_string(),
-            ),
-            "#3717 must not touch writes: a PUT to a private repository outside the token's \
-             scope stays refused BY THE SCOPE GATE with 403"
+            (StatusCode::NOT_FOUND, "Repository not found".to_string()),
+            "#5458: a PUT to a private repository outside the token's scope is the \
+             existence-hiding 404"
+        );
+        assert_eq!(
+            private_put, missing_put,
+            "#5458: identical to an unknown key"
         );
     }
 

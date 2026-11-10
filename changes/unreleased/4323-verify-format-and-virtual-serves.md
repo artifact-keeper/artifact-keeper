@@ -1,5 +1,0 @@
----
-section: Changed
-issues: [#4323]
----
-- **Stored bytes are verified on more download routes, and a small corrupted object is answered `502` instead of a cut-short `200`** (#4323). The serve-time SHA-256 check that #3919 added to the generic download route now also covers every virtual-repository member serve, the format routes that read hosted artifacts through the shared fetch (Terraform, Go, Composer, pacman, VS Code, sbt and others), and Incus image downloads (checked against the digest the response advertises). An object up to 4 MiB is checked before any byte is sent, so a mismatch is `502` with `code: STORED_OBJECT_INTEGRITY` and nothing of the bad object; a larger one keeps streaming and is aborted before its last bytes. A virtual repository whose member fails the check answers 502 rather than falling through to another member's bytes. `DOWNLOAD_VERIFY_CHECKSUMS=false` still turns verification off everywhere. OCI blob pulls and the Maven, npm, PyPI, Cargo, NuGet and Helm hosted downloads read storage through their own paths and are not covered yet. See `docs/operations/download-integrity.md`.

@@ -459,6 +459,154 @@ impl From<StreamHandle> for StreamingFetchResult {
     }
 }
 
+/// A streaming leader's body that finishes its cache fill when the client
+/// stops reading it early (#5509).
+///
+/// The tee into the proxy cache is driven by the client. A ranged GET answered
+/// `206` from a cold fetch takes only its window, and hyper drops a body once
+/// `Content-Length` bytes are out, so a window ending before EOF dropped the
+/// tee mid-object: the cache write was rejected as truncated, the upstream
+/// fetch aborted and the followers sharing it started over. Only a window
+/// ending at EOF ever filled the cache.
+///
+/// Dropped after at least one chunk and before the body ended, the rest of the
+/// body is read on its own task, which runs the tee to EOF, so the fill
+/// commits and the followers receive the whole object. It stops early once
+/// the cache writer has finished (the #2928 ceiling abandoned the write).
+/// Bounded like the #5220 detached fills: from the same permits (with none
+/// free the body is dropped as before) and within the same deadline, the
+/// fetch deadline plus the commit allowance, because the read timeout restarts
+/// on every chunk and a trickling upstream would otherwise hold a permit for
+/// as long as its socket stays open. A body dropped before its first chunk (a
+/// HEAD or a client gone before any byte), or after every byte its
+/// `Content-Length` announced (hyper never polls a fixed-length body for its
+/// end), is dropped as before too.
+struct FinishFillOnDrop {
+    body: Option<BoxStream<'static, Result<Bytes>>>,
+    /// Bytes handed to the client so far.
+    yielded: u64,
+    /// The body's advertised length, when known.
+    content_length: Option<u64>,
+    /// The body yielded its last item (EOF or an error).
+    ended: bool,
+    cache_published: tokio::sync::watch::Receiver<bool>,
+    limits: FinishFillLimits,
+}
+
+/// How many [`FinishFillOnDrop`] drains may run at once (shared with the
+/// #5220 detached buffered fills) and for how long each may run.
+#[derive(Clone)]
+struct FinishFillLimits {
+    permits: Arc<Semaphore>,
+    deadline: Duration,
+}
+
+impl FinishFillOnDrop {
+    /// Wrap a leader handle that feeds a cache write; other handles (follower
+    /// replays, the over-quota bypass) are returned unchanged.
+    fn wrap(handle: StreamHandle, limits: FinishFillLimits) -> StreamHandle {
+        let Some(cache_published) = handle.cache_published.clone() else {
+            return handle;
+        };
+        StreamHandle {
+            body: Box::pin(Self {
+                body: Some(handle.body),
+                yielded: 0,
+                content_length: handle.headers.content_length,
+                ended: false,
+                cache_published,
+                limits,
+            }),
+            ..handle
+        }
+    }
+
+    /// Whether dropping the body now would cut a fill short: some bytes went
+    /// out, the body did not end, and not every advertised byte was read.
+    fn unfinished(&self) -> bool {
+        !self.ended && self.yielded > 0 && self.content_length != Some(self.yielded)
+    }
+
+    /// Read `body` to its end, or until the cache writer has finished.
+    async fn drain(
+        mut body: BoxStream<'static, Result<Bytes>>,
+        mut cache_published: tokio::sync::watch::Receiver<bool>,
+    ) {
+        loop {
+            tokio::select! {
+                item = body.next() => match item {
+                    Some(Ok(_)) => {}
+                    _ => return,
+                },
+                _ = cache_published.wait_for(|done| *done) => return,
+            }
+        }
+    }
+}
+
+impl futures::Stream for FinishFillOnDrop {
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let Some(body) = this.body.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        let item = futures::ready!(body.as_mut().poll_next(cx));
+        match &item {
+            Some(Ok(chunk)) => this.yielded += chunk.len() as u64,
+            Some(Err(_)) | None => this.ended = true,
+        }
+        std::task::Poll::Ready(item)
+    }
+}
+
+impl Drop for FinishFillOnDrop {
+    fn drop(&mut self) {
+        if !self.unfinished() {
+            return;
+        }
+        let Some(body) = self.body.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Ok(permit) = Arc::clone(&self.limits.permits).try_acquire_owned() else {
+            tracing::debug!(
+                "no detached-fill permit free; a streaming fill its client stopped \
+                 reading is dropped unfinished (#5509)"
+            );
+            return;
+        };
+        let deadline = self.limits.deadline;
+        let cache_published = self.cache_published.clone();
+        let drain = async move {
+            let drained = tokio::time::timeout(deadline, Self::drain(body, cache_published)).await;
+            if drained.is_err() {
+                tracing::debug!(
+                    deadline_secs = deadline.as_secs(),
+                    "a streaming fill its client stopped reading did not finish within the \
+                     detached-fill deadline; abandoned unfinished (#5509)"
+                );
+            }
+        };
+        let correlation = crate::api::middleware::tracing::current_correlation_id();
+        runtime.spawn(async move {
+            let _permit = permit;
+            match correlation {
+                Some(id) => {
+                    crate::api::middleware::tracing::with_correlation_scope(id, drain).await
+                }
+                None => drain.await,
+            }
+        });
+    }
+}
+
 impl std::fmt::Debug for StreamingFetchResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingFetchResult")
@@ -1022,18 +1170,118 @@ fn validate_upstream_status(status: StatusCode, url: &str) -> Result<()> {
         )));
     }
     if status.is_server_error() {
-        return Err(AppError::ServiceUnavailable(format!(
-            "Upstream returned error status {}: {}",
-            status, diagnostic_url
+        return Err(AppError::ServiceUnavailable(upstream_status_message(
+            status,
+            "",
+            &diagnostic_url,
         )));
     }
     if !status.is_success() {
-        return Err(AppError::BadGateway(format!(
-            "Upstream returned error status {}: {}",
-            status, diagnostic_url
+        return Err(AppError::BadGateway(upstream_status_message(
+            status,
+            "",
+            &diagnostic_url,
         )));
     }
     Ok(())
+}
+
+/// How every upstream-status error of this module begins: the status follows
+/// it (`"Upstream returned error status 403 Forbidden: <url>"`). The errors
+/// carry no status field, so [`upstream_error_status`] reads it back from here.
+const UPSTREAM_ERROR_STATUS_PREFIX: &str = "Upstream returned error status ";
+
+/// The one constructor of an upstream-status error message (#5504):
+/// `"Upstream returned error status <status><tag>: <url>"`. Every producer
+/// goes through it, so [`upstream_error_status`] reads every one back. `tag`
+/// sits between the status and the URL ([`ANONYMOUS_TOKEN_REFUSAL_MARKER`],
+/// or empty); `url` must already be redacted.
+fn upstream_status_message(status: StatusCode, tag: &str, url: &str) -> String {
+    format!("{UPSTREAM_ERROR_STATUS_PREFIX}{status}{tag}: {url}")
+}
+
+/// `UPSTREAM_ERROR_STATUS_PREFIX` followed by `status`: what a message for
+/// that status begins with.
+fn upstream_status_prefix(status: StatusCode) -> String {
+    format!("{UPSTREAM_ERROR_STATUS_PREFIX}{status}")
+}
+
+/// The upstream HTTP status behind a proxy fetch error, when the error is one
+/// this module produced for a non-success upstream answer: the
+/// [`AppError::BadGateway`] [`validate_upstream_status`] maps a 4xx to, the
+/// [`AppError::Storage`] a `401` without a usable Bearer challenge becomes, or
+/// the [`AppError::ServiceUnavailable`] a 5xx becomes.
+pub(crate) fn upstream_error_status(err: &AppError) -> Option<StatusCode> {
+    let (AppError::BadGateway(message)
+    | AppError::Storage(message)
+    | AppError::ServiceUnavailable(message)) = err
+    else {
+        return None;
+    };
+    let digits = message
+        .strip_prefix(UPSTREAM_ERROR_STATUS_PREFIX)?
+        .get(..3)?;
+    StatusCode::from_bytes(digits.as_bytes()).ok()
+}
+
+/// How a virtual repository's member walk reads a member fetch that failed
+/// (#5495, #5504).
+///
+/// The distinction is between an answer that will not change if the client
+/// retries and one that might. Both let the walk go on to the next member;
+/// they differ only when NO member serves: then a walk that saw an
+/// [`MemberFetchFailure::Unavailable`] member answers a retryable `503`
+/// instead of the definitive `404` that Maven and Gradle cache as "this
+/// artifact does not exist".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberFetchFailure {
+    /// A permanent answer: the member does not have the object, or will never
+    /// hand it out. An upstream `404`/`410` ([`AppError::NotFound`]), a path
+    /// the proxy rejects (`Validation`, `400`), and any other upstream `4xx`,
+    /// which [`validate_upstream_status`] maps to [`AppError::BadGateway`]:
+    /// `401`/`403` from stale credentials, or an S3-hosted repository that
+    /// answers `403` for a key it does not hold. Retrying yields the same
+    /// answer, so it reads as a miss. The retryable 4xx (`408`, `425`,
+    /// `429`) are the exception and count as
+    /// [`MemberFetchFailure::Unavailable`].
+    Miss,
+    /// The member could not answer: an upstream `5xx`
+    /// ([`AppError::ServiceUnavailable`]), a transport failure or timeout
+    /// ([`AppError::Storage`] / [`AppError::BadGateway`] without an upstream
+    /// status), or a fault on this server's side (storage, database). The
+    /// member may hold the object, so "not found" is unknowable.
+    Unavailable,
+}
+
+/// Whether an upstream 4xx is a permanent answer (#5504). `408 Request
+/// Timeout`, `425 Too Early` and `429 Too Many Requests` are the 4xx statuses
+/// that say "ask again later" (rate limiting on Maven Central or Docker Hub
+/// answers 429), so they are transient like a 5xx.
+fn is_permanent_client_error(status: StatusCode) -> bool {
+    status.is_client_error()
+        && !matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS
+        )
+}
+
+/// Classify a member fetch error for a virtual walk; see
+/// [`MemberFetchFailure`]. Anything not recognised as permanent is
+/// [`MemberFetchFailure::Unavailable`]: a retry costs a client one round
+/// trip, a wrong `404` is cached by the build tool.
+pub(crate) fn classify_member_fetch_failure(err: &AppError) -> MemberFetchFailure {
+    match err {
+        AppError::NotFound(_)
+        | AppError::Validation(_)
+        | AppError::CodedValidation { .. }
+        | AppError::UpstreamAuth(_)
+        | AppError::Conflict(_)
+        | AppError::Authorization(_) => MemberFetchFailure::Miss,
+        _ if upstream_error_status(err).is_some_and(is_permanent_client_error) => {
+            MemberFetchFailure::Miss
+        }
+        _ => MemberFetchFailure::Unavailable,
+    }
 }
 
 /// The error for an OCI token endpoint that answered `status` (not 2xx).
@@ -1106,8 +1354,10 @@ fn anonymous_token_refused_error(status: StatusCode, url: &str) -> AppError {
         "upstream registry refused a request made with an anonymous bearer token (no \
          credentials were sent); treating the object as not available"
     );
-    AppError::BadGateway(format!(
-        "Upstream returned error status {status}{ANONYMOUS_TOKEN_REFUSAL_MARKER}: {url}"
+    AppError::BadGateway(upstream_status_message(
+        status,
+        ANONYMOUS_TOKEN_REFUSAL_MARKER,
+        &url,
     ))
 }
 
@@ -1135,7 +1385,7 @@ pub(crate) fn upstream_request_auth_refusal(err: &AppError) -> Option<StatusCode
     };
     [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
         .into_iter()
-        .find(|status| msg.starts_with(&format!("Upstream returned error status {status}:")))
+        .find(|status| msg.starts_with(&format!("{}:", upstream_status_prefix(*status))))
 }
 
 /// At most one of each upstream-auth `security` WARN per Remote per this
@@ -1307,12 +1557,11 @@ pub(crate) fn is_upstream_forbidden(err: &AppError) -> bool {
 /// [`crate::api::handlers::proxy_helpers::upstream_refusal_status`], which
 /// preserves this through the proxy-error mapping (#4929).
 pub(crate) fn upstream_refusal_status(err: &AppError) -> Option<StatusCode> {
-    let (AppError::BadGateway(message) | AppError::Storage(message)) = err else {
+    if !matches!(err, AppError::BadGateway(_) | AppError::Storage(_)) {
         return None;
-    };
-    [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN]
-        .into_iter()
-        .find(|status| message.starts_with(&format!("Upstream returned error status {status}")))
+    }
+    upstream_error_status(err)
+        .filter(|status| matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
 }
 
 /// The Hugging Face Hub's machine-readable refusal codes, as it sends them in
@@ -1360,7 +1609,7 @@ fn with_hub_error_code(err: AppError, headers: &reqwest::header::HeaderMap) -> A
     else {
         return err;
     };
-    let prefix = format!("Upstream returned error status {status}");
+    let prefix = upstream_status_prefix(status);
     let tag = |message: String| {
         let tagged = message
             .strip_prefix(&prefix)
@@ -1385,9 +1634,7 @@ fn hub_refusal_error(
 ) -> Option<AppError> {
     is_hub_refusal(headers).then(|| {
         with_hub_error_code(
-            AppError::Storage(format!(
-                "Upstream returned error status {status}: {diagnostic_url}"
-            )),
+            AppError::Storage(upstream_status_message(status, "", diagnostic_url)),
             headers,
         )
     })
@@ -1401,7 +1648,7 @@ pub(crate) fn upstream_hub_error_code(err: &AppError) -> Option<&'static str> {
         return None;
     };
     let rest = message
-        .strip_prefix(&format!("Upstream returned error status {status}"))?
+        .strip_prefix(&upstream_status_prefix(status))?
         .strip_prefix(HUB_ERROR_CODE_TAG)?;
     let (code, _) = rest.split_once(')')?;
     HUB_ERROR_CODES.into_iter().find(|known| *known == code)
@@ -4508,9 +4755,10 @@ impl UpstreamClient {
                 return Self::read_upstream_response_capped(retry_response, url, max).await;
             }
 
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, diagnostic_url
+            return Err(AppError::Storage(upstream_status_message(
+                status,
+                "",
+                &diagnostic_url,
             )));
         }
 
@@ -4751,9 +4999,10 @@ impl UpstreamClient {
                 return Self::read_upstream_response_streaming(retry_response, url);
             }
 
-            return Err(AppError::Storage(format!(
-                "Upstream returned error status {}: {}",
-                status, diagnostic_url
+            return Err(AppError::Storage(upstream_status_message(
+                status,
+                "",
+                &diagnostic_url,
             )));
         }
 
@@ -5664,8 +5913,10 @@ pub struct ProxyService {
     /// buffered upstream fetch.
     upstream_timeouts: crate::config::ProxyUpstreamSettings,
     /// Permits for buffered fills running detached from their request
-    /// (#5220), `upstream_timeouts.max_detached_fills` of them. Shared by the
-    /// clones a detached fill holds.
+    /// (#5220) and for streamed fills finishing after their client stopped
+    /// reading ([`FinishFillOnDrop`], #5509),
+    /// `upstream_timeouts.max_detached_fills` of them. Shared by the clones a
+    /// detached fill holds.
     detached_fill_permits: Arc<Semaphore>,
 }
 
@@ -7675,6 +7926,15 @@ impl ProxyService {
         .await
     }
 
+    /// The bounds of a [`FinishFillOnDrop`] drain: the #5220 detached-fill
+    /// permits and deadline.
+    fn finish_fill_limits(&self) -> FinishFillLimits {
+        FinishFillLimits {
+            permits: Arc::clone(&self.detached_fill_permits),
+            deadline: self.upstream_timeouts.fetch_deadline() + DETACHED_FILL_COMMIT_ALLOWANCE,
+        }
+    }
+
     /// One coordinated attempt of the streaming fetch. Returns `Ok(None)` when
     /// the streaming coordinator asked the caller to fall back (re-enter):
     /// either a late would-be follower that would miss leading bytes, or a
@@ -7730,7 +7990,10 @@ impl ProxyService {
             .await?;
 
         match handle {
-            Some(handle) => Ok(Some(StreamingFetchResult::from(handle))),
+            Some(handle) => Ok(Some(StreamingFetchResult::from(FinishFillOnDrop::wrap(
+                handle,
+                self.finish_fill_limits(),
+            )))),
             None => {
                 forget_cached_sidecar_miss(&metadata_key).await;
                 Ok(None)
@@ -8735,7 +8998,10 @@ impl ProxyService {
                 expected_checksum,
             )
             .await?;
-        Ok(StreamingFetchResult::from(handle))
+        Ok(StreamingFetchResult::from(FinishFillOnDrop::wrap(
+            handle,
+            self.finish_fill_limits(),
+        )))
     }
 
     /// Check if upstream has a newer version of the artifact.
@@ -9279,10 +9545,10 @@ impl ProxyService {
                     return Ok(Some(resp));
                 }
 
-                Err(AppError::Storage(format!(
-                    "Upstream returned error status {}: {}",
+                Err(AppError::Storage(upstream_status_message(
                     status,
-                    redact_url_for_diagnostics(url)
+                    "",
+                    &redact_url_for_diagnostics(url),
                 )))
             }
             _ => {
@@ -19131,6 +19397,118 @@ mod tests {
         let mut coded = reqwest::header::HeaderMap::new();
         coded.insert("x-error-code", "GatedRepo".parse().unwrap());
         assert!(is_hub_refusal(&coded));
+    }
+
+    /// #5504: what a virtual member walk may treat as a miss. Every answer
+    /// `validate_upstream_status` produces for a 4xx is permanent (a miss);
+    /// every 5xx, and every failure without an upstream status, is transient.
+    #[test]
+    fn member_fetch_failure_reads_permanent_4xx_as_a_miss_and_5xx_as_unavailable_5504() {
+        use MemberFetchFailure::{Miss, Unavailable};
+        for (code, want) in [
+            (404, Miss),
+            (410, Miss),
+            (400, Miss),
+            (401, Miss),
+            (403, Miss),
+            (418, Miss),
+            (408, Unavailable),
+            (425, Unavailable),
+            (429, Unavailable),
+            (500, Unavailable),
+            (502, Unavailable),
+            (503, Unavailable),
+            (504, Unavailable),
+        ] {
+            let status = StatusCode::from_u16(code).unwrap();
+            let err = validate_upstream_status(status, "http://x/y").expect_err("non-2xx");
+            assert_eq!(classify_member_fetch_failure(&err), want, "{code}: {err:?}");
+            if code != 404 && code != 410 {
+                assert_eq!(upstream_error_status(&err), Some(status), "{err:?}");
+            }
+        }
+        // A 401 without a Bearer challenge is a `Storage` error carrying the
+        // status; a transport failure or timeout carries none.
+        let no_challenge = AppError::Storage(format!(
+            "{UPSTREAM_ERROR_STATUS_PREFIX}401 Unauthorized: http://x/y"
+        ));
+        assert_eq!(classify_member_fetch_failure(&no_challenge), Miss);
+        assert_eq!(
+            upstream_refusal_status(&no_challenge),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        for transient in [
+            AppError::Storage("Failed to fetch from upstream http://x: operation timed out".into()),
+            AppError::BadGateway(format!("{HYDRATION_WAIT_TIMEOUT_MESSAGE}: k")),
+            AppError::Database("pool timed out".into()),
+        ] {
+            assert_eq!(
+                classify_member_fetch_failure(&transient),
+                Unavailable,
+                "{transient:?}"
+            );
+            assert_eq!(upstream_error_status(&transient), None);
+        }
+        for permanent in [
+            AppError::Validation("bad path".into()),
+            AppError::UpstreamAuth("refused".into()),
+        ] {
+            assert_eq!(
+                classify_member_fetch_failure(&permanent),
+                Miss,
+                "{permanent:?}"
+            );
+        }
+        // A 5xx is never a refusal, even though it carries the status.
+        let down = validate_upstream_status(StatusCode::BAD_GATEWAY, "http://x").unwrap_err();
+        assert_eq!(upstream_refusal_status(&down), None);
+    }
+
+    /// #5504: every producer of an upstream-status error builds its message
+    /// through `upstream_status_message`, so `upstream_error_status` reads
+    /// each one back; and no production line formats the prefix by hand.
+    #[test]
+    fn every_upstream_status_message_round_trips_5504() {
+        let mut hub = reqwest::header::HeaderMap::new();
+        hub.insert("x-error-code", "GatedRepo".parse().unwrap());
+        let produced = [
+            (
+                StatusCode::FORBIDDEN,
+                validate_upstream_status(StatusCode::FORBIDDEN, "http://x").unwrap_err(),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                validate_upstream_status(StatusCode::SERVICE_UNAVAILABLE, "http://x").unwrap_err(),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                anonymous_token_refused_error(StatusCode::UNAUTHORIZED, "http://x"),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                hub_refusal_error(StatusCode::UNAUTHORIZED, &hub, "http://x").expect("hub"),
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                AppError::Storage(upstream_status_message(StatusCode::UNAUTHORIZED, "", "u")),
+            ),
+        ];
+        for (status, err) in produced {
+            assert_eq!(upstream_error_status(&err), Some(status), "{err:?}");
+        }
+
+        let src = include_str!("proxy_service.rs");
+        let production = &src[..src.find("\n#[cfg(test)]").expect("test module")];
+        let literal = ["Upstream returned", " error status"].concat();
+        let hand_formatted: Vec<&str> = production
+            .lines()
+            .filter(|l| l.contains(&literal) && !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            hand_formatted.len(),
+            1,
+            "only UPSTREAM_ERROR_STATUS_PREFIX may spell the prefix: {hand_formatted:?}"
+        );
     }
 
     #[test]
@@ -30175,5 +30553,262 @@ mod cache_read_overlap_tests {
         let open = backend.first("open").expect("body opened");
         let sidecar = backend.first("sidecar_read_done").expect("sidecar read");
         assert!(open > sidecar, "no speculative open on an object store");
+    }
+}
+
+/// [`FinishFillOnDrop`] (#5509): a leader body its client stops reading after
+/// the first bytes is read to its end on its own task, within the permits.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod finish_fill_on_drop_5509 {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A leader handle over `chunks` chunks that counts how many were read,
+    /// plus the sender of its `cache_published` signal.
+    fn leader(
+        chunks: usize,
+    ) -> (
+        StreamHandle,
+        Arc<AtomicUsize>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let read = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&read);
+        let body = futures::stream::iter(0..chunks)
+            .then(move |_| {
+                let counter = Arc::clone(&counter);
+                async move {
+                    tokio::task::yield_now().await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok(Bytes::from_static(b"chunk"))
+                }
+            })
+            .boxed();
+        let (published_tx, published_rx) = tokio::sync::watch::channel(false);
+        let handle = StreamHandle {
+            body,
+            headers: StreamHeaders::default(),
+            cache_published: Some(published_rx),
+        };
+        (handle, read, published_tx)
+    }
+
+    fn limits(permits: &Arc<Semaphore>) -> FinishFillLimits {
+        FinishFillLimits {
+            permits: Arc::clone(permits),
+            deadline: Duration::from_secs(30),
+        }
+    }
+
+    async fn permits_back(permits: &Semaphore, want: usize) -> usize {
+        for _ in 0..200 {
+            if permits.available_permits() == want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        permits.available_permits()
+    }
+
+    async fn read_eventually(read: &AtomicUsize, want: usize) -> usize {
+        for _ in 0..200 {
+            if read.load(Ordering::SeqCst) >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        read.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_body_dropped_mid_object_is_read_to_its_end() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (handle, read, _published) = leader(8);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        assert!(wrapped.body.next().await.unwrap().is_ok());
+        drop(wrapped);
+        assert_eq!(read_eventually(&read, 8).await, 8);
+        // The permit comes back once the drain is done.
+        for _ in 0..200 {
+            if permits.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_a_free_permit_the_body_is_dropped_as_before() {
+        let permits = Arc::new(Semaphore::new(0));
+        let (handle, read, _published) = leader(8);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        assert!(wrapped.body.next().await.unwrap().is_ok());
+        drop(wrapped);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_body_dropped_before_its_first_chunk_is_not_read() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (handle, read, _published) = leader(8);
+        drop(FinishFillOnDrop::wrap(handle, limits(&permits)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 0);
+    }
+
+    /// A finished cache writer (the #2928 ceiling abandoned the write) stops
+    /// the drain: the rest of the body would be read for nothing.
+    #[tokio::test]
+    async fn a_finished_cache_writer_stops_the_drain() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (handle, read, published) = leader(1000);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        assert!(wrapped.body.next().await.unwrap().is_ok());
+        published.send_replace(true);
+        drop(wrapped);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(read.load(Ordering::SeqCst) < 1000);
+    }
+
+    /// A handle feeding no cache write (a follower replay) is left alone.
+    #[tokio::test]
+    async fn a_handle_without_a_cache_write_is_not_wrapped() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (mut handle, read, _published) = leader(8);
+        handle.cache_published = None;
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        assert!(wrapped.body.next().await.unwrap().is_ok());
+        drop(wrapped);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 1);
+    }
+
+    /// A body read to its end leaves nothing to drain.
+    #[tokio::test]
+    async fn a_body_read_to_its_end_takes_no_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (handle, read, _published) = leader(3);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        while wrapped.body.next().await.is_some() {}
+        drop(wrapped);
+        assert_eq!(read.load(Ordering::SeqCst), 3);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    /// A drain is bounded like a #5220 detached fill: an upstream that sends
+    /// one chunk and then stalls gives its permit back at the deadline.
+    #[tokio::test]
+    async fn a_stalled_drain_returns_its_permit_at_the_deadline() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (_published_tx, published_rx) = tokio::sync::watch::channel(false);
+        let body = futures::stream::once(async { Ok(Bytes::from_static(b"chunk")) })
+            .chain(futures::stream::pending())
+            .boxed();
+        let handle = StreamHandle {
+            body,
+            headers: StreamHeaders::default(),
+            cache_published: Some(published_rx),
+        };
+        let mut wrapped = FinishFillOnDrop::wrap(
+            handle,
+            FinishFillLimits {
+                permits: Arc::clone(&permits),
+                deadline: Duration::from_millis(50),
+            },
+        );
+        assert!(wrapped.body.next().await.unwrap().is_ok());
+        drop(wrapped);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(permits.available_permits(), 0, "the drain holds the permit");
+        assert_eq!(permits_back(&permits, 1).await, 1);
+    }
+
+    /// hyper never polls a fixed-length body for its end: a body dropped once
+    /// every advertised byte is out has nothing left to fill.
+    #[tokio::test]
+    async fn a_fully_read_fixed_length_body_takes_no_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (mut handle, read, _published) = leader(3);
+        handle.headers.content_length = Some(3 * b"chunk".len() as u64);
+        let mut wrapped = FinishFillOnDrop::wrap(handle, limits(&permits));
+        for _ in 0..3 {
+            assert!(wrapped.body.next().await.unwrap().is_ok());
+        }
+        drop(wrapped);
+        assert_eq!(permits.available_permits(), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(read.load(Ordering::SeqCst), 3);
+    }
+
+    /// A follower that joined the leader's fan-out before the leader's client
+    /// stopped reading: the drain carries the rest of the object to it, and
+    /// an upstream failure during the drain releases it to re-enter (`None`)
+    /// instead of leaving it waiting.
+    async fn follower_of_a_dropped_leader(fail_midway: bool) -> Option<Vec<u8>> {
+        let lease_key = format!("proxy-stream:finish-fill-test:{}", Uuid::new_v4());
+        let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Bytes>>();
+        let (_published_tx, published_rx) = tokio::sync::watch::channel(false);
+        let leader =
+            crate::services::proxy_hydration::coordinate_stream_fanout(&lease_key, || async move {
+                Ok(StreamHandle {
+                    body: rx.boxed(),
+                    headers: StreamHeaders {
+                        content_length: Some(15),
+                        ..StreamHeaders::default()
+                    },
+                    cache_published: Some(published_rx),
+                })
+            })
+            .await
+            .expect("leader opens")
+            .expect("first caller leads");
+        let follower_key = lease_key.clone();
+        let follower = tokio::spawn(async move {
+            crate::services::proxy_hydration::coordinate_stream_fanout(&follower_key, || async {
+                Err::<StreamHandle, _>(AppError::Internal("a follower never opens".into()))
+            })
+            .await
+        });
+        // Let the follower subscribe before the leader emits anything.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let mut wrapped = FinishFillOnDrop::wrap(leader, limits(&permits));
+        tx.unbounded_send(Ok(Bytes::from_static(b"aaaaa"))).unwrap();
+        assert_eq!(&wrapped.body.next().await.unwrap().unwrap()[..], b"aaaaa");
+        // The client took its window and went away.
+        drop(wrapped);
+        tx.unbounded_send(Ok(Bytes::from_static(b"bbbbb"))).unwrap();
+        if fail_midway {
+            tx.unbounded_send(Err(AppError::BadGateway("upstream reset".into())))
+                .unwrap();
+        } else {
+            tx.unbounded_send(Ok(Bytes::from_static(b"ccccc"))).unwrap();
+        }
+        drop(tx);
+
+        let handle = tokio::time::timeout(Duration::from_secs(10), follower)
+            .await
+            .expect("the follower is released, not left waiting")
+            .expect("follower task")
+            .expect("follower result")?;
+        let body: Vec<Bytes> = handle.body.map(|c| c.unwrap()).collect().await;
+        Some(body.concat())
+    }
+
+    #[tokio::test]
+    async fn a_follower_gets_the_whole_object_through_the_drain() {
+        assert_eq!(
+            follower_of_a_dropped_leader(false).await.as_deref(),
+            Some(&b"aaaaabbbbbccccc"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_that_fails_midway_releases_the_follower_to_re_enter() {
+        assert_eq!(follower_of_a_dropped_leader(true).await, None);
     }
 }

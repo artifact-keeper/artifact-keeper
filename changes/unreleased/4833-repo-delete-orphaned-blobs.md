@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4833]
----
-- **Deleting a repository on filesystem storage now removes its files even when another repository holds the same bytes** (#4833). Generic and other content-addressed artifacts share a storage key across repositories that hold the same content, and the delete spared any key another repository's row also named. On filesystem storage each repository keeps its own copy in its own directory, so the other repository's copy wrongly shielded this one, the cascade then dropped the only row that named it, and garbage collection could never find it again. The check now counts only a repository that resolves the key to the same object (same backend, and on filesystem the same storage path), including an older revision there. A key the delete still spares because it is genuinely shared is handed to the storage-GC candidate set, so the next GC pass reclaims it once no repository references it, which also covers two repositories sharing a key on cloud storage being deleted together. GC likewise reclaims a trashed filesystem copy while another repository serves its own copy of the same key.

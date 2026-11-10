@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#5345]
----
-- **An npm Remote that cannot reach or may not contact its upstream now says why on the `/-/` meta endpoints, instead of answering `501 "... is not implemented for local repositories"`** (#5345). `npm audit signatures` (`GET /-/npm/v1/attestations/...`), `npm search` and the other `/-/` reads fell through to the Local repository stub whenever the upstream request failed. A Remote now answers `503 upstream unreachable` when its upstream cannot be reached, and `404` with the gate's own reason when the upstream filter refuses the path or the repository is cache-only (the cache-only reason was previously reported as an upstream filter refusal). An attestation answer still held in the attestation cache is served instead. A Virtual repository whose Remote members cannot answer returns `503` (a member was unreachable) or `404` listing each member's refusal. `/-/ping` and `/-/whoami` are still answered locally when the upstream is unreachable, Local repositories keep their `501`, and the audit POST endpoints keep their empty-advisories fallback. See `docs/air-gapped.md`.

@@ -312,10 +312,16 @@ pub(crate) const KNOWN_SEVERITIES: &[&str] = &["critical", "high", "medium", "lo
 /// [`crate::models::security::FindingClass::as_str`].
 pub(crate) const KNOWN_FINDING_CLASSES: &[&str] = &["vulnerability", "malicious", "policy"];
 
-/// Longest accepted value for the free-text findings filters (`source`,
-/// `cve_id`). Both columns are `VARCHAR(100)`, so anything longer cannot match
-/// a stored row and is rejected rather than run as a guaranteed-empty query.
+/// Longest accepted `cve_id` findings filter. This bounds the query, not the
+/// column: `scan_findings.cve_id` is `VARCHAR(30)`, so a value between 31 and
+/// 100 characters runs as a guaranteed-empty query, and anything longer is
+/// rejected up front.
 const FINDING_FILTER_MAX_LEN: usize = 100;
+
+/// Longest accepted `source` findings filter. `scan_findings.source` is `TEXT`
+/// since migration 339 (#5534), so this bounds the query, not the column: it
+/// is well above any scanner name a finding carries.
+const FINDING_SOURCE_FILTER_MAX_LEN: usize = 1024;
 
 /// Validate an optional filter against a closed vocabulary (#3410).
 ///
@@ -343,14 +349,18 @@ fn validate_enum_filter<'a>(
 /// carries whichever scanner name an engine (or an external submitter) wrote —
 /// so these are bounded rather than enumerated: a blank or over-long value is
 /// rejected, anything else is matched exactly.
-fn validate_text_filter<'a>(value: Option<&'a String>, field: &str) -> Result<Option<&'a str>> {
+fn validate_text_filter<'a>(
+    value: Option<&'a String>,
+    field: &str,
+    max_len: usize,
+) -> Result<Option<&'a str>> {
     match value {
         None => Ok(None),
         Some(v) if v.trim().is_empty() => Err(AppError::Validation(format!(
             "Invalid {field}: must not be blank"
         ))),
-        Some(v) if v.len() > FINDING_FILTER_MAX_LEN => Err(AppError::Validation(format!(
-            "Invalid {field}: must be at most {FINDING_FILTER_MAX_LEN} characters"
+        Some(v) if v.len() > max_len => Err(AppError::Validation(format!(
+            "Invalid {field}: must be at most {max_len} characters"
         ))),
         Some(v) => Ok(Some(v.as_str())),
     }
@@ -759,8 +769,12 @@ impl ListFindingsQuery {
     ) -> Result<crate::services::scan_result_service::FindingListFilter<'_>> {
         Ok(crate::services::scan_result_service::FindingListFilter {
             severity: validate_enum_filter(self.severity.as_ref(), KNOWN_SEVERITIES, "severity")?,
-            source: validate_text_filter(self.source.as_ref(), "source")?,
-            cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id")?,
+            source: validate_text_filter(
+                self.source.as_ref(),
+                "source",
+                FINDING_SOURCE_FILTER_MAX_LEN,
+            )?,
+            cve_id: validate_text_filter(self.cve_id.as_ref(), "cve_id", FINDING_FILTER_MAX_LEN)?,
             finding_class: validate_enum_filter(
                 self.finding_class.as_ref(),
                 KNOWN_FINDING_CLASSES,
@@ -11537,8 +11551,23 @@ mod tests {
         };
         assert!(
             matches!(q.validated_filters(), Err(AppError::Validation(_))),
-            "cve_id is VARCHAR(100): a longer value cannot match a stored row"
+            "cve_id is VARCHAR(30): a longer value cannot match a stored row"
         );
+        // #5534: `source` is TEXT, so a scanner name past the old 100-char
+        // column bound is filterable; only an unbounded query is refused.
+        let long_source = ListFindingsQuery {
+            source: Some("s".repeat(300)),
+            ..Default::default()
+        };
+        assert!(long_source.validated_filters().is_ok());
+        let q = ListFindingsQuery {
+            source: Some("s".repeat(FINDING_SOURCE_FILTER_MAX_LEN + 1)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            q.validated_filters(),
+            Err(AppError::Validation(_))
+        ));
         let ok = ListFindingsQuery {
             source: Some("grype".to_string()),
             cve_id: Some("CVE-2024-3094".to_string()),

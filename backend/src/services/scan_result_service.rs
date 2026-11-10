@@ -3439,10 +3439,72 @@ impl ScanResultService {
     }
 }
 
+/// Longest `scan_findings.cve_id` the column holds, in characters
+/// (`VARCHAR(30)`, migration 022). It is the one scanner-supplied text column
+/// migration 339 did not widen to `TEXT` (#5534): a partial index sits on it,
+/// and widening would rebuild that index under an exclusive lock.
+pub(crate) const SCAN_FINDING_CVE_ID_MAX_CHARS: usize = 30;
+
+/// Why `findings` cannot be stored, naming the finding and the column, or
+/// `None` when every row fits the `scan_findings` schema (#5534).
+///
+/// The findings go in as ONE statement, so a single value the column rejects
+/// fails the whole batch, and PostgreSQL's error names neither the row nor
+/// (for an over-long value) the column. This check runs first and says which.
+/// It refuses rather than truncates or drops: storing a finding other than
+/// the one the scanner reported, or completing a scan without it, would hand
+/// every gate that reads the scan a verdict nobody issued.
+///
+/// Covers what the schema still refuses: a NUL byte in any text column
+/// (PostgreSQL cannot store one in `TEXT`) and an over-long `cve_id`.
+fn unstorable_finding(findings: &[RawFinding]) -> Option<String> {
+    let total = findings.len();
+    findings.iter().enumerate().find_map(|(index, f)| {
+        let text_columns = [
+            ("title", Some(f.title.as_str())),
+            ("description", f.description.as_deref()),
+            ("cve_id", f.cve_id.as_deref()),
+            ("affected_component", f.affected_component.as_deref()),
+            ("affected_version", f.affected_version.as_deref()),
+            ("fixed_version", f.fixed_version.as_deref()),
+            ("source", f.source.as_deref()),
+            ("source_url", f.source_url.as_deref()),
+        ];
+        let problem = text_columns.iter().find_map(|(column, value)| {
+            let value = (*value)?;
+            if value.contains('\0') {
+                return Some(format!("`{column}` contains a NUL byte"));
+            }
+            let chars = value.chars().count();
+            (*column == "cve_id" && chars > SCAN_FINDING_CVE_ID_MAX_CHARS).then(|| {
+                format!(
+                    "`cve_id` is {chars} characters, longer than the \
+                     {SCAN_FINDING_CVE_ID_MAX_CHARS} the column holds"
+                )
+            })
+        })?;
+        let label: String = f
+            .cve_id
+            .as_deref()
+            .unwrap_or(&f.title)
+            .chars()
+            .take(80)
+            .collect();
+        Some(format!(
+            "finding {} of {total} ({label:?}) cannot be stored: {problem}",
+            index + 1
+        ))
+    })
+}
+
 /// The single-statement UNNEST insert behind
 /// [`ScanResultService::create_findings`], generic over the executor so
 /// [`ScanResultService::create_completed_scan_with_findings`] can run it
 /// inside the transaction that wrote the scan row (#4667).
+///
+/// #5534: a batch the schema would refuse is answered with a `Validation`
+/// error naming the finding and the column (see [`unstorable_finding`]), and
+/// any other database error says how many findings for which scan it lost.
 pub(crate) async fn insert_findings<'e, E>(
     executor: E,
     scan_result_id: Uuid,
@@ -3454,6 +3516,9 @@ where
 {
     if findings.is_empty() {
         return Ok(());
+    }
+    if let Some(problem) = unstorable_finding(findings) {
+        return Err(AppError::Validation(problem));
     }
 
     let severities: Vec<String> = findings
@@ -3517,7 +3582,12 @@ where
     )
     .execute(executor)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .map_err(|e| {
+        AppError::Database(format!(
+            "storing {} findings for scan {scan_result_id}: {e}",
+            findings.len()
+        ))
+    })?;
 
     Ok(())
 }
@@ -4188,6 +4258,69 @@ mod tests {
         };
         assert_eq!(finding.severity, Severity::Info);
         assert!(finding.description.is_none());
+    }
+
+    // =======================================================================
+    // unstorable_finding (#5534)
+    // =======================================================================
+
+    fn storable_finding(cve: &str) -> RawFinding {
+        RawFinding {
+            severity: Severity::High,
+            title: format!("{cve} in libexpat"),
+            description: None,
+            cve_id: Some(cve.to_string()),
+            affected_component: Some("libexpat".to_string()),
+            affected_version: Some("2.5.0".to_string()),
+            fixed_version: Some("2.6.0".to_string()),
+            source: Some("trivy".to_string()),
+            source_url: None,
+            finding_class: crate::models::security::FindingClass::Vulnerability,
+        }
+    }
+
+    /// Lengths the 022 schema refused are storable now that the columns are
+    /// `TEXT` (339): nothing is refused, so nothing would be truncated.
+    #[test]
+    fn test_unstorable_finding_accepts_long_text_columns() {
+        let mut long = storable_finding("CVE-2024-5534");
+        long.title = "t".repeat(2000);
+        long.affected_component = Some("c".repeat(600));
+        long.affected_version = Some("a".repeat(300));
+        long.fixed_version = Some("f".repeat(300));
+        long.source = Some("s".repeat(300));
+        long.source_url = Some("u".repeat(1000));
+        long.cve_id = Some("C".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS));
+        assert_eq!(unstorable_finding(&[storable_finding("CVE-1"), long]), None);
+        assert_eq!(unstorable_finding(&[]), None);
+    }
+
+    #[test]
+    fn test_unstorable_finding_names_the_finding_and_column() {
+        let mut overlong = storable_finding(&"X".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS + 1));
+        overlong.title = "ignored".to_string();
+        let message = unstorable_finding(&[storable_finding("CVE-1"), overlong])
+            .expect("a cve_id past VARCHAR(30) is refused");
+        assert!(message.starts_with("finding 2 of 2 (\"XXXX"), "{message}");
+        assert!(
+            message.contains("`cve_id` is 31 characters, longer than the 30"),
+            "{message}"
+        );
+
+        // Characters, not bytes: the column is VARCHAR(30) characters.
+        let wide = storable_finding(&"é".repeat(SCAN_FINDING_CVE_ID_MAX_CHARS));
+        assert_eq!(unstorable_finding(&[wide]), None);
+
+        // A NUL in any text column, labelled by title when there is no id.
+        let mut nul = storable_finding("CVE-2");
+        nul.cve_id = None;
+        nul.fixed_version = Some("1.0\u{0}".to_string());
+        let message = unstorable_finding(&[nul]).expect("a NUL is refused");
+        assert_eq!(
+            message,
+            "finding 1 of 1 (\"CVE-2 in libexpat\") cannot be stored: \
+             `fixed_version` contains a NUL byte"
+        );
     }
 
     // =======================================================================

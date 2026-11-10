@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4790]
----
-- **OCI/Docker images pushed to hosted repositories are now replicated to push/mirror peers** (#4790). A `docker push` queued no replication at all, because an image's config and layer blobs live in `oci_blobs` rather than `artifacts` and the sync worker moved one `artifacts` row at a time. A pushed manifest now queues a push task, and the sync worker sends the manifest's blob closure (config and layers, and child manifests for a multi-arch index) to the peer before the manifest itself, through new receive routes `PUT /api/v1/repositories/{key}/oci/blobs/{digest}` and `.../oci/manifests/{digest}`. The peer verifies every digest and commits the manifest last, so it never serves an image with missing blobs, and a replicated write is not fanned back out. The receive routes take the same checks as generic replication uploads: the peer's API key needs the `write:artifacts` scope and `write` on the target hosted repository. Both nodes must run this release; a peer on an older release answers the new routes with an error and the task is retried.

@@ -4,12 +4,13 @@
 #
 # * Every entry below is a Go-dependency CVE compiled INTO one of the vendored
 #   scanner CLIs that AK images ship and invoke:
-#     - /usr/local/bin/grype  (upstream tag v0.120.1, BUILT FROM SOURCE in
+#     - /usr/local/bin/grype  (upstream tag v0.121.3, BUILT FROM SOURCE in
 #       docker/Dockerfile.backend{,.alpine} since #3352 — backend images)
 #     - /usr/local/bin/trivy  (ghcr.io/artifact-keeper/trivy, pinned by digest
 #       in docker/Dockerfile.scanner-adapter — scanner-adapter image only; the
 #       backend images do NOT bundle trivy)
-#     - /usr/local/bin/buildctl  (moby/buildkit v0.33.1, BUILT FROM SOURCE in
+#     - /usr/local/bin/buildctl  (moby/buildkit v0.33.1 with golang.org/x/net
+#       overridden to v0.62.0 since #5565, BUILT FROM SOURCE in
 #       docker/Dockerfile.backend since 2026-10-10 — UBI backend image only)
 #   All are short-lived CLI subprocesses the services shell out to. They are
 #   NOT part of the network-reachable service surface (axum HTTP :8080 / gRPC
@@ -34,7 +35,7 @@
 #   trivy has been our own build of the pinned upstream tag since #3123
 #   (ghcr.io/artifact-keeper/trivy, dependency overrides declared in that
 #   repo's overrides.yaml). grype joined it at #3352: the backend Dockerfiles
-#   now COMPILE upstream v0.120.1 (since #3698) from source with a Go
+#   now COMPILE upstream v0.121.3 (since #5565) from source with a Go
 #   toolchain floored at go1.27.2, instead of copying the prebuilt binary out
 #   of ghcr.io/anchore/grype.
 #
@@ -135,6 +136,10 @@
 # in overrides.yaml). None of those tokens belongs in this file.
 #
 # ---------------------------------------------------------------------------
+# RETIRED at #5565 (2026-11-09): this block no longer suppresses anything; its
+# five tokens are tombstoned at the bottom of this file. The history below is
+# kept because it is the record of why they were ever here.
+#
 # grype v0.120.1 binary — github.com/docker/docker @ v28.5.2+incompatible
 # CVE-2026-41567 / -41568 / -42306: NO upstream-fixed docker release exists yet
 # (FixedVersion=none). CVE-2026-33997 / -34040 are fixed in docker 29.3.1 but
@@ -178,11 +183,27 @@
 # v1.83.2 itself) and brings golang.org/x/crypto v0.57.0, clearing
 # CVE-2026-56855 / CVE-2026-78662 from upstream's own pin; neither was ever
 # listed here.
-CVE-2026-33997
-CVE-2026-34040
-CVE-2026-41567
-CVE-2026-41568
-CVE-2026-42306
+#
+# Retired on the v0.120.1 -> v0.121.3 bump (2026-11-09, #5565), and for the
+# artifact-side reason the ledger convention asks for, not a DB-side one.
+# v0.121.3's go.mod no longer requires github.com/docker/docker at all: upstream
+# moved its engine client to github.com/moby/moby/client v0.6.2 (+
+# github.com/moby/moby/api v1.56.1). The `go mod edit -require` retry this
+# block kept asking for therefore has nothing to move; it would add a module the
+# build does not use. Measured with trivy 0.76.2 and `go version -m` on the
+# binaries the changed stages build, no ignorefile, all severities:
+#   * grype v0.121.3 (grype-bin): no docker/docker in the build info, none of
+#     the five tokens reported, 0 HIGH/CRITICAL. Before the bump the same scan
+#     of the 1.11.12 image's grype reported -41567 and -42306 (HIGH, no fix),
+#     and Grype reported GO-2026-4887 against the same module.
+#   * buildctl (buildkit-bin): no docker/docker in the build info.
+#   * the scanner-adapter's trivy (ghcr.io/artifact-keeper/trivy@sha256:47199755,
+#     upstream v0.76.0): no docker/docker in the build info either (it links
+#     moby/moby/client v0.6.0), so no image main ships still carries the module.
+# None of the bump's other findings came here, which is the rule working again:
+# GO-2026-6888 (brotli) and GO-2026-6865 (klauspost/compress) had fixed
+# versions and the bump BUILT them; buildctl's CVE-2026-78661 (x/net, fixed in
+# v0.62.0) moved the buildkit-bin override's target instead.
 
 # ---------------------------------------------------------------------------
 # DELIBERATELY NOT SUPPRESSED (#3262) — go-git in the PUBLISHED images only.
@@ -261,6 +282,16 @@ CVE-2026-42306
 #   These seven are the reason to read the header before adding a stdlib token
 #   back: the class is now fixed at the source, and a new one belongs in
 #   GO_MIN_PATCH, not here.
+#
+# Measurement record (2026-11-09, #5565):
+# * The five github.com/docker/docker tokens — CVE-2026-33997 / -34040 /
+#   -41567 / -41568 / -42306. Suppressed since 2026-08-16 because grype pinned
+#   docker/docker v28.5.2+incompatible and the "fixed" v29.3.1 could not be
+#   resolved on that module path. grype v0.121.3 drops the module (moby/moby/
+#   client replaces it). trivy 0.76.2, no ignorefile, all severities, against
+#   the rebuilt grype, the rebuilt buildctl and the scanner-adapter's pinned
+#   trivy: none of the five appears, and none of the three binaries' Go build
+#   info lists github.com/docker/docker.
 # ===========================================================================
 # RETIRED: GHSA-hrxh-6v49-42gf (2026-08-13, grype grpc-go fixed in v0.117.0, #3307/#3309)
 # RETIRED: CVE-2026-27145 (2026-08-16, grype stdlib cleared by go1.26.6 source build, #3352)
@@ -277,3 +308,8 @@ CVE-2026-42306
 # RETIRED: CVE-2026-56852 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
 # RETIRED: CVE-2026-49834 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
 # RETIRED: CVE-2026-49835 (2026-08-13, absent from artifact-keeper/trivy build, #3123/#3309)
+# RETIRED: CVE-2026-33997 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
+# RETIRED: CVE-2026-34040 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
+# RETIRED: CVE-2026-41567 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
+# RETIRED: CVE-2026-41568 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)
+# RETIRED: CVE-2026-42306 (2026-11-09, docker/docker dropped by grype v0.121.3, #5565)

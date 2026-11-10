@@ -15,7 +15,8 @@ use uuid::Uuid;
 
 use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::handlers::repositories::{
-    require_repo_admin, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_admin, require_repo_write_access,
+    require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -124,7 +125,11 @@ async fn administered_repo(
     let service = RepositoryService::new(state.db.clone());
     let model = service.get_by_key(key).await?;
     require_repo_write_access(auth, &model, &service).await?;
-    require_repo_admin(auth, model.id, &state.permission_service).await?;
+    // #5458: an admin refusal to a caller who cannot read the repository is
+    // the unknown-key 404 too (`require_repo_write_access` already hides its
+    // own refusals the same way).
+    let admin = require_repo_admin(auth, model.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, auth, &model, &service).await?;
     remote_info(state, key).await
 }
 
@@ -253,6 +258,9 @@ pub struct DecisionRequest {
         (status = 200, body = DecisionResult),
         (status = 403, description = "Repository admin required"),
         (status = 404, description = "Unknown row"),
+        (status = 409, description = "Approved, but the ingested version's storage key is held by another repository"),
+        (status = 500, description = "Approved, but the ingested version could not be stored"),
+        (status = 507, description = "Approved, but storing the ingested version exceeds a quota"),
     )
 )]
 pub async fn decide(
@@ -454,7 +462,13 @@ pub struct PinRequest {
     tag = "mcp",
     params(("key" = String, Path, description = "Remote MCP repository key")),
     request_body = PinRequest,
-    responses((status = 200, body = DecisionResult), (status = 404, description = "Name not in the catalog"))
+    responses(
+        (status = 200, body = DecisionResult),
+        (status = 404, description = "Name not in the catalog"),
+        (status = 409, description = "Pinned, but the ingested version's storage key is held by another repository"),
+        (status = 500, description = "Pinned, but the ingested version could not be stored"),
+        (status = 507, description = "Pinned, but storing the ingested version exceeds a quota"),
+    )
 )]
 pub async fn create_pin(
     State(state): State<SharedState>,
@@ -798,6 +812,7 @@ mod tests {
     use crate::api::handlers::test_db_helpers as tdh;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -850,6 +865,17 @@ mod tests {
 
     impl Env {
         async fn new() -> Option<Self> {
+            Self::setup(None).await.map(|(env, _)| env)
+        }
+
+        /// An [`Env`] whose repositories store on the in-memory shared
+        /// cloud backend `s3`, the deployment shape of #5660.
+        async fn new_cloud() -> Option<(Self, Arc<tdh::MemStorage>)> {
+            let (env, mem) = Self::setup(Some("s3")).await?;
+            Some((env, mem.expect("cloud backend")))
+        }
+
+        async fn setup(cloud: Option<&str>) -> Option<(Self, Option<Arc<tdh::MemStorage>>)> {
             let fx = tdh::Fixture::setup("remote", "mcp").await?;
             let (upstream, guard) = tdh::non_loopback_mock_server().await;
             sqlx::query("UPDATE repositories SET upstream_url = $2 WHERE id = $1")
@@ -859,24 +885,43 @@ mod tests {
                 .await
                 .unwrap();
             let dir = fx.storage_dir.to_string_lossy().to_string();
-            let state = tdh::build_state_with_proxy_and_age_gate(
-                fx.pool.clone(),
-                &dir,
-                tdh::build_proxy_service_with_fs(fx.pool.clone(), &dir),
-            );
+            let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), &dir);
+            let (state, mem) = match cloud {
+                None => (
+                    tdh::build_state_with_proxy_and_age_gate(fx.pool.clone(), &dir, proxy),
+                    None,
+                ),
+                Some(backend) => {
+                    sqlx::query(
+                        "UPDATE repositories SET storage_backend = $2, storage_path = key \
+                         WHERE id = $1",
+                    )
+                    .bind(fx.repo_id)
+                    .bind(backend)
+                    .execute(&fx.pool)
+                    .await
+                    .unwrap();
+                    let (state, mem) =
+                        tdh::build_state_with_cloud_and_proxy(fx.pool.clone(), backend, proxy);
+                    (state, Some(mem))
+                }
+            };
             let mut admin = tdh::make_auth(fx.user_id, &fx.username);
             admin.is_admin = true;
             // Another test may be toggling the shared `upstream_jobs_paused`
             // setting right now; this process reads only the env default.
             crate::services::upstream_pause::ignore_stored_setting_for_tests();
-            Some(Self {
-                fx,
-                upstream,
-                _guard: guard,
-                state,
-                admin,
-                extra: Vec::new(),
-            })
+            Some((
+                Self {
+                    fx,
+                    upstream,
+                    _guard: guard,
+                    state,
+                    admin,
+                    extra: Vec::new(),
+                },
+                mem,
+            ))
         }
 
         fn app(&self, auth: Option<AuthExtension>) -> Router {
@@ -2296,6 +2341,303 @@ mod tests {
         let st = env.finished_after(&before).await;
         assert_eq!(st["lastSummary"]["pages"], 1, "{st}");
         assert_eq!(st["lastSummary"]["namesNew"], 1, "{st}");
+        env.teardown().await;
+    }
+
+    /// #5458: every Remote management write (sync, pin, approve, block,
+    /// reopen, the bulk decisions, a seed) by an administrator of ANOTHER
+    /// repository answers an existing private Remote key exactly (status,
+    /// headers, body) as it answers an unknown key, and changes nothing. A
+    /// member who can read keeps the 403.
+    #[tokio::test]
+    async fn write_denials_to_non_readers_match_an_unknown_key() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        // An administrator of a different repository, not of the instance.
+        let (foreign, foreign_name) = tdh::create_user(&env.fx.pool).await;
+        let (own_id, _, own_dir) = tdh::create_repo(&env.fx.pool, "remote", "mcp").await;
+        env.extra.push((own_id, own_dir));
+        tdh::grant_repo_role(&env.fx.pool, own_id, foreign, "repository-owner").await;
+        let foreign_auth = tdh::make_auth(foreign, &foreign_name);
+        // The same principal through a CI token carrying `trigger:sync`.
+        let mut foreign_ci = foreign_auth.clone();
+        foreign_ci.is_api_token = true;
+        foreign_ci.scopes = Some(vec!["trigger:sync".into(), "write:repositories".into()]);
+        let (reader, reader_name) = tdh::create_user(&env.fx.pool).await;
+        tdh::grant_repo_role(&env.fx.pool, env.fx.repo_id, reader, "reader").await;
+        let reader_auth = tdh::make_auth(reader, &reader_name);
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let row = Uuid::new_v4();
+        let writes: Vec<(String, Option<serde_json::Value>)> = vec![
+            ("/sync".into(), None),
+            (
+                "/catalog/pins".into(),
+                Some(serde_json::json!({"name": "com.acme/a", "version": "1.0.0"})),
+            ),
+            (format!("/catalog/{row}/approve"), None),
+            (format!("/catalog/{row}/block"), None),
+            (format!("/catalog/{row}/reopen"), None),
+            (
+                "/catalog/bulk-approve".into(),
+                Some(serde_json::json!({"pattern": "com.acme/*"})),
+            ),
+            (
+                "/catalog/bulk-block".into(),
+                Some(serde_json::json!({"pattern": "com.acme/*"})),
+            ),
+            (
+                "/catalog/bulk-decide".into(),
+                Some(serde_json::json!({"ids": [row], "action": "approve"})),
+            ),
+            (
+                "/seed".into(),
+                Some(serde_json::json!({"servers": [{"name": "com.acme/a", "version": "1.0.0"}]})),
+            ),
+        ];
+        let send =
+            |auth: &AuthExtension, key: &str, tail: &str, body: Option<&serde_json::Value>| {
+                let mut b = Request::builder()
+                    .method("POST")
+                    .uri(format!("/r/{key}/mcp{tail}"));
+                if body.is_some() {
+                    b = b.header("content-type", "application/json");
+                }
+                let req = b
+                    .body(
+                        body.map(|v| Body::from(v.to_string()))
+                            .unwrap_or_else(Body::empty),
+                    )
+                    .unwrap();
+                tdh::send_with_headers(env.app(Some(auth.clone())), req)
+            };
+        for (tail, body) in &writes {
+            let mut callers = vec![&foreign_auth];
+            if tail == "/sync" || tail == "/seed" {
+                callers.push(&foreign_ci);
+            }
+            for auth in callers {
+                let existing = send(auth, &env.fx.repo_key, tail, body.as_ref()).await;
+                let missing = send(auth, &unknown, tail, body.as_ref()).await;
+                assert_eq!(existing.0, StatusCode::NOT_FOUND, "{tail}");
+                assert_eq!(existing, missing, "{tail}: existing private vs unknown");
+            }
+            // A member who can read already knows the repository exists.
+            let (s, _, _) = send(&reader_auth, &env.fx.repo_key, tail, body.as_ref()).await;
+            assert_eq!(s, StatusCode::FORBIDDEN, "{tail}: reader");
+        }
+        // Nothing changed: no catalog row, no sync or seed started, no
+        // upstream request.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM curation_packages WHERE staging_repo_id = $1")
+                .bind(env.fx.repo_id)
+                .fetch_one(&env.fx.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+        let st = env.settled().await;
+        assert!(st["lastStartedAt"].is_null(), "{st}");
+        assert_eq!(env.upstream.received_requests().await.unwrap().len(), 0);
+        tdh::cleanup_user(&env.fx.pool, foreign).await;
+        tdh::cleanup_user(&env.fx.pool, reader).await;
+        env.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5660: repo-scoped storage keys, and an approval that cannot store
+    // -----------------------------------------------------------------------
+
+    impl Env {
+        /// `/r/{key}/mcp{tail}` as the instance administrator.
+        async fn admin_at(
+            &self,
+            key: &str,
+            verb: &str,
+            tail: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, serde_json::Value) {
+            let uri = format!("/r/{key}/mcp{tail}");
+            self.call(Some(self.admin.clone()), verb, &uri, body).await
+        }
+
+        /// Run one sync of the Remote `key` to its end.
+        async fn sync_at(&self, key: &str) {
+            let (s, b) = self.admin_at(key, "POST", "/sync", None).await;
+            assert_eq!(s, StatusCode::ACCEPTED, "{b}");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let (_, st) = self.admin_at(key, "GET", "/sync", None).await;
+                if st["running"] == false && st["lastFinishedAt"].is_string() {
+                    assert!(st["lastError"].is_null(), "{st}");
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "sync of {key}: {st}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Approve the catalog name `name` of the Remote `key`.
+        async fn approve_at(&self, key: &str, name: &str) -> (StatusCode, serde_json::Value) {
+            let (s, item) = self
+                .admin_at(key, "GET", &format!("/catalog/servers/{name}"), None)
+                .await;
+            assert_eq!(s, StatusCode::OK, "{item}");
+            let id = item["id"].as_str().expect("catalog id").to_string();
+            self.admin_at(key, "POST", &format!("/catalog/{id}/approve"), None)
+                .await
+        }
+
+        /// The names served by the MCP registry surface of `key`.
+        async fn listed_at(&self, key: &str) -> Vec<String> {
+            let uri = format!("/mcp/{key}/v0.1/servers");
+            let (s, b) = self.call(None, "GET", &uri, None).await;
+            assert_eq!(s, StatusCode::OK, "{b}");
+            b["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["server"]["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        /// A second Remote MCP repository of this test's upstream, on the
+        /// same storage backend as the first.
+        async fn second_remote(&mut self) -> (Uuid, String) {
+            let (id, key, dir) = tdh::create_repo(&self.fx.pool, "remote", "mcp").await;
+            sqlx::query(
+                "UPDATE repositories SET upstream_url = $2, storage_backend = r.storage_backend, \
+                 storage_path = repositories.key \
+                 FROM repositories r WHERE repositories.id = $1 AND r.id = $3",
+            )
+            .bind(id)
+            .bind(self.upstream.uri())
+            .bind(self.fx.repo_id)
+            .execute(&self.fx.pool)
+            .await
+            .unwrap();
+            tdh::grant_repo_access(&self.fx.pool, id, self.fx.user_id).await;
+            self.extra.push((id, dir));
+            (id, key)
+        }
+
+        async fn server_row_key(&self, repo_id: Uuid) -> Option<String> {
+            sqlx::query_scalar(
+                "SELECT storage_key FROM artifacts WHERE repository_id = $1 \
+                 AND path LIKE 'servers/%/server.json' AND is_deleted = false",
+            )
+            .bind(repo_id)
+            .fetch_optional(&self.fx.pool)
+            .await
+            .unwrap()
+        }
+    }
+
+    const SHARED: &str = "io.github.acme/shared";
+
+    /// Serve one version of [`SHARED`] from the upstream, and return the
+    /// entry as listed.
+    async fn serve_shared(env: &Env) -> serde_json::Value {
+        let shared = entry(server(SHARED, "1.0.0", serde_json::json!({})), T1);
+        env.serve(
+            Mock::given(method("GET")).and(path("/v0.1/servers")),
+            vec![shared.clone()],
+        )
+        .await;
+        env.serve_versions(SHARED, vec![shared.clone()]).await;
+        shared
+    }
+
+    /// Two Remote MCP registries of one upstream on a shared cloud namespace
+    /// both approve, store and serve the same server version. On main the
+    /// second approval answered 200 while its store failed the
+    /// cross-repository write guard (409, logged only), and the version was
+    /// never served from it.
+    #[tokio::test]
+    async fn same_version_approves_into_two_cloud_remotes_5660() {
+        let Some((mut env, mem)) = Env::new_cloud().await else {
+            return;
+        };
+        serve_shared(&env).await;
+        let first = (env.fx.repo_id, env.fx.repo_key.clone());
+        let second = env.second_remote().await;
+
+        for (repo_id, key) in [&first, &second] {
+            env.sync_at(key).await;
+            let (s, b) = env.approve_at(key, SHARED).await;
+            assert_eq!(s, StatusCode::OK, "approve in {key}: {b}");
+            assert!(b["ingestError"].is_null(), "approve in {key}: {b}");
+            assert_eq!(env.listed_at(key).await, [SHARED], "served from {key}");
+            let row_key = env.server_row_key(*repo_id).await.expect("ingested row");
+            assert!(
+                row_key.starts_with(&format!("mcp/{repo_id}/{SHARED}/1.0.0/")),
+                "{row_key} must be repo-scoped"
+            );
+            assert!(
+                mem.objects.lock().unwrap().contains_key(&row_key),
+                "{row_key} must be written"
+            );
+        }
+        let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+        assert!(
+            !objects
+                .iter()
+                .any(|k| k.starts_with(&format!("mcp/{SHARED}/"))),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
+        );
+        env.teardown().await;
+    }
+
+    /// An approval whose ingest cannot store the version answers the storage
+    /// error (409 with the guard's message), never 200; nothing is served.
+    /// The conflict is forced by a row of another repository already holding
+    /// the exact key the approving repository writes.
+    #[tokio::test]
+    async fn approval_answers_the_storage_conflict_5660() {
+        let Some((mut env, _mem)) = Env::new_cloud().await else {
+            return;
+        };
+        let shared = serve_shared(&env).await;
+        env.sync_at(&env.fx.repo_key.clone()).await;
+        let admitted = crate::services::mcp_remote::admit_upstream(
+            &crate::services::mcp_remote::parse_entry(&shared).expect("entry"),
+        )
+        .expect("admitted");
+        let key = crate::formats::mcp::storage_key(
+            crate::formats::mcp::KeyScope {
+                scheme: crate::storage::StorageKeyScheme::RepoScoped,
+                storage_backend: "s3",
+                repository_id: env.fx.repo_id,
+            },
+            SHARED,
+            "1.0.0",
+            &admitted.sha256,
+        );
+        let (other, _) = env.second_remote().await;
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, 'squatter/server.json', 'squatter', '1', 1, $2, 'application/json', $3)",
+        )
+        .bind(other)
+        .bind(&admitted.sha256)
+        .bind(&key)
+        .execute(&env.fx.pool)
+        .await
+        .unwrap();
+
+        let (s, b) = env.approve_at(&env.fx.repo_key.clone(), SHARED).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{b}");
+        assert!(
+            b["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("already owned by another repository"),
+            "{b}"
+        );
+        assert!(env.listed_at(&env.fx.repo_key.clone()).await.is_empty());
+        assert_eq!(env.server_row_key(env.fx.repo_id).await, None);
+        // The decision stands and the next sync retries the ingest.
+        assert_eq!(env.item(SHARED).await["status"], "approved");
         env.teardown().await;
     }
 }

@@ -12275,6 +12275,46 @@ mod tests {
         cleanup().await;
     }
 
+    /// #5504: the shared virtual artifact walk reads a member's upstream 5xx
+    /// as "could not answer" on every format that uses it, not only Maven:
+    /// with the higher-priority member missing (404), an npm Virtual tarball
+    /// answers 503 when the other member's upstream is failing and 404 when
+    /// it refuses permanently (403).
+    #[tokio::test]
+    async fn test_virtual_tarball_503s_on_member_5xx_and_404s_on_member_4xx_5504() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut got = Vec::new();
+        for broken in [503u16, 403] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "npm", broken).await;
+            let dir = std::env::temp_dir().join(format!("npm5504-{}", rig.virtual_key));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+            let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+            let (status, _) = tdh::send(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get(format!(
+                    "/{}/is-number5504/-/is-number5504-7.0.0.tgz",
+                    rig.virtual_key
+                )),
+            )
+            .await;
+            got.push((broken, status));
+            rig.cleanup(&pool).await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(
+            got,
+            vec![
+                (503, StatusCode::SERVICE_UNAVAILABLE),
+                (403, StatusCode::NOT_FOUND)
+            ]
+        );
+    }
+
     /// #4341: a direct GET of a tarball on an npm Remote with scan-on-proxy
     /// off records one proxy download under the canonical tarball path, as
     /// the scanned and Virtual paths already did; HEAD records none.

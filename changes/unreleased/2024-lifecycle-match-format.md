@@ -1,5 +1,0 @@
----
-section: Added
-issues: [#2024]
----
-- **Lifecycle policies take a `match.format` scope** (#2024). `"match": {"format": "docker"}` (or an array such as `["npm", "yarn"]`) limits a policy to repositories of those formats: the policy is skipped entirely in a repository of any other format, in the dry-run preview, the live run and the proxy-cache eviction alike, so one global policy can clean up build images without touching Maven or npm repositories. It combines with `match.path_prefix`, `match.version_pattern`, `exclude` and `min_keep`. Format names are the repository format keys (`docker`, `helm_oci`, `conda_native`, ...); an unknown name is rejected with 400 when the policy is created or updated. A 1.11.x server refuses a policy that carries `match.format` rather than ignoring the scope: in a mixed-version fleet a run, preview, create or update on a 1.11.x replica answers 400 `unknown key 'match.format'` and a scheduled run there fails before deleting anything (logged, `last_run_at` unchanged) and is retried on a later tick, so the policy only runs on upgraded replicas; see `docs/lifecycle-policy-assignments.md`.

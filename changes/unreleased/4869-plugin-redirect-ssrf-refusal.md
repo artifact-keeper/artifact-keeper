@@ -1,5 +1,0 @@
----
-section: Fixed
-issues: [#4869]
----
-- **A plugin install or reload whose git source redirects to a blocked address is now refused with a 400 instead of a 500** (#4869). The outbound SSRF policy refuses two things under two different wordings: a host that resolves to an address the policy blocks ("blocked by SSRF policy") and a redirect hop that points at one ("redirect target rejected by SSRF policy"). Only the first was recognized when a git clone failed, so a source that redirected onto a blocked address fell through to the generic internal-error branch and the API answered 500 for what is a rejected request. Both refusals are now recognized through one shared vocabulary, so the plugin install and reload paths answer 400 with the same policy wording as the connect-time refusal, and an upstream fetch whose redirect the policy refuses is reported as the 503 the policy refusal deserves instead of a generic 500. No security change: the redirect is still aborted before the target is contacted.

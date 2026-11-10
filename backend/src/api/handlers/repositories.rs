@@ -119,7 +119,67 @@ fn require_repo_access(auth: &AuthExtension, repo_id: Uuid) -> Result<()> {
 /// rather than re-deriving (or forgetting) it. The `/api/v1/repositories` nest
 /// runs under `optional_auth_middleware` only, NOT `repo_visibility_middleware`,
 /// so each sub-handler must enforce this itself.
+///
+/// A refusal to a caller who may not even READ the repository is the
+/// unknown-key 404 (#5458, see [`hide_write_denial_from_non_readers`]); a
+/// caller who can read keeps the 403.
 pub(crate) async fn require_repo_write_access(
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    let decision = tenant_write_gate(auth, repo, repo_service).await;
+    hide_write_denial_from_non_readers(decision, auth, repo, repo_service).await
+}
+
+/// #5458: turn a WRITE refusal (`AppError::Authorization`) into the
+/// existence-hiding answer when the caller may not read the repository.
+///
+/// A key that names no repository answers `404 Repository not found`
+/// ([`RepositoryService::get_by_key`]); an existing repository the caller
+/// cannot read answers the same through [`require_visible`]. Before this, a
+/// write to an existing private repository answered `403` where an unknown
+/// key answered `404`, so any authenticated caller (an owner of some other
+/// repository, a token scoped elsewhere) could enumerate private keys by
+/// trying to write. A caller who CAN read already knows the repository
+/// exists and keeps the `403` with its reason (#3524's reasoning), as does
+/// every caller on an anonymously readable repository, where
+/// `require_visible` passes. Only ever turns one refusal into another;
+/// anything other than an authorization refusal passes through unchanged.
+pub(crate) async fn hide_write_denial_from_non_readers(
+    decision: Result<()>,
+    auth: &AuthExtension,
+    repo: &crate::models::repository::Repository,
+    repo_service: &RepositoryService,
+) -> Result<()> {
+    match decision {
+        Err(AppError::Authorization(reason)) => {
+            if let Err(hidden) = require_visible(repo, &Some(auth.clone()), repo_service).await {
+                // A lookup error (database) is returned as is, without
+                // claiming to hide anything.
+                if !matches!(hidden, AppError::NotFound(_)) {
+                    return Err(hidden);
+                }
+                // The caller sees only the unknown-key answer; the operator
+                // keeps the reason the write was refused.
+                tracing::warn!(
+                    repository_id = %repo.id,
+                    user_id = %auth.user_id,
+                    reason = %reason,
+                    "repository write denied to a caller who cannot read the repository; \
+                     answering the existence-hiding 404"
+                );
+                return Err(hidden);
+            }
+            Err(AppError::Authorization(reason))
+        }
+        other => other,
+    }
+}
+
+/// The tenant half of [`require_repo_write_access`], before the
+/// existence-hiding mapping.
+async fn tenant_write_gate(
     auth: &AuthExtension,
     repo: &crate::models::repository::Repository,
     repo_service: &RepositoryService,
@@ -3898,8 +3958,11 @@ pub async fn get_npm_scope_policy(
 
     // Reading the npm scope policy is admin-tier (it discloses the repository's
     // supply-chain configuration). `require_repo_admin` honors an `admin` action
-    // held through a role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // held through a role (`repository-owner`), not only a rule (#4834). A
+    // refusal to a caller who cannot read the repository is the unknown-key
+    // 404 (#5458).
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     let policy = crate::api::handlers::npm::fetch_npm_scope_policy(&state.db, repo.id).await?;
     let active = policy.is_active();
@@ -6114,12 +6177,15 @@ pub async fn update_repository(
 
     // Get existing repo by key and check repo access
     let existing = service.get_by_key(&key).await?;
-    require_repo_access(&auth, existing.id)?;
-
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository. `require_repo_admin` honors an `admin` action held through a
-    // role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, existing.id, &state.permission_service).await?;
+    // role (`repository-owner`), not only a rule (#4834). Either refusal, to a
+    // caller who cannot read the repository, is the unknown-key 404 (#5458).
+    let gate = match require_repo_access(&auth, existing.id) {
+        Ok(()) => require_repo_admin(&auth, existing.id, &state.permission_service).await,
+        Err(e) => Err(e),
+    };
+    hide_write_denial_from_non_readers(gate, &auth, &existing, &service).await?;
 
     // Projects (#2473): (re)assigning a repository to a different project
     // needs a global admin, a system repo-admin, or project-admin on the
@@ -7221,12 +7287,15 @@ pub async fn delete_repository(
         }
         Err(e) => return Err(e),
     };
-    require_repo_access(&auth, repo.id)?;
-
     // Fine-grained permission check: non-admins need "admin" on the target
     // repository. `require_repo_admin` honors an `admin` action held through a
-    // role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // role (`repository-owner`), not only a rule (#4834). Either refusal, to a
+    // caller who cannot read the repository, is the unknown-key 404 (#5458).
+    let gate = match require_repo_access(&auth, repo.id) {
+        Ok(()) => require_repo_admin(&auth, repo.id, &state.permission_service).await,
+        Err(e) => Err(e),
+    };
+    hide_write_denial_from_non_readers(gate, &auth, &repo, &service).await?;
 
     // Record the job and rename the repository to `~deleting~<job id>` in one
     // transaction: from here every lookup by its key misses (no new upload or
@@ -10850,8 +10919,16 @@ pub async fn get_artifact_metadata(
             },
         )
         .await
-        .map_err(|_| {
-            AppError::NotFound("Artifact not found in any member repository".to_string())
+        .map_err(|resp| {
+            // #5504: a member that could not answer makes "not found"
+            // unknowable; answer the retryable 503, not a cacheable 404.
+            if proxy_helpers::is_member_unavailable_response(&resp) {
+                AppError::ServiceUnavailable(
+                    "A repository member is temporarily unavailable, retry shortly".to_string(),
+                )
+            } else {
+                AppError::NotFound("Artifact not found in any member repository".to_string())
+            }
         })?;
 
         // #2394: unlike the direct-row branch above (metadata JSON only,
@@ -13206,6 +13283,10 @@ pub async fn download_artifact(
     // covers the `?version=` historical-revision branch below — which serves
     // straight from content-addressed storage and never reaches
     // `ArtifactService::prepare_download`.
+    //
+    // #5457: an OCI manifest row (`v2/<name>/manifests/<ref>`) is gated with
+    // every alias of its digest, as the native pull is, so a rejected image
+    // is not downloadable here through a clean tag or digest alias.
     {
         if let Some(artifact_id) = sqlx::query_scalar::<_, Uuid>(
             "SELECT id \
@@ -13218,8 +13299,12 @@ pub async fn download_artifact(
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
         {
-            crate::services::quarantine_service::enforce_download_gate(&state.db, artifact_id)
-                .await?;
+            crate::services::oci_manifests::enforce_path_download_gate(
+                &state.db,
+                artifact_id,
+                &path,
+            )
+            .await?;
         }
     }
 
@@ -13472,7 +13557,18 @@ pub async fn download_artifact(
                             &dl_ctx,
                         )
                         .await;
-                        Ok(response.into_response())
+                        // The proxied serve is a complete `200`; cut the
+                        // client's `Range` from it as the Hugging Face resolve
+                        // route does (#5145). Without this a ranged GET of a
+                        // proxied object got every byte, which breaks clients
+                        // that fetch byte windows and check each against its
+                        // own digest (apk segment fetches).
+                        Ok(proxy_helpers::apply_range_to_streamed_serve(
+                            response.into_response(),
+                            request.headers(),
+                            dl_ctx.is_head,
+                        )
+                        .unwrap_or_else(|r| r))
                     }
                     Err(e) => Ok(e.into_response()),
                 }
@@ -13557,6 +13653,11 @@ pub async fn download_artifact(
                 Err(resp) if crate::storage::verify::is_integrity_failure(&resp) => {
                     return Ok(resp)
                 }
+                // #5504: no member served and one could not answer: the
+                // walk's retryable 503, not a 404 the client caches.
+                Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+                    return Ok(resp)
+                }
                 Err(_) => return Err(not_found()),
             };
 
@@ -13614,7 +13715,15 @@ pub async fn download_artifact(
             } else {
                 Body::from_stream(result.body)
             };
-            Ok(builder.body(body).unwrap())
+            // A member's serve is a complete `200` too, Remote members
+            // included; cut the client's `Range` from it as the Remote arm
+            // does (#5502).
+            Ok(proxy_helpers::apply_range_to_streamed_serve(
+                builder.body(body).unwrap(),
+                request.headers(),
+                is_head,
+            )
+            .unwrap_or_else(|r| r))
         }
         Err(e) => Err(e),
     }
@@ -13869,6 +13978,16 @@ pub async fn delete_artifact(
             )
             .await;
         }
+        // The version-level SNAPSHOT document names the newest build; drop it
+        // too so it cannot keep pointing at the build just deleted (#5667).
+        crate::api::handlers::maven::clear_stored_snapshot_version_metadata(
+            &state,
+            repo.id,
+            &repo.storage_backend,
+            &repo.storage_location(),
+            &path,
+        )
+        .await;
     }
 
     // Deleting an npm artifact changes the packument, so drop the computed
@@ -14006,27 +14125,32 @@ pub(crate) async fn visible_virtual_members(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(key).await?;
 
+    // Caller must be able to see the virtual parent itself.
+    //
+    // BOTH gates run, because they answer different questions and neither
+    // subsumes the other (#3163):
+    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
+    //    missing entirely: token scope passes for any unscoped principal, so a
+    //    browser session holding no grant on a PRIVATE virtual repository
+    //    could confirm it exists and read its membership — while `GET /{key}`
+    //    on that same repository correctly 404s. It runs FIRST (#5612): a
+    //    caller who cannot read the repository gets the unknown-key 404
+    //    before the token-scope 403 or the wrong-type 400 below, either of
+    //    which would confirm that the key exists (and the 400, that it is not
+    //    a virtual). An out-of-scope token on a private repository is refused
+    //    here too, with the same 404.
+    //  * `require_repo_access` is the TOKEN-SCOPE check. It still runs because
+    //    `require_visible` short-circuits `Ok` on a public repository, which
+    //    would otherwise let a repo-scoped token reach a public virtual
+    //    outside its allowed set.
+    require_visible(&repo, &Some(auth.clone()), &service).await?;
+    require_repo_access(auth, repo.id)?;
+
     if repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
             "Only virtual repositories have members".to_string(),
         ));
     }
-
-    // Caller must be able to see the virtual parent itself.
-    //
-    // BOTH gates run, because they answer different questions and neither
-    // subsumes the other (#3163):
-    //  * `require_repo_access` is the TOKEN-SCOPE check. It is kept ahead of
-    //    the visibility gate because `require_visible` short-circuits `Ok` on
-    //    a public repository, which would otherwise let a repo-scoped token
-    //    reach a public virtual outside its allowed set.
-    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
-    //    missing entirely: token scope passes for any unscoped principal, so a
-    //    browser session holding no grant on a PRIVATE virtual repository
-    //    could confirm it exists and read its membership — while `GET /{key}`
-    //    on that same repository correctly 404s.
-    require_repo_access(auth, repo.id)?;
-    require_visible(&repo, &Some(auth.clone()), &service).await?;
 
     // Query members with their repository info
     let members: Vec<VirtualMemberRow> = sqlx::query_as(
@@ -14129,6 +14253,8 @@ pub async fn add_virtual_member(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    // #5458: hide the parent from a caller who cannot read it.
+    require_visible(&virtual_repo, &Some(auth.clone()), &service).await?;
     let member_repo = service.get_by_key(&payload.member_key).await?;
     authorize_virtual_member_mutation(
         &state.db,
@@ -14209,6 +14335,9 @@ pub async fn remove_virtual_member(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    // #5458: a caller who cannot read the parent gets the unknown-key 404
+    // first; the 400 below would otherwise confirm that the key exists.
+    require_visible(&virtual_repo, &Some(auth.clone()), &service).await?;
     // Validate repo type BEFORE any access check so a caller without rights
     // on a non-virtual repo gets 400 (validation), not 403 (authz). The 403
     // path would otherwise act as an enumeration oracle: it tells an
@@ -14301,6 +14430,9 @@ pub async fn update_virtual_members(
     let service = RepositoryService::new(state.db.clone());
 
     let virtual_repo = service.get_by_key(&key).await?;
+    // #5458: a caller who cannot read the parent gets the unknown-key 404
+    // first; the 400 below would otherwise confirm that the key exists.
+    require_visible(&virtual_repo, &Some(auth.clone()), &service).await?;
     // Validate repo type BEFORE any access check so a caller without rights
     // on a non-virtual repo gets 400 (validation), not 403 (authz). Avoids
     // the same enumeration oracle remove_virtual_member guards against.
@@ -14449,6 +14581,10 @@ async fn load_remote_repo(
 ) -> Result<crate::models::repository::Repository> {
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(key).await?;
+    // #5458: a caller who cannot read the repository gets the unknown-key 404
+    // before the token-scope 403 or the wrong-type 400, either of which would
+    // confirm that the key exists.
+    require_visible(&repo, &Some(auth.clone()), &service).await?;
     require_repo_access(auth, repo.id)?;
     if repo.repo_type != RepositoryType::Remote {
         return Err(AppError::Validation(
@@ -15424,6 +15560,9 @@ async fn conda_allowlist_repo(
     })?;
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(key).await?;
+    // #5458: a caller who cannot read the repository gets the unknown-key 404
+    // before the token-scope 403 or the wrong-type 400.
+    require_visible(&repo, &Some(auth.clone()), &repo_service).await?;
     require_repo_access(&auth, repo.id)?;
     if repo.repo_type != RepositoryType::Virtual
         || !matches!(
@@ -17576,6 +17715,294 @@ mod tests {
             .await
             .concat();
         assert_eq!(collected, b"defg");
+    }
+
+    // -----------------------------------------------------------------------
+    // Range on the generic route's proxied serves (#5502)
+    //
+    // A Remote serve (cache hit or upstream fetch) and a Virtual serve through
+    // a Remote member both arrive as a complete `200`. Driven end to end
+    // through `download_router()` and the `/general/` mount the issue names:
+    // the upstream must never see `Range`, so the cache still fills whole.
+    // -----------------------------------------------------------------------
+
+    /// 1000 bytes in which every offset is distinguishable from its neighbours.
+    fn range_payload_5502() -> Vec<u8> {
+        (0..1000u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn ranged_get_5502(uri: &str, range: Option<&str>) -> axum::http::Request<Body> {
+        let mut req = tdh::get(uri.to_string());
+        if let Some(range) = range {
+            req.headers_mut()
+                .insert(header::RANGE, range.parse().unwrap());
+        }
+        req
+    }
+
+    async fn mount_upstream_5502(server: &wiremock::MockServer, file: &str, data: &[u8]) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/{file}")))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(data.to_vec()))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    fn upstream_saw_range_5502(requests: &[wiremock::Request]) -> bool {
+        requests.iter().any(|r| r.headers.contains_key("range"))
+    }
+
+    /// Cold range, warm range, past-end and whole, all against one Remote
+    /// repository's proxied object, through `router`.
+    async fn assert_remote_range_cold_and_cached_5502(
+        router: Router<SharedState>,
+        uri_for: fn(&str, &str) -> String,
+    ) {
+        let Some(f) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        tdh::publish_repo(&f.pool, f.repo_id).await;
+        let data = range_payload_5502();
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_5502(&server, "pkg/blob.bin", &data).await;
+        let (state, cache) = tdh::rewire_remote_proxy(&f, &server.uri()).await;
+        let uri = uri_for(&f.repo_key, "pkg/blob.bin");
+        let send = |range: Option<&'static str>| {
+            tdh::send_with_headers(
+                tdh::router_anon(router.clone(), state.clone()),
+                ranged_get_5502(&uri, range),
+            )
+        };
+
+        let cold = send(Some("bytes=900-")).await;
+        tdh::wait_for_cache_commit(cache.path(), data.len() as u64).await;
+        let warm = send(Some("bytes=100-199")).await;
+        let past_end = send(Some("bytes=1000-")).await;
+        let whole = send(None).await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        f.teardown().await;
+
+        assert!(
+            !upstream_saw_range_5502(&requests),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
+        assert_eq!(cold.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(cold.2[header::CONTENT_RANGE], "bytes 900-999/1000");
+        assert_eq!(cold.2[header::CONTENT_LENGTH], "100");
+        assert_eq!(&cold.1[..], &data[900..]);
+
+        assert_eq!(warm.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(warm.2[header::CONTENT_RANGE], "bytes 100-199/1000");
+        assert_eq!(&warm.1[..], &data[100..200]);
+
+        assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(past_end.2[header::CONTENT_RANGE], "bytes */1000");
+        assert!(past_end.1.is_empty());
+
+        assert_eq!(whole.0, StatusCode::OK);
+        assert_eq!(&whole.1[..], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn remote_download_honours_range_cold_and_cached_5502() {
+        assert_remote_range_cold_and_cached_5502(download_router(), |key, path| {
+            format!("/{key}/download/{path}")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn general_route_remote_honours_range_cold_and_cached_5502() {
+        assert_remote_range_cold_and_cached_5502(
+            crate::api::handlers::general::router(),
+            |key, path| format!("/{key}/{path}"),
+        )
+        .await;
+    }
+
+    /// #5504: the generic route answers the walk's 503 when the
+    /// higher-priority member misses and the other one's upstream is failing
+    /// (5xx or 429), and 404 when it refuses permanently (403), on both the
+    /// `/download/` route and the `/general/` mount.
+    #[tokio::test]
+    async fn virtual_download_503s_on_member_5xx_and_404s_on_member_4xx_5504() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let mut got = Vec::new();
+        for broken in [503u16, 429, 403] {
+            let rig = tdh::MissAndBrokenVirtual::new(&pool, "generic", broken).await;
+            let cache = tempfile::tempdir().expect("tempdir");
+            let proxy =
+                tdh::build_proxy_service_with_fs(pool.clone(), cache.path().to_str().unwrap());
+            let state =
+                tdh::build_state_with_proxy(pool.clone(), cache.path().to_str().unwrap(), proxy);
+            for (router, uri) in [
+                (
+                    download_router(),
+                    format!("/{}/download/pkg5504/a.bin", rig.virtual_key),
+                ),
+                (
+                    crate::api::handlers::general::router(),
+                    format!("/{}/pkg5504/a.bin", rig.virtual_key),
+                ),
+            ] {
+                let (status, _) =
+                    tdh::send(tdh::router_anon(router, state.clone()), tdh::get(uri)).await;
+                got.push((broken, status));
+            }
+            rig.cleanup(&pool).await;
+        }
+        let want = |broken: u16| {
+            if broken == 403 {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        };
+        let wrong: Vec<_> = got.iter().filter(|(b, s)| *s != want(*b)).collect();
+        assert!(wrong.is_empty(), "wrong: {wrong:?} of {got:?}");
+    }
+
+    /// A Virtual repository over a Remote member serves through the member
+    /// walk, which builds its own complete `200`.
+    #[tokio::test]
+    async fn virtual_over_remote_honours_range_5502() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let data = range_payload_5502();
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_5502(&server, "pkg/virtual.bin", &data).await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "generic", &server.uri()).await;
+        tdh::publish_repo(&pool, virtual_id).await;
+        let cache = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(pool.clone(), cache.path().to_str().unwrap(), proxy);
+        let send = |router: Router<SharedState>, uri: String, range: Option<&'static str>| {
+            tdh::send_with_headers(
+                tdh::router_anon(router, state.clone()),
+                ranged_get_5502(&uri, range),
+            )
+        };
+
+        let download = send(
+            download_router(),
+            format!("/{virtual_key}/download/pkg/virtual.bin"),
+            Some("bytes=900-"),
+        )
+        .await;
+        tdh::wait_for_cache_commit(cache.path(), data.len() as u64).await;
+        let general = send(
+            crate::api::handlers::general::router(),
+            format!("/{virtual_key}/pkg/virtual.bin"),
+            Some("bytes=100-199"),
+        )
+        .await;
+        let past_end = send(
+            download_router(),
+            format!("/{virtual_key}/download/pkg/virtual.bin"),
+            Some("bytes=1000-"),
+        )
+        .await;
+        let whole = send(
+            download_router(),
+            format!("/{virtual_key}/download/pkg/virtual.bin"),
+            None,
+        )
+        .await;
+        let requests = server.received_requests().await.unwrap_or_default();
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert!(
+            !upstream_saw_range_5502(&requests),
+            "Range must not reach the upstream, so the cache fills whole"
+        );
+        assert_eq!(download.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(download.2[header::CONTENT_RANGE], "bytes 900-999/1000");
+        assert_eq!(&download.1[..], &data[900..]);
+
+        assert_eq!(general.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(general.2[header::CONTENT_RANGE], "bytes 100-199/1000");
+        assert_eq!(&general.1[..], &data[100..200]);
+
+        assert_eq!(past_end.0, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(past_end.2[header::CONTENT_RANGE], "bytes */1000");
+
+        assert_eq!(whole.0, StatusCode::OK);
+        assert_eq!(&whole.1[..], &data[..]);
+    }
+
+    /// The Virtual arm ranges a LOCAL member's serve too, when the shadowing
+    /// guard finds a non-Remote member owning the path (#5554): `206` for a
+    /// window, and a HEAD with `Range` is a `200` describing the whole file.
+    #[tokio::test]
+    async fn virtual_over_local_member_honours_range_5554() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add virtual member");
+        tdh::grant_repo_access(&fx.pool, member_id, fx.user_id).await;
+        let data = range_payload_5502();
+        let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_repo,
+            &format!("ph-test/{}.bin", Uuid::new_v4()),
+            "vrange/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/octet-stream",
+            Bytes::from(data.clone()),
+            fx.user_id,
+        )
+        .await;
+        let uri = format!("/{}/download/vrange/blob.bin", fx.repo_key);
+
+        let ranged = tdh::send_with_headers(
+            fx.router_with_auth(download_router()),
+            ranged_get_5502(&uri, Some("bytes=100-199")),
+        )
+        .await;
+        let mut head = ranged_get_5502(&uri, Some("bytes=100-199"));
+        *head.method_mut() = axum::http::Method::HEAD;
+        let head = tdh::send_with_headers(fx.router_with_auth(download_router()), head).await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+
+        assert_eq!(ranged.0, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.2[header::CONTENT_RANGE], "bytes 100-199/1000");
+        assert_eq!(&ranged.1[..], &data[100..200]);
+
+        assert_eq!(head.0, StatusCode::OK);
+        assert_eq!(head.2[header::CONTENT_LENGTH], "1000");
+        assert!(head.2.get(header::CONTENT_RANGE).is_none());
+        assert!(head.1.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -20989,8 +21416,10 @@ mod tests {
         let repo = make_repo_with_id(Uuid::new_v4(), "globex-private");
         let auth = make_auth_ext(Some(vec![Uuid::new_v4()]));
         let res = require_repo_write_access(&auth, &repo, &no_db_repo_service()).await;
+        // #5458: the token cannot read this private repository either, so the
+        // refusal is the unknown-key 404 (still before any DB lookup).
         assert!(
-            matches!(res, Err(AppError::Authorization(_))),
+            matches!(&res, Err(AppError::NotFound(m)) if m == REPOSITORY_NOT_FOUND),
             "a repo-scoped token must be denied write outside its scope: {res:?}"
         );
     }
@@ -21052,8 +21481,10 @@ mod tests {
         let svc = RepositoryService::new(pool.clone());
 
         let denied = require_repo_write_access(&ext, &repo, &svc).await;
+        // #5458: a non-member cannot read the private repository, so it gets
+        // the unknown-key 404 rather than a 403 that confirms the key.
         assert!(
-            matches!(denied, Err(AppError::Authorization(_))),
+            matches!(&denied, Err(AppError::NotFound(m)) if m == REPOSITORY_NOT_FOUND),
             "non-member must be denied write on a private repo: {denied:?}"
         );
 
@@ -21254,6 +21685,86 @@ mod tests {
         assert_eq!(
             stored,
             Some(ArtifactService::calculate_sha256(b"REBUILT-RELEASE-BYTES"))
+        );
+    }
+
+    /// #5624: `?permanent=true` soft-deletes (queueing the peer deletes) and
+    /// purges in one request. The purge used to cascade the just-queued
+    /// deletes away before any sync worker could see them, so push peers kept
+    /// the artifact; the delete now stays queued, addressed by key and path.
+    #[tokio::test]
+    async fn permanent_delete_keeps_the_peer_delete_queued_5624() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let mut admin = tdh::make_auth(user_id, &username);
+        admin.is_admin = true;
+        let peer_id = tdh::register_test_peer(&pool, "permanent-delete", "5624").await;
+        sqlx::query(
+            "INSERT INTO peer_repo_subscriptions \
+                 (peer_instance_id, repository_id, sync_enabled, replication_mode) \
+             VALUES ($1, $2, true, 'push')",
+        )
+        .bind(peer_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("subscribe peer");
+        let path = "secret/leaked.env".to_string();
+
+        let up = upload_artifact(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Body::from(Bytes::from_static(b"TOKEN=do-not-ship")),
+        )
+        .await;
+        let purged = delete_artifact(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path((key.clone(), path.clone())),
+            Query(DeleteArtifactQuery { permanent: true }),
+            HeaderMap::new(),
+        )
+        .await;
+        let rows_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        type DeleteRow = (Option<Uuid>, String, Option<String>, Option<String>);
+        let deletes: Vec<DeleteRow> = sqlx::query_as(
+            "SELECT artifact_id, status::TEXT, target_repository_key, target_path \
+                 FROM sync_tasks WHERE peer_instance_id = $1 AND task_type = 'delete'",
+        )
+        .bind(peer_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+            .bind(peer_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(up.is_ok(), "{up:?}");
+        assert!(purged.is_ok(), "{purged:?}");
+        assert_eq!(rows_left, 0, "the artifact is purged");
+        assert_eq!(
+            deletes,
+            vec![(None, "pending".to_string(), Some(key.clone()), Some(path))],
+            "the peer delete must survive the purge, addressed by key and path"
         );
     }
 
@@ -25810,8 +26321,16 @@ mod tests {
         let svc = RepositoryService::new(crate::api::handlers::test_db_helpers::lazy_pool());
         let result = require_repo_write_access(&auth, &repo, &svc).await;
         assert!(result.is_err());
+        // #5458: on a private repository the scope refusal is the unknown-key
+        // 404, byte for byte the message `get_by_key` gives a missing key.
         match result.unwrap_err() {
-            AppError::Authorization(msg) => assert!(msg.contains("does not have access")),
+            AppError::NotFound(msg) => assert_eq!(msg, REPOSITORY_NOT_FOUND),
+            other => panic!("Expected the unknown-key NotFound, got: {:?}", other),
+        }
+        // A public repository has no existence to hide: the 403 stays.
+        let public = make_repo(true);
+        match require_repo_write_access(&auth, &public, &svc).await {
+            Err(AppError::Authorization(msg)) => assert!(msg.contains("does not have access")),
             other => panic!("Expected Authorization error, got: {:?}", other),
         }
     }
@@ -37132,6 +37651,238 @@ mod tests {
             Some(Some("203.0.113.61".to_string())),
             "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
         );
+    }
+
+    /// #5458: a generic upload (`PUT /{key}/artifacts/{path}`) by an owner
+    /// of ANOTHER repository answers an existing private key exactly
+    /// (status, headers, body) as it answers an unknown key, and stores
+    /// nothing; a member who can read but not write keeps the 403.
+    #[tokio::test]
+    async fn generic_upload_denial_to_a_non_reader_matches_an_unknown_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (own_id, _, own_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (foreign, foreign_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, repo_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &repo_dir.to_string_lossy());
+        let put = |auth: AuthExtension, key: String| {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+            tdh::send_with_headers(
+                router,
+                tdh::put(
+                    format!("/{key}/artifacts/tool/1.0/tool.bin"),
+                    Bytes::from_static(b"probe"),
+                ),
+            )
+        };
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let existing = put(tdh::make_auth(foreign, &foreign_name), repo_key.clone()).await;
+        let missing = put(tdh::make_auth(foreign, &foreign_name), unknown).await;
+        let (reader_status, _, _) = put(tdh::make_auth(reader, &reader_name), repo_key).await;
+        let stored: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        tdh::cleanup_member_repo(&pool, own_id, &own_dir).await;
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup_member_repo(&pool, repo_id, &repo_dir).await;
+
+        assert_eq!(existing.0, StatusCode::NOT_FOUND);
+        assert_eq!(existing, missing, "existing private vs unknown key");
+        assert_eq!(
+            reader_status,
+            StatusCode::FORBIDDEN,
+            "a reader keeps the 403"
+        );
+        assert_eq!(stored, 0);
+    }
+
+    /// #5458 (round 2): the REST repository administration routes refuse a
+    /// caller who cannot read a private repository with exactly what an
+    /// unknown key answers (status, headers, body), before any token-scope,
+    /// admin or wrong-type check could confirm the key: `PATCH` and `DELETE`
+    /// of the repository, environment ingest and delete, the npm scope policy,
+    /// the Remote-only routes (`load_remote_repo`) and the virtual member
+    /// routes. Nothing changes; a reader is still refused, but not with 404.
+    #[tokio::test]
+    async fn admin_route_denials_to_a_non_reader_match_an_unknown_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (own_id, own_key, own_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (foreign, foreign_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, own_id, foreign, "repository-owner").await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, repo_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &repo_dir.to_string_lossy());
+        let unknown = format!("ak5458-unknown-{}", Uuid::new_v4());
+        let env_id = Uuid::new_v4();
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            ("PATCH", String::new(), Some("{}")),
+            ("DELETE", String::new(), None),
+            (
+                "POST",
+                "/environments?filename=package-lock.json".to_string(),
+                Some("{}"),
+            ),
+            ("DELETE", format!("/environments/{env_id}"), None),
+            ("GET", "/npm-scope-policy".to_string(), None),
+            ("GET", "/egress-proxy".to_string(), None),
+            ("POST", "/test-upstream".to_string(), None),
+            ("PUT", "/members".to_string(), Some(r#"{"members": []}"#)),
+            ("DELETE", format!("/members/{own_key}"), None),
+            // #5612: the member listing hid its wrong-type 400 behind nothing.
+            ("GET", "/members".to_string(), None),
+            // #5610: the proxy-cache cap (wrong-type 400 on a local key).
+            ("GET", "/proxy-cache-cap".to_string(), None),
+            (
+                "PUT",
+                "/proxy-cache-cap".to_string(),
+                Some(r#"{"cap_bytes": 1024}"#),
+            ),
+            ("DELETE", "/proxy-cache-cap".to_string(), None),
+        ];
+        let send = |auth: AuthExtension, method: &str, uri: String, body: Option<&str>| {
+            let router = tdh::router_with_auth(
+                super::router()
+                    .merge(crate::api::handlers::environments::repo_router())
+                    .merge(crate::api::handlers::proxy_cache_cap::repo_router()),
+                state.clone(),
+                auth,
+            );
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if body.is_some() {
+                b = b.header("content-type", "application/json");
+            }
+            let req = b
+                .body(axum::body::Body::from(body.unwrap_or("").to_string()))
+                .unwrap();
+            tdh::send_with_headers(router, req)
+        };
+        let mut answers = Vec::new();
+        for (method, tail, body) in &cases {
+            let foreign_auth = tdh::make_auth(foreign, &foreign_name);
+            let existing = send(
+                foreign_auth.clone(),
+                method,
+                format!("/{repo_key}{tail}"),
+                *body,
+            )
+            .await;
+            let missing = send(foreign_auth, method, format!("/{unknown}{tail}"), *body).await;
+            let as_reader = send(
+                tdh::make_auth(reader, &reader_name),
+                method,
+                format!("/{repo_key}{tail}"),
+                *body,
+            )
+            .await
+            .0;
+            answers.push((format!("{method} {tail}"), existing, missing, as_reader));
+        }
+        let still_there: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM repositories WHERE id = $1)")
+                .bind(repo_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        tdh::cleanup_user(&pool, foreign).await;
+        tdh::cleanup_user(&pool, reader).await;
+        tdh::cleanup_member_repo(&pool, own_id, &own_dir).await;
+        tdh::cleanup_member_repo(&pool, repo_id, &repo_dir).await;
+
+        for (case, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            assert!(
+                as_reader.is_client_error() && as_reader != StatusCode::NOT_FOUND,
+                "{case}: a reader is refused, and not with the unknown-key 404: {as_reader}"
+            );
+        }
+        assert!(still_there, "the refused DELETE removed nothing");
+    }
+
+    /// #5612: `GET /{key}/members` answers a caller who cannot read a private
+    /// repository exactly as it answers an unknown key (status, headers,
+    /// body), whatever the repository's type: a user with no grant and a
+    /// token whose repository list leaves the key out (even a token of the
+    /// repository's owner). Before the fix a local or remote key answered the
+    /// wrong-type 400 and an out-of-scope token on a virtual the token-scope
+    /// 403. A reader keeps its answers: 200 with the listing on its virtual,
+    /// the wrong-type 400 on a local key it reads.
+    #[tokio::test]
+    async fn member_listing_hides_private_repositories_from_non_readers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (remote_id, remote_key, remote_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "npm").await;
+        let (stranger, stranger_name) = tdh::create_user(&pool).await;
+        let (owner, owner_name) = tdh::create_user(&pool).await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        for id in [local_id, remote_id, virtual_id] {
+            tdh::grant_repo_role(&pool, id, owner, "repository-owner").await;
+        }
+        tdh::grant_repo_role(&pool, virtual_id, reader, "reader").await;
+        tdh::grant_repo_role(&pool, local_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &local_dir.to_string_lossy());
+        let unknown = format!("ak5612-unknown-{}", Uuid::new_v4());
+        let get = |auth: AuthExtension, key: &str| {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+            tdh::send_with_headers(router, tdh::get(format!("/{key}/members")))
+        };
+        let scoped_elsewhere = AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..tdh::make_auth(owner, &owner_name)
+        };
+        let mut answers = Vec::new();
+        for (caller, auth) in [
+            ("no grant", tdh::make_auth(stranger, &stranger_name)),
+            ("token scoped elsewhere", scoped_elsewhere),
+        ] {
+            for key in [&local_key, &remote_key, &virtual_key] {
+                let existing = get(auth.clone(), key).await;
+                let missing = get(auth.clone(), &unknown).await;
+                answers.push((format!("{caller} GET {key}/members"), existing, missing));
+            }
+        }
+        let reader_auth = tdh::make_auth(reader, &reader_name);
+        let reader_virtual = get(reader_auth.clone(), &virtual_key).await;
+        let reader_local = get(reader_auth, &local_key).await;
+        let owner_virtual = get(tdh::make_auth(owner, &owner_name), &virtual_key).await;
+        for user in [stranger, owner, reader] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup_member_repo(&pool, local_id, &local_dir).await;
+        tdh::cleanup_member_repo(&pool, remote_id, &remote_dir).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, &virtual_dir).await;
+
+        for (case, existing, missing) in &answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            let v: serde_json::Value = serde_json::from_slice(&existing.1).expect("json body");
+            assert_eq!(
+                v,
+                serde_json::json!({"code": "NOT_FOUND", "message": REPOSITORY_NOT_FOUND}),
+                "{case}"
+            );
+        }
+        assert_eq!(reader_virtual.0, StatusCode::OK, "{reader_virtual:?}");
+        assert_eq!(reader_local.0, StatusCode::BAD_REQUEST, "{reader_local:?}");
+        assert_eq!(owner_virtual.0, StatusCode::OK, "{owner_virtual:?}");
     }
 }
 
