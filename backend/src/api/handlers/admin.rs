@@ -745,21 +745,84 @@ pub async fn delete_backup(
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+/// `GET /api/v1/admin/settings` (#5652): the settings in force. Every field is
+/// the value the server applies, not merely what was last stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SystemSettings {
+    /// Read-only (`STORAGE_BACKEND`).
     pub storage_backend: String,
+    /// Read-only (`STORAGE_PATH`).
     pub storage_path: String,
     /// Read-only deployment environment name, sourced from the `ENVIRONMENT`
-    /// config value. Defaulted on deserialization so it is not required in the
-    /// update-settings request body.
+    /// config value.
     #[serde(default)]
     pub environment: String,
-    pub allow_anonymous_download: bool,
+    /// Read-only: the upload size limit in force, from `MAX_UPLOAD_SIZE`
+    /// (bytes, `0` = no limit). It cannot be changed through this API.
     pub max_upload_size_bytes: i64,
+    /// Backup retention window in days, applied by `POST /api/v1/admin/cleanup`
+    /// with `cleanup_old_backups`: completed backups older than this, beyond
+    /// the newest `backup_retention_count`, are deleted. `0..=36500`.
     pub retention_days: i32,
+    /// `audit_log` retention in days, applied hourly; `0` = off. `0..=36500`.
     pub audit_retention_days: i32,
+    /// Completed backups `POST /api/v1/admin/cleanup` always keeps. `1..=10000`.
     pub backup_retention_count: i32,
+    /// Minutes without a heartbeat after which a peer is marked offline, by
+    /// the background detector and by `POST /api/v1/admin/cleanup`.
+    /// `1..=10080`. `PEER_STALE_THRESHOLD_MINUTES` pins it when set.
     pub edge_stale_threshold_minutes: i32,
+}
+
+/// `POST /api/v1/admin/settings` body (#5652). Every field is optional: an
+/// absent one keeps its value. The read-only fields of [`SystemSettings`] may
+/// be sent back unchanged (so a client can post the `GET` body); a different
+/// value is refused with `400`. `allow_anonymous_download` was never enforced
+/// and has been removed: sending it is a `400` (use the guest-access setting).
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct UpdateSystemSettingsRequest {
+    // `storage_backend`, `storage_path` and `environment` are read-only and
+    // ignored when sent (like any other unknown field).
+    /// Read-only: accepted only when equal to the value in force.
+    pub max_upload_size_bytes: Option<i64>,
+    pub retention_days: Option<i32>,
+    pub audit_retention_days: Option<i32>,
+    pub backup_retention_count: Option<i32>,
+    pub edge_stale_threshold_minutes: Option<i32>,
+}
+
+/// Fields removed from `POST /api/v1/admin/settings` (#5652), with the reason
+/// the `400` gives.
+const REMOVED_SETTINGS: &[(&str, &str)] = &[(
+    "allow_anonymous_download",
+    "allow_anonymous_download was never enforced and has been removed; anonymous \
+     access is the guest-access setting (PATCH /api/v1/admin/settings/system \
+     `guest_access_enabled`, or AK_GUEST_ACCESS_ENABLED)",
+)];
+
+/// The writable settings: `(key, min, max)`.
+const SETTING_RANGES: &[(&str, i64, i64)] = &[
+    ("retention_days", 0, 36_500),
+    ("audit_retention_days", 0, 36_500),
+    ("backup_retention_count", 1, 10_000),
+    ("edge_stale_threshold_minutes", 1, 10_080),
+];
+
+/// Defaults for a writable setting that was never stored.
+const DEFAULT_RETENTION_DAYS: i32 = 365;
+/// #4718: retention is off (0) until a period is saved.
+const DEFAULT_AUDIT_RETENTION_DAYS: i32 = 0;
+const DEFAULT_BACKUP_RETENTION_COUNT: i32 = 10;
+
+fn effective_upload_limit(state: &SharedState) -> i64 {
+    i64::try_from(state.config.max_upload_size_bytes).unwrap_or(i64::MAX)
+}
+
+fn stored_i32(value: &serde_json::Value, default: i32) -> i32 {
+    value
+        .as_i64()
+        .and_then(|v| i32::try_from(v).ok())
+        .unwrap_or(default)
 }
 
 /// Get system settings
@@ -769,7 +832,7 @@ pub struct SystemSettings {
     context_path = "/api/v1/admin",
     tag = "admin",
     responses(
-        (status = 200, description = "System settings", body = SystemSettings),
+        (status = 200, description = "System settings in force", body = SystemSettings),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -794,55 +857,42 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    let env_threshold = crate::services::sync_worker::stale_threshold_from_env();
+    let mut stored_threshold = None;
     let mut result = SystemSettings {
         storage_backend: state.config.storage_backend.clone(),
         storage_path: state.config.storage_path.clone(),
         environment: state.config.environment.clone(),
-        allow_anonymous_download: false,
-        max_upload_size_bytes: 100 * 1024 * 1024, // 100MB default
-        retention_days: 365,
-        // #4718: report the EFFECTIVE audit retention. Retention is off (0)
-        // until a period is saved; a displayed default of 90 was never applied.
-        audit_retention_days: 0,
-        backup_retention_count: 10,
-        edge_stale_threshold_minutes: 5,
+        // #5652: the limit in force, not a stored value nothing reads.
+        max_upload_size_bytes: effective_upload_limit(&state),
+        retention_days: DEFAULT_RETENTION_DAYS,
+        audit_retention_days: DEFAULT_AUDIT_RETENTION_DAYS,
+        backup_retention_count: DEFAULT_BACKUP_RETENTION_COUNT,
+        edge_stale_threshold_minutes: 0,
     };
 
     for row in settings {
         match row.key.as_str() {
-            "allow_anonymous_download" => {
-                result.allow_anonymous_download = row.value.as_bool().unwrap_or(false);
-            }
-            "max_upload_size_bytes" => {
-                result.max_upload_size_bytes =
-                    row.value.as_i64().unwrap_or(result.max_upload_size_bytes);
-            }
             "retention_days" => {
-                result.retention_days =
-                    row.value.as_i64().unwrap_or(result.retention_days as i64) as i32;
+                result.retention_days = stored_i32(&row.value, result.retention_days);
             }
             "audit_retention_days" => {
-                result.audit_retention_days =
-                    row.value
-                        .as_i64()
-                        .unwrap_or(result.audit_retention_days as i64) as i32;
+                result.audit_retention_days = stored_i32(&row.value, result.audit_retention_days);
             }
             "backup_retention_count" => {
                 result.backup_retention_count =
-                    row.value
-                        .as_i64()
-                        .unwrap_or(result.backup_retention_count as i64) as i32;
+                    stored_i32(&row.value, result.backup_retention_count);
             }
-            "edge_stale_threshold_minutes" => {
-                result.edge_stale_threshold_minutes = row
-                    .value
-                    .as_i64()
-                    .unwrap_or(result.edge_stale_threshold_minutes as i64)
-                    as i32;
-            }
+            "edge_stale_threshold_minutes" => stored_threshold = Some(row.value),
+            // `allow_anonymous_download` and `max_upload_size_bytes` rows
+            // were never read by anything (#5652); left in place, ignored.
             _ => {}
         }
     }
+    result.edge_stale_threshold_minutes = crate::services::sync_worker::resolve_stale_threshold(
+        env_threshold,
+        stored_threshold.as_ref(),
+    );
 
     Ok(Json(result))
 }
@@ -852,65 +902,153 @@ struct SystemSettingsRow {
     value: serde_json::Value,
 }
 
+/// Validate an update against the settings in force; `400` naming the field.
+fn validate_settings_update(
+    body: &serde_json::Value,
+    request: &UpdateSystemSettingsRequest,
+    current: &SystemSettings,
+    stale_threshold_pinned: bool,
+) -> Result<()> {
+    if let Some(obj) = body.as_object() {
+        for (field, reason) in REMOVED_SETTINGS {
+            if obj.contains_key(*field) {
+                return Err(AppError::Validation((*reason).to_string()));
+            }
+        }
+    }
+    if let Some(bytes) = request.max_upload_size_bytes {
+        if bytes != current.max_upload_size_bytes {
+            return Err(AppError::Validation(format!(
+                "max_upload_size_bytes is read-only: the upload limit is set by the \
+                 MAX_UPLOAD_SIZE environment variable (in force: {} bytes)",
+                current.max_upload_size_bytes
+            )));
+        }
+    }
+    // Only a value that changes is range-checked (and written): posting back
+    // a `GET` body that carries an out-of-range value stored before 1.12.0
+    // changes nothing and is not refused for it.
+    for (key, _, v) in changed_settings(request, current) {
+        let Some((_, min, max)) = SETTING_RANGES.iter().find(|(k, _, _)| *k == key) else {
+            continue;
+        };
+        if i64::from(v) < *min || i64::from(v) > *max {
+            return Err(AppError::Validation(format!(
+                "{key} must be between {min} and {max}, got {v}"
+            )));
+        }
+    }
+    if let Some(v) = request.edge_stale_threshold_minutes {
+        if stale_threshold_pinned && v != current.edge_stale_threshold_minutes {
+            return Err(AppError::Validation(format!(
+                "edge_stale_threshold_minutes is pinned by the PEER_STALE_THRESHOLD_MINUTES \
+                 environment variable (in force: {} minutes)",
+                current.edge_stale_threshold_minutes
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The writable settings the update changes: `(key, before, after)`.
+fn changed_settings(
+    request: &UpdateSystemSettingsRequest,
+    current: &SystemSettings,
+) -> Vec<(&'static str, i32, i32)> {
+    [
+        (
+            "retention_days",
+            current.retention_days,
+            request.retention_days,
+        ),
+        (
+            "audit_retention_days",
+            current.audit_retention_days,
+            request.audit_retention_days,
+        ),
+        (
+            "backup_retention_count",
+            current.backup_retention_count,
+            request.backup_retention_count,
+        ),
+        (
+            "edge_stale_threshold_minutes",
+            current.edge_stale_threshold_minutes,
+            request.edge_stale_threshold_minutes,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(key, before, after)| match after {
+        Some(after) if after != before => Some((key, before, after)),
+        _ => None,
+    })
+    .collect()
+}
+
+/// `SETTING_CHANGED` details for one `POST /api/v1/admin/settings` field.
+fn system_setting_audit_details(key: &str, before: i32, after: i32) -> serde_json::Value {
+    serde_json::json!({
+        "key": key,
+        "old_value": before.to_string(),
+        "new_value": after.to_string(),
+        "setting": key,
+        "from": before,
+        "to": after,
+    })
+}
+
 /// Update system settings
+///
+/// Partial update: absent fields keep their value. Values are range-checked,
+/// read-only fields may only be echoed back unchanged, and each changed field
+/// writes one `SETTING_CHANGED` audit row (#5652).
 #[utoipa::path(
     post,
     path = "/settings",
     context_path = "/api/v1/admin",
     tag = "admin",
-    request_body = SystemSettings,
+    request_body = UpdateSystemSettingsRequest,
     responses(
-        (status = 200, description = "Settings updated", body = SystemSettings),
+        (status = 200, description = "Settings updated; the settings in force", body = SystemSettings),
+        (status = 400, description = "A value is out of range, a read-only field differs from the value in force, or a removed field was sent", body = crate::api::openapi::ErrorResponse),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn update_settings(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
-    Json(settings): Json<SystemSettings>,
+    Extension(auth): Extension<AuthExtension>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<SystemSettings>> {
-    // Update each setting
-    let settings_to_update = vec![
-        (
-            "allow_anonymous_download",
-            serde_json::json!(settings.allow_anonymous_download),
-        ),
-        (
-            "max_upload_size_bytes",
-            serde_json::json!(settings.max_upload_size_bytes),
-        ),
-        ("retention_days", serde_json::json!(settings.retention_days)),
-        (
-            "audit_retention_days",
-            serde_json::json!(settings.audit_retention_days),
-        ),
-        (
-            "backup_retention_count",
-            serde_json::json!(settings.backup_retention_count),
-        ),
-        (
-            "edge_stale_threshold_minutes",
-            serde_json::json!(settings.edge_stale_threshold_minutes),
-        ),
-    ];
+    let request: UpdateSystemSettingsRequest = serde_json::from_value(body.clone())
+        .map_err(|e| AppError::Validation(format!("invalid settings body: {e}")))?;
+    let current = get_settings(State(state.clone())).await?.0;
+    let pinned = crate::services::sync_worker::stale_threshold_from_env().is_some();
+    validate_settings_update(&body, &request, &current, pinned)?;
 
-    for (setting_key, setting_value) in settings_to_update {
+    for (key, before, after) in changed_settings(&request, &current) {
         sqlx::query!(
             r#"
             INSERT INTO system_settings (key, value)
             VALUES ($1, $2)
             ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()
             "#,
-            setting_key,
-            setting_value
+            key,
+            serde_json::json!(after)
         )
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+        audit_setting_changed(
+            &state,
+            &auth,
+            key,
+            system_setting_audit_details(key, before, after),
+        )
+        .await;
     }
 
-    Ok(Json(settings))
+    get_settings(State(state)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2863,6 +3001,7 @@ pub async fn delete_proxy_scan_verdicts(
         RestoreRequest,
         RestoreResponse,
         SystemSettings,
+        UpdateSystemSettingsRequest,
         TotpPolicyResponse,
         UpdateTotpPolicyRequest,
         TotpPolicy,
@@ -3139,51 +3278,25 @@ mod tests {
         assert!(!audit_cleanup_applies(None, 90));
     }
 
-    #[test]
-    fn test_system_settings_defaults() {
-        let settings = SystemSettings {
+    fn sample_settings() -> SystemSettings {
+        SystemSettings {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/artifacts".to_string(),
-            environment: "development".to_string(),
-            allow_anonymous_download: false,
-            max_upload_size_bytes: 100 * 1024 * 1024,
+            environment: "production".to_string(),
+            max_upload_size_bytes: 10_737_418_240,
             retention_days: 365,
-            audit_retention_days: 90,
+            audit_retention_days: 0,
             backup_retention_count: 10,
             edge_stale_threshold_minutes: 5,
-        };
-        assert!(!settings.allow_anonymous_download);
-        assert_eq!(settings.max_upload_size_bytes, 104_857_600);
-        assert_eq!(settings.retention_days, 365);
-        assert_eq!(settings.audit_retention_days, 90);
-        assert_eq!(settings.backup_retention_count, 10);
-        assert_eq!(settings.edge_stale_threshold_minutes, 5);
-        assert_eq!(settings.storage_backend, "filesystem");
-        assert_eq!(settings.environment, "development");
+        }
     }
 
-    #[test]
-    fn test_system_settings_serialization_roundtrip() {
-        let settings = SystemSettings {
-            storage_backend: "s3".to_string(),
-            storage_path: "/data/artifacts".to_string(),
-            environment: "staging".to_string(),
-            allow_anonymous_download: true,
-            max_upload_size_bytes: 500_000_000,
-            retention_days: 30,
-            audit_retention_days: 7,
-            backup_retention_count: 5,
-            edge_stale_threshold_minutes: 10,
-        };
-        let json = serde_json::to_string(&settings).unwrap();
-        let parsed: SystemSettings = serde_json::from_str(&json).unwrap();
-        assert!(parsed.allow_anonymous_download);
-        assert_eq!(parsed.max_upload_size_bytes, 500_000_000);
-        assert_eq!(parsed.retention_days, 30);
-        assert_eq!(parsed.audit_retention_days, 7);
-        assert_eq!(parsed.backup_retention_count, 5);
-        assert_eq!(parsed.edge_stale_threshold_minutes, 10);
-        assert_eq!(parsed.environment, "staging");
+    fn parse_update(body: &serde_json::Value) -> UpdateSystemSettingsRequest {
+        serde_json::from_value(body.clone()).expect("update body")
+    }
+
+    fn validate(body: serde_json::Value, pinned: bool) -> Result<()> {
+        validate_settings_update(&body, &parse_update(&body), &sample_settings(), pinned)
     }
 
     /// Regression: the settings DTO must serialize an `environment` field so
@@ -3191,41 +3304,128 @@ mod tests {
     /// hardcoded value. This fails if the field is dropped from the response.
     #[test]
     fn test_system_settings_serializes_environment() {
-        let settings = SystemSettings {
-            storage_backend: "filesystem".to_string(),
-            storage_path: "/data/artifacts".to_string(),
-            environment: "production".to_string(),
-            allow_anonymous_download: false,
-            max_upload_size_bytes: 100 * 1024 * 1024,
-            retention_days: 365,
-            audit_retention_days: 90,
-            backup_retention_count: 10,
-            edge_stale_threshold_minutes: 5,
-        };
-        let json = serde_json::to_string(&settings).unwrap();
+        let json = serde_json::to_string(&sample_settings()).unwrap();
         assert!(
             json.contains("\"environment\":\"production\""),
             "settings response must expose environment: {json}"
         );
     }
 
-    /// Regression: `serde(default)` on `environment` keeps it optional in the
-    /// update-settings request body, so older clients that omit it still
-    /// deserialize (defaulting to an empty string).
+    /// #5652: `allow_anonymous_download` (never enforced) is gone from the
+    /// response schema.
     #[test]
-    fn test_system_settings_environment_defaults_when_absent() {
-        let json = r#"{
-            "storage_backend": "filesystem",
-            "storage_path": "/data/artifacts",
-            "allow_anonymous_download": false,
-            "max_upload_size_bytes": 104857600,
+    fn test_system_settings_response_has_no_allow_anonymous_download_5652() {
+        let json = serde_json::to_value(sample_settings()).unwrap();
+        assert!(json.get("allow_anonymous_download").is_none(), "{json}");
+    }
+
+    /// #5652: the `GET` body posts back unchanged, so a client that sends the
+    /// whole object (the web UI does) keeps working.
+    #[test]
+    fn test_update_accepts_the_get_body_unchanged_5652() {
+        let body = serde_json::to_value(sample_settings()).unwrap();
+        assert!(validate(body.clone(), false).is_ok());
+        assert!(validate(body, true).is_ok());
+        assert!(validate(serde_json::json!({}), false).is_ok());
+    }
+
+    /// #5652: every writable field is range-checked; negatives were stored.
+    #[test]
+    fn test_update_rejects_out_of_range_values_per_field_5652() {
+        for (key, min, max) in SETTING_RANGES {
+            for bad in [min - 1, max + 1, -1] {
+                if (*min..=*max).contains(&bad) {
+                    continue;
+                }
+                let err = validate(serde_json::json!({ (*key): bad }), false)
+                    .expect_err(&format!("{key}={bad} must be refused"));
+                match err {
+                    AppError::Validation(msg) => assert!(msg.contains(key), "{msg}"),
+                    other => panic!("{key}: expected Validation, got {other:?}"),
+                }
+            }
+            assert!(
+                validate(serde_json::json!({ (*key): min }), false).is_ok(),
+                "{key}"
+            );
+            assert!(
+                validate(serde_json::json!({ (*key): max }), false).is_ok(),
+                "{key}"
+            );
+        }
+    }
+
+    /// #5652: the upload limit is `MAX_UPLOAD_SIZE`; a different value is
+    /// refused instead of being stored and ignored.
+    #[test]
+    fn test_update_refuses_changing_the_read_only_upload_limit_5652() {
+        let err = validate(
+            serde_json::json!({ "max_upload_size_bytes": 104_857_600 }),
+            false,
+        )
+        .expect_err("a different upload limit must be refused");
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("MAX_UPLOAD_SIZE")),
+            "{err:?}"
+        );
+    }
+
+    /// #5652: `allow_anonymous_download` is refused with a pointer to the
+    /// guest-access setting, whatever its value.
+    #[test]
+    fn test_update_refuses_the_removed_anonymous_download_field_5652() {
+        for value in [true, false] {
+            let err = validate(
+                serde_json::json!({ "allow_anonymous_download": value }),
+                false,
+            )
+            .expect_err("removed field must be refused");
+            assert!(
+                matches!(&err, AppError::Validation(m) if m.contains("guest_access_enabled")),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// #5652: an env-pinned stale threshold cannot be changed here.
+    #[test]
+    fn test_update_refuses_a_pinned_stale_threshold_5652() {
+        assert!(validate(
+            serde_json::json!({ "edge_stale_threshold_minutes": 9 }),
+            false
+        )
+        .is_ok());
+        let err = validate(
+            serde_json::json!({ "edge_stale_threshold_minutes": 9 }),
+            true,
+        )
+        .expect_err("pinned threshold must be refused");
+        assert!(
+            matches!(&err, AppError::Validation(m) if m.contains("PEER_STALE_THRESHOLD_MINUTES")),
+            "{err:?}"
+        );
+    }
+
+    /// #5652: only the fields whose value changes are written and audited.
+    #[test]
+    fn test_changed_settings_lists_only_changes_5652() {
+        let body = serde_json::json!({
             "retention_days": 365,
-            "audit_retention_days": 90,
-            "backup_retention_count": 10,
-            "edge_stale_threshold_minutes": 5
-        }"#;
-        let parsed: SystemSettings = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.environment, "");
+            "audit_retention_days": 30,
+            "backup_retention_count": 3,
+        });
+        let changed = changed_settings(&parse_update(&body), &sample_settings());
+        assert_eq!(
+            changed,
+            vec![
+                ("audit_retention_days", 0, 30),
+                ("backup_retention_count", 10, 3)
+            ]
+        );
+        let details = system_setting_audit_details("audit_retention_days", 0, 30);
+        assert_eq!(details["key"], "audit_retention_days");
+        assert_eq!(details["old_value"], "0");
+        assert_eq!(details["new_value"], "30");
     }
 
     /// Regression (DB-backed, no-op without `DATABASE_URL`): `get_settings`
@@ -3243,6 +3443,194 @@ mod tests {
         let Json(settings) = get_settings(State(state)).await.unwrap();
 
         assert_eq!(settings.environment, "development");
+    }
+
+    /// The `POST /api/v1/admin/settings` rows (#5652).
+    const SETTINGS_KEYS: [&str; 6] = [
+        "allow_anonymous_download",
+        "max_upload_size_bytes",
+        "retention_days",
+        "audit_retention_days",
+        "backup_retention_count",
+        "edge_stale_threshold_minutes",
+    ];
+
+    /// #5652 (DB-backed, through the route): `GET` reports the upload limit
+    /// in force and no `allow_anonymous_download`; the `GET` body posts back;
+    /// a negative value and the removed field answer 400 and store nothing;
+    /// each changed field writes one `SETTING_CHANGED` row with the actor.
+    #[tokio::test]
+    async fn test_post_settings_validates_and_audits_each_change_db_5652() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let _guard = tdh::admin_settings_serial_lock().await;
+        let saved: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT key, value FROM system_settings WHERE key = ANY($1)")
+                .bind(&SETTINGS_KEYS[..])
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        sqlx::query("DELETE FROM system_settings WHERE key = ANY($1)")
+            .bind(&SETTINGS_KEYS[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-settings-5652");
+        let (admin_id, admin_name) = tdh::create_user(&pool).await;
+        let app = || {
+            tdh::router_with_auth_ext(
+                router(),
+                state.clone(),
+                tdh::admin_auth(admin_id, &admin_name),
+            )
+        };
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/settings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let stored = |key: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, serde_json::Value>(
+                    "SELECT value FROM system_settings WHERE key = $1",
+                )
+                .bind(key)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let (status, body) = tdh::send(app(), tdh::get("/settings".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        let got: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let in_force = state.config.max_upload_size_bytes;
+        let in_force_reported = got["max_upload_size_bytes"].as_u64();
+        let anon_reported = got.get("allow_anonymous_download").cloned();
+
+        let mut negative = got.clone();
+        negative["audit_retention_days"] = serde_json::json!(-5);
+        let (neg_status, _) = tdh::send(app(), post(negative)).await;
+        let neg_stored = stored("audit_retention_days").await;
+
+        let mut anon = got.clone();
+        anon["allow_anonymous_download"] = serde_json::json!(true);
+        let (anon_status, _) = tdh::send(app(), post(anon)).await;
+
+        let mut change = got.clone();
+        change["retention_days"] = serde_json::json!(30);
+        change["backup_retention_count"] = serde_json::json!(3);
+        let (change_status, change_body) = tdh::send(app(), post(change)).await;
+        let changed: serde_json::Value =
+            serde_json::from_slice(&change_body).unwrap_or(serde_json::Value::Null);
+
+        // The audit write is detached; give it a moment.
+        let mut audited: Vec<String> = Vec::new();
+        for _ in 0..50 {
+            audited = sqlx::query_scalar(
+                "SELECT details->>'key' FROM audit_log \
+                  WHERE action = 'SETTING_CHANGED' AND user_id = $1 ORDER BY 1",
+            )
+            .bind(admin_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if audited.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        sqlx::query("DELETE FROM system_settings WHERE key = ANY($1)")
+            .bind(&SETTINGS_KEYS[..])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (key, value) in &saved {
+            sqlx::query("INSERT INTO system_settings (key, value) VALUES ($1, $2)")
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let _ = sqlx::query("DELETE FROM audit_log WHERE user_id = $1")
+            .bind(admin_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, admin_id).await;
+
+        assert_eq!(
+            in_force_reported,
+            Some(in_force),
+            "GET must report the upload limit in force: {got}"
+        );
+        assert_eq!(anon_reported, None, "removed field still reported: {got}");
+        assert_eq!(neg_status, StatusCode::BAD_REQUEST, "negative retention");
+        assert_eq!(neg_stored, None, "a refused value must not be stored");
+        assert_eq!(anon_status, StatusCode::BAD_REQUEST, "removed field");
+        assert_eq!(change_status, StatusCode::OK, "{changed}");
+        assert_eq!(changed["retention_days"], 30);
+        assert_eq!(changed["backup_retention_count"], 3);
+        assert_eq!(
+            audited,
+            vec!["backup_retention_count", "retention_days"],
+            "one SETTING_CHANGED row per changed field"
+        );
+    }
+
+    /// #5652 (DB-backed): the stored `edge_stale_threshold_minutes` is the
+    /// threshold the background stale-peer detector applies (it used to read
+    /// only `PEER_STALE_THRESHOLD_MINUTES`).
+    #[tokio::test]
+    async fn test_stored_stale_threshold_drives_the_detector_db_5652() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        if crate::services::sync_worker::stale_threshold_from_env().is_some() {
+            return; // pinned by the environment of this run
+        }
+        let _guard = tdh::admin_settings_serial_lock().await;
+        let key = crate::services::sync_worker::STALE_THRESHOLD_SETTING;
+        let saved: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT value FROM system_settings WHERE key = $1")
+                .bind(key)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO system_settings (key, value) VALUES ($1, '17'::jsonb) \
+             ON CONFLICT (key) DO UPDATE SET value = '17'::jsonb",
+        )
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let effective =
+            crate::services::sync_worker::effective_stale_threshold_minutes(&pool).await;
+        let state = tdh::build_state(pool.clone(), "/tmp/admin-settings-5652-stale");
+        let reported = get_settings(State(state)).await.unwrap().0;
+        match saved {
+            Some(v) => sqlx::query("UPDATE system_settings SET value = $2 WHERE key = $1")
+                .bind(key)
+                .bind(v),
+            None => sqlx::query("DELETE FROM system_settings WHERE key = $1").bind(key),
+        }
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(effective, 17);
+        assert_eq!(reported.edge_stale_threshold_minutes, 17);
     }
 
     /// #3069: the npm upstream-feed status endpoint is admin-only and reports
