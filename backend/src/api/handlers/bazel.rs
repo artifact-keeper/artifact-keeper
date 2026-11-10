@@ -901,6 +901,73 @@ mod tests {
             .0
     }
 
+    /// #5649 / #5650 review: a publish through `put_artifact_bytes` against a
+    /// store that is down answers `503 STORAGE_UNAVAILABLE` with
+    /// `Retry-After`, and against one that is full `507`, with no backend
+    /// text and no storage-class marker token in the body. The download of a
+    /// published module (`serve_local_artifact`) answers the outage the same
+    /// way: it went through `internal_error`, which answered 500 with the raw
+    /// error, marker token included.
+    #[tokio::test]
+    async fn put_maps_storage_outage_and_full_without_echoing_the_error_5649() {
+        let Some(f) = tdh::Fixture::setup("local", "bazel").await else {
+            return;
+        };
+        let published = "modules/served5649/1.0.0/MODULE.bazel";
+        assert_eq!(
+            put_as_member(&f, published, b"module(name = \"served5649\")").await,
+            StatusCode::CREATED,
+            "publish while storage works"
+        );
+        for (message, want) in [
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
+        ] {
+            let state =
+                tdh::route_repo_to_failing_storage(&f.pool, &f.state, f.repo_id, &message).await;
+            let app = tdh::router_with_auth(
+                super::router(),
+                state.clone(),
+                tdh::make_auth(f.user_id, &f.username),
+            );
+            let (status, body, headers) = tdh::send_with_headers(
+                app,
+                tdh::put(
+                    format!("/{}/modules/outage5649/1.0.0/MODULE.bazel", f.repo_key),
+                    Bytes::from_static(b"module(name = \"outage5649\")"),
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "{}", String::from_utf8_lossy(&body));
+            assert!(
+                headers.contains_key(axum::http::header::RETRY_AFTER),
+                "both the 503 and the full-disk 507 carry Retry-After"
+            );
+            tdh::assert_no_storage_backend_text("bazel PUT", &body);
+
+            if want == StatusCode::SERVICE_UNAVAILABLE {
+                let app = tdh::router_with_auth(
+                    super::router(),
+                    state.clone(),
+                    tdh::make_auth(f.user_id, &f.username),
+                );
+                let (status, body, headers) =
+                    tdh::send_with_headers(app, tdh::get(format!("/{}/{published}", f.repo_key)))
+                        .await;
+                assert_eq!(status, want, "GET: {}", String::from_utf8_lossy(&body));
+                assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+                tdh::assert_no_storage_backend_text("bazel GET", &body);
+            }
+        }
+        f.teardown().await;
+    }
+
     async fn fetch(app: Router, uri: String) -> (StatusCode, Bytes) {
         tdh::send(app, tdh::get(uri)).await
     }

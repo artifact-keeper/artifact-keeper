@@ -448,7 +448,8 @@ pub(crate) fn is_redirect_compatible(
 /// The request URL is left out: in Shared Key mode its query string is a SAS
 /// token, and this message reaches API clients and the logs.
 fn request_error(operation: &str, e: reqwest::Error) -> AppError {
-    AppError::Storage(format!("{}: {}", operation, e.without_url()))
+    // #5649: a refused connection or a timeout is tagged unavailable (503).
+    crate::storage::failure::transport_storage_error(operation, e)
 }
 
 /// Longest Azure error code or request id kept in an error message.
@@ -508,6 +509,16 @@ fn azure_error_detail_from(headers: &reqwest::header::HeaderMap, body: &str) -> 
         parts.push(format!("request id {id}"));
     }
     parts.join(", ")
+}
+
+/// The Azure error code at the front of an [`azure_error_detail_from`]
+/// string, when the response carried one. It is token-shaped by
+/// construction, so it cannot be a client-chosen blob name (#5650).
+fn azure_error_code(detail: &str) -> Option<&str> {
+    detail
+        .split(", ")
+        .next()
+        .filter(|code| is_azure_error_token(code))
 }
 
 /// [`azure_error_detail_from`] for a response, consuming its body.
@@ -680,10 +691,15 @@ impl AzureBackend {
         // so the HTTP client must allow non-TLS when RBAC mode might use managed identity.
         let needs_http = allow_http || config.access_key.is_none();
 
+        // #5649: STORAGE_CONNECT_TIMEOUT_SECS bounds one connection attempt,
+        // so a stopped endpoint is reported unavailable promptly.
+        let connect_timeout = crate::storage::StorageTimeouts::from_env().connect;
         let client = crate::services::http_client::large_object_client_builder(needs_http)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
         let copy_client = crate::services::http_client::server_side_copy_client_builder(needs_http)
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| AppError::Storage(format!("Failed to create HTTP client: {}", e)))?;
         let token_client = crate::services::http_client::base_client_builder()
@@ -832,10 +848,14 @@ impl AzureBackend {
 
         let status = response.status();
         let detail = azure_error_detail(response).await;
-        Err(AppError::Storage(format!(
-            "Azure fallback ranged download failed with status {} for {} ({}): {}",
-            status, key, range_header, detail
-        )))
+        Err(crate::storage::failure::status_storage_error(
+            status.as_u16(),
+            azure_error_code(&detail),
+            format!(
+                "Azure fallback ranged download failed with status {} for {} ({}): {}",
+                status, key, range_header, detail
+            ),
+        ))
     }
 
     fn write_url(&self, key: &str) -> Result<String> {
@@ -1415,10 +1435,14 @@ impl AzureBackend {
         if !response.status().is_success() {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure Put Block for '{}' failed with status {}: {}",
-                key, status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure Put Block for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
 
         block_ids.push(block_id);
@@ -1442,10 +1466,14 @@ impl AzureBackend {
         if !response.status().is_success() {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure Put Block List for '{}' failed with status {}: {}",
-                key, status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure Put Block List for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
 
         Ok(())
@@ -1544,10 +1572,14 @@ impl AzureBackend {
         if !response.status().is_success() {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure HEAD for '{}' failed with status {}: {}",
-                key, status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure HEAD for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
         Self::content_length_from_head(&response, key)
     }
@@ -1631,10 +1663,14 @@ impl AzureBackend {
         if !response.status().is_success() {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
-                source, dest, status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure Put Blob From URL copy from '{}' to '{}' failed with status {}: {}",
+                    source, dest, status, detail
+                ),
+            ));
         }
 
         Ok(AzureCopyPath::PutBlobFromUrl)
@@ -1677,10 +1713,11 @@ impl AzureBackend {
             if !response.status().is_success() {
                 let status = response.status();
                 let detail = azure_error_detail(response).await;
-                return Err(AppError::Storage(format!(
-                    "Azure List Blobs failed with status {}: {}",
-                    status, detail
-                )));
+                return Err(crate::storage::failure::status_storage_error(
+                    status.as_u16(),
+                    azure_error_code(&detail),
+                    format!("Azure List Blobs failed with status {}: {}", status, detail),
+                ));
             }
             let body = response
                 .text()
@@ -1801,10 +1838,11 @@ impl StorageBackend for AzureBackend {
         if !response.status().is_success() {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure upload failed with status {}: {}",
-                status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure upload failed with status {}: {}", status, detail),
+            ));
         }
 
         Ok(())
@@ -1849,10 +1887,11 @@ impl StorageBackend for AzureBackend {
                 return Err(AppError::NotFound(format!("Blob not found: {}", key)));
             }
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure download failed with status {}: {}",
-                status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure download failed with status {}: {}", status, detail),
+            ));
         }
 
         #[allow(clippy::disallowed_methods)]
@@ -1893,10 +1932,14 @@ impl StorageBackend for AzureBackend {
 
         let status = response.status();
         let detail = azure_error_detail(response).await;
-        Err(AppError::Storage(format!(
-            "Azure ranged download failed with status {} for {} ({}): {}",
-            status, key, range_header, detail
-        )))
+        Err(crate::storage::failure::status_storage_error(
+            status.as_u16(),
+            azure_error_code(&detail),
+            format!(
+                "Azure ranged download failed with status {} for {} ({}): {}",
+                status, key, range_header, detail
+            ),
+        ))
     }
 
     // The span covers GET initiation (time-to-first-byte); the body transfer
@@ -1931,10 +1974,11 @@ impl StorageBackend for AzureBackend {
                 }
             } else {
                 let detail = azure_error_detail(response).await;
-                return Err(AppError::Storage(format!(
-                    "Azure download failed with status {}: {}",
-                    status, detail
-                )));
+                return Err(crate::storage::failure::status_storage_error(
+                    status.as_u16(),
+                    azure_error_code(&detail),
+                    format!("Azure download failed with status {}: {}", status, detail),
+                ));
             }
         }
 
@@ -2056,10 +2100,14 @@ impl StorageBackend for AzureBackend {
         }
         let status = response.status();
         let detail = azure_error_detail(response).await;
-        Err(AppError::Storage(format!(
-            "Azure HEAD for '{}' failed with status {}: {}",
-            key, status, detail
-        )))
+        Err(crate::storage::failure::status_storage_error(
+            status.as_u16(),
+            azure_error_code(&detail),
+            format!(
+                "Azure HEAD for '{}' failed with status {}: {}",
+                key, status, detail
+            ),
+        ))
     }
 
     #[tracing::instrument(err(Display, level = "info"), skip(self), fields(otel.kind = "client", storage.system = "azure", storage.operation = "exists"))]
@@ -2078,10 +2126,14 @@ impl StorageBackend for AzureBackend {
         if response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure HEAD for '{}' failed with status {}: {}",
-                key, status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!(
+                    "Azure HEAD for '{}' failed with status {}: {}",
+                    key, status, detail
+                ),
+            ));
         }
 
         // In migration mode, check the Artifactory fallback path only after a
@@ -2120,10 +2172,11 @@ impl StorageBackend for AzureBackend {
         if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure delete failed with status {}: {}",
-                status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure delete failed with status {}: {}", status, detail),
+            ));
         }
 
         Ok(())
@@ -2269,10 +2322,11 @@ impl StorageBackend for AzureBackend {
         if !response.status().is_success() {
             let status = response.status();
             let detail = azure_error_detail(response).await;
-            return Err(AppError::Storage(format!(
-                "Azure upload failed with status {}: {}",
-                status, detail
-            )));
+            return Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure upload failed with status {}: {}", status, detail),
+            ));
         }
 
         Ok(())
@@ -2301,10 +2355,11 @@ impl StorageBackend for AzureBackend {
             )))
         } else {
             let detail = azure_error_detail(response).await;
-            Err(AppError::Storage(format!(
-                "Azure health check failed (status {}): {}",
-                status, detail
-            )))
+            Err(crate::storage::failure::status_storage_error(
+                status.as_u16(),
+                azure_error_code(&detail),
+                format!("Azure health check failed (status {}): {}", status, detail),
+            ))
         }
     }
 }
