@@ -425,4 +425,79 @@ mod tests {
             .unwrap()
             .contains(NOT_APPLICABLE_MARKER));
     }
+
+    // -- property tests --------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    fn any_row() -> impl Strategy<Value = ScanStateRow> {
+        let status = prop_oneof![
+            Just("completed"),
+            Just("pending"),
+            Just("running"),
+            Just("failed"),
+            Just(NOT_APPLICABLE_STATUS),
+        ];
+        let message = prop_oneof![
+            Just(None),
+            Just(Some("scanner crashed".to_string())),
+            Just(Some(format!(
+                "trivy {NOT_APPLICABLE_MARKER} to this format"
+            ))),
+        ];
+        (status, message).prop_map(|(status, error_message)| ScanStateRow {
+            status: status.to_string(),
+            error_message,
+        })
+    }
+
+    fn genuine_failure(r: &ScanStateRow) -> bool {
+        r.status == "failed" && !r.is_not_applicable()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+
+        /// Row order comes from SQL and must not change the verdict.
+        #[test]
+        fn classification_ignores_row_order(
+            rows in proptest::collection::vec(any_row(), 0..6).prop_shuffle(),
+            seed in any::<u64>(),
+        ) {
+            let mut rotated = rows.clone();
+            if !rotated.is_empty() {
+                let k = (seed as usize) % rotated.len();
+                rotated.rotate_left(k);
+            }
+            rotated.reverse();
+            prop_assert_eq!(classify_scan_state(&rows), classify_scan_state(&rotated));
+            prop_assert_eq!(any_scanner_failed(&rows), any_scanner_failed(&rotated));
+        }
+
+        /// Fail closed: with no completed scan, anything still in flight or
+        /// genuinely crashed keeps the artifact unscanned.
+        #[test]
+        fn no_completed_scan_and_unfinished_work_is_unscanned(
+            rows in proptest::collection::vec(any_row(), 0..6),
+        ) {
+            let completed = rows.iter().any(|r| r.status == "completed");
+            let unfinished = rows
+                .iter()
+                .any(|r| r.status == "pending" || r.status == "running" || genuine_failure(r));
+            if !completed && (unfinished || rows.is_empty()) {
+                prop_assert!(classify_scan_state(&rows).is_unscanned(), "{:?}", rows);
+            }
+        }
+
+        /// `Failed` and `any_scanner_failed` share one definition of a crash.
+        #[test]
+        fn failed_state_implies_any_scanner_failed(
+            rows in proptest::collection::vec(any_row(), 0..6),
+        ) {
+            if classify_scan_state(&rows) == ScanState::Failed {
+                prop_assert!(any_scanner_failed(&rows));
+            }
+            prop_assert_eq!(any_scanner_failed(&rows), rows.iter().any(genuine_failure));
+        }
+    }
 }

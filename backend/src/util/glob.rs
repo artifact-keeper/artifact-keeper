@@ -69,4 +69,45 @@ mod tests {
         assert!(glob_match("lodash", "lodash"));
         assert!(!glob_match("lodash", "lodashx"));
     }
+
+    // -- property test: agree with a regex oracle ------------------------------
+
+    /// The same pattern as an anchored regex: `*` is any run, `?` is any one
+    /// character, everything else is literal.
+    fn oracle(pattern: &str) -> regex::Regex {
+        let body: String = pattern
+            .chars()
+            .map(|c| match c {
+                '*' => "(?s:.*)".to_string(),
+                '?' => "(?s:.)".to_string(),
+                c => regex::escape(&c.to_string()),
+            })
+            .collect();
+        regex::Regex::new(&format!("^{body}$")).expect("oracle regex compiles")
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4000))]
+
+        #[test]
+        fn glob_match_agrees_with_the_regex_oracle(
+            pattern in "[ab*?.é]{0,8}",
+            text in "[ab.é]{0,10}",
+        ) {
+            proptest::prop_assert_eq!(
+                glob_match(&pattern, &text),
+                oracle(&pattern).is_match(&text),
+                "pattern {:?} on {:?}", pattern, text
+            );
+        }
+
+        /// A pattern with no wildcard matches exactly itself.
+        #[test]
+        fn a_literal_pattern_matches_only_itself(
+            pattern in "[ab.]{0,8}",
+            text in "[ab.]{0,8}",
+        ) {
+            proptest::prop_assert_eq!(glob_match(&pattern, &text), pattern == text);
+        }
+    }
 }
