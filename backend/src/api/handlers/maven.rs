@@ -4933,7 +4933,9 @@ async fn upload(
     // regenerated that way (it is the only copy of the prefix mapping), so it
     // takes the normal row-and-push path below.
     if MavenHandler::is_metadata(&path) {
-        if let Some(document) = staged_plugin_prefix_document(&staged, storage.as_ref()).await? {
+        if let Some(document) =
+            staged_plugin_prefix_document(&path, &staged, storage.as_ref()).await?
+        {
             let published = publish_plugin_prefix_metadata(
                 &state,
                 &repo,
@@ -5463,11 +5465,17 @@ const MAX_PLUGIN_PREFIX_METADATA_DETECT_BYTES: i64 = 8 * 1024 * 1024;
 /// The staged body when it is a group-level plugin-prefix `maven-metadata.xml`
 /// (`<plugins>`), else `None` (#4916). The body is read from wherever it was
 /// staged, local scratch or the repository's own backend.
+///
+/// Only a group-level path qualifies (#5693): a version-level
+/// `maven-metadata.xml` is never a plugin-prefix mapping whatever its body.
 async fn staged_plugin_prefix_document(
+    path: &str,
     staged: &super::repositories::GenericStagedBody,
     storage: &dyn crate::storage::StorageBackend,
 ) -> Result<Option<Bytes>, Response> {
-    if staged.size_bytes() > MAX_PLUGIN_PREFIX_METADATA_DETECT_BYTES {
+    if !crate::formats::maven::is_group_level_metadata_path(path)
+        || staged.size_bytes() > MAX_PLUGIN_PREFIX_METADATA_DETECT_BYTES
+    {
         return Ok(None);
     }
     let bytes = staged.read_all(storage).await.map_err(map_storage_err)?;
@@ -7241,6 +7249,89 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&get_body).contains("<prefix>example</prefix>"),
             "the stored mapping must still be served at its original path"
+        );
+    }
+
+    /// #5693: plugin-prefix detection must not reclassify an artifact-level
+    /// or version-level `maven-metadata.xml` whose body happens to contain a
+    /// `<plugins>` block. Both stay row-less version indexes (the #4889
+    /// decision), are not queued to push peers, and are still served at
+    /// their path. The group-level control is
+    /// `plugin_prefix_metadata_is_pushed_4916`.
+    #[tokio::test]
+    async fn artifact_level_metadata_with_plugins_stays_row_less_5693() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let peer_id = tdh::subscribe_push_peer(&fx.pool, fx.repo_id, "maven-5693").await;
+        let router = fx.router_with_auth(super::router());
+        let jar = "com/x/lib/1.0/lib-1.0.jar";
+        let artifact_level = "com/x/lib/maven-metadata.xml";
+        let version_level = "com/x/lib/1.0-SNAPSHOT/maven-metadata.xml";
+        let artifact_level_xml: &[u8] = br#"<metadata>
+  <groupId>com.x</groupId>
+  <artifactId>lib</artifactId>
+  <versioning><release>1.0</release><versions><version>1.0</version></versions></versioning>
+  <plugins><plugin><prefix>marker</prefix><artifactId>marker-maven-plugin</artifactId></plugin></plugins>
+</metadata>"#;
+        // No `<versioning>`: only the path rules this one out.
+        let version_level_xml: &[u8] = br#"<metadata>
+  <plugins><plugin><prefix>marker</prefix><artifactId>marker-maven-plugin</artifactId></plugin></plugins>
+</metadata>"#;
+        let mut statuses = Vec::new();
+        for (path, body) in [
+            (artifact_level, artifact_level_xml),
+            (version_level, version_level_xml),
+            (jar, b"release jar bytes".as_slice()),
+        ] {
+            let (status, _) = tdh::send(
+                router.clone(),
+                tdh::put(
+                    format!("/{}/{}", fx.repo_key, path),
+                    bytes::Bytes::copy_from_slice(body),
+                ),
+            )
+            .await;
+            statuses.push(status);
+        }
+
+        let queued = tdh::queued_push_paths_settled(&fx.pool, peer_id, fx.repo_id, jar).await;
+        let metadata_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 \
+             AND path LIKE '%maven-metadata.xml'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count metadata rows");
+        let (get_status, get_body) = tdh::send(
+            router,
+            tdh::get(format!("/{}/{}", fx.repo_key, version_level)),
+        )
+        .await;
+        tdh::delete_push_peer(&fx.pool, peer_id).await;
+        fx.teardown().await;
+
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::CREATED),
+            "every deploy must succeed: {statuses:?}"
+        );
+        assert_eq!(
+            metadata_rows, 0,
+            "artifact- and version-level maven-metadata.xml must stay row-less"
+        );
+        assert_eq!(
+            queued,
+            vec![jar.to_string()],
+            "only the versioned file is pushed; neither metadata file is"
+        );
+        assert_eq!(get_status, StatusCode::OK);
+        assert!(
+            String::from_utf8_lossy(&get_body).contains("<prefix>marker</prefix>"),
+            "the stored version-level document is still served at its path"
         );
     }
 
