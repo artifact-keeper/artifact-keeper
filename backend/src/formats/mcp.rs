@@ -1467,11 +1467,58 @@ pub fn storage_path(name: &str, version: &str) -> String {
     format!("servers/{name}/{version}/server.json")
 }
 
-/// `artifacts.storage_key` of a server version: content-addressed, so a
-/// publish that loses the race for a version cannot overwrite the bytes of
-/// the one that won.
-pub fn storage_key(name: &str, version: &str, sha256: &str) -> String {
-    format!("mcp/{name}/{version}/{sha256}.json")
+/// Where one repository's new MCP objects are keyed: its id and storage
+/// backend under the `STORAGE_KEY_SCHEME` (#2624).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyScope<'a> {
+    pub scheme: crate::storage::StorageKeyScheme,
+    pub storage_backend: &'a str,
+    pub repository_id: Uuid,
+}
+
+impl<'a> KeyScope<'a> {
+    /// The scope of a repository on `storage_backend`, under the scheme the
+    /// environment selects.
+    pub fn of(storage_backend: &'a str, repository_id: Uuid) -> Self {
+        Self {
+            scheme: crate::storage::StorageKeyScheme::from_env(),
+            storage_backend,
+            repository_id,
+        }
+    }
+
+    fn key(self, path: &str) -> String {
+        self.scheme
+            .write_key(self.storage_backend, "mcp", self.repository_id, path)
+    }
+}
+
+/// `artifacts.storage_key` a new server version is written to:
+/// content-addressed, so a publish that loses the race for a version cannot
+/// overwrite the bytes of the one that won.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) the key is the repo-scoped
+/// `mcp/{repository_id}/{name}/{version}/{sha256}.json`, so two MCP
+/// repositories holding the same version (two Remotes of one upstream, a
+/// hosted copy) write two objects. The flat `mcp/{name}/...` key they used to
+/// share made the second repository's write fail the cross-repository write
+/// guard with 409 (#5660). Filesystem backends and `STORAGE_KEY_SCHEME=flat`
+/// keep the flat key. Existing objects are untouched: every MCP read resolves
+/// the object through the `storage_key` its artifact row recorded.
+pub fn storage_key(scope: KeyScope<'_>, name: &str, version: &str, sha256: &str) -> String {
+    scope.key(&format!("{name}/{version}/{sha256}.json"))
+}
+
+/// `artifacts.storage_key` a new MCPB bundle is written to, scoped as
+/// [`storage_key`] is (#5660).
+pub fn bundle_storage_key(
+    scope: KeyScope<'_>,
+    name: &str,
+    version: &str,
+    sha256: &str,
+    file: &str,
+) -> String {
+    scope.key(&format!("{name}/{version}/bundles/{sha256}/{file}"))
 }
 
 /// `(name, version)` from a [`storage_path`].
@@ -3714,9 +3761,14 @@ mod tests {
             storage_path("com.acme/w", "1.0"),
             "servers/com.acme/w/1.0/server.json"
         );
+        let on_filesystem = KeyScope::of("filesystem", Uuid::new_v4());
         assert_eq!(
-            storage_key("com.acme/w", "1.0", "ab"),
+            storage_key(on_filesystem, "com.acme/w", "1.0", "ab"),
             "mcp/com.acme/w/1.0/ab.json"
+        );
+        assert_eq!(
+            bundle_storage_key(on_filesystem, "com.acme/w", "1.0", "ab", "w.mcpb"),
+            "mcp/com.acme/w/1.0/bundles/ab/w.mcpb"
         );
         assert_eq!(
             parse_storage_path("servers/com.acme/w/1.0/server.json"),
@@ -3724,6 +3776,46 @@ mod tests {
         );
         assert_eq!(parse_storage_path("servers/w/1.0/server.json"), None);
         assert_eq!(parse_storage_path("other/a/b/c/server.json"), None);
+    }
+
+    /// #5660: a shared cloud namespace gets the repo-scoped key for a
+    /// server version and a bundle alike, and the `STORAGE_KEY_SCHEME=flat`
+    /// opt-out keeps the legacy shared key.
+    #[test]
+    fn storage_keys_are_repo_scoped_on_cloud_5660() {
+        use crate::storage::StorageKeyScheme;
+        let repository_id = Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            let scoped = KeyScope {
+                scheme: StorageKeyScheme::RepoScoped,
+                storage_backend: backend,
+                repository_id,
+            };
+            let flat = KeyScope {
+                scheme: StorageKeyScheme::Flat,
+                ..scoped
+            };
+            assert_eq!(
+                storage_key(scoped, "com.acme/w", "1.0", "ab"),
+                format!("mcp/{repository_id}/com.acme/w/1.0/ab.json"),
+                "{backend}"
+            );
+            assert_eq!(
+                bundle_storage_key(scoped, "com.acme/w", "1.0", "ab", "w.mcpb"),
+                format!("mcp/{repository_id}/com.acme/w/1.0/bundles/ab/w.mcpb"),
+                "{backend}"
+            );
+            assert_eq!(
+                storage_key(flat, "com.acme/w", "1.0", "ab"),
+                "mcp/com.acme/w/1.0/ab.json",
+                "{backend}"
+            );
+            assert_eq!(
+                bundle_storage_key(flat, "com.acme/w", "1.0", "ab", "w.mcpb"),
+                "mcp/com.acme/w/1.0/bundles/ab/w.mcpb",
+                "{backend}"
+            );
+        }
     }
 
     /// Finding 4: a listing cursor is opaque and sealed. It round-trips for

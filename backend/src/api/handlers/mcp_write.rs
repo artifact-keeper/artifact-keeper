@@ -775,7 +775,12 @@ async fn edit_impl(
         );
         return Ok(surface::json_ok(StatusCode::OK, &entry));
     }
-    let key = fmt::storage_key(name, version, &sha256);
+    let key = fmt::storage_key(
+        fmt::KeyScope::of(&repo.storage_backend, repo.id),
+        name,
+        version,
+        &sha256,
+    );
     super::proxy_helpers::put_artifact_bytes(state, &repo, &key, Bytes::from(bytes.clone()))
         .await
         .map_err(reproblem)?;
@@ -1512,7 +1517,13 @@ async fn upload_bundle(
             serde_json::json!({}),
         ));
     }
-    let storage_key = format!("mcp/{name}/{version}/bundles/{}/{file}", digests.sha256);
+    let storage_key = fmt::bundle_storage_key(
+        fmt::KeyScope::of(&repo.storage_backend, repo.id),
+        name,
+        version,
+        &digests.sha256,
+        file,
+    );
     let size_bytes = staged.size_bytes();
     super::proxy_helpers::put_staged_body(
         state,

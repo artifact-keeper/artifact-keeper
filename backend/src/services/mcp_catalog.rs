@@ -686,6 +686,11 @@ fn audit_version(row_version: &str) -> Option<&str> {
 /// repository routes here, or `/api/v1/curation/packages/...`): the audit
 /// and, for an approval, the ingest. Returns the ingest error, if any (the
 /// approval stands; the next sync retries).
+///
+/// A failure to store the ingested bytes is the `Err` (#5660): the decision
+/// is recorded and the next sync retries, but the caller answers the storage
+/// error (409 for the cross-repository write guard, 507 for a quota, 500
+/// otherwise) instead of a 200 for a version that is never served.
 #[allow(clippy::too_many_arguments)]
 pub async fn after_status_change(
     state: &SharedState,
@@ -696,7 +701,7 @@ pub async fn after_status_change(
     decision: Decision,
     actor: Option<Uuid>,
     reason: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     mcp_remote::audit(
         &state.db,
         decision.audit_action(),
@@ -707,10 +712,10 @@ pub async fn after_status_change(
         serde_json::json!({"review_id": row_id, "reason": reason}),
     );
     if decision != Decision::Approve {
-        return None;
+        return Ok(None);
     }
     if let Err(e) = mark_needs_ingest(&state.db, &[row_id]).await {
-        return Some(e.to_string());
+        return Ok(Some(e.to_string()));
     }
     match mcp_remote::ingest_after_approval(state, repo, name, version).await {
         Ok(_) => {
@@ -720,11 +725,15 @@ pub async fn after_status_change(
             .bind(row_id)
             .execute(&state.db)
             .await;
-            None
+            Ok(None)
+        }
+        Err(mcp_remote::IngestError::Store(e)) => {
+            tracing::warn!(server = %name, error = %e, "MCP approval: the approved version could not be stored");
+            Err(e)
         }
         Err(e) => {
             tracing::warn!(server = %name, error = %e, "MCP approval: ingest deferred to the next sync");
-            Some(e)
+            Ok(Some(e.to_string()))
         }
     }
 }
@@ -789,7 +798,7 @@ pub async fn decide(
         Some(actor),
         reason,
     )
-    .await;
+    .await?;
     Ok(DecisionResult {
         item: item_by_name(&state.db, repo, &row.package_name).await?,
         ingest_error,
@@ -845,7 +854,7 @@ pub async fn pin(
         Some(actor),
         reason,
     )
-    .await;
+    .await?;
     Ok(DecisionResult {
         item: item_by_name(&state.db, repo, name).await?,
         ingest_error,
@@ -1354,7 +1363,9 @@ pub async fn after_generic_status(
             let _ = mark_needs_ingest(&state.db, &[id]).await;
             spawn_ingest(state, &repo, vec![(name, version)]);
         } else {
-            after_status_change(
+            // The curation route already answered; a storage failure is
+            // logged by `after_status_change` and retried by the next sync.
+            let _ = after_status_change(
                 state,
                 &repo,
                 id,

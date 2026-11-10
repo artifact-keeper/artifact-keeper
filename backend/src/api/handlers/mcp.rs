@@ -2505,7 +2505,12 @@ async fn publish_server(
             StatusCode::CONFLICT => mcp_error(McpError::VersionExists),
             _ => reproblem(resp),
         })?;
-    let key = fmt::storage_key(&server.name, &server.version, &sha256);
+    let key = fmt::storage_key(
+        fmt::KeyScope::of(&repo.storage_backend, repo.id),
+        &server.name,
+        &server.version,
+        &sha256,
+    );
     let size_bytes = bytes.len() as i64;
     proxy_helpers::put_artifact_bytes(&state, &repo, &key, Bytes::from(bytes))
         .await

@@ -993,6 +993,20 @@ pub fn build_state_with_presigning_cloud(
     build_cloud_state(pool, backend_name, /* presign = */ true)
 }
 
+/// Like [`build_state_with_cloud`], with `proxy` as the proxy service (an
+/// upstream sync, e.g. a Remote MCP registry's, on a shared cloud
+/// namespace; #5660).
+pub fn build_state_with_cloud_and_proxy(
+    pool: PgPool,
+    backend_name: &str,
+    proxy: Arc<crate::services::proxy_service::ProxyService>,
+) -> (SharedState, Arc<MemStorage>) {
+    let (state, mem) = build_cloud_state(pool, backend_name, false);
+    let mut state = Arc::try_unwrap(state).unwrap_or_else(|_| unreachable!("fresh state"));
+    state.set_proxy_service(proxy);
+    (Arc::new(state), mem)
+}
+
 fn build_cloud_state(
     pool: PgPool,
     backend_name: &str,

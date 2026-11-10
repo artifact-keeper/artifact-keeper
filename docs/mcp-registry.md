@@ -1869,7 +1869,12 @@ SeedJob  { jobId, repository, status: "pending" | "running" | "completed" | "fai
 
 Approving a name (or pinning a version) ingests it right away; when upstream
 cannot be reached the approval stands, `ingestError` says why, and the next
-sync ingests it. A bulk approval ingests in the background.
+sync ingests it. When the ingested version cannot be stored, the approval
+still stands (the next sync retries) but the request answers the storage
+error instead of `200`: `409 CONFLICT` when the storage key is held by
+another repository (only possible with `STORAGE_KEY_SCHEME=flat` on cloud
+storage), `507 QUOTA_EXCEEDED` for a quota, `500 STORAGE_ERROR` otherwise. A
+bulk approval ingests in the background.
 
 Bulk decisions by pattern take a glob over the **full** server name, the
 same rule as `mcp_auto_approve_namespaces` and `mcp_server_deny` (`*`
