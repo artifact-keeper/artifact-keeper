@@ -3126,6 +3126,12 @@ async fn fetch_maven_metadata_bytes(
         let mut member_unavailable = false;
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
+            // Remote members the GA pass found unavailable in THIS request
+            // (#5673). The plugin-prefix pass below fetches the same path
+            // from the same upstreams, so asking them again only doubles the
+            // outage latency (2x the connect timeout) before the 503.
+            let mut unavailable_members: std::collections::HashSet<uuid::Uuid> =
+                std::collections::HashSet::new();
             let cache_key: VirtualMetadataCacheKey =
                 (repo.id, group_id.clone(), artifact_id.clone());
 
@@ -3174,6 +3180,11 @@ async fn fetch_maven_metadata_bytes(
                         // A member that missed the deadline fails the merge
                         // (#4508); nothing is cached for it.
                         let member_docs = member_docs.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        for (member, doc) in chunk.iter().zip(&member_docs) {
+                            if *doc == MemberMetadata::Unavailable {
+                                unavailable_members.insert(member.id);
+                            }
+                        }
                         for xml in member_docs
                             .into_iter()
                             .filter_map(|doc| doc.into_doc(&mut member_unavailable))
@@ -3254,7 +3265,11 @@ async fn fetch_maven_metadata_bytes(
                     // Stored-document read: repo-scoped key first, then the
                     // attribution-gated legacy flat key (#2624, #2504, #2574);
                     // see `read_member_stored_metadata`.
-                    if member.repo_type == RepositoryType::Remote {
+                    if unavailable_members.contains(&member.id) {
+                        // Already unavailable this request (#5673); the GA
+                        // pass recorded it in `member_unavailable`.
+                        Ok(MemberMetadata::Unavailable)
+                    } else if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
                     } else {
                         Ok(MemberMetadata::from_doc(
@@ -13132,6 +13147,73 @@ mod tests {
             repos.push((id, dir));
         }
         (virtual_id, virtual_key, repos)
+    }
+
+    /// #5673: the plugin-prefix second pass of a Virtual GA metadata merge
+    /// re-fetched every Remote member, including ones the first pass had
+    /// just found unavailable, so an outage cost twice the upstream connect
+    /// timeout before the 503. A member found unavailable is asked once per
+    /// request; the answer is still the retryable 503.
+    #[tokio::test]
+    async fn test_virtual_metadata_second_pass_skips_unavailable_members_5673() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/down/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/miss/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5673-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let members = [
+            format!("{}/down", upstream.uri()),
+            format!("{}/miss", upstream.uri()),
+        ];
+        let (_, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+
+        let (status, body, _) = tdh::send_with_headers(
+            tdh::router_anon(router(), state.clone()),
+            tdh::get(format!(
+                "/{virtual_key}/com/outage5673/lib/maven-metadata.xml"
+            )),
+        )
+        .await;
+        let requests = upstream.received_requests().await.unwrap_or_default();
+        let count = |prefix: &str| {
+            requests
+                .iter()
+                .filter(|r| r.url.path().starts_with(prefix))
+                .count()
+        };
+        let (down, miss) = (count("/down/"), count("/miss/"));
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            down, 1,
+            "the unavailable member must be asked once per request, not again \
+             by the plugin-prefix pass"
+        );
+        assert!(miss >= 1, "the answering member is still asked");
     }
 
     /// #5621: GET `maven-metadata.xml` (and its checksum sidecars) through a
