@@ -870,6 +870,15 @@ bytes, or evicts it, the version is `unresolvable` (hidden) until the package
 is pulled again; nothing else is ever served in its place. OCI pulls through
 a Remote write manifest records, which publish already finds.
 
+A publish that arrives while this instance is still committing a pull-through
+of the package (the client already has the bytes, the cache entry is being
+recorded) waits for that commit, at most 10 seconds and never longer than
+one resolver tick (`MCP_RESOLVER_INTERVAL_SECS`), and then pins the entry: an
+`npm install` through AK followed straight away by `mcp-publisher publish`
+answers `200`. A pull-through running on another replica is not seen; that
+publish answers `202` as below and the resolver pins the entry on its next
+tick.
+
 A package that is not in the Remote yet (directly mapped, or the first Remote
 member by priority of a mapped Virtual) is **filled** instead of refused:
 
