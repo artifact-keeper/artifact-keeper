@@ -207,9 +207,23 @@ async fn depth_response(
         .get_stream(&storage_key)
         .await
         .map_err(IntoResponse::into_response)?;
+    // #5076: a row a scanning Remote holds goes through the scan gate.
+    let proxy_helpers::StoredRowBody { body: stream, scan } = gate_stored_rpm(
+        state,
+        storage.as_ref(),
+        repo,
+        path,
+        path.rsplit('/').next().unwrap_or(path),
+        &storage_key,
+        size_bytes,
+        stream,
+    )
+    .await?;
     crate::services::artifact_service::record_download(&state.db, id, ctx).await;
-    let mut response =
-        build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum);
+    let mut response = proxy_helpers::StoredRowBody::stamp(
+        scan,
+        build_rpm_package_response(Body::from_stream(stream), "", size_bytes, &checksum),
+    );
     // The stored basename, not its URL form; the shared helper keeps any
     // name a valid header (quoted-string escapes, RFC 5987 for non-ASCII).
     let disposition = crate::api::download_response::content_disposition_attachment(
@@ -2966,12 +2980,27 @@ async fn upstream_proxy(
             .get_stream(&artifact.storage_key)
             .await
             .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
-
-        return Ok(build_rpm_package_response(
-            Body::from_stream(stream),
+        // #5076: the Remote's own row goes through the scan gate.
+        let proxy_helpers::StoredRowBody { body: stream, scan } = gate_stored_rpm(
+            &state,
+            storage.as_ref(),
+            &repo,
+            &upstream_path,
             filename,
+            &artifact.storage_key,
             artifact.size_bytes,
-            &artifact.checksum_sha256,
+            stream,
+        )
+        .await?;
+
+        return Ok(proxy_helpers::StoredRowBody::stamp(
+            scan,
+            build_rpm_package_response(
+                Body::from_stream(stream),
+                filename,
+                artifact.size_bytes,
+                &artifact.checksum_sha256,
+            ),
         ));
     }
 
@@ -3122,6 +3151,40 @@ fn rpm_identity(
         None,
         rpm_release_from_dist_tag(&header.release),
     )
+}
+
+/// A stored `artifacts` row an RPM route has opened, through the scan gate
+/// when `repo` is a Remote that scans on proxy (#5076): graded as the same
+/// file proxied through the route would be. `path` decides, as on the proxied
+/// path, whether the file is metadata (never gated); `filename` is the name
+/// the request asks for, which the package must declare.
+#[allow(clippy::too_many_arguments)]
+async fn gate_stored_rpm(
+    state: &SharedState,
+    storage: &dyn crate::storage::StorageBackend,
+    repo: &RepoInfo,
+    path: &str,
+    filename: &str,
+    storage_key: &str,
+    size_bytes: i64,
+    body: futures::stream::BoxStream<'static, crate::error::Result<Bytes>>,
+) -> Result<proxy_helpers::StoredRowBody, Response> {
+    if rpm_path_is_metadata(path) {
+        return Ok(proxy_helpers::StoredRowBody { body, scan: None });
+    }
+    proxy_helpers::gate_opened_stored_row(
+        state,
+        storage,
+        &proxy_helpers::StoredRow {
+            repo,
+            filename,
+            storage_key,
+            size_bytes,
+        },
+        RpmPackage,
+        body,
+    )
+    .await
 }
 
 /// Inline scan-and-block for one RPM proxy file from one Remote repository
@@ -3302,15 +3365,30 @@ async fn download_package(
         .get_stream(&artifact.storage_key)
         .await
         .map_err(|e| crate::api::handlers::storage_err_plain(&e))?;
+    // #5076: a row a scanning Remote holds goes through the scan gate.
+    let proxy_helpers::StoredRowBody { body: stream, scan } = gate_stored_rpm(
+        &state,
+        storage.as_ref(),
+        &repo,
+        &format!("packages/{pkg_path}"),
+        filename,
+        &artifact.storage_key,
+        artifact.size_bytes,
+        stream,
+    )
+    .await?;
 
     // Record download
     crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
-    Ok(build_rpm_package_response(
-        Body::from_stream(stream),
-        filename,
-        artifact.size_bytes,
-        &artifact.checksum_sha256,
+    Ok(proxy_helpers::StoredRowBody::stamp(
+        scan,
+        build_rpm_package_response(
+            Body::from_stream(stream),
+            filename,
+            artifact.size_bytes,
+            &artifact.checksum_sha256,
+        ),
     ))
 }
 
@@ -9155,6 +9233,22 @@ mod scan_on_proxy_4112 {
 
     archive_scan_suite!(case);
 
+    /// #5076: a row the scanning Remote holds itself is served through the
+    /// gate, as the proxied file is. Fails on `main`: the row streamed
+    /// ungated (200, no `X-AK-Scan`) under every policy.
+    #[tokio::test]
+    async fn a_stored_row_of_a_scanning_remote_is_gated_5076() {
+        crate::api::handlers::proxy_scan_archive::test_support::stored_row_is_gated(
+            case,
+            crate::api::handlers::proxy_scan_archive::test_support::StoredRowSeed {
+                path: format!("packages/{FILE}"),
+                name: "dtf-libs".to_string(),
+                version: "1.0-1.el9_2".to_string(),
+            },
+        )
+        .await;
+    }
+
     /// The yum layout dnf actually fetches, through the catch-all.
     fn catchall_case(_mock: &str) -> ArchiveCase {
         let path = format!("9/BaseOS/x86_64/os/Packages/d/{FILE}");
@@ -9179,6 +9273,21 @@ mod scan_on_proxy_4112 {
         ts::fail_open_first_pull_is_served_pending(catchall_case).await;
         ts::virtual_member_is_gated(catchall_case).await;
         ts::without_scan_on_proxy_streams_unscanned(catchall_case).await;
+    }
+
+    /// #5076: the Remote's own row found by file name on the catch-all is
+    /// gated too.
+    #[tokio::test]
+    async fn a_stored_row_on_the_catch_all_is_gated_5076() {
+        ts::stored_row_is_gated(
+            catchall_case,
+            ts::StoredRowSeed {
+                path: format!("9/BaseOS/x86_64/os/Packages/d/{FILE}"),
+                name: "dtf-libs".to_string(),
+                version: "1.0-1.el9_2".to_string(),
+            },
+        )
+        .await;
     }
 
     /// Repository metadata on the catch-all still streams through a scanning

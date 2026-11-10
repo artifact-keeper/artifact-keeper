@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5076]
+---
+- **A package row a scanning Remote repository holds itself is no longer served past the scan gate on the NuGet, Debian, RPM, Alpine and generic download routes** ([#5076]). A Remote can hold `artifacts` rows of its own, from replication or a publish into the remote. With scan-on-proxy on, the NuGet flat-container and V2 package routes, the Debian `pool/` route, the RPM package routes and the Alpine package route streamed such a row from storage with no scan, while the same file proxied through the route was gated. These routes now gate the row as they gate the proxied file, under the format's own identity rule: a `vulnerable` verdict for its bytes is `403 scan_blocked`, `fail_closed` with no verdict is `423 scan_pending`, and `fail_open` serves it with `X-AK-Scan: pending`. The generic download route (`/api/v1/repositories/{key}/download/*path` and `/general/{key}/*path`) cannot grade a row, so it now refuses one of an enforced format with the same `403 scan_on_proxy_route_required` it already answered for a proxied file. Hosted repositories, and Remotes with scan-on-proxy off, are unchanged.
