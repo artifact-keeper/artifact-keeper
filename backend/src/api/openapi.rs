@@ -197,6 +197,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
             "admin_security",
             handlers::admin_security::AdminSecurityApiDoc::openapi(),
         ),
+        (
+            "security_reviewers",
+            handlers::security_reviewers::SecurityReviewersApiDoc::openapi(),
+        ),
         ("analytics", handlers::analytics::AnalyticsApiDoc::openapi()),
         ("lifecycle", handlers::lifecycle::LifecycleApiDoc::openapi()),
         (
