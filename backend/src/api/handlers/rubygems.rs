@@ -34,7 +34,9 @@ use sqlx::{PgPool, Row};
 use std::io::Write as IoWrite;
 use tracing::info;
 
-use crate::api::handlers::proxy_helpers::{self, RepoInfo, LARGE_METADATA_MAX_BYTES};
+use crate::api::handlers::proxy_helpers::{
+    self, RepoInfo, DEFAULT_METADATA_MAX_BYTES, LARGE_METADATA_MAX_BYTES,
+};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::rubygems::{RubygemsHandler, SpecEntry};
@@ -61,6 +63,11 @@ pub fn router() -> Router<SharedState> {
             "/:repo_key/prerelease_specs.4.8.gz",
             get(prerelease_specs_index),
         )
+        // Compact Index (Bundler's first choice). Served for Remote repos only,
+        // see `serve_compact_index`.
+        .route("/:repo_key/versions", get(compact_versions))
+        .route("/:repo_key/names", get(compact_names))
+        .route("/:repo_key/info/:name", get(compact_info))
         // Quick gemspec (Marshal 4.8, zlib-deflated). `gem install` fetches this
         // to resolve a gem's dependencies before downloading the .gem.
         .route("/:repo_key/quick/Marshal.4.8/:spec_file", get(quick_spec))
@@ -834,7 +841,14 @@ async fn serve_specs_index(
     sql: &str,
 ) -> Result<Response, Response> {
     if repo.repo_type == RepositoryType::Remote {
-        return proxy_remote_index(state, repo, upstream_path).await;
+        return proxy_remote_document(
+            state,
+            repo,
+            upstream_path,
+            LARGE_METADATA_MAX_BYTES,
+            "application/gzip",
+        )
+        .await;
     }
     if repo.repo_type == RepositoryType::Virtual {
         return serve_virtual_specs_index(state, repo, auth, upstream_path, sql).await;
@@ -1409,6 +1423,21 @@ async fn quick_spec(
 
     match find_local_quick_spec(&state.db, repo.id, full_name).await? {
         Some(spec) => quick_spec_response(&spec),
+        // A Remote repo has no local row for a gem it has not cached yet, so
+        // the spec comes from upstream (already zlib-deflated Marshal).
+        None if repo.repo_type == RepositoryType::Remote => {
+            if !is_safe_path_segment(&spec_file) {
+                return Err((StatusCode::NOT_FOUND, "Gemspec not found").into_response());
+            }
+            proxy_remote_document(
+                &state,
+                &repo,
+                &format!("quick/Marshal.4.8/{spec_file}"),
+                DEFAULT_METADATA_MAX_BYTES,
+                "application/octet-stream",
+            )
+            .await
+        }
         None => Err((StatusCode::NOT_FOUND, "Gemspec not found").into_response()),
     }
 }
@@ -1428,6 +1457,14 @@ async fn dependencies(
     Query(query): Query<DependencyQuery>,
 ) -> Result<Response, Response> {
     let repo = resolve_rubygems_repo(&state.db, &repo_key).await?;
+
+    // This endpoint answers from local rows only. For a Remote repo that meant
+    // `[]` for every gem it had not cached, which tells a client the gem has no
+    // versions. rubygems.org has retired the Dependency API (it answers 404),
+    // so a Remote repo answers 404 too and Bundler uses the Compact Index.
+    if repo.repo_type == RepositoryType::Remote {
+        return Err(dependency_api_not_served());
+    }
 
     let gem_names: Vec<&str> = query
         .gems
@@ -1522,14 +1559,18 @@ fn index_bytes_response(bytes: Bytes, content_type: Option<&str>) -> Response {
         .unwrap()
 }
 
-/// Pass a Remote repo's upstream specs index through verbatim (#4280).
+/// Pass a document from a Remote repo's upstream through verbatim.
 ///
-/// Specs indexes from rubygems.org exceed [`proxy_helpers::DEFAULT_METADATA_MAX_BYTES`]
-/// (8 MiB), so the fetch uses [`LARGE_METADATA_MAX_BYTES`].
-async fn proxy_remote_index(
+/// Used for the specs indexes (#4280), the Compact Index and the quick
+/// gemspecs. Specs indexes and the Compact Index `versions` file from
+/// rubygems.org exceed [`DEFAULT_METADATA_MAX_BYTES`] (8 MiB), so those
+/// fetches pass [`LARGE_METADATA_MAX_BYTES`].
+async fn proxy_remote_document(
     state: &SharedState,
     repo: &RepoInfo,
     path: &str,
+    max_bytes: usize,
+    default_content_type: &str,
 ) -> Result<Response, Response> {
     let (Some(proxy), Some(upstream)) =
         (state.proxy_service.as_deref(), repo.upstream_url.as_deref())
@@ -1546,17 +1587,126 @@ async fn proxy_remote_index(
         &repo.key,
         upstream,
         path,
-        LARGE_METADATA_MAX_BYTES,
+        max_bytes,
         RepositoryFormat::Rubygems,
     )
     .await?;
-    Ok(index_bytes_response(content, content_type.as_deref()))
+    let content_type = content_type.as_deref().unwrap_or(default_content_type);
+    Ok(index_bytes_response(content, Some(content_type)))
+}
+
+// ---------------------------------------------------------------------------
+// GET /gems/{repo_key}/versions, /names, /info/{name} — Compact Index
+// ---------------------------------------------------------------------------
+
+async fn compact_versions(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    serve_compact_index(&state, &repo_key, "versions", LARGE_METADATA_MAX_BYTES).await
+}
+
+async fn compact_names(
+    State(state): State<SharedState>,
+    Path(repo_key): Path<String>,
+) -> Result<Response, Response> {
+    serve_compact_index(&state, &repo_key, "names", LARGE_METADATA_MAX_BYTES).await
+}
+
+async fn compact_info(
+    State(state): State<SharedState>,
+    Path((repo_key, name)): Path<(String, String)>,
+) -> Result<Response, Response> {
+    if !is_safe_path_segment(&name) {
+        return Err(compact_index_not_served());
+    }
+    serve_compact_index(
+        &state,
+        &repo_key,
+        &format!("info/{name}"),
+        DEFAULT_METADATA_MAX_BYTES,
+    )
+    .await
+}
+
+/// Serve a Compact Index document.
+///
+/// * Remote: the upstream document, byte for byte. Bundler checks each
+///   `info/{name}` body against the MD5 the `versions` file lists for it, so
+///   neither document may be rewritten.
+/// * Hosted and Virtual: 404, so Bundler falls back to the Marshal specs
+///   indexes and quick gemspecs (#4272 review). Generating a conformant
+///   Compact Index from local rows is separate work.
+async fn serve_compact_index(
+    state: &SharedState,
+    repo_key: &str,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Response, Response> {
+    let repo = resolve_rubygems_repo(&state.db, repo_key).await?;
+    if repo.repo_type != RepositoryType::Remote {
+        return Err(compact_index_not_served());
+    }
+    proxy_remote_document(state, &repo, path, max_bytes, "text/plain; charset=utf-8").await
+}
+
+fn compact_index_not_served() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "Compact Index is served for Remote RubyGems repositories only",
+    )
+        .into_response()
+}
+
+fn dependency_api_not_served() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "Dependency API is not served for Remote RubyGems repositories; use the Compact Index",
+    )
+        .into_response()
+}
+
+/// True when `segment` can be appended to an upstream URL as one path
+/// segment: gem names and `{name}-{version}[-{platform}].gemspec.rz` file
+/// names only use these characters.
+fn is_safe_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('.')
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_safe_path_segment() {
+        for ok in [
+            "rexml",
+            "net-http",
+            "aws_sdk",
+            "rexml-3.4.4.gemspec.rz",
+            "Ab9",
+        ] {
+            assert!(is_safe_path_segment(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "../versions",
+            "a/b",
+            "a?b",
+            "a%2Fb",
+            "a b",
+        ] {
+            assert!(!is_safe_path_segment(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn test_push_artifact_path_traversal_rejected() {
@@ -2657,6 +2807,111 @@ mod db_cov_tests {
             RUBY_SPECS_GZ,
             "virtual specs must be upstream Marshal gzip, not a reconstructed index"
         );
+    }
+
+    /// Mount `body` at the exact upstream `path` of `server`.
+    async fn mount_doc(server: &wiremock::MockServer, path: &str, ct: &str, body: &[u8]) {
+        use wiremock::matchers::{method, path as exact_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(exact_path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body.to_vec())
+                    .insert_header("content-type", ct),
+            )
+            .mount(server)
+            .await;
+    }
+
+    const VERSIONS_DOC: &[u8] =
+        b"created_at: 2026-11-01T00:00:04Z\n---\nrexml 3.4.3,3.4.4 0123456789abcdef0123456789abcdef\n";
+    const NAMES_DOC: &[u8] = b"---\nrake\nrexml\n";
+    const INFO_DOC: &[u8] = b"---\n3.4.4 |checksum:abc,ruby:>= 2.5.0\n";
+    const QUICK_SPEC: &[u8] = b"x\x9c\x01\x02\x03 not-really-deflate";
+
+    /// A Remote repo had no Compact Index routes (404), its Dependency API
+    /// answered `[]` from local rows, and its quick gemspec only looked
+    /// locally (404), so Bundler could not resolve anything through
+    /// `/gems/{remote}`. The Compact Index and quick gemspecs now pass the
+    /// upstream through byte for byte, and the Dependency API answers 404 like
+    /// rubygems.org so Bundler does not read "no versions" from it.
+    #[tokio::test]
+    async fn test_rubygems_remote_serves_bundler_endpoints_from_upstream() {
+        let Some(fx) = tdh::Fixture::setup("remote", "rubygems").await else {
+            return;
+        };
+        let upstream = wiremock::MockServer::start().await;
+        let text = "text/plain; charset=utf-8";
+        mount_doc(&upstream, "/versions", text, VERSIONS_DOC).await;
+        mount_doc(&upstream, "/names", text, NAMES_DOC).await;
+        mount_doc(&upstream, "/info/rexml", text, INFO_DOC).await;
+        mount_doc(
+            &upstream,
+            "/quick/Marshal.4.8/rexml-3.4.4.gemspec.rz",
+            "application/octet-stream",
+            QUICK_SPEC,
+        )
+        .await;
+        let (state, _cache_dir) = tdh::rewire_remote_proxy(&fx, &upstream.uri()).await;
+
+        let k = fx.repo_key.clone();
+        let cases: Vec<(String, &[u8])> = vec![
+            (format!("/{k}/versions"), VERSIONS_DOC),
+            (format!("/{k}/names"), NAMES_DOC),
+            (format!("/{k}/info/rexml"), INFO_DOC),
+            (
+                format!("/{k}/quick/Marshal.4.8/rexml-3.4.4.gemspec.rz"),
+                QUICK_SPEC,
+            ),
+        ];
+        let mut got = Vec::new();
+        for (uri, _) in &cases {
+            let app = tdh::router_anon(super::router(), state.clone());
+            got.push(tdh::send(app, tdh::get(uri.clone())).await);
+        }
+        let mut refused = Vec::new();
+        for uri in [
+            format!("/{k}/api/v1/dependencies?gems=rexml"),
+            format!("/{k}/info/.rexml"),
+            format!("/{k}/info/..%2Fversions"),
+            format!("/{k}/quick/Marshal.4.8/..%2Fversions"),
+        ] {
+            let app = tdh::router_anon(super::router(), state.clone());
+            refused.push((uri.clone(), tdh::send(app, tdh::get(uri)).await.0));
+        }
+        fx.teardown().await;
+
+        for ((uri, want), (status, body)) in cases.iter().zip(got) {
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+            assert_eq!(&body[..], *want, "{uri} must be the upstream bytes");
+        }
+        for (uri, status) in refused {
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// The Compact Index is only proxied: a hosted repo still answers 404 on
+    /// every Compact Index path so Bundler falls back to the Marshal indexes.
+    #[tokio::test]
+    async fn test_rubygems_hosted_compact_index_stays_not_found() {
+        let Some(fx) = tdh::Fixture::setup("local", "rubygems").await else {
+            return;
+        };
+        let k = fx.repo_key.clone();
+        let mut got = Vec::new();
+        for uri in [
+            format!("/{k}/versions"),
+            format!("/{k}/names"),
+            format!("/{k}/info/rexml"),
+        ] {
+            let app = fx.router_with_auth(super::router());
+            got.push((uri.clone(), tdh::send(app, tdh::get(uri)).await.0));
+        }
+        fx.teardown().await;
+        for (uri, status) in got {
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     /// Seed `.gem` artifacts `(name, version)` into `repo`.
