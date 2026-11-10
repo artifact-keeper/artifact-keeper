@@ -162,7 +162,9 @@ impl ScanState {
 /// Precedence: any completed scan -> `Completed`; else any in-progress
 /// (pending/running) -> `InProgress`; else any genuine failure -> `Failed`;
 /// else if rows exist and they are all "not applicable" markers ->
-/// `NotApplicable`; else (no rows) -> `NeverScanned`.
+/// `NotApplicable`; else (no rows) -> `NeverScanned`. A row with a status
+/// this build does not recognise counts as a failure, never as "not
+/// applicable".
 pub(crate) fn classify_scan_state(rows: &[ScanStateRow]) -> ScanState {
     if rows.iter().any(|r| r.status == "completed") {
         return ScanState::Completed;
@@ -187,9 +189,17 @@ pub(crate) fn classify_scan_state(rows: &[ScanStateRow]) -> ScanState {
     if rows.is_empty() {
         return ScanState::NeverScanned;
     }
-    // Rows exist, none completed, none in-progress, none a genuine failure ->
-    // every row is "not applicable".
-    ScanState::NotApplicable
+    // Rows exist, none completed, none in-progress, none a genuine failure.
+    // Only when every one of them is a "not applicable" marker does scanning
+    // genuinely not apply. A row whose status this build does not recognise
+    // (a status added by a newer release, read by an older node during a
+    // rolling upgrade) proves nothing about the artifact, so it is not vetted:
+    // fail closed rather than fall through to "not applicable".
+    if rows.iter().all(ScanStateRow::is_not_applicable) {
+        ScanState::NotApplicable
+    } else {
+        ScanState::Failed
+    }
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -437,6 +447,7 @@ mod tests {
             Just("running"),
             Just("failed"),
             Just(NOT_APPLICABLE_STATUS),
+            Just("some_future_status"),
         ];
         let message = prop_oneof![
             Just(None),
@@ -489,15 +500,44 @@ mod tests {
             }
         }
 
+        /// The only ways to pass the unscanned gate: a completed scan, or
+        /// at least one row and every row a "not applicable" marker.
+        #[test]
+        fn passing_the_gate_needs_a_completed_scan_or_all_not_applicable(
+            rows in proptest::collection::vec(any_row(), 0..6),
+        ) {
+            if !classify_scan_state(&rows).is_unscanned() {
+                let completed = rows.iter().any(|r| r.status == "completed");
+                let all_na = !rows.is_empty() && rows.iter().all(|r| r.is_not_applicable());
+                prop_assert!(completed || all_na, "{:?}", rows);
+            }
+        }
+
         /// `Failed` and `any_scanner_failed` share one definition of a crash.
         #[test]
         fn failed_state_implies_any_scanner_failed(
             rows in proptest::collection::vec(any_row(), 0..6),
         ) {
+            let known = ["completed", "pending", "running", "failed", NOT_APPLICABLE_STATUS];
+            let unrecognised = rows.iter().any(|r| !known.contains(&r.status.as_str()));
             if classify_scan_state(&rows) == ScanState::Failed {
-                prop_assert!(any_scanner_failed(&rows));
+                prop_assert!(any_scanner_failed(&rows) || unrecognised);
             }
             prop_assert_eq!(any_scanner_failed(&rows), rows.iter().any(genuine_failure));
         }
+    }
+
+    /// A status this build does not know must not read as "not applicable".
+    #[test]
+    fn an_unrecognised_status_is_unscanned_not_not_applicable() {
+        let rows = [row("some_future_status", None)];
+        assert_eq!(classify_scan_state(&rows), ScanState::Failed);
+        assert!(classify_scan_state(&rows).is_unscanned());
+
+        let rows = [
+            row(NOT_APPLICABLE_STATUS, None),
+            row("some_future_status", None),
+        ];
+        assert!(classify_scan_state(&rows).is_unscanned());
     }
 }
