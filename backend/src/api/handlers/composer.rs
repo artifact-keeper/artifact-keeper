@@ -2103,8 +2103,16 @@ async fn upload(
         body.len() as i64,
     )
     .await?;
-    // Store the archive
-    let storage_key = format!("composer/{}/{}/{}.zip", full_name, version, sha256);
+    // Store the archive.
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same package version do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "composer",
+        repo.id,
+        &format!("{}/{}/{}.zip", full_name, version, sha256),
+    );
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -3909,6 +3917,24 @@ mod upload_db_tests {
             .header("content-type", "application/zip")
             .body(axum::body::Body::from(zip_bytes))
             .expect("build PUT request")
+    }
+
+    /// #5662: the same package version uploads into two Composer repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_package_version_uploads_to_two_cloud_repositories_5662() {
+        use sha2::Digest;
+        let zip = build_composer_zip("acme/scoped5662", "1.0.0", "one package two repos");
+        let reference = format!("{:x}", sha2::Sha256::digest(&zip));
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "composer",
+            key_prefix: "composer",
+            router: super::router,
+            publish: &|key| vec![put_composer(format!("/{key}/api/packages"), zip.clone())],
+            download: &|key| tdh::get(format!("/{key}/dist/acme/scoped5662/1.0.0/{reference}.zip")),
+            expected: &zip,
+        })
+        .await;
     }
 
     // -----------------------------------------------------------------------

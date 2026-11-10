@@ -710,7 +710,15 @@ async fn publish_module(
     )
     .await?;
 
-    let storage_key = format!("puppet/{}/{}/{}", full_name, module_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same module release do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "puppet",
+        repo.id,
+        &format!("{}/{}/{}", full_name, module_version, filename),
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, tarball.clone()).await?;
 
     let puppet_metadata = serde_json::json!({
@@ -1124,22 +1132,27 @@ mod tests {
         f.teardown().await;
     }
 
-    /// Publish `acme-ntp` `version` natively to the fixture repo.
-    async fn publish_acme_ntp(f: &tdh::Fixture, version: &str, body: &str) {
+    /// Multipart body (boundary `B`) publishing `acme-ntp` `version` with
+    /// `body` as the module tarball.
+    fn acme_ntp_multipart(version: &str, body: &str) -> bytes::Bytes {
         let module = format!(
             r#"{{"owner":"acme","name":"ntp","version":"{version}","summary":"time sync","dependencies":[{{"name":"puppetlabs/stdlib","version_requirement":">= 4.0.0"}}]}}"#
         );
-        let multipart = format!(
+        bytes::Bytes::from(format!(
             "--B\r\nContent-Disposition: form-data; name=\"module\"\r\n\r\n{module}\r\n\
              --B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"m.tar.gz\"\r\n\
              Content-Type: application/octet-stream\r\n\r\n{body}\r\n--B--\r\n"
-        );
+        ))
+    }
+
+    /// Publish `acme-ntp` `version` natively to the fixture repo.
+    async fn publish_acme_ntp(f: &tdh::Fixture, version: &str, body: &str) {
         let (status, resp) = tdh::send(
             f.router_with_auth(super::router()),
             tdh::post(
                 format!("/{}/v3/releases", f.repo_key),
                 "multipart/form-data; boundary=B",
-                bytes::Bytes::from(multipart),
+                acme_ntp_multipart(version, body),
             ),
         )
         .await;
@@ -1148,6 +1161,28 @@ mod tests {
             "puppet publish failed: {status} {}",
             String::from_utf8_lossy(&resp)
         );
+    }
+
+    /// #5662: the same module release publishes into two Puppet repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_module_release_publishes_to_two_cloud_repositories_5662() {
+        let tarball = "one module release two forges carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "puppet",
+            key_prefix: "puppet",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/v3/releases"),
+                    "multipart/form-data; boundary=B",
+                    acme_ntp_multipart("5.6.62", tarball),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/v3/files/acme-ntp-5.6.62.tar.gz")),
+            expected: tarball.as_bytes(),
+        })
+        .await;
     }
 
     /// The query `puppet module install` sends (Puppet::Forge#fetch).

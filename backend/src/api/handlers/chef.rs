@@ -510,7 +510,15 @@ async fn upload_cookbook(
 
     // Stream the staged tarball into the repo's StorageBackend, from local
     // scratch or by copying the object the backend already staged (#4990).
-    let storage_key = format!("chef/{}/{}/{}", cookbook_name, cookbook_version, filename);
+    // Repo-scoped on a shared cloud namespace (#5662), so two repositories
+    // holding the same cookbook version do not collide on one key; reads go
+    // through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "chef",
+        repo.id,
+        &format!("{}/{}/{}", cookbook_name, cookbook_version, filename),
+    );
     let put = proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -1027,6 +1035,32 @@ mod upload_stream_tests {
         body.extend_from_slice(tarball);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         bytes::Bytes::from(body)
+    }
+
+    /// #5662: the same cookbook version uploads into two Chef repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_cookbook_uploads_to_two_cloud_repositories_5662() {
+        let tarball = b"one cookbook two supermarkets carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "chef",
+            key_prefix: "chef",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/v1/cookbooks"),
+                    "multipart/form-data; boundary=CHEFBND",
+                    cookbook_multipart("CHEFBND", "shared-cb", "1.0.0", tarball),
+                )]
+            },
+            download: &|key| {
+                tdh::get(format!(
+                    "/{key}/api/v1/cookbooks/shared-cb/versions/1.0.0/download"
+                ))
+            },
+            expected: tarball,
+        })
+        .await;
     }
 
     #[tokio::test]

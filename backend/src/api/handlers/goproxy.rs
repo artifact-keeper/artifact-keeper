@@ -2138,7 +2138,12 @@ async fn upload_zip(
         size_bytes,
     )
     .await?;
-    let storage_key = build_go_zip_storage_key(module, version);
+    let storage_key = go_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
 
@@ -2307,7 +2312,12 @@ async fn upload_mod(
         size_bytes,
     )
     .await?;
-    let storage_key = build_go_mod_storage_key(module, version);
+    let storage_key = go_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+    );
     proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
 
@@ -2448,22 +2458,29 @@ fn build_go_zip_artifact_path(module: &str, version: &str) -> String {
     format!("{}/{}/{}.zip", encoded_module, version, version)
 }
 
-/// Build the storage key for a Go module zip.
-fn build_go_zip_storage_key(module: &str, version: &str) -> String {
-    let encoded_module = encode_module_path(module);
-    format!("go/{}/{}/{}.zip", encoded_module, version, version)
+/// The storage key a hosted module file (zip or go.mod) at `artifact_path`
+/// is written to.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `go/{repository_id}/{artifact_path}` of the #2624 scheme, so two
+/// repositories holding the same module version write two objects; the flat
+/// `go/{artifact_path}` key they used to share made the second repository's
+/// upload fail the cross-repository write guard with 409 (#5662). Filesystem
+/// backends and `STORAGE_KEY_SCHEME=flat` keep the flat key. Existing files
+/// keep serving: every read resolves the `storage_key` its row recorded.
+fn go_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    artifact_path: &str,
+) -> String {
+    scheme.write_key(storage_backend, "go", repo_id, artifact_path)
 }
 
 /// Build the artifact path for a Go go.mod file.
 fn build_go_mod_artifact_path(module: &str, version: &str) -> String {
     let encoded_module = encode_module_path(module);
     format!("{}/{}/go.mod", encoded_module, version)
-}
-
-/// Build the storage key for a Go go.mod file.
-fn build_go_mod_storage_key(module: &str, version: &str) -> String {
-    let encoded_module = encode_module_path(module);
-    format!("go/{}/{}/go.mod", encoded_module, version)
 }
 
 /// Build Go module metadata JSON for storage.
@@ -3050,6 +3067,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // build_go_zip_storage_key
     // -----------------------------------------------------------------------
+
+    /// The key a hosted upload writes on a filesystem backend.
+    fn build_go_zip_storage_key(module: &str, version: &str) -> String {
+        on_filesystem(&build_go_zip_artifact_path(module, version))
+    }
+
+    fn build_go_mod_storage_key(module: &str, version: &str) -> String {
+        on_filesystem(&build_go_mod_artifact_path(module, version))
+    }
+
+    fn on_filesystem(artifact_path: &str) -> String {
+        go_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            artifact_path,
+        )
+    }
+
+    /// #5662: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn go_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let path = build_go_zip_artifact_path("github.com/user/repo", "v1.0.0");
+        let repo_id = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                go_storage_key(StorageKeyScheme::RepoScoped, backend, repo_id, &path),
+                format!("go/{repo_id}/github.com/user/repo/v1.0.0/v1.0.0.zip"),
+                "{backend}"
+            );
+            assert_eq!(
+                go_storage_key(StorageKeyScheme::Flat, backend, repo_id, &path),
+                "go/github.com/user/repo/v1.0.0/v1.0.0.zip",
+                "{backend}"
+            );
+        }
+    }
 
     #[test]
     fn test_build_go_zip_storage_key_simple() {
@@ -4394,6 +4450,33 @@ mod virtual_collation_tests {
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
+
+    /// #5662: the same module version uploads into two Go repositories on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_module_uploads_to_two_cloud_repositories_5662() {
+        const ZIP: &[u8] = b"one module zip two proxies carry (#5662)";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "go",
+            key_prefix: "go",
+            router: super::router,
+            publish: &|key| {
+                vec![
+                    tdh::put(
+                        format!("/{key}/example.com/shared/@v/v1.0.0.mod"),
+                        bytes::Bytes::from_static(b"module example.com/shared\n"),
+                    ),
+                    tdh::put(
+                        format!("/{key}/example.com/shared/@v/v1.0.0.zip"),
+                        bytes::Bytes::from_static(ZIP),
+                    ),
+                ]
+            },
+            download: &|key| tdh::get(format!("/{key}/example.com/shared/@v/v1.0.0.zip")),
+            expected: ZIP,
+        })
+        .await;
+    }
 
     /// A module zip upload must register the catalog row under the module
     /// path and version.

@@ -550,8 +550,23 @@ async fn virtual_metadata(
 // ---------------------------------------------------------------------------
 
 /// Storage key for a published file, unique per content.
-fn storage_key_for(artifact_path: &str, sha256: &str) -> String {
-    format!("bazel/{}/{}", sha256, artifact_path)
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// publishing the same bytes at the same path do not collide on one key;
+/// reads go through the row's storage_key, so legacy flat-key rows keep serving.
+fn storage_key_for(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: Uuid,
+    artifact_path: &str,
+    sha256: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        "bazel",
+        repo_id,
+        &format!("{}/{}", sha256, artifact_path),
+    )
 }
 
 /// Validate an uploaded file's body for the registry file it is published as.
@@ -620,7 +635,13 @@ async fn put_file(
 
     // Content-addressed key: a concurrent PUT of different bytes to the same
     // path cannot overwrite the blob the winning row points at.
-    let storage_key = storage_key_for(&artifact_path, &checksum);
+    let storage_key = storage_key_for(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &artifact_path,
+        &checksum,
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let inserted = proxy_helpers::insert_artifact(
@@ -878,6 +899,30 @@ mod tests {
     }
 
     #[test]
+    fn bazel_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = Uuid::new_v4();
+        let path = "modules/a/1.0/MODULE.bazel";
+        let key = |scheme, backend| storage_key_for(scheme, backend, repo_id, path, "abc");
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                key(StorageKeyScheme::RepoScoped, backend),
+                format!("bazel/{repo_id}/abc/{path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                key(StorageKeyScheme::Flat, backend),
+                format!("bazel/abc/{path}"),
+                "{backend}"
+            );
+        }
+        assert_eq!(
+            key(StorageKeyScheme::RepoScoped, "filesystem"),
+            format!("bazel/abc/{path}")
+        );
+    }
+
+    #[test]
     fn validate_upload_rules() {
         assert!(validate_upload("MODULE.bazel", b"").is_err());
         assert!(validate_upload("source.json", b"{not json").is_err());
@@ -966,6 +1011,23 @@ mod tests {
             }
         }
         f.teardown().await;
+    }
+
+    /// #5662: the same module file publishes into two Bazel registries on a
+    /// shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_module_file_publishes_to_two_cloud_repositories_5662() {
+        let body = b"module(name = \"shared5662\", version = \"1.0.0\")";
+        let path = "modules/shared5662/1.0.0/MODULE.bazel";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "bazel",
+            key_prefix: "bazel",
+            router: super::router,
+            publish: &|key| vec![tdh::put(format!("/{key}/{path}"), Bytes::from_static(body))],
+            download: &|key| tdh::get(format!("/{key}/{path}")),
+            expected: body,
+        })
+        .await;
     }
 
     async fn fetch(app: Router, uri: String) -> (StatusCode, Bytes) {

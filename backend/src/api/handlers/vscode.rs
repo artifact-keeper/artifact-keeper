@@ -4405,7 +4405,14 @@ async fn publish_extension(
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Store the file
-    let storage_key = build_vscode_storage_key(&publisher, &ext_name, &ext_version);
+    let storage_key = build_vscode_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &publisher,
+        &ext_name,
+        &ext_version,
+    );
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
         .await?;
     let storage = state
@@ -4603,9 +4610,25 @@ fn build_vscode_artifact_path(publisher: &str, name: &str, version: &str) -> Str
 }
 
 /// Build the storage key for a VS Code extension.
-fn build_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
+///
+/// Repo-scoped on a shared cloud namespace (#5662), so two repositories
+/// holding the same extension version do not collide on one key; reads go
+/// through the row's storage_key, so legacy flat-key rows keep serving.
+fn build_vscode_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    publisher: &str,
+    name: &str,
+    version: &str,
+) -> String {
     let filename = build_vsix_filename(publisher, name, version);
-    format!("vscode/{}/{}/{}", publisher, name, filename)
+    scheme.write_key(
+        storage_backend,
+        "vscode",
+        repo_id,
+        &format!("{}/{}/{}", publisher, name, filename),
+    )
 }
 
 /// Build the download URL for a VS Code extension.
@@ -8618,24 +8641,65 @@ mod tests {
     // build_vscode_storage_key
     // -----------------------------------------------------------------------
 
+    /// The key on a filesystem backend, which keeps the legacy flat layout.
+    fn fs_vscode_storage_key(publisher: &str, name: &str, version: &str) -> String {
+        build_vscode_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            publisher,
+            name,
+            version,
+        )
+    }
+
     #[test]
     fn test_build_vscode_storage_key() {
         assert_eq!(
-            build_vscode_storage_key("esbenp", "prettier-vscode", "10.1.0"),
+            fs_vscode_storage_key("esbenp", "prettier-vscode", "10.1.0"),
             "vscode/esbenp/prettier-vscode/esbenp.prettier-vscode-10.1.0.vsix"
         );
     }
 
     #[test]
     fn test_build_vscode_storage_key_starts_with_vscode() {
-        let key = build_vscode_storage_key("ms-python", "python", "1.0.0");
+        let key = fs_vscode_storage_key("ms-python", "python", "1.0.0");
         assert!(key.starts_with("vscode/"));
     }
 
     #[test]
     fn test_build_vscode_storage_key_ends_with_vsix() {
-        let key = build_vscode_storage_key("ms-vscode", "cpptools", "1.18.0");
+        let key = fs_vscode_storage_key("ms-vscode", "cpptools", "1.18.0");
         assert!(key.ends_with(".vsix"));
+    }
+
+    #[test]
+    fn vscode_storage_key_is_repo_scoped_on_cloud_5662() {
+        use crate::storage::StorageKeyScheme;
+        let repo_id = uuid::Uuid::new_v4();
+        let key = |scheme, backend| {
+            build_vscode_storage_key(
+                scheme,
+                backend,
+                repo_id,
+                "esbenp",
+                "prettier-vscode",
+                "10.1.0",
+            )
+        };
+        let path = "esbenp/prettier-vscode/esbenp.prettier-vscode-10.1.0.vsix";
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                key(StorageKeyScheme::RepoScoped, backend),
+                format!("vscode/{repo_id}/{path}"),
+                "{backend}"
+            );
+            assert_eq!(
+                key(StorageKeyScheme::Flat, backend),
+                format!("vscode/{path}"),
+                "{backend}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -10250,6 +10314,29 @@ mod vsix_manifest_publish_tests {
             "a benign name must still publish: {ok_status} {}",
             String::from_utf8_lossy(&ok_body)
         );
+    }
+
+    /// #5662: the same extension version publishes into two VS Code
+    /// repositories on a shared cloud namespace (on main the second answered
+    /// 409).
+    #[tokio::test]
+    async fn same_extension_publishes_to_two_cloud_repositories_5662() {
+        let package = vsix("acme", "shared5662", "1.0.0", "universal");
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "vscode",
+            key_prefix: "vscode",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/extensions"),
+                    "application/octet-stream",
+                    bytes::Bytes::from(package.clone()),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/extensions/acme/shared5662/1.0.0/download")),
+            expected: &package,
+        })
+        .await;
     }
 
     /// `vsce package` output publishes with no `x-*` header and its fields are
