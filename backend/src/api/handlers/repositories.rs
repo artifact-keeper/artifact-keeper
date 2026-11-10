@@ -10923,7 +10923,7 @@ pub async fn get_artifact_metadata(
             // #5504: a member that could not answer makes "not found"
             // unknowable; answer the retryable 503, not a cacheable 404.
             if proxy_helpers::is_member_unavailable_response(&resp) {
-                AppError::ServiceUnavailable(
+                AppError::MemberUnavailable(
                     "A repository member is temporarily unavailable, retry shortly".to_string(),
                 )
             } else {
