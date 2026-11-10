@@ -71,7 +71,8 @@ tag (`v2/<name>/manifests/<tag>`) and a digest row
 (`v2/<name>/manifests/sha256:<hex>`, written by an MCP pin, a push by digest
 or a Remote pull). Since #5457 every read of a manifest (the native pull and
 HEAD, hosted and through a Virtual, the MCP backing gate, the generic
-`/download` route and the tree content read) checks every live row of the
+`/download` and `/general` routes, hosted and through a Virtual (#5619), and
+the tree content read) checks every live row of the
 digest in that repository, whatever the image name. If any row is held or
 rejected, every reference to the digest is refused.
 

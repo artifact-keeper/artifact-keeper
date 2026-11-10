@@ -6221,11 +6221,20 @@ async fn local_lookup_artifact(
     Response,
 > {
     let artifact = lookup.fetch_row(db, repo_id).await?;
-    // #4510: a scan-policy hold answers the policy 403, not the 409.
-    check_quarantine_row(db, &artifact, repo_id).await?;
-    crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
-        .await
-        .map_err(|e| e.into_response())?;
+    if crate::services::oci_manifests::is_manifest_path(&artifact.path) {
+        // #5619: an OCI manifest row is gated with every alias of its digest
+        // (#5457), as the hosted generic download and `/v2` are, so a Virtual
+        // does not serve a digest one of its other rows refuses.
+        crate::services::oci_manifests::enforce_path_download_gate(db, artifact.id, &artifact.path)
+            .await
+            .map_err(|e| e.into_response())?;
+    } else {
+        // #4510: a scan-policy hold answers the policy 403, not the 409.
+        check_quarantine_row(db, &artifact, repo_id).await?;
+        crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
+            .await
+            .map_err(|e| e.into_response())?;
+    }
     let storage = state.storage_for_repo_or_500(location)?;
     Ok((artifact, storage))
 }

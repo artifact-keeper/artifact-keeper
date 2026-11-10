@@ -13658,6 +13658,12 @@ pub async fn download_artifact(
                 Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
                     return Ok(resp)
                 }
+                // #5619: a member's download gate refused the artifact (a
+                // hold, a rejection, the scan policy): the refusal the hosted
+                // route answers, not a miss.
+                Err(resp) if proxy_helpers::is_member_policy_block_response(&resp) => {
+                    return Ok(resp)
+                }
                 Err(_) => return Err(not_found()),
             };
 
