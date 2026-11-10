@@ -40,6 +40,9 @@ cd formal && lake build --wfail
 
 `--wfail` turns warnings into errors, so a proof left as `sorry` fails the build.
 
+CI runs the same command in `.github/workflows/formal.yml` whenever `formal/`
+changes.
+
 ## Adding a model
 
 1. Pick a rule that is already a pure function (no database, no I/O).
