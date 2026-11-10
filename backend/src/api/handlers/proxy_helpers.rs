@@ -10257,6 +10257,57 @@ pub(crate) fn scan_pending_locked_response(filename: &str) -> Response {
         .into_response()
 }
 
+/// Marks a `423 scan_pending` that a retry is expected to resolve (#5273):
+/// the scan was still queued or running when this request stopped waiting for
+/// it, or there was no room to start it. Carried as a response extension, so
+/// the status stays `423` for everything inside the server that reads it (a
+/// Virtual walk ends on it, the metrics label it `locked`), and only a format
+/// route that opts in through [`scan_pending_as_retryable_503`] answers its
+/// client differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanPendingRetryable;
+
+/// `Retry-After` on a retryable `scan_pending` (#5273), in seconds. Short on
+/// purpose: a retry that arrives while the scan is in flight joins it and waits
+/// server-side, and one inside
+/// [`ABANDON_GRACE`](crate::api::handlers::proxy_scan_inflight::ABANDON_GRACE)
+/// keeps a queued scan's place.
+pub(crate) const SCAN_PENDING_RETRY_AFTER_SECS: u64 = 5;
+
+/// [`scan_pending_locked_response`] for a scan that did not finish in time for
+/// this request ([`ProxyScanInconclusive::BudgetExceeded`]), marked
+/// [`ScanPendingRetryable`]. Still a `423` with the same body.
+pub(crate) fn scan_pending_retryable_response(filename: &str) -> Response {
+    let mut resp = scan_pending_locked_response(filename);
+    resp.extensions_mut().insert(ScanPendingRetryable);
+    resp
+}
+
+/// What a client that does not retry a `423` is sent for a
+/// [`ScanPendingRetryable`] refusal (#5273): `503` with `Retry-After`, the
+/// `scan_pending` body unchanged. Every other response, including the `423`
+/// of a refusal no retry resolves (no scanner, a failed scan, an object over
+/// the byte cap, an identity that cannot be established), is returned as it is.
+///
+/// For the outermost handler of a format route only. Inside the server the
+/// refusal has to stay the `423` it was built as: a Virtual walk treats `423`
+/// as a scanning member's final answer, and would take a `503` for a miss and
+/// try the next member.
+pub(crate) fn scan_pending_as_retryable_503(resp: Response) -> Response {
+    if resp.status() != StatusCode::LOCKED
+        || resp.extensions().get::<ScanPendingRetryable>().is_none()
+    {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    parts.status = StatusCode::SERVICE_UNAVAILABLE;
+    parts.headers.insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(SCAN_PENDING_RETRY_AFTER_SECS),
+    );
+    Response::from_parts(parts, body)
+}
+
 /// Identity failure is not a pending scan. Keep 423 terminal in virtual walks (#5148).
 pub(crate) fn scan_identity_unestablished_response(filename: &str) -> Response {
     let body = serde_json::json!({
@@ -10358,11 +10409,12 @@ pub(crate) fn proxy_rescan_synthetic_artifact(
 ///
 /// Exactly three things make a scan inconclusive, and they collapse to this
 /// one discriminated result instead of `Option`'s single `None` so a caller
-/// that cares WHICH one fired -- currently only the rescan endpoint (#3396) --
-/// can say so. The inline download gate's two call sites do not care: they
-/// map every arm back onto the SAME fail-open/fail-closed handling they had
-/// before this change (`.ok()`-shaped), because that posture is #2954's and
-/// is explicitly out of scope here.
+/// that cares WHICH one fired -- the rescan endpoint (#3396) -- can say so.
+/// The inline download gate's two call sites map every arm back onto the SAME
+/// fail-open/fail-closed handling they had before this change
+/// (`.ok()`-shaped), because that posture is #2954's and is explicitly out of
+/// scope here. The fail-closed one only marks the `BudgetExceeded` refusal as
+/// one a retry resolves (#5273, [`ScanPendingRetryable`]).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ProxyScanInconclusive {
     /// No scanner is configured for this instance.
@@ -11174,10 +11226,12 @@ pub(crate) async fn stored_vulnerable_verdict_blocks(
 /// Pulled out (#3455) so this decision is provable WITHOUT a DB or a scanner
 /// subprocess -- including for [`ProxyScanInconclusive::BudgetExceeded`],
 /// which is otherwise only reachable by actually exceeding a 30s+ budget.
-/// The `Err(_)` arm is a wildcard on purpose and must stay one: every one of
-/// [`ProxyScanInconclusive`]'s three reasons (NoScanner / ScanFailed /
-/// BudgetExceeded) maps here identically -- this gate does not discriminate,
-/// see the type's own doc comment.
+/// Every one of [`ProxyScanInconclusive`]'s three reasons (NoScanner /
+/// ScanFailed / BudgetExceeded) is the same `423 scan_pending` here, and none
+/// of them ever serves. `BudgetExceeded` alone is marked
+/// [`ScanPendingRetryable`] (#5273): the scan goes on without this request, so
+/// a retry finds its verdict, and a format route whose client gives up on a
+/// `423` can say so with [`scan_pending_as_retryable_503`].
 fn scan_inline_serve_decision(
     result: std::result::Result<
         crate::services::scanner_service::ProxyScanVerdict,
@@ -11205,7 +11259,12 @@ fn scan_inline_serve_decision(
                 repo_id = %repo_id, file = %filename, digest = %digest, reason = ?why,
                 "withholding proxy pull: scan not conclusive yet (fail-closed)"
             );
-            ProxyScanServeOutcome::Deny(scan_pending_locked_response(filename))
+            ProxyScanServeOutcome::Deny(match why {
+                ProxyScanInconclusive::BudgetExceeded => scan_pending_retryable_response(filename),
+                ProxyScanInconclusive::NoScanner | ProxyScanInconclusive::ScanFailed => {
+                    scan_pending_locked_response(filename)
+                }
+            })
         }
     }
 }
@@ -14607,6 +14666,75 @@ mod tests {
                 text.contains("scan not conclusive") && text.contains(reason),
                 "the 423 must log its reason {reason}: {text}"
             );
+        }
+    }
+
+    /// #5273: only the refusal a retry resolves is marked for it. A scan that
+    /// is still queued or running (`BudgetExceeded`) is; no scanner and a
+    /// failed scan are not, and all three stay `423` inside the server.
+    #[test]
+    fn inline_gate_marks_only_the_budget_exceeded_deny_retryable_5273() {
+        use crate::services::proxy_scan_service::ProxySeverityGate;
+        for (why, retryable) in [
+            (ProxyScanInconclusive::NoScanner, false),
+            (ProxyScanInconclusive::ScanFailed, false),
+            (ProxyScanInconclusive::BudgetExceeded, true),
+        ] {
+            let ProxyScanServeOutcome::Deny(resp) = scan_inline_serve_decision(
+                Err(why),
+                ProxySeverityGate::BlockOnAny,
+                Uuid::new_v4(),
+                "pkg-1.0.tgz",
+                "deadbeef",
+            ) else {
+                panic!("fail-closed must never serve an inconclusive scan ({why:?})");
+            };
+            assert_eq!(resp.status(), StatusCode::LOCKED, "{why:?}");
+            assert_eq!(
+                resp.extensions().get::<ScanPendingRetryable>().is_some(),
+                retryable,
+                "{why:?}"
+            );
+        }
+    }
+
+    /// #5273: a route that opts in answers the retryable refusal `503` with
+    /// `Retry-After` and the `scan_pending` body it already had.
+    #[tokio::test]
+    async fn a_retryable_scan_pending_becomes_503_with_retry_after_5273() {
+        let resp = scan_pending_as_retryable_503(scan_pending_retryable_response("pkg-1.0.tgz"));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()[axum::http::header::RETRY_AFTER],
+            SCAN_PENDING_RETRY_AFTER_SECS.to_string().as_str()
+        );
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_TYPE],
+            "application/json"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
+            .await
+            .expect("scan_pending body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("scan_pending JSON");
+        assert_eq!(body["error"], "scan_pending");
+        assert_eq!(body["file"], "pkg-1.0.tgz");
+    }
+
+    /// #5273: every refusal a retry does not resolve keeps its status and gets
+    /// no `Retry-After`: the terminal `423`s (no scanner, failed scan, over
+    /// the cap; an identity that cannot be established) and a `403` block.
+    #[test]
+    fn refusals_a_retry_does_not_resolve_are_left_alone_5273() {
+        for resp in [
+            scan_pending_locked_response("pkg-1.0.tgz"),
+            scan_identity_unestablished_response("pkg-1.0.tgz"),
+            scan_blocked_response("pkg-1.0.tgz"),
+        ] {
+            let status = resp.status();
+            let resp = scan_pending_as_retryable_503(resp);
+            assert_eq!(resp.status(), status);
+            let retry_after = resp.headers().get(axum::http::header::RETRY_AFTER);
+            assert!(retry_after.is_none());
         }
     }
 
