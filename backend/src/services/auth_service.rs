@@ -963,6 +963,13 @@ pub fn install_global_auth_semaphore(sem: Option<Arc<Semaphore>>) {
     let _ = GLOBAL_AUTH_SEMAPHORE.set(sem);
 }
 
+/// The installed process-wide auth cap, so a test can tell whether the cap it
+/// asked [`install_global_auth_semaphore`] for is the one in force (#5633).
+#[cfg(test)]
+pub(crate) fn installed_global_auth_semaphore() -> Option<Arc<Semaphore>> {
+    GLOBAL_AUTH_SEMAPHORE.get().and_then(|cell| cell.clone())
+}
+
 /// How long to wait for a bcrypt-permit before giving up and shedding to
 /// 503. A short queue tolerance turns "burst of 50 concurrent basic-auth
 /// requests" (every CI package-manager invocation) into a survivable
@@ -1193,10 +1200,9 @@ pub enum TimingPad {
 pub enum AuthEntry {
     /// The shared credential primitive, [`AuthService::authenticate`].
     ///
-    /// The API middleware tries it *before* the API-token path on every
-    /// Basic-auth package-manager request (`middleware/auth.rs`,
-    /// `oci_v2.rs`, `conda.rs`). A user who authenticates `cargo`/`pip` as
-    /// `username:<api-token>` therefore takes a rejection arm on **every**
+    /// Some handlers still try it *before* their API-token path
+    /// (`oci_v2.rs`, `conda.rs`). A user who authenticates as
+    /// `username:<api-token>` there takes a rejection arm on **every**
     /// request, and an SSO-only deployment takes the federated arm on every
     /// request. So this entry point neither pads (a cost-12 bcrypt in front of
     /// traffic that never reaches the login form, halving the auth-permit
@@ -1205,6 +1211,29 @@ pub enum AuthEntry {
     /// target and level, and would let any anonymous caller write
     /// attacker-chosen text to the log). `origin/main` did neither here.
     Shared,
+    /// HTTP Basic `username:password` in the auth middleware,
+    /// [`AuthService::authenticate_basic_with_reason`] (#5640).
+    ///
+    /// The middleware resolves an issued-token-shaped password (API token,
+    /// JWT) as a token and never sends it here, so only something meant to
+    /// be a local password reaches
+    /// this entry, and a wrong one is the only way it fails. That makes the
+    /// pad cheap enough to run: an unknown username, a federated account and
+    /// a hashless account each pay the same single bcrypt as a wrong password
+    /// against a real account, so the package-manager Basic surface no longer
+    /// answers an unknown username measurably faster than a known one. It is
+    /// not budgeted per IP like [`Self::Login`]: an anonymous caller can
+    /// already buy one bcrypt per request by sending any wrong password for
+    /// any real account, so the pad adds no amplification.
+    ///
+    /// The middleware always passes [`TimingPad::On`] on release/1.11.x,
+    /// which has no LDAP Basic-auth passthrough (on main the pad is off while
+    /// the passthrough is enabled). Does not log, for the same reason as
+    /// [`Self::Shared`].
+    Basic {
+        /// Whether the hashless arms run the dummy-hash verify.
+        pad: TimingPad,
+    },
     /// The unauthenticated `POST /api/v1/auth/login` endpoint — the one
     /// surface where the enumeration oracle is reachable.
     ///
@@ -1222,6 +1251,7 @@ impl AuthEntry {
     fn pad(self) -> TimingPad {
         match self {
             Self::Shared => TimingPad::Off,
+            Self::Basic { pad } => pad,
             Self::Login { pad } => pad,
         }
     }
@@ -1232,6 +1262,22 @@ impl AuthEntry {
     /// the log once an attacker exhausts the budget would hide the sweep.
     fn logs_rejections(self) -> bool {
         matches!(self, Self::Login { .. })
+    }
+
+    /// Whether a wrong password for `password` counts against the account's
+    /// lockout (`failed_login_attempts` / `locked_until` /
+    /// `last_failed_login_at`).
+    ///
+    /// A secret shaped like a credential Artifact Keeper issues (an API token
+    /// or a JWT) is a token that failed, not a password guess: a Maven
+    /// `settings.xml` or `.npmrc` carrying `user:<api_token>` used to bump the
+    /// counter on every request (1793 writes in 30 min, #5640) and keep the
+    /// account flagged as locked while the token went on working. So on the
+    /// machine-to-machine entries such a secret is never recorded. The login
+    /// endpoint is unchanged: a human typing at the form keeps the policy
+    /// exactly as it was.
+    fn records_failure_for(self, password: &str) -> bool {
+        matches!(self, Self::Login { .. }) || !looks_like_issued_token(password)
     }
 }
 
@@ -1502,6 +1548,22 @@ impl AuthService {
             .await
     }
 
+    /// HTTP Basic `username:password` for the auth middleware (#5640).
+    ///
+    /// [`Self::authenticate_with_reason`] plus, with [`TimingPad::On`], the
+    /// bcrypt timing pad on every rejection arm, so an unknown username costs
+    /// the same as a wrong password against a real account. See
+    /// [`AuthEntry::Basic`] for when the caller turns it off.
+    pub async fn authenticate_basic_with_reason(
+        &self,
+        username: &str,
+        password: &str,
+        pad: TimingPad,
+    ) -> std::result::Result<(User, TokenPair), LoginFailure> {
+        self.authenticate_inner(username, password, AuthEntry::Basic { pad })
+            .await
+    }
+
     async fn authenticate_inner(
         &self,
         username: &str,
@@ -1570,10 +1632,9 @@ impl AuthService {
         }
 
         // ONE `verify_password` for every arm that reaches here. An arm with
-        // no stored hash of its own substitutes `dummy_bcrypt_hash()` — the
-        // same substitution `validate_api_token` uses — so the code path, the
-        // error type and the status are identical by construction rather than
-        // by inspection. The shared `?` is the point: `verify_password` yields
+        // no stored hash of its own substitutes `dummy_bcrypt_hash()`, so the
+        // code path, the error type and the status are identical by
+        // construction rather than by inspection. The shared `?` is the point: `verify_password` yields
         // `ServiceUnavailable` when the auth semaphore is saturated, and
         // swallowing that on the padded arms only would answer 401 for an
         // absent username while a real account answered 503 — a one-request
@@ -1591,6 +1652,16 @@ impl AuthService {
         // `rejection` is `None`, which the match above produces only for a
         // present, active, local row that has a password hash.
         let user = user.expect("a login with no rejection has a user row");
+
+        if !password_matches && !entry.records_failure_for(password) {
+            // An issued-token-shaped secret that is not this account's
+            // password: reject without touching the lockout columns (#5640).
+            return Err(Self::reject_login(
+                username,
+                LoginRejection::InvalidPassword,
+                entry,
+            ));
+        }
 
         if !password_matches {
             // Record failed attempt
@@ -2856,12 +2927,31 @@ impl AuthService {
         }
 
         // API tokens have format: prefix_secret
-        // We store hash of full token and prefix for lookup
-        let dummy = Self::dummy_bcrypt_hash();
+        // We store hash of full token and prefix for lookup.
+        //
+        // Every rejection that can be decided without the secret is decided
+        // BEFORE the bcrypt verify, so it never takes a permit from the
+        // process-wide auth-concurrency cap (#5633). A burst of expired JWTs,
+        // garbage, or dead API tokens used to run one cost-12 bcrypt each
+        // (against `dummy_bcrypt_hash()` when nothing matched), saturate the
+        // cap, and answer `503 Authentication service is at capacity` instead
+        // of 401 — which clients retry, turning one expired credential into a
+        // retry storm.
+        //
+        // Nothing secret leaks by answering these early. The token shape is
+        // public. The `token_prefix` is a non-secret lookup key: it is shown
+        // in every token listing, and knowing that a prefix exists, or is
+        // revoked or expired, gets an attacker no closer to the 128-bit
+        // secret that follows it. Revocation was already reported before the
+        // hash comparison (`check_token_validation_result`). Only a live row
+        // whose prefix matches pays for the bcrypt, and that comparison is
+        // the one that genuinely needs the secret.
+        if !is_api_token_shape(token) {
+            return Err(AppError::Authentication("Invalid API token".to_string()));
+        }
         let Some(prefix) = Self::api_token_prefix(token) else {
-            // Too short, or byte 8 is not a char boundary (#5525). Still
-            // must burn bcrypt time to avoid leaking token length info.
-            let _ = Self::verify_password(token, dummy).await;
+            // Unreachable for a token-shaped (ASCII) credential; kept so the
+            // #5525 boundary guard stays the single slicing point.
             return Err(AppError::Authentication("Invalid API token".to_string()));
         };
 
@@ -2881,30 +2971,30 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Extract verification inputs. When no token was found, use a dummy
-        // hash so that bcrypt still runs and all code paths take equal time.
-        let (hash_to_verify, token_exists, is_revoked) = match &stored_token_opt {
-            Some(t) => (t.token_hash.clone(), true, t.revoked_at.is_some()),
-            None => (dummy.to_string(), false, false),
-        };
-
-        // Always run bcrypt verification regardless of token existence.
-        // This is the constant-time core of the fix: an attacker cannot
-        // distinguish "prefix not found" from "wrong secret" by timing.
-        let hash_matches = Self::verify_password(token, &hash_to_verify).await?;
-
-        // Check results only after bcrypt has completed
-        check_token_validation_result(token_exists, is_revoked, hash_matches)?;
-
-        // Unwrap is safe: token_exists is true only when stored_token_opt is Some
+        // Unknown prefix or revoked row: rejected without bcrypt (see above).
+        // `hash_matches = true` here only means "not yet compared"; the
+        // comparison itself runs below for a live row.
+        check_token_validation_result(
+            stored_token_opt.is_some(),
+            stored_token_opt
+                .as_ref()
+                .is_some_and(|t| t.revoked_at.is_some()),
+            true,
+        )?;
+        // Unwrap is safe: `check_token_validation_result` refused `None`.
         let stored_token = stored_token_opt.unwrap();
 
-        // Check expiration
+        // Check expiration, also before bcrypt.
         if let Some(expires_at) = stored_token.expires_at {
             if expires_at < Utc::now() {
                 return Err(AppError::Authentication("API token expired".to_string()));
             }
         }
+
+        // The only arm that needs the secret: a live, unexpired row whose
+        // prefix matches.
+        let hash_matches = Self::verify_password(token, &stored_token.token_hash).await?;
+        check_token_validation_result(true, false, hash_matches)?;
 
         // Debounced usage analytics: only update last_used_at if it has been
         // more than 5 minutes since the last recorded use (or never used).
@@ -4020,6 +4110,45 @@ pub(crate) fn should_debounce_usage_update(last_used_at: Option<DateTime<Utc>>) 
         None => true,
         Some(lu) => Utc::now() - lu > Duration::minutes(5),
     }
+}
+
+/// `<8 hex>_<32 hex>`: the shape of every API token Artifact Keeper mints
+/// (see [`AuthService::generate_api_token_with_policy`]: the first 8 hex digits
+/// of a UUID, `_`, then a dash-less UUID).
+///
+/// A pure, credential-independent check, so a caller may branch on it before
+/// any database lookup or bcrypt work without leaking anything: the shape is
+/// public (#5640).
+pub(crate) fn is_api_token_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 41
+        && bytes[8] == b'_'
+        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
+        && bytes[9..].iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Three non-empty base64url segments with a JSON header: a compact JWS.
+pub(crate) fn is_jwt_shape(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return false;
+    };
+    let base64url = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    header.starts_with("eyJ") && base64url(header) && base64url(payload) && base64url(signature)
+}
+
+/// Whether a Basic password is a credential Artifact Keeper itself issues.
+pub(crate) fn looks_like_issued_token(password: &str) -> bool {
+    is_api_token_shape(password) || is_jwt_shape(password)
 }
 
 /// Evaluate token validation state after bcrypt verification has completed.
@@ -5825,8 +5954,8 @@ mod tests {
     /// The timing pad must be generated at the *same* cost as real hashes.
     ///
     /// bcrypt reads its work factor from the hash being verified, so a dummy
-    /// at a different cost would make the "token prefix not found" path take
-    /// visibly different wall-clock time from the "wrong secret" path — the
+    /// at a different cost would make the "unknown username" path take
+    /// visibly different wall-clock time from the "wrong password" path — the
     /// exact side channel `dummy_bcrypt_hash` exists to close (#3407 must not
     /// regress the constant-time property it piggybacks on).
     #[test]
@@ -5835,7 +5964,7 @@ mod tests {
             cost_of(AuthService::dummy_bcrypt_hash()),
             bcrypt_cost(),
             "dummy timing pad must track bcrypt_cost(), else the \
-             constant-time rejection path leaks token existence by timing"
+             constant-time rejection path leaks username existence by timing"
         );
     }
 

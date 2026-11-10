@@ -581,8 +581,9 @@ async fn verify_oci_credential(
             // presented Basic `<user>:<api_token>` would lock the service
             // account out after `account_lockout_threshold` requests. Mirrors
             // the #1145 fix on `/v2/token`. `validate_api_token` has no
-            // failure-counter side effect and runs a constant-time bcrypt
-            // pad on miss so this reorder is safe. The username from Basic
+            // failure-counter side effect and rejects a credential that is
+            // not a live token before any bcrypt (#5633), so this reorder
+            // costs a real password nothing. The username from Basic
             // auth is ignored when an API token validates (matching the
             // /v2/token behavior): the token itself identifies the user.
             let validated = match auth_service.validate_api_token(&password).await {
@@ -5855,17 +5856,19 @@ async fn version_check(
             }
             Err(_) => None,
         };
+        // API token in the password field first (#5640): it answers from the
+        // token cache and rejects a non-token shape without bcrypt, whereas
+        // trying the password first cost every `user:<api_token>` probe a
+        // cost-12 bcrypt before the token was even looked at.
+        if let Some(resp) = outcome(auth_service.validate_api_token(&password).await.map(|_| ())) {
+            return resp;
+        }
         if let Some(resp) = outcome(
             auth_service
                 .authenticate(&username, &password)
                 .await
                 .map(|_| ()),
         ) {
-            return resp;
-        }
-
-        // Fall back to API token in the password field
-        if let Some(resp) = outcome(auth_service.validate_api_token(&password).await.map(|_| ())) {
             return resp;
         }
 
