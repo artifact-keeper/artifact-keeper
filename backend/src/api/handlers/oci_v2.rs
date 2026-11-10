@@ -100,6 +100,8 @@ fn oci_error_detail(
     message: &str,
     detail: Option<serde_json::Value>,
 ) -> Response {
+    let (status, code, message) = oci_storage_envelope(status, code, message);
+    let message: &str = &message;
     // The database sites pass `db_status(&e)` with `INTERNAL_ERROR`; when
     // that status is a 503 (saturated pool, unreachable database) the error is
     // transient, so it carries the same `UNAVAILABLE` code the other
@@ -124,6 +126,77 @@ fn oci_error_detail(
             .body(Body::from(json))
             .unwrap(),
     )
+}
+
+/// Code for the `507` a push gets when the storage backend is out of space
+/// (#5650). The distribution spec has no code for it; like `UNAVAILABLE`,
+/// clients print it next to the message.
+const OCI_INSUFFICIENT_STORAGE: &str = "INSUFFICIENT_STORAGE";
+
+/// Neutral message for a storage failure that has no class of its own.
+const OCI_STORAGE_FAILED_MESSAGE: &str = "storage operation failed";
+
+/// The status, code and message a `/v2` error answers with once storage
+/// failures are taken out of it (#5649, #5650).
+///
+/// Every OCI error goes through [`oci_error_detail`], and the storage sites
+/// hand it the storage error's own text (`&e.to_string()`) under a 500. That
+/// is how `docker push` into a bucket at its MinIO quota printed MinIO's XML
+/// error document, bucket name and request ids included. Here, for a 5xx
+/// only:
+///
+/// * an out-of-space refusal becomes `507 INSUFFICIENT_STORAGE`,
+/// * an unreachable or timed-out backend becomes `503 UNAVAILABLE` (with
+///   `Retry-After`, added below like every other OCI 503),
+/// * any other 5xx keeps its status but loses the store's own error text
+///   (XML documents, the raw S3 error).
+///
+/// Client errors (4xx) are left alone: their messages are written for the
+/// client.
+fn oci_storage_envelope<'a>(
+    status: StatusCode,
+    code: &'a str,
+    message: &'a str,
+) -> (StatusCode, &'a str, std::borrow::Cow<'a, str>) {
+    use crate::storage::StorageFailure;
+    if !status.is_server_error() {
+        return (status, code, message.into());
+    }
+    let class = StorageFailure::from_message(message);
+    if class.is_some() || carries_storage_backend_text(message) {
+        // The backend's text stays in the server log only.
+        tracing::warn!(error = %message, code, "OCI storage error");
+    }
+    match class {
+        Some(class) => {
+            crate::storage::failure::record_failure(class);
+            match class {
+                StorageFailure::Full => (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    OCI_INSUFFICIENT_STORAGE,
+                    crate::error::STORAGE_FULL_MESSAGE.into(),
+                ),
+                StorageFailure::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UNAVAILABLE",
+                    crate::error::STORAGE_UNAVAILABLE_MESSAGE.into(),
+                ),
+            }
+        }
+        None if carries_storage_backend_text(message) => {
+            (status, code, OCI_STORAGE_FAILED_MESSAGE.into())
+        }
+        None => (status, code, message.into()),
+    }
+}
+
+/// Whether an OCI error message carries an object store's own error text:
+/// its XML error document, or the raw error the S3 backend appends after
+/// `caused by:` (which names the endpoint's answer verbatim). Messages
+/// Artifact Keeper writes itself, such as which upload part is short and by
+/// how many bytes, stay readable.
+fn carries_storage_backend_text(message: &str) -> bool {
+    message.contains("<?xml") || message.contains("<Error>") || message.contains("caused by:")
 }
 
 fn oci_internal_error(message: &str) -> Response {
@@ -26263,6 +26336,163 @@ mod oci_blob_upload_streaming_tests {
         );
 
         f.teardown().await;
+    }
+
+    /// #5649 / #5650: a `docker push` against an object store that is out of
+    /// space answers `507` in the `/v2` error envelope, and against one that
+    /// cannot be reached `503 UNAVAILABLE` with `Retry-After`, on both blob
+    /// upload shapes (monolithic POST and chunked PATCH). Before the fix both
+    /// were a 500 whose message was the store's own error text: MinIO's XML
+    /// document with the bucket name and request ids.
+    #[tokio::test]
+    async fn blob_upload_maps_storage_full_and_outage_5650() {
+        let Some(f) = OciUploadFixture::setup().await else {
+            return;
+        };
+        let content = Bytes::from_static(b"oci layer 5650");
+        let digest = compute_sha256(&content);
+
+        for (message, want_status, want_code) in [
+            (
+                tdh::minio_quota_exceeded_error(),
+                StatusCode::INSUFFICIENT_STORAGE,
+                OCI_INSUFFICIENT_STORAGE,
+            ),
+            (
+                tdh::minio_unreachable_error(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+        ] {
+            // Chunked: the session is opened while storage still works (the
+            // fixture's filesystem), then the store fails under the PATCH.
+            sqlx::query(
+                "UPDATE repositories SET storage_backend = 'filesystem', storage_path = $2 \
+                 WHERE id = $1",
+            )
+            .bind(f.inner.repo_id)
+            .bind(f.inner.storage_dir.to_string_lossy().into_owned())
+            .execute(&f.inner.pool)
+            .await
+            .expect("back on the working store");
+            let (status, headers, body) = send(
+                f.app(),
+                request(
+                    Method::POST,
+                    format!("/{}/image/blobs/uploads/", f.inner.repo_key),
+                    &f.authorization,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED, "start upload: {body:?}");
+            let upload_uuid = headers
+                .get("Docker-Upload-UUID")
+                .and_then(|v| v.to_str().ok())
+                .expect("Docker-Upload-UUID")
+                .to_string();
+
+            let state = tdh::route_repo_to_failing_storage(
+                &f.inner.pool,
+                &f.inner.state,
+                f.inner.repo_id,
+                &message,
+            )
+            .await;
+            let app = router(None).with_state(state);
+
+            // Monolithic: POST with the digest and the whole body.
+            let monolithic = send(
+                app.clone(),
+                request(
+                    Method::POST,
+                    format!(
+                        "/{}/image/blobs/uploads/?digest={}",
+                        f.inner.repo_key, digest
+                    ),
+                    &f.authorization,
+                    content.clone(),
+                ),
+            )
+            .await;
+            let chunked = send(
+                app.clone(),
+                request(
+                    Method::PATCH,
+                    format!("/{}/image/blobs/uploads/{}", f.inner.repo_key, upload_uuid),
+                    &f.authorization,
+                    content.clone(),
+                ),
+            )
+            .await;
+
+            for (shape, (status, headers, body)) in
+                [("monolithic POST", monolithic), ("chunked PATCH", chunked)]
+            {
+                let label = format!("{shape} ({want_code})");
+                assert_eq!(
+                    status,
+                    want_status,
+                    "{label}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                let json: serde_json::Value =
+                    serde_json::from_slice(&body).expect("/v2 error envelope");
+                assert_eq!(json["errors"][0]["code"], want_code, "{label}");
+                assert_eq!(
+                    headers.contains_key(axum::http::header::RETRY_AFTER),
+                    want_status == StatusCode::SERVICE_UNAVAILABLE,
+                    "{label}: Retry-After goes on the 503 only"
+                );
+                tdh::assert_no_storage_backend_text(&label, &body);
+            }
+        }
+
+        f.teardown().await;
+    }
+
+    /// The `/v2` envelope keeps client errors as written and never lets a
+    /// storage error's own text through on a 5xx, classified or not.
+    #[test]
+    fn oci_storage_envelope_rewrites_only_storage_5xx_5650() {
+        let full = AppError::Storage(tdh::minio_quota_exceeded_error()).to_string();
+        let (status, code, message) = oci_storage_envelope(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "BLOB_UPLOAD_UNKNOWN",
+            &full,
+        );
+        assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(code, OCI_INSUFFICIENT_STORAGE);
+        assert_eq!(message, crate::error::STORAGE_FULL_MESSAGE);
+
+        let down = AppError::Storage(tdh::minio_unreachable_error()).to_string();
+        let (status, code, _) =
+            oci_storage_envelope(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &down);
+        assert_eq!(
+            (status, code),
+            (StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE")
+        );
+
+        let other = AppError::Storage(
+            "Failed to copy: S3 request failed. caused by: <Error><Code>InternalError</Code>\
+             <BucketName>ak-quota-bucket-5650</BucketName></Error>"
+                .into(),
+        )
+        .to_string();
+        let (status, code, message) =
+            oci_storage_envelope(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &other);
+        assert_eq!(
+            (status, code),
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+        );
+        assert_eq!(message, OCI_STORAGE_FAILED_MESSAGE);
+
+        // A 4xx message is written for the client and passes through, even
+        // one that happens to mention storage.
+        let (status, _, message) =
+            oci_storage_envelope(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &full);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, full);
     }
 
     #[tokio::test]
