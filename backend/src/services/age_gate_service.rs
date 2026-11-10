@@ -5104,4 +5104,11 @@ mod tests {
             "legacy rows are not swept under first_seen"
         );
     }
+
+    // -- property test: the version comparator is a total order ---------------
+
+    crate::testing::props::total_order_proptest!(
+        version_compare_is_a_total_order,
+        |a: &str, b: &str| version_compare(a, b).cmp(&0)
+    );
 }

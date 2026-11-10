@@ -156,4 +156,27 @@ mod tests {
         assert_eq!(compare_semver_prerelease_identifier("alpha", "beta"), Less);
         assert_eq!(compare_semver_prerelease_identifier("1", "alpha"), Less);
     }
+
+    // -- property tests: the comparators built on these segments are total orders --
+
+    mod total_order_props {
+        use crate::testing::props::total_order_proptest;
+
+        total_order_proptest!(natural_segment, super::compare_natural_segment);
+        total_order_proptest!(
+            semver_prerelease_identifier,
+            super::compare_semver_prerelease_identifier
+        );
+        total_order_proptest!(curation_version_compare, |a: &str, b: &str| {
+            crate::services::curation_service::version_compare(a, b).cmp(&0)
+        });
+        total_order_proptest!(
+            agent_plugins_compare_versions,
+            crate::formats::agent_plugins::compare_versions
+        );
+        total_order_proptest!(
+            mcp_compare_versions_for_latest,
+            crate::formats::mcp::compare_versions_for_latest
+        );
+    }
 }

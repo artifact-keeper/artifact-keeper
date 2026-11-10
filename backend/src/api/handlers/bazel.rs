@@ -1457,4 +1457,11 @@ mod tests {
         tdh::cleanup_member_repo(&f.pool, virtual_id, &vdir).await;
         f.teardown().await;
     }
+
+    // -- property test: the listing comparator is a total order ---------------
+
+    crate::testing::props::total_order_proptest!(
+        compare_versions_is_a_total_order,
+        compare_versions
+    );
 }
