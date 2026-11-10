@@ -2664,6 +2664,90 @@ mod tests {
         ));
     }
 
+    // -- the laws proved in formal/ArtifactKeeper/AgeGate, on the real functions --
+
+    /// `AgeGate/PolicyRelaxation.lean`, `allowed_run_never_relaxes`: however
+    /// many individually allowed changes are applied to an enabled gate, it
+    /// stays enabled, in the same mode, with a minimum age that never drops.
+    mod policy_relaxation_props {
+        use super::super::{AgeGateMode, AgeGatePolicy};
+        use proptest::prelude::*;
+
+        fn any_policy() -> impl Strategy<Value = AgeGatePolicy> {
+            (any::<bool>(), 0i32..60, any::<bool>()).prop_map(
+                |(enabled, min_age_days, first_seen)| AgeGatePolicy {
+                    enabled,
+                    min_age_days,
+                    mode: if first_seen {
+                        AgeGateMode::FirstSeen
+                    } else {
+                        AgeGateMode::UpstreamPublishTime
+                    },
+                },
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4000))]
+
+            #[test]
+            fn a_run_of_allowed_changes_never_relaxes_an_enabled_gate(
+                start in any_policy(),
+                proposals in proptest::collection::vec(any_policy(), 0..10),
+            ) {
+                let start = AgeGatePolicy { enabled: true, ..start };
+                let mut current = start;
+                for next in proposals {
+                    if !current.is_relaxed_by(next) {
+                        current = next;
+                    }
+                }
+                prop_assert!(current.enabled);
+                prop_assert_eq!(current.mode, start.mode);
+                prop_assert!(current.min_age_days >= start.min_age_days);
+            }
+        }
+    }
+
+    /// `AgeGate/CheckDecision.lean`, `serves_iff`: over every review row and
+    /// both sides of the threshold, a version is served exactly when it is
+    /// not rejected and either meets the threshold or carries a manual
+    /// approval the current policy still honours.
+    #[test]
+    fn a_version_is_served_exactly_when_the_model_says_so() {
+        use ReviewIdentityMatch::{Differs, Legacy, Matches};
+        let serves = |action: AgeGateCheckAction| {
+            matches!(
+                action,
+                AgeGateCheckAction::Allow
+                    | AgeGateCheckAction::AllowAndAutoApprovePending
+                    | AgeGateCheckAction::AllowAlreadyApproved
+            )
+        };
+        let mut rows: Vec<Option<ReviewPolicyView>> = vec![None];
+        for status in ["pending", "approved", "rejected", "some_future_status"] {
+            for is_automatic in [false, true] {
+                for identity in [Matches, Differs, Legacy] {
+                    rows.push(Some(view(status, is_automatic, identity)));
+                }
+            }
+        }
+        for row in &rows {
+            for meets in [false, true] {
+                let rejected = row.as_ref().is_some_and(|r| r.status == "rejected");
+                let honoured_manual_approval = row.as_ref().is_some_and(|r| {
+                    r.status == "approved" && !r.is_automatic && r.identity != Differs
+                });
+                let expected = !rejected && (meets || honoured_manual_approval);
+                assert_eq!(
+                    serves(decide_age_gate_check(row.as_ref(), meets)),
+                    expected,
+                    "row {row:?}, meets_threshold {meets}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_policy_is_relaxed_by_disabling_lowering_or_switching_mode() {
         let set = AgeGatePolicy {

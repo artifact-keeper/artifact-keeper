@@ -1239,6 +1239,88 @@ pub fn validate_duration(minutes: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the laws proved in formal/ArtifactKeeper/Quarantine/DownloadGate.lean --
+
+    mod download_gate_props {
+        use super::super::{admin_quarantine_allowed, check_download_allowed};
+        use chrono::{DateTime, TimeZone, Utc};
+        use proptest::prelude::*;
+
+        fn at(secs: i64) -> DateTime<Utc> {
+            Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2000))]
+
+            /// `rejected_never_downloads`.
+            #[test]
+            fn a_rejection_never_downloads(
+                until in proptest::option::of(-1000i64..1000),
+                now in -1000i64..1000,
+            ) {
+                prop_assert!(check_download_allowed(Some("rejected"), until.map(at), at(now)).is_err());
+            }
+
+            /// `permanent_hold_never_lapses`.
+            #[test]
+            fn a_hold_with_no_expiry_never_lapses(now in -1000i64..1000) {
+                prop_assert!(check_download_allowed(Some("quarantined"), None, at(now)).is_err());
+            }
+
+            /// `timed_hold_blocks_until_expiry`.
+            #[test]
+            fn a_timed_hold_blocks_for_exactly_its_window(
+                until in -1000i64..1000,
+                now in -1000i64..1000,
+            ) {
+                let blocked =
+                    check_download_allowed(Some("quarantined"), Some(at(until)), at(now)).is_err();
+                prop_assert_eq!(blocked, now < until);
+            }
+
+            /// `lapsed_hold_stays_lapsed`.
+            #[test]
+            fn a_lapsed_hold_stays_lapsed(
+                until in -1000i64..1000,
+                now in -1000i64..1000,
+                later in 0i64..1000,
+            ) {
+                if check_download_allowed(Some("quarantined"), Some(at(until)), at(now)).is_ok() {
+                    prop_assert!(check_download_allowed(
+                        Some("quarantined"),
+                        Some(at(until)),
+                        at(now + later)
+                    )
+                    .is_ok());
+                }
+            }
+        }
+
+        /// `admin_quarantine_refused_on_rejection` and the statuses the gate
+        /// has no arm for (`unrecognised_status_downloads`): every other value
+        /// the column's CHECK constraint allows is downloadable and may be
+        /// quarantined by an administrator.
+        #[test]
+        fn statuses_without_an_arm_download_and_only_a_rejection_refuses_quarantine_now() {
+            assert!(!admin_quarantine_allowed(Some("rejected")));
+            for status in [
+                None,
+                Some("released"),
+                Some("clean"),
+                Some("unscanned"),
+                Some("flagged"),
+            ] {
+                assert!(
+                    check_download_allowed(status, None, at(0)).is_ok(),
+                    "{status:?}"
+                );
+                assert!(admin_quarantine_allowed(status), "{status:?}");
+            }
+            assert!(admin_quarantine_allowed(Some("quarantined")));
+        }
+    }
     use chrono::Utc;
 
     // -----------------------------------------------------------------------
