@@ -56,7 +56,7 @@ use crate::services::audit_service::{
     audit_fire_and_forget, federated_login_details, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::auth_config_service::{AuthConfigService, LdapConfigRow};
-use crate::services::auth_service::{AuthService, FederatedCredentials};
+use crate::services::auth_service::{looks_like_issued_token, AuthService, FederatedCredentials};
 use crate::services::ldap_service::{LdapService, LdapUserInfo};
 
 /// Opt-in switch for the passthrough. Unset or false (the default) keeps the
@@ -753,37 +753,17 @@ async fn check_login_budget(username: &str) -> Result<(), u64> {
     Ok(())
 }
 
-/// `<8 hex>_<32 hex>`: the shape of an Artifact Keeper API token.
-fn is_api_token_shape(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 41
-        && bytes[8] == b'_'
-        && bytes[..8].iter().all(u8::is_ascii_hexdigit)
-        && bytes[9..].iter().all(u8::is_ascii_hexdigit)
-}
-
-/// Three non-empty base64url segments with a JSON header: a compact JWS.
-fn is_jwt_shape(value: &str) -> bool {
-    let mut segments = value.split('.');
-    let (Some(header), Some(payload), Some(signature), None) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) else {
-        return false;
-    };
-    let base64url = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    };
-    header.starts_with("eyJ") && base64url(header) && base64url(payload) && base64url(signature)
-}
-
-/// Whether a Basic password is a credential Artifact Keeper itself issues.
-pub(crate) fn looks_like_issued_token(password: &str) -> bool {
-    is_api_token_shape(password) || is_jwt_shape(password)
+/// Whether the LDAP Basic-auth passthrough is switched on right now (#5640).
+///
+/// Read per call, like [`try_authenticate`], so the Basic resolver can drop
+/// the local timing pad while directory users' passwords are expected to take
+/// the federated arm on every request.
+pub(crate) fn passthrough_enabled() -> bool {
+    #[cfg(test)]
+    let settings = test_seam::settings_override().unwrap_or_else(Settings::from_env);
+    #[cfg(not(test))]
+    let settings = Settings::from_env();
+    settings.enabled
 }
 
 /// Try to authenticate a package-manager Basic credential against the
@@ -1994,6 +1974,79 @@ mod tests {
             .execute(&pool)
             .await;
         cleanup(&pool, provider_id, &dir_user).await;
+    }
+
+    /// #5640 review: a directory user's correct password takes the local
+    /// federated arm on every request before the passthrough answers it. The
+    /// local timing pad must stay off while the passthrough is enabled, or
+    /// every request (cache hits included) pays a cost-12 bcrypt and an auth
+    /// permit. Counted with `bcrypt_verify_counter` (the only place a permit
+    /// is taken), which nextest's process-per-test isolation keeps private.
+    #[tokio::test]
+    async fn test_cached_passthrough_request_runs_no_bcrypt_5640() {
+        use crate::api::middleware::auth::{
+            try_resolve_auth_outcome_with_passthrough, AuthOutcome, ExtractedToken,
+        };
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use base64::Engine as _;
+        use std::sync::atomic::Ordering;
+
+        if !encryption_key_available() {
+            return;
+        }
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let dir_user = format!("ldappad{suffix}");
+        let dn = format!("uid={dir_user},ou=people,{BASE}");
+        let (port, ops) = scripted_directory(&dir_user, &dn, 0x00).await;
+        let provider_id = create_provider(&pool, &format!("pad-{suffix}"), port).await;
+        insert_known_user(&pool, &dir_user, &dn, provider_id).await;
+        let auth = test_auth_service(&pool);
+        let _pin = test_seam::SettingsOverride::set(settings());
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(format!("{dir_user}:directory-password"));
+
+        let resolve = || {
+            try_resolve_auth_outcome_with_passthrough(
+                &auth,
+                ExtractedToken::Basic(&encoded),
+                true,
+                "/pypi/private/simple/",
+                "GET",
+            )
+        };
+        let verifies = || bcrypt_verify_counter().load(Ordering::Relaxed);
+
+        let before = verifies();
+        let first = resolve().await;
+        let first_cost = verifies() - before;
+        assert!(matches!(first, AuthOutcome::Resolved(_)), "{first:?}");
+        assert_eq!(count(&ops, "bind"), 1);
+
+        let before = verifies();
+        for _ in 0..10 {
+            let outcome = resolve().await;
+            assert!(matches!(outcome, AuthOutcome::Resolved(_)), "{outcome:?}");
+        }
+        let cached_cost = verifies() - before;
+        assert_eq!(
+            count(&ops, "bind"),
+            1,
+            "repeat requests must be answered from the passthrough cache"
+        );
+        cleanup(&pool, provider_id, &dir_user).await;
+
+        assert_eq!(
+            first_cost, 0,
+            "the binding passthrough request ran {first_cost} local bcrypt verifies"
+        );
+        assert_eq!(
+            cached_cost, 0,
+            "10 cache-accepted passthrough requests ran {cached_cost} local bcrypt verifies: \
+             the Basic timing pad must be off while the passthrough is enabled"
+        );
     }
 
     /// Inner package-route auth for the guest-guard regression below: exactly
