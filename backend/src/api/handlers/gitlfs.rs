@@ -252,6 +252,33 @@ fn validate_oid(oid: &str) -> Result<(), Response> {
     Ok(())
 }
 
+/// The storage key a new LFS object is written to.
+///
+/// On a shared cloud namespace (S3/GCS/Azure) this is the repo-scoped
+/// `gitlfs/{repository_id}/{oid[..2]}/{oid}` of the #2624 scheme, so two
+/// repositories holding the same object (a fork and its upstream, a mirror)
+/// write two objects. The flat `gitlfs/{oid[..2]}/{oid}` key every
+/// repository used to share made the second repository's PUT fail the
+/// cross-repository write guard with 409 "already owned by another
+/// repository" once #5002 routed the LFS PUT through it (#5659).
+/// Filesystem backends (one directory per repository) and
+/// `STORAGE_KEY_SCHEME=flat` keep the flat key. Existing objects are
+/// untouched: every LFS read resolves the object through the `storage_key`
+/// its artifact row recorded.
+fn lfs_storage_key(
+    scheme: crate::storage::StorageKeyScheme,
+    storage_backend: &str,
+    repo_id: uuid::Uuid,
+    oid: &str,
+) -> String {
+    scheme.write_key(
+        storage_backend,
+        "gitlfs",
+        repo_id,
+        &format!("{}/{}", &oid[..2], oid),
+    )
+}
+
 fn lfs_json_response(status: StatusCode, body: &impl Serialize) -> Response {
     Response::builder()
         .status(status)
@@ -574,8 +601,16 @@ async fn upload_object(
 
     // Store the object, streaming it from local scratch or copying the object
     // the repository's backend already staged (#4990). The helper runs the
-    // quota preflight and the cross-repo write guard before writing.
-    let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
+    // quota preflight and the cross-repo write guard before writing. The key
+    // is repo-scoped on a shared cloud namespace (#5659), so the guard only
+    // ever refuses a key another repository could own on the legacy flat
+    // scheme (`STORAGE_KEY_SCHEME=flat`).
+    let storage_key = lfs_storage_key(
+        crate::storage::StorageKeyScheme::from_env(),
+        &repo.storage_backend,
+        repo.id,
+        &oid,
+    );
     proxy_helpers::put_staged_body(
         &state,
         &repo,
@@ -1645,11 +1680,37 @@ mod tests {
     #[test]
     fn test_lfs_storage_key_format() {
         let oid = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
+        let storage_key = lfs_storage_key(
+            crate::storage::StorageKeyScheme::RepoScoped,
+            "filesystem",
+            uuid::Uuid::new_v4(),
+            oid,
+        );
         assert_eq!(
             storage_key,
             "gitlfs/ab/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
         );
+    }
+
+    /// #5659: a shared cloud namespace gets the repo-scoped key, and the
+    /// `STORAGE_KEY_SCHEME=flat` opt-out keeps the legacy shared key.
+    #[test]
+    fn test_lfs_storage_key_is_repo_scoped_on_cloud_5659() {
+        use crate::storage::StorageKeyScheme;
+        let oid = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let repo_id = uuid::Uuid::new_v4();
+        for backend in ["s3", "gcs", "azure"] {
+            assert_eq!(
+                lfs_storage_key(StorageKeyScheme::RepoScoped, backend, repo_id, oid),
+                format!("gitlfs/{repo_id}/ab/{oid}"),
+                "{backend}"
+            );
+            assert_eq!(
+                lfs_storage_key(StorageKeyScheme::Flat, backend, repo_id, oid),
+                format!("gitlfs/ab/{oid}"),
+                "{backend}"
+            );
+        }
     }
 
     #[test]
@@ -2732,5 +2793,185 @@ mod tests {
             );
             fx.cleanup().await;
         }
+    }
+}
+
+/// #5659: Git LFS storage keys are repository-scoped on shared cloud storage.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering a small test object in
+// an assertion is not an artifact path (#1608).
+mod repo_scoped_keys_5659 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use crate::storage::StorageBackend;
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    const OBJECT: &[u8] = b"one LFS object shared by a fork and its upstream (#5659)";
+
+    async fn cloud_lfs_repo(pool: &sqlx::PgPool) -> (Uuid, String, std::path::PathBuf) {
+        let (repo_id, repo_key, dir) = tdh::create_repo(pool, "local", "gitlfs").await;
+        sqlx::query(
+            "UPDATE repositories SET storage_backend = 's3', storage_path = key WHERE id = $1",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("set cloud backend");
+        (repo_id, repo_key, dir)
+    }
+
+    async fn parts(out: Result<Response, Response>) -> (StatusCode, Bytes) {
+        let response = out.unwrap_or_else(|r| r);
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        (status, body)
+    }
+
+    async fn put(
+        state: &SharedState,
+        auth: &AuthExtension,
+        repo_key: &str,
+        oid: &str,
+    ) -> (StatusCode, Bytes) {
+        parts(
+            upload_object(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path((repo_key.to_string(), oid.to_string())),
+                HeaderMap::new(),
+                Body::from(OBJECT.to_vec()),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn get(
+        state: &SharedState,
+        auth: &AuthExtension,
+        repo_key: &str,
+        oid: &str,
+    ) -> (StatusCode, Bytes) {
+        parts(
+            download_object(
+                State(state.clone()),
+                Extension(Some(auth.clone())),
+                Path((repo_key.to_string(), oid.to_string())),
+                crate::api::middleware::download_telemetry::DownloadContext::default(),
+            )
+            .await,
+        )
+        .await
+    }
+
+    async fn row_key(pool: &sqlx::PgPool, repo_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT storage_key FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(repo_id)
+        .fetch_optional(pool)
+        .await
+        .expect("row key")
+    }
+
+    /// The same object pushes into two Git LFS repositories on a shared
+    /// cloud namespace, and each serves its own copy. On main the second
+    /// repository's PUT answered 409 "already owned by another repository;
+    /// refusing cross-repository overwrite".
+    #[tokio::test]
+    async fn same_object_pushes_to_two_cloud_repositories_5659() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let oid = hex::encode(Sha256::digest(OBJECT));
+        let mut repos = Vec::new();
+        for _ in 0..2 {
+            repos.push(cloud_lfs_repo(&pool).await);
+        }
+
+        let mut outcomes = Vec::new();
+        for (repo_id, repo_key, _) in &repos {
+            let pushed = put(&state, &auth, repo_key, &oid).await;
+            let fetched = get(&state, &auth, repo_key, &oid).await;
+            outcomes.push((*repo_id, pushed, fetched, row_key(&pool, *repo_id).await));
+        }
+        let objects: Vec<String> = mem.objects.lock().unwrap().keys().cloned().collect();
+
+        for (repo_id, _, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *repo_id, dir).await;
+        }
+        tdh::cleanup_user(&pool, user_id).await;
+
+        for (repo_id, pushed, fetched, key) in outcomes {
+            assert_eq!(
+                pushed.0,
+                StatusCode::OK,
+                "PUT into repository {repo_id} must be accepted: {}",
+                String::from_utf8_lossy(&pushed.1)
+            );
+            assert_eq!(fetched.0, StatusCode::OK, "GET from {repo_id}");
+            assert_eq!(&fetched.1[..], OBJECT);
+            let expected = format!("gitlfs/{repo_id}/{}/{oid}", &oid[..2]);
+            assert_eq!(key.as_deref(), Some(expected.as_str()));
+            assert!(objects.contains(&expected), "{expected} must be written");
+        }
+        assert!(
+            !objects.contains(&format!("gitlfs/{}/{oid}", &oid[..2])),
+            "the legacy flat key must not be written on a cloud backend: {objects:?}"
+        );
+    }
+
+    /// Existing data keeps serving: an object whose row records the legacy
+    /// flat `gitlfs/{oid[..2]}/{oid}` key is still downloadable, and its
+    /// repository still answers the batch download with an action.
+    #[tokio::test]
+    async fn legacy_flat_key_object_still_downloadable_5659() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let auth = tdh::make_auth(user_id, &username);
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        let oid = hex::encode(Sha256::digest(OBJECT));
+        let (repo_id, repo_key, dir) = cloud_lfs_repo(&pool).await;
+        let legacy_key = format!("gitlfs/{}/{oid}", &oid[..2]);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 'sha256', $4, $3, 'application/octet-stream', $5)",
+        )
+        .bind(repo_id)
+        .bind(format!("lfs/objects/{}/{oid}", &oid[..2]))
+        .bind(&oid)
+        .bind(OBJECT.len() as i64)
+        .bind(&legacy_key)
+        .execute(&pool)
+        .await
+        .expect("seed legacy row");
+        mem.put(&legacy_key, Bytes::from_static(OBJECT))
+            .await
+            .expect("seed legacy object");
+
+        let fetched = get(&state, &auth, &repo_key, &oid).await;
+        // A re-push of an object the repository holds is the idempotent 200
+        // and leaves the row on its legacy key.
+        let repushed = put(&state, &auth, &repo_key, &oid).await;
+        let key = row_key(&pool, repo_id).await;
+
+        tdh::cleanup_member_repo(&pool, repo_id, &dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(fetched.0, StatusCode::OK, "legacy-key object must download");
+        assert_eq!(&fetched.1[..], OBJECT);
+        assert_eq!(repushed.0, StatusCode::OK);
+        assert_eq!(key, Some(legacy_key));
     }
 }
