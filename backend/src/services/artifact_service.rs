@@ -356,6 +356,15 @@ struct PriorHeadRow {
     uploaded_by: Option<Uuid>,
 }
 
+/// One soft-deleted artifact version, as
+/// [`ArtifactService::retract_deleted_versions`] needs it (#5676).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DeletedVersion {
+    pub name: String,
+    pub path: String,
+    pub version: Option<String>,
+}
+
 /// Compact artifact value struct shared by the download / delete epilogues
 /// (audit entries, download events).
 ///
@@ -2969,40 +2978,17 @@ impl ArtifactService {
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
-        // A deleted version must stop being advertised (#5604, #5632): move
-        // the catalog's Latest to the newest version still live and, for an
-        // npm repository only, drop the dist-tags that name it. The catalog
-        // lookup returns the repository format, so a non-npm delete costs no
-        // dist-tags round trip. Best-effort, as every step here.
-        let format = match crate::services::package_service::refresh_package_latest(
+        // A deleted version must stop being advertised (#5604, #5632).
+        Self::retract_deleted_versions(
             &self.db,
             artifact.repository_id,
-            &artifact.name,
+            &[DeletedVersion {
+                name: artifact.name.clone(),
+                path: artifact.path.clone(),
+                version: artifact.version.clone(),
+            }],
         )
-        .await
-        {
-            Ok(refresh) => refresh.format,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to refresh catalog latest after deleting artifact {}: {}",
-                    id,
-                    e
-                );
-                None
-            }
-        };
-        if let (Some("npm"), Some(version)) = (format.as_deref(), artifact.version.clone()) {
-            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
-                &self.db,
-                artifact.repository_id,
-                &artifact.name,
-                &[version],
-            )
-            .await
-            {
-                tracing::warn!("Failed to drop dist-tags of deleted artifact {}: {}", id, e);
-            }
-        }
+        .await;
 
         // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and
         // was likewise never emitted. Symmetric with the upload emit, and on
@@ -3022,6 +3008,91 @@ impl ArtifactService {
                     );
                 }
             });
+        }
+    }
+
+    /// Stop advertising soft-deleted versions of repository `repository_id`
+    /// (#5604, #5632, #5676): move each affected catalog row's Latest to the
+    /// newest version still live and, for an npm repository only, drop the
+    /// dist-tags that name a version with no live artifact left.
+    ///
+    /// The single post-commit step every soft delete shares: the per-artifact
+    /// [`Self::finish_delete`] calls it with one version, and the lifecycle
+    /// sweeps, which soft-delete in bulk SQL, call it once per run with every
+    /// version they removed. Versions are grouped per catalog row
+    /// ([`package_service::catalog_package_name`], so Maven's
+    /// `groupId:artifactId` row is found) and per npm package, so a sweep that
+    /// removes many versions of one package costs one refresh and one
+    /// dist-tags write for it. Best-effort: a failure is logged and never
+    /// fails the delete.
+    ///
+    /// [`package_service::catalog_package_name`]: crate::services::package_service::catalog_package_name
+    pub async fn retract_deleted_versions(
+        db: &PgPool,
+        repository_id: Uuid,
+        deleted: &[DeletedVersion],
+    ) {
+        use crate::services::package_service::{
+            catalog_package_name, refresh_package_latest, repository_format,
+        };
+        if deleted.is_empty() {
+            return;
+        }
+        let format = match repository_format(db, repository_id).await {
+            Ok(Some(format)) => format,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read the format of repository {} after a delete: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        let catalog_rows: std::collections::BTreeSet<String> = deleted
+            .iter()
+            .map(|d| catalog_package_name(&format, &d.path, &d.name))
+            .collect();
+        for catalog in &catalog_rows {
+            if let Err(e) = refresh_package_latest(db, repository_id, catalog).await {
+                tracing::warn!(
+                    "Failed to refresh catalog latest of {} in repository {} after a delete: {}",
+                    catalog,
+                    repository_id,
+                    e
+                );
+            }
+        }
+        if format != "npm" {
+            return;
+        }
+        let mut by_package: std::collections::BTreeMap<&str, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for d in deleted {
+            if let Some(ref version) = d.version {
+                by_package
+                    .entry(d.name.as_str())
+                    .or_default()
+                    .push(version.clone());
+            }
+        }
+        for (package, versions) in by_package {
+            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
+                db,
+                repository_id,
+                package,
+                &versions,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to drop dist-tags of deleted versions of {} in repository {}: {}",
+                    package,
+                    repository_id,
+                    e
+                );
+            }
         }
     }
 

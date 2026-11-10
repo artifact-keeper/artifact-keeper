@@ -1576,6 +1576,13 @@ impl LifecycleService {
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
+        // The transaction's own timestamp: migration 261's trigger stamps
+        // every row this transaction soft-deletes with exactly this
+        // `deleted_at`, which is how step 3 finds them (#5676).
+        let deleted_at: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         let result = Self::dispatch_execute(&mut tx, policy, false).await?;
         tx.commit()
             .await
@@ -1595,7 +1602,50 @@ impl LifecycleService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Step 3 (#5676): the per-artifact delete path's advertising cleanup,
+        // batched. The sweeps above soft-delete in bulk SQL, so they never
+        // reach `ArtifactService::finish_delete`; without this a retention
+        // policy that removed an npm package's tagged version left `latest`
+        // naming it (ETARGET for clients) and the catalog's Latest on it.
+        if result.artifacts_removed > 0 {
+            self.retract_swept_versions(repository_id, deleted_at).await;
+        }
+
         Ok(result)
+    }
+
+    /// Stop advertising the versions a sweep of `repository_id` soft-deleted
+    /// in the transaction stamped `deleted_at` (#5676), through the same
+    /// [`ArtifactService::retract_deleted_versions`] step every per-artifact
+    /// delete runs: catalog Latest moves to the newest live version and, in an
+    /// npm repository, dist-tags naming a removed version are dropped.
+    /// Best-effort, as on the per-artifact path: the deletions are committed.
+    /// Rows a concurrent delete stamped later are included too, harmlessly:
+    /// the step only retracts versions that are no longer live.
+    ///
+    /// [`ArtifactService::retract_deleted_versions`]: crate::services::artifact_service::ArtifactService::retract_deleted_versions
+    async fn retract_swept_versions(&self, repository_id: Uuid, deleted_at: DateTime<Utc>) {
+        use crate::services::artifact_service::{ArtifactService, DeletedVersion};
+        let swept: Vec<DeletedVersion> = match sqlx::query_as(
+            "SELECT DISTINCT name, path, version FROM artifacts \
+             WHERE repository_id = $1 AND is_deleted = true AND deleted_at >= $2",
+        )
+        .bind(repository_id)
+        .bind(deleted_at)
+        .fetch_all(&self.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "Lifecycle: failed to list the versions swept from repository {}: {}",
+                    repository_id,
+                    e
+                );
+                return;
+            }
+        };
+        ArtifactService::retract_deleted_versions(&self.db, repository_id, &swept).await;
     }
 
     /// Dispatch to the per-type implementation against a single

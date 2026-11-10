@@ -296,9 +296,10 @@ pub struct LatestRefresh {
 /// conditional on the version read, so a concurrent publish wins.
 ///
 /// The row is found by `(repository_id, name)` (the `packages` unique key) and
-/// its versions by `package_id`, both indexed. Formats whose catalog name is
-/// not the artifact name (Maven's `groupId:artifactId`) find no row and are
-/// covered by the read-side backstop instead.
+/// its versions by `package_id`, both indexed. `name` is the CATALOG name:
+/// callers holding an artifact row map it with [`catalog_package_name`] (or
+/// call [`refresh_package_latest_for_artifact`]), since Maven's catalog name is
+/// `groupId:artifactId`, not the artifact name (#5676).
 pub async fn refresh_package_latest(
     db: &PgPool,
     repository_id: Uuid,
@@ -361,6 +362,49 @@ pub async fn refresh_package_latest(
     .rows_affected()
         > 0;
     Ok(out)
+}
+
+/// The catalog package name the artifact row `(path, name)` of a `format`
+/// repository registers under (#5676).
+///
+/// The artifact name for every format but the ones whose publish path
+/// catalogues parsed coordinates the row does not carry: Maven/Gradle
+/// (`groupId:artifactId`, #2723) and SBT (`org/module`). Same derivation as
+/// the catalog backfill ([`backfill_catalog_coordinates`]); a path that does
+/// not parse (a Maven sidecar) falls back to the artifact name, which finds
+/// no catalog row.
+pub fn catalog_package_name(format: &str, path: &str, name: &str) -> String {
+    match format {
+        "maven" | "gradle" | "sbt" => backfill_catalog_coordinates(format, path, name, Some("_"))
+            .map(|(catalog, _)| catalog)
+            .unwrap_or_else(|| name.to_string()),
+        _ => name.to_string(),
+    }
+}
+
+/// The format (`repository_format` as text) of repository `repository_id`,
+/// `None` when it is gone.
+pub async fn repository_format(db: &PgPool, repository_id: Uuid) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar("SELECT format::text FROM repositories WHERE id = $1")
+        .bind(repository_id)
+        .fetch_optional(db)
+        .await
+}
+
+/// [`refresh_package_latest`] for the catalog row the artifact `(path, name)`
+/// registers under (#5676): what a trash restore calls, so a restored Maven
+/// version moves its `groupId:artifactId` row's Latest back up.
+pub async fn refresh_package_latest_for_artifact(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+    path: &str,
+) -> sqlx::Result<LatestRefresh> {
+    let Some(format) = repository_format(db, repository_id).await? else {
+        return Ok(LatestRefresh::default());
+    };
+    let catalog = catalog_package_name(&format, path, name);
+    refresh_package_latest(db, repository_id, &catalog).await
 }
 
 /// Drop the catalog rows left behind by a HARD-deleted artifact (#3660).

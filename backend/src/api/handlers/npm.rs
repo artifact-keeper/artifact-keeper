@@ -22554,4 +22554,95 @@ mod delete_cleanup_5604_tests {
         assert_eq!(stored, "1.1.0");
         assert_eq!(tags["latest"], "1.1.0");
     }
+
+    /// Run a live `max_age_days` policy over the fixture repository that
+    /// removes everything older than 30 days.
+    async fn run_retention(fx: &tdh::Fixture) -> i64 {
+        use crate::services::lifecycle_service::{CreateLifecyclePolicyRequest, LifecycleService};
+        let service = LifecycleService::new(fx.pool.clone());
+        let policy = service
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(fx.repo_id),
+                name: format!("retention-{}", fx.repo_id.simple()),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: serde_json::json!({"days": 30}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create policy");
+        let result = service
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute policy");
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        result.artifacts_removed
+    }
+
+    /// Age every artifact of `pkg@version` past the retention window.
+    async fn age(fx: &tdh::Fixture, pkg: &str, version: &str) {
+        sqlx::query(
+            "UPDATE artifacts SET created_at = NOW() - INTERVAL '60 days' \
+             WHERE repository_id = $1 AND name = $2 AND version = $3",
+        )
+        .bind(fx.repo_id)
+        .bind(pkg)
+        .bind(version)
+        .execute(&fx.pool)
+        .await
+        .expect("age artifact");
+    }
+
+    /// #5676: a retention (lifecycle) delete of the tagged newest version
+    /// drops the dist-tags naming it and moves the catalog's Latest, exactly
+    /// as the per-artifact deletes do (#5604, #5632). Before, the sweeps'
+    /// bulk soft-delete skipped `finish_delete`, so the stored `latest` kept
+    /// naming the removed version (ETARGET for npm) and the catalog row kept
+    /// it as Latest.
+    #[tokio::test]
+    async fn retention_delete_moves_dist_tags_and_catalog_latest_5676() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "retention-tags";
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.1.0").await;
+        publish(&fx, pkg, "2.0.0").await;
+        tag(&fx, pkg, "latest", "2.0.0").await;
+        tag(&fx, pkg, "beta", "2.0.0").await;
+        tag(&fx, pkg, "stable", "1.1.0").await;
+        age(&fx, pkg, "2.0.0").await;
+
+        let removed = run_retention(&fx).await;
+        let stored = stored_tags(&fx, pkg).await;
+        let tags = dist_tags(&fx, pkg).await;
+        let stored_latest = stored_catalog_latest(&fx, pkg).await;
+        let listed = catalog(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_eq!(removed, 1, "the policy removes 2.0.0 only");
+        assert_eq!(
+            stored,
+            serde_json::json!({ "stable": "1.1.0" }),
+            "every stored tag naming the swept version is dropped; others are kept"
+        );
+        assert_eq!(
+            tags["latest"], "1.1.0",
+            "latest is derived from what is left"
+        );
+        assert!(tags.get("beta").is_none());
+        assert_eq!(
+            stored_latest, "1.1.0",
+            "the stored catalog row is recomputed"
+        );
+        assert_eq!(listed.0, "1.1.0");
+        assert_eq!(listed.1, vec!["1.1.0", "1.0.0"]);
+    }
 }

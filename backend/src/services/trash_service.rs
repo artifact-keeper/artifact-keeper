@@ -431,10 +431,11 @@ impl TrashService {
         // The inverse of the delete hook (#5632): the restored version may be
         // the newest live one again, so the catalog's Latest goes back to it.
         // Best-effort: the restore itself is already committed.
-        if let Err(e) = crate::services::package_service::refresh_package_latest(
+        if let Err(e) = crate::services::package_service::refresh_package_latest_for_artifact(
             &self.db,
             candidate.row.repository_id,
             &candidate.row.name,
+            &candidate.row.path,
         )
         .await
         {
@@ -1221,5 +1222,129 @@ pub(crate) mod tests {
         assert!(matches!(missing, Err(AppError::NotFound(_))), "{missing:?}");
         assert!(both_left, "a refused purge must change nothing");
         assert!(live_object_left);
+    }
+
+    /// #5676: the catalog-Latest hook finds a Maven row by its catalog name
+    /// (`groupId:artifactId`), not the artifact name (`artifactId`), in both
+    /// directions: a retention sweep of the newest version moves the stored
+    /// Latest down, and a trash restore of it moves Latest back up. Before,
+    /// the sweep never reached the hook and the restore looked up `widget`,
+    /// found no row, and left Latest where the delete put it.
+    #[tokio::test]
+    async fn maven_catalog_latest_follows_retention_delete_and_restore_5676() {
+        use crate::services::lifecycle_service::{CreateLifecyclePolicyRequest, LifecycleService};
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let mut ids = Vec::new();
+        for (version, checksum, age_days) in [("1.0", "a1", 0), ("2.0", "b2", 60)] {
+            let path = format!("com/acme/widget/{version}/widget-{version}.jar");
+            put_object(&fx, &path).await;
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                     checksum_sha256, content_type, storage_key, uploaded_by, created_at) \
+                 VALUES ($1, $2, 'widget', $3, 7, $4, 'application/java-archive', $2, $5, \
+                         NOW() - make_interval(days => $6)) \
+                 RETURNING id",
+            )
+            .bind(fx.repo_id)
+            .bind(&path)
+            .bind(version)
+            .bind(checksum)
+            .bind(fx.user_id)
+            .bind(age_days)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("insert maven artifact");
+            ids.push(id);
+        }
+        let package_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO packages (repository_id, name, version, size_bytes) \
+             VALUES ($1, 'com.acme:widget', '2.0', 7) RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("insert catalog row");
+        for (version, checksum) in [("1.0", "a1"), ("2.0", "b2")] {
+            sqlx::query(
+                "INSERT INTO package_versions (package_id, version, size_bytes, checksum_sha256) \
+                 VALUES ($1, $2, 7, $3)",
+            )
+            .bind(package_id)
+            .bind(version)
+            .bind(checksum)
+            .execute(&fx.pool)
+            .await
+            .expect("insert catalog version");
+        }
+        let stored_latest = || async {
+            sqlx::query_scalar::<_, String>("SELECT version FROM packages WHERE id = $1")
+                .bind(package_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("read catalog latest")
+        };
+
+        let lifecycle = LifecycleService::new(fx.pool.clone());
+        let policy = lifecycle
+            .create_policy(CreateLifecyclePolicyRequest {
+                applies_to_all: false,
+                repository_ids: None,
+                repository_id: Some(fx.repo_id),
+                name: format!("retention-{}", fx.repo_id.simple()),
+                description: None,
+                policy_type: "max_age_days".to_string(),
+                config: serde_json::json!({"days": 30}),
+                priority: None,
+                cron_schedule: None,
+                enabled: None,
+            })
+            .await
+            .expect("create policy");
+        let removed = lifecycle
+            .execute_policy(policy.id, false)
+            .await
+            .expect("execute policy")
+            .artifacts_removed;
+        let after_sweep = stored_latest().await;
+        let restored = service(&fx, 0).restore(ids[1]).await;
+        let after_restore = stored_latest().await;
+        let _ = sqlx::query("DELETE FROM lifecycle_policies WHERE id = $1")
+            .bind(policy.id)
+            .execute(&fx.pool)
+            .await;
+        fx.teardown().await;
+
+        assert_eq!(removed, 1, "the sweep removes 2.0 only");
+        assert_eq!(after_sweep, "1.0", "Latest moves off the swept version");
+        restored.expect("restore 2.0");
+        assert_eq!(
+            after_restore, "2.0",
+            "Latest goes back to the restored version"
+        );
+    }
+
+    #[test]
+    fn catalog_package_name_maps_maven_and_sbt_coordinates_5676() {
+        use crate::services::package_service::catalog_package_name;
+        assert_eq!(
+            catalog_package_name("maven", "com/acme/widget/1.0/widget-1.0.jar", "widget"),
+            "com.acme:widget"
+        );
+        assert_eq!(
+            catalog_package_name("gradle", "com/acme/widget/1.0/widget-1.0.pom", "widget"),
+            "com.acme:widget"
+        );
+        // A path that does not parse keeps the artifact name.
+        assert_eq!(
+            catalog_package_name("maven", "com/acme/widget/maven-metadata.xml", "widget"),
+            "widget"
+        );
+        assert_eq!(
+            catalog_package_name("npm", "left-pad/1.0.0/left-pad-1.0.0.tgz", "left-pad"),
+            "left-pad"
+        );
     }
 }
