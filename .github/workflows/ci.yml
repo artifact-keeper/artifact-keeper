@@ -697,7 +697,7 @@ jobs:
   test-backend-fips:
     name: 🔐 FIPS build and gate tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: [changes, release-bump]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.release-bump.outputs.bump_only != 'true' }}
     env:
@@ -735,12 +735,20 @@ jobs:
       - name: Single crypto provider (fips feature set)
         run: ./scripts/ci/check-crypto-provider.sh --features fips
 
+      # One shard, like the unit job: compiling every inline test module in a
+      # single rustc does not fit a hosted runner (the first run of this lane
+      # took the runner down at 7 minutes). The crypto, fips and SAML policy
+      # test modules are not shard-gated, so they compile with any shard; the
+      # router shard is the smallest. The shard-gated password/token/at-rest
+      # tests run under the fips feature in the dual-format integration test
+      # and in the sharded unit job on the default build.
       - name: Crypto facade and gate tests under FIPS_MODE=strict
         env:
           FIPS_MODE: strict
+          CARGO_BUILD_JOBS: "2"
         run: |
-          cargo nextest run -p artifact-keeper-backend --lib --bins --features fips \
-            -E 'test(/^(crypto|fips)::/) | test(/password|api_token|dummy_bcrypt|encryption::|saml_non_approved/)'
+          cargo nextest run -p artifact-keeper-backend --lib --bins --features "fips,test-shard-router" \
+            -E 'test(/^(crypto|fips)::/) | test(/saml_non_approved|algorithm_policy_tests/)'
 
       - name: Strict mode refuses a non-FIPS build
         run: |
