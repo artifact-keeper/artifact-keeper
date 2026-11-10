@@ -724,6 +724,18 @@ async fn verify_oci_credential(
                 Some(oci_basic_password(&auth_service, &username, &password).await?)
             };
             if let Some(user) = authenticated {
+                // #5484: `/v2/token` refuses a TOTP-enrolled account's
+                // password; the direct Basic credential on the registry
+                // routes must too, or a stolen password alone pushes and
+                // pulls. Such an account uses an API token as the password.
+                if crate::api::middleware::auth::format_route_password_refusal(&user).is_some() {
+                    tracing::info!(
+                        target: "security",
+                        username = %user.username,
+                        "OCI password authentication refused; TOTP is enabled, the account needs an API token"
+                    );
+                    return Err(OciAuthError::Invalid);
+                }
                 let claims = auth_service
                     .generate_tokens(&user)
                     .map_err(|_| OciAuthError::Invalid)
@@ -22264,6 +22276,92 @@ mod token_lockout_regression_tests {
     /// request and locked the account out after `account_lockout_threshold`
     /// calls. This test exercises `authenticate_oci_with_scopes` directly and asserts
     /// the counter stays at zero across many requests.
+    /// #5484: `docker` clients that skip `/v2/token` send Basic
+    /// `user:password` on every verb. `/v2/token` refuses a TOTP-enrolled
+    /// account's password; the direct credential used to accept it. Now both
+    /// refuse it, the account's API token still works as the password, and
+    /// an account without TOTP still authenticates with its password.
+    #[tokio::test]
+    async fn direct_basic_password_is_refused_for_a_totp_account_5484() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (plain_id, plain_name) = tdh::create_user(&pool).await;
+        let pwd_hash = bcrypt::hash("real-test-password", 4).expect("bcrypt hash");
+        sqlx::query("UPDATE users SET password_hash = $1 WHERE id = ANY($2)")
+            .bind(&pwd_hash)
+            .bind(vec![user_id, plain_id])
+            .execute(&pool)
+            .await
+            .expect("update password_hash");
+        sqlx::query(
+            "UPDATE users SET totp_enabled = true, totp_secret = 'JBSWY3DPEHPK3PXP' WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("enrol totp");
+
+        let storage_dir = std::env::temp_dir().join(format!("oci-5484-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        let (api_token, _) = auth_service
+            .generate_api_token(user_id, "oci-5484", vec!["*".to_string()], None)
+            .await
+            .expect("generate API token");
+        let headers_for = |user: &str, secret: &str| {
+            let mut headers = HeaderMap::new();
+            let value = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}"))
+            );
+            headers.insert(
+                AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&value).expect("valid basic header"),
+            );
+            headers
+        };
+
+        let password = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &headers_for(&username, "real-test-password"),
+        )
+        .await;
+        let token = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &headers_for(&username, &api_token),
+        )
+        .await;
+        let plain = authenticate_oci_with_scopes(
+            &state.db,
+            &state.config,
+            &headers_for(&plain_name, "real-test-password"),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+            .bind(vec![user_id, plain_id])
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert!(
+            matches!(password, Err(OciAuthError::Invalid)),
+            "a TOTP account's password must be refused: {:?}",
+            password.map(|(c, _)| c.sub)
+        );
+        assert_eq!(token.expect("API token as the password").0.sub, user_id);
+        assert_eq!(plain.expect("password without TOTP").0.sub, plain_id);
+    }
+
     #[tokio::test]
     async fn authenticate_oci_verb_basic_auth_does_not_bump_failed_login_attempts() {
         let Some(pool) = tdh::try_pool().await else {

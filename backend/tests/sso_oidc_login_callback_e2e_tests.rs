@@ -1750,3 +1750,106 @@ async fn test_ldap_login_on_disabled_provider_returns_404() {
 
     let _ = AuthConfigService::delete_ldap(&pool, created.id).await;
 }
+
+/// POST an exchange code to `/exchange`; returns the status, the number of
+/// `Set-Cookie` headers and the JSON body.
+#[allow(clippy::disallowed_methods)] // streaming-invariant: test exempt — buffering a small JSON body in a test assertion is not an artifact path (#1608)
+async fn exchange_code_for(state: SharedState, code: &str) -> (StatusCode, usize, Value) {
+    let resp = sso_app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/exchange")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "code": code }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .expect("exchange oneshot");
+    let status = resp.status();
+    let cookies = resp.headers().get_all("set-cookie").iter().count();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    (
+        status,
+        cookies,
+        serde_json::from_slice(&body).expect("json"),
+    )
+}
+
+/// #5484: an OIDC user who enrolled TOTP in Artifact Keeper used to get a
+/// session from the callback with no second factor. Now the callback sets no
+/// cookies and its exchange code answers with the `/auth/login` TOTP
+/// challenge (`totp_required` plus a single-use `totp_token`) and no session.
+/// The first login, before enrolment, is the control.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL + non-loopback IP"]
+async fn test_oidc_callback_challenges_a_totp_enrolled_user_5484() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let Some(idp) = MockIdp::start().await else {
+        return;
+    };
+    let provider_id = create_provider(&pool, &idp).await;
+    let external_id = format!("oidc-sub-5484-{}", Uuid::new_v4().as_simple());
+    let state = build_state(pool.clone());
+
+    let mut outcomes = Vec::new();
+    for enrolled in [false, true] {
+        if enrolled {
+            sqlx::query(
+                "UPDATE users SET totp_enabled = true, totp_secret = 'JBSWY3DPEHPK3PXP' \
+                 WHERE external_id = $1 AND auth_provider = 'oidc'",
+            )
+            .bind(&external_id)
+            .execute(&pool)
+            .await
+            .expect("enrol totp");
+        }
+        let (sso_state, nonce) = login_state_nonce(&pool, provider_id).await;
+        idp.mount_token_endpoint_once(&nonce, json!({ "sub": external_id }))
+            .await;
+        let resp = do_callback_state(&pool, provider_id, &sso_state).await;
+        let status = resp.status();
+        let cookies = resp.headers().get_all("set-cookie").iter().count();
+        let location = resp.headers()["location"].to_str().unwrap().to_string();
+        let code = url_decode_query(location.split_once('?').map(|(_, q)| q).unwrap_or(""))
+            .remove("code")
+            .expect("exchange code on the frontend redirect");
+        let exchanged = exchange_code_for(state.clone(), &code).await;
+        outcomes.push((status, cookies, exchanged));
+    }
+    let user_id = get_user(&pool, &external_id).await.map(|u| u.0);
+    delete_user_by_sub(&pool, &external_id).await;
+    delete_provider(&pool, provider_id).await;
+
+    let (status, cookies, (ex_status, ex_cookies, body)) = &outcomes[0];
+    assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT, "control");
+    assert!(*cookies > 0, "control: the callback sets session cookies");
+    assert_eq!(*ex_status, StatusCode::OK);
+    assert!(*ex_cookies > 0);
+    assert!(body["access_token"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(body.get("totp_required").is_none(), "{body}");
+
+    let (status, cookies, (ex_status, ex_cookies, body)) = &outcomes[1];
+    assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(*cookies, 0, "no session cookies before the second factor");
+    assert_eq!(*ex_status, StatusCode::OK, "{body}");
+    assert_eq!(
+        *ex_cookies, 0,
+        "the exchange sets no session cookies either"
+    );
+    assert_eq!(body["totp_required"], true, "{body}");
+    assert_eq!(body["access_token"], "", "{body}");
+    assert_eq!(body["refresh_token"], "", "{body}");
+    let totp_token = body["totp_token"].as_str().expect("totp_token");
+    let claims = artifact_keeper_backend::services::auth_service::AuthService::new(
+        pool.clone(),
+        std::sync::Arc::new(test_config()),
+    )
+    .validate_totp_pending_token(totp_token)
+    .expect("a TOTP pending token for /auth/totp/verify");
+    assert_eq!(Some(claims.sub), user_id);
+}

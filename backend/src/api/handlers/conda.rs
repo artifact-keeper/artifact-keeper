@@ -1082,6 +1082,15 @@ async fn authenticate_with_token(
                 .body(Body::from("Invalid token"))
                 .unwrap()
         })?;
+    // #5484: this is a password check for the user named "token"; an account
+    // with TOTP enrolled must present an API token instead.
+    if crate::api::middleware::auth::format_route_password_refusal(&user).is_some() {
+        return Err(Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("WWW-Authenticate", "Basic realm=\"conda\"")
+            .body(Body::from("Invalid token"))
+            .unwrap());
+    }
 
     Ok(user.id)
 }
@@ -27732,5 +27741,62 @@ mod duplicate_entry_tests {
             ("pkg-demo-1.0.0-0.tar.zst", &pkg),
         ]);
         assert!(established(&check(v2, &ok_v2).1));
+    }
+}
+
+/// #5484: the conda path token is checked as the password of the user named
+/// `token`; a TOTP-enrolled account must not pass on its password.
+#[cfg(test)]
+mod path_token_totp_5484 {
+    use super::authenticate_with_token;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn path_token_password_is_refused_for_a_totp_account() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let id = Uuid::new_v4();
+        let hash = bcrypt::hash("conda-path-secret-5484", 4).expect("hash");
+        // The username is fixed by the handler. If another row already holds
+        // it, this test cannot control that account; skip rather than flake.
+        let inserted = sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, \
+             is_admin, totp_enabled, totp_secret) \
+             VALUES ($1, 'token', $2, $3, 'local', true, false, true, 'JBSWY3DPEHPK3PXP') \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(format!("conda-5484-{}@test.local", id.simple()))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed user")
+        .rows_affected();
+        if inserted == 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("conda-5484-{}", id));
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+        let refused =
+            authenticate_with_token(&state.db, &state.config, "conda-path-secret-5484").await;
+        sqlx::query("UPDATE users SET totp_enabled = false WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("drop totp");
+        let allowed =
+            authenticate_with_token(&state.db, &state.config, "conda-path-secret-5484").await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await;
+
+        assert_eq!(
+            refused.err().map(|r| r.status()),
+            Some(axum::http::StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(allowed.ok(), Some(id));
     }
 }

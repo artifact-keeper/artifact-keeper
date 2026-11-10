@@ -115,6 +115,10 @@ password; the directory is not consulted.
   request writes exactly one `LOGIN_FAILED` event, whether the directory
   rejected the password or the failure was served from the failure window.
   Passwords are never included.
+- **TOTP still applies.** A directory user who enrolled TOTP in Artifact
+  Keeper is refused with `401` on the directory password, as a local account
+  is on the format routes; such accounts use an API token as the password.
+  See [two-factor-and-passwords.md](two-factor-and-passwords.md).
 - **Locally managed accounts are never bound.** If a username exists with
   `auth_provider` other than `ldap`, the passthrough refuses without contacting
   the directory: a mistyped local password must not spend an AD account's
