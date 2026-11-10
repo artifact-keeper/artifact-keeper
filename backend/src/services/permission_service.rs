@@ -651,11 +651,11 @@ impl PermissionService {
 
     /// Does `user_id` hold a GLOBAL (instance-wide) capability?
     ///
-    /// Distinct from [`Self::check_repository_action`] in two ways that matter:
-    /// the capability is not about any one repository, and only an assignment
-    /// with `repository_id IS NULL` counts. A repo-scoped grant of
-    /// `security_review` must NOT confer the instance-wide power to accept
-    /// risk, so the NULL check is load-bearing, not defensive.
+    /// Distinct from [`Self::check_repository_action`]: the capability is not
+    /// about any one repository, so it is read from `user_global_roles` and
+    /// `group_global_roles` only, never from `role_assignments`. A repo-scoped
+    /// assignment of the role confers nothing, and a global grant confers no
+    /// repository access.
     ///
     /// Deliberately NOT resolved in the auth middleware and NOT cached: the
     /// only callers are low-traffic reviewer endpoints, so this costs one
@@ -671,18 +671,31 @@ impl PermissionService {
     /// [`crate::services::auth_service::fetch_live_is_admin`] filters on it: a
     /// deactivated account must lose the capability immediately, not keep
     /// accepting risk until someone remembers to strip its role too.
+    ///
+    /// A `group_global_roles` row grants the role to every member of the
+    /// group, SSO-synced groups included. Service accounts never hold a global
+    /// capability, whichever way the row got there.
     pub async fn has_global_capability(&self, user_id: Uuid, capability: &str) -> Result<bool> {
         sqlx::query_scalar::<_, bool>(
             r#"
             SELECT EXISTS (
                 SELECT 1
-                FROM role_assignments ra
-                JOIN roles r ON r.id = ra.role_id
-                JOIN users u ON u.id = ra.user_id
-                WHERE ra.user_id = $1
+                FROM users u
+                JOIN roles r ON $2 = ANY(r.permissions)
+                WHERE u.id = $1
                   AND u.is_active = true
-                  AND ra.repository_id IS NULL
-                  AND $2 = ANY(r.permissions)
+                  AND u.is_service_account = false
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM user_global_roles ugr
+                          WHERE ugr.user_id = u.id AND ugr.role_id = r.id
+                      )
+                      OR EXISTS (
+                          SELECT 1 FROM group_global_roles ggr
+                          JOIN user_group_members m ON m.group_id = ggr.group_id
+                          WHERE m.user_id = u.id AND ggr.role_id = r.id
+                      )
+                  )
             )
             "#,
         )
@@ -1559,7 +1572,8 @@ mod tests {
             "a repo-scoped role must NOT grant a global capability"
         );
 
-        // A global assignment (repository_id IS NULL) does.
+        // Neither does a global role_assignments row, the capability lives in its
+        // own tables.
         sqlx::query(
             "INSERT INTO role_assignments (user_id, role_id, repository_id) VALUES ($1, $2, NULL)",
         )
@@ -1568,6 +1582,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed global assignment");
+        assert!(!service
+            .has_global_capability(user_id, "security_review")
+            .await
+            .expect("query ok"));
+
+        // A user_global_roles grant does.
+        sqlx::query("INSERT INTO user_global_roles (user_id, role_id) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(role_id)
+            .execute(&pool)
+            .await
+            .expect("seed global grant");
         assert!(service
             .has_global_capability(user_id, "security_review")
             .await

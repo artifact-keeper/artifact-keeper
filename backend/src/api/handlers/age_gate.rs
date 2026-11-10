@@ -2402,8 +2402,8 @@ mod tests {
         assert_eq!(review_status(&pool, scan_id).await, "pending");
 
         sqlx::query(
-            "INSERT INTO role_assignments (user_id, role_id, repository_id) \
-             SELECT $1, id, NULL FROM roles WHERE name = 'security-reviewer'",
+            "INSERT INTO user_global_roles (user_id, role_id) \
+             SELECT $1, id FROM roles WHERE name = 'security-reviewer'",
         )
         .bind(user_id)
         .execute(&pool)

@@ -300,6 +300,15 @@ bytes under the same version are refused again. The verdict and its findings are
 changed. Unlike a finding acknowledgement (see [download holds](download-holds.md)), an
 exception covers the whole verdict for those bytes, not one advisory.
 
+An administrator grants the role to a user or a group with
+`PUT /api/v1/admin/security-reviewers/users/{id}` or `.../groups/{id}`, revokes it with
+`DELETE` on the same path, and lists the holders with `GET /api/v1/admin/security-reviewers`.
+A group grant covers every member, and for a group synced from SSO the identity provider
+decides who that is (membership refreshes at each member's login). Service accounts never
+hold the capability, and only an administrator can add members to a group that carries it.
+The grant gives no repository access: a reviewer sees the repository key on each queue row
+and nothing else of a private repository.
+
 ## Previewing enforcement
 
 `record_only` refuses nothing, so the three views above are empty under it.

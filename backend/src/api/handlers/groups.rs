@@ -889,6 +889,19 @@ pub async fn add_members(
                 "Insufficient permissions to manage group membership".to_string(),
             ));
         }
+        // A delegated group admin must not hand out a global role (security reviewer) by adding members
+        let holds_global_role: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM group_global_roles WHERE group_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+        if holds_global_role {
+            return Err(AppError::Authorization(
+                "Only an administrator can add members to a group that holds a global role"
+                    .to_string(),
+            ));
+        }
     }
 
     ensure_membership_editable(&state.db, id).await?;
