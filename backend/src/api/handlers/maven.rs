@@ -10253,6 +10253,42 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&sha1_body), expected);
     }
 
+    /// #5668: an uncached GET through a Remote whose upstream cannot be
+    /// reached (DNS failure, refused connection) answered
+    /// `500 STORAGE_ERROR`; it is a gateway failure, 502.
+    #[tokio::test]
+    async fn test_remote_unreachable_upstream_is_502_5668() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // Nothing listens on port 1: a transport failure, not an HTTP answer.
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind("http://127.0.0.1:1/maven2")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote at a dead upstream");
+        tdh::publish_repo(&pool, remote_id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{remote_key}/org/apache/commons/commons-collections4/4.4/commons-collections4-4.4.pom"
+            )),
+        )
+        .await;
+        tdh::cleanup_member_repo(&pool, remote_id, &dir).await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(!body.contains("STORAGE_ERROR"), "{body}");
+    }
+
     /// #5668: the native `/maven/` route ignored `Range` and answered 200
     /// with the whole body and no `Accept-Ranges`, so a segmented download
     /// stitched every segment from byte 0. A hosted serve now answers 206
