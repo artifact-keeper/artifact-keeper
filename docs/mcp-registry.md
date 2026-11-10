@@ -1006,12 +1006,23 @@ existing server in the same registry.
   advisory lock on the lowercased name, so two concurrent publishes of
   `io.acme/tool` and `io.Acme/tool` into an empty registry cannot both
   succeed: one is stored, the other is `409`.
-- **Scope:** hosted publish only. An admin edit cannot change a name, a
-  Remote mirrors upstream names as they are, and a Virtual collapses twins
-  across members as described under
-  [Virtual repositories](#virtual-repositories). Promotion and peer
-  replication copy names as they are (#5435). `POST /validate` reports the conflict
-  to a repository holder (`reference: "mcp_name_case_conflict"`).
+- **Promotion:** a promotion into a Local or Staging registry (single or
+  bulk) obeys the same rule under the same lock (#5435): promoting
+  `io.Acme/tool` from Staging into a Local registry that holds
+  `io.acme/tool` answers `409` with `code: "mcp_name_case_conflict"` and
+  the same `message` (a bulk promotion reports it for that artifact), and
+  nothing is copied. The recorded spelling promotes as before.
+- **Peer replication** stores the name exactly as the peer sends it: a
+  mirror refusing it would stay out of step with its source for good.
+  When the stored name has case-only twins recorded in the registry, the
+  write is audited `MCP_NAME_CASE_TWIN_REPLICATED` (details: `server`,
+  `version`, `twins`) and logged at `warn`, and the twin shows in the
+  report below.
+- **Scope:** hosted publish and promotion. An admin edit cannot change a
+  name, a Remote mirrors upstream names as they are, and a Virtual
+  collapses twins across members as described under
+  [Virtual repositories](#virtual-repositories). `POST /validate` reports
+  the conflict to a repository holder (`reference: "mcp_name_case_conflict"`).
 
 Upstream context: the official registry accepts case-only twins today and
 treats that as a defect; modelcontextprotocol/registry#1805 proposes the

@@ -2170,21 +2170,53 @@ pub(super) async fn refuse_case_only_twin_in(
     repo_id: Uuid,
     name: &str,
 ) -> Result<(), Response> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mcp-name-ci'), hashtext($1))")
-        .bind(format!(
-            "mcp-name-ci/{repo_id}/{}",
-            super::mcp_virtual::OwnedNames::key(name)
-        ))
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-    match case_twin_of(&mut *tx, repo_id, name)
+    match locked_case_twin_of(tx, repo_id, name)
         .await
         .map_err(internal)?
     {
         Some(existing) => Err(name_case_conflict(name, existing)),
         None => Ok(()),
     }
+}
+
+/// [`case_twin_of`] under the case-insensitive name lock of `repo_id`, held
+/// until the caller's transaction ends: the check every writer that stores
+/// a new server name in a hosted registry runs before its insert (publish,
+/// and promotion since #5435), so no two of them can store twins
+/// concurrently.
+pub(super) async fn locked_case_twin_of(
+    tx: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mcp-name-ci'), hashtext($1))")
+        .bind(format!(
+            "mcp-name-ci/{repo_id}/{}",
+            super::mcp_virtual::OwnedNames::key(name)
+        ))
+        .execute(&mut *tx)
+        .await?;
+    case_twin_of(&mut *tx, repo_id, name).await
+}
+
+/// The other spellings of `name` the registry `repo_id` has recorded (its
+/// case-only twins), whether or not `name` itself is recorded: what a peer
+/// replication that stored `name` is audited with (#5435).
+pub(super) async fn case_twins_of(
+    db: &PgPool,
+    repo_id: Uuid,
+    name: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT t.name FROM mcp_version_tombstones t \
+         WHERE t.repository_id = $1 AND lower(t.name) = $2 AND t.name <> $3 \
+         ORDER BY t.name LIMIT 20",
+    )
+    .bind(repo_id)
+    .bind(super::mcp_virtual::OwnedNames::key(name))
+    .bind(name)
+    .fetch_all(db)
+    .await
 }
 
 /// Insert the server.json row, its metadata and the OCI retention holds in

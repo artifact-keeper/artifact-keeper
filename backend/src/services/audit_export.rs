@@ -211,6 +211,7 @@ impl AuditAction {
             | AuditAction::McpServerApproved
             | AuditAction::McpServerReopened
             | AuditAction::McpServerContentDrift
+            | AuditAction::McpNameCaseTwinReplicated
             | AuditAction::McpCapabilitiesIngested
             | AuditAction::McpToolsDrift
             | AuditAction::McpNamespaceGranted
