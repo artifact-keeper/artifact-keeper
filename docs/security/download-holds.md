@@ -96,6 +96,13 @@ What this means for operators:
 - Only manifests are gated. Layers and other blobs are content-addressed and
   shared between images, so a client that already knows a blob digest can
   still fetch it (as since #2912).
+- Replacing a held tag with a fixed image works with a plain `docker push`
+  (#5606). A caller who may push to the repository (write permission, and a
+  token with `write:artifacts`) is answered the held manifest's and blobs'
+  headers on `HEAD`, which docker checks before it uploads. The answer has no
+  body. `GET` of the held bytes stays refused for every caller, pull-only
+  callers are refused `HEAD` too, and the held image stays refused by digest
+  after the push.
 
 ## Queues
 

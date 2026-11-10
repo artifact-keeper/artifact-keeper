@@ -461,6 +461,25 @@ async fn authenticate_oci_read(
     base_url: &str,
     scope: &str,
 ) -> Result<Option<crate::services::auth_service::Claims>, Response> {
+    Ok(
+        authenticate_oci_read_with_scopes(state, headers, base_url, scope)
+            .await?
+            .map(|(claims, _)| claims),
+    )
+}
+
+/// A caller and its API-token action scopes (`None` for a JWT or password
+/// login), as [`authenticate_oci_read_with_scopes`] returns them.
+type OciReadAuth = (crate::services::auth_service::Claims, Option<Vec<String>>);
+
+/// [`authenticate_oci_read`] that also returns the API-token action scopes,
+/// for a read that must know whether the caller could also push (#5606).
+async fn authenticate_oci_read_with_scopes(
+    state: &SharedState,
+    headers: &HeaderMap,
+    base_url: &str,
+    scope: &str,
+) -> Result<Option<OciReadAuth>, Response> {
     if is_anonymous_token(headers) {
         return Ok(None);
     }
@@ -472,7 +491,34 @@ async fn authenticate_oci_read(
     if !oci_scopes_grant(&token_scopes, OCI_SCOPE_READ) {
         return Err(oci_forbidden_scope(OCI_SCOPE_READ));
     }
-    Ok(Some(claims))
+    Ok(Some((claims, token_scopes)))
+}
+
+/// Whether the caller of a HEAD may push to `repo` (#5606): a hosted
+/// repository (one that stores its own manifests), a credential whose action
+/// scopes grant `write:artifacts`, and the repository `write` decision a push
+/// takes ([`oci_write_decision`]). An anonymous caller never may.
+///
+/// `docker push` checks the manifest and its blobs with `HEAD` before it
+/// uploads, and aborts on any answer other than 200 or 404. The pull gate
+/// answering that HEAD with a hold's 403/409 therefore made a held tag
+/// impossible to replace with a fixed image. A HEAD carries no body, and a
+/// caller who may push can overwrite the tag anyway, so such a caller is told
+/// that the held manifest or blob exists. A GET of the held bytes stays
+/// refused for everyone.
+async fn caller_may_push(
+    state: &SharedState,
+    auth: Option<&OciReadAuth>,
+    repo: &OciRepoInfo,
+) -> bool {
+    let Some((claims, token_scopes)) = auth else {
+        return false;
+    };
+    stores_own_manifests(&repo.repo_type)
+        && oci_scopes_grant(token_scopes, OCI_SCOPE_WRITE)
+        && oci_write_decision(state, claims, repo.id, "write")
+            .await
+            .is_ok()
 }
 
 /// Authenticate an OCI request and also return the API-token scopes if the
@@ -6399,10 +6445,11 @@ async fn handle_head_blob(
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
     // tokens can be enforced per-repository below (#2093). The helper also
     // enforces the token's `read:artifacts` action ceiling (#3408).
-    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+    let auth = match authenticate_oci_read_with_scopes(state, headers, base_url, &scope).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    let claims = auth.as_ref().map(|(claims, _)| claims.clone());
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
@@ -6451,8 +6498,12 @@ async fn handle_head_blob(
     // #3258: HEAD must apply the same scan re-block as GET (including the
     // #3245 `scan_on_proxy` scoping) and answer 403 where GET would; before
     // this, HEAD leaked the existence and exact size of blocked content.
+    // #5606: except to a caller who may push here, whose `docker push` checks
+    // each blob with a HEAD and aborts on the 403. The GET stays refused.
     if let Err(resp) = enforce_blob_scan_reblock(state, &claims, &repo, &lookup_digest).await {
-        return resp;
+        if !caller_may_push(state, auth.as_ref(), &repo).await {
+            return resp;
+        }
     }
     let blob = sqlx::query!(
         "SELECT size_bytes, storage_key FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
@@ -10375,10 +10426,11 @@ async fn handle_head_manifest(
     // Bind the authenticated claims (don't discard) so scanner-scoped pull
     // tokens can be enforced per-repository below (#2093). The helper also
     // enforces the token's `read:artifacts` action ceiling (#3408).
-    let claims = match authenticate_oci_read(state, headers, base_url, &scope).await {
+    let auth = match authenticate_oci_read_with_scopes(state, headers, base_url, &scope).await {
         Ok(c) => c,
         Err(resp) => return resp,
     };
+    let claims = auth.as_ref().map(|(claims, _)| claims.clone());
 
     // Anonymous tokens may only access public repositories, and a key naming
     // no repository answers them with the same challenge (#3730).
@@ -10496,11 +10548,20 @@ async fn handle_head_manifest(
         {
             // #2912: same gate as the GET path, so a HEAD does not report a
             // quarantined image as available and a client cannot use it to
-            // confirm the image exists.
+            // confirm the image exists. #5606: except to a caller who may push
+            // here, so `docker push` can replace a held tag. Headers only; the
+            // GET stays refused.
             if let Some(blocked) =
                 oci_manifest_quarantine_block(state, repo.id, &manifest_digest).await
             {
-                return blocked;
+                if !caller_may_push(state, auth.as_ref(), &repo).await {
+                    return blocked;
+                }
+                tracing::info!(
+                    repo = %repo.key,
+                    manifest_digest = %manifest_digest,
+                    "answering a held manifest's HEAD to a caller who may push (no body)"
+                );
             }
 
             return build_local_manifest_response(&manifest_digest, &content_type, data, false);
@@ -42199,6 +42260,224 @@ mod proxy_scan_block_tests {
             "enforcement blocks the blobs from the same recorded verdict"
         );
     }
+
+    /// #5606: `docker push` of a fixed image over a held tag. docker checks
+    /// the manifest and each blob with `HEAD` before it uploads and aborts on
+    /// anything but 200/404, so a caller who may push is answered the held
+    /// manifest's and blob's headers (no body). Every GET of the held bytes
+    /// stays refused, a pull-only caller (another user, or the writer's own
+    /// read-scoped token) is refused the HEAD too, and after the fixed image
+    /// replaces the tag the held digest is still refused by digest.
+    #[tokio::test]
+    async fn push_over_a_held_tag_heads_without_serving_the_held_bytes_5606() {
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write"]).await;
+        let (reader, _) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_actions(&fx.pool, fx.repo_id, reader, &["read"]).await;
+        let reader_bearer = tdh::bearer_for(&fx.state, reader).await;
+        let auth_service = AuthService::new(fx.state.db.clone(), Arc::new(fx.state.config.clone()));
+        let basic = |token: String| {
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", fx.username, token))
+            )
+        };
+        let writer = basic(
+            auth_service
+                .generate_api_token(fx.user_id, "push-5606", vec!["*".to_string()], None)
+                .await
+                .expect("push token")
+                .0,
+        );
+        let writer_pull_only = basic(
+            auth_service
+                .generate_api_token(
+                    fx.user_id,
+                    "pull-5606",
+                    vec!["read:artifacts".to_string()],
+                    None,
+                )
+                .await
+                .expect("pull token")
+                .0,
+        );
+
+        let storage = fx
+            .state
+            .storage_for_repo(&crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: fx.storage_dir.to_string_lossy().into_owned(),
+            })
+            .expect("storage");
+        let layer = unique_fixture_bytes("held-5606-layer");
+        let (cfg1, cfg2) = (
+            unique_fixture_bytes("held-5606-cfg"),
+            unique_fixture_bytes("fixed-5606-cfg"),
+        );
+        for bytes in [&layer, &cfg1, &cfg2] {
+            let d = compute_sha256(bytes);
+            storage
+                .put(&blob_storage_key(&d), Bytes::from(bytes.clone()))
+                .await
+                .expect("put blob");
+            sqlx::query(
+                "INSERT INTO oci_blobs (repository_id, digest, size_bytes, storage_key) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(fx.repo_id)
+            .bind(&d)
+            .bind(bytes.len() as i64)
+            .bind(blob_storage_key(&d))
+            .execute(&fx.pool)
+            .await
+            .expect("insert oci_blobs");
+        }
+        let (held, _, layer_digest) = image_manifest(&cfg1, &layer);
+        let (fixed, _, _) = image_manifest(&cfg2, &layer);
+        let (held_digest, fixed_digest) = (compute_sha256(&held), compute_sha256(&fixed));
+
+        let call = |method: Method, auth: String, path: String, body: Bytes| {
+            let app = router(None).with_state(fx.state.clone());
+            let key = fx.repo_key.clone();
+            async move {
+                let req = Request::builder()
+                    .method(method)
+                    .uri(format!("/{key}/app/{path}"))
+                    .header(AUTHORIZATION, auth)
+                    .header(CONTENT_TYPE, IMAGE_MANIFEST_MT)
+                    .body(Body::from(body))
+                    .unwrap();
+                let resp = app.oneshot(req).await.expect("oneshot");
+                let status = resp.status();
+                let digest = resp
+                    .headers()
+                    .get("Docker-Content-Digest")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, digest, body)
+            }
+        };
+        let tag = || "manifests/1.0".to_string();
+        let (s, _, b) = call(Method::PUT, writer.clone(), tag(), held.clone()).await;
+        assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&b));
+        // The image is held (an administrator's quarantine on its tag row),
+        // and its scan found it vulnerable, which re-blocks its blobs.
+        sqlx::query(
+            "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+             quarantine_source = 'admin' WHERE repository_id = $1 AND path = 'v2/app/manifests/1.0'",
+        )
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("hold the tag");
+        ProxyScanService::new(fx.pool.clone())
+            .record_verdict(
+                held_digest.strip_prefix("sha256:").unwrap(),
+                "grype",
+                "vulnerable",
+                1,
+                1,
+                0,
+                0,
+                0,
+                Some("critical"),
+                Some("grype-1.0.0-test"),
+                Some(fx.repo_id),
+            )
+            .await
+            .expect("seed vulnerable verdict");
+
+        let blob = || format!("blobs/{layer_digest}");
+        let (head_status, head_digest, head_body) =
+            call(Method::HEAD, writer.clone(), tag(), Bytes::new()).await;
+        let writer_get = call(Method::GET, writer.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let pull_only_head = call(Method::HEAD, writer_pull_only.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let reader_head = call(Method::HEAD, reader_bearer.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let reader_get = call(Method::GET, reader_bearer.clone(), tag(), Bytes::new())
+            .await
+            .0;
+        let writer_blob_head = call(Method::HEAD, writer.clone(), blob(), Bytes::new())
+            .await
+            .0;
+        let writer_blob_get = call(Method::GET, writer.clone(), blob(), Bytes::new())
+            .await
+            .0;
+        let reader_blob_head = call(Method::HEAD, reader_bearer.clone(), blob(), Bytes::new())
+            .await
+            .0;
+
+        let (put_status, _, put_body) =
+            call(Method::PUT, writer.clone(), tag(), fixed.clone()).await;
+        let (after_status, after_digest, _) =
+            call(Method::GET, reader_bearer.clone(), tag(), Bytes::new()).await;
+        let held_by_digest = |auth: String| {
+            let path = format!("manifests/{held_digest}");
+            let call = &call;
+            async move { call(Method::GET, auth, path, Bytes::new()).await.0 }
+        };
+        let reader_held_by_digest = held_by_digest(reader_bearer.clone()).await;
+        let writer_held_by_digest = held_by_digest(writer.clone()).await;
+
+        let _ = sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+            .bind(fx.user_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup_user(&fx.pool, reader).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            (head_status, head_digest.as_deref(), head_body.len()),
+            (StatusCode::OK, Some(held_digest.as_str()), 0),
+            "a caller who may push is answered the held manifest's headers, no body"
+        );
+        assert_eq!(
+            writer_get,
+            StatusCode::CONFLICT,
+            "GET stays refused to the writer"
+        );
+        assert_eq!(
+            (pull_only_head, reader_head, reader_get),
+            (
+                StatusCode::CONFLICT,
+                StatusCode::CONFLICT,
+                StatusCode::CONFLICT
+            ),
+            "a pull-only caller is refused HEAD and GET"
+        );
+        assert_eq!(
+            (writer_blob_head, writer_blob_get, reader_blob_head),
+            (StatusCode::OK, StatusCode::FORBIDDEN, StatusCode::FORBIDDEN),
+            "the held image's blob: HEAD for the writer only, GET for no one"
+        );
+        assert_eq!(
+            put_status,
+            StatusCode::CREATED,
+            "the fixed image replaces the held tag: {}",
+            String::from_utf8_lossy(&put_body)
+        );
+        assert_eq!(
+            (after_status, after_digest.as_deref()),
+            (StatusCode::OK, Some(fixed_digest.as_str())),
+            "the tag now serves the fixed image"
+        );
+        assert_eq!(
+            (reader_held_by_digest, writer_held_by_digest),
+            (StatusCode::CONFLICT, StatusCode::CONFLICT),
+            "the held digest is still not served by digest"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -47589,9 +47868,11 @@ mod action_scope_structural_tests {
     /// `enforce_token_repo_scope` is documented to.
     #[test]
     fn the_read_scope_gate_precedes_the_admin_bypass() {
+        // `authenticate_oci_read` delegates to the variant that also returns
+        // the token scopes (#5606); the gate lives there.
         let gate = SRC
-            .find("async fn authenticate_oci_read(")
-            .expect("authenticate_oci_read must exist");
+            .find("async fn authenticate_oci_read_with_scopes(")
+            .expect("authenticate_oci_read_with_scopes must exist");
         let bypass = SRC
             .find("if claims.is_admin || claims.scan_pull_repo.is_some()")
             .expect("the oci_read_permitted admin bypass must exist");
