@@ -649,6 +649,50 @@ impl PermissionService {
         Ok(allowed)
     }
 
+    /// Does `user_id` hold a GLOBAL (instance-wide) capability?
+    ///
+    /// Distinct from [`Self::check_repository_action`] in two ways that matter:
+    /// the capability is not about any one repository, and only an assignment
+    /// with `repository_id IS NULL` counts. A repo-scoped grant of
+    /// `security_review` must NOT confer the instance-wide power to accept
+    /// risk, so the NULL check is load-bearing, not defensive.
+    ///
+    /// Deliberately NOT resolved in the auth middleware and NOT cached: the
+    /// only callers are low-traffic reviewer endpoints, so this costs one
+    /// indexed read per call there and nothing at all on the proxy hot path.
+    /// Revocation therefore also takes effect on the next request, with no
+    /// cache to invalidate.
+    ///
+    /// Admin is checked by the caller, not here: this answers "holds this
+    /// capability", and conflating it with admin would make the two
+    /// indistinguishable in an audit record.
+    ///
+    /// `users.is_active` is joined for the same reason
+    /// [`crate::services::auth_service::fetch_live_is_admin`] filters on it: a
+    /// deactivated account must lose the capability immediately, not keep
+    /// accepting risk until someone remembers to strip its role too.
+    pub async fn has_global_capability(&self, user_id: Uuid, capability: &str) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM role_assignments ra
+                JOIN roles r ON r.id = ra.role_id
+                JOIN users u ON u.id = ra.user_id
+                WHERE ra.user_id = $1
+                  AND u.is_active = true
+                  AND ra.repository_id IS NULL
+                  AND $2 = ANY(r.permissions)
+            )
+            "#,
+        )
+        .bind(user_id)
+        .bind(capability)
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+    }
+
     /// Return true when at least one permission rule exists for the given
     /// target, regardless of principal. This is used by middleware to decide
     /// whether fine-grained rules should be enforced at all (targets without
@@ -1460,6 +1504,105 @@ mod tests {
             matches!(err, AppError::Validation(_)),
             "unknown principal_type must be a 400 Validation, got {err:?}"
         );
+    }
+
+    /// The four properties `has_global_capability` exists to guarantee, all
+    /// against a real schema because every one of them is a SQL predicate.
+    #[tokio::test]
+    async fn db_has_global_capability_scope_and_revocation() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let service = PermissionService::new(pool.clone());
+
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let role_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM roles WHERE name = 'security-reviewer'")
+                .fetch_one(&pool)
+                .await
+                .expect("migration 345 seeds the security-reviewer role");
+
+        // No assignment yet.
+        assert!(!service
+            .has_global_capability(user_id, "security_review")
+            .await
+            .expect("query ok"));
+
+        // A REPO-SCOPED grant must not confer the instance-wide capability:
+        // accepting risk is not a per-repository power.
+        let repo_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO repositories (id, key, name, format, repo_type, storage_path, upstream_url)
+               VALUES ($1, $2, $2, 'npm', 'remote', '/tmp/ph-cap', 'https://registry.npmjs.org')"#,
+        )
+        .bind(repo_id)
+        .bind(format!("ph-cap-{repo_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed repo");
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) VALUES ($1, $2, $3)",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .bind(repo_id)
+        .execute(&pool)
+        .await
+        .expect("seed repo-scoped assignment");
+        assert!(
+            !service
+                .has_global_capability(user_id, "security_review")
+                .await
+                .expect("query ok"),
+            "a repo-scoped role must NOT grant a global capability"
+        );
+
+        // A global assignment (repository_id IS NULL) does.
+        sqlx::query(
+            "INSERT INTO role_assignments (user_id, role_id, repository_id) VALUES ($1, $2, NULL)",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .execute(&pool)
+        .await
+        .expect("seed global assignment");
+        assert!(service
+            .has_global_capability(user_id, "security_review")
+            .await
+            .expect("query ok"));
+
+        // A capability the role does not carry is still denied, so holding one
+        // global role is not a wildcard.
+        assert!(!service
+            .has_global_capability(user_id, "some_other_capability")
+            .await
+            .expect("query ok"));
+
+        // Deactivating the account revokes it immediately, without anyone
+        // having to remember to strip the role as well.
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("deactivate user");
+        assert!(
+            !service
+                .has_global_capability(user_id, "security_review")
+                .await
+                .expect("query ok"),
+            "a deactivated account must lose the capability"
+        );
+
+        let _ = sqlx::query("DELETE FROM role_assignments WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
     }
 
     #[tokio::test]

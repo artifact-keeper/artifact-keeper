@@ -223,6 +223,11 @@ pub struct UserResponse {
     pub display_name: Option<String>,
     pub is_admin: bool,
     pub totp_enabled: bool,
+    /// Capabilities the UI gates controls on, e.g. `security_review`. Admin is
+    /// NOT listed here: it is already carried by `is_admin`. A list of what to
+    /// show, not a dump of the authorization model; each endpoint behind a
+    /// control re-checks server-side.
+    pub capabilities: Vec<String>,
 }
 
 /// DB-backed enforcement of the local-login SSO policy for an already-verified
@@ -604,6 +609,17 @@ pub async fn get_current_user(
     .map_err(|e| AppError::Database(e.to_string()))?
     .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
+    // A DB hiccup hides the reviewer nav rather than breaking the session, every route re-checks
+    let perms = crate::services::permission_service::PermissionService::new(state.db.clone());
+    let mut capabilities = Vec::new();
+    if perms
+        .has_global_capability(user.id, crate::api::handlers::age_gate::CAP_SECURITY_REVIEW)
+        .await
+        .unwrap_or(false)
+    {
+        capabilities.push(crate::api::handlers::age_gate::CAP_SECURITY_REVIEW.to_string());
+    }
+
     Ok(Json(UserResponse {
         id: user.id,
         username: user.username,
@@ -611,6 +627,7 @@ pub async fn get_current_user(
         display_name: user.display_name,
         is_admin: user.is_admin,
         totp_enabled: user.totp_enabled,
+        capabilities,
     }))
 }
 
@@ -2075,6 +2092,7 @@ mod tests {
             display_name: Some("Test User".to_string()),
             is_admin: true,
             totp_enabled: false,
+            capabilities: vec!["security_review".to_string()],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "550e8400-e29b-41d4-a716-446655440000");
@@ -2083,6 +2101,7 @@ mod tests {
         assert_eq!(json["display_name"], "Test User");
         assert_eq!(json["is_admin"], true);
         assert_eq!(json["totp_enabled"], false);
+        assert_eq!(json["capabilities"][0], "security_review");
     }
 
     #[test]
@@ -2095,6 +2114,7 @@ mod tests {
             display_name: None,
             is_admin: false,
             totp_enabled: true,
+            capabilities: vec![],
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json["display_name"].is_null());
