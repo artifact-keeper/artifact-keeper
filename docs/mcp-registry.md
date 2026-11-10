@@ -2159,6 +2159,18 @@ snapshot (`outcome` other than `ok`) leaves them.
 | `hidden_text` | `block` | Control (other than tab and line breaks), bidirectional, zero-width or Unicode tag characters in any linted string or object key. Stored as finding class `malicious`. |
 | `dangerous_args` | `block`, `review` | `block`: in `runtimeArguments`, flags that re-route installs around the backing repository (`--registry`, `--index-url`, `--extra-index-url`, `--find-links`, `--index`, `--default-index`, `--source`, `--pypi-mirror`); anywhere, `--privileged`, a bind mount of the host root (`-v /:/host`, `--mount source=/`) or of the Docker socket. `review`: the same re-routing flags in `packageArguments`, other host bind mounts, `--network/--net/--pid/--ipc/--uts/--userns=host`, `--cap-add`, `--security-opt`, `--device`, `--unsafe-perm`, `--trusted-host`, `--insecure`, `-A`/`--allow-*`, and `LD_PRELOAD`, `NODE_OPTIONS`, `PYTHONPATH` and other code-injecting variables (as `-e`/`--env` values, positional `NAME=value` arguments or environment variable names). Both `--flag value` and `--flag=value` spellings. |
 | `remote_url_shape` | `review`, `warn` | `remotes[].url` (and `packages[].transport.url` for templates). `review`: a template variable in the host, user-info, an IP literal (private or public), `localhost`, a URL template that can expand to a non-`http(s)` URL (refused at publish since #5529; a version stored before is flagged when it is next linted, and one with more than 256 expansions has its scheme-position values checked on their own). `warn`: plain `http`, a non-default port on a public host, an internal host name (`.internal`, `.local`, `.corp`, `.lan`, `.intranet`, `.home.arpa`, `.localdomain`) in a public registry. |
+
+The URL rules of `remote_url_shape` and `secret_literal` run on the URL as
+written and on every URL its variables expand to with the publisher's own
+values (`value`, `default`, `placeholder`, every `choices` entry; a variable
+without one stays client input): `{base}/sse` with a `default` of
+`https://user:pass@host` is a `secret_literal` block on `remotes[N].url`. A
+finding on an expansion ends "once expanded with the publisher's values"
+and never quotes the expansion. Combinations past 256 are checked one
+variable at a time. A package's `transport.url` (literal and expanded) gets
+the credential and user-info rules only: the server it names is the one the
+client launches, so plain `http`, `localhost`, a private address or a port
+there is not flagged.
 | `oci_tag_digest_mismatch` | `warn` | A submitted `:tag@sha256:D` whose tag currently resolves to another digest (`D` is pinned). |
 | `oci_label_mismatch` | `warn` | The pinned image's config has no `io.modelcontextprotocol.server.name` label, a label naming another server, or a config that is not stored in the backing repository (labels are read from the stored manifest and config blob, never fetched). Under `mcp_require_oci_label: true` this refuses the publish instead (see below). |
 | `mcpb_missing_sha` | `block`, `review` | `block`: an `mcpb` package without `fileSha256`. `review`: an `mcpb` `fileSha256` that matches no bundle stored with the version (when bundles are stored). |

@@ -758,24 +758,16 @@ fn union_values<'a>(inputs: impl Iterator<Item = &'a Input>) -> Option<Vec<&'a s
     declared.then_some(out)
 }
 
-/// Every expansion of the `{variable}` template `template` against the
-/// publisher values `values_of` finds (`None`: undeclared) must be an
-/// absolute `http(s)` URL ([`is_http_url`], as for every other URL in a
-/// server.json). A variable with no value stands in for client input; one
-/// in the scheme position, declared or not, is refused, since whatever the
-/// client fills in picks the scheme (the later variables are still
-/// expanded, so a value of theirs that reaches the scheme is named). A
-/// template with no publisher value and a literal scheme is left to the
-/// shape check alone.
-pub fn url_template_issue<'a>(
-    template: &str,
-    values_of: impl Fn(&str) -> Option<Vec<&'a str>>,
-    mode: UrlExpansion,
-) -> Option<UrlTemplateIssue> {
-    enum Seg<'s> {
-        Lit(&'s str),
-        Var(&'s str),
-    }
+/// One piece of a `{variable}` URL template.
+enum Seg<'s> {
+    Lit(&'s str),
+    Var(&'s str),
+}
+
+/// `template` split into literal and `{variable}` pieces (an unclosed `{`
+/// ends the scan, the rest dropped), and the distinct variable names in
+/// order of first use.
+fn template_segments(template: &str) -> (Vec<Seg<'_>>, Vec<&str>) {
     let mut segs = Vec::new();
     let mut rest = template;
     while let Some(open) = rest.find('{') {
@@ -799,6 +791,91 @@ pub fn url_template_issue<'a>(
             }
         }
     }
+    (segs, names)
+}
+
+/// The URLs a client that takes the publisher's word builds from the
+/// `{variable}` template `template` (#5547): every combination of the
+/// publisher values `values_of` finds, a variable without one left as
+/// `{name}` (client input). When the combinations exceed
+/// [`MAX_URL_TEMPLATE_EXPANSIONS`], each variable's values are tried on
+/// their own instead, the others at their first value, so every publisher
+/// value still appears in some expansion. Empty when no variable has a
+/// publisher value (the template itself is all there is to check).
+pub fn url_template_expansions<'a>(
+    template: &str,
+    values_of: impl Fn(&str) -> Option<Vec<&'a str>>,
+) -> Vec<String> {
+    let (segs, names) = template_segments(template);
+    let values: Vec<Vec<&str>> = names
+        .iter()
+        .map(|n| values_of(n).unwrap_or_default())
+        .collect();
+    if values.iter().all(Vec::is_empty) {
+        return Vec::new();
+    }
+    let render = |pick: &[usize]| -> String {
+        segs.iter()
+            .map(|s| match s {
+                Seg::Lit(l) => (*l).to_string(),
+                Seg::Var(n) => {
+                    let i = names.iter().position(|m| m == n).unwrap_or(0);
+                    match values[i].get(pick[i]) {
+                        Some(v) => (*v).to_string(),
+                        None => format!("{{{n}}}"),
+                    }
+                }
+            })
+            .collect()
+    };
+    let count = values
+        .iter()
+        .fold(1usize, |acc, v| acc.saturating_mul(v.len().max(1)));
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |u: String| {
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    };
+    if count <= MAX_URL_TEMPLATE_EXPANSIONS {
+        let mut pick = vec![0usize; names.len()];
+        for _ in 0..count {
+            push(render(&pick));
+            for (i, p) in pick.iter_mut().enumerate() {
+                *p += 1;
+                if *p < values[i].len() {
+                    break;
+                }
+                *p = 0;
+            }
+        }
+    } else {
+        for (i, vs) in values.iter().enumerate() {
+            for j in 0..vs.len() {
+                let mut pick = vec![0usize; names.len()];
+                pick[i] = j;
+                push(render(&pick));
+            }
+        }
+    }
+    out
+}
+
+/// Every expansion of the `{variable}` template `template` against the
+/// publisher values `values_of` finds (`None`: undeclared) must be an
+/// absolute `http(s)` URL ([`is_http_url`], as for every other URL in a
+/// server.json). A variable with no value stands in for client input; one
+/// in the scheme position, declared or not, is refused, since whatever the
+/// client fills in picks the scheme (the later variables are still
+/// expanded, so a value of theirs that reaches the scheme is named). A
+/// template with no publisher value and a literal scheme is left to the
+/// shape check alone.
+pub fn url_template_issue<'a>(
+    template: &str,
+    values_of: impl Fn(&str) -> Option<Vec<&'a str>>,
+    mode: UrlExpansion,
+) -> Option<UrlTemplateIssue> {
+    let (segs, names) = template_segments(template);
     let mut values: Vec<Vec<&str>> = names
         .iter()
         .map(|n| values_of(n).unwrap_or_default())
@@ -873,11 +950,21 @@ pub fn url_template_issue<'a>(
 /// `variables` map.
 pub fn remote_url_issue(remote: &Transport, mode: UrlExpansion) -> Option<UrlTemplateIssue> {
     let url = remote.url.as_deref()?;
-    url_template_issue(
-        url,
-        |n| union_values(remote.variables.as_ref()?.get(n).into_iter()),
-        mode,
-    )
+    url_template_issue(url, |n| remote_values(remote, n), mode)
+}
+
+/// The publisher values of a remote's URL variable `n` (its `variables`).
+fn remote_values<'a>(remote: &'a Transport, n: &str) -> Option<Vec<&'a str>> {
+    union_values(remote.variables.as_ref()?.get(n).into_iter())
+}
+
+/// [`url_template_expansions`] of a remote's `url`.
+pub fn remote_url_expansions(remote: &Transport) -> Vec<String> {
+    remote
+        .url
+        .as_deref()
+        .map(|u| url_template_expansions(u, |n| remote_values(remote, n)))
+        .unwrap_or_default()
 }
 
 /// [`url_template_issue`] for a package transport: its variables are the
@@ -887,24 +974,32 @@ pub fn remote_url_issue(remote: &Transport, mode: UrlExpansion) -> Option<UrlTem
 /// union of all of theirs.
 pub fn package_url_issue(p: &Package, mode: UrlExpansion) -> Option<UrlTemplateIssue> {
     let url = p.transport.url.as_deref()?;
-    url_template_issue(
-        url,
-        |n| {
-            let envs = p
-                .environment_variables
-                .iter()
-                .filter(move |e| e.name.as_deref() == Some(n));
-            let args = p
-                .runtime_arguments
-                .iter()
-                .chain(&p.package_arguments)
-                .filter(move |a| {
-                    a.value_hint.as_deref() == Some(n) || a.name.as_deref() == Some(n)
-                });
-            union_values(envs.chain(args))
-        },
-        mode,
-    )
+    url_template_issue(url, |n| package_values(p, n), mode)
+}
+
+/// The publisher values of a package transport URL variable `n`: those of
+/// every argument (by `valueHint` or `name`) and environment variable (by
+/// `name`) so called.
+fn package_values<'a>(p: &'a Package, n: &str) -> Option<Vec<&'a str>> {
+    let envs = p
+        .environment_variables
+        .iter()
+        .filter(move |e| e.name.as_deref() == Some(n));
+    let args = p
+        .runtime_arguments
+        .iter()
+        .chain(&p.package_arguments)
+        .filter(move |a| a.value_hint.as_deref() == Some(n) || a.name.as_deref() == Some(n));
+    union_values(envs.chain(args))
+}
+
+/// [`url_template_expansions`] of a package's `transport.url`.
+pub fn package_url_expansions(p: &Package) -> Vec<String> {
+    p.transport
+        .url
+        .as_deref()
+        .map(|u| url_template_expansions(u, |n| package_values(p, n)))
+        .unwrap_or_default()
 }
 
 fn check_url_template(path: &str, issue: Option<UrlTemplateIssue>) -> V {
