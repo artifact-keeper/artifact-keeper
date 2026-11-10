@@ -62,20 +62,31 @@ pub(crate) async fn check_artifact_visibility(
     action: &str,
 ) -> Result<()> {
     // Always fetch repo info so we can check both visibility and token scope.
-    let repo_info: Option<(Uuid, crate::models::repository::RepositoryVisibility)> =
-        sqlx::query_as(
-            "SELECT r.id, r.visibility FROM repositories r \
+    let repo_info: Option<(
+        Uuid,
+        String,
+        crate::models::repository::RepositoryVisibility,
+    )> = sqlx::query_as(
+        "SELECT r.id, r.key, r.visibility FROM repositories r \
          JOIN artifacts a ON a.repository_id = r.id WHERE a.id = $1",
-        )
-        .bind(artifact_id)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+    )
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let Some((repo_id, visibility)) = repo_info else {
+    let Some((repo_id, repo_key, visibility)) = repo_info else {
         // No matching repo means the artifact query upstream will 404.
         return Ok(());
     };
+
+    // #5694: from the moment its delete job is queued, a repository is renamed
+    // to `~deleting~<job id>` and is gone on every by-key surface. Its
+    // artifacts are gone on the by-id surfaces too, with the same 404 as a
+    // missing id, although the job has not deleted their rows yet.
+    if crate::models::repository::is_deleting_key(&repo_key) {
+        return Err(AppError::NotFound("Artifact not found".to_string()));
+    }
 
     match auth {
         Some(ext) => {
@@ -1087,5 +1098,119 @@ mod public_read_repo_scope_3704 {
             "unchanged: an anonymous caller still gets the existence-hiding 404 on \
              a private repository's artifact"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #5694: by-id reads of a repository whose delete job is queued.
+// ---------------------------------------------------------------------------
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod deleting_repository_by_id_5694 {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    /// One artifact row with a metadata row, so `/metadata` answers 200 for a
+    /// live repository.
+    async fn insert_artifact(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts \
+                 (id, repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, 'f.bin', 3, md5($3), 'application/octet-stream', $3)",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("p/{id}.bin"))
+        .execute(pool)
+        .await
+        .expect("insert artifact");
+        sqlx::query(
+            "INSERT INTO artifact_metadata (artifact_id, format, metadata, properties) \
+             VALUES ($1, 'generic', '{}'::jsonb, '{}'::jsonb)",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert metadata");
+        id
+    }
+
+    /// #5694: once a repository's delete job is queued (the repository is
+    /// renamed to `~deleting~<job id>`, its rows still there), its artifacts
+    /// answer the generic 404 on `/api/v1/artifacts/{id}`, `/stats` and
+    /// `/metadata`, as its key already does; an artifact of a live repository
+    /// still answers 200.
+    #[tokio::test]
+    async fn test_artifacts_of_a_deleting_repository_are_gone_by_id_5694() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (doomed, doomed_key, doomed_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let (live, _, live_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let gone = [
+            insert_artifact(&pool, doomed).await,
+            insert_artifact(&pool, doomed).await,
+        ];
+        let kept = insert_artifact(&pool, live).await;
+
+        // What `DELETE /api/v1/repositories/{key}` does before its worker runs.
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repository_delete_jobs \
+                 (repository_id, repository_key, storage_backend, storage_path, created_by) \
+             VALUES ($1, $2, 'filesystem', $3, $4) RETURNING id",
+        )
+        .bind(doomed)
+        .bind(&doomed_key)
+        .bind(doomed_dir.to_string_lossy().into_owned())
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("queue delete job");
+        sqlx::query("UPDATE repositories SET key = $2 WHERE id = $1")
+            .bind(doomed)
+            .bind(format!(
+                "{}{job_id}",
+                crate::models::repository::DELETING_PREFIX
+            ))
+            .execute(&pool)
+            .await
+            .expect("rename as the delete does");
+
+        let state = tdh::build_state(pool.clone(), live_dir.to_str().unwrap());
+        let mut results = Vec::new();
+        for id in gone.iter().chain(std::iter::once(&kept)) {
+            for suffix in ["", "/stats", "/metadata"] {
+                let app = tdh::router_with_auth(
+                    router(),
+                    state.clone(),
+                    tdh::admin_auth(user_id, &username),
+                );
+                let (status, _) = tdh::send(app, tdh::get(format!("/{id}{suffix}"))).await;
+                results.push((*id, suffix, status));
+            }
+        }
+
+        let _ = sqlx::query("DELETE FROM repository_delete_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup(&pool, doomed, user_id).await;
+        tdh::cleanup(&pool, live, user_id).await;
+        let _ = std::fs::remove_dir_all(&doomed_dir);
+        let _ = std::fs::remove_dir_all(&live_dir);
+
+        for (id, suffix, status) in results {
+            let expected = if id == kept {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(status, expected, "GET /{id}{suffix}");
+        }
     }
 }
