@@ -1371,6 +1371,111 @@ mod tests {
         }
     }
 
+    // -- the laws proved in formal/ArtifactKeeper/Curation/RuleEvaluation.lean --
+
+    mod rule_evaluation_props {
+        use super::{make_rule, CurationService};
+        use crate::models::curation::CurationRule;
+        use proptest::prelude::*;
+
+        /// Rules over a tiny space so that several of them apply to one request.
+        fn any_rule() -> impl Strategy<Value = CurationRule> {
+            (
+                prop_oneof![Just("pkg"), Just("other"), Just("*"), Just("p*")],
+                prop_oneof![Just("*"), Just(">=2.0"), Just("<2.0"), Just("=1.0")],
+                prop_oneof![Just("*"), Just("amd64"), Just("arm64")],
+                prop_oneof![Just("allow"), Just("block"), Just("flag")],
+            )
+                .prop_map(|(pattern, constraint, arch, action)| {
+                    make_rule(pattern, constraint, arch, action)
+                })
+        }
+
+        fn any_request() -> impl Strategy<Value = (Option<&'static str>, Option<&'static str>)> {
+            (
+                prop_oneof![
+                    Just(None),
+                    Just(Some("1.0")),
+                    Just(Some("2.0")),
+                    Just(Some("3.1"))
+                ],
+                prop_oneof![Just(None), Just(Some("amd64")), Just(Some("arm64"))],
+            )
+        }
+
+        fn evaluate(
+            rules: &[CurationRule],
+            (version, arch): (Option<&str>, Option<&str>),
+        ) -> crate::services::curation_service::RuleEvaluation {
+            CurationService::evaluate_rules(
+                rules,
+                "default",
+                "pkg",
+                version,
+                arch,
+                false,
+                false, // the generic comparator, not conda's
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(4000))]
+
+            /// `first_applicable_rule_decides`: the decision is the action of
+            /// the first rule that, evaluated alone, applies; otherwise the default.
+            #[test]
+            fn the_first_applicable_rule_decides(
+                rules in proptest::collection::vec(any_rule(), 0..7),
+                request in any_request(),
+            ) {
+                let first = rules
+                    .iter()
+                    .find(|rule| evaluate(std::slice::from_ref(*rule), request).rule_id.is_some());
+                let got = evaluate(&rules, request);
+                match first {
+                    Some(rule) => {
+                        prop_assert_eq!(got.rule_id, Some(rule.id));
+                        prop_assert_eq!(&got.action, &rule.action);
+                    }
+                    None => {
+                        prop_assert_eq!(got.rule_id, None);
+                        prop_assert_eq!(got.action.as_str(), "default");
+                    }
+                }
+            }
+
+            /// `rules_below_a_matching_block_cannot_unblock`: once a rule has
+            /// decided, appending rules changes nothing.
+            #[test]
+            fn rules_added_below_the_deciding_rule_change_nothing(
+                rules in proptest::collection::vec(any_rule(), 1..6),
+                extra in proptest::collection::vec(any_rule(), 0..6),
+                request in any_request(),
+            ) {
+                let before = evaluate(&rules, request);
+                if before.rule_id.is_some() {
+                    let mut extended = rules.clone();
+                    extended.extend(extra);
+                    let after = evaluate(&extended, request);
+                    prop_assert_eq!(after.rule_id, before.rule_id);
+                    prop_assert_eq!(after.action, before.action);
+                }
+            }
+
+            /// `constrained_rule_skips_versionless_request` and
+            /// `scoped_rule_skips_archless_request`.
+            #[test]
+            fn a_rule_that_cannot_be_decided_is_skipped(rule in any_rule(), request in any_request()) {
+                let (version, arch) = request;
+                let undecidable = (version.is_none() && rule.version_constraint != "*")
+                    || (arch.is_none() && rule.architecture != "*");
+                if undecidable {
+                    prop_assert_eq!(evaluate(std::slice::from_ref(&rule), request).rule_id, None);
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_evaluate_in_memory_no_rules_uses_default() {
         let eval =
