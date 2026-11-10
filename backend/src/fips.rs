@@ -196,8 +196,9 @@ pub async fn db_violations(mode: FipsMode, db: &sqlx::PgPool) -> Vec<Violation> 
     if !mode.checks_enabled() {
         return v;
     }
+    // `oidc_configs` is the SSO provider table (services/auth_config_service).
     match sqlx::query_scalar::<_, String>(
-        "SELECT name FROM sso_providers WHERE allow_legacy_rsa_keys = true ORDER BY name",
+        "SELECT name FROM oidc_configs WHERE allow_legacy_rsa_keys = true ORDER BY name",
     )
     .fetch_all(db)
     .await

@@ -81,6 +81,22 @@ async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
         .await;
 }
 
+/// The database-backed policy check runs against the real schema: a fresh
+/// database has no provider allowing legacy RSA keys, so no violation, and
+/// in particular no `policy-check-failed` from a mistyped table name (the
+/// first lab deployment refused to start on exactly that).
+#[tokio::test]
+#[ignore]
+async fn db_violations_query_matches_the_schema() {
+    let pool = pool().await;
+    let violations = fips::db_violations(FipsMode::Strict, &pool).await;
+    assert!(
+        violations.is_empty(),
+        "fresh schema must yield no violations, got {violations:?}"
+    );
+    assert!(fips::db_violations(FipsMode::Off, &pool).await.is_empty());
+}
+
 /// Default mode: bcrypt is still what gets written, and a PBKDF2 hash that a
 /// strict-mode deployment wrote earlier still logs in (forward readability
 /// across a downgrade).
