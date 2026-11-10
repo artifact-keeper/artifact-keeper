@@ -13978,6 +13978,16 @@ pub async fn delete_artifact(
             )
             .await;
         }
+        // The version-level SNAPSHOT document names the newest build; drop it
+        // too so it cannot keep pointing at the build just deleted (#5667).
+        crate::api::handlers::maven::clear_stored_snapshot_version_metadata(
+            &state,
+            repo.id,
+            &repo.storage_backend,
+            &repo.storage_location(),
+            &path,
+        )
+        .await;
     }
 
     // Deleting an npm artifact changes the packument, so drop the computed
