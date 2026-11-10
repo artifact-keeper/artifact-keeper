@@ -4832,7 +4832,7 @@ async fn download_scoped_tarball(
 
 /// [`serve_tarball`] as the tarball routes answer it (#5273).
 ///
-/// npm, pnpm and Yarn fail an install on a `423` and retry a `503`. Under
+/// npm fails an install on a `423` and retries a `503`. Under
 /// `fail_closed`, a tarball whose scan is still queued or running when the
 /// request stops waiting is refused `423 scan_pending`, and a retry joins
 /// that scan or finds its verdict, so a first install failed on a refusal a
@@ -19179,6 +19179,189 @@ mod proxy_scan_block_tests {
         };
         assert_eq!(inner.status(), StatusCode::LOCKED);
         assert!(inner.headers().get("Retry-After").is_none());
+    }
+
+    /// Exercise the real npm client against the download handler, including a
+    /// Virtual member that must not fall through while its scan is pending.
+    /// The first request has no remaining wait budget; later requests can wait
+    /// for the same background scan. No paused clock runs beside the DB pool.
+    async fn npm_install_retries_pending_scan(blocked: bool) {
+        use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
+        use std::sync::{atomic::Ordering, Arc, Mutex};
+        use std::time::Duration;
+
+        let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
+            return;
+        };
+        let package = if blocked {
+            "retry-blocked"
+        } else {
+            "retry-clean"
+        };
+        let filename = format!("{package}-1.0.0.tgz");
+        let tarball = honest_tgz(package, "1.0.0");
+        let digest = sha256_hex(&tarball);
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&upstream, package, &filename, &tarball, None).await;
+        let fallback = wiremock::MockServer::start().await;
+        mount_tarball_upstream(&fallback, package, &filename, &tarball, Some(0)).await;
+        let (first, _, first_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", &upstream.uri(), 1).await;
+        let (second, _, second_dir) =
+            tdh::attach_remote_member(&fx.pool, fx.repo_id, "npm", &fallback.uri(), 2).await;
+        enable_proxy_scan(&fx.pool, first, "fail_closed").await;
+
+        let outcome = if blocked {
+            &MockCveRescan::CatalogedVulnerable("retry-blocked", "1.0.0")
+        } else {
+            &MockCveRescan::Cataloged("retry-clean", "1.0.0")
+        };
+        let (scanner, scans) = VersionedCveScanner::counting(
+            Some("grype-0.84.0-test"),
+            MockCveRescan::HangThen(Duration::from_secs(1), outcome),
+        );
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state =
+            tdh::build_scan_state_with_leaf_scanners(&fx, &storage_path, vec![Arc::new(scanner)]);
+        // Keep the scan queued until the first refusal is captured, even on
+        // a slow CI runner. The retry then waits for its actual verdict.
+        let permits = crate::services::scanner_service::test_helpers::hold_all_scan_permits().await;
+        let permits = Arc::new(Mutex::new(Some(permits)));
+        let responses = Arc::new(Mutex::new(Vec::new()));
+        let observed = responses.clone();
+        let repo_key = fx.repo_key.clone();
+        let route = format!("/npm/{repo_key}/{package}/-/{filename}");
+        let app = axum::Router::new().route(
+            &route,
+            axum::routing::get(move || {
+                let state = state.clone();
+                let repo_key = repo_key.clone();
+                let filename = filename.clone();
+                let observed = observed.clone();
+                let permits = permits.clone();
+                async move {
+                    let first_request = observed.lock().unwrap().is_empty();
+                    let budget = if first_request {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(15)
+                    };
+                    let result = REQUEST_ANSWER_BY
+                        .scope(
+                            tokio::time::Instant::now() + budget,
+                            super::download_tarball(
+                                State(state),
+                                Extension(tdh::admin_auth_ext()),
+                                Path((repo_key, package.to_string(), filename)),
+                                Default::default(),
+                            ),
+                        )
+                        .await;
+                    let resp = match result {
+                        Ok(resp) | Err(resp) => resp,
+                    };
+                    let (parts, body) = resp.into_parts();
+                    let body = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    observed.lock().unwrap().push((
+                        parts.status,
+                        parts.headers.get(axum::http::header::RETRY_AFTER).cloned(),
+                        body.clone(),
+                    ));
+                    if first_request {
+                        drop(permits.lock().unwrap().take());
+                    }
+                    Response::from_parts(parts, axum::body::Body::from(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let install_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            install_dir.path().join("package.json"),
+            r#"{"name":"retry-probe","version":"1.0.0","private":true}"#,
+        )
+        .unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(45),
+            tokio::process::Command::new("npm")
+                .args([
+                    "install",
+                    "--ignore-scripts",
+                    "--no-audit",
+                    "--no-fund",
+                    "--fetch-retries=2",
+                    "--fetch-retry-mintimeout=10",
+                    "--fetch-retry-maxtimeout=20",
+                    "--fetch-timeout=20000",
+                    "--cache",
+                ])
+                .arg(install_dir.path().join("cache"))
+                .arg(format!("http://{address}{route}"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .current_dir(install_dir.path())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        fallback.verify().await;
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        cleanup_npm_member(&fx.pool, first, &first_dir).await;
+        cleanup_npm_member(&fx.pool, second, &second_dir).await;
+        fx.teardown().await;
+
+        let output = output
+            .expect("npm install timed out")
+            .expect("npm is required for #5273");
+        assert_eq!(
+            output.status.success(),
+            !blocked,
+            "npm stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            install_dir
+                .path()
+                .join("node_modules")
+                .join(package)
+                .join("package.json")
+                .exists(),
+            !blocked
+        );
+        let responses = responses.lock().unwrap();
+        assert!(responses.len() >= 2, "the same install must retry");
+        assert_eq!(responses[0].0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(responses[0].1.as_ref().unwrap(), "5");
+        let pending: serde_json::Value = serde_json::from_slice(&responses[0].2).unwrap();
+        assert_eq!(pending["error"], "scan_pending");
+        let final_status = if blocked {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::OK
+        };
+        for (status, _, body) in responses.iter().skip(1) {
+            assert_eq!(*status, final_status);
+            if blocked {
+                let denied: serde_json::Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(denied["error"], "scan_blocked");
+            } else {
+                assert_eq!(body, &tarball);
+            }
+        }
+        assert_eq!(scans.load(Ordering::SeqCst), 1, "retries reuse the scan");
+    }
+
+    #[tokio::test]
+    async fn test_npm_install_retries_pending_virtual_scan_then_installs_5273() {
+        npm_install_retries_pending_scan(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_npm_install_retries_pending_virtual_scan_then_blocks_5273() {
+        npm_install_retries_pending_scan(true).await;
     }
 
     /// #5273: a refusal no retry resolves stays `423` on the tarball routes.

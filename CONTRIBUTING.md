@@ -41,6 +41,9 @@ set -a; . ./.env.local-dev; set +a
 AK_PRE_PUSH_TESTS=1 git push
 ```
 
+The npm scan-on-proxy regression tests in `handlers-1` also require Node.js 22
+and npm 10.9.9 (`npm install --global npm@10.9.9`), matching CI.
+
 A full test build peaks around 20 GB of rustc memory, which is why this is not the default.
 
 The hooks are fast local feedback, not a substitute for CI. Bypass once with

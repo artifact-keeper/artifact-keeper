@@ -400,7 +400,8 @@ waiting on the scan get `423`, then that verdict on their retry.
 
 #### Clients that do not retry a `423`
 
-npm, pnpm and Yarn fail an install on a `423`, and retry a `503`. So the npm
+npm retries a `503` but not a `423`. The npm 10.9.9 regression tests exercise
+both a clean and a blocking verdict after a pending scan. The npm
 tarball routes (`/npm/{key}/{package}/-/{file}`, scoped or not, Remote and
 Virtual) answer `503` with `Retry-After: 5` and the same `scan_pending` body
 when the refusal is one a retry resolves:
