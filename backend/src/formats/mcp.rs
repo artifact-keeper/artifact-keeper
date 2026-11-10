@@ -941,6 +941,47 @@ pub fn check_version(path: &str, v: &str) -> V {
     Ok(())
 }
 
+/// SemVer 2.0.0, exactly one version, without build metadata (registry
+/// versions carry none, and npm reads `1.2.3+x.tgz` as a file).
+const NPM_EXACT_VERSION_RE: &str = r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$";
+/// A PEP 440 version (the `packaging` grammar), exactly one version.
+const PYPI_EXACT_VERSION_RE: &str = r"^(?i:v?([0-9]+!)?[0-9]+(\.[0-9]+)*([-_.]?(a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?((-[0-9]+)|([-_.]?(post|rev|r)[-_.]?[0-9]*))?([-_.]?dev[-_.]?[0-9]*)?(\+[a-z0-9]+([-_.][a-z0-9]+)*)?)$";
+/// The longest npm or PyPI package version accepted.
+pub const MAX_EXACT_VERSION_LEN: usize = 256;
+
+/// The exact-version rule for an `npm` or `pypi` package version, shared by
+/// publish ([`validate_server_json`]) and the introspection worker's sandbox
+/// (#5446, #5549): `Err` names what the version must be. npm wants one
+/// SemVer 2.0.0 version without build metadata (`1.2`, `v1.2.3` and
+/// dist-tags such as `next` are not one), PyPI one PEP 440 version (no
+/// specifier); neither may end in `.tgz`, `.tar` or `.tar.gz` (npm opens
+/// such a spec as a file). Other registry types are not checked here.
+pub fn exact_package_version(
+    registry_type: &str,
+    v: &str,
+) -> std::result::Result<(), &'static str> {
+    let (ok, what) = match registry_type {
+        "npm" => (
+            re(NPM_EXACT_VERSION_RE).is_match(v),
+            "an exact SemVer version without build metadata",
+        ),
+        "pypi" => (
+            re(PYPI_EXACT_VERSION_RE).is_match(v),
+            "an exact PEP 440 version",
+        ),
+        _ => return Ok(()),
+    };
+    let lower = v.to_ascii_lowercase();
+    let archive = [".tgz", ".tar", ".tar.gz"]
+        .iter()
+        .any(|x| lower.ends_with(x));
+    if ok && v.len() <= MAX_EXACT_VERSION_LEN && !archive {
+        Ok(())
+    } else {
+        Err(what)
+    }
+}
+
 pub fn check_name(name: &str) -> V {
     let len = name.chars().count();
     if !(3..=200).contains(&len) {
@@ -1177,6 +1218,18 @@ fn validate_package(i: usize, p: &Package, allow_floating_oci: bool) -> V {
     }
     if let Some(v) = p.version.as_deref() {
         check_version(&format!("{path}.version"), v)?;
+        // A publish states one exact version the sandbox can run (#5549);
+        // a document ingested from an upstream registry keeps the looser
+        // rule, as for a floating OCI tag, and the worker reports it
+        // `unsupported` instead.
+        if !allow_floating_oci {
+            exact_package_version(&p.registry_type, v).map_err(|what| {
+                McpError::invalid(
+                    format!("{path}.version"),
+                    format!("must be {what} (not a range, tag or partial version)"),
+                )
+            })?;
+        }
     }
     check_http_url(
         &format!("{path}.registryBaseUrl"),
@@ -3098,6 +3151,65 @@ mod tests {
             )),
             "repository.subfolder"
         );
+    }
+
+    /// #5549: publish refuses an npm or PyPI package version the sandbox
+    /// worker would report `unsupported`: one exact SemVer version (npm) or
+    /// PEP 440 version (PyPI). A document ingested from an upstream registry
+    /// keeps the looser rule; other registry types are unaffected.
+    #[test]
+    fn package_versions_must_be_exact_for_npm_and_pypi_5549() {
+        let with = |p: serde_json::Value| doc(serde_json::json!({"remotes": [], "packages": [p]}));
+        let pypi = |v: &str| {
+            npm(serde_json::json!({"registryType": "pypi", "identifier": "acme-mcp", "version": v}))
+        };
+        for v in [
+            "1.2",
+            "1",
+            "v1.2.3",
+            "next",
+            "beta",
+            "1.2.3+build.5",
+            "01.2.3",
+            "1.2.3.tgz",
+        ] {
+            let d = with(npm(serde_json::json!({"version": v})));
+            match check(d.clone()) {
+                Err(McpError::Invalid { path, msg }) => {
+                    assert_eq!(path, "packages[0].version", "npm {v}");
+                    assert!(msg.contains("exact SemVer"), "npm {v}: {msg}");
+                }
+                other => panic!("npm {v}: expected Invalid, got {other:?}"),
+            }
+            // Ingest keeps the looser rule.
+            let s = parse_server_json(&serde_json::to_vec(&d).unwrap()).unwrap();
+            assert!(
+                validate_server_json_opts(&s, true).is_ok(),
+                "ingest npm {v}"
+            );
+        }
+        for v in ["1.0.0", "0.1.0-beta.2", "10.20.30-rc.1"] {
+            assert!(
+                check(with(npm(serde_json::json!({"version": v})))).is_ok(),
+                "npm {v}"
+            );
+        }
+        for v in ["next", "1.0.tar.gz", "1.0-final"] {
+            assert_eq!(
+                invalid_path(with(pypi(v))),
+                "packages[0].version",
+                "pypi {v}"
+            );
+        }
+        for v in ["1.0", "2", "1.0.0rc1", "1.0.post1", "1!2.0", "1.0+local.1"] {
+            assert!(check(with(pypi(v))).is_ok(), "pypi {v}");
+        }
+        // Other registry types keep the generic rule only.
+        let nuget = npm(
+            serde_json::json!({"registryType": "nuget", "identifier": "Acme.Mcp", "version": "1.2"}),
+        );
+        assert!(check(with(nuget)).is_ok());
+        assert_eq!(exact_package_version("cargo", "1.2"), Ok(()));
     }
 
     #[test]

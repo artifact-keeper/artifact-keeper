@@ -240,6 +240,19 @@ publish answers `202 resolving` and `mcp-publisher` prints that as an error
 although the version was stored. Do not run it again; see [Packages in a
 Remote backing repository](#packages-in-a-remote-backing-repository).
 
+A package `version` names one exact version. For every registry type it is
+1 to 255 characters and not `latest`, a range (`^1`, `~1`, `>=1`, `1 || 2`)
+or a wildcard (`1.x`, `*`). An `npm` package version must also be one SemVer
+2.0.0 version without build metadata (`1.2.3`, `1.2.3-rc.1`; not `1.2`,
+`v1.2.3`, `1.2.3+build` or a dist-tag such as `next`) and a `pypi` one a PEP
+440 version (`1.0`, `1.0.0rc1`; not a specifier). Neither may end in `.tgz`,
+`.tar` or `.tar.gz`. This is the rule the introspection sandbox applies
+before it runs a package (see [Capabilities and
+introspection](#capabilities-and-introspection)), so a version publish
+accepts is one the sandbox can run. A version that breaks it is `400
+mcp_invalid_server_json` naming `packages[N].version`. Documents ingested
+from an upstream registry into a Remote repository keep the generic rule.
+
 Names follow the schema (`namespace/name`, 3 to 200 characters). The
 `io.modelcontextprotocol` namespace and its sub-namespaces (including
 `io.modelcontextprotocol.anonymous`) are reserved and refused with `403`. A
