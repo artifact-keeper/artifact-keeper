@@ -5111,4 +5111,40 @@ mod tests {
         version_compare_is_a_total_order,
         |a: &str, b: &str| version_compare(a, b).cmp(&0)
     );
+
+    /// The comparator orders valid SemVer versions exactly as npm's `semver`
+    /// does (reference fixture, `scripts/reference/gen_npm_fixture.js`).
+    #[test]
+    fn version_compare_agrees_with_npm_semver() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_fixtures/reference/npm.json")).unwrap();
+        let versions: Vec<(String, u64)> = fixture["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["valid"].as_bool().unwrap())
+            .map(|r| {
+                (
+                    r["version"].as_str().unwrap().to_string(),
+                    r["rank"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert!(versions.len() > 200, "fixture loaded");
+        let mut wrong = Vec::new();
+        for (i, (a, ra)) in versions.iter().enumerate() {
+            for (b, rb) in versions.iter().skip(i + 1) {
+                let got = version_compare(a, b).cmp(&0);
+                if got != ra.cmp(rb) {
+                    wrong.push(format!("{a:?} vs {b:?}: {got:?}, semver {:?}", ra.cmp(rb)));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreements:\n{}",
+            wrong.len(),
+            wrong[..wrong.len().min(10)].join("\n")
+        );
+    }
 }

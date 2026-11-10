@@ -3218,15 +3218,21 @@ fn merge_packument_into(acc: &mut serde_json::Value, next: serde_json::Value) {
 /// Choose the `latest` dist-tag for a set of versions when none is recorded.
 ///
 /// Per npm convention `latest` should be the highest **non-prerelease** semver,
-/// never auto-set to a prerelease by recency. We compare on the numeric
-/// `major.minor.patch` core (build metadata and prerelease suffixes are
-/// stripped); a version carrying a `-prerelease` suffix is excluded from the
-/// stable candidates. Falls back to the highest version overall when every
-/// version is a prerelease, and to the last (most-recently-created) version
-/// when nothing parses as semver. Returns `None` only for an empty input.
+/// never auto-set to a prerelease by recency. Versions are compared by SemVer
+/// precedence (build metadata ignored), so among pre-releases of one release
+/// `1.0.0-rc.1` outranks `1.0.0-alpha` whatever order they were published in.
+/// A version that is not strict SemVer but has a numeric `major[.minor[.patch]]`
+/// core still takes part, ranked by that core. Falls back to the highest
+/// version overall when every version is a prerelease, and to the last
+/// (most-recently-created) version when nothing parses. Ties go to the
+/// later-listed version. Returns `None` only for an empty input.
 fn derive_latest_version(versions: &[String]) -> Option<String> {
-    // Parse into (major, minor, patch, is_prerelease); `None` if not semver-ish.
-    fn parse(v: &str) -> Option<(u64, u64, u64, bool)> {
+    // `(precedence key, is_prerelease)`; `None` if not semver-ish.
+    fn parse(v: &str) -> Option<(semver::Version, bool)> {
+        if let Ok(strict) = semver::Version::parse(v) {
+            let is_pre = !strict.pre.is_empty();
+            return Some((strict, is_pre));
+        }
         let core = v.split('+').next().unwrap_or(v); // drop +build metadata
         let (mmp, is_pre) = match core.split_once('-') {
             Some((head, _pre)) => (head, true),
@@ -3236,27 +3242,24 @@ fn derive_latest_version(versions: &[String]) -> Option<String> {
         let major = parts.next()?.parse::<u64>().ok()?;
         let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
         let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
-        Some((major, minor, patch, is_pre))
+        Some((semver::Version::new(major, minor, patch), is_pre))
     }
 
-    let mut best_stable: Option<(&String, (u64, u64, u64))> = None;
-    let mut best_any: Option<(&String, (u64, u64, u64))> = None;
-    for v in versions {
-        if let Some((major, minor, patch, is_pre)) = parse(v) {
-            let key = (major, minor, patch);
-            // Prefer the later-listed (more recent) version on ties.
-            if best_any.as_ref().is_none_or(|(_, k)| key >= *k) {
-                best_any = Some((v, key));
-            }
-            if !is_pre && best_stable.as_ref().is_none_or(|(_, k)| key >= *k) {
-                best_stable = Some((v, key));
-            }
-        }
-    }
+    let parsed: Vec<(&String, semver::Version, bool)> = versions
+        .iter()
+        .filter_map(|v| parse(v).map(|(key, is_pre)| (v, key, is_pre)))
+        .collect();
+    // `max_by` keeps the last of equal elements: the later-listed version.
+    let best = |stable_only: bool| {
+        parsed
+            .iter()
+            .filter(|(_, _, is_pre)| !(stable_only && *is_pre))
+            .max_by(|a, b| a.1.cmp_precedence(&b.1))
+            .map(|(v, _, _)| (*v).clone())
+    };
 
-    best_stable
-        .map(|(v, _)| v.clone())
-        .or_else(|| best_any.map(|(v, _)| v.clone()))
+    best(true)
+        .or_else(|| best(false))
         .or_else(|| versions.last().cloned())
 }
 
@@ -14249,6 +14252,62 @@ mod tests {
     #[test]
     fn test_derive_latest_empty_is_none() {
         assert_eq!(derive_latest_version(&[]), None);
+    }
+
+    /// `derive_latest_version` against npm's `semver` (reference fixture):
+    /// the highest stable version, or the highest version overall when every
+    /// one is a pre-release.
+    #[test]
+    fn derive_latest_version_follows_semver_precedence() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../test_fixtures/reference/npm.json"))
+                .unwrap();
+        let versions: Vec<(String, u64, bool)> = fixture["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["valid"].as_bool().unwrap())
+            .map(|r| {
+                (
+                    r["version"].as_str().unwrap().to_string(),
+                    r["rank"].as_u64().unwrap(),
+                    r["prerelease"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let mut wrong = 0;
+        let mut total = 0;
+        let mut examples: Vec<String> = Vec::new();
+        // Deterministic windows of 4 over a stride, in both directions.
+        for start in 0..versions.len().saturating_sub(4) {
+            for stride in [1usize, 7, 13] {
+                let mut set: Vec<&(String, u64, bool)> = (0..4)
+                    .map(|k| &versions[(start + k * stride) % versions.len()])
+                    .collect();
+                for _ in 0..2 {
+                    set.reverse();
+                    total += 1;
+                    let input: Vec<String> = set.iter().map(|v| v.0.clone()).collect();
+                    let stable_best = set.iter().filter(|v| !v.2).map(|v| v.1).max();
+                    let best_rank =
+                        stable_best.unwrap_or_else(|| set.iter().map(|v| v.1).max().unwrap());
+                    let got = derive_latest_version(&input).unwrap();
+                    let got_rank = set.iter().find(|v| v.0 == got).unwrap().1;
+                    if got_rank != best_rank {
+                        wrong += 1;
+                        if examples.len() < 10 {
+                            examples.push(format!("latest of {input:?} = {got:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            wrong,
+            0,
+            "{wrong} of {total} sets disagree with semver:\n{}",
+            examples.join("\n")
+        );
     }
 
     // -----------------------------------------------------------------------
