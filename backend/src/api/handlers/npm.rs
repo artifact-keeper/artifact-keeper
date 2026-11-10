@@ -3066,7 +3066,15 @@ async fn get_scoped_version_metadata(
     if let Some((scope_part, name_part)) = encoded_scoped_tarball_parts(&scope, &package) {
         let full_name = build_scoped_package_name(scope_part, name_part);
         validate_package_name(&full_name)?;
-        return serve_tarball(&state, auth.as_ref(), &repo_key, &full_name, &version, &ctx).await;
+        return serve_tarball_to_client(
+            &state,
+            auth.as_ref(),
+            &repo_key,
+            &full_name,
+            &version,
+            &ctx,
+        )
+        .await;
     }
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
@@ -4798,7 +4806,7 @@ async fn download_tarball(
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    serve_tarball(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
+    serve_tarball_to_client(&state, auth.as_ref(), &repo_key, &package, &filename, &ctx).await
 }
 
 async fn download_scoped_tarball(
@@ -4811,7 +4819,7 @@ async fn download_scoped_tarball(
     let package = normalize_package_name(&package);
     let full_name = build_scoped_package_name(&scope, &package);
     validate_package_name(&full_name)?;
-    serve_tarball(
+    serve_tarball_to_client(
         &state,
         auth.as_ref(),
         &repo_key,
@@ -4820,6 +4828,29 @@ async fn download_scoped_tarball(
         &ctx,
     )
     .await
+}
+
+/// [`serve_tarball`] as the tarball routes answer it (#5273).
+///
+/// npm, pnpm and Yarn fail an install on a `423` and retry a `503`. Under
+/// `fail_closed`, a tarball whose scan is still queued or running when the
+/// request stops waiting is refused `423 scan_pending`, and a retry joins
+/// that scan or finds its verdict, so a first install failed on a refusal a
+/// retry would have resolved. That refusal goes to the client as `503` with
+/// `Retry-After`. A `423` no retry resolves is left as it is, and so is
+/// everything else. [`serve_tarball`] itself keeps answering `423`: its
+/// Virtual walk ends on that status.
+async fn serve_tarball_to_client(
+    state: &SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    repo_key: &str,
+    package_name: &str,
+    filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
+) -> Result<Response, Response> {
+    serve_tarball(state, auth, repo_key, package_name, filename, ctx)
+        .await
+        .map_err(proxy_helpers::scan_pending_as_retryable_503)
 }
 
 /// Fetch an npm tarball from a virtual member's local storage, matching
@@ -19043,6 +19074,160 @@ mod proxy_scan_block_tests {
                 "fail-closed inconclusive must be 423 Locked"
             ),
         }
+    }
+
+    /// #5273: a tarball whose scan is still running when the request stops
+    /// waiting is refused with a status npm retries. The tarball routes answer
+    /// `503` with `Retry-After` and the `scan_pending` body, where they
+    /// answered a `423` that fails `npm install`; `serve_tarball` underneath
+    /// still answers the `423` its Virtual walk ends on. The scan outlasts both
+    /// requests in real time: no paused clock next to a database pool.
+    #[tokio::test]
+    async fn test_tarball_route_answers_a_pending_scan_503_with_retry_after_5273() {
+        use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
+
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("slowscan-widget", "1.0.0");
+        let digest = sha256_hex(&tarball);
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "slowscan-widget",
+            "slowscan-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let state = tdh::build_scan_state_with_leaf_scanners(
+            &fx,
+            &storage_path,
+            vec![std::sync::Arc::new(VersionedCveScanner::new(
+                Some("grype-0.84.0-test"),
+                MockCveRescan::Hang(std::time::Duration::from_secs(120)),
+            ))],
+        );
+        let auth = tdh::admin_auth_ext();
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext::default();
+        let answer_in = std::time::Duration::from_secs(1);
+
+        // What the client is sent.
+        let routed = REQUEST_ANSWER_BY
+            .scope(
+                tokio::time::Instant::now() + answer_in,
+                super::serve_tarball_to_client(
+                    &state,
+                    auth.as_ref(),
+                    &fx.repo_key,
+                    "slowscan-widget",
+                    "slowscan-widget-1.0.0.tgz",
+                    &ctx,
+                ),
+            )
+            .await;
+        // What the handler underneath answers, on a retry that joins the scan.
+        let inner = REQUEST_ANSWER_BY
+            .scope(
+                tokio::time::Instant::now() + answer_in,
+                super::serve_tarball(
+                    &state,
+                    auth.as_ref(),
+                    &fx.repo_key,
+                    "slowscan-widget",
+                    "slowscan-widget-1.0.0.tgz",
+                    &ctx,
+                ),
+            )
+            .await;
+
+        cleanup_proxy_scan_row(&fx.pool, &digest).await;
+        fx.teardown().await;
+
+        let routed = match routed {
+            Ok(r) => panic!(
+                "a tarball with no verdict must not be served under fail_closed, got {}",
+                r.status()
+            ),
+            Err(resp) => resp,
+        };
+        assert_eq!(
+            routed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "npm retries a 503 and gives up on a 423"
+        );
+        let retry_after = proxy_helpers::SCAN_PENDING_RETRY_AFTER_SECS.to_string();
+        assert_eq!(
+            routed.headers()[axum::http::header::RETRY_AFTER],
+            retry_after.as_str()
+        );
+        let body = axum::body::to_bytes(routed.into_body(), 16 * 1024)
+            .await
+            .expect("scan_pending body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("scan_pending JSON");
+        assert_eq!(json["error"], "scan_pending");
+        assert_eq!(json["file"], "slowscan-widget-1.0.0.tgz");
+
+        let inner = match inner {
+            Ok(r) => panic!("the retry must wait on the scan too, got {}", r.status()),
+            Err(resp) => resp,
+        };
+        assert_eq!(inner.status(), StatusCode::LOCKED);
+        assert!(inner.headers().get("Retry-After").is_none());
+    }
+
+    /// #5273: a refusal no retry resolves stays `423` on the tarball routes.
+    /// With no scanner on the state the scan is inconclusive for good, and a
+    /// `503` would only make npm ask twice more before failing the same way.
+    #[tokio::test]
+    async fn test_tarball_route_keeps_423_for_a_scan_that_cannot_run_5273() {
+        let Some(fx) = tdh::Fixture::setup("remote", "npm").await else {
+            return;
+        };
+        let tarball = honest_tgz("noscanner-widget", "1.0.0");
+
+        let upstream = wiremock::MockServer::start().await;
+        mount_tarball_upstream(
+            &upstream,
+            "noscanner-widget",
+            "noscanner-widget-1.0.0.tgz",
+            &tarball,
+            None,
+        )
+        .await;
+        point_upstream(&fx, &upstream).await;
+        enable_proxy_scan(&fx.pool, fx.repo_id, "fail_closed").await;
+
+        let storage_path = fx.storage_dir.to_str().unwrap().to_string();
+        let proxy = tdh::build_proxy_service_with_fs(fx.pool.clone(), storage_path.as_str());
+        let state = tdh::build_state_with_proxy(fx.pool.clone(), storage_path.as_str(), proxy);
+
+        let result = super::serve_tarball_to_client(
+            &state,
+            tdh::admin_auth_ext().as_ref(),
+            &fx.repo_key,
+            "noscanner-widget",
+            "noscanner-widget-1.0.0.tgz",
+            &Default::default(),
+        )
+        .await;
+
+        fx.teardown().await;
+
+        let resp = match result {
+            Ok(r) => panic!(
+                "fail-closed must never serve unscanned bytes, got {}",
+                r.status()
+            ),
+            Err(resp) => resp,
+        };
+        assert_eq!(resp.status(), StatusCode::LOCKED);
+        assert!(resp.headers().get("Retry-After").is_none());
     }
 
     /// Fail-open first pull serves LOUDLY: 200 with `X-AK-Scan: pending`, the

@@ -79,6 +79,7 @@ Responses:
 | Vulnerable, record-only | `200` | `X-AK-Scan: recorded` |
 | Vulnerable and blocked by the policy | `403` | `{"error": "scan_blocked", "file": ...}` |
 | No conclusive verdict under fail-closed | `423` | `{"error": "scan_pending", "file": ...}`; retry later |
+| Scan still queued or running under fail-closed, npm tarball routes | `503` | The same `scan_pending` body with `Retry-After: 5`; see [Clients that do not retry a `423`](#clients-that-do-not-retry-a-423) |
 | Scan configuration unreadable (database fault) | `503` | Retry later; never served unscanned |
 | Requested through the generic download route instead of the format route | `403` | `{"error": "scan_on_proxy_route_required", "file": ..., "handler": ...}`; see [The generic download route](#the-generic-download-route) |
 
@@ -397,6 +398,30 @@ its verdict: the file is served, or `403` if the verdict blocks it. A
 is recorded for the same bytes while a scan runs, that one stands, and requests
 waiting on the scan get `423`, then that verdict on their retry.
 
+#### Clients that do not retry a `423`
+
+npm, pnpm and Yarn fail an install on a `423`, and retry a `503`. So the npm
+tarball routes (`/npm/{key}/{package}/-/{file}`, scoped or not, Remote and
+Virtual) answer `503` with `Retry-After: 5` and the same `scan_pending` body
+when the refusal is one a retry resolves:
+
+| Why the request was refused | npm tarball routes | Every other route |
+| --- | --- | --- |
+| The scan was still queued or running at one of the limits above, or there was no room to start it | `503`, `Retry-After: 5` | `423` |
+| No scanner, a scan that failed, a file over the 200 MiB cap | `423` | `423` |
+| What the bytes are served as cannot be established | `423` (`scan_identity_unestablished`) | `423` |
+
+The gate is the same either way: no byte is served without a verdict, and a
+verdict that blocks is `403` on the retry. npm asks three times in all with its
+default settings (`fetch-retries` 2), 10 seconds after the first refusal and 60
+seconds after the second, and each attempt waits on the scan as above. The
+first retry arrives while a queued scan still has its place. An install that is
+refused three times fails with `503`, not `423`.
+
+These responses are `5xx`, so they count in whatever watches the server error
+rate; the gate's own metrics still label them `inconclusive` / `locked`. Other
+formats' routes are unchanged.
+
 The table of scans belongs to one backend process:
 
 - A retry that reaches another replica starts a second scan there. Both record a
@@ -430,7 +455,7 @@ what sits in front of the backend needs to allow for it:
 | In front of the backend | Default | What happens past it |
 | --- | --- | --- |
 | nginx, ingress-nginx `proxy_read_timeout` | 60 s | The client gets `504`. The scan carries on for the retry. |
-| npm `fetch-timeout` | 300 s | No effect at these limits. npm retries a `504` but not a `423`. |
+| npm `fetch-timeout` | 300 s | No effect at these limits. npm retries a `504`, and the `503` its tarball routes answer for a scan still in flight, but not a `423`. |
 | pip `--timeout` | 15 s | pip retries, joining the scan. |
 | cargo `http.timeout` | 30 s | cargo retries, joining the scan. |
 | apt `Acquire::http::Timeout` | 120 s | No effect at these limits. |
