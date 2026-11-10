@@ -52,9 +52,6 @@ disallowed-types = [
     # `rsa::RsaPrivateKey` joins this list with #5586, when repository RSA
     # signing moves onto the module. Until then the `rsa` crate does the RSA
     # arithmetic over digests the facade computes.
-    { path = "rand::rngs::SysRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
-    { path = "rand08::rngs::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
-    { path = "rsa::rand_core::OsRng", reason = "CRYPTO: use crate::crypto::rng::ModuleRng; see #5579" },
 ]
 
 # result_large_err threshold — see #3551.

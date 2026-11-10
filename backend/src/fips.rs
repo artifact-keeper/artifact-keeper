@@ -167,24 +167,44 @@ pub fn config_violations(config: &Config) -> Vec<Violation> {
             "set DATA_ENCRYPTION_KEY (32 random bytes, base64) or DATA_ENCRYPTION_KEY_FILE, then run `reencrypt-secrets`",
         ));
     }
-    if env_flag("LDAP_INSECURE_TLS") {
+    // Each flag is parsed exactly the way the service that honours it parses
+    // it, so strict never refuses a value the service ignores, nor accepts
+    // one it honours.
+    if env_flag_exact("LDAP_INSECURE_TLS") {
         v.push(Violation::new(
             "ldap-insecure-tls",
             "LDAP_INSECURE_TLS=true disables certificate verification for LDAP",
             "unset it and set LDAP_CA_CERT_PATH to the directory's CA",
         ));
     }
+    if env_flag_lowercase("S3_INSECURE_TLS") {
+        v.push(Violation::new(
+            "s3-insecure-tls",
+            "S3_INSECURE_TLS=true disables certificate verification for object storage",
+            "unset it and trust the storage endpoint's CA through the OS store or CUSTOM_CA_CERT_PATH",
+        ));
+    }
+    if config.opensearch_allow_invalid_certs {
+        v.push(Violation::new(
+            "opensearch-allow-invalid-certs",
+            "OPENSEARCH_ALLOW_INVALID_CERTS=true disables certificate verification for search",
+            "unset it and trust the search endpoint's CA",
+        ));
+    }
     v
 }
 
-fn env_flag(name: &str) -> bool {
+/// `services/ldap_service.rs`: exactly `true` or `1`.
+fn env_flag_exact(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+}
+
+/// `storage/s3.rs`: lower-cased `true`, or `1`.
+fn env_flag_lowercase(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v.to_lowercase() == "true" || v == "1")
         .unwrap_or(false)
 }
 
@@ -215,6 +235,30 @@ pub async fn db_violations(mode: FipsMode, db: &sqlx::PgPool) -> Vec<Violation> 
         Err(e) => v.push(Violation::new(
             "policy-check-failed",
             format!("could not inspect SSO provider configuration: {e}"),
+            "make sure the database is reachable and migrations have run",
+        )),
+    }
+    // Per-provider LDAP skip-verify (migration 174) is honoured by
+    // `ldap_service` exactly like LDAP_INSECURE_TLS, so it is refused the
+    // same way.
+    match sqlx::query_scalar::<_, String>(
+        "SELECT name FROM ldap_configs WHERE insecure_skip_verify = true ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    {
+        Ok(names) => {
+            for name in names {
+                v.push(Violation::new(
+                    "ldap-insecure-tls",
+                    format!("LDAP provider {name:?} has insecure_skip_verify enabled"),
+                    "disable insecure_skip_verify on the provider and configure its CA certificate",
+                ));
+            }
+        }
+        Err(e) => v.push(Violation::new(
+            "policy-check-failed",
+            format!("could not inspect LDAP provider configuration: {e}"),
             "make sure the database is reachable and migrations have run",
         )),
     }
@@ -256,16 +300,32 @@ pub fn strict() -> bool {
     mode().is_strict()
 }
 
-/// The `/health` report for the current process.
+/// The `/health` report for the current process, with full violation text.
 pub fn health_report() -> CryptoHealth {
+    health_report_for(true)
+}
+
+/// The `/health` report. With `expose_details` false (the unauthenticated
+/// default, #2226) each violation keeps its stable `code` but its message
+/// and hint are replaced, since they can name providers and quote database
+/// errors.
+pub fn health_report_for(expose_details: bool) -> CryptoHealth {
     let installed = INSTALLED.get();
+    let mut violations = installed.map(|i| i.violations.clone()).unwrap_or_default();
+    if !expose_details {
+        for v in &mut violations {
+            v.message =
+                "details withheld; set EXPOSE_DETAILED_HEALTH=true or read the startup log".into();
+            v.hint = "";
+        }
+    }
     CryptoHealth {
         provider: crate::crypto::provider_name(),
         provider_version: crate::crypto::provider_version(),
         fips_build: cfg!(feature = "fips"),
         fips_module_active: crate::crypto::module_fips_active(),
         mode: installed.map(|i| i.mode).unwrap_or_default(),
-        violations: installed.map(|i| i.violations.clone()).unwrap_or_default(),
+        violations,
     }
 }
 
@@ -402,15 +462,18 @@ mod tests {
         assert!(config_violations(&c).is_empty());
 
         c.fips_mode = FipsMode::Warn;
+        c.opensearch_allow_invalid_certs = true;
         let codes: Vec<_> = config_violations(&c).into_iter().map(|v| v.code).collect();
         assert_eq!(
             codes,
             vec![
                 "jwt-secret-length",
                 "smtp-tls-skip-verify",
-                "data-encryption-key-missing"
+                "data-encryption-key-missing",
+                "opensearch-allow-invalid-certs"
             ]
         );
+        c.opensearch_allow_invalid_certs = false;
 
         c.jwt_secret = "x".repeat(MIN_JWT_SECRET_BYTES_FIPS);
         c.smtp_tls_skip_verify = false;
@@ -453,6 +516,27 @@ mod tests {
     }
 
     #[test]
+    fn health_report_for_redacts_violation_text_unless_exposed() {
+        let v = vec![Violation::new("a", "provider \"corp\" is bad", "fix a")];
+        let s = decide(FipsMode::Warn, &v);
+        assert_eq!(s, Ok(()));
+        // The redaction is a pure function of the stored list; exercise it on
+        // a local copy since INSTALLED is process-global.
+        let mut redacted = v.clone();
+        for r in &mut redacted {
+            r.message =
+                "details withheld; set EXPOSE_DETAILED_HEALTH=true or read the startup log".into();
+            r.hint = "";
+        }
+        assert_eq!(redacted[0].code, "a");
+        assert!(!redacted[0].message.contains("corp"));
+        assert!(health_report_for(false)
+            .violations
+            .iter()
+            .all(|v| v.hint.is_empty()));
+    }
+
+    #[test]
     fn rustls_provider_install_reports_fips_according_to_build() {
         let fips = install_rustls_provider(FipsMode::Off);
         assert!(!fips || cfg!(feature = "fips"));
@@ -462,20 +546,22 @@ mod tests {
     }
 
     #[test]
-    fn env_flag_parsing() {
+    fn env_flags_parse_like_the_services_that_honour_them() {
         let key = "AK_TEST_FIPS_ENV_FLAG_5580";
         std::env::remove_var(key);
-        assert!(!env_flag(key));
-        for (v, want) in [
-            ("1", true),
-            ("true", true),
-            ("YES", true),
-            ("on", true),
-            ("0", false),
-            ("no", false),
+        assert!(!env_flag_exact(key));
+        assert!(!env_flag_lowercase(key));
+        for (v, exact, lower) in [
+            ("1", true, true),
+            ("true", true, true),
+            ("TRUE", false, true),
+            ("yes", false, false),
+            ("on", false, false),
+            ("0", false, false),
         ] {
             std::env::set_var(key, v);
-            assert_eq!(env_flag(key), want, "{v}");
+            assert_eq!(env_flag_exact(key), exact, "exact {v}");
+            assert_eq!(env_flag_lowercase(key), lower, "lowercase {v}");
         }
         std::env::remove_var(key);
     }

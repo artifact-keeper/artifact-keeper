@@ -293,6 +293,10 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         artifact_keeper_backend::services::auth_service::install_pbkdf2_iterations(
             config.pbkdf2_iterations,
         );
+        // Not a violation in any mode, but loud: rows that need the data
+        // key while none is configured (a downgrade that dropped it).
+        artifact_keeper_backend::services::encryption::warn_if_data_key_rows_unreadable(&db_pool)
+            .await;
     }
 
     let setup_required = provision_admin_user(
@@ -1790,12 +1794,17 @@ async fn main() -> Result<()> {
     run_server(None).await
 }
 
-#[cfg(not(windows))]
 async fn reencrypt_secrets_command() -> Result<()> {
     use artifact_keeper_backend::error::AppError;
     use artifact_keeper_backend::services::encryption;
 
     tracing_subscriber::fmt().with_env_filter("info").init();
+    // Same environment the server sees: `.env` / AK_ENV_FILE first.
+    if let Ok(env_file) = std::env::var("AK_ENV_FILE") {
+        dotenvy::from_path(&env_file).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
     let config = Config::from_env()?;
     let raw = config.data_encryption_key.as_deref().ok_or_else(|| {
         AppError::Config("reencrypt-secrets needs DATA_ENCRYPTION_KEY (or _FILE) set".into())
@@ -1807,7 +1816,13 @@ async fn reencrypt_secrets_command() -> Result<()> {
     let db_pool = sqlx::PgPool::connect(&config.database_url)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-    let report = encryption::reencrypt_legacy_rows(&db_pool, &config.jwt_secret).await?;
+    // Each column is read back with the passphrase its writer used.
+    let keys = encryption::ReencryptKeys {
+        sso: artifact_keeper_backend::services::auth_config_service::encryption_key(),
+        jwt: config.jwt_secret.clone(),
+        migration: artifact_keeper_backend::api::handlers::migration::migration_encryption_key()?,
+    };
+    let report = encryption::reencrypt_legacy_rows(&db_pool, &keys).await?;
     println!("{report}");
     if report.failed > 0 {
         return Err(AppError::Internal(format!(
@@ -1824,7 +1839,13 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "--service") {
+    if args.get(1).map(String::as_str) == Some("reencrypt-secrets") {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime");
+        runtime.block_on(reencrypt_secrets_command())
+    } else if args.iter().any(|a| a == "--service") {
         windows_service::run_as_service().map_err(|e| {
             eprintln!("Service error: {e}");
             AppError::Config(e.to_string())

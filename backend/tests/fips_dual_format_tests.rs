@@ -83,8 +83,8 @@ async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
 
 /// The database-backed policy check runs against the real schema: a fresh
 /// database has no provider allowing legacy RSA keys, so no violation, and
-/// in particular no `policy-check-failed` from a mistyped table name (the
-/// first lab deployment refused to start on exactly that).
+/// in particular no `policy-check-failed` from a mistyped table name (a
+/// strict-mode deployment refused to start on exactly that once).
 #[tokio::test]
 #[ignore]
 async fn db_violations_query_matches_the_schema() {

@@ -33,6 +33,12 @@ impl TokenKey {
         Self(hmac::Key::sha256(&k))
     }
 
+    /// Use an already-derived 32-byte subkey (the `token-hmac` subkey of the
+    /// dedicated data key, #5583) as the token key.
+    pub fn from_subkey(subkey: &[u8]) -> Self {
+        Self(hmac::Key::sha256(subkey))
+    }
+
     /// The stored form of `token`.
     pub fn hash(&self, token: &str) -> String {
         format!("{HMAC_PREFIX}{}", self.0.sign_hex(token.as_bytes()))

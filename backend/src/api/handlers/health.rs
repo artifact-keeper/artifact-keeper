@@ -564,7 +564,10 @@ pub async fn health_check(State(state): State<SharedState>) -> impl IntoResponse
         db_pool,
         commit,
         dirty,
-        crypto: crate::fips::health_report(),
+        // Violation texts name providers and quote database errors; like
+        // db_pool/commit above (#2226) they are only published when the
+        // operator opts in. Codes and the mode are always visible.
+        crypto: crate::fips::health_report_for(state.config.expose_detailed_health),
         skipped_storage_backends,
     };
 

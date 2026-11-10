@@ -1142,6 +1142,11 @@ pub(crate) fn bcrypt_cost() -> u32 {
 /// count, like [`bcrypt_cost`] does for bcrypt.
 static PBKDF2_ITERATIONS: OnceLock<u32> = OnceLock::new();
 
+/// The fixed, non-secret input the timing-pad dummies are built from and
+/// verified against. It matches nothing stored anywhere; it exists so every
+/// rejection path performs a full hash computation.
+const TIMING_PAD_INPUT: &str = "__dummy_timing_pad__";
+
 pub fn install_pbkdf2_iterations(iterations: u32) {
     let _ = PBKDF2_ITERATIONS.set(iterations.max(crate::crypto::password::MIN_ITERATIONS));
 }
@@ -1164,7 +1169,17 @@ impl AuthService {
     /// Key under which API-token secrets are stored in strict mode: derived
     /// from the deployment secret, never the raw `JWT_SECRET` (#5582).
     fn api_token_key(&self) -> crate::crypto::token::TokenKey {
-        crate::crypto::token::TokenKey::derive(self.config.jwt_secret.as_bytes())
+        // The data key's `token-hmac` subkey when configured (#5583), else
+        // derived from JWT_SECRET; see docs/fips.md on rotation.
+        crate::services::encryption::token_key_for(&self.config.jwt_secret)
+    }
+
+    /// A syntactically valid keyed-form stored token that matches nothing,
+    /// so an unknown prefix costs the same HMAC compare as a known one in
+    /// strict mode instead of a 210k-iteration PBKDF2 run that would reveal
+    /// which prefixes exist.
+    fn dummy_api_token_hash() -> &'static str {
+        "$hmac-sha256$0000000000000000000000000000000000000000000000000000000000000000"
     }
 
     /// Stored form of an API token: keyed HMAC in strict mode, bcrypt
@@ -1872,6 +1887,18 @@ impl AuthService {
             _ => Self::dummy_bcrypt_hash(),
         };
         let password_matches = Self::verify_password(password, hash_to_verify).await?;
+        // Strict mode during the bcrypt -> PBKDF2 migration: a user row can be
+        // either family while the unknown-user pad is PBKDF2, so every login
+        // path also runs the *other* family's dummy. Unknown, legacy and
+        // migrated users then all cost one bcrypt plus one PBKDF2 (#5582).
+        if crate::fips::strict() {
+            use crate::crypto::password::{format_of, Format};
+            let other = match format_of(hash_to_verify) {
+                Ok(Format::Bcrypt) => Self::dummy_pbkdf2_hash(),
+                _ => Self::dummy_legacy_bcrypt_hash(),
+            };
+            let _ = Self::verify_password(TIMING_PAD_INPUT, other).await;
+        }
 
         if let Some(reason) = rejection {
             return Err(Self::reject_login(username, reason, entry));
@@ -3265,8 +3292,19 @@ impl AuthService {
             // Reads bcrypt and PBKDF2 alike (#5582). A bcrypt match while
             // FIPS checks are on is a legacy verification: counted so an
             // operator can watch the migration drain.
-            let matched = crate::crypto::password::verify(&pwd, &h)
-                .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))?;
+            // An unreadable stored hash is a failed login, not an outage; it
+            // is logged so the operator can find the row.
+            let matched = match crate::crypto::password::verify(&pwd, &h) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "security",
+                        error = %e,
+                        "stored password hash could not be interpreted; treating as a mismatch"
+                    );
+                    false
+                }
+            };
             if matched
                 && checks_enabled
                 && crate::crypto::password::format_of(&h)
@@ -3295,17 +3333,28 @@ impl AuthService {
     /// In `FIPS_MODE=strict` the real hashes are PBKDF2 at the configured
     /// iteration count, so the dummy is too (#5582); the name is historical.
     fn dummy_bcrypt_hash() -> &'static str {
+        if crate::fips::strict() {
+            Self::dummy_pbkdf2_hash()
+        } else {
+            Self::dummy_legacy_bcrypt_hash()
+        }
+    }
+
+    /// A bcrypt dummy at the real cost, whatever the mode (#5582: the
+    /// strict-mode timing pad runs both families, see `authenticate_inner`).
+    fn dummy_legacy_bcrypt_hash() -> &'static str {
         static DUMMY: OnceLock<String> = OnceLock::new(); //NOSONAR - intentional dummy hash for constant-time rejection
         DUMMY.get_or_init(|| {
-            if crate::fips::strict() {
-                crate::crypto::password::hash_pbkdf2_with(
-                    "__dummy_timing_pad__",
-                    pbkdf2_iterations(),
-                )
-            } else {
-                crate::crypto::password::hash_bcrypt("__dummy_timing_pad__", bcrypt_cost())
-                    .expect("bcrypt hash generation must not fail")
-            }
+            crate::crypto::password::hash_bcrypt(TIMING_PAD_INPUT, bcrypt_cost())
+                .expect("bcrypt hash generation must not fail")
+        })
+    }
+
+    /// A PBKDF2 dummy at the configured iteration count.
+    fn dummy_pbkdf2_hash() -> &'static str {
+        static DUMMY: OnceLock<String> = OnceLock::new(); //NOSONAR - intentional dummy hash for constant-time rejection
+        DUMMY.get_or_init(|| {
+            crate::crypto::password::hash_pbkdf2_with(TIMING_PAD_INPUT, pbkdf2_iterations())
         })
     }
 
@@ -3363,11 +3412,19 @@ impl AuthService {
 
         // API tokens have format: prefix_secret
         // We store hash of full token and prefix for lookup
-        let dummy = Self::dummy_bcrypt_hash();
+        // Strict mode stores tokens in the keyed form, so the dummy is one
+        // too: unknown and known prefixes then cost the same microseconds
+        // (a PBKDF2 dummy here would reveal which prefixes exist, #5582).
+        let dummy = if crate::fips::strict() {
+            Self::dummy_api_token_hash()
+        } else {
+            Self::dummy_bcrypt_hash()
+        };
         let Some(prefix) = Self::api_token_prefix(token) else {
             // Too short, or byte 8 is not a char boundary (#5525). Still
-            // must burn bcrypt time to avoid leaking token length info.
-            let _ = Self::verify_password(token, dummy).await;
+            // must burn the same verification time to avoid leaking token
+            // length info.
+            let _ = self.verify_api_token_hash(token, dummy).await;
             return Err(AppError::Authentication("Invalid API token".to_string()));
         };
 
@@ -4647,9 +4704,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_password_invalid_hash() {
-        // An invalid bcrypt hash should return an error, not panic
+        // An unreadable stored hash is a failed login (logged), never a
+        // panic and never a 500 that would turn one bad row into an outage.
         let result = AuthService::verify_password("password", "not-a-valid-hash").await;
-        assert!(result.is_err());
+        assert!(!result.unwrap());
     }
 
     // -----------------------------------------------------------------------

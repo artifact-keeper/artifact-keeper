@@ -438,7 +438,7 @@ fn generate_openpgp_key_blocking(
         .primary_user_id(params.user_id)
         .passphrase(None);
 
-    let mut rng = rand08::rngs::OsRng;
+    let mut rng = crate::crypto::rng::ModuleRng;
     let secret_key = key_params
         .build()
         .map_err(|e| AppError::Internal(format!("Failed to build OpenPGP key params: {}", e)))?
@@ -611,14 +611,13 @@ fn openpgp_signature_config(
     let hash = openpgp_signature_hash(algorithm);
     let mut config = match secret_key.version() {
         KeyVersion::V4 => SignatureConfig::v4(typ, algorithm, hash),
-        KeyVersion::V6 => {
-            SignatureConfig::v6(rand08::rngs::OsRng, typ, algorithm, hash).map_err(|e| {
+        KeyVersion::V6 => SignatureConfig::v6(crate::crypto::rng::ModuleRng, typ, algorithm, hash)
+            .map_err(|e| {
                 AppError::Internal(format!(
                     "Failed to build OpenPGP v6 signature config: {}",
                     e
                 ))
-            })?
-        }
+            })?,
         other => {
             return Err(AppError::Internal(format!(
                 "Unsupported OpenPGP key version for signing: {:?}",
@@ -1599,9 +1598,24 @@ created_at:{created_at}\n",
     /// Cannot reuse [`SigningService::sign_data`]: a SHA-256 signature under a
     /// `.SIGN.RSA.` entry is well-formed but apk verifies it against a SHA-1
     /// digest and fails with `BAD signature` (#3021).
-    pub async fn sign_apk_index(&self, repo_id: Uuid, data: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.sign_data_with_digest(repo_id, data, RsaDigest::Sha1)
-            .await
+    /// Sign an APKINDEX segment. Returns the signature and the digest it was
+    /// made with, which decides the tar entry name (`.SIGN.RSA.` for SHA-1,
+    /// `.SIGN.RSA256.` for SHA-256). `FIPS_MODE=strict` always signs with
+    /// SHA-256 (#5586); apk-tools 2.12 and later verify that entry.
+    pub async fn sign_apk_index(
+        &self,
+        repo_id: Uuid,
+        data: &[u8],
+    ) -> Result<Option<(Vec<u8>, RsaDigest)>> {
+        let digest = if crate::fips::strict() {
+            RsaDigest::Sha256
+        } else {
+            RsaDigest::Sha1
+        };
+        Ok(self
+            .sign_data_with_digest(repo_id, data, digest)
+            .await?
+            .map(|sig| (sig, digest)))
     }
 
     /// Shared body of [`Self::sign_data`] / [`Self::sign_apk_index`]: resolve
@@ -1615,20 +1629,19 @@ created_at:{created_at}\n",
         data: &[u8],
         digest: RsaDigest,
     ) -> Result<Option<Vec<u8>>> {
-        // FIPS strict mode never generates a SHA-1 signature (#5586). The
-        // only caller asking for one is apk's legacy `.SIGN.RSA` index
-        // signature; the SHA-256 variant stays available.
-        if digest == RsaDigest::Sha1 && crate::fips::strict() {
-            return Err(AppError::Validation(
-                "SHA-1 repository signatures are refused in FIPS_MODE=strict; \
-                 apk clients must verify the SHA-256 (.SIGN.RSA256) signature"
-                    .to_string(),
-            ));
-        }
         let key = match self.get_active_key_for_repo(repo_id).await? {
             Some(k) => k,
             None => return Ok(None),
         };
+        // FIPS strict mode never generates a SHA-1 signature (#5586). Checked
+        // after the key lookup so a repository with no signing key keeps
+        // serving unsigned, as it does in every other mode. apk callers go
+        // through `sign_apk_index`, which picks SHA-256 in strict mode.
+        if digest == RsaDigest::Sha1 && crate::fips::strict() {
+            return Err(AppError::Validation(
+                "SHA-1 repository signatures are refused in FIPS_MODE=strict".to_string(),
+            ));
+        }
 
         let signature = self.sign_with_key_digest(&key, data, digest)?;
 

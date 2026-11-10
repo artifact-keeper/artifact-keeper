@@ -104,11 +104,52 @@ pub fn data_key_configured() -> bool {
     DATA_KEY.get().is_some_and(|k| k.is_some())
 }
 
+/// The per-purpose 32-byte subkey under the data key, if one is configured.
+pub fn data_subkey_raw(purpose: &[u8]) -> Option<Vec<u8>> {
+    let dk = (*DATA_KEY.get()?)?;
+    Some(kdf::kbkdf_sha256(&dk, purpose, b"", aead::KEY_LEN))
+}
+
 /// The per-purpose AEAD subkey under the data key, if one is configured.
 pub fn data_subkey(purpose: &[u8]) -> Option<aead::Key> {
-    let dk = (*DATA_KEY.get()?)?;
-    let sub = kdf::kbkdf_sha256(&dk, purpose, b"", aead::KEY_LEN);
+    let sub = data_subkey_raw(purpose)?;
     Some(aead::Key::new(&sub).expect("KBKDF output is 32 bytes"))
+}
+
+/// KBKDF label of the API-token HMAC subkey.
+pub const PURPOSE_TOKEN_HMAC: &[u8] = b"token-hmac";
+
+/// The key API tokens are stored under in strict mode (#5582): the
+/// `token-hmac` subkey of the data key when one is configured, otherwise
+/// derived from `jwt_secret`. Rotating the source secret invalidates every
+/// keyed token row (docs/fips.md, "Key hierarchy").
+pub fn token_key_for(jwt_secret: &str) -> crate::crypto::token::TokenKey {
+    match data_subkey_raw(PURPOSE_TOKEN_HMAC) {
+        Some(sub) => crate::crypto::token::TokenKey::from_subkey(&sub),
+        None => crate::crypto::token::TokenKey::derive(jwt_secret.as_bytes()),
+    }
+}
+
+/// Whether any row that needs the data key exists while no data key is
+/// configured: TOTP seeds written as `enc:` under strict mode. Logged at
+/// startup in every mode so a downgrade that dropped `DATA_ENCRYPTION_KEY`
+/// is visible before the first 2FA login fails.
+pub async fn warn_if_data_key_rows_unreadable(db: &sqlx::PgPool) {
+    if data_key_configured() {
+        return;
+    }
+    match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE totp_secret LIKE 'enc:%'")
+        .fetch_one(db)
+        .await
+    {
+        Ok(n) if n > 0 => tracing::warn!(
+            users = n,
+            "{n} user(s) have TOTP seeds encrypted under DATA_ENCRYPTION_KEY but no key is \
+             configured; their TOTP logins will fail until the key is restored"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::debug!(error = %e, "could not check for data-key-dependent rows"),
+    }
 }
 
 /// Whether v2 rows should be written: data key present and strict mode.
@@ -262,38 +303,64 @@ enum ColumnEncoding {
     HexText,
 }
 
+/// Which passphrase a column's legacy ciphertext was written under.
+#[derive(Clone, Copy)]
+enum LegacyKey {
+    /// `SSO_ENCRYPTION_KEY`, falling back to `JWT_SECRET`
+    /// (`auth_config_service::encryption_key`).
+    Sso,
+    /// `JWT_SECRET` directly (`SigningService::new`).
+    Jwt,
+    /// `MIGRATION_ENCRYPTION_KEY`, falling back to the built-in dev key
+    /// (`handlers::migration::migration_encryption_key`).
+    Migration,
+}
+
+/// The passphrases the legacy columns were written under, resolved by the
+/// caller from the same sources the writers use.
+pub struct ReencryptKeys {
+    pub sso: String,
+    pub jwt: String,
+    pub migration: String,
+}
+
 /// Every passphrase-encrypted column in the schema. Webhook secrets are not
 /// here: they have their own dedicated key (`WEBHOOK_SECRET_KEY`).
-const ENCRYPTED_COLUMNS: &[(&str, &str, &str, ColumnEncoding)] = &[
+const ENCRYPTED_COLUMNS: &[(&str, &str, &str, ColumnEncoding, LegacyKey)] = &[
     (
         "oidc_configs",
         "id",
         "client_secret_encrypted",
         ColumnEncoding::HexText,
+        LegacyKey::Sso,
     ),
     (
         "ldap_configs",
         "id",
         "bind_password_encrypted",
         ColumnEncoding::HexText,
+        LegacyKey::Sso,
     ),
     (
         "remote_instances",
         "id",
         "api_key_encrypted",
         ColumnEncoding::HexText,
+        LegacyKey::Sso,
     ),
     (
         "signing_keys",
         "id",
         "private_key_enc",
         ColumnEncoding::Bytea,
+        LegacyKey::Jwt,
     ),
     (
         "source_connections",
         "id",
         "credentials_enc",
         ColumnEncoding::Bytea,
+        LegacyKey::Migration,
     ),
 ];
 
@@ -307,7 +374,7 @@ const ENCRYPTED_COLUMNS: &[(&str, &str, &str, ColumnEncoding)] = &[
 /// consult `FIPS_MODE` itself so an operator can prepare in advance.
 pub async fn reencrypt_legacy_rows(
     db: &sqlx::PgPool,
-    passphrase: &str,
+    keys: &ReencryptKeys,
 ) -> crate::error::Result<ReencryptReport> {
     use crate::error::AppError;
 
@@ -316,10 +383,17 @@ pub async fn reencrypt_legacy_rows(
             "reencrypt-secrets: no DATA_ENCRYPTION_KEY installed".into(),
         ));
     };
-    let legacy = CredentialEncryption::from_passphrase(passphrase);
+    let sso = CredentialEncryption::from_passphrase(&keys.sso);
+    let jwt = CredentialEncryption::from_passphrase(&keys.jwt);
+    let migration = CredentialEncryption::from_passphrase(&keys.migration);
     let mut report = ReencryptReport::default();
 
-    for (table, id_col, col, enc) in ENCRYPTED_COLUMNS {
+    for (table, id_col, col, enc, key) in ENCRYPTED_COLUMNS {
+        let legacy = match key {
+            LegacyKey::Sso => &sso,
+            LegacyKey::Jwt => &jwt,
+            LegacyKey::Migration => &migration,
+        };
         // Table and column names come from the constant list above, never
         // from input, hence the explicit opt-in.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -391,7 +465,8 @@ pub async fn reencrypt_legacy_rows(
         }
     }
 
-    // `upstream_auth_credentials` lives in a key/value table.
+    // `upstream_auth_credentials` lives in a key/value table, under the SSO key.
+    let legacy = &sso;
     let rows = sqlx::query(
         "SELECT repository_id::text AS id, value FROM repository_config \
          WHERE key = 'upstream_auth_credentials' AND value IS NOT NULL",

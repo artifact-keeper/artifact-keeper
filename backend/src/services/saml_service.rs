@@ -48,28 +48,65 @@ pub(crate) fn saml_non_approved_algorithms(xml: &str) -> Vec<String> {
         let mut rest = xml;
         while let Some(pos) = rest.find(marker) {
             let after = &rest[pos + marker.len()..];
+            // Only an element *start* tag counts: the marker must be the
+            // local name right after `<` or `<prefix:`, and must end there
+            // (`<ds:SignatureMethod ` not `</ds:SignatureMethod>` and not
+            // `<SignatureMethodValue>`).
+            let is_start_tag = {
+                let before = &rest[..pos];
+                let name_start = before
+                    .rfind(|c: char| {
+                        !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+                    })
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let prefix = &before[name_start..];
+                before[..name_start].ends_with('<')
+                    && (prefix.is_empty() || prefix.ends_with(':'))
+                    && after
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+            };
             // The element's own attributes end at the first `>`.
             let Some(end) = after.find('>') else { break };
-            let attrs = &after[..end];
-            let algorithm = attrs
-                .find("Algorithm")
-                .and_then(|a| {
-                    let v = &attrs[a..];
-                    let q = v.find(['"', '\''])?;
-                    let quote = v.as_bytes()[q] as char;
-                    let v = &v[q + 1..];
-                    v.find(quote).map(|e| v[..e].trim().to_string())
-                })
-                .unwrap_or_else(|| "<unreadable>".to_string());
-            if !APPROVED_XMLDSIG_ALGORITHMS.contains(&algorithm.as_str())
-                && !found.contains(&algorithm)
-            {
-                found.push(algorithm);
+            if is_start_tag {
+                let attrs = &after[..end];
+                let algorithm = find_attribute(attrs, "Algorithm")
+                    .unwrap_or_else(|| "<unreadable>".to_string());
+                if !APPROVED_XMLDSIG_ALGORITHMS.contains(&algorithm.as_str())
+                    && !found.contains(&algorithm)
+                {
+                    found.push(algorithm);
+                }
             }
             rest = &after[end..];
         }
     }
     found
+}
+
+/// The value of attribute `name` in an element's attribute text, matching
+/// the attribute *name* (preceded by whitespace, followed by `=`), so that
+/// `xAlgorithm="..."` or `Algorithm2="..."` cannot stand in for `Algorithm`.
+fn find_attribute(attrs: &str, name: &str) -> Option<String> {
+    let mut rest = attrs;
+    while let Some(pos) = rest.find(name) {
+        let before_ok = pos == 0 || rest[..pos].ends_with(|c: char| c.is_whitespace());
+        let after = &rest[pos + name.len()..];
+        let after_trim = after.trim_start();
+        if before_ok && after_trim.starts_with('=') {
+            let v = after_trim[1..].trim_start();
+            let quote = v.chars().next()?;
+            if quote != '"' && quote != '\'' {
+                return None;
+            }
+            let v = &v[1..];
+            return v.find(quote).map(|e| v[..e].trim().to_string());
+        }
+        rest = after;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -99,6 +136,34 @@ mod algorithm_policy_tests {
                 "http://www.w3.org/2000/09/xmldsig#sha1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn decoy_attributes_cannot_hide_the_real_algorithm() {
+        // A look-alike attribute before the real one (review finding on
+        // #5584): only the attribute *named* Algorithm counts.
+        let xml = r#"<ds:SignatureMethod xAlgorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>"#;
+        assert_eq!(
+            saml_non_approved_algorithms(xml),
+            vec!["http://www.w3.org/2000/09/xmldsig#rsa-sha1".to_string()]
+        );
+        let xml2 = r#"<ds:DigestMethod Algorithm2="http://www.w3.org/2001/04/xmlenc#sha256" Algorithm = 'http://www.w3.org/2000/09/xmldsig#sha1' />"#;
+        assert_eq!(
+            saml_non_approved_algorithms(xml2),
+            vec!["http://www.w3.org/2000/09/xmldsig#sha1".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_closing_tags_and_lookalike_elements_are_not_elements() {
+        // C14N serialises empty elements with an explicit closing tag; the
+        // closing tag has no attributes and must not be read as a second
+        // element with an unreadable algorithm.
+        let xml = r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"></ds:SignatureMethod>
+            <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></ds:DigestMethod>
+            <ds:SignatureMethodValue>ignored</ds:SignatureMethodValue>
+            <saml:Attribute Name="DigestMethod">a value, not an element</saml:Attribute>"#;
+        assert!(saml_non_approved_algorithms(xml).is_empty());
     }
 
     #[test]

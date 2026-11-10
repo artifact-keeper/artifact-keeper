@@ -77,6 +77,15 @@ impl Clone for Ed25519KeyPair {
     }
 }
 
+// The seed is the private key; wipe it when the pair is dropped, as the
+// `Zeroizing` wrapper and ed25519-dalek's Drop did before (#5585).
+impl Drop for Ed25519KeyPair {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.seed.zeroize();
+    }
+}
+
 impl std::fmt::Debug for Ed25519KeyPair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ed25519KeyPair")

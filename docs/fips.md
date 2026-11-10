@@ -3,8 +3,10 @@
 Artifact Keeper can run every security function on a single FIPS 140-3
 validated cryptographic module and refuse configurations that fall outside
 the approved set. This is **opt-in**: the default build and the default
-`FIPS_MODE=off` behave exactly as before, write no new storage formats, and
-can be downgraded freely.
+`FIPS_MODE=off` behave exactly as before and write no new storage formats.
+A deployment that has run in `strict` mode can go back to `off` or `warn`,
+but must keep `DATA_ENCRYPTION_KEY` configured: rows written under it (TOTP
+seeds, re-encrypted secrets) need the key to be read, on any build.
 
 This document is the one reference for the design (for contributors) and the
 operating procedure (for deployments). Issue tracker: #5577 (epic).
@@ -82,6 +84,13 @@ mode, HMAC-SHA256): `credential-aead`, `totp-seed`, `token-hmac`. Without it,
 the legacy derivation from `JWT_SECRET` stays in use and `strict` refuses to
 start.
 
+The API-token key (`token-hmac`) is derived from `DATA_ENCRYPTION_KEY` when
+it is set and from `JWT_SECRET` otherwise. **Rotating whichever secret the
+token key comes from invalidates every API token stored in the keyed form**;
+a stored tag cannot be re-derived without the token itself. Plan token
+re-issue into any rotation of that secret (legacy bcrypt rows were
+independent of `JWT_SECRET`; keyed rows are not).
+
 ### `reencrypt-secrets`
 
 ```
@@ -103,7 +112,8 @@ backup first.
    when the host and the bundled services (database, search, ingress,
    scanners) also run in FIPS mode. On RHEL-family hosts: `fips-mode-setup
    --enable` and a reboot.
-2. **Image.** Use the `<version>-fips` tag. `/health` shows
+2. **Image.** Use the `<version>-fips` tag once it is published (tracked on
+   #5581; until then build with `CARGO_FEATURES=jemalloc,fips`). `/health` shows
    `crypto.provider = "AWS-LC FIPS"`, `crypto.fips_build = true`,
    `crypto.fips_module_active = true`. The image labels name the module
    version (`AWS_LC_FIPS_SYS_VERSION`).

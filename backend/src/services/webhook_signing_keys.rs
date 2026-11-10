@@ -120,8 +120,11 @@ impl InstanceSigningKey {
 
     /// Generate a fresh key from the OS CSPRNG.
     pub fn generate() -> Self {
-        // Seed from the module DRBG (#5585); the key pair holds the only copy.
-        Self::from_seed(Ed25519KeyPair::generate().seed())
+        // Seed from the module DRBG (#5585); the key pair holds the only copy
+        // and zeroizes it on drop.
+        let signing_key = Ed25519KeyPair::generate();
+        let kid = jwk_thumbprint(&signing_key.public_key());
+        Self { kid, signing_key }
     }
 
     /// RFC 7638 thumbprint of the public key; the `kid` in JWKS and `v2=`.

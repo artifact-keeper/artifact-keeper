@@ -706,6 +706,25 @@ jobs:
       CARGO_NET_RETRY: "10"
       SQLX_OFFLINE: "true"
       JWT_SECRET: ci-fips-lane-secret-at-least-32-bytes-long
+      DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
+      AK_TESTS_REQUIRE_DB: "1"
+    services:
+      # The strict-mode write paths (PBKDF2 passwords, keyed tokens, data-key
+      # ciphertexts) are exercised by the database-backed dual-format test,
+      # which this lane runs on the FIPS build.
+      postgres:
+        image: ghcr.io/artifact-keeper/ci-mirror/postgres:18-alpine
+        env:
+          POSTGRES_USER: registry
+          POSTGRES_PASSWORD: registry
+          POSTGRES_DB: artifact_registry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -718,10 +737,18 @@ jobs:
       - name: Install protoc, cmake and Go
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake golang-go
 
-      - name: Install cargo-nextest
+      - name: Install cargo-nextest and sqlx-cli
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest,sqlx-cli
+
+      - name: Run database migrations
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/5432) >/dev/null 2>&1 && break
+            sleep 1
+          done
+          sqlx migrate run --source backend/migrations
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -762,6 +789,17 @@ jobs:
         run: |
           cargo nextest run -p artifact-keeper-backend --lib --features "test-shard-router,fips" \
             -E 'test(/^(crypto|fips)::/) | test(/saml_non_approved|algorithm_policy_tests/)'
+
+      # The strict-mode write paths on the FIPS module, against a real
+      # schema: bcrypt -> PBKDF2 on login, bcrypt -> keyed HMAC on token use,
+      # the database policy check. The test installs strict mode itself.
+      - name: Dual-format storage tests on the FIPS build
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo nextest run -p artifact-keeper-backend --features fips \
+            --run-ignored ignored-only --no-tests=fail --test fips_dual_format_tests
 
       - name: Strict mode refuses a non-FIPS build
         run: |

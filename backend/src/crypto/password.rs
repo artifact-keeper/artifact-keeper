@@ -81,6 +81,15 @@ pub fn hash_pbkdf2_with(password: &str, iterations: u32) -> String {
     )
 }
 
+/// PHC base64 (standard alphabet, no padding), also accepting passlib's
+/// "adapted base64" which uses `.` in place of `+`.
+fn decode_phc_b64(field: &str) -> Option<Vec<u8>> {
+    let field = field.trim_end_matches('=');
+    B64.decode(field)
+        .or_else(|_| B64.decode(field.replace('.', "+")))
+        .ok()
+}
+
 struct Pbkdf2Parts {
     iterations: u32,
     salt: Vec<u8>,
@@ -94,20 +103,19 @@ fn parse_pbkdf2(stored: &str) -> Result<Pbkdf2Parts, Error> {
         return Err(Error::UnknownFormat);
     }
     let params = parts.next().ok_or(Error::Malformed("missing parameters"))?;
+    // PHC proper is `i=N`; passlib writes the bare count (`$pbkdf2-sha256$29000$…`).
     let iterations = params
         .strip_prefix("i=")
-        .ok_or(Error::Malformed("missing iteration count"))?
+        .unwrap_or(params)
         .parse::<u32>()
         .map_err(|_| Error::Malformed("iteration count is not a number"))?;
     if iterations < MIN_ITERATIONS {
         return Err(Error::Malformed("iteration count below minimum"));
     }
-    let salt = B64
-        .decode(parts.next().ok_or(Error::Malformed("missing salt"))?)
-        .map_err(|_| Error::Malformed("salt is not base64"))?;
-    let hash = B64
-        .decode(parts.next().ok_or(Error::Malformed("missing hash"))?)
-        .map_err(|_| Error::Malformed("hash is not base64"))?;
+    let salt = decode_phc_b64(parts.next().ok_or(Error::Malformed("missing salt"))?)
+        .ok_or(Error::Malformed("salt is not base64"))?;
+    let hash = decode_phc_b64(parts.next().ok_or(Error::Malformed("missing hash"))?)
+        .ok_or(Error::Malformed("hash is not base64"))?;
     if parts.next().is_some() {
         return Err(Error::Malformed("trailing data"));
     }
@@ -241,6 +249,26 @@ mod tests {
     }
 
     #[test]
+    fn passlib_style_pbkdf2_sha256_verifies() {
+        // passlib: bare iteration count and "adapted base64" (`.` for `+`,
+        // no padding). Build one from the facade's own derivation.
+        let salt = [
+            0xfbu8, 0xff, 0xef, 0xbe, 0x3e, 0xfa, 0xfb, 0xff, 0x01, 0x02, 0x03, 0x04,
+        ];
+        let mut out = [0u8; 32];
+        kdf::pbkdf2_sha256(b"passlib-user", &salt, 29_000, &mut out);
+        let ab64 = |b: &[u8]| B64.encode(b).replace('+', ".");
+        let stored = format!("$pbkdf2-sha256$29000${}${}", ab64(&salt), ab64(&out));
+        assert!(
+            stored.contains('.'),
+            "vector must exercise the `.` alphabet: {stored}"
+        );
+        assert_eq!(verify("passlib-user", &stored), Ok(true));
+        assert_eq!(verify("passlib-usr", &stored), Ok(false));
+        assert_eq!(format_of(&stored), Ok(Format::Pbkdf2Sha256));
+    }
+
+    #[test]
     fn bcrypt_hashes_still_verify() {
         let h = hash_bcrypt("legacy", 4).unwrap();
         assert_eq!(format_of(&h), Ok(Format::Bcrypt));
@@ -280,15 +308,24 @@ mod tests {
             verify("x", "$pbkdf2-sha512$i=1000$c2FsdA$YQ"),
             Err(Error::Malformed("salt or hash too short"))
         );
+        // A bare iteration count is the passlib spelling: parsed, and this
+        // one simply does not match.
         assert_eq!(
             verify("x", "$pbkdf2-sha512$1000$c2FsdA$aGFzaGhhc2hoYXNoaGFzaA"),
-            Err(Error::Malformed("missing iteration count"))
+            Ok(false)
+        );
+        assert_eq!(
+            verify(
+                "x",
+                "$pbkdf2-sha512$iterations$c2FsdA$aGFzaGhhc2hoYXNoaGFzaA"
+            ),
+            Err(Error::Malformed("iteration count is not a number"))
         );
         // Without the closing `$` the prefix is not the format at all.
         assert_eq!(verify("x", "$pbkdf2-sha512"), Err(Error::UnknownFormat));
         assert_eq!(
             verify("x", "$pbkdf2-sha512$"),
-            Err(Error::Malformed("missing iteration count"))
+            Err(Error::Malformed("iteration count is not a number"))
         );
         // A bcrypt-looking string that isn't a valid bcrypt hash is a miss.
         assert_eq!(verify("x", "$2b$garbage"), Ok(false));

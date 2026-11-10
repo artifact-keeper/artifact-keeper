@@ -2170,11 +2170,14 @@ impl Config {
                     .as_str(),
                 "false" | "0" | "no" | "off"
             ),
+            // Clamped to [1_000, 10_000_000]: below the floor is not a
+            // password hash, above the ceiling a single login takes seconds
+            // and the auth-concurrency cap turns into a denial of service.
             pbkdf2_iterations: env_parse(
                 "PBKDF2_ITERATIONS",
                 crate::crypto::kdf::PBKDF2_DEFAULT_ITERATIONS,
             )
-            .max(crate::crypto::password::MIN_ITERATIONS),
+            .clamp(crate::crypto::password::MIN_ITERATIONS, 10_000_000),
             data_encryption_key: secret_or_env("DATA_ENCRYPTION_KEY").map_err(AppError::Config)?,
             signature_expiry_seconds: env_parse(
                 "SIGNATURE_EXPIRY_SECONDS",

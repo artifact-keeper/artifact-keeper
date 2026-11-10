@@ -53,7 +53,7 @@ const FALLBACK_MIGRATION_ENCRYPTION_KEY: &str = "artifact-keeper-default-migrati
 /// (the warning log fires once per call when the fallback is used). Dev
 /// and unit-test invocations work out of the box so `create_connection`
 /// no longer returns an unconditional 500 when the env var is unset.
-fn migration_encryption_key() -> Result<String> {
+pub fn migration_encryption_key() -> Result<String> {
     match crate::config::secret_or_env("MIGRATION_ENCRYPTION_KEY") {
         Ok(Some(v)) if !v.is_empty() => Ok(v),
         Ok(_) => {
