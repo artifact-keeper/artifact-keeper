@@ -1444,6 +1444,19 @@ async fn execute_transfer(
                 .text()
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
+            if peer_already_holds_pushed_bytes(
+                client,
+                peer_endpoint,
+                peer_api_key,
+                task,
+                status.as_u16(),
+                &body,
+            )
+            .await
+            {
+                handle_transfer_success(db, task, 0).await;
+                return Ok(());
+            }
             let msg = format_peer_response_failure("Remote peer returned", status.as_u16(), &body);
             let scope = failure_scope_for_peer_response(status.as_u16(), &body);
             handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
@@ -1455,6 +1468,69 @@ async fn execute_transfer(
             Err(msg)
         }
     }
+}
+
+/// True when a 409 "already exists and is immutable" answer to a push means
+/// the push is already applied: the peer holds the artifact at this path
+/// with exactly the bytes being pushed (#5627).
+///
+/// That is what a re-armed push looks like when a restore cancelled a queued
+/// delete the peer never applied (#5505): the peer still has the artifact,
+/// refuses the overwrite of its immutable version, and the push would end a
+/// permanently failed task for content the peer already serves correctly.
+/// The 409 does not say what the peer stores, so this asks it for the
+/// artifact's metadata (`GET /api/v1/repositories/{key}/artifacts/{path}`,
+/// which every peer version serves) and compares its `checksum_sha256` with
+/// the pushed one. Anything else — another status or body, a lookup that
+/// fails, a different digest, a task with no checksum — is not applied, and
+/// the caller keeps the failure.
+async fn peer_already_holds_pushed_bytes(
+    client: &reqwest::Client,
+    peer_endpoint: &str,
+    peer_api_key: &str,
+    task: &TaskRow,
+    status: u16,
+    body: &str,
+) -> bool {
+    if status != 409
+        || !body
+            .to_ascii_lowercase()
+            .contains("already exists and is immutable")
+        || task.checksum_sha256.trim().is_empty()
+    {
+        return false;
+    }
+    let url = build_transfer_url(peer_endpoint, &task.repository_key, &task.artifact_path);
+    let response = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", peer_api_key))
+        .header(REPLICATION_REQUEST_HEADER, REPLICATION_REQUEST_VALUE)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return false,
+    };
+    let held = match response.json::<serde_json::Value>().await {
+        Ok(metadata) => metadata
+            .get("checksum_sha256")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        Err(_) => None,
+    };
+    let applied = held.is_some_and(|held| {
+        held.trim()
+            .eq_ignore_ascii_case(task.checksum_sha256.trim())
+    });
+    if applied {
+        tracing::info!(
+            "Peer already holds artifact '{}' with the pushed sha256; sync task {} is \
+             already applied",
+            task.artifact_path,
+            task.id
+        );
+    }
+    applied
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,9 +2068,22 @@ async fn execute_chunked_transfer(
                 .text()
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
+            cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
+            if peer_already_holds_pushed_bytes(
+                client,
+                peer_endpoint,
+                peer_api_key,
+                task,
+                status.as_u16(),
+                &body,
+            )
+            .await
+            {
+                handle_transfer_success(db, task, 0).await;
+                return Ok(());
+            }
             let msg = format!("Chunked upload session complete returned {status}: {body}");
             let scope = failure_scope_for_peer_response(status.as_u16(), &body);
-            cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
             handle_transfer_failure_scoped(db, task, &msg, retry_policy, scope).await;
             Err(msg)
         }
@@ -5748,6 +5837,215 @@ mod tests {
             .flat_map(|r| r.body.clone())
             .collect();
         (body["checksum_sha256"].as_str().unwrap().to_string(), sent)
+    }
+
+    const IMMUTABLE_409: &str =
+        r#"{"code":"CONFLICT","message":"Artifact version already exists and is immutable"}"#;
+
+    /// Store fresh bytes as the fixture's single artifact and return its
+    /// `(path, repository key, sha256)`. `chunked` adds a metadata document,
+    /// which sends the push through the upload-session path.
+    async fn store_fixture_artifact_5627(
+        f: &ClaimFixture,
+        chunked: bool,
+    ) -> (String, String, String) {
+        use sha2::{Digest, Sha256};
+        let bytes = format!("restored bytes {}", Uuid::new_v4()).into_bytes();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        let (artifact_id, storage_key): (Uuid, String) = sqlx::query_as(
+            "SELECT a.id, a.storage_key FROM sync_tasks st \
+             JOIN artifacts a ON a.id = st.artifact_id WHERE st.id = $1",
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("fixture artifact");
+        let storage_path: String =
+            sqlx::query_scalar("SELECT storage_path FROM repositories WHERE id = $1")
+                .bind(f.repo_id)
+                .fetch_one(&f.pool)
+                .await
+                .expect("repo storage");
+        let fs = crate::storage::filesystem::FilesystemStorage::new(&storage_path);
+        crate::storage::StorageBackend::put(&fs, &storage_key, Bytes::from(bytes.clone()))
+            .await
+            .expect("store bytes");
+        sqlx::query("UPDATE artifacts SET size_bytes = $2, checksum_sha256 = $3 WHERE id = $1")
+            .bind(artifact_id)
+            .bind(bytes.len() as i64)
+            .bind(&sha)
+            .execute(&f.pool)
+            .await
+            .expect("artifact row");
+        if chunked {
+            sqlx::query(
+                "INSERT INTO artifact_metadata (artifact_id, format, metadata) \
+                 VALUES ($1, 'generic', $2)",
+            )
+            .bind(artifact_id)
+            .bind(serde_json::json!({ "note": "5627" }))
+            .execute(&f.pool)
+            .await
+            .expect("metadata");
+        }
+        let (path, _, key) = task_address(f, f.task_ids[0]).await;
+        (path, key, sha)
+    }
+
+    /// The peer's artifact metadata route answers `checksum_sha256 = held`.
+    async fn mount_peer_metadata_5627(
+        server: &wiremock::MockServer,
+        key: &str,
+        path: &str,
+        held: &str,
+    ) {
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(url_path(format!(
+                "/api/v1/repositories/{key}/artifacts/{path}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "path": path,
+                "checksum_sha256": held,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// `(status, retry_count, error_message, peer consecutive_failures,
+    /// peer transfer_failures_total)` after the transfer.
+    async fn push_outcome_5627(f: &ClaimFixture) -> (String, i32, Option<String>, i32, i64) {
+        let (status, retries, error): (String, i32, Option<String>) = sqlx::query_as(
+            "SELECT status::TEXT, retry_count, error_message FROM sync_tasks WHERE id = $1",
+        )
+        .bind(f.task_ids[0])
+        .fetch_one(&f.pool)
+        .await
+        .expect("task");
+        let (consecutive, failures): (i32, i64) = sqlx::query_as(
+            "SELECT consecutive_failures, transfer_failures_total::BIGINT \
+             FROM peer_instances WHERE id = $1",
+        )
+        .bind(f.peer_id)
+        .fetch_one(&f.pool)
+        .await
+        .expect("peer");
+        (status, retries, error, consecutive, failures)
+    }
+
+    /// A peer whose single-request PUT of the artifact answers the 409
+    /// immutable refusal, and whose metadata route reports `held`.
+    async fn immutable_put_peer_5627(key: &str, path: &str, held: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path as url_path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(url_path(format!(
+                "/api/v1/repositories/{key}/artifacts/{path}"
+            )))
+            .respond_with(ResponseTemplate::new(409).set_body_string(IMMUTABLE_409))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_peer_metadata_5627(&server, key, path, held).await;
+        server
+    }
+
+    /// #5627: a restore re-arms the push to a peer that never applied the
+    /// delete, so the peer still holds the same bytes and refuses the
+    /// overwrite with 409 immutable. That push is already applied: the task
+    /// completes on the first attempt, with no failure charged to the task or
+    /// the peer.
+    #[tokio::test]
+    async fn push_refused_as_immutable_for_identical_bytes_is_applied_5627() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let (path, key, sha) = store_fixture_artifact_5627(&f, false).await;
+        let server = immutable_put_peer_5627(&key, &path, &sha.to_ascii_uppercase()).await;
+
+        let result = run_claimed_transfer(&f, &server).await;
+        let outcome = push_outcome_5627(&f).await;
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            outcome,
+            ("completed".to_string(), 0, None, 0, 0),
+            "an identical-bytes 409 is an applied push, not a failed task"
+        );
+        server.verify().await;
+    }
+
+    /// #5627 control: a 409 immutable for DIFFERENT bytes is still a failed
+    /// push (an item rejection, #4921), and so is one the peer's metadata
+    /// cannot confirm.
+    #[tokio::test]
+    async fn push_refused_as_immutable_for_other_bytes_still_fails_5627() {
+        for held in [Some("0".repeat(64)), None] {
+            let Some(f) = setup_claim_fixture(1).await else {
+                return;
+            };
+            let (path, key, _sha) = store_fixture_artifact_5627(&f, false).await;
+            let server = match &held {
+                Some(held) => immutable_put_peer_5627(&key, &path, held).await,
+                // No metadata route: the lookup 404s.
+                None => {
+                    use wiremock::matchers::method;
+                    use wiremock::{Mock, ResponseTemplate};
+                    let server = wiremock::MockServer::start().await;
+                    Mock::given(method("PUT"))
+                        .respond_with(ResponseTemplate::new(409).set_body_string(IMMUTABLE_409))
+                        .mount(&server)
+                        .await;
+                    server
+                }
+            };
+
+            let result = run_claimed_transfer(&f, &server).await;
+            let (status, _, error, consecutive, failures) = push_outcome_5627(&f).await;
+            teardown_claim_fixture(&f).await;
+
+            assert!(result.is_err(), "{held:?}: {result:?}");
+            assert_eq!(status, "failed", "{held:?}");
+            assert!(
+                error.as_deref().is_some_and(|e| e.contains("immutable")),
+                "{held:?}: {error:?}"
+            );
+            assert_eq!(
+                (consecutive, failures),
+                (0, 1),
+                "{held:?}: an item rejection"
+            );
+        }
+    }
+
+    /// #5627 on the upload-session path: the session complete answers the
+    /// 409 immutable refusal for bytes the peer already holds.
+    #[tokio::test]
+    async fn chunked_push_refused_as_immutable_for_identical_bytes_is_applied_5627() {
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let (path, key, sha) = store_fixture_artifact_5627(&f, true).await;
+        let server = mock_upload_peer(409, IMMUTABLE_409).await;
+        mount_peer_metadata_5627(&server, &key, &path, &sha).await;
+
+        let result = run_claimed_transfer(&f, &server).await;
+        let outcome = push_outcome_5627(&f).await;
+        let sessions = server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
+        teardown_claim_fixture(&f).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(sessions, 1, "the push took the upload-session path once");
+        assert_eq!(outcome, ("completed".to_string(), 0, None, 0, 0));
     }
 
     /// #4921: a protobuf commit row written before the fix still pushes. The
