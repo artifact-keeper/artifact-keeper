@@ -1,5 +1,0 @@
----
-section: Security
-issues: [#5610, #5612]
----
-- **The proxy-cache cap and the virtual member listing no longer tell an existing private repository from an unknown key** ([#5610], [#5612]). `GET`, `PUT` and `DELETE /api/v1/repositories/{key}/proxy-cache-cap` (new in this release) and `GET /api/v1/repositories/{key}/members` checked the repository's type, the token's repository scope and (for the cap) the repository `admin` action before checking whether the caller could read the repository. A logged-in user with no grant, or a token scoped to other repositories, therefore got a wrong-type `400` or a `403` for an existing private key where an unknown key answers `404`, and learned whether the key was a Remote or a virtual. Both routes now check visibility first and answer such a caller exactly what an unknown key answers: `404 {"code": "NOT_FOUND", "message": "Repository not found"}`. A caller who can read the repository keeps the `403` (no `admin`) and the wrong-type `400`, and admins and owners are unaffected. See `docs/repository-visibility.md`.
