@@ -60,6 +60,34 @@ What the server shares and what it does not, per trivy's client/server design:
   holds no DB, or a stale one, in client mode). A DB block that cannot be
   parsed omits the field without failing the scan.
 
+## Concurrent scans (adapter >= 1.7.0)
+
+trivy keeps its image-layer analysis cache in `SCANNER_TRIVY_CACHE_DIR/fanal/fanal.db`
+and locks it for the whole of a scan; a second scan that cannot take the lock
+within 5s fails with `cache may be in use by another process: timeout`
+(#5657). One image scan at a time now uses that cache, and image scans started
+while it is held run with `--cache-backend memory`: the same report, without
+reusing cached layers. A scan that still hits the lock (held by another
+process sharing the cache volume) is rerun once on the memory backend.
+Filesystem scans and client mode (`SCANNER_TRIVY_SERVER`) never take the lock.
+
+At most `SCANNER_MAX_CONCURRENT_SCANS` scans (image and filesystem together,
+default `4`, `0` for no bound) run trivy at once. Further jobs wait for a slot
+instead of starting: their report route answers `302` with
+`X-Scan-Status: Queued` (`Running` once trivy runs), and the scan's own
+timeout starts only when it leaves the queue. The backend does not charge
+queued time to its poll budget (up to 30 minutes of queueing per scan), so a
+burst of scans waits rather than timing out. Each trivy run holds the
+vulnerability DB and the analysed layers in memory, so raise the bound only
+with the pod's memory limit.
+
+Jobs live in memory, so a restarted or replaced adapter answers `404 unknown
+scan id` for jobs its predecessor accepted. The backend submits such a scan
+again (up to three submissions in all), and does the same for a job that
+failed on the cache lock, so neither ends as a failed scan. While the old pod
+is gone and the new one not yet answering, the backend keeps polling for up
+to two minutes instead of failing on the gap.
+
 ## Offline use and vulnerability-DB import (adapter >= 1.7.0)
 
 For a disconnected install, set one switch:

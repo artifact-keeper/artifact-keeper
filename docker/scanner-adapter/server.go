@@ -26,6 +26,9 @@ type Server struct {
 	// remote is the trivy-server readiness gate in client mode
 	// (cfg.TrivyServer set); nil in standalone mode.
 	remote *remoteGate
+	// scanSlots holds one token per running scan, image and filesystem alike
+	// (#5657); nil when cfg.MaxConcurrentScans is 0 (unbounded).
+	scanSlots chan struct{}
 }
 
 // NewServer constructs a Server. It is NOT ready until MarkReady is called.
@@ -34,6 +37,9 @@ func NewServer(cfg *Config) *Server {
 		cfg:     cfg,
 		jobs:    NewJobStore(cfg.JobTTL),
 		scanner: NewScanner(cfg),
+	}
+	if cfg.MaxConcurrentScans > 0 {
+		s.scanSlots = make(chan struct{}, cfg.MaxConcurrentScans)
 	}
 	if cfg.TrivyServer != "" {
 		client := newServerHTTPClient(cfg)
@@ -156,10 +162,30 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, ScanResponse{ID: job.ID})
 }
 
+// acquireScanSlot blocks until one of the MaxConcurrentScans slots is free,
+// marking the job Queued while it waits, then marks it Running (#5657). The
+// returned func frees the slot. The scan's own timeout starts after this, so
+// time spent queued never eats into it.
+func (s *Server) acquireScanSlot(id string) (release func()) {
+	if s.scanSlots == nil {
+		s.jobs.Running(id)
+		return func() {}
+	}
+	select {
+	case s.scanSlots <- struct{}{}:
+	default:
+		s.jobs.Queued(id)
+		log.Printf("scan %s queued: %d scans already running (SCANNER_MAX_CONCURRENT_SCANS)", id, cap(s.scanSlots))
+		s.scanSlots <- struct{}{}
+	}
+	s.jobs.Running(id)
+	return func() { <-s.scanSlots }
+}
+
 // runJob executes the scan and records the outcome. Detached from the request
 // context so a client disconnect does not cancel the scan.
 func (s *Server) runJob(id string, req ScanRequest) {
-	s.jobs.Running(id)
+	defer s.acquireScanSlot(id)()
 	report, err := s.scanner.Scan(context.Background(), &req)
 	if err != nil {
 		// Do not include the request authorization; Scan's error messages only
@@ -218,7 +244,7 @@ func (s *Server) handleFsScan(w http.ResponseWriter, r *http.Request) {
 // disconnect does not cancel the scan.
 func (s *Server) runFsJob(id, dir string) {
 	defer func() { _ = os.RemoveAll(dir) }()
-	s.jobs.Running(id)
+	defer s.acquireScanSlot(id)()
 	report, db, stderr, err := s.scanner.ScanFilesystem(context.Background(), dir)
 	if err != nil {
 		log.Printf("filesystem scan %s failed: %v", id, err)
@@ -243,7 +269,8 @@ func (s *Server) handleFsReport(w http.ResponseWriter, r *http.Request) {
 // serveJobReport implements the shared report-polling contract for both scan
 // families: 200 + body when Succeeded, 500 when Failed (fail-closed — a trivy
 // error is NEVER a 200 with empty findings), 302 + integer Refresh-After while
-// Pending/Running, 404 for an unknown/expired id.
+// Pending/Queued/Running (the state in X-Scan-Status, #5657), 404 for an
+// unknown/expired id.
 func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, body func(*Job) any) {
 	job, ok := s.jobs.Get(id)
 	if !ok {
@@ -261,9 +288,16 @@ func (s *Server) serveJobReport(w http.ResponseWriter, id, contentType string, b
 		http.Error(w, "scan failed: "+job.Err, http.StatusInternalServerError)
 	default:
 		w.Header().Set("Refresh-After", "5")
+		w.Header().Set(scanStatusHeader, string(job.Status))
 		w.WriteHeader(http.StatusFound)
 	}
 }
+
+// scanStatusHeader carries a pending job's state (Pending, Queued or Running)
+// on the 302 report response, so the backend can tell a scan waiting for a
+// slot from one that is running (#5657). Not part of the Harbor contract;
+// clients that ignore it see the same 302 + Refresh-After as before.
+const scanStatusHeader = "X-Scan-Status"
 
 // writeJSON writes v as a JSON response with the given status.
 func writeJSON(w http.ResponseWriter, status int, v any) {
