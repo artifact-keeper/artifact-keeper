@@ -52,6 +52,34 @@ pub fn router() -> Router<SharedState> {
             "/artifact/:artifact_id/accessible-users",
             get(artifact_accessible_users),
         )
+        // The live scan queue behind the Scan Queue page.
+        .route("/scan-queue", get(get_scan_queue))
+}
+
+/// Outstanding scan jobs plus the queue depth behind them.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ScanQueueResponse {
+    /// `SCAN_QUEUE_ENABLED` on this instance. Off, scans run in-process and the
+    /// queue only holds what was left from when it was on.
+    pub enabled: bool,
+    /// One page of live jobs, running first, then what is due soonest at the
+    /// highest priority band.
+    pub items: Vec<crate::services::scan_queue::ScanQueueJobRow>,
+    /// Job count per `(kind, state)`, with the oldest due job's age.
+    pub depth: Vec<crate::services::scan_queue::ScanQueueDepth>,
+    /// Jobs matching the filter, across all pages.
+    pub total: i64,
+}
+
+/// Query for [`get_scan_queue`].
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ScanQueueQuery {
+    /// `pending` | `running` | `failed`.
+    pub state: Option<String>,
+    /// `proxy_file` | `hosted_artifact`.
+    pub kind: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
 }
 
 /// Default page size for the downloaders listing.
@@ -1085,13 +1113,71 @@ pub async fn artifact_accessible_users(
     ))
 }
 
+/// `400` for a state or kind no queue row can have.
+fn validate_scan_queue_filters(state: Option<&str>, kind: Option<&str>) -> Result<()> {
+    if let Some(s) = state.filter(|s| !matches!(*s, "pending" | "running" | "failed")) {
+        return Err(AppError::Validation(format!(
+            "unknown state {s:?}; a completed job is deleted, so only pending, running and \
+             failed exist"
+        )));
+    }
+    if let Some(k) = kind.filter(|k| crate::services::scan_queue::ScanJobKind::from_db(k).is_none())
+    {
+        return Err(AppError::Validation(format!("unknown kind {k:?}")));
+    }
+    Ok(())
+}
+
+/// Live scan-queue view. Only pending, running and failed rows exist.
+#[utoipa::path(
+    get,
+    path = "/scan-queue",
+    context_path = "/api/v1/admin/security",
+    tag = "admin",
+    params(ScanQueueQuery),
+    responses(
+        (status = 200, description = "Outstanding scan jobs and queue depth", body = ScanQueueResponse),
+        (status = 400, description = "Unknown state or kind"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_scan_queue(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<ScanQueueQuery>,
+) -> Result<Json<ScanQueueResponse>> {
+    require_admin(&auth)?;
+    validate_scan_queue_filters(query.state.as_deref(), query.kind.as_deref())?;
+    let (offset, per_page, _, _) = blast_page_bounds(query.page, query.per_page);
+
+    let queue = crate::services::scan_queue::ScanQueue::new(state.db.clone());
+    let (items, total) = queue
+        .list_jobs(
+            query.state.as_deref(),
+            query.kind.as_deref(),
+            per_page,
+            offset,
+        )
+        .await?;
+    let depth = queue.depth().await?;
+
+    Ok(Json(ScanQueueResponse {
+        enabled: state.config.scan_queue_enabled,
+        items,
+        depth,
+        total,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
         cve_blast_radius,
         artifact_blast_radius,
         cve_accessible_users,
-        artifact_accessible_users
+        artifact_accessible_users,
+        get_scan_queue
     ),
     components(schemas(
         BlastRadiusResponse,
@@ -1103,6 +1189,9 @@ pub async fn artifact_accessible_users(
         AccessibleUsersResponse,
         RepoExposure,
         AccessibleUser,
+        ScanQueueResponse,
+        crate::services::scan_queue::ScanQueueJobRow,
+        crate::services::scan_queue::ScanQueueDepth,
     ))
 )]
 pub struct AdminSecurityApiDoc;
@@ -1115,6 +1204,21 @@ mod tests {
     // -----------------------------------------------------------------------
     // Pure helpers — no DB required.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_queue_filters_accept_only_states_and_kinds_a_row_can_have() {
+        for state in ["pending", "running", "failed"] {
+            assert!(validate_scan_queue_filters(Some(state), None).is_ok());
+        }
+        for kind in ["proxy_file", "hosted_artifact"] {
+            assert!(validate_scan_queue_filters(None, Some(kind)).is_ok());
+        }
+        assert!(validate_scan_queue_filters(None, None).is_ok());
+        // A completed job is deleted, so `completed` can never match a row.
+        assert!(validate_scan_queue_filters(Some("completed"), None).is_err());
+        assert!(validate_scan_queue_filters(None, Some("proxy_oci")).is_err());
+        assert!(validate_scan_queue_filters(Some("pending'; --"), None).is_err());
+    }
 
     #[test]
     fn test_blast_page_bounds_defaults() {

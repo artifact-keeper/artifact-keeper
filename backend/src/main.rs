@@ -1288,6 +1288,13 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         state.proxy_service.clone(),
     );
 
+    // Drains the durable scan queue (migration 362) when SCAN_QUEUE_ENABLED and
+    // SCAN_WORKER_ENABLED are both on, before the listeners bind
+    artifact_keeper_backend::services::scan_worker::spawn_scan_worker(
+        state.clone(),
+        runtime_shutdown_token.clone(),
+    );
+
     // Keep a handle for the gRPC server before the sync worker consumes db_pool
     let grpc_db_pool = db_pool.clone();
 
