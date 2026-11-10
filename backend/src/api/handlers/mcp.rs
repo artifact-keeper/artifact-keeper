@@ -7456,6 +7456,173 @@ mod tests {
         virtual_generic_download_gates_every_alias(Refusal::Scanner).await;
     }
 
+    /// One admin quarantine-API call (`action` `quarantine` / `reject`) on
+    /// `artifact_id`: status and JSON body.
+    async fn admin_hold(
+        rig: &AliasRig,
+        artifact_id: Uuid,
+        action: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let (s, b) = tdh::send(
+            tdh::router_with_auth(
+                crate::api::handlers::quarantine::router(),
+                rig.env.fx.state.clone(),
+                tdh::admin_auth(rig.env.fx.user_id, &rig.env.fx.username),
+            ),
+            tdh::post(
+                format!("/{artifact_id}/{action}"),
+                "application/json",
+                Bytes::from(body.to_string()),
+            ),
+        )
+        .await;
+        (s, serde_json::from_slice(&b).unwrap_or_default())
+    }
+
+    /// #5646: an administrator's quarantine whose `UPDATE` waits on the row
+    /// lock of a push that is moving the tag D1 -> D2 holds D1 (the image the
+    /// tag named when the request read it), not D2. The interleaving is the
+    /// reverse of #5618's: the move's upsert runs in an open transaction (so
+    /// it holds the tag row's lock), the quarantine starts and is observed
+    /// blocked on that transaction, and only then does the move commit.
+    #[tokio::test]
+    async fn quarantine_landing_after_a_tag_move_holds_the_digest_it_read_5646() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("seen").await;
+        let tag_row = rig.row_id("1.0").await;
+        let pool = &rig.env.fx.pool;
+        let d2 = format!("sha256:{}", "e".repeat(64));
+
+        let mut push = pool.begin().await.unwrap();
+        let push_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *push)
+            .await
+            .unwrap();
+        crate::api::handlers::oci_v2::upsert_manifest_artifact(
+            &mut *push,
+            rig.docker.id,
+            ALIAS_IMAGE,
+            "1.0",
+            &d2,
+            ALIAS_MT,
+            &crate::api::handlers::oci_v2::manifest_storage_key(&d2),
+            10,
+            Some(rig.env.fx.user_id),
+            None,
+        )
+        .await
+        .unwrap();
+        let commit_once_blocked = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut blocked = false;
+            while std::time::Instant::now() < deadline {
+                blocked = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(push_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            push.commit().await.unwrap();
+            blocked
+        };
+        let ((status, body), blocked) = tokio::join!(
+            admin_hold(
+                &rig,
+                tag_row,
+                "quarantine",
+                serde_json::json!({"reason": "admin hold"})
+            ),
+            commit_once_blocked
+        );
+        assert!(blocked, "precondition: the quarantine waited on the move");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["held_digest"], d1.as_str(), "{body}");
+        assert_eq!(body["moved_to_digest"], d2.as_str(), "{body}");
+
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(
+                format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
+                Some("quarantined".to_string())
+            )],
+            "D1 is held through its digest row"
+        );
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| h.0),
+            Some(None),
+            "the tag row, which names D2, is not held"
+        );
+        assert_eq!(
+            rig.native(&rig.docker.key, &d1).await,
+            StatusCode::CONFLICT,
+            "D1 is refused by digest"
+        );
+        rig.teardown().await;
+    }
+
+    /// #5646: a rejection that names the digest the operator saw
+    /// (`expected_digest`) after the tag moved to an image under its own
+    /// upload hold rejects the old image, never the new one; the answer names
+    /// both digests.
+    #[tokio::test]
+    async fn rejection_with_an_expected_digest_after_a_tag_move_rejects_it_5646() {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("seen").await;
+        let tag_row = rig.row_id("1.0").await;
+        let (s, b) = admin_hold(&rig, tag_row, "quarantine", serde_json::json!({})).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let d2 = rig.push("next").await;
+        assert_eq!(rig.row_id("1.0").await, tag_row);
+        // D2's own upload hold, which the rejection of D1 must not touch.
+        rig.set_hold("1.0", "quarantined", "NOW() + INTERVAL '1 hour'", "upload")
+            .await;
+
+        let (status, body) = admin_hold(
+            &rig,
+            tag_row,
+            "reject",
+            serde_json::json!({"reason": "critical", "expected_digest": d1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["new_status"], "rejected", "{body}");
+        assert_eq!(body["held_digest"], d1.as_str(), "{body}");
+        assert_eq!(body["moved_to_digest"], d2.as_str(), "{body}");
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(
+                format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
+                Some("rejected".to_string())
+            )],
+        );
+        assert_eq!(
+            rig.hold_at("1.0").await.map(|h| (h.0, h.1)),
+            Some((Some("quarantined".to_string()), true)),
+            "D2's timed upload hold is untouched"
+        );
+        let (s, b) = admin_hold(
+            &rig,
+            tag_row,
+            "quarantine",
+            serde_json::json!({"expected_digest": "sha256:nothex"}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+        rig.teardown().await;
+    }
+
     /// `isLatest` is the newest servable version on every read, and
     /// `version=latest` picks the newest before `updated_since` filters.
     #[tokio::test]

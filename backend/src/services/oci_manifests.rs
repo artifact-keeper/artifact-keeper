@@ -377,6 +377,144 @@ pub(crate) async fn alias_rows(
     Ok(rows.into_iter().map(alias_row).collect())
 }
 
+// ---------------------------------------------------------------------------
+// Holds bind to the bytes they were decided on (#5646)
+// ---------------------------------------------------------------------------
+//
+// A tag-path row is rewritten in place when the tag moves, so an
+// administrator's or a scanner's hold that names the row by id, decided while
+// the row named D1, would land on D2 if the move committed first: D1 stays
+// servable and the new image is held instead. Every such hold therefore
+// compares the row's checksum with the one it was decided on, and when the
+// tag has moved it is applied to a row of the old digest instead (the same
+// target a tag move carries a hold to, #5457).
+
+/// Where a hold decided on the bytes `seen` lands, now that the row it named
+/// may have moved (#5646).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HoldTarget {
+    /// The row still holds `seen` (or is not a live manifest row): hold it.
+    Same,
+    /// The tag moved to `moved_to`; `artifact_id` is a live row of the old
+    /// digest `held_digest`.
+    Moved {
+        artifact_id: Uuid,
+        held_digest: String,
+        moved_to: String,
+    },
+    /// The tag moved to `moved_to` and the old digest has no row to hold (it
+    /// was deleted by digest, or the registry no longer records it).
+    Gone {
+        held_digest: String,
+        moved_to: String,
+    },
+}
+
+/// The sha256 hex of `artifact_id` when it is a live OCI manifest row: the
+/// checksum a hold on it binds to. `None` for any other row.
+pub(crate) async fn manifest_checksum(
+    db: impl sqlx::PgExecutor<'_>,
+    artifact_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(concat!(
+        "SELECT TRIM(a.checksum_sha256) FROM artifacts a \
+         WHERE a.id = $1 AND a.is_deleted = false AND ",
+        crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!()
+    ))
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await
+}
+
+/// The image name of a tag- or digest-path manifest row
+/// (`v2/<name>/manifests/<ref>`), or `None` for another layout.
+fn manifest_row_image(path: &str) -> Option<&str> {
+    path.strip_prefix("v2/")?
+        .rsplit_once("/manifests/")
+        .map(|(name, _)| name)
+        .filter(|name| !name.is_empty())
+}
+
+/// Where a hold decided on the bytes `seen` (sha256 hex) for the row
+/// `artifact_id` must land (#5646). When the row is a live manifest row that
+/// now names other bytes, the hold goes to a live row of `seen` in the same
+/// repository: its digest-path row under the same image name when there is
+/// one, else any live alias. When the old digest has no live row, its
+/// digest-path row is created from the registry's record of the manifest, as
+/// a tag move creates it for a held tag; a digest deleted by digest (its
+/// soft-deleted digest row remains) or no longer recorded is [`HoldTarget::Gone`].
+pub(crate) async fn hold_target(
+    db: &PgPool,
+    artifact_id: Uuid,
+    seen: &str,
+) -> Result<HoldTarget, sqlx::Error> {
+    let current: Option<(Uuid, String, String)> = sqlx::query_as(concat!(
+        "SELECT a.repository_id, a.path, TRIM(a.checksum_sha256) FROM artifacts a \
+         WHERE a.id = $1 AND a.is_deleted = false AND ",
+        crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!()
+    ))
+    .bind(artifact_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((repo_id, path, checksum)) = current else {
+        return Ok(HoldTarget::Same);
+    };
+    if checksum.eq_ignore_ascii_case(seen) {
+        return Ok(HoldTarget::Same);
+    }
+    let held_digest = format!("sha256:{seen}");
+    let moved_to = format!("sha256:{checksum}");
+    let image = manifest_row_image(&path);
+    let digest_path = image.map(|name| format!("v2/{name}/manifests/{held_digest}"));
+    let alias: Option<Uuid> = sqlx::query_scalar(concat!(
+        "SELECT a.id FROM artifacts a \
+         WHERE a.repository_id = $1 AND a.checksum_sha256 = $2::bpchar \
+           AND a.is_deleted = false AND ",
+        crate::services::oci_migration_reindex::reindex_manifest_path_shape_sql!(),
+        " ORDER BY (a.path = $3) DESC, a.path LIMIT 1"
+    ))
+    .bind(repo_id)
+    .bind(seen)
+    .bind(digest_path.as_deref())
+    .fetch_optional(db)
+    .await?;
+    let created = match (alias, image, digest_path.as_deref()) {
+        (Some(id), _, _) => Some(id),
+        (None, Some(name), Some(digest_path)) => {
+            sqlx::query_scalar(
+                "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                                        checksum_sha256, content_type, storage_key) \
+                 SELECT $1, $2, $3, om.digest, om.size_bytes, $4, om.content_type, $5 \
+                 FROM oci_manifests om WHERE om.repository_id = $1 AND om.digest = $6 \
+                 ON CONFLICT (repository_id, path) DO NOTHING \
+                 RETURNING id",
+            )
+            .bind(repo_id)
+            .bind(digest_path)
+            .bind(format!("{name}:{held_digest}"))
+            .bind(seen)
+            .bind(crate::api::handlers::oci_v2::manifest_storage_key(
+                &held_digest,
+            ))
+            .bind(&held_digest)
+            .fetch_optional(db)
+            .await?
+        }
+        _ => None,
+    };
+    Ok(match created {
+        Some(artifact_id) => HoldTarget::Moved {
+            artifact_id,
+            held_digest,
+            moved_to,
+        },
+        None => HoldTarget::Gone {
+            held_digest,
+            moved_to,
+        },
+    })
+}
+
 /// Whether `path` has the shape of an OCI manifest row (the same shape
 /// [`alias_rows`] selects), so a path-addressed download gates the digest.
 pub(crate) fn is_manifest_path(path: &str) -> bool {

@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5646]
+---
+- **An administrator's or a scanner's hold on an OCI tag now lands on the image the tag named when the hold was decided, not on the image a concurrent push moved it to** ([#5646]). The quarantine and reject actions (`POST /api/v1/quarantine/{artifact_id}/quarantine` and `/reject`) and the scanner's verdict wrote to the tag's row by id. A push that moved the tag first therefore left the old image servable and held the new one. Each of these writes now checks that the row still names the digest it was decided on. If the tag has moved, the hold is applied to the old digest's row (its digest-path row, created when needed, as a tag move does since 1.12.0) and the new image is not changed. The quarantine and reject response then carries `held_artifact_id`, `held_digest` and `moved_to_digest`, so the operator can decide whether the new image needs a hold too. Both actions accept an optional `expected_digest` (`sha256:<hex>`) naming the image the operator saw, so a tag that moved before the request was sent is handled the same way. If the old digest has no row left (it was deleted by digest), they answer `409` and change nothing.
