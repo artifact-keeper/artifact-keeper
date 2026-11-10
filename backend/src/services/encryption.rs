@@ -524,6 +524,124 @@ pub async fn reencrypt_legacy_rows(
     Ok(report)
 }
 
+/// Data-key hierarchy and v2 ciphertext (#5583). Each test runs in its own
+/// nextest process, so installing the key and strict mode is per test.
+#[cfg(ak_test_shard = "services-1")]
+#[cfg(test)]
+mod data_key_tests {
+    use super::*;
+    use crate::fips::FipsMode;
+
+    const KEY: [u8; 32] = [0x5a; 32];
+
+    #[test]
+    fn parse_data_key_accepts_hex_and_both_base64_alphabets() {
+        let hex_key = "5a".repeat(32);
+        assert_eq!(parse_data_key(&hex_key).unwrap(), KEY);
+        use base64::Engine;
+        let std = base64::engine::general_purpose::STANDARD.encode(KEY);
+        assert_eq!(parse_data_key(&format!(" {std}\n")).unwrap(), KEY);
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xfb; 32]);
+        assert_eq!(parse_data_key(&url).unwrap(), [0xfb; 32]);
+        assert!(parse_data_key("not base64!!")
+            .unwrap_err()
+            .contains("neither base64"));
+        assert!(
+            parse_data_key(&base64::engine::general_purpose::STANDARD.encode([1u8; 16]))
+                .unwrap_err()
+                .contains("32 bytes, got 16")
+        );
+    }
+
+    #[test]
+    fn without_a_data_key_everything_stays_legacy() {
+        install_data_key(None);
+        assert!(!data_key_configured());
+        assert!(data_subkey(PURPOSE_CREDENTIALS).is_none());
+        assert!(data_subkey_raw(PURPOSE_TOTP_SEED).is_none());
+        let enc = CredentialEncryption::from_passphrase("pass");
+        let ct = enc.encrypt(b"plain");
+        assert_ne!(
+            ct[0], DATA_KEY_CIPHERTEXT_VERSION,
+            "legacy layout has no version byte"
+        );
+        assert!(is_legacy_ciphertext(&ct));
+        assert_eq!(enc.decrypt(&ct).unwrap(), b"plain");
+        // The token key falls back to the deployment secret.
+        let k = token_key_for("jwt-secret-value-for-tokens");
+        assert_eq!(
+            k.hash("t"),
+            crate::crypto::token::TokenKey::derive(b"jwt-secret-value-for-tokens").hash("t")
+        );
+    }
+
+    #[test]
+    fn with_a_data_key_in_strict_mode_v2_is_written_and_legacy_still_reads() {
+        install_data_key(Some(KEY));
+        crate::fips::install(FipsMode::Strict, Vec::new()).unwrap();
+        assert!(data_key_configured());
+        let a = data_subkey_raw(PURPOSE_CREDENTIALS).unwrap();
+        let b = data_subkey_raw(PURPOSE_TOTP_SEED).unwrap();
+        let c = data_subkey_raw(PURPOSE_TOKEN_HMAC).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+
+        let enc = CredentialEncryption::from_passphrase("pass");
+        let v2 = enc.encrypt(b"secret value");
+        assert_eq!(v2[0], DATA_KEY_CIPHERTEXT_VERSION);
+        assert!(!is_legacy_ciphertext(&v2));
+        assert_eq!(enc.decrypt(&v2).unwrap(), b"secret value");
+        // A row from before the key existed still decrypts.
+        let legacy_key = aead::Key::new(&derive_key_hkdf("pass")).unwrap();
+        let legacy = legacy_key.seal(b"older row", b"");
+        assert!(is_legacy_ciphertext(&legacy));
+        assert_eq!(enc.decrypt(&legacy).unwrap(), b"older row");
+        // A legacy nonce that happens to start with 0x02 is still legacy.
+        let mut lookalike = legacy.clone();
+        lookalike[0] = DATA_KEY_CIPHERTEXT_VERSION;
+        assert!(is_legacy_ciphertext(&lookalike));
+        // `new(key)` instances bring their own key and never use the hierarchy.
+        let own = CredentialEncryption::new(&[9u8; 32]).unwrap();
+        let ct = own.encrypt(b"x");
+        assert_ne!(ct[0], DATA_KEY_CIPHERTEXT_VERSION);
+        assert_eq!(own.decrypt(&ct).unwrap(), b"x");
+        // The convenience functions go through the same path.
+        let ct = encrypt_credentials("{\"k\":1}", "pass");
+        assert_eq!(decrypt_credentials(&ct, "pass").unwrap(), "{\"k\":1}");
+        // The token key is the data-key subkey, not the JWT derivation.
+        let k = token_key_for("jwt");
+        assert_eq!(
+            k.hash("t"),
+            crate::crypto::token::TokenKey::from_subkey(&c).hash("t")
+        );
+        assert_ne!(
+            k.hash("t"),
+            crate::crypto::token::TokenKey::derive(b"jwt").hash("t")
+        );
+    }
+
+    #[test]
+    fn reencrypt_report_display_and_defaults() {
+        let r = ReencryptReport {
+            rewritten: 2,
+            already_current: 3,
+            failed: 1,
+        };
+        assert_eq!(
+            r.to_string(),
+            "reencrypt-secrets: 2 rewritten, 3 already current, 1 failed"
+        );
+        assert_eq!(
+            ReencryptReport::default(),
+            ReencryptReport {
+                rewritten: 0,
+                already_current: 0,
+                failed: 0
+            }
+        );
+    }
+}
+
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests {

@@ -435,6 +435,24 @@ mod tests {
     }
 
     #[test]
+    fn output_helpers_and_comparisons() {
+        let out = Sha256::digest(b"abc");
+        assert_eq!(out.as_slice(), &sha256(b"abc")[..]);
+        assert_eq!(out.into_bytes(), sha256(b"abc"));
+        assert!(out == sha256(b"abc").to_vec());
+        assert!(out == sha256(b"abc")[..]);
+        assert_eq!(format!("{out:X}"), ABC_SHA256.to_uppercase());
+        assert_eq!(Sha384::digest(b"abc").to_vec().len(), 48);
+        assert_eq!(Sha512::digest(b"abc").as_ref().len(), 64);
+        assert_eq!(Algorithm::Sha384.name(), "sha384");
+        assert_eq!(Algorithm::Sha512.name(), "sha512");
+        let mut h = Hasher::new(Algorithm::Sha384);
+        h.update(b"abc");
+        assert_eq!(h.clone().finish_hex(), ABC_SHA384);
+        assert_eq!(hex::encode(h.finish()), ABC_SHA384);
+    }
+
+    #[test]
     fn algorithm_metadata() {
         assert_eq!(Algorithm::Sha256.output_len(), 32);
         assert_eq!(Algorithm::Sha384.output_len(), 48);

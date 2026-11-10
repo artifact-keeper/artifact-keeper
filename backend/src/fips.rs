@@ -537,6 +537,46 @@ mod tests {
     }
 
     #[test]
+    fn install_publishes_mode_and_violations_for_health() {
+        // Own nextest process: INSTALLED is set exactly once here.
+        let v = vec![Violation::new("x", "named \"corp-okta\"", "fix x")];
+        assert_eq!(install(FipsMode::Warn, v.clone()), Ok(()));
+        assert_eq!(mode(), FipsMode::Warn);
+        assert!(!strict());
+        let full = health_report();
+        assert_eq!(full.mode, FipsMode::Warn);
+        assert_eq!(full.violations, v);
+        let redacted = health_report_for(false);
+        assert_eq!(redacted.violations[0].code, "x");
+        assert!(!redacted.violations[0].message.contains("corp-okta"));
+        assert!(redacted.violations[0].hint.is_empty());
+        // A second install is ignored, whatever it asks for.
+        assert_eq!(
+            install(FipsMode::Strict, vec![Violation::new("y", "m", "h")]),
+            Err(decide(FipsMode::Strict, &[Violation::new("y", "m", "h")]).unwrap_err())
+        );
+        assert_eq!(mode(), FipsMode::Warn);
+    }
+
+    #[test]
+    fn env_driven_bypass_flags_are_violations_as_the_services_read_them() {
+        // Own nextest process: environment writes are not visible elsewhere.
+        let mut c = Config::test_config();
+        c.fips_mode = FipsMode::Strict;
+        c.data_encryption_key = Some("00".repeat(32));
+        std::env::set_var("LDAP_INSECURE_TLS", "yes"); // not honoured by ldap_service
+        std::env::set_var("S3_INSECURE_TLS", "TRUE"); // honoured by s3 (lower-cased)
+        let codes: Vec<_> = config_violations(&c).into_iter().map(|v| v.code).collect();
+        assert_eq!(codes, vec!["s3-insecure-tls"]);
+        std::env::set_var("LDAP_INSECURE_TLS", "1");
+        std::env::remove_var("S3_INSECURE_TLS");
+        let codes: Vec<_> = config_violations(&c).into_iter().map(|v| v.code).collect();
+        assert_eq!(codes, vec!["ldap-insecure-tls"]);
+        std::env::remove_var("LDAP_INSECURE_TLS");
+        assert!(config_violations(&c).is_empty());
+    }
+
+    #[test]
     fn rustls_provider_install_reports_fips_according_to_build() {
         let fips = install_rustls_provider(FipsMode::Off);
         assert!(!fips || cfg!(feature = "fips"));

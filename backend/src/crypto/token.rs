@@ -110,6 +110,18 @@ mod tests {
     }
 
     #[test]
+    fn from_subkey_uses_the_given_bytes_directly() {
+        let sub = [0x11u8; 32];
+        let k = TokenKey::from_subkey(&sub);
+        assert_eq!(
+            k.hash("t"),
+            format!("{HMAC_PREFIX}{}", hmac::Key::sha256(&sub).sign_hex(b"t"))
+        );
+        assert_eq!(k.verify("t", &k.hash("t")), Ok(true));
+        assert_ne!(k.hash("t"), TokenKey::derive(&sub).hash("t"));
+    }
+
+    #[test]
     fn derived_key_is_not_the_raw_secret() {
         let secret = b"0123456789abcdef0123456789abcdef";
         let k = TokenKey::derive(secret);

@@ -167,6 +167,34 @@ mod algorithm_policy_tests {
     }
 
     #[test]
+    fn find_attribute_matches_the_name_boundary_and_both_quote_styles() {
+        use super::find_attribute;
+        assert_eq!(
+            find_attribute(r#" Algorithm="a""#, "Algorithm"),
+            Some("a".into())
+        );
+        assert_eq!(
+            find_attribute(r#" Algorithm = 'b' "#, "Algorithm"),
+            Some("b".into())
+        );
+        assert_eq!(
+            find_attribute(r#"Algorithm="first""#, "Algorithm"),
+            Some("first".into())
+        );
+        assert_eq!(
+            find_attribute(r#" xAlgorithm="x" Algorithm="y""#, "Algorithm"),
+            Some("y".into())
+        );
+        assert_eq!(find_attribute(r#" Algorithm2="x""#, "Algorithm"), None);
+        assert_eq!(find_attribute(r#" Algorithm=unquoted"#, "Algorithm"), None);
+        assert_eq!(
+            find_attribute(r#" Algorithm="unterminated"#, "Algorithm"),
+            None
+        );
+        assert_eq!(find_attribute(r#" Id="1""#, "Algorithm"), None);
+    }
+
+    #[test]
     fn unreadable_algorithm_attribute_is_non_approved_and_no_signature_is_fine() {
         assert_eq!(
             saml_non_approved_algorithms("<SignatureMethod Algorithm=>"),

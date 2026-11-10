@@ -1029,6 +1029,81 @@ pub async fn disable_totp(
 )]
 pub struct TotpApiDoc;
 
+/// TOTP seeds at rest (#5583): plain base32 outside strict mode, encrypted
+/// under the data key's `totp-seed` subkey in strict mode, readable either
+/// way. Each test is its own nextest process.
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod seed_storage_tests {
+    use super::*;
+    use crate::fips::FipsMode;
+    use crate::services::encryption;
+
+    const SEED: &str = "JBSWY3DPEHPK3PXP";
+
+    #[test]
+    fn off_mode_stores_plain_base32_and_reads_it_back() {
+        encryption::install_data_key(Some([3u8; 32]));
+        assert_eq!(seal_secret_for_storage(SEED), SEED);
+        assert_eq!(stored_secret_to_base32(SEED).unwrap(), SEED);
+        assert!(decode_secret(SEED).is_ok());
+    }
+
+    #[test]
+    fn strict_mode_without_a_data_key_stores_plain_base32() {
+        encryption::install_data_key(None);
+        crate::fips::install(FipsMode::Strict, Vec::new()).unwrap();
+        assert_eq!(seal_secret_for_storage(SEED), SEED);
+    }
+
+    #[test]
+    fn strict_mode_with_a_data_key_encrypts_and_round_trips() {
+        encryption::install_data_key(Some([3u8; 32]));
+        crate::fips::install(FipsMode::Strict, Vec::new()).unwrap();
+        let stored = seal_secret_for_storage(SEED);
+        assert!(stored.starts_with(ENCRYPTED_SEED_PREFIX), "{stored}");
+        assert_ne!(
+            seal_secret_for_storage(SEED),
+            stored,
+            "fresh nonce per seal"
+        );
+        assert_eq!(stored_secret_to_base32(&stored).unwrap(), SEED);
+        assert_eq!(
+            decode_secret(&stored).unwrap(),
+            decode_secret(SEED).unwrap()
+        );
+        // Malformed stored values are reported, not panicked on.
+        assert!(stored_secret_to_base32("enc:not*base64").is_err());
+        let mut raw = vec![0x09u8];
+        raw.extend_from_slice(&[0u8; 40]);
+        use base64::Engine;
+        let bad_version = format!(
+            "enc:{}",
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(&raw)
+        );
+        assert!(stored_secret_to_base32(&bad_version)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown version"));
+        let mut tampered = stored.clone();
+        tampered.replace_range(stored.len() - 2.., "AA");
+        assert!(stored_secret_to_base32(&tampered).is_err());
+    }
+
+    #[test]
+    fn encrypted_seed_without_a_data_key_is_a_clear_error() {
+        encryption::install_data_key(None);
+        let err =
+            stored_secret_to_base32("enc:AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("DATA_ENCRYPTION_KEY is not configured"),
+            "{err}"
+        );
+    }
+}
+
 #[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {

@@ -203,6 +203,16 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_clone_signs_identically_and_drop_runs() {
+        let kp = Ed25519KeyPair::from_seed(&hex::decode(SEED).unwrap()).unwrap();
+        let copy = kp.clone();
+        assert_eq!(copy.sign(b"m"), kp.sign(b"m"));
+        assert_eq!(copy.seed(), kp.seed());
+        drop(copy); // zeroizes its own seed; the original is untouched
+        assert_eq!(hex::encode(kp.seed()), SEED);
+    }
+
+    #[test]
     fn ed25519_seed_length_is_enforced() {
         assert_eq!(
             Ed25519KeyPair::from_seed(&[1u8; 31]).err(),
