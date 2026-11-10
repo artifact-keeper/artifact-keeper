@@ -50,11 +50,13 @@ pub async fn try_pool() -> Option<PgPool> {
 /// /128 is allowlisted for the lifetime of the guard.
 /// It is the same lock the outbound-policy unit tests take
 /// (`validation::OUTBOUND_POLICY_ENV_LOCK`), so the two never interleave.
-static SSRF_TEST_ENV_LOCK: &tokio::sync::Mutex<()> =
-    &crate::api::validation::OUTBOUND_POLICY_ENV_LOCK;
-
+///
+/// One guard per test: the lock is not re-entrant, so a second
+/// `non_loopback_mock_server()` (or `mock_upstream`) while the first guard is
+/// alive panics at once naming both call sites, instead of waiting on itself
+/// forever as it did before #5537.
 pub struct SsrfTestAllowlistGuard {
-    _lock: tokio::sync::MutexGuard<'static, ()>,
+    _lock: crate::api::validation::OutboundPolicyEnvLock,
     previous: Option<String>,
 }
 
@@ -70,7 +72,8 @@ impl Drop for SsrfTestAllowlistGuard {
 /// Start wiremock on a non-loopback interface accepted by the upstream SSRF
 /// policy, returning a guard that restores the process environment on drop.
 pub async fn non_loopback_mock_server() -> (wiremock::MockServer, SsrfTestAllowlistGuard) {
-    let lock = SSRF_TEST_ENV_LOCK.lock().await;
+    let lock =
+        crate::api::validation::lock_outbound_policy_env("tdh::non_loopback_mock_server").await;
     let previous = std::env::var("AK_SSRF_ALLOW_PRIVATE_CIDRS").ok();
     let probe = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route probe");
     probe.connect("8.8.8.8:80").expect("connect route probe");
