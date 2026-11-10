@@ -161,6 +161,45 @@ pub async fn cleanup_soft_deleted_artifact(
     .await;
 }
 
+/// [`cleanup_soft_deleted_artifact`] for a write whose new row stores its
+/// bytes under `new_storage_key` (#5675): a purged row that named another
+/// key (a Git LFS object stored under the legacy flat key before #5672,
+/// re-pushed under its repository-scoped key) hands that key to the storage
+/// GC as a candidate, the way a conditional replace does
+/// (`record_replaced_object_gc_candidate`). Without it the old object was an
+/// orphan the row-driven GC no longer saw. The candidate sweep deletes the
+/// object only if nothing else references the key. Fire-and-forget like the
+/// plain cleanup: a failure only leaves the old object where it was.
+pub async fn cleanup_soft_deleted_artifact_reclaiming(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    location: &crate::storage::StorageLocation,
+    path: &str,
+    new_storage_key: &str,
+) {
+    let scope = crate::services::storage_gc_service::oci_gc_candidate_scope(location);
+    if let Err(e) = sqlx::query(
+        "WITH purged AS ( \
+             DELETE FROM artifacts \
+              WHERE repository_id = $1 AND path = $2 AND is_deleted = true \
+             RETURNING storage_key) \
+         INSERT INTO oci_gc_candidates \
+             (storage_key, storage_backend, storage_path, source_repository_id) \
+         SELECT DISTINCT storage_key, $3, $4, $1 FROM purged WHERE storage_key <> $5 \
+         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .bind(&scope.backend)
+    .bind(&scope.path)
+    .bind(new_storage_key)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(%repository_id, path, error = %e, "soft-deleted artifact cleanup failed");
+    }
+}
+
 /// Remove any soft-deleted artifact at `(repository_id, path)` so a subsequent
 /// INSERT won't violate `UNIQUE(repository_id, path)` — UNLESS the coordinate is
 /// a *released* one AND the incoming bytes differ from the tombstoned bytes.
@@ -1156,6 +1195,68 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert tombstone");
+    }
+
+    /// #5675: purging a tombstone whose key differs from the new row's
+    /// journals the old key as a storage GC candidate; the same key (or no
+    /// tombstone) journals nothing.
+    #[tokio::test]
+    async fn reclaiming_cleanup_journals_the_replaced_key_5675() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let sha = "c".repeat(64);
+        let flat = format!("sk/{sha}");
+        let location = crate::storage::StorageLocation {
+            backend: "s3".into(),
+            path: String::new(),
+        };
+        let journaled = |key: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM oci_gc_candidates \
+                     WHERE storage_key = $1 AND storage_backend = 's3' AND source_repository_id = $2",
+                )
+                .bind(key)
+                .bind(repo)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let tombstones = |path: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+                )
+                .bind(repo)
+                .bind(path)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        // Same key: purged, nothing journaled.
+        insert_tombstone(&pool, repo, "lfs/same", &sha).await;
+        cleanup_soft_deleted_artifact_reclaiming(&pool, repo, &location, "lfs/same", &flat).await;
+        assert_eq!(tombstones("lfs/same").await, 0);
+        assert_eq!(journaled(flat.clone()).await, 0);
+        // Another key: purged and the old key journaled.
+        insert_tombstone(&pool, repo, "lfs/moved", &sha).await;
+        let scoped = format!("lfs/{repo}/{sha}");
+        cleanup_soft_deleted_artifact_reclaiming(&pool, repo, &location, "lfs/moved", &scoped)
+            .await;
+        assert_eq!(tombstones("lfs/moved").await, 0);
+        assert_eq!(journaled(flat.clone()).await, 1);
+        assert_eq!(journaled(scoped).await, 0);
+        let _ = sqlx::query("DELETE FROM oci_gc_candidates WHERE source_repository_id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await;
+        cleanup_repo(&pool, repo).await;
     }
 
     async fn cleanup_repo(pool: &sqlx::PgPool, repo: uuid::Uuid) {

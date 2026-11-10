@@ -68,6 +68,9 @@ pub const MAX_SUMMARY_VERSIONS: usize = 200;
 pub const MAX_BACKFILL_NAMES: i64 = 50;
 /// Ingested versions a run retries package resolution for.
 pub const MAX_RERESOLVE: i64 = 100;
+/// Failed backfill attempts of one row before it is retried only once a day
+/// (#5675): a name that cannot be stored no longer costs every sync.
+pub const MAX_BACKFILL_ATTEMPTS: i64 = 5;
 /// The watermark never runs closer to the run's start than this, so an
 /// upstream entry updated while a pass was paging past it is read again.
 pub const WATERMARK_OVERLAP_SECS: i64 = 600;
@@ -599,9 +602,13 @@ fn store_failure(key: &str, status: axum::http::StatusCode) -> crate::error::App
     let message = format!("storing '{key}' failed ({status})");
     match status {
         StatusCode::CONFLICT => AppError::Conflict(message),
-        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::INSUFFICIENT_STORAGE => {
-            AppError::QuotaExceeded(message)
-        }
+        // A size cap (the upload limit), not a quota: its own `400` code
+        // instead of `507 QUOTA_EXCEEDED` (#5675).
+        StatusCode::PAYLOAD_TOO_LARGE => AppError::CodedValidation {
+            code: "PAYLOAD_TOO_LARGE",
+            message,
+        },
+        StatusCode::INSUFFICIENT_STORAGE => AppError::QuotaExceeded(message),
         _ => AppError::Storage(message),
     }
 }
@@ -871,13 +878,17 @@ pub async fn upsert_row(
     .map_err(db_err)
 }
 
-/// Clear `metadata.needsIngest` on a row once its versions are in.
+/// Clear `metadata.needsIngest` (and the backfill attempt record) on a row
+/// once its versions are in.
 async fn clear_needs_ingest(db: &PgPool, id: Uuid) -> Result<(), String> {
-    sqlx::query("UPDATE curation_packages SET metadata = metadata - 'needsIngest' WHERE id = $1")
-        .bind(id)
-        .execute(db)
-        .await
-        .map_err(db_err)?;
+    sqlx::query(
+        "UPDATE curation_packages SET metadata = metadata - 'needsIngest' \
+         - 'backfillAttempts' - 'backfillAttemptedAt' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -1818,16 +1829,7 @@ fn absorb(into: &mut SyncSummary, from: &SyncSummary) {
 /// Names (and pins) an approval flagged `needsIngest` that no page carried:
 /// ingest them from their per-server version list.
 async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), String> {
-    let pending: Vec<StoredRow> = sqlx::query_as(
-        "SELECT id, package_name, version, status, metadata FROM curation_packages \
-         WHERE staging_repo_id = $1 AND format = 'mcp' AND status = 'approved' \
-           AND metadata ? 'needsIngest' ORDER BY package_name, version LIMIT $2",
-    )
-    .bind(run.repo.id)
-    .bind(MAX_BACKFILL_NAMES)
-    .fetch_all(&run.state.db)
-    .await
-    .map_err(db_err)?;
+    let pending = backfill_candidates(&run.state.db, run.repo.id, MAX_BACKFILL_NAMES).await?;
     for row in pending {
         if run.denied(&row.package_name) {
             continue;
@@ -1849,9 +1851,55 @@ async fn backfill(run: &RunCtx<'_>, summary: &mut SyncSummary) -> Result<(), Str
                 summary.backfilled_names += 1;
                 clear_needs_ingest(&run.state.db, row.id).await?;
             }
-            Err(e) => summary.errors.push(e.into()),
+            Err(e) => {
+                record_backfill_failure(&run.state.db, row.id).await?;
+                summary.errors.push(e.into());
+            }
         }
     }
+    Ok(())
+}
+
+/// The rows [`backfill`] attempts this run (#5675): least recently
+/// attempted first (never attempted before any), so rows that keep failing
+/// cannot starve the rest once they fill the batch; a row that failed
+/// [`MAX_BACKFILL_ATTEMPTS`] times is picked again only a day after its last
+/// attempt.
+async fn backfill_candidates(
+    db: &PgPool,
+    repo_id: Uuid,
+    limit: i64,
+) -> Result<Vec<StoredRow>, String> {
+    sqlx::query_as(
+        "SELECT id, package_name, version, status, metadata FROM curation_packages \
+         WHERE staging_repo_id = $1 AND format = 'mcp' AND status = 'approved' \
+           AND metadata ? 'needsIngest' \
+           AND (COALESCE((metadata->>'backfillAttempts')::bigint, 0) < $3 \
+                OR (metadata->>'backfillAttemptedAt')::timestamptz < now() - interval '1 day') \
+         ORDER BY (metadata->>'backfillAttemptedAt')::timestamptz ASC NULLS FIRST, \
+                  package_name, version \
+         LIMIT $2",
+    )
+    .bind(repo_id)
+    .bind(limit)
+    .bind(MAX_BACKFILL_ATTEMPTS)
+    .fetch_all(db)
+    .await
+    .map_err(db_err)
+}
+
+/// Count a failed backfill attempt of a row and stamp when it was made.
+async fn record_backfill_failure(db: &PgPool, id: Uuid) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE curation_packages SET metadata = metadata || jsonb_build_object( \
+           'backfillAttempts', COALESCE((metadata->>'backfillAttempts')::bigint, 0) + 1, \
+           'backfillAttemptedAt', now()) \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -2408,6 +2456,131 @@ mod tests {
             ak_sha256: None,
             ak_source: false,
         }
+    }
+
+    /// #5675: a storage `413` is a size cap with its own `400` code, not
+    /// `507 QUOTA_EXCEEDED`; a full store (`507`) stays a quota refusal.
+    #[test]
+    fn store_failure_maps_413_to_its_own_code_5675() {
+        use crate::error::AppError;
+        use axum::http::StatusCode;
+        let too_large = store_failure("k", StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            matches!(
+                too_large,
+                AppError::CodedValidation {
+                    code: "PAYLOAD_TOO_LARGE",
+                    ..
+                }
+            ),
+            "{too_large:?}"
+        );
+        assert!(matches!(
+            store_failure("k", StatusCode::INSUFFICIENT_STORAGE),
+            AppError::QuotaExceeded(_)
+        ));
+        assert!(matches!(
+            store_failure("k", StatusCode::CONFLICT),
+            AppError::Conflict(_)
+        ));
+        assert!(matches!(
+            store_failure("k", StatusCode::INTERNAL_SERVER_ERROR),
+            AppError::Storage(_)
+        ));
+    }
+
+    /// #5675: backfill picks never-attempted rows first, then the least
+    /// recently attempted, so failing rows cannot starve later names; a
+    /// row that failed [`MAX_BACKFILL_ATTEMPTS`] times waits a day; a
+    /// success clears the attempt record.
+    #[tokio::test]
+    async fn backfill_rotates_and_caps_failing_rows_5675() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo, _key, dir) = tdh::create_repo(&pool, "remote", "mcp").await;
+        let mut ids = std::collections::HashMap::new();
+        for name in ["io.a/fails", "io.b/once", "io.c/fresh"] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO curation_packages (staging_repo_id, remote_repo_id, format, \
+                 package_name, version, upstream_path, status, metadata) \
+                 VALUES ($1, $1, 'mcp', $2, '1.0.0', $2, 'approved', '{\"needsIngest\": true}') \
+                 RETURNING id",
+            )
+            .bind(repo)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.insert(name, id);
+        }
+        let picked = |limit| {
+            let pool = pool.clone();
+            async move {
+                backfill_candidates(&pool, repo, limit)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.package_name)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(picked(10).await, ["io.a/fails", "io.b/once", "io.c/fresh"]);
+        record_backfill_failure(&pool, ids["io.b/once"])
+            .await
+            .unwrap();
+        // The failed row goes to the back; with a batch of two the fresh
+        // name behind it is reached.
+        assert_eq!(picked(2).await, ["io.a/fails", "io.c/fresh"]);
+        for _ in 0..MAX_BACKFILL_ATTEMPTS {
+            record_backfill_failure(&pool, ids["io.a/fails"])
+                .await
+                .unwrap();
+        }
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT (metadata->>'backfillAttempts')::bigint FROM curation_packages WHERE id = $1",
+        )
+        .bind(ids["io.a/fails"])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, MAX_BACKFILL_ATTEMPTS);
+        assert_eq!(
+            picked(10).await,
+            ["io.c/fresh", "io.b/once"],
+            "capped row waits"
+        );
+        sqlx::query(
+            "UPDATE curation_packages SET metadata = jsonb_set(metadata, '{backfillAttemptedAt}', \
+             to_jsonb(now() - interval '2 days')) WHERE id = $1",
+        )
+        .bind(ids["io.a/fails"])
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            picked(10).await,
+            ["io.c/fresh", "io.a/fails", "io.b/once"],
+            "a day later the capped row is retried"
+        );
+        clear_needs_ingest(&pool, ids["io.b/once"]).await.unwrap();
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM curation_packages WHERE id = $1")
+                .bind(ids["io.b/once"])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            meta.get("needsIngest").is_none() && meta.get("backfillAttempts").is_none(),
+            "{meta}"
+        );
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

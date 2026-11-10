@@ -621,7 +621,16 @@ async fn upload_object(
     )
     .await?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    // A tombstone stored under the legacy flat key hands that object to the
+    // storage GC rather than orphaning it (#5675).
+    super::cleanup_soft_deleted_artifact_reclaiming(
+        &state.db,
+        repo.id,
+        &repo.storage_location(),
+        &artifact_path,
+        &storage_key,
+    )
+    .await;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(
