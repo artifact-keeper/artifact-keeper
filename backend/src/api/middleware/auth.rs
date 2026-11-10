@@ -32,7 +32,9 @@ use crate::error::AppError;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::RepositoryVisibility;
 use crate::models::user::User;
-use crate::services::auth_service::{AuthService, Claims};
+use crate::services::auth_service::{
+    is_api_token_shape, is_jwt_shape, AuthService, Claims, TimingPad,
+};
 use crate::services::metrics_service::{
     record_auth_failure, AuthFailureReason, AuthFailureSurface,
 };
@@ -943,76 +945,32 @@ pub async fn auth_middleware(
                 "Invalid Basic auth credentials",
                 Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken)),
             )),
+            // Same token-first resolution as the optional-auth paths, with
+            // API tokens refused as the Basic password on this management
+            // surface (#2806): an issued-token-shaped password is never
+            // bcrypt-verified, and a real password pays exactly one bcrypt
+            // (#5640). A JWT access token as the password still works for the
+            // CI/CD keyless flows (OIDC token exchange) where Maven, twine and
+            // Helm send it there.
             Some((username, password)) => {
-                match auth_service
-                    .authenticate_with_reason(&username, &password)
+                let mut failure = None;
+                match resolve_basic_pair(&auth_service, &username, &password, false, &mut failure)
                     .await
-                    .map_err(|failure| {
-                        let reason = failure
-                            .metric_reason()
-                            .unwrap_or(AuthFailureReason::BadPassword);
-                        (failure.error, reason)
-                    }) {
-                    Ok((user, _token_pair)) => Ok(AuthExtension::from(user)),
-                    // A transient bcrypt-capacity shed must NOT be collapsed
-                    // into a 401. `authenticate()` runs bcrypt(cost=12) under a
-                    // process-wide concurrency cap (see
-                    // `auth_service::acquire_auth_permit_for_bcrypt`); when that
-                    // cap saturates under a burst of concurrent Basic-auth
-                    // requests it returns `AppError::ServiceUnavailable`, which
-                    // is a retryable 503, not "wrong password". Collapsing it to
-                    // 401 "Invalid credentials" is what made `twine upload` fail
-                    // in the release gate (a curl -u upload with byte-identical
-                    // credentials passed because it didn't coincide with a
-                    // saturated cap): twine does not retry on 401 but does on
-                    // 503. Surface the shed as 503 + Retry-After so well-behaved
-                    // clients back off and retry instead of aborting.
-                    Err((AppError::ServiceUnavailable(msg), _)) => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            [(axum::http::header::RETRY_AFTER, "1")],
-                            msg,
-                        )
-                            .into_response();
-                    }
-                    // A pool-acquire timeout during the credential DB lookup is
-                    // a transient capacity problem (POOL_EXHAUSTED), not "wrong
-                    // password": surface the same retryable 503 the #2101/#2102
-                    // handlers return rather than flattening it to a spurious
-                    // 401 (#2125). Clients retry on 503 but abort on 401.
-                    Err((ref e, _)) if e.is_db_unavailable() => {
+                {
+                    AuthOutcome::Resolved(ext) => Ok(ext),
+                    // A transient bcrypt-capacity shed or a pool-acquire
+                    // timeout is a retryable 503, never a 401: twine does not
+                    // retry on 401 but does on 503 (#2125).
+                    AuthOutcome::Overloaded => {
                         return service_unavailable_response();
                     }
-                    Err((_, password_reason)) => {
-                        // Try treating the password as a short-lived JWT access
-                        // token. This enables CI/CD keyless flows (e.g. OIDC
-                        // token exchange) where package managers like Maven,
-                        // pip/twine, and Helm send the AK access token as the
-                        // Basic-auth password. `From<Claims>` stamps `iat_ms` so
-                        // credential-change invalidation can exempt the calling
-                        // session.
-                        //
-                        // An API token is deliberately NOT accepted as the Basic
-                        // password here: this is the hard-auth middleware for the
-                        // management API (/api/v1/auth, /profile, /signing, …).
-                        // Per the openapi.rs contract, an API token is only ever
-                        // valid as a `Bearer`/`X-Api-Key` credential or the Basic
-                        // password on the FORMAT/registry endpoints (handled by
-                        // `repo_visibility_middleware` → `try_resolve_auth_outcome`
-                        // with `allow_basic_api_token=true`). Accepting it here
-                        // (added by #2798) over-reached the #2786 need; #2806
-                        // restores the /api/v1 Basic-auth boundary.
-                        match auth_service.validate_access_token_async(&password).await {
-                            Ok(claims) => Ok(AuthExtension::from(claims)),
-                            Err(ref e) if e.is_db_unavailable() => {
-                                return service_unavailable_response();
-                            }
-                            Err(_) => Err((
-                                "Invalid credentials",
-                                Some((AuthFailureSurface::Basic, password_reason)),
-                            )),
-                        }
-                    }
+                    AuthOutcome::InvalidCredential | AuthOutcome::NoCredential => Err((
+                        "Invalid credentials",
+                        Some(failure.unwrap_or((
+                            AuthFailureSurface::Basic,
+                            AuthFailureReason::BadPassword,
+                        ))),
+                    )),
                 }
             }
         },
@@ -1363,66 +1321,14 @@ async fn resolve_auth_outcome(
                 *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
                 return AuthOutcome::InvalidCredential;
             };
-            // Try bcrypt username/password auth first
-            match auth_service
-                .authenticate_with_reason(&username, &password)
-                .await
-            {
-                Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-                // A transient bcrypt-capacity shed must surface as 503, not a
-                // 401. Without this, twine (which sends standard Basic auth)
-                // gets a spurious 401 under parallel-suite load and aborts,
-                // while a single curl -u upload with the same credentials
-                // succeeds. See `AuthOutcome::Overloaded`.
-                Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => {
-                    return AuthOutcome::Overloaded
-                }
-                // A pool-acquire timeout is a retryable 503, never a 401.
-                // Short-circuit here so a saturated pool does not pay a second
-                // acquire-timeout on the API-token fallback below before the
-                // classifier reaches the same conclusion (#2125). See
-                // `AuthOutcome::Overloaded`.
-                Err(ref f) if f.error.is_db_unavailable() => return AuthOutcome::Overloaded,
-                // If every fallback below fails too, this is what the
-                // rejected credential counts as.
-                Err(f) => {
-                    *failure = Some((
-                        AuthFailureSurface::Basic,
-                        f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
-                    ));
-                }
-            }
-            // Try treating the password as a short-lived JWT access token.
-            // This enables CI/CD keyless flows (e.g. OIDC token exchange) where
-            // package managers like Maven, pip/twine, and Helm send the AK access
-            // token as the Basic auth password.
-            match auth_service.validate_access_token_async(&password).await {
-                Ok(claims) => return AuthOutcome::Resolved(AuthExtension::from(claims)),
-                Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
-                Err(_) => {}
-            }
-            // Fall back to treating the password as an API token — compatible with
-            // pip netrc / Artifactory-style `token:<api_token>` credential format.
-            //
-            // Only the format/registry endpoints (`repo_visibility_middleware`)
-            // opt into this via `allow_basic_api_token=true`. The /api/v1
-            // management callers (`optional_auth_middleware`, `admin_middleware`)
-            // pass `false`, so an API token presented as a Basic password there is
-            // refused (falls through to `InvalidCredential`), honouring the
-            // openapi.rs contract (#2806). Bearer/X-Api-Key token auth and
-            // bcrypt/JWT Basic auth above are unaffected.
-            if !allow_basic_api_token {
-                return AuthOutcome::InvalidCredential;
-            }
-            match validate_api_token_with_scopes(auth_service, &password).await {
-                Ok(ext) => AuthOutcome::Resolved(ext),
-                // The token fallback also burns a bcrypt verify under the
-                // same process-wide cap; preserve the shed as Overloaded so
-                // pip-netrc-style `token:<api_token>` clients get the
-                // retryable 503, not a spurious 401.
-                Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
-                Err(TokenAuthError::Invalid(_)) => AuthOutcome::InvalidCredential,
-            }
+            resolve_basic_pair(
+                auth_service,
+                &username,
+                &password,
+                allow_basic_api_token,
+                failure,
+            )
+            .await
         }
         ExtractedToken::None => AuthOutcome::NoCredential,
         ExtractedToken::Invalid => {
@@ -1435,6 +1341,109 @@ async fn resolve_auth_outcome(
 // ---------------------------------------------------------------------------
 // Download ticket auth (?ticket= query param)
 // ---------------------------------------------------------------------------
+
+/// Resolve a decoded HTTP Basic `username:password` pair (#5640, #5633).
+///
+/// Order is by cost, cheapest first, and is shaped so a token never pays for
+/// a password check:
+///
+/// 1. **JWT-shaped password** (`eyJ…` compact JWS): validated as an AK access
+///    token (HMAC, no bcrypt) — the keyless CI/OIDC flow where Maven, twine
+///    or Helm send the access token as the password. Never bcrypt-verified.
+/// 2. **API-token-shaped password** (`<8 hex>_<32 hex>`): validated as an API
+///    token, which answers from the token cache after the first request and
+///    rejects an unknown, revoked or expired token before any bcrypt (see
+///    `AuthService::validate_api_token`). On the /api/v1 management surfaces
+///    (`allow_basic_api_token = false`) a token is not an accepted Basic
+///    password (#2806), so it is refused outright. Never bcrypt-verified as a
+///    password either: that is what cost every `user:<api_token>` request a
+///    cost-12 bcrypt (0.34 s) before the token was even tried, saturated the
+///    auth-concurrency cap into `503 Authentication service is at capacity`,
+///    and bumped the account's failed-login counter on every request.
+/// 3. **Anything else** is a password: one bcrypt via
+///    `AuthService::authenticate_basic_with_reason`, which pads the
+///    unknown-username, federated and hashless arms with the same bcrypt so
+///    an unknown username is not answered measurably faster than a known one.
+///    (release/1.11.x has no LDAP Basic-auth passthrough, so the pad is
+///    always on here; see `AuthEntry::Basic`.)
+///
+/// Consequence, deliberate: a local account whose password happens to be
+/// shaped exactly like an AK-issued token cannot use it as a Basic password
+/// on these surfaces (it still logs in at `POST /api/v1/auth/login`).
+/// Falling back to bcrypt for such a secret would put every invalid token
+/// back in front of the auth-capacity cap.
+///
+/// Sets `failure` to the `ak_auth_failures_total` labels before answering
+/// [`AuthOutcome::InvalidCredential`].
+async fn resolve_basic_pair(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+    allow_basic_api_token: bool,
+    failure: &mut Option<AuthFailureLabels>,
+) -> AuthOutcome {
+    if is_jwt_shape(password) {
+        return match auth_service.validate_access_token_async(password).await {
+            Ok(claims) => AuthOutcome::Resolved(AuthExtension::from(claims)),
+            // Signature verified, DB lookup failed: retryable 503 (#4750).
+            Err(ref e) if e.is_db_unavailable() => AuthOutcome::Overloaded,
+            Err(e) => {
+                *failure = Some((
+                    AuthFailureSurface::Basic,
+                    AuthFailureReason::for_token_error(&e, AuthFailureReason::InvalidToken),
+                ));
+                AuthOutcome::InvalidCredential
+            }
+        };
+    }
+
+    if is_api_token_shape(password) {
+        // The /api/v1 management callers (`optional_auth_middleware`,
+        // `admin_middleware`, `auth_middleware`) pass `false`: an API token
+        // presented as a Basic password there is refused, honouring the
+        // openapi.rs contract (#2806). Only the format/registry endpoints
+        // (`repo_visibility_middleware`) accept the pip-netrc /
+        // Artifactory-style `user:<api_token>` form (#2786). The username is
+        // not checked against the token owner: `__token__:` / `token:` clients
+        // rely on the token alone identifying the user.
+        if !allow_basic_api_token {
+            *failure = Some((AuthFailureSurface::Basic, AuthFailureReason::InvalidToken));
+            return AuthOutcome::InvalidCredential;
+        }
+        return match validate_api_token_with_scopes(auth_service, password).await {
+            Ok(ext) => AuthOutcome::Resolved(ext),
+            // A live token's first (uncached) verify runs bcrypt under the
+            // process-wide cap; a shed there is a retryable 503, not a 401.
+            Err(TokenAuthError::Overloaded) => AuthOutcome::Overloaded,
+            Err(TokenAuthError::Invalid(reason)) => {
+                *failure = Some((AuthFailureSurface::Basic, reason));
+                AuthOutcome::InvalidCredential
+            }
+        };
+    }
+
+    match auth_service
+        .authenticate_basic_with_reason(username, password, TimingPad::On)
+        .await
+    {
+        Ok((user, _)) => AuthOutcome::Resolved(AuthExtension::from(user)),
+        // A transient bcrypt-capacity shed must surface as 503, not a 401.
+        // Without this, twine (which sends standard Basic auth) gets a
+        // spurious 401 under parallel-suite load and aborts, while a single
+        // curl -u upload with the same credentials succeeds. See
+        // `AuthOutcome::Overloaded`.
+        Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => AuthOutcome::Overloaded,
+        // A pool-acquire timeout is a retryable 503, never a 401 (#2125).
+        Err(ref f) if f.error.is_db_unavailable() => AuthOutcome::Overloaded,
+        Err(f) => {
+            *failure = Some((
+                AuthFailureSurface::Basic,
+                f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
+            ));
+            AuthOutcome::InvalidCredential
+        }
+    }
+}
 
 /// Extract the value of a `ticket` query parameter from a URI's query string.
 ///
@@ -8165,7 +8174,12 @@ mod tests {
         let req = axum::http::Request::builder()
             .method(Method::GET)
             .uri("/probe")
-            .header("Authorization", "Bearer deadbeefdead")
+            // API-token-shaped, so it passes the pre-DB shape check (#5633)
+            // and actually reaches the timing-out prefix lookup.
+            .header(
+                "Authorization",
+                "Bearer deadbeef_0123456789abcdef0123456789abcdef",
+            )
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = run_through_optional_auth(req).await;
@@ -11917,5 +11931,391 @@ mod tests {
             matches!(outcome, AuthOutcome::InvalidCredential),
             "{outcome:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #5640 / #5633: Basic `user:<api_token>` is resolved token-first, and an
+    // invalid credential is refused before it can take an auth-capacity
+    // permit.
+    //
+    // Counted, not timed: `bcrypt_verify_counter` counts every
+    // `AuthService::verify_password` call, and `verify_password` is the only
+    // place the auth-capacity permit is taken, so "zero verifies" is "zero
+    // permits". The count is a process-global, which `cargo nextest`'s
+    // process-per-test isolation (mandated by CLAUDE.md and CI) keeps private
+    // to each test.
+    // -----------------------------------------------------------------------
+    mod basic_token_first_5640 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5640";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic(username: &str, password: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        }
+
+        /// A token-shaped secret no token was ever minted for.
+        fn unknown_token() -> String {
+            format!("deadbeef_{}", Uuid::new_v4().simple())
+        }
+
+        /// A local account with a real (cost-4) password hash. Hashed with
+        /// `bcrypt::hash` directly so seeding takes no permit and no count.
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5640-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        /// `(failed_login_attempts, last_failed_login_at IS NOT NULL,
+        /// locked_until IS NOT NULL)`.
+        async fn lockout_state(pool: &sqlx::PgPool, user_id: Uuid) -> (i32, bool, bool) {
+            sqlx::query_as(
+                "SELECT failed_login_attempts, last_failed_login_at IS NOT NULL, \
+                 locked_until IS NOT NULL FROM users WHERE id = $1",
+            )
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("read lockout state")
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        fn service(pool: &sqlx::PgPool) -> AuthService {
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()))
+        }
+
+        /// The issue's shape: `user:<api_token>` on a format route, N times.
+        /// Before the fix every request bcrypt-verified the token as the
+        /// user's password and wrote a failed login.
+        #[tokio::test]
+        async fn basic_user_token_runs_no_bcrypt_and_writes_no_failed_login() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = service(&pool);
+            let (token, _) = svc
+                .generate_api_token(user_id, "maven", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let header = basic(&username, &token);
+
+            // The first request verifies the token itself once (uncached) —
+            // that is the token's own check, not a password check.
+            let before = verifies();
+            let first = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await;
+            assert!(
+                matches!(first, AuthOutcome::Resolved(ref e) if e.is_api_token && e.user_id == user_id),
+                "user:<api_token> must resolve to the token owner, got {first:?}"
+            );
+            assert_eq!(verifies() - before, 1, "only the token's own verify");
+
+            const N: u64 = 20;
+            let before = verifies();
+            for _ in 0..N {
+                let outcome =
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await;
+                assert!(matches!(outcome, AuthOutcome::Resolved(_)), "{outcome:?}");
+            }
+            let ran = verifies() - before;
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            assert_eq!(
+                ran, 0,
+                "{N} cached Basic user:<api_token> requests ran {ran} bcrypt verifies: the \
+                 token was tried as a password first (#5640)"
+            );
+            assert_eq!(
+                state,
+                (0, false, false),
+                "user:<api_token> must never write the lockout columns (#5640)"
+            );
+        }
+
+        /// A token-shaped secret that is not a live token — never minted,
+        /// revoked, or expired — is a 401 with no bcrypt (no permit) and no
+        /// failed-login write, on both the format and the management path.
+        #[tokio::test]
+        async fn basic_user_bad_token_is_refused_without_bcrypt_or_failed_login() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+            let (revoked, revoked_id) = svc
+                .generate_api_token(user_id, "revoked", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let (expired, expired_id) = svc
+                .generate_api_token(user_id, "expired", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            sqlx::query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+                .bind(revoked_id)
+                .execute(&pool)
+                .await
+                .expect("revoke");
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .expect("expire");
+
+            let before = verifies();
+            let mut format_outcomes = Vec::new();
+            for secret in [unknown_token(), revoked, expired] {
+                let header = basic(&username, &secret);
+                format_outcomes.push(
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), true).await,
+                );
+                format_outcomes.push(
+                    try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), false).await,
+                );
+            }
+            let mgmt = run_auth_middleware_with_service(
+                svc.clone(),
+                basic_get(&username, &unknown_token()),
+            )
+            .await
+            .status();
+            let ran = verifies() - before;
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            for outcome in &format_outcomes {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "a dead token as the Basic password must be InvalidCredential, got {outcome:?}"
+                );
+            }
+            assert_eq!(mgmt, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                ran, 0,
+                "a dead token as the Basic password ran {ran} bcrypt verifies (each one takes \
+                 an auth-capacity permit, #5633)"
+            );
+            assert_eq!(state, (0, false, false), "no failed-login write (#5640)");
+        }
+
+        /// Ordinary `user:password` Basic auth is unchanged: the right
+        /// password authenticates, and a wrong one still counts toward the
+        /// lockout. Lockout policy is not part of this fix.
+        #[tokio::test]
+        async fn basic_user_password_still_works_and_a_wrong_one_still_counts() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+
+            let good = basic(&username, PASSWORD);
+            let resolved = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&good), true).await;
+            let mgmt_ok =
+                run_auth_middleware_with_service(svc.clone(), basic_get(&username, PASSWORD))
+                    .await
+                    .status();
+
+            let bad = basic(&username, "wrong-password");
+            let before = verifies();
+            let rejected = try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&bad), true).await;
+            let wrong_verifies = verifies() - before;
+            let mgmt_bad =
+                run_auth_middleware_with_service(svc.clone(), basic_get(&username, "also-wrong"))
+                    .await
+                    .status();
+            let state = lockout_state(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            assert!(
+                matches!(resolved, AuthOutcome::Resolved(ref e) if !e.is_api_token && e.user_id == user_id),
+                "{resolved:?}"
+            );
+            assert_eq!(mgmt_ok, StatusCode::OK);
+            assert!(
+                matches!(rejected, AuthOutcome::InvalidCredential),
+                "{rejected:?}"
+            );
+            assert_eq!(mgmt_bad, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                wrong_verifies, 1,
+                "a wrong password pays exactly one bcrypt (no second, token-shaped dummy verify)"
+            );
+            assert_eq!(state.0, 2, "both wrong passwords count toward the lockout");
+            assert!(
+                state.1,
+                "last_failed_login_at is recorded for a wrong password"
+            );
+        }
+
+        /// The timing oracle (#5640: 0.67 s for a wrong password on an
+        /// existing account vs 0.32 s for an unknown one): a wrong Basic
+        /// password costs the same single bcrypt whether or not the username
+        /// exists, on both surfaces. Pinned by code path (the dummy-hash
+        /// verify on the unknown-username arm), not wall time.
+        #[tokio::test]
+        async fn basic_wrong_password_costs_one_bcrypt_for_known_and_unknown_users() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let (user_id, username) = local_user(&pool).await;
+            let svc = service(&pool);
+            let ghost = format!("ph-5640-ghost-{}", Uuid::new_v4());
+
+            let mut costs = Vec::new();
+            for allow in [true, false] {
+                for who in [username.as_str(), ghost.as_str()] {
+                    let header = basic(who, "wrong-password");
+                    let before = verifies();
+                    let outcome =
+                        try_resolve_auth_outcome(&svc, ExtractedToken::Basic(&header), allow).await;
+                    assert!(
+                        matches!(outcome, AuthOutcome::InvalidCredential),
+                        "{outcome:?}"
+                    );
+                    costs.push((allow, who == ghost, verifies() - before));
+                }
+            }
+            drop_user(&pool, user_id).await;
+
+            for (allow, unknown, cost) in costs {
+                assert_eq!(
+                    cost, 1,
+                    "wrong Basic password (allow_basic_api_token={allow}, unknown_user={unknown}) \
+                     ran {cost} bcrypt verifies; known and unknown usernames must both pay \
+                     exactly one so they take comparable time"
+                );
+            }
+        }
+
+        /// #5633: a burst of invalid credentials — a JWT that does not verify, garbage, a
+        /// never-minted and an expired API token as Bearer, and a dead token
+        /// as the Basic password — answers 401, never 503, even with the
+        /// auth-capacity cap fully held. Before the fix each of them ran a
+        /// bcrypt (the dummy-hash pad) under the cap.
+        #[tokio::test]
+        async fn invalid_credential_burst_never_sheds_to_503() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // Under nextest this process installs the cap itself, so it can
+            // hold the only permit: any request that reached bcrypt would then
+            // wait out the 3 s queue and shed to 503. Outside nextest the cap
+            // is process-wide and shared with other tests, so it is left
+            // alone and the zero-verify count below carries the assertion.
+            let ours = if std::env::var_os("NEXTEST").is_some() {
+                let sem = Arc::new(tokio::sync::Semaphore::new(1));
+                crate::services::auth_service::install_global_auth_semaphore(Some(sem.clone()));
+                crate::services::auth_service::installed_global_auth_semaphore()
+                    .filter(|installed| Arc::ptr_eq(installed, &sem))
+            } else {
+                None
+            };
+
+            let (user_id, username) = local_user(&pool).await;
+            let svc = Arc::new(service(&pool));
+            let (expired, expired_id) = svc
+                .generate_api_token(user_id, "expired", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(expired_id)
+            .execute(&pool)
+            .await
+            .expect("expire");
+            // JWT-shaped, but signed with a key this service does not hold
+            // (an expired or foreign session token behaves the same way).
+            let bad_jwt = mint_access_jwt(
+                "some-other-secret-at-least-32-bytes-long",
+                user_id,
+                &username,
+            );
+
+            let headers = [
+                format!("Bearer {bad_jwt}"),
+                "Bearer not-a-real-credential".to_string(),
+                format!("Bearer {}", unknown_token()),
+                format!("Bearer {expired}"),
+                format!("Basic {}", basic(&username, &unknown_token())),
+                format!("Basic {}", basic(&username, &expired)),
+            ];
+
+            // Seeding (the token mint hashes under the cap) is done; now hold
+            // the only permit for the whole burst.
+            let held = ours.map(|sem| sem.try_acquire_owned().expect("hold the only permit"));
+
+            let before = verifies();
+            let started = std::time::Instant::now();
+            let mut tasks = tokio::task::JoinSet::new();
+            for i in 0..64 {
+                let header = headers[i % headers.len()].clone();
+                let svc = svc.clone();
+                tasks.spawn(async move {
+                    let request = axum::http::Request::builder()
+                        .method(Method::GET)
+                        .uri("/probe")
+                        .header("Authorization", header)
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                    run_auth_middleware_with_service(svc, request)
+                        .await
+                        .status()
+                });
+            }
+            let mut statuses = Vec::new();
+            while let Some(status) = tasks.join_next().await {
+                statuses.push(status.expect("burst task"));
+            }
+            let elapsed = started.elapsed();
+            let ran = verifies() - before;
+            drop(held);
+            drop_user(&pool, user_id).await;
+
+            assert!(
+                statuses.iter().all(|s| *s == StatusCode::UNAUTHORIZED),
+                "every invalid credential must answer 401, never a retryable 503: {statuses:?}"
+            );
+            assert_eq!(
+                ran, 0,
+                "the burst ran {ran} bcrypt verifies (permits) (#5633)"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(3),
+                "the burst queued on the auth cap ({elapsed:?})"
+            );
+        }
     }
 }
