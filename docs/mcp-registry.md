@@ -138,8 +138,11 @@ whose newest 100 versions are all held has no `latest` (the unknown-name
 
 `nextCursor` is opaque, as upstream specifies: a URL-safe string to pass back
 as `cursor` unchanged. It is sealed (AES-256-GCM under a key derived from the
-instance's `jwt_secret`) and bound to the repository and listing that issued
-it, so a client cannot read or make one up. It never names a version the
+instance's `jwt_secret`) and bound to the repository and listing kind that
+issued it (`/servers`, a server's `/versions`, the holds listing), so a client
+cannot read or make one up. It is not bound to the query: a cursor issued
+for `?search=` or `?version=latest` also resumes a plain `/servers` listing,
+which reveals nothing the caller could not list anyway. It never names a version the
 reader is not served, not even sealed: it holds the last row the listing
 served and, when the request stopped at the row bound after reading only
 rows the reader is not served, the internal id of the last of those rows.
@@ -198,7 +201,11 @@ Behaviour pinned by the end-to-end suite (clients may rely on it):
   `include_deleted`, an over-long `search`, `include_deleted=false` with
   `updated_since`) are `400 mcp_invalid_query`; a malformed document is `400
   mcp_invalid_server_json`; a `search` under 3 characters is `422
-  mcp_search_too_short`.
+  mcp_search_too_short`. A NUL byte (`%00`) anywhere in the request URL, in
+  `cursor`, `search` or the path alike, is refused by the instance-wide
+  guard before the query is parsed, so it answers `400 mcp_bad_request`
+  ("The request is malformed") rather than `mcp_invalid_query`; it is never
+  a `500`.
 - A write without `write:artifacts` is `403 mcp_forbidden` ("This token does
   not carry the write:artifacts scope"); a token minted for other repositories
   is `403 mcp_forbidden` on a public repository and the unknown-name `404` on
@@ -728,6 +735,12 @@ One decision function (`decide_mcp_serve`) answers every read:
 | pinned package younger than its Remote's age gate | omitted | skipped | `404` plain | `404` + `package`, `gate: age_gate`, `review_id`, `min_age_days`, `requested_age_days` | `mcp_age_gate_blocked` |
 | pinned package gone, no longer what its Virtual serves (`gate: shadowed`), or the policy changed | omitted | skipped | `404` plain | `404` + `package` | `mcp_unresolvable` |
 | a gate cannot be evaluated (database error) | omitted | `503` | `503` | `503` | `mcp_gate_unavailable` |
+
+Every `503` of the registry surface carries `Retry-After` (seconds): the
+middleware's own value where it set one, else `5`, including
+`mcp_gate_unavailable` on reads, the holds listing and the introspection
+job routes.
+
 | `deprecated` | listed | eligible | `200` | `200` | |
 | `deleted` | omitted unless `include_deleted=true` | skipped | `404` plain; `200` with `include_deleted=true` | same | |
 
@@ -2081,7 +2094,8 @@ rules (deleted versions are not holds and are not listed).
   Each entry is the reason-gated refusal body of an exact read (without the
   RFC 9457 `type`/`title`), with `status` the HTTP status that read answers
   (`404`, or `503` with `error: mcp_gate_unavailable` when a gate cannot be
-  evaluated). Members by hold: `hold` (`quarantine`, `scan_policy`,
+  evaluated), and always `name`, `version` and `instance`, also on a `503`
+  entry, whose read body carries none of them. Members by hold: `hold` (`quarantine`, `scan_policy`,
   `backing`, `age_gate`, `unresolvable`, `resolving`, `curation`,
   `content_drift`), `gate`, `package`, `review_id`, `min_age_days`,
   `requested_age_days`, as in [What a client sees](#what-a-client-sees).

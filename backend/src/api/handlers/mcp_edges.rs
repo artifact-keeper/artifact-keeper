@@ -84,13 +84,24 @@ async fn openapi(State(state): State<SharedState>, Path(repo_key): Path<String>)
 
 /// One held version as the holds listing reports it: the reason-gated
 /// refusal body without the RFC 9457 envelope members, plus the HTTP status
-/// an exact read answers (`404`, or `503` for an unevaluable gate).
-pub fn hold_entry(status: u16, body: &serde_json::Value) -> serde_json::Value {
+/// an exact read answers (`404`, or `503` for an unevaluable gate). Every
+/// entry names its version (`name`, `version`, `instance`), including a
+/// `503` whose body, the same for every caller, carries none (#5637).
+pub fn hold_entry(
+    status: u16,
+    body: &serde_json::Value,
+    name: &str,
+    version: &str,
+    instance: &str,
+) -> serde_json::Value {
     let mut entry = body.clone();
     if let Some(o) = entry.as_object_mut() {
         o.remove("type");
         o.remove("title");
         o.insert("status".into(), status.into());
+        for (k, v) in [("name", name), ("version", version), ("instance", instance)] {
+            o.entry(k).or_insert_with(|| v.into());
+        }
     }
     entry
 }
@@ -136,12 +147,12 @@ async fn holds(
         for row in &batch.rows {
             let instance = mcp::instance_url(base.as_str(), &repo.key, &row.name, &row.version);
             let decision =
-                mcp::decide_row(ctx, row, false, GateAudience::ReasonGated, instance).await;
+                mcp::decide_row(ctx, row, false, GateAudience::ReasonGated, instance.clone()).await;
             if let ServeDecision::Refuse { status, body, .. } = decision {
                 out.push((
                     row.name.clone(),
                     row.version.clone(),
-                    hold_entry(status, &body),
+                    hold_entry(status, &body, &row.name, &row.version, &instance),
                 ));
             }
         }
@@ -442,6 +453,44 @@ mod tests {
         assert_eq!(exchange_failure(&AppError::Internal("x".into())).0, 500);
     }
 
+    /// #5637: during a gate outage the reason body (the same `503` for every
+    /// caller) names no version; the holds entry still says which one.
+    #[test]
+    fn gate_outage_hold_entries_name_the_version_5637() {
+        let version = fmt::VersionState {
+            instance: "https://ak.test/mcp/r/v0.1/servers/a%2Fb/versions/1".into(),
+            name: "a/b".into(),
+            version: "1".into(),
+            status: fmt::ServerStatus::Active,
+            own_hold: None,
+            include_deleted: false,
+        };
+        let gate = fmt::BackingGate {
+            package: "npm:x@1.0.0".into(),
+            outcome: fmt::GateOutcome::Unavailable,
+        };
+        let ServeDecision::Refuse { status, body, .. } =
+            fmt::decide_mcp_serve(&version, &[gate], GateAudience::ReasonGated)
+        else {
+            panic!("an unevaluable gate refuses");
+        };
+        assert_eq!(status, 503);
+        let e = hold_entry(
+            status,
+            &body,
+            &version.name,
+            &version.version,
+            &version.instance,
+        );
+        assert_eq!(e["error"], "mcp_gate_unavailable");
+        assert_eq!(e["status"], 503);
+        assert_eq!(e["name"], "a/b");
+        assert_eq!(e["version"], "1");
+        assert_eq!(e["instance"], version.instance);
+        // The `503` itself still names nothing for a reader.
+        assert!(body.get("name").is_none());
+    }
+
     #[test]
     fn hold_entries_drop_the_envelope() {
         let body = fmt::problem_body(
@@ -450,12 +499,18 @@ mod tests {
             "held",
             serde_json::json!({"name": "a/b", "version": "1", "hold": "quarantine"}),
         );
-        let e = hold_entry(404, &body);
+        let e = hold_entry(404, &body, "x/y", "9", "https://ak.test/i");
         assert!(e.get("type").is_none() && e.get("title").is_none());
         assert_eq!(
             (e["status"].as_u64(), e["error"].as_str()),
             (Some(404), Some("mcp_pending_review"))
         );
+        // The reason body's own members win.
+        assert_eq!(
+            (e["name"].as_str(), e["version"].as_str()),
+            (Some("a/b"), Some("1"))
+        );
+        assert_eq!(e["instance"], "https://ak.test/i");
         assert!(OPENAPI_YAML.contains("/v0.1/servers"));
     }
 }
