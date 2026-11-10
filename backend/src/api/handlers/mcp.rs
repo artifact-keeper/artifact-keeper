@@ -2584,6 +2584,7 @@ async fn publish_server(
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, ext.user_id),
         repo.id,
         &server.name,
         &server.version,

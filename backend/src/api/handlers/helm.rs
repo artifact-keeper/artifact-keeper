@@ -1237,6 +1237,7 @@ async fn upload_chart(
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         chart_name,
         chart_version,

@@ -807,8 +807,9 @@ async fn upsert_artifact(p: UpsertArtifactParams<'_>) -> Result<Uuid, String> {
     // upload path (artifact_service) and the npm/pypi/nuget handlers populate
     // these tables already; the Incus handler writes `artifacts` directly and
     // so must call it explicitly. Best-effort — a failure must not fail upload.
+    let published = crate::services::package_service::PublishedArtifact::new(artifact_id, user_id);
     crate::services::package_service::register_published_package(
-        db, event_bus, repo_id, "incus", product, version, size_bytes, checksum, None,
+        db, event_bus, published, repo_id, "incus", product, version, size_bytes, checksum, None,
     )
     .await;
 

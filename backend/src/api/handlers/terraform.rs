@@ -1772,6 +1772,7 @@ async fn upload_module(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "terraform",
         &module_name,
@@ -2548,6 +2549,7 @@ async fn upload_provider(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "terraform",
         &provider_name,
