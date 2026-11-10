@@ -742,12 +742,25 @@ jobs:
       # router shard is the smallest. The shard-gated password/token/at-rest
       # tests run under the fips feature in the dual-format integration test
       # and in the sharded unit job on the default build.
+      # Same shape as the shard job: the lib test target alone (the bin test
+      # target compiles the whole lib a second time), built first with
+      # `--no-run`, no incremental artifacts, and the AWS-LC cmake build held
+      # to two parallel compiles so the peak stays inside the runner's memory.
+      - name: Build the FIPS lib test target
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_BUILD_JOBS: "2"
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
+        run: |
+          cargo nextest run -p artifact-keeper-backend --lib --no-run --features "test-shard-router,fips"
+
       - name: Crypto facade and gate tests under FIPS_MODE=strict
         env:
           FIPS_MODE: strict
+          CARGO_INCREMENTAL: "0"
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo nextest run -p artifact-keeper-backend --lib --bins --features "fips,test-shard-router" \
+          cargo nextest run -p artifact-keeper-backend --lib --features "test-shard-router,fips" \
             -E 'test(/^(crypto|fips)::/) | test(/saml_non_approved|algorithm_policy_tests/)'
 
       - name: Strict mode refuses a non-FIPS build
