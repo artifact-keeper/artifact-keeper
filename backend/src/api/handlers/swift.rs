@@ -1773,6 +1773,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.id, id);
         assert_eq!(repo.storage_path, "/data/swift-repo");
@@ -1796,6 +1797,7 @@ mod tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         };
         assert_eq!(repo.repo_type, "remote");
         assert_eq!(
@@ -2399,6 +2401,7 @@ mod multipart_publish_tests {
             age_gate_mode: "upstream_publish_time".to_string(),
             curation_enabled: false,
             curation_default_action: "allow".to_string(),
+            allow_overwrite: false,
         }
     }
 

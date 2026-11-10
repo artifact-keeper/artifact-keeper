@@ -1100,6 +1100,12 @@ pub struct CreateRepositoryRequest {
     /// uploads to Generic/Mlmodel repos append immutable revisions instead
     /// of overwriting. Defaults to false (current behavior preserved).
     pub versioning_enabled: Option<bool>,
+    /// Make this repository mutable (#5188): re-uploading an existing
+    /// filename replaces it instead of answering 409. Defaults to false
+    /// (immutable, write-once).
+    #[serde(rename = "mutable", alias = "allow_overwrite")]
+    #[schema(rename = "mutable")]
+    pub allow_overwrite: Option<bool>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -1463,6 +1469,11 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables first-class artifact versioning for
     /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
     pub versioning_enabled: Option<bool>,
+    /// When provided, makes the repository mutable (`true`) or immutable
+    /// (`false`) (#5188). When omitted, unchanged.
+    #[serde(rename = "mutable", alias = "allow_overwrite")]
+    #[schema(rename = "mutable")]
+    pub allow_overwrite: Option<bool>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -1680,6 +1691,11 @@ pub struct RepositoryResponse {
     /// When true, uploads to this Generic/Mlmodel repository append immutable
     /// revisions instead of overwriting the prior content (#2367).
     pub versioning_enabled: bool,
+    /// When true, re-uploading an existing filename replaces it instead of
+    /// answering 409 (#5188).
+    #[serde(rename = "mutable")]
+    #[schema(rename = "mutable")]
+    pub allow_overwrite: bool,
     /// Which storage backend holds this repository's content: `filesystem`,
     /// `s3`, `azure`, `gcs`. Accepted on create and immutable afterwards, so
     /// before #3917 it was write-only — no read path echoed it back and
@@ -2245,6 +2261,7 @@ fn repo_to_response(
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
+        allow_overwrite: repo.allow_overwrite,
         storage_backend: repo.storage_backend,
         storage_used_bytes,
         member_storage_used_bytes: None,
@@ -4940,6 +4957,7 @@ pub async fn create_repository(
                 quota_bytes: payload.quota_bytes,
                 promotion_only: payload.promotion_only.unwrap_or(false),
                 versioning_enabled: payload.versioning_enabled.unwrap_or(false),
+                allow_overwrite: payload.allow_overwrite.unwrap_or(false),
                 // Plugin format key takes precedence over any explicit format_key
                 // in the payload: when a WASM plugin format was resolved above,
                 // `plugin_format_key` carries the canonical handler name.
@@ -6392,6 +6410,7 @@ pub async fn update_repository(
                 upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
+                allow_overwrite: payload.allow_overwrite,
                 // Three-way (#2472, #4026): omit = unchanged, Some(None) =
                 // clear, Some(Some(id)) = assign (authorized above).
                 project_id: payload.project_id,
@@ -18894,6 +18913,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "rpm-curation".to_string(),
             name: "RPM Curation".to_string(),
@@ -19370,6 +19390,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
+            allow_overwrite: true,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
@@ -19423,6 +19444,28 @@ mod tests {
         assert!(json.contains("\"quota_bytes\":1048576"));
         assert!(json.contains("\"allow_anonymous_access\":true"));
         assert!(json.contains("\"promotion_only\":false"));
+        // #5188: the field serializes under its API name, not the column name.
+        assert!(json.contains("\"mutable\":true"), "got {json}");
+        assert!(!json.contains("allow_overwrite"));
+    }
+
+    #[test]
+    fn test_mutable_json_field_renames_allow_overwrite_5188() {
+        // Request accepts the API name `mutable`...
+        let req: CreateRepositoryRequest = serde_json::from_str(
+            r#"{"key":"k","name":"n","format":"pypi","repo_type":"local","mutable":true}"#,
+        )
+        .unwrap();
+        assert_eq!(req.allow_overwrite, Some(true));
+        // ...and the legacy `allow_overwrite` alias stays accepted.
+        let aliased: CreateRepositoryRequest = serde_json::from_str(
+            r#"{"key":"k","name":"n","format":"pypi","repo_type":"local","allow_overwrite":true}"#,
+        )
+        .unwrap();
+        assert_eq!(aliased.allow_overwrite, Some(true));
+        // Update request too.
+        let upd: UpdateRepositoryRequest = serde_json::from_str(r#"{"mutable":false}"#).unwrap();
+        assert_eq!(upd.allow_overwrite, Some(false));
     }
 
     #[test]
@@ -20826,6 +20869,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "maven-central".to_string(),
             name: "Maven Central".to_string(),
@@ -20881,6 +20925,7 @@ mod tests {
             repodata_depth_editable: false,
             repodata_mode: None,
             versioning_enabled: false,
+            allow_overwrite: false,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
             key: "npm-age".to_string(),
@@ -20940,6 +20985,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "npm-hosted".to_string(),
             name: "NPM Local".to_string(),
@@ -20987,6 +21033,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "docker-all".to_string(),
             name: "Docker Virtual".to_string(),
@@ -21027,6 +21074,7 @@ mod tests {
         let now = chrono::Utc::now();
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "cargo-staging".to_string(),
             name: "Cargo Staging".to_string(),
@@ -21145,6 +21193,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id,
             key: key.to_string(),
             name: key.to_string(),
@@ -26195,6 +26244,7 @@ mod tests {
         let now = chrono::Utc::now();
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repo".to_string(),
@@ -36613,6 +36663,7 @@ mod tests {
             allow_anonymous_access: false,
             promotion_only: false,
             versioning_enabled: false,
+            allow_overwrite: false,
             storage_backend: "filesystem".to_string(),
             storage_used_bytes: 0,
             member_storage_used_bytes: None,

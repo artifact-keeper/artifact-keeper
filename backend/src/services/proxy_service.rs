@@ -20925,6 +20925,7 @@ mod tests {
 
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "test-accept-fwd".to_string(),
             name: "test-accept-fwd".to_string(),
@@ -21005,6 +21006,7 @@ mod tests {
 
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "test-cached-meta-servable".to_string(),
             name: "test-cached-meta-servable".to_string(),
@@ -21091,6 +21093,7 @@ mod tests {
 
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "test-accept-none".to_string(),
             name: "test-accept-none".to_string(),
@@ -21176,6 +21179,7 @@ mod tests {
 
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "remote-container-ghcr".to_string(),
             name: "remote-container-ghcr".to_string(),
@@ -21265,6 +21269,7 @@ mod tests {
 
         let repo = Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "remote-container-ghcr".to_string(),
             name: "remote-container-ghcr".to_string(),
@@ -21421,6 +21426,7 @@ mod tests {
     fn remote_repo_for(key: &str, upstream_url: &str, storage_path: &str) -> Repository {
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),
@@ -23174,6 +23180,7 @@ mod tests {
     fn wiremock_remote_repo(key: &str, upstream: &str, storage_path: &str) -> Repository {
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),

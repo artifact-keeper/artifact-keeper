@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.allow_overwrite FROM repositories r WHERE r.id = $1 AND EXISTS (SELECT 1 FROM artifacts a WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "allow_overwrite",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "repositories",
+            "name": "allow_overwrite"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b6f0113ee4ab664c4d7bbf96b216c35ff813760549f937e7291bb2e5c34c5ec7"
+}

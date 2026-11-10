@@ -1240,6 +1240,29 @@ async fn complete_session_commit(
     // both passed it and the later upsert silently replaced the earlier one.
     // A live row at the same version is now left untouched (no row returned)
     // and this completion is refused with the gate's own 409.
+    //
+    // #5188: a mutable repository replaces the row instead. Lock it first so
+    // the object it pointed at can be handed to storage GC with the commit.
+    let overwrite_active = crate::services::artifact_service::overwrite_applies(&repo);
+    let replaced_key = if overwrite_active {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT storage_key FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 FOR UPDATE",
+        )
+        .bind(session.repository_id)
+        .bind(&session.artifact_path)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(key) => key,
+            Err(e) => {
+                drop(tx);
+                return Err(release_after_precommit_failure(&state.db, &session, e).await);
+            }
+        }
+    } else {
+        None
+    };
     let inserted_artifact_id = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO artifacts (repository_id, path, name, version, size_bytes,
@@ -1254,6 +1277,7 @@ async fn complete_session_commit(
             OR artifacts.version IS DISTINCT FROM EXCLUDED.version
             OR ($11 AND LOWER(artifacts.checksum_sha256) = LOWER(EXCLUDED.checksum_sha256))
             OR $12
+            OR $13
         RETURNING id
         "#,
     )
@@ -1272,10 +1296,24 @@ async fn complete_session_commit(
     ))
     .bind(identical_replay)
     .bind(mutable_replication)
+    .bind(overwrite_active)
     .fetch_optional(&mut *tx)
     .await;
     let artifact_id: Uuid = match inserted_artifact_id {
-        Ok(Some(id)) => id,
+        Ok(Some(id)) => {
+            if let Some(old_key) = replaced_key.as_deref().filter(|k| *k != storage_key) {
+                if let Err(e) =
+                    crate::services::artifact_service::record_replaced_object_gc_candidate(
+                        &mut tx, &repo, old_key,
+                    )
+                    .await
+                {
+                    drop(tx);
+                    return Err(release_after_precommit_failure(&state.db, &session, e).await);
+                }
+            }
+            id
+        }
         Ok(None) => {
             // Same response and lease handling as the gate's own 409: the
             // write becomes legal once the occupying artifact is deleted, so

@@ -19420,6 +19420,7 @@ mod tests {
         use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
         Repository {
             versioning_enabled: false,
+            allow_overwrite: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "test-repo".to_string(),
@@ -42399,6 +42400,7 @@ mod virtual_scan_gate_tests {
             age_gate_enabled: false,
             age_gate_min_age_days: 7,
             versioning_enabled: false,
+            allow_overwrite: false,
             project_id: None,
             created_at: now,
             updated_at: now,

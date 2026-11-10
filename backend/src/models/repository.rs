@@ -479,6 +479,9 @@ pub struct Repository {
     /// the prior content at the same path (#2367). Defaults to false: no
     /// behavior change for existing repositories.
     pub versioning_enabled: bool,
+    /// When true, re-uploading an existing path replaces its content instead
+    /// of answering 409 (#5188). Defaults to false: write-once, as before.
+    pub allow_overwrite: bool,
     /// Optional project this repository belongs to (#2472). `None` means the
     /// repository is unassigned and behaves exactly as before projects
     /// existed. Grants on the owning project (permissions rows with
