@@ -9748,6 +9748,7 @@ pub fn age_gate_blocked_response(
     version: &str,
     min_age_days: i32,
     requested_age_days: Option<i64>,
+    request_url: Option<&str>,
 ) -> Response {
     let body = age_gate_blocked_body(
         review_id,
@@ -9758,15 +9759,12 @@ pub fn age_gate_blocked_response(
     );
     // RFC 7725: a 451 is cacheable by default. The hold is lifted by a
     // review or by time passing, so no cache may keep this answer (#5253).
-    (
-        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
-        [
-            (axum::http::header::CONTENT_TYPE, "application/json"),
-            (axum::http::header::CACHE_CONTROL, "no-store"),
-        ],
-        body.to_string(),
-    )
-        .into_response()
+    let mut resp = refusal_response(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, body, request_url);
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
 }
 
 /// The structured facts behind a curation `block` verdict (#3110).
@@ -9788,28 +9786,43 @@ pub struct CurationBlock {
     /// Human-readable statement of which rule fired, from
     /// `CurationService::evaluate_pep503_package`.
     pub reason: String,
+    /// Where the caller can ask for an exception, when one is configured.
+    /// Carried on the verdict rather than resolved at render time so the OCI
+    /// seam, which builds its own error envelope, emits the same link.
+    pub request_url: Option<String>,
 }
 
 impl CurationBlock {
     /// The shared REST-shaped 403 body every non-OCI proxy format serves.
     pub fn into_rest_response(&self) -> Response {
-        curation_blocked_response(&self.package, &self.reason)
+        curation_blocked_response_with_link(
+            &self.package,
+            &self.reason,
+            self.request_url.as_deref(),
+        )
     }
 }
 
 /// 403 response for a curation-rule block on a proxy request.
 pub fn curation_blocked_response(package: &str, reason: &str) -> Response {
-    let body = serde_json::json!({
-        "error": "curation_blocked",
-        "package": package,
-        "reason": reason,
-    });
-    (
+    curation_blocked_response_with_link(package, reason, None)
+}
+
+/// [`curation_blocked_response`] plus the exception-request link.
+pub fn curation_blocked_response_with_link(
+    package: &str,
+    reason: &str,
+    request_url: Option<&str>,
+) -> Response {
+    refusal_response(
         StatusCode::FORBIDDEN,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
+        serde_json::json!({
+            "error": "curation_blocked",
+            "package": package,
+            "reason": reason,
+        }),
+        request_url,
     )
-        .into_response()
 }
 
 /// The repository fields curation enforcement needs, decoupled from any one
@@ -9903,9 +9916,65 @@ pub async fn evaluate_curation<'a>(
         .ok();
     if let Some(eval) = eval {
         if eval.action == "block" {
+            // A rule said no; the exception queue is where a human can say
+            // otherwise (migration 345). Unlike the scan gate there is no
+            // digest at this seam, so the exception is keyed on the coordinate
+            // alone. npm and OCI pass no version here at all (a tarball
+            // filename cannot be split unambiguously, and a manifest is
+            // content-addressed), so they collapse to the whole-package
+            // coordinate `*`, which is also the only granularity a curation
+            // `allow` rule can express for them.
+            let coord = crate::services::exception_queue::ExceptionCoord {
+                gate: crate::services::age_gate_service::GATE_CURATION,
+                repository_id: target.id,
+                package_name: package.to_string(),
+                package_version: version.unwrap_or("*").to_string(),
+                digest: None,
+            };
+            match crate::services::exception_queue::exception_allows(db, &coord).await {
+                Ok(true) => {
+                    tracing::warn!(
+                        repo_id = %target.id, repo_key = %target.key, package = %package,
+                        "serving proxy pull despite a curation block: an approved, \
+                         unexpired security exception covers this package"
+                    );
+                    return Ok(());
+                }
+                // Keep the block on a lookup failure. This lookup can only ever
+                // widen access, so failing open here would turn a database blip
+                // into a policy bypass.
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        repo_id = %target.id, package = %package, error = %e,
+                        "curation exception lookup failed; keeping the block"
+                    );
+                    return Err(CurationBlock {
+                        package: package.to_string(),
+                        reason: eval.reason,
+                        request_url: None,
+                    });
+                }
+            }
+            if let Err(e) = crate::services::exception_queue::record_refusal(db, None, &coord).await
+            {
+                tracing::warn!(
+                    repo_id = %target.id, package = %package, error = %e,
+                    "failed to record the curation refusal on the exception queue"
+                );
+            }
+            let request_url = crate::services::exception_queue::exception_request_url(
+                db,
+                crate::services::age_gate_service::GATE_CURATION,
+                target.key,
+                package,
+                &coord.package_version,
+            )
+            .await;
             return Err(CurationBlock {
                 package: package.to_string(),
                 reason: eval.reason,
+                request_url,
             });
         }
     }
@@ -10254,12 +10323,23 @@ pub async fn enforce_age_gate(
         } => {
             let requested_age_days =
                 published_at.map(|p| AgeGateService::package_age_days(p, chrono::Utc::now()));
+            // Resolved only on the refusal path, so a served pull pays
+            // nothing for it.
+            let request_url = crate::services::exception_queue::exception_request_url(
+                svc.db(),
+                crate::services::age_gate_service::GATE_AGE,
+                &params.key,
+                package,
+                version,
+            )
+            .await;
             Err(age_gate_blocked_response(
                 review_id,
                 package,
                 version,
                 params.age_gate_min_age_days,
                 requested_age_days,
+                request_url.as_deref(),
             ))
         }
     }
@@ -10409,17 +10489,98 @@ pub(crate) fn sha256_hex(bytes: &Bytes) -> String {
 /// neutral: it names the file, not the specific CVEs (the download route is
 /// anonymous-readable for public repos).
 pub(crate) fn scan_blocked_response(filename: &str) -> Response {
-    let body = serde_json::json!({
-        "error": "scan_blocked",
-        "file": filename,
-        "reason": "blocked by inline vulnerability scan policy",
-    });
-    (
-        StatusCode::FORBIDDEN,
+    scan_blocked_response_with_link(filename, None)
+}
+
+/// Header carrying the "request an exception" link, as an axum `HeaderName`.
+/// Lowercase because `from_static` requires it.
+pub(crate) const EXCEPTION_URL_HEADER: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("x-ak-exception-request");
+
+/// Render a refusal with the optional "here is how to ask" link attached to
+/// BOTH the JSON body and a response header.
+///
+/// One implementation for every REST-shaped refusal so the three gates cannot
+/// drift on the field name or the header. The link is omitted entirely rather
+/// than emitted empty when nothing is configured: a blank URL in an error body
+/// is worse than no URL.
+///
+/// The header exists because the body is not universally visible: `docker
+/// pull` prints `errors[0].message`, cargo and npm usually show the body, but
+/// pip generally shows only the status line.
+pub(crate) fn refusal_response(
+    status: StatusCode,
+    mut body: serde_json::Value,
+    request_url: Option<&str>,
+) -> Response {
+    if let Some(url) = request_url {
+        body["exception_request_url"] = serde_json::Value::String(url.to_string());
+    }
+    let mut resp = (
+        status,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body.to_string(),
     )
-        .into_response()
+        .into_response();
+    // A URL that cannot be a header value (control characters, non-ASCII an
+    // operator template introduced) is dropped from the header only; the body
+    // still carries it.
+    if let Some(v) = request_url.and_then(|u| axum::http::HeaderValue::from_str(u).ok()) {
+        resp.headers_mut().insert(EXCEPTION_URL_HEADER, v);
+    }
+    resp
+}
+
+/// Which refusal [`scan_deny_unless_excepted`] renders.
+///
+/// Both carry the exception-request link, because both are states a human can
+/// accept: `Blocked` means we graded the bytes and they are bad, `Unscannable`
+/// means we could not grade them at all and retrying will not change that.
+/// A merely slow scan is NOT in here -- it clears on its own, so it keeps the
+/// plain "retry shortly" 423 and files nothing.
+#[derive(Clone, Copy)]
+pub(crate) enum ScanRefusal {
+    Blocked,
+    Unscannable,
+}
+
+impl ScanRefusal {
+    fn render(self, filename: &str, request_url: Option<&str>) -> Response {
+        match self {
+            Self::Blocked => scan_blocked_response_with_link(filename, request_url),
+            // Same `scan_pending` error as the transient 423 so existing clients
+            // keep matching on it; `reason` is what tells the two apart.
+            Self::Unscannable => refusal_response(
+                StatusCode::LOCKED,
+                serde_json::json!({
+                    "error": "scan_pending",
+                    "file": filename,
+                    "reason": "this artifact could not be scanned; retrying will not clear it",
+                }),
+                request_url,
+            ),
+        }
+    }
+}
+
+/// [`scan_blocked_response`] plus the exception-request link.
+///
+/// The body stays CVE-free on purpose: this route is anonymous-readable on a
+/// public repo, so it names the file and never the findings. A link is not
+/// disclosure.
+pub(crate) fn scan_blocked_response_with_link(
+    filename: &str,
+    request_url: Option<&str>,
+) -> Response {
+    refusal_response(
+        StatusCode::FORBIDDEN,
+        serde_json::json!({
+            "error": "scan_blocked",
+            "file": filename,
+            "reason": "blocked by inline vulnerability scan policy",
+        }),
+        request_url,
+    )
 }
 
 /// A 403 for a proxied file of a scan-on-proxy enforced format, requested
@@ -11614,6 +11775,133 @@ fn scan_inline_serve_decision(
     }
 }
 
+/// The coordinate a scan exception would be keyed on, or `None` when this
+/// pull has no nameable identity to grant one against.
+///
+/// * `Established` carries the coordinate the format already parsed.
+/// * OCI passes `NotApplicable` because content-addressing IS the identity for
+///   a manifest, so the image name plus the manifest digest is the coordinate.
+///   That is not a workaround: for a content-addressed artifact the digest is
+///   the version, and it is exactly the binding an exception needs.
+/// * `Unestablished` means the format expected a coordinate and could not
+///   establish one. There is nothing to except, and nothing should be granted
+///   over content we cannot even name.
+pub(crate) fn scan_exception_coord(
+    repo_id: Uuid,
+    identity: &ProxyScanIdentity,
+    mode: &ProxyScanMode,
+    digest: &str,
+) -> Option<crate::services::exception_queue::ExceptionCoord> {
+    use crate::services::age_gate_service::GATE_SCAN;
+    use crate::services::exception_queue::ExceptionCoord;
+
+    let (name, version) = match (identity, mode) {
+        (ProxyScanIdentity::Established(c), _) => (c.name.clone(), c.version.clone()),
+        (ProxyScanIdentity::NotApplicable, ProxyScanMode::OciImage(ctx)) => {
+            (ctx.image.clone(), digest.to_string())
+        }
+        _ => return None,
+    };
+    Some(ExceptionCoord {
+        gate: GATE_SCAN,
+        repository_id: repo_id,
+        package_name: name,
+        package_version: version,
+        digest: Some(digest.to_string()),
+    })
+}
+
+/// Serve when a live exception covers these exact bytes; otherwise record the
+/// refusal on the queue and deny.
+///
+/// Both the lookup and the record are best-effort in the SAFE direction: a
+/// failed lookup denies (it can only ever widen access, so it must not fail
+/// open), and a failed record still denies (the client is being refused either
+/// way; losing the demand signal is not worth a 500).
+#[allow(clippy::too_many_arguments)]
+async fn scan_deny_unless_excepted(
+    state: &crate::api::SharedState,
+    repo_id: Uuid,
+    filename: &str,
+    digest: &str,
+    identity: &ProxyScanIdentity,
+    mode: &ProxyScanMode,
+    why: &str,
+    refusal: ScanRefusal,
+) -> ProxyScanServeOutcome {
+    use crate::services::exception_queue;
+
+    let Some(coord) = scan_exception_coord(repo_id, identity, mode, digest) else {
+        tracing::warn!(
+            repo_id = %repo_id, file = %filename, digest = %digest,
+            "blocking proxy pull: {why} (no coordinate, so no exception is possible)"
+        );
+        return ProxyScanServeOutcome::Deny(refusal.render(filename, None));
+    };
+
+    match exception_queue::exception_allows(&state.db, &coord).await {
+        Ok(true) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest,
+                package = %coord.package_name, version = %coord.package_version,
+                "serving proxy pull despite {why}: an approved, unexpired security \
+                 exception is bound to this digest"
+            );
+            // `Recorded`, not `Clean`: the verdict is vulnerable and recorded,
+            // this repository just is not enforcing it for these bytes. Same
+            // shape as the record-only posture, and telling the client `clean`
+            // about content we know is not clean would be a lie.
+            return ProxyScanServeOutcome::Serve(ProxyScanServed::Recorded);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(
+                repo_id = %repo_id, file = %filename, digest = %digest, error = %e,
+                "exception lookup failed; denying (a lookup that can only widen \
+                 access must never fail open)"
+            );
+            return ProxyScanServeOutcome::Deny(refusal.render(filename, None));
+        }
+    }
+
+    if let Err(e) = exception_queue::record_refusal(&state.db, Some(&state.event_bus), &coord).await
+    {
+        tracing::warn!(
+            repo_id = %repo_id, file = %filename, digest = %digest, error = %e,
+            "failed to record the refusal on the exception queue; the pull is \
+             still refused, but this package will not show as requested"
+        );
+    }
+    tracing::warn!(
+        repo_id = %repo_id, file = %filename, digest = %digest,
+        package = %coord.package_name, version = %coord.package_version,
+        "blocking proxy pull: {why}"
+    );
+
+    // The seam carries a repo id, not the key a human types, so resolve it
+    // here. One indexed read, on a path that is already refusing.
+    let repo_key: Option<String> = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+        .bind(repo_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let request_url = match repo_key {
+        Some(key) => {
+            exception_queue::exception_request_url(
+                &state.db,
+                crate::services::age_gate_service::GATE_SCAN,
+                &key,
+                &coord.package_name,
+                &coord.package_version,
+            )
+            .await
+        }
+        None => None,
+    };
+    ProxyScanServeOutcome::Deny(refusal.render(filename, request_url.as_deref()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn gate_proxy_scan_serve(
     state: &crate::api::SharedState,
@@ -11764,8 +12052,17 @@ async fn decide_proxy_scan_serve(
                 );
                 return ProxyScanServeOutcome::Serve(ProxyScanServed::Clean);
             }
-            tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: cached vulnerable verdict");
-            ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
+            scan_deny_unless_excepted(
+                state,
+                repo_id,
+                filename,
+                digest,
+                &identity,
+                &mode,
+                "cached vulnerable verdict",
+                ScanRefusal::Blocked,
+            )
+            .await
         }
         ServeDecision::ServeCached => ProxyScanServeOutcome::Serve(ProxyScanServed::Clean),
         ServeDecision::ScanInline => {
@@ -11798,7 +12095,42 @@ async fn decide_proxy_scan_serve(
                 )
                 .await
             };
-            scan_inline_serve_decision(result, severity_gate, repo_id, filename, digest)
+            // BudgetExceeded clears on its own and keeps the plain 423, the other two can be excepted
+            let unscannable = matches!(
+                result.as_ref(),
+                Err(ProxyScanInconclusive::NoScanner) | Err(ProxyScanInconclusive::ScanFailed)
+            );
+            match scan_inline_serve_decision(result, severity_gate, repo_id, filename, digest) {
+                ProxyScanServeOutcome::Deny(resp) if resp.status() == StatusCode::FORBIDDEN => {
+                    scan_deny_unless_excepted(
+                        state,
+                        repo_id,
+                        filename,
+                        digest,
+                        &identity,
+                        &mode,
+                        "inline scan found vulnerabilities",
+                        ScanRefusal::Blocked,
+                    )
+                    .await
+                }
+                ProxyScanServeOutcome::Deny(resp)
+                    if resp.status() == StatusCode::LOCKED && unscannable =>
+                {
+                    scan_deny_unless_excepted(
+                        state,
+                        repo_id,
+                        filename,
+                        digest,
+                        &identity,
+                        &mode,
+                        "scan cannot conclude for these bytes",
+                        ScanRefusal::Unscannable,
+                    )
+                    .await
+                }
+                other => other,
+            }
         }
         ServeDecision::ServePendingScanAsync => {
             // Fail-open: serve immediately (loud: X-AK-Scan pending) and scan
@@ -15316,6 +15648,7 @@ mod tests {
         let block = CurationBlock {
             package: "left-pad".to_string(),
             reason: "#2930 tier block".to_string(),
+            request_url: None,
         };
         let resp = block.into_rest_response();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -15324,6 +15657,79 @@ mod tests {
             String::from_utf8_lossy(&body),
             r##"{"error":"curation_blocked","package":"left-pad","reason":"#2930 tier block"}"##
         );
+    }
+
+    /// Which pulls can be excepted at all, and which deliberately cannot.
+    ///
+    /// This is a security boundary, not a convenience: returning a coordinate
+    /// for an identity the format could NOT establish would let someone hold
+    /// an exception over content nobody can name.
+    #[test]
+    fn scan_exception_coord_only_names_what_the_format_established() {
+        use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+        let repo = Uuid::new_v4();
+        let digest = "sha256:abc";
+
+        // An established coordinate is used as-is, bound to the digest.
+        let established = ProxyScanIdentity::Established(ExpectedComponent::new(
+            ComponentEcosystem::Npm,
+            "lodash",
+            "4.17.20",
+        ));
+        let c = scan_exception_coord(repo, &established, &ProxyScanMode::File, digest)
+            .expect("an established identity is exceptable");
+        assert_eq!(c.package_name, "lodash");
+        assert_eq!(c.package_version, "4.17.20");
+        assert_eq!(c.digest.as_deref(), Some(digest));
+        assert_eq!(c.gate, crate::services::age_gate_service::GATE_SCAN);
+
+        // OCI passes NotApplicable because content-addressing IS the identity
+        // for a manifest: image name plus the manifest digest.
+        let ctx = OciImageScanCtx {
+            repo_id: repo,
+            repo_key: "docker-remote".to_string(),
+            repo_type: "remote".to_string(),
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: "/tmp/ph-coord".to_string(),
+            },
+            image: "nginx".to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+        };
+        let c = scan_exception_coord(
+            repo,
+            &ProxyScanIdentity::NotApplicable,
+            &ProxyScanMode::OciImage(ctx),
+            digest,
+        )
+        .expect("an OCI manifest is exceptable by image + digest");
+        assert_eq!(c.package_name, "nginx");
+        assert_eq!(
+            c.package_version, digest,
+            "for a content-addressed manifest the digest IS the version"
+        );
+
+        // Unestablished: the format expected a coordinate and could not get
+        // one. Nothing to except.
+        assert!(
+            scan_exception_coord(
+                repo,
+                &ProxyScanIdentity::Unestablished,
+                &ProxyScanMode::File,
+                digest
+            )
+            .is_none(),
+            "content whose identity could not be established must not be exceptable"
+        );
+
+        // NotApplicable WITHOUT the OCI mode has no coordinate either.
+        assert!(scan_exception_coord(
+            repo,
+            &ProxyScanIdentity::NotApplicable,
+            &ProxyScanMode::File,
+            digest
+        )
+        .is_none());
     }
 
     // ── Stricter-of-two virtual scan policy (#3023) ──────────────────
@@ -25575,7 +25981,8 @@ mod tests {
     /// temporary, so the answer must never be stored by a cache (#5253).
     #[test]
     fn age_gate_blocked_response_is_not_cacheable() {
-        let resp = age_gate_blocked_response(uuid::Uuid::new_v4(), "lodash", "4.0.0", 7, Some(2));
+        let resp =
+            age_gate_blocked_response(uuid::Uuid::new_v4(), "lodash", "4.0.0", 7, Some(2), None);
         assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         assert_eq!(
             resp.headers()
@@ -26186,6 +26593,83 @@ mod tests {
         let allowed = enforce_curation(&pool, &repo, "some-other-pkg", None).await;
         assert!(allowed.is_ok(), "non-matching package must pass through");
 
+        curation_cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// A curation block is auto-filed on the exception queue, and an approved,
+    /// unexpired exception releases it (migration 345).
+    #[tokio::test]
+    async fn test_curation_block_files_and_honours_an_exception() {
+        use crate::services::age_gate_service::GATE_CURATION;
+
+        let Some(pool) = db_helpers::try_pool().await else {
+            return;
+        };
+        let (user_id, repo_id, key) =
+            seed_curated_repo(&pool, "remote", true, Some("blocked-pkg")).await;
+        let repo = repo_info_for(repo_id, &key, "remote", true);
+
+        // Blocked, and the refusal is recorded as `attempted` (no
+        // justification) so the reviewer sees demand without anyone filing.
+        assert!(evaluate_curation(&pool, &repo, "blocked-pkg", None)
+            .await
+            .is_err());
+        let (row_id, justification, version): (uuid::Uuid, Option<String>, String) =
+            sqlx::query_as(
+                "SELECT id, justification, package_version FROM age_gate_reviews
+                 WHERE gate = $1 AND repository_id = $2 AND package_name = 'blocked-pkg'",
+            )
+            .bind(GATE_CURATION)
+            .bind(repo_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the refusal was filed");
+        assert!(justification.is_none(), "an auto-filed row is `attempted`");
+        assert_eq!(
+            version, "*",
+            "npm passes no version at this seam, so the exception is whole-package"
+        );
+
+        // Pending is not permission.
+        assert!(evaluate_curation(&pool, &repo, "blocked-pkg", None)
+            .await
+            .is_err());
+
+        // Approved and unexpired -> the same pull is released.
+        sqlx::query(
+            "UPDATE age_gate_reviews SET status = 'approved',
+             expires_at = NOW() + INTERVAL '90 days' WHERE id = $1",
+        )
+        .bind(row_id)
+        .execute(&pool)
+        .await
+        .expect("approve");
+        assert!(
+            evaluate_curation(&pool, &repo, "blocked-pkg", None)
+                .await
+                .is_ok(),
+            "an approved exception releases a curation block"
+        );
+
+        // Expiry re-blocks with no sweep involved.
+        sqlx::query(
+            "UPDATE age_gate_reviews SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(row_id)
+        .execute(&pool)
+        .await
+        .expect("expire");
+        assert!(
+            evaluate_curation(&pool, &repo, "blocked-pkg", None)
+                .await
+                .is_err(),
+            "a lapsed exception stops releasing the block"
+        );
+
+        let _ = sqlx::query("DELETE FROM age_gate_reviews WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
         curation_cleanup(&pool, repo_id, user_id).await;
     }
 

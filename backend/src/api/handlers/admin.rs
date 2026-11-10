@@ -786,6 +786,13 @@ pub struct SystemSettings {
     /// the background detector and by `POST /api/v1/admin/cleanup`.
     /// `1..=10080`. `PEER_STALE_THRESHOLD_MINUTES` pins it when set.
     pub edge_stale_threshold_minutes: i32,
+    /// Template for the "request an exception" link every gate refusal carries
+    /// (`security.exception_request_url`). Absent/empty falls back to the
+    /// AK-native deep link, which needs `AK_EXTERNAL_URL`; where that is unset
+    /// the fallback yields nothing and refusals carry no link at all, so this
+    /// is the only way to turn the link on for such a deployment.
+    #[serde(default)]
+    pub exception_request_url: Option<String>,
 }
 
 /// `POST /api/v1/admin/settings` body (#5652). Every field is optional: an
@@ -803,6 +810,8 @@ pub struct UpdateSystemSettingsRequest {
     pub audit_retention_days: Option<i32>,
     pub backup_retention_count: Option<i32>,
     pub edge_stale_threshold_minutes: Option<i32>,
+    /// Exception request link template; an empty string clears it.
+    pub exception_request_url: Option<String>,
 }
 
 /// Fields removed from `POST /api/v1/admin/settings` (#5652), with the reason
@@ -883,7 +892,21 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
         audit_retention_days: DEFAULT_AUDIT_RETENTION_DAYS,
         backup_retention_count: DEFAULT_BACKUP_RETENTION_COUNT,
         edge_stale_threshold_minutes: 0,
+        exception_request_url: None,
     };
+
+    // Read separately and WITHOUT the macro on purpose: widening the key list
+    // in the `query_as!` above would invalidate its committed `.sqlx` entry,
+    // and regenerating that cache is lossy.
+    result.exception_request_url = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT value FROM system_settings WHERE key = $1",
+    )
+    .bind(crate::services::exception_queue::EXCEPTION_URL_SETTING_KEY)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|v| v.as_str().map(str::to_string));
 
     for row in settings {
         match row.key.as_str() {
@@ -1062,7 +1085,45 @@ pub async fn update_settings(
         .await;
     }
 
+    if let Some((before, after)) = changed_exception_request_url(&request, &current) {
+        let key = crate::services::exception_queue::EXCEPTION_URL_SETTING_KEY;
+        sqlx::query(
+            "INSERT INTO system_settings (key, value) VALUES ($1, $2) \
+             ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+        )
+        .bind(key)
+        .bind(serde_json::json!(after))
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        audit_setting_changed(
+            &state,
+            &auth,
+            key,
+            serde_json::json!({
+                "key": key,
+                "old_value": before,
+                "new_value": after,
+                "setting": key,
+                "from": before,
+                "to": after,
+            }),
+        )
+        .await;
+    }
+
     get_settings(State(state)).await
+}
+
+/// `(before, after)` when the update changes the exception request link. The
+/// value is trimmed, and an unset link reads as the empty string.
+fn changed_exception_request_url(
+    request: &UpdateSystemSettingsRequest,
+    current: &SystemSettings,
+) -> Option<(String, String)> {
+    let after = request.exception_request_url.as_deref()?.trim().to_string();
+    let before = current.exception_request_url.clone().unwrap_or_default();
+    (after != before).then_some((before, after))
 }
 
 // ---------------------------------------------------------------------------
@@ -3302,6 +3363,7 @@ mod tests {
             audit_retention_days: 0,
             backup_retention_count: 10,
             edge_stale_threshold_minutes: 5,
+            exception_request_url: None,
         }
     }
 
@@ -3323,6 +3385,37 @@ mod tests {
             json.contains("\"environment\":\"production\""),
             "settings response must expose environment: {json}"
         );
+    }
+
+    #[test]
+    fn exception_request_url_is_written_only_when_it_changes() {
+        let set = SystemSettings {
+            exception_request_url: Some("https://help.example/{package}".to_string()),
+            ..sample_settings()
+        };
+        let update = |v: Option<&str>| UpdateSystemSettingsRequest {
+            exception_request_url: v.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(changed_exception_request_url(&update(None), &set), None);
+        assert_eq!(
+            changed_exception_request_url(&update(Some(" https://help.example/{package} ")), &set),
+            None
+        );
+        assert_eq!(
+            changed_exception_request_url(&update(Some("")), &set),
+            Some(("https://help.example/{package}".to_string(), String::new()))
+        );
+        assert_eq!(
+            changed_exception_request_url(&update(Some("https://y.example")), &sample_settings()),
+            Some((String::new(), "https://y.example".to_string()))
+        );
+        let posted_back = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            parse_update(&posted_back).exception_request_url.as_deref(),
+            Some("https://help.example/{package}")
+        );
+        assert!(validate(posted_back, false).is_ok());
     }
 
     /// #5652: `allow_anonymous_download` (never enforced) is gone from the

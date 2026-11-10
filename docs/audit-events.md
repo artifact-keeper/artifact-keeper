@@ -275,6 +275,16 @@ To answer "who asked for this blocked package", filter the audit log on
 `PROXY_SCAN_BLOCKED` and the repository, and match `checksum_sha256` against
 `GET /api/v1/security/proxy-blocked`.
 
+### Package exception requests
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `EXCEPTION_REQUESTED` | `repository` | An authenticated user asks for a package exception with `POST /api/v1/exceptions/requests` (#5152). Outcome `success`. | `review_id` (the queue row, shared with the age-gate review routes), `gate` (`age`, `scan` or `curation`), `package`, `version`. The justification stays on the row, not in the audit record. |
+
+A reviewer's decision on any gate's row is recorded as `AGE_GATE_APPROVED`,
+`AGE_GATE_REJECTED` or `AGE_GATE_REOPENED` with the actor and the row's `gate`, and
+an approval carries `expires_at`
+
 ### Proxy cache seeds
 
 | Action | Resource | Fires when | `details` |

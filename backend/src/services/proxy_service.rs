@@ -6667,6 +6667,18 @@ impl ProxyService {
             crate::services::scanner_service::DEDUP_TTL_DAYS as i64,
             Utc::now(),
         );
+        // An approved exception is decided on the full gate, so the fast path steps aside for it
+        if gate == CacheScanGate::Block
+            && crate::services::exception_queue::scan_digest_excepted(
+                &self.db,
+                policy.repository_id,
+                &digest,
+            )
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(CacheScanGate::NotForFastPath);
+        }
         if gate == CacheScanGate::Block && record_block {
             self.note_fast_path_block(policy.repository_id, cache_path, &digest);
         }

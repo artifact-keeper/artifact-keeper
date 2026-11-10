@@ -481,7 +481,7 @@ async fn approve_stamps_live_basis_identity() {
     .expect("get review id");
 
     let approved = svc
-        .approve(review_id, reviewer, Some("test approve"))
+        .approve(review_id, reviewer, Some("test approve"), None)
         .await
         .expect("approve review");
 
@@ -524,7 +524,7 @@ async fn concurrent_review_transition_has_one_winner() {
         let barrier = Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            svc.approve(review_id, reviewer, Some("concurrent approve"))
+            svc.approve(review_id, reviewer, Some("concurrent approve"), None)
                 .await
         }));
     }

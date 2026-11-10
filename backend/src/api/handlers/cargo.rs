@@ -938,12 +938,22 @@ async fn decide_cargo_download_gate(
     if let Some(blocked) =
         proxy_helpers::enforce_age_gate(Some(service), params, name_lower, version, basis).await?
     {
+        // Resolved only on the refusal path, so a served pull pays nothing.
+        let request_url = crate::services::exception_queue::exception_request_url(
+            service.db(),
+            crate::services::age_gate_service::GATE_AGE,
+            &params.key,
+            name_lower,
+            version,
+        )
+        .await;
         return Err(proxy_helpers::age_gate_blocked_response(
             blocked.review_id,
             name_lower,
             version,
             params.age_gate_min_age_days,
             basis.map(|t| AgeGateService::package_age_days(t, chrono::Utc::now())),
+            request_url.as_deref(),
         ));
     }
     Ok(())
@@ -7950,7 +7960,7 @@ mod age_gate_tests {
             .age_gate_service
             .as_ref()
             .expect("age gate service")
-            .approve(review, gated.fx.user_id, Some("test approval"))
+            .approve(review, gated.fx.user_id, Some("test approval"), None)
             .await
             .expect("approve");
 

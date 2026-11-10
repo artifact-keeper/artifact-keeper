@@ -2228,12 +2228,21 @@ async fn enforce_gallery_age_gate(
     )
     .await?
     {
+        let request_url = crate::services::exception_queue::exception_request_url(
+            &state.db,
+            crate::services::age_gate_service::GATE_AGE,
+            &params.key,
+            &package,
+            &coordinate,
+        )
+        .await;
         return Err(proxy_helpers::age_gate_blocked_response(
             blocked.review_id,
             &package,
             &coordinate,
             params.age_gate_min_age_days,
             basis.map(|time| AgeGateService::package_age_days(time, Utc::now())),
+            request_url.as_deref(),
         ));
     }
     gallery_age_gate_memo_allow(memo_key);
@@ -5273,7 +5282,7 @@ mod tests {
             .age_gate_service
             .as_ref()
             .unwrap()
-            .approve(review_id, fx.user_id, Some("reviewed"))
+            .approve(review_id, fx.user_id, Some("reviewed"), None)
             .await
             .unwrap();
 

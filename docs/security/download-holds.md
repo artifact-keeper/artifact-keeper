@@ -231,7 +231,9 @@ Upgrading to 1.12.0 turns an acknowledged row into a decision only when every ro
 of that finding in the artifact's current scans is acknowledged. A finding
 acknowledged only in an older scan, or by one engine while another's row is open,
 stays open and is acknowledged again. Proxied files have no acknowledgement
-(#5152).
+(#5152). A proxied package version the scan gate refuses can instead get a package
+exception (`/api/v1/exceptions`), which releases those bytes from the gate as a whole
+until it expires; see [scan-on-proxy](scan-on-proxy.md).
 
 A 1.11 replica still running during a rolling upgrade reads the old flags on the
 finding rows and not the decisions. A revoke, or a lapse once the five-minute task has

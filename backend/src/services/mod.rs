@@ -48,6 +48,7 @@ pub mod environment_reeval;
 pub mod environment_sbom;
 pub mod environment_service;
 pub mod event_bus;
+pub mod exception_queue;
 pub mod federated_email;
 pub mod finding_acknowledgements;
 pub mod grype_scanner;
