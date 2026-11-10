@@ -12005,27 +12005,32 @@ pub async fn list_virtual_members(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
 
+    // Caller must be able to see the virtual parent itself.
+    //
+    // BOTH gates run, because they answer different questions and neither
+    // subsumes the other (#3163):
+    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
+    //    missing entirely: token scope passes for any unscoped principal, so a
+    //    browser session holding no grant on a PRIVATE virtual repository
+    //    could confirm it exists and read its membership — while `GET /{key}`
+    //    on that same repository correctly 404s. It runs FIRST (#5612): a
+    //    caller who cannot read the repository gets the unknown-key 404
+    //    before the token-scope 403 or the wrong-type 400 below, either of
+    //    which would confirm that the key exists (and the 400, that it is not
+    //    a virtual). An out-of-scope token on a private repository is refused
+    //    here too, with the same 404.
+    //  * `require_repo_access` is the TOKEN-SCOPE check. It still runs because
+    //    `require_visible` short-circuits `Ok` on a public repository, which
+    //    would otherwise let a repo-scoped token reach a public virtual
+    //    outside its allowed set.
+    require_visible(&repo, &Some(auth.clone()), &service).await?;
+    require_repo_access(&auth, repo.id)?;
+
     if repo.repo_type != RepositoryType::Virtual {
         return Err(AppError::Validation(
             "Only virtual repositories have members".to_string(),
         ));
     }
-
-    // Caller must be able to see the virtual parent itself.
-    //
-    // BOTH gates run, because they answer different questions and neither
-    // subsumes the other (#3163):
-    //  * `require_repo_access` is the TOKEN-SCOPE check. It is kept ahead of
-    //    the visibility gate because `require_visible` short-circuits `Ok` on
-    //    a public repository, which would otherwise let a repo-scoped token
-    //    reach a public virtual outside its allowed set.
-    //  * `require_visible` is the canonical repository VISIBILITY gate. It was
-    //    missing entirely: token scope passes for any unscoped principal, so a
-    //    browser session holding no grant on a PRIVATE virtual repository
-    //    could confirm it exists and read its membership — while `GET /{key}`
-    //    on that same repository correctly 404s.
-    require_repo_access(&auth, repo.id)?;
-    require_visible(&repo, &Some(auth.clone()), &service).await?;
 
     // Query members with their repository info
     let members: Vec<VirtualMemberRow> = sqlx::query_as(
@@ -33170,6 +33175,81 @@ mod tests {
             Some(Some("203.0.113.61".to_string())),
             "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
         );
+    }
+
+    /// #5612: `GET /{key}/members` answers a caller who cannot read a private
+    /// repository exactly as it answers an unknown key (status, headers,
+    /// body), whatever the repository's type: a user with no grant and a
+    /// token whose repository list leaves the key out (even a token of the
+    /// repository's owner). Before the fix a local or remote key answered the
+    /// wrong-type 400 and an out-of-scope token on a virtual the token-scope
+    /// 403. A reader keeps its answers: 200 with the listing on its virtual,
+    /// the wrong-type 400 on a local key it reads.
+    #[tokio::test]
+    async fn member_listing_hides_private_repositories_from_non_readers() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (local_id, local_key, local_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (remote_id, remote_key, remote_dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let (virtual_id, virtual_key, virtual_dir) =
+            tdh::create_repo(&pool, "virtual", "npm").await;
+        let (stranger, stranger_name) = tdh::create_user(&pool).await;
+        let (owner, owner_name) = tdh::create_user(&pool).await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        for id in [local_id, remote_id, virtual_id] {
+            tdh::grant_repo_role(&pool, id, owner, "repository-owner").await;
+        }
+        tdh::grant_repo_role(&pool, virtual_id, reader, "reader").await;
+        tdh::grant_repo_role(&pool, local_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &local_dir.to_string_lossy());
+        let unknown = format!("ak5612-unknown-{}", Uuid::new_v4());
+        let get = |auth: AuthExtension, key: &str| {
+            let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+            tdh::send_with_headers(router, tdh::get(format!("/{key}/members")))
+        };
+        let scoped_elsewhere = AuthExtension {
+            is_api_token: true,
+            allowed_repo_ids: crate::models::access_scope::AccessScope::Restricted(vec![
+                Uuid::new_v4(),
+            ]),
+            ..tdh::make_auth(owner, &owner_name)
+        };
+        let mut answers = Vec::new();
+        for (caller, auth) in [
+            ("no grant", tdh::make_auth(stranger, &stranger_name)),
+            ("token scoped elsewhere", scoped_elsewhere),
+        ] {
+            for key in [&local_key, &remote_key, &virtual_key] {
+                let existing = get(auth.clone(), key).await;
+                let missing = get(auth.clone(), &unknown).await;
+                answers.push((format!("{caller} GET {key}/members"), existing, missing));
+            }
+        }
+        let reader_auth = tdh::make_auth(reader, &reader_name);
+        let reader_virtual = get(reader_auth.clone(), &virtual_key).await;
+        let reader_local = get(reader_auth, &local_key).await;
+        let owner_virtual = get(tdh::make_auth(owner, &owner_name), &virtual_key).await;
+        for user in [stranger, owner, reader] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup_member_repo(&pool, local_id, &local_dir).await;
+        tdh::cleanup_member_repo(&pool, remote_id, &remote_dir).await;
+        tdh::cleanup_member_repo(&pool, virtual_id, &virtual_dir).await;
+
+        for (case, existing, missing) in &answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            let v: serde_json::Value = serde_json::from_slice(&existing.1).expect("json body");
+            assert_eq!(
+                v,
+                serde_json::json!({"code": "NOT_FOUND", "message": REPOSITORY_NOT_FOUND}),
+                "{case}"
+            );
+        }
+        assert_eq!(reader_virtual.0, StatusCode::OK, "{reader_virtual:?}");
+        assert_eq!(reader_local.0, StatusCode::BAD_REQUEST, "{reader_local:?}");
+        assert_eq!(owner_virtual.0, StatusCode::OK, "{owner_virtual:?}");
     }
 }
 
