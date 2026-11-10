@@ -428,6 +428,23 @@ impl TrashService {
         .await?;
         tx.commit().await?;
 
+        // The inverse of the delete hook (#5632): the restored version may be
+        // the newest live one again, so the catalog's Latest goes back to it.
+        // Best-effort: the restore itself is already committed.
+        if let Err(e) = crate::services::package_service::refresh_package_latest(
+            &self.db,
+            candidate.row.repository_id,
+            &candidate.row.name,
+        )
+        .await
+        {
+            tracing::warn!(
+                "Failed to refresh catalog latest after restoring artifact {}: {}",
+                id,
+                e
+            );
+        }
+
         Ok(candidate.row.into_restored())
     }
 

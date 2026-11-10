@@ -6884,6 +6884,45 @@ fn rows_not_kept<'a>(
         .collect()
 }
 
+/// Drop every dist-tag of `package` that points at one of `versions` once no
+/// live `artifacts` row of that version is left in the repository (#5604).
+///
+/// Shared by `npm unpublish` and every soft delete that goes through
+/// `ArtifactService::finish_delete` (the REST artifact delete included), so a
+/// tag can never outlive the version it names: a stale `latest` would
+/// otherwise come back into force the moment that version is republished,
+/// overriding the semver-derived `latest` of newer versions. `latest` is not
+/// rewritten here; once its tag is gone the packument derives it again from
+/// the versions that are left ([`derive_latest_version`]). A no-op for a
+/// package without a dist-tags row (every non-npm artifact).
+pub(crate) async fn drop_dist_tags_for_deleted_versions(
+    db: &PgPool,
+    repo_id: uuid::Uuid,
+    package: &str,
+    versions: &[String],
+) -> sqlx::Result<()> {
+    if versions.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE npm_dist_tags t SET tags = COALESCE( \
+             (SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(t.tags) e \
+              WHERE NOT (e.value #>> '{}' = ANY($3) AND NOT EXISTS ( \
+                  SELECT 1 FROM artifacts a \
+                  WHERE a.repository_id = t.repository_id AND a.name = t.name \
+                    AND a.version = e.value #>> '{}' AND a.is_deleted = false))), \
+             '{}'::jsonb), updated_at = NOW() \
+         WHERE t.repository_id = $1 AND t.name = $2 \
+           AND EXISTS (SELECT 1 FROM jsonb_each(t.tags) e WHERE e.value #>> '{}' = ANY($3))",
+    )
+    .bind(repo_id)
+    .bind(package)
+    .bind(versions)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Remove `rows` through `ArtifactService` (soft delete, audit,
 /// `artifact.deleted` webhook, replication delete tasks, search removal),
 /// drop dist-tags that pointed at a removed version (`latest` is then derived
@@ -6906,18 +6945,9 @@ async fn unpublish_npm_rows(
         }
         removed_versions.extend(row.version.clone());
     }
-    sqlx::query(
-        "UPDATE npm_dist_tags SET tags = COALESCE( \
-             (SELECT jsonb_object_agg(key, value) FROM jsonb_each(tags) \
-              WHERE NOT (value #>> '{}' = ANY($3))), '{}'::jsonb), updated_at = NOW() \
-         WHERE repository_id = $1 AND name = $2",
-    )
-    .bind(repo.id)
-    .bind(package)
-    .bind(&removed_versions)
-    .execute(&state.db)
-    .await
-    .map_err(map_db_err)?;
+    drop_dist_tags_for_deleted_versions(&state.db, repo.id, package, &removed_versions)
+        .await
+        .map_err(map_db_err)?;
     let _ = sqlx::query("UPDATE repositories SET updated_at = NOW() WHERE id = $1")
         .bind(repo.id)
         .execute(&state.db)
@@ -21695,5 +21725,299 @@ mod meta_upstream_failure_5345_tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let resp = virtual_meta_failure("v", "v1/search", false, &refusals);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+/// #5604 / #5632: deleting an npm version — through the REST artifact API or
+/// `npm unpublish` — must stop advertising it: no dist-tag may keep naming it
+/// (a stale `latest` comes back into force when the version is republished),
+/// and the package catalog's Latest and version list must move off it.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod delete_cleanup_5604_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::extract::{Path, Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::Extension;
+
+    fn publish_body(package: &str, version: &str) -> bytes::Bytes {
+        use base64::Engine;
+        let tarball_b64 =
+            base64::engine::general_purpose::STANDARD.encode(format!("tgz-{package}-{version}"));
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": package,
+                "dist-tags": { "latest": version },
+                "versions": { version: { "name": package, "version": version } },
+                "_attachments": {
+                    format!("{package}-{version}.tgz"): { "data": tarball_b64 }
+                }
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn admin(fx: &tdh::Fixture) -> crate::api::middleware::auth::AuthExtension {
+        tdh::admin_auth(fx.user_id, &fx.username)
+    }
+
+    fn npm_app(fx: &tdh::Fixture) -> axum::Router {
+        tdh::router_with_auth(super::router(), fx.state.clone(), admin(fx))
+    }
+
+    async fn publish(fx: &tdh::Fixture, pkg: &str, version: &str) {
+        let (status, body) = tdh::send(
+            npm_app(fx),
+            tdh::put_json(
+                format!("/{}/{pkg}", fx.repo_key),
+                publish_body(pkg, version),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "publish {pkg}@{version}: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    async fn tag(fx: &tdh::Fixture, pkg: &str, tag: &str, version: &str) {
+        let (status, body) = tdh::send(
+            npm_app(fx),
+            tdh::put_json(
+                format!("/{}/-/package/{pkg}/dist-tags/{tag}", fx.repo_key),
+                bytes::Bytes::from(serde_json::to_vec(version).unwrap()),
+            ),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "dist-tag {tag}: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    async fn dist_tags(fx: &tdh::Fixture, pkg: &str) -> serde_json::Value {
+        let (status, body) =
+            tdh::send(npm_app(fx), tdh::get(format!("/{}/{pkg}", fx.repo_key))).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let pkg: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        pkg["dist-tags"].clone()
+    }
+
+    async fn stored_tags(fx: &tdh::Fixture, pkg: &str) -> serde_json::Value {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT tags FROM npm_dist_tags WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(pkg)
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap()
+        .unwrap_or(serde_json::Value::Null)
+    }
+
+    async fn rest_delete(fx: &tdh::Fixture, pkg: &str, version: &str) {
+        crate::api::handlers::repositories::delete_artifact(
+            State(fx.state.clone()),
+            Extension(Some(admin(fx))),
+            Path((
+                fx.repo_key.clone(),
+                format!("{pkg}/{version}/{pkg}-{version}.tgz"),
+            )),
+            Query(Default::default()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("REST delete");
+    }
+
+    /// `npm unpublish <pkg>@<version>`: the `?write=true` packument without
+    /// the version, PUT to `/{pkg}/-rev/{rev}`.
+    async fn unpublish(fx: &tdh::Fixture, pkg: &str, version: &str) {
+        let (_, body) = tdh::send(
+            npm_app(fx),
+            tdh::get(format!("/{}/{pkg}?write=true", fx.repo_key)),
+        )
+        .await;
+        let mut doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        doc["versions"].as_object_mut().unwrap().remove(version);
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/{pkg}/-rev/undefined", fx.repo_key))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&doc).unwrap()))
+            .unwrap();
+        let (status, body) = tdh::send(npm_app(fx), req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+
+    /// `(package id, Latest)` as `/api/v1/packages` lists it, and the
+    /// version list `/api/v1/packages/{id}/versions` reports.
+    async fn catalog(fx: &tdh::Fixture, pkg: &str) -> (String, Vec<String>) {
+        let app = || {
+            tdh::router_with_auth(
+                crate::api::handlers::packages::router(),
+                fx.state.clone(),
+                admin(fx),
+            )
+        };
+        let (status, body) = tdh::send(
+            app(),
+            tdh::get(format!("/?repository_key={}&search={pkg}", fx.repo_key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let item = &list["items"][0];
+        let id = item["id"].as_str().expect("package listed").to_string();
+        let latest = item["version"].as_str().unwrap().to_string();
+        let (status, body) = tdh::send(app(), tdh::get(format!("/{id}/versions"))).await;
+        assert_eq!(status, StatusCode::OK);
+        let versions: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = versions["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["version"].as_str().unwrap().to_string())
+            .collect();
+        (latest, versions)
+    }
+
+    /// The stored catalog row itself, not just what the read path shows.
+    async fn stored_catalog_latest(fx: &tdh::Fixture, pkg: &str) -> String {
+        sqlx::query_scalar("SELECT version FROM packages WHERE repository_id = $1 AND name = $2")
+            .bind(fx.repo_id)
+            .bind(pkg)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap()
+    }
+
+    /// The #5604 sequence: `latest` tagged at 1.0.0, 1.0.0 deleted through the
+    /// REST API, republished, then 1.2.0 published. `latest` must be 1.2.0,
+    /// not the tag that outlived its version.
+    #[tokio::test]
+    async fn rest_delete_drops_dist_tags_of_the_deleted_version_5604() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "rest-del-tags";
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.1.0").await;
+        tag(&fx, pkg, "latest", "1.0.0").await;
+        tag(&fx, pkg, "stable", "1.0.0").await;
+        tag(&fx, pkg, "next", "1.1.0").await;
+        assert_eq!(dist_tags(&fx, pkg).await["latest"], "1.0.0");
+
+        rest_delete(&fx, pkg, "1.0.0").await;
+        let after_delete = dist_tags(&fx, pkg).await;
+        let stored_after_delete = stored_tags(&fx, pkg).await;
+
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.2.0").await;
+        let final_tags = dist_tags(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_eq!(after_delete["latest"], "1.1.0", "falls back while deleted");
+        assert_eq!(
+            stored_after_delete,
+            serde_json::json!({ "next": "1.1.0" }),
+            "every tag naming 1.0.0 is dropped; the others are kept"
+        );
+        assert_eq!(
+            final_tags["latest"], "1.2.0",
+            "a republished 1.0.0 must not get its old latest tag back"
+        );
+        assert!(final_tags.get("stable").is_none());
+        assert_eq!(final_tags["next"], "1.1.0");
+    }
+
+    /// #5632: after a REST delete of the newest version, the catalog's Latest
+    /// and version list move to what is left (stored row and read path).
+    #[tokio::test]
+    async fn rest_delete_moves_catalog_latest_5632() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "rest-del-catalog";
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.1.0").await;
+        let before = catalog(&fx, pkg).await;
+
+        rest_delete(&fx, pkg, "1.1.0").await;
+        let after = catalog(&fx, pkg).await;
+        let stored = stored_catalog_latest(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_eq!(before.0, "1.1.0");
+        assert_eq!(after.0, "1.0.0", "Latest moves off the deleted version");
+        assert_eq!(after.1, vec!["1.0.0"], "the deleted version is not listed");
+        assert_eq!(stored, "1.0.0", "the stored catalog row is recomputed");
+    }
+
+    /// #5632, the inverse direction: a trash restore of the deleted newest
+    /// version moves the catalog's Latest back up to it (the read-side
+    /// backstop cannot, since the version it moved down to is live).
+    #[tokio::test]
+    async fn trash_restore_moves_catalog_latest_back_5632() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "restore-catalog";
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.1.0").await;
+        publish(&fx, pkg, "2.0.0").await;
+        let id = tdh::artifact_id_at(
+            &fx.pool,
+            fx.repo_id,
+            &format!("{pkg}/2.0.0/{pkg}-2.0.0.tgz"),
+        )
+        .await;
+
+        rest_delete(&fx, pkg, "2.0.0").await;
+        let deleted = catalog(&fx, pkg).await;
+        crate::api::handlers::trash::trash_service(&fx.state)
+            .restore(id)
+            .await
+            .expect("restore");
+        let restored = catalog(&fx, pkg).await;
+        let stored = stored_catalog_latest(&fx, pkg).await;
+        let tags = dist_tags(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_eq!(deleted.0, "1.1.0");
+        assert_eq!(
+            restored.0, "2.0.0",
+            "Latest goes back to the restored version"
+        );
+        assert_eq!(restored.1, vec!["2.0.0", "1.1.0", "1.0.0"]);
+        assert_eq!(stored, "2.0.0", "the stored catalog row is re-pointed");
+        assert_eq!(tags["latest"], "2.0.0");
+    }
+
+    /// #5632 through `npm unpublish`: same catalog outcome, and the dist-tag
+    /// cleanup unpublish already did still holds.
+    #[tokio::test]
+    async fn unpublish_moves_catalog_latest_5632() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let pkg = "unpub-catalog";
+        publish(&fx, pkg, "1.0.0").await;
+        publish(&fx, pkg, "1.1.0").await;
+        publish(&fx, pkg, "2.0.0").await;
+        tag(&fx, pkg, "latest", "2.0.0").await;
+
+        unpublish(&fx, pkg, "2.0.0").await;
+        let after = catalog(&fx, pkg).await;
+        let stored = stored_catalog_latest(&fx, pkg).await;
+        let tags = dist_tags(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_eq!(after.0, "1.1.0", "Latest moves off the unpublished version");
+        assert_eq!(after.1, vec!["1.1.0", "1.0.0"]);
+        assert_eq!(stored, "1.1.0");
+        assert_eq!(tags["latest"], "1.1.0");
     }
 }

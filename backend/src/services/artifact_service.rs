@@ -2969,6 +2969,41 @@ impl ArtifactService {
             audit_fire_and_forget(self.db.clone(), entry).await;
         }
 
+        // A deleted version must stop being advertised (#5604, #5632): move
+        // the catalog's Latest to the newest version still live and, for an
+        // npm repository only, drop the dist-tags that name it. The catalog
+        // lookup returns the repository format, so a non-npm delete costs no
+        // dist-tags round trip. Best-effort, as every step here.
+        let format = match crate::services::package_service::refresh_package_latest(
+            &self.db,
+            artifact.repository_id,
+            &artifact.name,
+        )
+        .await
+        {
+            Ok(refresh) => refresh.format,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to refresh catalog latest after deleting artifact {}: {}",
+                    id,
+                    e
+                );
+                None
+            }
+        };
+        if let (Some("npm"), Some(version)) = (format.as_deref(), artifact.version.clone()) {
+            if let Err(e) = crate::api::handlers::npm::drop_dist_tags_for_deleted_versions(
+                &self.db,
+                artifact.repository_id,
+                &artifact.name,
+                &[version],
+            )
+            .await
+            {
+                tracing::warn!("Failed to drop dist-tags of deleted artifact {}: {}", id, e);
+            }
+        }
+
         // #3411 part 1: `artifact.deleted` is mapped by `webhook_producer` and
         // was likewise never emitted. Symmetric with the upload emit, and on
         // the same choke point the audit write uses.
