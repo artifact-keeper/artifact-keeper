@@ -953,6 +953,8 @@ async fn authenticate_uncached(
         // directory: it would spend the directory account's lockout budget
         // for a credential that was never meant to work there.
         if known.auth_provider != "ldap" {
+            // The caller relies on every refusal here writing a row (#5653).
+            audit_failure(db, username, path, method, "not_directory_account").await;
             return Err(AuthError::Invalid);
         }
         if !known.is_active {
@@ -971,6 +973,7 @@ async fn authenticate_uncached(
             username = %username,
             "LDAP Basic-auth passthrough found no enabled provider"
         );
+        audit_failure(db, username, path, method, "no_directory_provider").await;
         return Err(AuthError::Invalid);
     };
 
@@ -988,7 +991,15 @@ async fn authenticate_uncached(
         }
     };
 
-    let user = sync_directory_user(auth_service, &ldap_service, &row, &ldap_user).await?;
+    let user = match sync_directory_user(auth_service, &ldap_service, &row, &ldap_user).await {
+        Ok(user) => user,
+        Err(error) => {
+            if error == AuthError::Invalid {
+                audit_failure(db, username, path, method, "directory_sync_refused").await;
+            }
+            return Err(error);
+        }
+    };
 
     record_success(tag, user.id, settings, Instant::now());
     cache()
@@ -2196,11 +2207,25 @@ mod tests {
             0,
             "the guest guard must not reach the directory for management/Oci"
         );
+        // The guard answers these itself, so it writes the refusal's one
+        // LOGIN_FAILED row (#5653): HTTP Basic, from the local check, sampled
+        // per (username, source) so both requests share it. A Basic guess on
+        // the management API or `/v2` is no longer unaudited.
         assert_eq!(
             poll_login_failed(&pool, &allowed_user).await,
-            0,
-            "the guard must not write a package-manager LOGIN_FAILED row"
+            1,
+            "the guard must write one (sampled) LOGIN_FAILED row for what it refuses"
         );
+        let guard_row: serde_json::Value = sqlx::query_scalar(
+            "SELECT details FROM audit_log \
+             WHERE action = 'LOGIN_FAILED' AND details->>'username' = $1",
+        )
+        .bind(&allowed_user)
+        .fetch_one(&pool)
+        .await
+        .expect("guard row");
+        assert_eq!(guard_row["auth_method"], "basic", "{guard_row}");
+        assert!(guard_row.get("provider").is_none(), "{guard_row}");
 
         // A wrong password on a package route: the guard defers, the package
         // middleware performs the one bind, and exactly one LOGIN_FAILED row
@@ -2569,5 +2594,146 @@ mod tests {
                 .expect("provisioned row");
         assert_eq!(recorded, Some(provider_id));
         cleanup(&pool, provider_id, &username).await;
+    }
+
+    /// The `LOGIN_FAILED` details rows recorded for `username` (#5653).
+    async fn login_failed_rows(pool: &PgPool, username: &str) -> Vec<serde_json::Value> {
+        for _ in 0..50 {
+            let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+                "SELECT details FROM audit_log \
+                 WHERE action = 'LOGIN_FAILED' AND details->>'username' = $1",
+            )
+            .bind(username)
+            .fetch_all(pool)
+            .await
+            .expect("LOGIN_FAILED rows");
+            if !rows.is_empty() {
+                // Long enough for a stray second row to land.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                return sqlx::query_scalar(
+                    "SELECT details FROM audit_log \
+                     WHERE action = 'LOGIN_FAILED' AND details->>'username' = $1",
+                )
+                .bind(username)
+                .fetch_all(pool)
+                .await
+                .expect("LOGIN_FAILED rows");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Vec::new()
+    }
+
+    fn basic_pair(user: &str, pass: &str) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    }
+
+    /// #5653 review: with the passthrough enabled, a caller that resolves
+    /// with `allow_basic_api_token = true` but never runs the passthrough
+    /// (the unknown-repository branch of the visibility middleware) still
+    /// audits a refused Basic password. The first cut skipped the row whenever
+    /// the passthrough was enabled.
+    #[tokio::test]
+    async fn test_refused_basic_password_is_audited_without_a_passthrough_5653() {
+        use crate::api::middleware::auth::AuthOutcome;
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let username = format!("localnopass{}", Uuid::new_v4().simple());
+        let hash = AuthService::hash_password("Right!Secret9").await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, email, password_hash, auth_provider, is_active, is_admin) \
+             VALUES ($1, $2, $3, $4, 'local', true, false)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&username)
+        .bind(format!("{username}@example.com"))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+        let auth = test_auth_service(&pool);
+        let _pin = test_seam::SettingsOverride::set(settings());
+        let basic = basic_pair(&username, "wrong-password");
+        let outcome = crate::api::middleware::auth::try_resolve_auth_outcome(
+            &auth,
+            crate::api::middleware::auth::ExtractedToken::Basic(&basic),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(outcome, AuthOutcome::InvalidCredential),
+            "{outcome:?}"
+        );
+        let rows = login_failed_rows(&pool, &username).await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE details->>'username' = $1")
+            .bind(&username)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE username = $1")
+            .bind(&username)
+            .execute(&pool)
+            .await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["auth_method"], "basic");
+        assert_eq!(rows[0]["reason"], "invalid_password");
+    }
+
+    /// #5653 review: a passthrough attempt the shared login limiter refuses
+    /// never reaches the directory, so the passthrough writes no row; the
+    /// local refusal is recorded instead, with the limiter as its reason.
+    #[tokio::test]
+    async fn test_rate_limited_passthrough_attempt_is_audited_5653() {
+        use crate::api::middleware::auth::{
+            try_resolve_auth_outcome_with_passthrough, AuthOutcome,
+        };
+        use crate::api::middleware::rate_limit::{
+            login_rate_limit_key, LoginRateLimitState, RateLimitExemptions, RateLimitState,
+            RateLimiter,
+        };
+        let Some(pool) = test_db_helpers::try_pool().await else {
+            return;
+        };
+        let username = format!("ldaplimited{}", Uuid::new_v4().simple());
+        let limiter = std::sync::Arc::new(RateLimiter::new(1, 3600));
+        // Spend the (username, unknown IP) budget before the attempt.
+        let _ = limiter
+            .check_rate_limit(&login_rate_limit_key(&username, "ip:unknown"))
+            .await;
+        install_rate_limit(LoginRateLimitState {
+            inner: RateLimitState {
+                limiter,
+                exemptions: std::sync::Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                enabled: true,
+                trusted_proxies: std::sync::Arc::new(Vec::new()),
+            },
+            backstop: std::sync::Arc::new(RateLimiter::new(10_000, 60)),
+            failed_by_ip: std::sync::Arc::new(RateLimiter::new(10_000, 60)),
+            audit: None,
+        });
+        let auth = test_auth_service(&pool);
+        let _pin = test_seam::SettingsOverride::set(settings());
+        let basic = basic_pair(&username, "directory-guess");
+        let outcome = try_resolve_auth_outcome_with_passthrough(
+            &auth,
+            crate::api::middleware::auth::ExtractedToken::Basic(&basic),
+            true,
+            "/pypi/private/simple/pkg/",
+            "GET",
+        )
+        .await;
+        let rows = login_failed_rows(&pool, &username).await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE details->>'username' = $1")
+            .bind(&username)
+            .execute(&pool)
+            .await;
+        assert!(
+            matches!(outcome, AuthOutcome::RateLimited(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["auth_method"], "basic");
+        assert_eq!(rows[0]["reason"], "ldap_passthrough_rate_limited");
     }
 }

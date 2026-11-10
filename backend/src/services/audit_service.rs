@@ -331,6 +331,21 @@ pub enum AuditAction {
     /// summary row per `mode=apply`; each write it made also records its own
     /// per-repository row.
     ConfigImported,
+    // Group administration (#5653). Appended at the END of the enum. A group
+    // grants its members every permission rule held by the group, so its
+    // membership is a privilege change and is audited like a role grant.
+    /// A group was created.
+    GroupCreated,
+    /// A group's name or description changed.
+    GroupUpdated,
+    /// A group was deleted (its memberships and grants cascade).
+    GroupDeleted,
+    /// Users were added to a group. One row per request, listing the users
+    /// whose membership was new.
+    GroupMembersAdded,
+    /// Users were removed from a group. One row per request, listing the
+    /// users whose membership existed.
+    GroupMembersRemoved,
 }
 
 impl AuditAction {
@@ -468,6 +483,11 @@ impl AuditAction {
             AuditAction::CacheSeeded => "CACHE_SEEDED",
             AuditAction::UpstreamFetched => "UPSTREAM_FETCHED",
             AuditAction::ConfigImported => "CONFIG_IMPORTED",
+            AuditAction::GroupCreated => "GROUP_CREATED",
+            AuditAction::GroupUpdated => "GROUP_UPDATED",
+            AuditAction::GroupDeleted => "GROUP_DELETED",
+            AuditAction::GroupMembersAdded => "GROUP_MEMBERS_ADDED",
+            AuditAction::GroupMembersRemoved => "GROUP_MEMBERS_REMOVED",
         }
     }
 }
@@ -494,6 +514,8 @@ pub enum ResourceType {
     SyncPolicy,
     /// A stored environment (ingested lockfile graph, #4054 / #4709).
     Environment,
+    /// A user group (#5653).
+    Group,
 }
 
 impl ResourceType {
@@ -516,6 +538,7 @@ impl ResourceType {
             ResourceType::Webhook => "webhook",
             ResourceType::SyncPolicy => "sync_policy",
             ResourceType::Environment => "environment",
+            ResourceType::Group => "group",
         }
     }
 }
@@ -1925,6 +1948,17 @@ mod proxy_scan_blocked_4777_tests {
         assert!(AuditAction::ProxyScanBlocked.as_str().len() <= 100);
         assert_eq!(AuditAction::UpstreamFetched.as_str(), "UPSTREAM_FETCHED");
         assert_eq!(AuditAction::ConfigImported.as_str(), "CONFIG_IMPORTED");
+        assert_eq!(AuditAction::GroupCreated.as_str(), "GROUP_CREATED");
+        assert_eq!(AuditAction::GroupUpdated.as_str(), "GROUP_UPDATED");
+        assert_eq!(AuditAction::GroupDeleted.as_str(), "GROUP_DELETED");
+        assert_eq!(
+            AuditAction::GroupMembersAdded.as_str(),
+            "GROUP_MEMBERS_ADDED"
+        );
+        assert_eq!(
+            AuditAction::GroupMembersRemoved.as_str(),
+            "GROUP_MEMBERS_REMOVED"
+        );
     }
 
     /// #5253: the MCP registry vocabulary is a published contract
@@ -2226,6 +2260,7 @@ mod tests {
         assert_eq!(ResourceType::Webhook.as_str(), "webhook");
         assert_eq!(ResourceType::SyncPolicy.as_str(), "sync_policy");
         assert_eq!(ResourceType::Environment.as_str(), "environment");
+        assert_eq!(ResourceType::Group.as_str(), "group");
     }
 
     /// #4710: the core privileged-action vocabulary. The names are a published

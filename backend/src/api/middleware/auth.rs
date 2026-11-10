@@ -971,9 +971,20 @@ pub async fn auth_middleware(
             // Helm send it there.
             Some((username, password)) => {
                 let mut failure = None;
-                match resolve_basic_pair(&auth_service, &username, &password, false, &mut failure)
-                    .await
-                {
+                let mut refused = None;
+                let resolved = resolve_basic_pair(
+                    &auth_service,
+                    &username,
+                    &password,
+                    false,
+                    &mut failure,
+                    &mut refused,
+                )
+                .await;
+                // This surface answers the request and never runs the LDAP
+                // passthrough: audit a refused password here (#5653).
+                record_basic_refusal(&auth_service, refused, None).await;
+                match resolved {
                     AuthOutcome::Resolved(ext) => Ok(ext),
                     // A transient bcrypt-capacity shed or a pool-acquire
                     // timeout is a retryable 503, never a 401: twine does not
@@ -1270,9 +1281,43 @@ pub(crate) async fn try_resolve_auth_outcome(
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
 ) -> AuthOutcome {
+    let mut refused = None;
+    let outcome = try_resolve_auth_outcome_deferring_audit(
+        auth_service,
+        extracted,
+        allow_basic_api_token,
+        &mut refused,
+    )
+    .await;
+    // The caller answers with this outcome and no LDAP passthrough follows:
+    // a refused Basic password is audited here (#5653).
+    record_basic_refusal(auth_service, refused, None).await;
+    outcome
+}
+
+/// [`try_resolve_auth_outcome`] that leaves the `LOGIN_FAILED` row of a
+/// refused Basic password to the caller (#5653): `refused` is set, and the
+/// caller passes it to [`record_basic_refusal`] when it answers the request
+/// itself, or drops it when a later layer re-resolves (and audits) the same
+/// credential. The guest-access guard uses it: it defers a bad Basic
+/// credential to the package route's own middleware, which runs the LDAP
+/// passthrough.
+#[tracing::instrument(name = "authenticate", level = "info", skip_all)]
+pub(crate) async fn try_resolve_auth_outcome_deferring_audit(
+    auth_service: &AuthService,
+    extracted: ExtractedToken<'_>,
+    allow_basic_api_token: bool,
+    refused: &mut Option<BasicRefusal>,
+) -> AuthOutcome {
     let mut failure = None;
-    let outcome =
-        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    let outcome = resolve_auth_outcome(
+        auth_service,
+        extracted,
+        allow_basic_api_token,
+        &mut failure,
+        refused,
+    )
+    .await;
     if matches!(outcome, AuthOutcome::InvalidCredential) {
         let (surface, reason) =
             failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
@@ -1305,9 +1350,19 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
     method: &str,
 ) -> AuthOutcome {
     let mut failure = None;
-    let outcome =
-        resolve_auth_outcome(auth_service, extracted, allow_basic_api_token, &mut failure).await;
+    let mut refused = None;
+    let outcome = resolve_auth_outcome(
+        auth_service,
+        extracted,
+        allow_basic_api_token,
+        &mut failure,
+        &mut refused,
+    )
+    .await;
 
+    // Whether the passthrough refused the credential and wrote its own
+    // `provider: ldap` LOGIN_FAILED row, which then stands for this request.
+    let mut passthrough_audited = false;
     if matches!(outcome, AuthOutcome::InvalidCredential) && allow_basic_api_token {
         // `resolve_auth_outcome` already tried the same decoded pair as
         // bcrypt (and the Bearer form as a JWT/API token), so this only
@@ -1323,15 +1378,31 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
             .await
             {
                 crate::services::ldap_basic_auth::Outcome::Resolved(user) => {
+                    // A directory user's password: the local refusal was not
+                    // a failed login.
                     return AuthOutcome::Resolved(AuthExtension::from(*user));
                 }
                 crate::services::ldap_basic_auth::Outcome::RateLimited(retry_after) => {
+                    // The directory was never asked, so nothing else records
+                    // this attempt (#5653).
+                    record_basic_refusal(
+                        auth_service,
+                        refused,
+                        Some("ldap_passthrough_rate_limited"),
+                    )
+                    .await;
                     return AuthOutcome::RateLimited(retry_after);
                 }
                 crate::services::ldap_basic_auth::Outcome::Unavailable => {
                     return AuthOutcome::Overloaded;
                 }
-                crate::services::ldap_basic_auth::Outcome::Invalid => {}
+                crate::services::ldap_basic_auth::Outcome::Invalid => {
+                    // An enabled passthrough audits every refusal of a
+                    // non-empty username and password it is handed (#5653).
+                    passthrough_audited = crate::services::ldap_basic_auth::passthrough_enabled()
+                        && !username.is_empty()
+                        && !password.is_empty();
+                }
             }
         }
     }
@@ -1340,6 +1411,11 @@ pub(crate) async fn try_resolve_auth_outcome_with_passthrough(
         let (surface, reason) =
             failure.unwrap_or((AuthFailureSurface::Api, AuthFailureReason::InvalidToken));
         record_auth_failure(surface, reason);
+    }
+    // Refused locally, and the passthrough did not run or wrote no row: the
+    // local refusal is this request's one row (#5653).
+    if !passthrough_audited {
+        record_basic_refusal(auth_service, refused, None).await;
     }
     outcome
 }
@@ -1351,6 +1427,7 @@ async fn resolve_auth_outcome(
     extracted: ExtractedToken<'_>,
     allow_basic_api_token: bool,
     failure: &mut Option<AuthFailureLabels>,
+    refused: &mut Option<BasicRefusal>,
 ) -> AuthOutcome {
     match extracted {
         ExtractedToken::Bearer(token) => {
@@ -1410,6 +1487,7 @@ async fn resolve_auth_outcome(
                 &password,
                 allow_basic_api_token,
                 failure,
+                refused,
             )
             .await
         }
@@ -1467,6 +1545,7 @@ async fn resolve_basic_pair(
     password: &str,
     allow_basic_api_token: bool,
     failure: &mut Option<AuthFailureLabels>,
+    refused: &mut Option<BasicRefusal>,
 ) -> AuthOutcome {
     if is_jwt_shape(password) {
         return match auth_service.validate_access_token_async(password).await {
@@ -1531,9 +1610,120 @@ async fn resolve_basic_pair(
                 AuthFailureSurface::Basic,
                 f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
             ));
+            // #5653: a refused Basic password is a failed login. Who writes
+            // its row is the caller's call (see `record_basic_refusal`).
+            *refused = Some(BasicRefusal {
+                username: username.to_string(),
+                reason: f.reason.unwrap_or("invalid_password"),
+            });
             AuthOutcome::InvalidCredential
         }
     }
+}
+
+/// A Basic password the local check refused (#5653), waiting for the caller
+/// to decide whether this request's answer is a failed login.
+#[derive(Debug)]
+pub(crate) struct BasicRefusal {
+    username: String,
+    reason: &'static str,
+}
+
+/// How long one `(username, source IP)` pair's failed Basic logins are folded
+/// into one audit row (#5653).
+const BASIC_FAILURE_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pairs remembered at most. When full, the pair audited longest ago is
+/// forgotten: a new pair is always recorded, so a flood of junk usernames
+/// cannot hide a targeted guess.
+const BASIC_FAILURE_AUDIT_MAX_TRACKED: usize = 10_000;
+
+/// Per pair: when its last row was written, and the refusals folded since.
+type BasicFailureSeen = std::collections::HashMap<(String, String), (Instant, u64)>;
+
+/// Whether a failed Basic login of `key` should be audited at `now`. `Some(n)`
+/// records it (and marks the pair), `n` being the refusals of that pair folded
+/// since its previous row; `None` folds it into the next row. A package client
+/// with a stale password retries on every request: one row per pair per
+/// [`BASIC_FAILURE_AUDIT_WINDOW`] keeps that from turning the audit table into
+/// a write amplifier, and the count keeps the volume visible.
+fn basic_failure_audit_should_record(
+    seen: &mut BasicFailureSeen,
+    key: (String, String),
+    now: Instant,
+) -> Option<u64> {
+    if let Some((last, suppressed)) = seen.get_mut(&key) {
+        if now.duration_since(*last) < BASIC_FAILURE_AUDIT_WINDOW {
+            *suppressed += 1;
+            return None;
+        }
+        let folded = *suppressed;
+        *last = now;
+        *suppressed = 0;
+        return Some(folded);
+    }
+    if seen.len() >= BASIC_FAILURE_AUDIT_MAX_TRACKED {
+        seen.retain(|_, (last, _)| now.duration_since(*last) < BASIC_FAILURE_AUDIT_WINDOW);
+        if seen.len() >= BASIC_FAILURE_AUDIT_MAX_TRACKED {
+            let oldest = seen
+                .iter()
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
+        }
+    }
+    seen.insert(key, (now, 0));
+    Some(0)
+}
+
+/// Write the `LOGIN_FAILED` row of a refused HTTP Basic password (#5653),
+/// sampled per `(username, verified source IP)`; `reason` overrides the local
+/// check's reason (a rate-limited passthrough). Never carries the password.
+/// A no-op for `None`.
+pub(crate) async fn record_basic_refusal(
+    auth_service: &AuthService,
+    refused: Option<BasicRefusal>,
+    reason: Option<&'static str>,
+) {
+    let Some(refused) = refused else {
+        return;
+    };
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<BasicFailureSeen>> =
+        std::sync::OnceLock::new();
+    let source = crate::api::middleware::client_ip::current_verified_client_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_default();
+    let Some(suppressed) = basic_failure_audit_should_record(
+        &mut SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        (refused.username.clone(), source),
+        Instant::now(),
+    ) else {
+        return;
+    };
+    use crate::services::audit_export::details::AuthDetails;
+    use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
+    let mut details = AuthDetails::failed_login(
+        Some(&refused.username),
+        Some(reason.unwrap_or(refused.reason)),
+    );
+    details.auth_method = Some("basic".to_string());
+    let mut details = serde_json::to_value(details).unwrap_or_default();
+    if let Some(map) = details.as_object_mut() {
+        map.insert(
+            "suppressed_since_last_row".to_string(),
+            serde_json::json!(suppressed),
+        );
+    }
+    let entry = AuditEntry::new(AuditAction::LoginFailed, ResourceType::User)
+        .actor_name(refused.username)
+        .with_request_client_ip()
+        .details(details);
+    crate::services::audit_service::audit_fire_and_forget(auth_service.db().clone(), entry).await;
 }
 
 /// Extract the value of a `ticket` query parameter from a URI's query string.
@@ -7154,6 +7344,148 @@ mod tests {
             status,
             StatusCode::UNAUTHORIZED,
             "an expired API token in the password position must still be rejected"
+        );
+    }
+
+    /// #5653: failed Basic logins are folded per (username, source) per
+    /// window, and the next row carries how many were folded.
+    #[test]
+    fn test_basic_failure_audit_is_sampled_per_pair_5653() {
+        let mut seen = BasicFailureSeen::new();
+        let t0 = Instant::now();
+        let key = |u: &str| (u.to_string(), "192.0.2.7".to_string());
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), t0),
+            Some(0)
+        );
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), t0),
+            None
+        );
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), t0),
+            None
+        );
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("other"), t0),
+            Some(0)
+        );
+        let later = t0 + BASIC_FAILURE_AUDIT_WINDOW;
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, key("ci"), later),
+            Some(2),
+            "the next row reports the two refusals folded since the last one"
+        );
+    }
+
+    /// #5653 review: a full memory forgets the pair audited longest ago
+    /// instead of refusing new pairs, so flooding junk usernames cannot hide
+    /// a targeted guess.
+    #[test]
+    fn test_basic_failure_audit_records_new_pairs_when_full_5653() {
+        let mut seen = BasicFailureSeen::new();
+        let t0 = Instant::now();
+        let oldest = ("junk-0".to_string(), "198.51.100.1".to_string());
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, oldest.clone(), t0),
+            Some(0)
+        );
+        let t1 = t0 + std::time::Duration::from_millis(1);
+        for i in 1..BASIC_FAILURE_AUDIT_MAX_TRACKED {
+            let key = (format!("junk-{i}"), "198.51.100.1".to_string());
+            assert!(basic_failure_audit_should_record(&mut seen, key, t1).is_some());
+        }
+        assert_eq!(seen.len(), BASIC_FAILURE_AUDIT_MAX_TRACKED);
+        let target = ("admin".to_string(), "198.51.100.1".to_string());
+        assert_eq!(
+            basic_failure_audit_should_record(&mut seen, target.clone(), t1),
+            Some(0),
+            "a new pair is recorded even when the memory is full"
+        );
+        assert_eq!(seen.len(), BASIC_FAILURE_AUDIT_MAX_TRACKED);
+        assert!(seen.contains_key(&target));
+        assert!(
+            !seen.contains_key(&oldest),
+            "the oldest pair is the one forgotten"
+        );
+    }
+
+    /// #5653 (DB-backed): a wrong Basic password writes a `LOGIN_FAILED` row
+    /// (`auth_method: basic`, the attempted username, never the password),
+    /// and a retry inside the window does not write a second one.
+    #[tokio::test]
+    async fn test_failed_basic_login_is_audited_db_5653() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let user_id = Uuid::new_v4();
+        let username = format!("ph-basic-fail-{user_id}");
+        let hash = AuthService::hash_password("right-password")
+            .await
+            .expect("hash password");
+        sqlx::query(
+            r#"INSERT INTO users
+               (id, username, email, password_hash, auth_provider,
+                is_admin, is_active, is_service_account)
+               VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+        )
+        .bind(user_id)
+        .bind(&username)
+        .bind(format!("{username}@test.local"))
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("insert local user");
+        let auth_service =
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()));
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:wrong-password"));
+        for _ in 0..2 {
+            let outcome =
+                try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic), false).await;
+            assert!(
+                matches!(outcome, AuthOutcome::InvalidCredential),
+                "{outcome:?}"
+            );
+        }
+        let (db, name) = (&pool, username.as_str());
+        let fetch = || async move {
+            sqlx::query_as::<_, (serde_json::Value,)>(
+                "SELECT details FROM audit_log \
+                  WHERE action = 'LOGIN_FAILED' AND details->>'username' = $1",
+            )
+            .bind(name)
+            .fetch_all(db)
+            .await
+            .unwrap()
+        };
+        for _ in 0..50 {
+            if !fetch().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let rows = fetch().await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE details->>'username' = $1")
+            .bind(&username)
+            .execute(&pool)
+            .await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .ok();
+
+        assert_eq!(rows.len(), 1, "one row per pair per window: {rows:?}");
+        let details = &rows[0].0;
+        assert_eq!(details["auth_method"], "basic");
+        assert_eq!(details["reason"], "invalid_password");
+        assert_eq!(details["suppressed_since_last_row"], 0);
+        assert!(
+            !details.to_string().contains("wrong-password"),
+            "the password must never be recorded: {details}"
         );
     }
 
