@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5664, #5665, #5667]
+---
+- **Maven SNAPSHOT aliases, checksum sidecars and SNAPSHOT version metadata now always agree with the stored files** ([#5664], [#5665], [#5667]). The `-SNAPSHOT` alias of a main jar (`…/1.0.0-SNAPSHOT/shop-core-1.0.0-SNAPSHOT.jar`) could serve the newest `-sources` or `-javadoc` jar of the build, with a matching alias `.sha1`, so clients could not notice; it now resolves to the newest build of exactly the requested classifier and extension. A `.md5`, `.sha1` or `.sha256` upload for a stored artifact must now name that artifact's digest (otherwise `400 VALIDATION_ERROR`, "Checksum mismatch"), and once a released (non-SNAPSHOT) artifact has a sidecar stored, replacing it answers `409 CONFLICT`, like re-uploading the released file; a normal deploy, which uploads each sidecar once after its file, is unaffected. Deleting a timestamped SNAPSHOT build now also drops the stored version-level `…/<version>-SNAPSHOT/maven-metadata.xml`, so it is regenerated from the remaining builds (or answers `404` when none is left) instead of pointing Maven at the deleted build.

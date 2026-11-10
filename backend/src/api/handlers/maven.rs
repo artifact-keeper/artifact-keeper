@@ -157,11 +157,24 @@ pub async fn clear_stored_maven_metadata(
     };
 
     let meta_path = maven_metadata_object_path(group_id, artifact_id);
+    delete_stored_metadata_document(storage.as_ref(), repo_id, storage_backend, &meta_path).await;
+}
+
+/// Remove one stored `maven-metadata.xml` (relative to the `maven/` prefix)
+/// and the checksum sidecars Maven stores beside it, under both the
+/// repo-scoped (#2624) and the legacy flat key. Best-effort: a miss or a
+/// storage error is logged at debug and otherwise ignored.
+async fn delete_stored_metadata_document(
+    storage: &dyn crate::storage::StorageBackend,
+    repo_id: Uuid,
+    storage_backend: &str,
+    meta_path: &str,
+) {
     let scheme = crate::storage::StorageKeyScheme::from_env();
 
     // Base keys: repo-scoped candidate (cloud RepoScoped) first, then legacy flat.
     let mut base_keys = Vec::with_capacity(2);
-    if let Some(scoped) = scheme.scoped_read_key(storage_backend, "maven", repo_id, &meta_path) {
+    if let Some(scoped) = scheme.scoped_read_key(storage_backend, "maven", repo_id, meta_path) {
         base_keys.push(scoped);
     }
     base_keys.push(format!("maven/{}", meta_path));
@@ -173,6 +186,7 @@ pub async fn clear_stored_maven_metadata(
             format!("{}.md5", base),
             format!("{}.sha1", base),
             format!("{}.sha256", base),
+            format!("{}.sha512", base),
         ] {
             if let Err(e) = storage.delete(&key).await {
                 // A missing object is the common case (never uploaded); log at
@@ -181,6 +195,53 @@ pub async fn clear_stored_maven_metadata(
             }
         }
     }
+}
+
+/// The version-level `maven-metadata.xml` path of a file deleted from a
+/// `-SNAPSHOT` version directory
+/// (`g/a/1.0-SNAPSHOT/a-1.0-20260101.120000-2.jar` ->
+/// `g/a/1.0-SNAPSHOT/maven-metadata.xml`), or `None` when the file is not in
+/// a `-SNAPSHOT` directory or is that metadata document itself.
+fn snapshot_version_metadata_path(artifact_path: &str) -> Option<String> {
+    let path = artifact_path.trim_start_matches('/');
+    let (dir, filename) = path.rsplit_once('/')?;
+    let version = dir.rsplit('/').next()?;
+    if !version.ends_with("-SNAPSHOT") || filename.starts_with("maven-metadata.xml") {
+        return None;
+    }
+    Some(format!("{dir}/maven-metadata.xml"))
+}
+
+/// Drop the stored version-level `…/<v>-SNAPSHOT/maven-metadata.xml` when a
+/// file of that SNAPSHOT version is deleted (#5667), the version-level
+/// counterpart of [`clear_stored_maven_metadata`] (#2845).
+///
+/// `mvn deploy` uploads that document verbatim, naming the newest
+/// timestamp/build, and the download path serves it in preference to
+/// generation. Deleting that build left the document pointing at it, so a
+/// client resolving `-SNAPSHOT` asked for a timestamped file that now 404s.
+/// With the stored document gone the next GET regenerates it from the live
+/// rows (`collect_snapshot_entries`), naming the newest remaining build, or
+/// answers 404 when no build is left. Best-effort, like the artifact-level
+/// clear: it never fails the delete.
+pub async fn clear_stored_snapshot_version_metadata(
+    state: &SharedState,
+    repo_id: Uuid,
+    storage_backend: &str,
+    storage_location: &crate::storage::StorageLocation,
+    artifact_path: &str,
+) {
+    let Some(meta_path) = snapshot_version_metadata_path(artifact_path) else {
+        return;
+    };
+    let storage = match state.storage_for_repo(storage_location) {
+        Ok(storage) => storage,
+        Err(e) => {
+            warn!(error = %e, "clear_stored_snapshot_version_metadata: storage unavailable");
+            return;
+        }
+    };
+    delete_stored_metadata_document(storage.as_ref(), repo_id, storage_backend, &meta_path).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,9 +446,10 @@ pub fn snapshot_like_pattern(path: &str) -> Option<String> {
     Some(format!("{}/{}", dir, resolved_filename))
 }
 
-/// Look up the latest timestamped artifact path matching a SNAPSHOT pattern.
-/// Uses a SQL LIKE query to find artifacts stored under timestamp-resolved names
-/// when the client requests the `-SNAPSHOT` form.
+/// Look up the latest timestamped artifact path a `-SNAPSHOT` alias names.
+/// A SQL LIKE prefilter narrows the candidates to the version directory, and
+/// [`snapshot_alias_build`] then keeps only the files that are exactly the
+/// alias's `<artifact>-<base>-<timestamp>-<build><tail>` (#5664).
 async fn resolve_snapshot_artifact(
     db: &PgPool,
     repo_id: uuid::Uuid,
@@ -397,6 +459,47 @@ async fn resolve_snapshot_artifact(
         .await
         .ok()
         .flatten()
+}
+
+/// The `(timestamp, build number)` of `candidate` when it is a timestamped
+/// build of the `-SNAPSHOT` alias `alias`, else `None` (#5664).
+///
+/// `alias` is `<dir>/<base>-SNAPSHOT/<prefix><base>-SNAPSHOT<tail>`, where
+/// `<tail>` carries the classifier and extension (`.jar`, `-sources.jar`,
+/// `.jar.asc`, ...). `candidate` matches only when it sits in the same
+/// directory and is exactly `<prefix><base>-<YYYYMMDD.HHMMSS>-<N><tail>`.
+/// The old `<prefix><base>-%<tail>` LIKE pattern alone also matched
+/// `<prefix><base>-<ts>-<N>-sources.jar` for the main jar's alias, so the
+/// newest classifier file was served under the main jar's name.
+fn snapshot_alias_build(alias: &str, candidate: &str) -> Option<(String, u32)> {
+    let alias = alias.trim_start_matches('/');
+    let candidate = candidate.trim_start_matches('/');
+    let (dir, filename) = alias.rsplit_once('/')?;
+    let (cand_dir, cand_filename) = candidate.rsplit_once('/')?;
+    if dir != cand_dir {
+        return None;
+    }
+    let version_dir = dir.rsplit('/').next()?;
+    let base_version = version_dir.strip_suffix("-SNAPSHOT")?;
+    let (prefix, tail) = filename.split_once(version_dir)?;
+    let rest = cand_filename
+        .strip_prefix(prefix)?
+        .strip_prefix(base_version)?
+        .strip_prefix('-')?;
+    let rest = rest.strip_suffix(tail)?;
+    let (ts, build) = rest.split_once('-')?;
+    let ts_ok = ts.len() == 15
+        && ts.bytes().enumerate().all(|(i, b)| {
+            if i == 8 {
+                b == b'.'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !ts_ok || build.is_empty() || !build.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((ts.to_string(), build.parse().ok()?))
 }
 
 /// [`resolve_snapshot_artifact`] that reports a failed query as an error
@@ -413,14 +516,18 @@ async fn fetch_snapshot_artifact(
     };
 
     // Use runtime sqlx::query (not the query! macro) to avoid needing an
-    // offline cache entry. The LIKE pattern matches timestamped filenames
-    // and we pick the latest one by created_at.
+    // offline cache entry.
     //
     // `pattern` is built by `snapshot_like_pattern`, which escapes any LIKE
     // metacharacters (`%`, `_`, `\`) coming from user input so only the
     // intentional `%` in place of `-SNAPSHOT` acts as a wildcard. The
     // `ESCAPE '\'` clause makes that contract explicit to PostgreSQL.
-    let row = sqlx::query(
+    //
+    // The pattern is only a prefilter: its `%` also spans a classifier
+    // (`-sources`, `-javadoc`), so each candidate is checked against the
+    // alias with `snapshot_alias_build` and the newest BUILD wins, not the
+    // newest row (#5664).
+    let rows = sqlx::query(
         r#"
         SELECT id, storage_key, checksum_sha256, path
         FROM artifacts
@@ -428,24 +535,36 @@ async fn fetch_snapshot_artifact(
           AND is_deleted = false
           AND path LIKE $2 ESCAPE '\'
         ORDER BY created_at DESC
-        LIMIT 1
         "#,
     )
     .bind(repo_id)
     .bind(&pattern)
-    .fetch_optional(db)
+    .fetch_all(db)
     .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
 
     use sqlx::Row;
-    Ok(Some(ResolvedSnapshot {
-        id: row.get("id"),
-        storage_key: row.get("storage_key"),
-        checksum_sha256: row.get("checksum_sha256"),
-        path: row.get("path"),
-    }))
+    let mut best: Option<((String, u32), ResolvedSnapshot)> = None;
+    for row in rows {
+        let path: String = row.get("path");
+        let Some(build) = snapshot_alias_build(snapshot_path, &path) else {
+            continue;
+        };
+        // Rows arrive newest first, so a strictly greater build replaces the
+        // pick and a tie keeps the newest row.
+        if best.as_ref().is_some_and(|(b, _)| *b >= build) {
+            continue;
+        }
+        best = Some((
+            build,
+            ResolvedSnapshot {
+                id: row.get("id"),
+                storage_key: row.get("storage_key"),
+                checksum_sha256: row.get("checksum_sha256"),
+                path,
+            },
+        ));
+    }
+    Ok(best.map(|(_, resolved)| resolved))
 }
 
 struct ResolvedSnapshot {
@@ -4675,7 +4794,24 @@ async fn upload(
     // If this is a checksum file (.sha1, .md5, .sha256), just store it and return.
     // These row-less puts create no artifact row, so attribution is committed
     // here -- only after the object bytes are durably written (#2574, V3b).
-    if parse_checksum_path(&path).is_some() {
+    if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
+        // #5665: a sidecar of a stored artifact is held to that artifact's
+        // rules: immutable once its release coordinate is published, and
+        // never allowed to name a digest the stored bytes do not have.
+        if let Err(refusal) = check_checksum_sidecar_upload(
+            &state.db,
+            storage.as_ref(),
+            &staged,
+            repo.id,
+            &storage_key,
+            base_path,
+            checksum_type,
+        )
+        .await
+        {
+            staged.discard().await;
+            return Err(refusal);
+        }
         // Atomically claim the flat key BEFORE writing its bytes: exactly one
         // concurrent first-publisher wins, the rest are refused, so the stored
         // bytes and the attributed owner can never disagree (#2586). Release the
@@ -5137,6 +5273,111 @@ async fn upload(
         .status(StatusCode::CREATED)
         .body(Body::from("Created"))
         .unwrap())
+}
+
+/// Largest body a checksum sidecar upload may carry: a SHA-512 hex digest
+/// plus an `md5sum`-style filename field fits with room to spare.
+const MAX_CHECKSUM_SIDECAR_BYTES: i64 = 4 * 1024;
+
+/// The digest a checksum sidecar body names: its first whitespace-separated
+/// token, lowercased, when that token is hex. Sidecars are either the bare
+/// digest or the two-field `<hex>  <filename>` form.
+fn sidecar_digest_token(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let token = text.split_whitespace().next()?;
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(token.to_ascii_lowercase())
+}
+
+/// Gate a `.md5`/`.sha1`/`.sha256`/`.sha512` sidecar upload on the artifact
+/// it describes (#5665). Before this the sidecar was stored with no check at
+/// all, so a writer could replace the `.sha1` of a released jar the jar's own
+/// PUT refuses with 409, and the hosted repository served the forged value.
+///
+/// * No live artifact row at `base_path` (a `maven-metadata.xml` sidecar, or
+///   a sidecar sent before its file): stored as before; there is nothing to
+///   hold it to.
+/// * The base is a release coordinate and a sidecar is already stored at
+///   `storage_key`: 409, exactly what re-uploading the released file answers.
+/// * The body does not name the digest the artifact row stores for this
+///   algorithm: 400. Maven and Gradle upload each sidecar after its file, so
+///   the row is there to compare against. SHA-512 has no stored digest and
+///   is not compared.
+async fn check_checksum_sidecar_upload(
+    db: &PgPool,
+    storage: &dyn crate::storage::StorageBackend,
+    staged: &super::repositories::GenericStagedBody,
+    repo_id: Uuid,
+    storage_key: &str,
+    base_path: &str,
+    checksum_type: ChecksumType,
+) -> Result<(), Response> {
+    use sqlx::Row;
+
+    if MavenHandler::is_metadata(base_path) {
+        return Ok(());
+    }
+    let row = sqlx::query(
+        "SELECT checksum_sha256, checksum_sha1, checksum_md5 FROM artifacts \
+         WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+    )
+    .bind(repo_id)
+    .bind(base_path)
+    .fetch_optional(db)
+    .await
+    .map_err(map_db_err)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+
+    if !crate::services::cache_classifier::maven_coordinate_is_republishable(base_path)
+        && storage
+            .exists(storage_key)
+            .await
+            .map_err(|e| e.into_response())?
+    {
+        return Err(AppError::Conflict(format!(
+            "Checksum for released artifact '{base_path}' already exists"
+        ))
+        .into_response());
+    }
+
+    let expected: Option<String> = match checksum_type {
+        ChecksumType::Sha256 => row.try_get("checksum_sha256").ok(),
+        ChecksumType::Sha1 => row
+            .try_get::<Option<String>, _>("checksum_sha1")
+            .ok()
+            .flatten(),
+        ChecksumType::Md5 => row
+            .try_get::<Option<String>, _>("checksum_md5")
+            .ok()
+            .flatten(),
+        ChecksumType::Sha512 => None,
+    };
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let expected = expected.trim().to_ascii_lowercase();
+    let suffix = checksum_suffix(checksum_type);
+    let uploaded = if staged.size_bytes() <= MAX_CHECKSUM_SIDECAR_BYTES {
+        let body = staged
+            .read_all(storage)
+            .await
+            .map_err(|e| e.into_response())?;
+        sidecar_digest_token(&body)
+    } else {
+        None
+    };
+    if uploaded.as_deref() != Some(expected.as_str()) {
+        return Err(AppError::Validation(format!(
+            "Checksum mismatch: the uploaded .{suffix} does not match the {suffix} \
+             of the stored artifact '{base_path}'"
+        ))
+        .into_response());
+    }
+    Ok(())
 }
 
 /// Bound on the maven-metadata.xml body inspected for plugin-prefix entries.
@@ -7891,9 +8132,10 @@ mod tests {
         assert_eq!(body, jar);
 
         // -- Row-less checksum sidecar: stored scoped, served via the scoped
-        //    read candidate (no attribution row needed).
+        //    read candidate (no attribution row needed). It names the jar's
+        //    real digest: a sidecar of a stored artifact must (#5665).
         let sha1_path = format!("{path}.sha1");
-        let sha1 = bytes::Bytes::from_static(b"da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        let sha1 = bytes::Bytes::from(compute_checksum(&jar, ChecksumType::Sha1));
         let (status, _) = tdh::send(
             router.clone(),
             tdh::put(format!("/{repo_key}/{sha1_path}"), sha1.clone()),
@@ -13179,6 +13421,459 @@ mod tests {
             ),
             other => panic!("no upload size sample recorded: {other:?}"),
         }
+    }
+
+    // ── #5664 / #5665 / #5667: SNAPSHOT alias, sidecar uploads, version metadata ──
+
+    #[test]
+    fn test_snapshot_alias_build_matches_only_the_requested_classifier_5664() {
+        let dir = "com/example/shop/shop-core/1.0.0-SNAPSHOT";
+        let main = format!("{dir}/shop-core-1.0.0-SNAPSHOT.jar");
+        let sources = format!("{dir}/shop-core-1.0.0-SNAPSHOT-sources.jar");
+        let signed = format!("{dir}/shop-core-1.0.0-SNAPSHOT.jar.asc");
+        let build = |f: &str| format!("{dir}/{f}");
+        let b = |ts: &str, n: u32| Some((ts.to_string(), n));
+
+        assert_eq!(
+            snapshot_alias_build(&main, &build("shop-core-1.0.0-20261101.101010-3.jar")),
+            b("20261101.101010", 3)
+        );
+        for other in [
+            "shop-core-1.0.0-20261101.101010-3-sources.jar",
+            "shop-core-1.0.0-20261101.101010-3-javadoc.jar",
+            "shop-core-1.0.0-20261101.101010-3.jar.asc",
+            "shop-core-1.0.0-20261101.101010-3.pom",
+            "shop-core-1.0.0-SNAPSHOT.jar",
+            "shop-core-1.0.0-2026110.101010-3.jar",
+            "shop-core-1.0.0-20261101.101010-.jar",
+            "shop-core-extra-1.0.0-20261101.101010-3.jar",
+        ] {
+            assert_eq!(snapshot_alias_build(&main, &build(other)), None, "{other}");
+        }
+        assert_eq!(
+            snapshot_alias_build(
+                &main,
+                "com/example/shop/other/1.0.0-SNAPSHOT/shop-core-1.0.0-20261101.101010-3.jar"
+            ),
+            None,
+            "a file in another directory is not a build of this alias"
+        );
+        assert_eq!(
+            snapshot_alias_build(
+                &sources,
+                &build("shop-core-1.0.0-20261101.101010-3-sources.jar")
+            ),
+            b("20261101.101010", 3)
+        );
+        assert_eq!(
+            snapshot_alias_build(&sources, &build("shop-core-1.0.0-20261101.101010-3.jar")),
+            None
+        );
+        assert_eq!(
+            snapshot_alias_build(
+                &signed,
+                &build("shop-core-1.0.0-20261101.101010-12.jar.asc")
+            ),
+            b("20261101.101010", 12)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_version_metadata_path_5667() {
+        assert_eq!(
+            snapshot_version_metadata_path(
+                "com/example/a/1.0-SNAPSHOT/a-1.0-20260101.120000-2.jar"
+            )
+            .as_deref(),
+            Some("com/example/a/1.0-SNAPSHOT/maven-metadata.xml")
+        );
+        assert_eq!(
+            snapshot_version_metadata_path("com/example/a/1.0/a-1.0.jar"),
+            None
+        );
+        assert_eq!(
+            snapshot_version_metadata_path("com/example/a/1.0-SNAPSHOT/maven-metadata.xml.sha1"),
+            None
+        );
+        assert_eq!(snapshot_version_metadata_path("a-1.0.jar"), None);
+    }
+
+    #[test]
+    fn test_sidecar_digest_token_5665() {
+        assert_eq!(
+            sidecar_digest_token(b"ABCdef01\n").as_deref(),
+            Some("abcdef01")
+        );
+        assert_eq!(
+            sidecar_digest_token(b"abcdef01  shop-core-1.0.0.jar\n").as_deref(),
+            Some("abcdef01")
+        );
+        assert_eq!(sidecar_digest_token(b"not-hex"), None);
+        assert_eq!(sidecar_digest_token(b"   "), None);
+        assert_eq!(sidecar_digest_token(&[0xff, 0xfe]), None);
+    }
+
+    fn sha1_hex(data: &[u8]) -> String {
+        compute_checksum(data, ChecksumType::Sha1)
+    }
+
+    /// #5664: Maven resolver 2 uploads a build's attached classifier jars in
+    /// parallel, so the `-sources`/`-javadoc` rows can be newer than the main
+    /// jar's. The `-SNAPSHOT` alias of the main jar matched them through the
+    /// `shop-core-1.0.0-%.jar` LIKE pattern and served the newest row, i.e.
+    /// the javadoc bytes, with a `.sha1` computed over those same wrong bytes.
+    /// The alias now names exactly one classifier and the newest BUILD.
+    #[tokio::test]
+    async fn test_snapshot_alias_never_serves_a_classifier_jar_5664() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let dir = "com/example/shop5664/shop-core/1.0.0-SNAPSHOT";
+        let main1 = bytes::Bytes::from_static(b"shop-core main jar, build 1");
+        let main2 = bytes::Bytes::from_static(b"shop-core main jar, build 2");
+        let sources2 = bytes::Bytes::from_static(b"shop-core SOURCES jar, build 2");
+        let javadoc2 = bytes::Bytes::from_static(b"shop-core JAVADOC jar, build 2");
+        let sources1 = bytes::Bytes::from_static(b"shop-core SOURCES jar, build 1");
+        // Main jars first, classifiers last (the order that reproduced it),
+        // then a late re-deploy of an OLDER build's sources: the newest row of
+        // all, but not the newest build.
+        let uploads = [
+            ("shop-core-1.0.0-20261101.100000-1.jar", main1.clone()),
+            ("shop-core-1.0.0-20261102.100000-2.jar", main2.clone()),
+            (
+                "shop-core-1.0.0-20261102.100000-2-sources.jar",
+                sources2.clone(),
+            ),
+            (
+                "shop-core-1.0.0-20261102.100000-2-javadoc.jar",
+                javadoc2.clone(),
+            ),
+            ("shop-core-1.0.0-20261101.100000-1-sources.jar", sources1),
+        ];
+        let mut put_statuses = Vec::new();
+        for (file, body) in uploads {
+            let app = fx.router_with_auth(super::router());
+            let (status, _) = tdh::send(
+                app,
+                tdh::put(format!("/{}/{dir}/{file}", fx.repo_key), body),
+            )
+            .await;
+            put_statuses.push((file, status));
+        }
+        let mut got = Vec::new();
+        for leaf in [
+            "shop-core-1.0.0-SNAPSHOT.jar",
+            "shop-core-1.0.0-SNAPSHOT.jar.sha1",
+            "shop-core-1.0.0-SNAPSHOT-sources.jar",
+            "shop-core-1.0.0-SNAPSHOT-javadoc.jar",
+        ] {
+            let app = fx.router_with_auth(super::router());
+            got.push(tdh::send(app, tdh::get(format!("/{}/{dir}/{leaf}", fx.repo_key))).await);
+        }
+        fx.teardown().await;
+
+        for (file, status) in put_statuses {
+            assert_eq!(status, StatusCode::CREATED, "{file}");
+        }
+        for (status, _) in &got {
+            assert_eq!(*status, StatusCode::OK);
+        }
+        assert_eq!(
+            &got[0].1[..],
+            &main2[..],
+            "the main-jar alias must serve the newest build's MAIN jar, got {:?}",
+            String::from_utf8_lossy(&got[0].1)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got[1].1).trim(),
+            sha1_hex(&main2),
+            "the alias .sha1 must describe the main jar"
+        );
+        assert_eq!(&got[2].1[..], &sources2[..], "newest build's sources");
+        assert_eq!(&got[3].1[..], &javadoc2[..]);
+    }
+
+    /// #5665: a released artifact's checksum sidecars were stored with no
+    /// check, so a writer could replace the `.sha1` of a jar whose own
+    /// re-upload answers 409, and the hosted repository served the forged
+    /// value. A sidecar of a stored artifact must name that artifact's digest
+    /// (400 otherwise) and, for a release, cannot be replaced once stored
+    /// (409). A normal deploy (file, then each sidecar once) is unaffected.
+    #[tokio::test]
+    async fn test_checksum_sidecars_follow_their_artifact_5665() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let jar_path = "com/example/shop5665/shop-core/1.0.0/shop-core-1.0.0.jar";
+        let jar = bytes::Bytes::from_static(b"released shop-core 1.0.0 jar bytes");
+        let good_sha1 = sha1_hex(&jar);
+        let good_md5 = compute_checksum(&jar, ChecksumType::Md5);
+        let forged = "0".repeat(40);
+        let snap_path =
+            "com/example/shop5665/shop-core/1.1.0-SNAPSHOT/shop-core-1.1.0-20261101.100000-1.jar";
+        let snap = bytes::Bytes::from_static(b"snapshot shop-core jar bytes");
+        let snap_sha1 = sha1_hex(&snap);
+
+        let put = |leaf: String, body: String| {
+            let app = fx.router_with_auth(super::router());
+            let uri = format!("/{}/{leaf}", fx.repo_key);
+            async move {
+                let (status, body) = tdh::send(app, tdh::put(uri, bytes::Bytes::from(body))).await;
+                (status, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let mut steps: Vec<(&str, StatusCode, StatusCode, String)> = Vec::new();
+        let app = fx.router_with_auth(super::router());
+        let (s, _) = tdh::send(
+            app,
+            tdh::put(format!("/{}/{jar_path}", fx.repo_key), jar.clone()),
+        )
+        .await;
+        steps.push((
+            "deploy the release jar",
+            StatusCode::CREATED,
+            s,
+            String::new(),
+        ));
+        let (s, b) = put(format!("{jar_path}.sha1"), forged.clone()).await;
+        steps.push(("a .sha1 naming other bytes", StatusCode::BAD_REQUEST, s, b));
+        let (s, b) = put(format!("{jar_path}.sha1"), good_sha1.clone()).await;
+        steps.push(("the deploy's own .sha1", StatusCode::CREATED, s, b));
+        let (s, b) = put(
+            format!("{jar_path}.md5"),
+            format!("{}  shop-core-1.0.0.jar\n", good_md5.to_uppercase()),
+        )
+        .await;
+        steps.push(("a two-field upper-case .md5", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{jar_path}.sha1"), forged.clone()).await;
+        steps.push(("overwriting the released .sha1", StatusCode::CONFLICT, s, b));
+        let (s, b) = put(format!("{jar_path}.sha1"), good_sha1.clone()).await;
+        steps.push((
+            "re-uploading the released .sha1",
+            StatusCode::CONFLICT,
+            s,
+            b,
+        ));
+        let app = fx.router_with_auth(super::router());
+        let (s, _) = tdh::send(
+            app,
+            tdh::put(format!("/{}/{jar_path}", fx.repo_key), jar.clone()),
+        )
+        .await;
+        steps.push((
+            "control: re-uploading the jar",
+            StatusCode::CONFLICT,
+            s,
+            String::new(),
+        ));
+
+        // A SNAPSHOT file stays republishable, its sidecar too, but still
+        // has to match the stored bytes.
+        let app = fx.router_with_auth(super::router());
+        let (s, _) = tdh::send(
+            app,
+            tdh::put(format!("/{}/{snap_path}", fx.repo_key), snap.clone()),
+        )
+        .await;
+        steps.push((
+            "deploy a snapshot jar",
+            StatusCode::CREATED,
+            s,
+            String::new(),
+        ));
+        let (s, b) = put(format!("{snap_path}.sha1"), snap_sha1.clone()).await;
+        steps.push(("snapshot .sha1", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{snap_path}.sha1"), snap_sha1.clone()).await;
+        steps.push(("snapshot .sha1 redeployed", StatusCode::CREATED, s, b));
+        let (s, b) = put(format!("{snap_path}.sha1"), forged.clone()).await;
+        steps.push((
+            "snapshot .sha1 naming other bytes",
+            StatusCode::BAD_REQUEST,
+            s,
+            b,
+        ));
+        // Sidecars with no artifact row to hold them to are stored as before.
+        let (s, b) = put(
+            "com/example/shop5665/shop-core/maven-metadata.xml.sha1".to_string(),
+            forged.clone(),
+        )
+        .await;
+        steps.push(("metadata .sha1", StatusCode::CREATED, s, b));
+
+        let app = fx.router_with_auth(super::router());
+        let (gs, served) =
+            tdh::send(app, tdh::get(format!("/{}/{jar_path}.sha1", fx.repo_key))).await;
+        fx.teardown().await;
+
+        for (what, want, got, body) in &steps {
+            assert_eq!(got, want, "{what}: body={body}");
+        }
+        assert!(
+            steps[1].3.contains("Checksum mismatch"),
+            "the 400 says why: {}",
+            steps[1].3
+        );
+        assert_eq!(gs, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8_lossy(&served).trim(),
+            good_sha1,
+            "the served .sha1 is the deploy's, never the forged one"
+        );
+    }
+
+    /// #5667: deleting the newest timestamped SNAPSHOT build left the stored
+    /// version-level `maven-metadata.xml` (uploaded verbatim by `mvn deploy`)
+    /// naming that build, so Maven resolved `-SNAPSHOT` to a file that now
+    /// 404s. The delete now drops the stored document, the next GET
+    /// regenerates it from the remaining builds, and with no build left it
+    /// answers 404.
+    #[tokio::test]
+    async fn test_deleting_newest_snapshot_build_regenerates_version_metadata_5667() {
+        use crate::api::handlers::repositories::{delete_artifact, DeleteArtifactQuery};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Path, Query, State};
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let dir = "com/example/shop5667/shop-core/1.0.0-SNAPSHOT";
+        let b1 = "shop-core-1.0.0-20261101.100000-1";
+        let b2 = "shop-core-1.0.0-20261102.100000-2";
+        let jar1 = bytes::Bytes::from_static(b"build 1 jar");
+        let jar2 = bytes::Bytes::from_static(b"build 2 jar");
+        let pom = |n: u8| {
+            bytes::Bytes::from(format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>com.example.shop5667</groupId>\
+                 <artifactId>shop-core</artifactId><version>1.0.0-SNAPSHOT</version>\
+                 <description>build {n}</description></project>"
+            ))
+        };
+        let stored_meta = |ts: &str, n: u32| {
+            bytes::Bytes::from(format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example.shop5667</groupId>
+  <artifactId>shop-core</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <versioning>
+    <snapshot><timestamp>{ts}</timestamp><buildNumber>{n}</buildNumber></snapshot>
+    <lastUpdated>{lu}</lastUpdated>
+    <snapshotVersions>
+      <snapshotVersion><extension>jar</extension><value>1.0.0-{ts}-{n}</value><updated>{lu}</updated></snapshotVersion>
+      <snapshotVersion><extension>pom</extension><value>1.0.0-{ts}-{n}</value><updated>{lu}</updated></snapshotVersion>
+    </snapshotVersions>
+  </versioning>
+</metadata>
+"#,
+                lu = ts.replace('.', "")
+            ))
+        };
+        let meta_uri = format!("/{}/{dir}/maven-metadata.xml", fx.repo_key);
+        let get = |uri: String| {
+            let app = fx.router_with_auth(super::router());
+            async move {
+                let (s, b) = tdh::send(app, tdh::get(uri)).await;
+                (s, String::from_utf8_lossy(&b).into_owned())
+            }
+        };
+
+        // Two deploys, each followed by the verbatim version-level metadata
+        // the deploy plugin uploads.
+        let mut put_statuses = Vec::new();
+        for (leaf, body) in [
+            (format!("{b1}.jar"), jar1.clone()),
+            (format!("{b1}.pom"), pom(1)),
+            (
+                "maven-metadata.xml".to_string(),
+                stored_meta("20261101.100000", 1),
+            ),
+            (format!("{b2}.jar"), jar2.clone()),
+            (format!("{b2}.pom"), pom(2)),
+            (
+                "maven-metadata.xml".to_string(),
+                stored_meta("20261102.100000", 2),
+            ),
+        ] {
+            let app = fx.router_with_auth(super::router());
+            let (s, _) = tdh::send(
+                app,
+                tdh::put(format!("/{}/{dir}/{leaf}", fx.repo_key), body),
+            )
+            .await;
+            put_statuses.push((leaf, s));
+        }
+        let before = get(meta_uri.clone()).await;
+
+        let admin = tdh::admin_auth(fx.user_id, &fx.username);
+        let delete = |path: String| {
+            delete_artifact(
+                State(fx.state.clone()),
+                Extension(Some(admin.clone())),
+                Path((fx.repo_key.clone(), path)),
+                Query(DeleteArtifactQuery::default()),
+                HeaderMap::new(),
+            )
+        };
+        let mut deletes = Vec::new();
+        for leaf in [format!("{b2}.jar"), format!("{b2}.pom")] {
+            deletes.push(delete(format!("{dir}/{leaf}")).await.is_ok());
+        }
+        let after = get(meta_uri.clone()).await;
+        // `mvn`-style resolution: the alias and the timestamped name the
+        // metadata now advertises both resolve to build 1.
+        let alias = get(format!(
+            "/{}/{dir}/shop-core-1.0.0-SNAPSHOT.jar",
+            fx.repo_key
+        ))
+        .await;
+        let named = get(format!("/{}/{dir}/{b1}.jar", fx.repo_key)).await;
+
+        for leaf in [format!("{b1}.jar"), format!("{b1}.pom")] {
+            deletes.push(delete(format!("{dir}/{leaf}")).await.is_ok());
+        }
+        let emptied = get(meta_uri.clone()).await;
+        fx.teardown().await;
+
+        for (leaf, s) in put_statuses {
+            assert_eq!(s, StatusCode::CREATED, "{leaf}");
+        }
+        assert!(deletes.iter().all(|ok| *ok), "{deletes:?}");
+        assert_eq!(before.0, StatusCode::OK);
+        assert!(
+            before.1.contains("<buildNumber>2</buildNumber>"),
+            "{}",
+            before.1
+        );
+        assert_eq!(after.0, StatusCode::OK, "{}", after.1);
+        assert!(
+            after.1.contains("<timestamp>20261101.100000</timestamp>")
+                && after.1.contains("<buildNumber>1</buildNumber>"),
+            "the metadata must name the remaining build: {}",
+            after.1
+        );
+        assert!(
+            !after.1.contains("20261102.100000"),
+            "the deleted build must no longer be advertised: {}",
+            after.1
+        );
+        assert_eq!(alias.0, StatusCode::OK);
+        assert_eq!(alias.1.as_bytes(), &jar1[..]);
+        assert_eq!(named.0, StatusCode::OK);
+        assert_eq!(named.1.as_bytes(), &jar1[..]);
+        assert_eq!(
+            emptied.0,
+            StatusCode::NOT_FOUND,
+            "no build left, no metadata: {}",
+            emptied.1
+        );
     }
 }
 
