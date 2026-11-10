@@ -3919,14 +3919,21 @@ async fn get_package_metadata(
     }
 
     let dist_tags = fetch_npm_dist_tags(&state.db, repo.id, package_name).await;
-    build_npm_metadata_response(
+    let mut packument = build_npm_metadata_value(
         &meta_artifacts,
         package_name,
         base_url,
         repo_key,
         &dist_tags,
-        want_abbreviated,
-    )
+    );
+    // The revision `npm unpublish` reads from `GET /{pkg}?write=true` and
+    // sends back as `-rev/{_rev}` (#5403). The abbreviated document carries
+    // no `_rev`, as on the npm registry.
+    if !want_abbreviated {
+        let rows = fetch_npm_package_rows(&state.db, repo.id, package_name).await?;
+        packument["_rev"] = serde_json::Value::String(npm_package_rev(&rows));
+    }
+    Ok(respond_with_packument(packument, want_abbreviated))
 }
 
 /// Fetch the full packument and extract a single version's metadata.
@@ -7007,8 +7014,13 @@ async fn dist_tags_delete(
 // `DELETE /{pkg}/-rev/{_rev}`. It reads a 404 on any of them as "already
 // gone", so these must exist or an unpublish silently does nothing.
 //
-// This registry keeps no packument revisions and serves no `_rev`, so the
-// client sends `-rev/undefined`; any `{rev}` is accepted.
+// The hosted full packument carries a `_rev` derived from the package's live
+// rows ([`npm_package_rev`], #5403). A packument rewrite or whole-package
+// unpublish whose `{rev}` no longer matches answers 409, so an unpublish
+// computed from an old packument cannot remove a version published after the
+// client read it. See [`check_npm_unpublish_rev`] for clients that send no
+// revision (`-rev/undefined`). The tarball delete names its one file and is
+// not checked.
 
 /// One live artifact row of an npm package, as unpublish sees it.
 struct NpmPackageRow {
@@ -7079,6 +7091,53 @@ async fn fetch_npm_package_rows(
             path: r.get("path"),
         })
         .collect())
+}
+
+/// The `_rev` of a hosted npm package: `<live row count>-<digest>`, the digest
+/// a SHA-256 over the sorted ids of its live artifact rows (#5403). Any
+/// publish, unpublish or delete of the package changes it.
+fn npm_package_rev(rows: &[NpmPackageRow]) -> String {
+    use sha2::Digest;
+    let mut ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    ids.sort();
+    let mut hasher = sha2::Sha256::new();
+    for id in &ids {
+        hasher.update(id.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("{}-{}", ids.len(), &digest[..32])
+}
+
+/// The `{rev}` a client sends when its packument carried no `_rev` (one read
+/// before #5403, or a hand-rolled client).
+const NPM_REV_UNDEFINED: &str = "undefined";
+
+/// Refuse an unpublish computed from a packument that is no longer current
+/// (#5403): 409 unless `rev` is the package's [`npm_package_rev`] over the
+/// same `rows` the unpublish acts on.
+///
+/// A client without a revision (`-rev/undefined`) is let through only when
+/// `removed_versions` is `None` (the whole-package unpublish, which removes
+/// everything either way) or exactly one version, which is what
+/// `npm unpublish <pkg>@<version>` removes; a rewrite that would remove more
+/// is the over-delete a concurrent publish causes and answers 409 too.
+#[allow(clippy::result_large_err)]
+fn check_npm_unpublish_rev(
+    rows: &[NpmPackageRow],
+    rev: &str,
+    removed_versions: Option<usize>,
+) -> Result<(), Response> {
+    let current = npm_package_rev(rows);
+    let accepted =
+        rev == current || (rev == NPM_REV_UNDEFINED && removed_versions.is_none_or(|n| n == 1));
+    if accepted {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "the package changed since its packument was read (revision {rev} is not \
+         the current {current}); fetch it again with ?write=true and retry"
+    ))
+    .into_response())
 }
 
 /// The versions a `PUT /{pkg}/-rev/{rev}` packument keeps.
@@ -7206,6 +7265,7 @@ async fn unpublish_versions_for(
     auth: Option<&AuthExtension>,
     repo_key: &str,
     package: &str,
+    rev: &str,
     body: &[u8],
 ) -> Result<Response, Response> {
     let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
@@ -7223,6 +7283,13 @@ async fn unpublish_versions_for(
         )
         .into_response());
     }
+    // `removed` comes from the same `rows` the revision is checked over, so a
+    // version published after this read is neither checked nor removed.
+    let removed_versions: std::collections::HashSet<&str> = removed
+        .iter()
+        .filter_map(|r| r.version.as_deref())
+        .collect();
+    check_npm_unpublish_rev(&rows, rev, Some(removed_versions.len()))?;
     unpublish_npm_rows(state, auth, &repo, package, &removed).await?;
     Ok(npm_ok_response())
 }
@@ -7233,12 +7300,14 @@ async fn unpublish_package_for(
     auth: Option<&AuthExtension>,
     repo_key: &str,
     package: &str,
+    rev: &str,
 ) -> Result<Response, Response> {
     let repo = resolve_npm_unpublish_target(state, auth, repo_key).await?;
     let rows = fetch_npm_package_rows(&state.db, repo.id, package).await?;
     if rows.is_empty() {
         return Err(npm_package_not_found(package));
     }
+    check_npm_unpublish_rev(&rows, rev, None)?;
     let all: Vec<&NpmPackageRow> = rows.iter().collect();
     unpublish_npm_rows(state, auth, &repo, package, &all).await?;
     let _ = sqlx::query("DELETE FROM npm_dist_tags WHERE repository_id = $1 AND name = $2")
@@ -7310,58 +7379,58 @@ fn encoded_scoped_unpublish_name(scope: &str, rev_segment: &str) -> Result<Strin
 async fn unpublish_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+    Path((repo_key, package, rev)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
     let package = unscoped_unpublish_name(&package)?;
-    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &rev, &body).await
 }
 
 async fn unpublish_scoped_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, package, rev)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
     let package = scoped_unpublish_name(&scope, &package)?;
-    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &rev, &body).await
 }
 
 async fn unpublish_encoded_scoped_versions(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, rev_segment, rev)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<Response, Response> {
     let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
-    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &body).await
+    unpublish_versions_for(&state, auth.as_ref(), &repo_key, &package, &rev, &body).await
 }
 
 async fn unpublish_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, package, _rev)): Path<(String, String, String)>,
+    Path((repo_key, package, rev)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let package = unscoped_unpublish_name(&package)?;
-    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package, &rev).await
 }
 
 async fn unpublish_scoped_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, package, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, package, rev)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let package = scoped_unpublish_name(&scope, &package)?;
-    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package, &rev).await
 }
 
 async fn unpublish_encoded_scoped_package(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
-    Path((repo_key, scope, rev_segment, _rev)): Path<(String, String, String, String)>,
+    Path((repo_key, scope, rev_segment, rev)): Path<(String, String, String, String)>,
 ) -> Result<Response, Response> {
     let package = encoded_scoped_unpublish_name(&scope, &rev_segment)?;
-    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package).await
+    unpublish_package_for(&state, auth.as_ref(), &repo_key, &package, &rev).await
 }
 
 async fn unpublish_tarball(
@@ -21659,15 +21728,28 @@ mod unpublish_4025_tests {
 
     /// What libnpmpublish sends for `npm unpublish <pkg>@<version>`: the
     /// `?write=true` packument with the version (and every dist-tag pointing
-    /// at it) removed, PUT to `/{pkg}/-rev/{_rev}`. This registry sends no
-    /// `_rev`, so the client's URL carries `undefined`.
+    /// at it) removed, PUT to `/{pkg}/-rev/{_rev}` (#5403: the packument's
+    /// own `_rev`).
     async fn npm_unpublish_version(
         fx: &tdh::Fixture,
         app: axum::Router,
         uri_name: &str,
         version: &str,
     ) -> (StatusCode, bytes::Bytes) {
-        let (_, mut pkg) = packument(fx, uri_name).await;
+        let (_, pkg) = packument(fx, uri_name).await;
+        let rev = pkg["_rev"].as_str().unwrap_or("undefined").to_string();
+        put_packument_without(app, fx, uri_name, pkg, version, &rev).await
+    }
+
+    /// `PUT /{pkg}/-rev/{rev}` with `pkg` minus `version` and its dist-tags.
+    async fn put_packument_without(
+        app: axum::Router,
+        fx: &tdh::Fixture,
+        uri_name: &str,
+        mut pkg: serde_json::Value,
+        version: &str,
+        rev: &str,
+    ) -> (StatusCode, bytes::Bytes) {
         pkg["versions"].as_object_mut().unwrap().remove(version);
         let tags = pkg["dist-tags"].as_object_mut().unwrap();
         tags.retain(|_, v| v.as_str() != Some(version));
@@ -21675,11 +21757,113 @@ mod unpublish_4025_tests {
             app,
             request(
                 "PUT",
-                format!("/{}/{}/-rev/undefined", fx.repo_key, uri_name),
+                format!("/{}/{}/-rev/{rev}", fx.repo_key, uri_name),
                 bytes::Bytes::from(serde_json::to_vec(&pkg).unwrap()),
             ),
         )
         .await
+    }
+
+    /// #5403: the revision changes with every publish and unpublish, and
+    /// only the current one (or, for a client without one, a removal of
+    /// exactly one version) passes.
+    #[test]
+    fn test_npm_unpublish_rev_check_5403() {
+        let row = |v: &str| super::NpmPackageRow {
+            id: uuid::Uuid::new_v4(),
+            version: Some(v.to_string()),
+            path: String::new(),
+        };
+        let mut rows = vec![row("1.0.0"), row("1.1.0")];
+        let rev_a = super::npm_package_rev(&rows);
+        assert!(rev_a.starts_with("2-"), "{rev_a}");
+        rows.reverse();
+        assert_eq!(
+            super::npm_package_rev(&rows),
+            rev_a,
+            "row order is irrelevant"
+        );
+        rows.push(row("2.0.0"));
+        let rev_b = super::npm_package_rev(&rows);
+        assert_ne!(rev_a, rev_b);
+
+        assert!(super::check_npm_unpublish_rev(&rows, &rev_b, Some(1)).is_ok());
+        assert!(super::check_npm_unpublish_rev(&rows, &rev_b, None).is_ok());
+        for (rev, removed) in [
+            (rev_a.as_str(), Some(1)),
+            (rev_a.as_str(), None),
+            ("3-deadbeef", Some(1)),
+            ("undefined", Some(2)),
+        ] {
+            let err = super::check_npm_unpublish_rev(&rows, rev, removed).unwrap_err();
+            assert_eq!(err.status(), StatusCode::CONFLICT, "{rev} {removed:?}");
+        }
+        assert!(super::check_npm_unpublish_rev(&rows, "undefined", Some(1)).is_ok());
+        assert!(super::check_npm_unpublish_rev(&rows, "undefined", None).is_ok());
+    }
+
+    /// #5403: `npm unpublish` reads the packument, then rewrites it. A
+    /// version published in between used to be missing from the rewrite and
+    /// was unpublished with the one the client asked for (200 both times).
+    /// Now the stale `-rev` answers 409 for the version rewrite, the
+    /// whole-package unpublish and a revision-less rewrite that would remove
+    /// two versions, and every version survives; a retry from a fresh read
+    /// removes only the version asked for.
+    #[tokio::test]
+    async fn test_npm_unpublish_with_stale_rev_cannot_remove_newer_version_5403() {
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        make_owner(&fx).await;
+        let pkg = "unpub-rev-race";
+        publish(&fx, pkg, pkg, "1.0.0").await;
+        let (_, read_a) = packument(&fx, pkg).await;
+        let rev_a = read_a["_rev"].as_str().expect("served _rev").to_string();
+        publish(&fx, pkg, pkg, "1.1.0").await;
+        let (_, read_b) = packument(&fx, pkg).await;
+        let rev_b = read_b["_rev"].as_str().expect("served _rev").to_string();
+        // Published after the client read `read_b`.
+        publish(&fx, pkg, pkg, "2.0.0").await;
+
+        let (stale_delete, _) = tdh::send(
+            owner_router(&fx),
+            request(
+                "DELETE",
+                format!("/{}/{pkg}/-rev/{rev_a}", fx.repo_key),
+                bytes::Bytes::new(),
+            ),
+        )
+        .await;
+        let (stale_put, stale_body) =
+            put_packument_without(owner_router(&fx), &fx, pkg, read_b.clone(), "1.0.0", &rev_b)
+                .await;
+        let (legacy_put, _) =
+            put_packument_without(owner_router(&fx), &fx, pkg, read_b, "1.0.0", "undefined").await;
+        let (_, after_stale) = packument(&fx, pkg).await;
+        let (fresh, _) = npm_unpublish_version(&fx, owner_router(&fx), pkg, "1.0.0").await;
+        let (_, after_fresh) = packument(&fx, pkg).await;
+        fx.teardown().await;
+
+        assert_ne!(rev_a, rev_b, "a publish moves the revision");
+        assert_eq!(stale_delete, StatusCode::CONFLICT);
+        assert_eq!(
+            stale_put,
+            StatusCode::CONFLICT,
+            "{}",
+            String::from_utf8_lossy(&stale_body)
+        );
+        assert_eq!(
+            legacy_put,
+            StatusCode::CONFLICT,
+            "a revision-less rewrite that would remove two versions"
+        );
+        assert_eq!(
+            version_keys(&after_stale),
+            vec!["1.0.0", "1.1.0", "2.0.0"],
+            "nothing was removed by the stale requests"
+        );
+        assert_eq!(fresh, StatusCode::OK);
+        assert_eq!(version_keys(&after_fresh), vec!["1.1.0", "2.0.0"]);
     }
 
     fn version_keys(pkg: &serde_json::Value) -> Vec<String> {
