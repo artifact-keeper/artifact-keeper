@@ -24,8 +24,10 @@ formal/
 
 | Model | Mirrors | Result |
 |---|---|---|
+| `AgeGate/CheckDecision.lean` | `decide_age_gate_check` (`backend/src/services/age_gate_service.rs`) | A version is served exactly when it is not rejected and either meets the threshold or carries a manual approval the current policy still honours. A rejection always blocks; below the threshold an automatic approval, or one bound to another identity, never serves. |
 | `AgeGate/PolicyRelaxation.lean` | `AgeGatePolicy::is_relaxed_by` (`backend/src/services/age_gate_service.rs`) | Holds over time: any run of individually allowed changes to an enabled gate leaves it enabled, in the same mode, with a minimum age that never drops. |
 | `Auth/MintRepoCeiling.lean` | `AuthExtension::mint_repo_ceiling` (`backend/src/api/middleware/auth.rs`) and `AccessScope::grants` (`backend/src/models/access_scope.rs`) | Holds over time: through any chain of mints, a token reaches only repositories the original credential reached. Shows the empty-allowlist refusal is load-bearing: without it, "restricted to nothing" mints "unrestricted". |
+| `Quarantine/DownloadGate.lean` | `check_download_allowed`, `admin_quarantine_allowed` (`backend/src/services/quarantine_service.rs`) | A rejection never downloads; a hold with no expiry never lapses; a timed hold blocks for exactly its window and, once lapsed, stays lapsed; quarantine-now always blocks and is refused on a rejection. Records that an unrecognised status downloads (safe only while the column constraint holds). |
 | `Scan/ScanState.lean` | `classify_scan_state` and `ScanState::is_unscanned` (`backend/src/services/scan_state.rs`) | The original fall-through passes a row with an unrecognised status (counterexample included). With the fall-through closed, the gate is passed exactly when a scan completed or every row is "not applicable". |
 
 ## Checking
