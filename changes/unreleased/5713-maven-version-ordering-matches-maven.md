@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5713]
+---
+- **Maven versions are ordered exactly as Maven orders them, so `maven-metadata.xml` names the right `latest` and `release`** (#5713). The version comparator was written as a port of Maven's `ComparableVersion` but disagreed with it: `1.0-SNAPSHOT` ordered above `1-SNAPSHOT` (Maven treats them as equal), `a` / `b` / `m` were read as `alpha` / `beta` / `milestone` even when no digit followed, a nested qualifier such as `0-0-1` compared equal to `0`, and a number too large for 64 bits was read as zero. For versions of those shapes the generated metadata could list versions in the wrong order and advertise the wrong latest or release version. The parser and comparison now follow the Maven 3.9.6 source branch for branch and agree with the real `ComparableVersion` on every pair of 1,799 test versions. Maven's own ordering is not consistent on some unusual strings, which could make the sort fail; the sort used for metadata can no longer fail on any input.
