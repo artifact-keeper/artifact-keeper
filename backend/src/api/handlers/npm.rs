@@ -19181,6 +19181,20 @@ mod proxy_scan_block_tests {
         assert!(inner.headers().get("Retry-After").is_none());
     }
 
+    /// Native-client tests are optional locally, but must not skip in CI.
+    fn npm_available() -> bool {
+        let available = std::process::Command::new("npm")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let required = std::env::var("AK_TESTS_REQUIRE_NPM").is_ok_and(|v| !v.is_empty());
+        assert!(
+            available || !required,
+            "AK_TESTS_REQUIRE_NPM is set but npm is unavailable"
+        );
+        available
+    }
+
     /// Exercise the real npm client against the download handler, including a
     /// Virtual member that must not fall through while its scan is pending.
     /// The first request has no remaining wait budget; later requests can wait
@@ -19189,6 +19203,11 @@ mod proxy_scan_block_tests {
         use crate::api::handlers::proxy_scan_inflight::REQUEST_ANSWER_BY;
         use std::sync::{atomic::Ordering, Arc, Mutex};
         use std::time::Duration;
+
+        if !npm_available() {
+            eprintln!("skipping: npm not available");
+            return;
+        }
 
         let Some(fx) = tdh::Fixture::setup("virtual", "npm").await else {
             return;

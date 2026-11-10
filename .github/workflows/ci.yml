@@ -853,9 +853,10 @@ jobs:
         env:
           DATABASE_URL: postgresql://registry:registry@localhost:5432/artifact_registry
           AK_TESTS_REQUIRE_DB: "1"
-          # The squashfs tests fail instead of skipping where the tools are
-          # installed (see the protoc step).
+          # External-tool tests must not skip in the legs that install
+          # their required tools.
           AK_TESTS_REQUIRE_SQUASHFS: ${{ matrix.shard == 'services-1' && '1' || '' }}
+          AK_TESTS_REQUIRE_NPM: ${{ matrix.shard == 'handlers-1' && '1' || '' }}
           JWT_SECRET: ci-coverage-secret-at-least-32-bytes-long-for-tests
         run: |
           source <(cargo llvm-cov show-env --sh)
