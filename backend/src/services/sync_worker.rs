@@ -804,9 +804,13 @@ async fn claim_pending_sync_tasks(
 
     // #5624: a delete whose artifact row is gone (purged, or its repository
     // deleted) is addressed by the repository key and path it carries. When a
-    // live artifact holds that path again (re-uploaded or restored), the
-    // peer's copy there is that artifact's to replace, so the delete is
-    // superseded rather than sent after (or racing) its push.
+    // live artifact holds that address again (re-uploaded or restored) AND is
+    // being pushed to this same peer, that push replaces the peer's copy, so
+    // the delete is superseded rather than sent after (or racing) it. Without
+    // such a push (the peer's subscription is disabled, or a sync policy
+    // excludes the new artifact) the delete still runs: the peer must lose the
+    // removed bytes. Matched by key, not repository id, as the peer addresses
+    // it: a repository deleted and re-created under the same key has a new id.
     sqlx::query(
         r#"
         UPDATE sync_tasks st
@@ -819,8 +823,14 @@ async fn claim_pending_sync_tasks(
           AND st.artifact_id IS NULL
           AND EXISTS (
               SELECT 1
-              FROM artifacts l
-              WHERE l.repository_id = st.target_repository_id
+              FROM repositories lr
+              JOIN artifacts l ON l.repository_id = lr.id
+              JOIN sync_tasks p
+                ON p.peer_instance_id = st.peer_instance_id
+               AND p.artifact_id = l.id
+               AND p.task_type = 'push'
+               AND p.status IN ('pending', 'in_progress', 'completed')
+              WHERE lr.key = st.target_repository_key
                 AND l.path = st.target_path
                 AND l.is_deleted = false
           )
@@ -872,7 +882,7 @@ async fn claim_pending_sync_tasks(
                       WHERE d.peer_instance_id = st.peer_instance_id
                         AND d.artifact_id IS NULL
                         AND d.task_type = 'delete'
-                        AND d.target_repository_id = a.repository_id
+                        AND d.target_repository_key = ar.key
                         AND d.target_path = a.path
                         AND (
                             d.status IN ('pending', 'in_progress')
@@ -943,7 +953,7 @@ async fn claim_pending_sync_tasks(
             COALESCE(r.storage_backend, '') AS repository_storage_backend,
             COALESCE(r.storage_path, '') AS repository_storage_path,
             COALESCE(a.content_type, '') AS content_type,
-            COALESCE(a.checksum_sha256, c.target_checksum_sha256, '') AS checksum_sha256,
+            COALESCE(a.checksum_sha256, '') AS checksum_sha256,
             c.task_type,
             prs.replication_filter,
             c.retry_count,
@@ -5948,7 +5958,7 @@ mod tests {
         let (path, repo_id, repo_key) = task_address(&f, task_id).await;
         sqlx::query(
             "UPDATE sync_tasks SET task_type = 'delete', target_repository_id = $2, \
-                 target_repository_key = $3, target_path = $4, target_checksum_sha256 = 'cafe' \
+                 target_repository_key = $3, target_path = $4 \
              WHERE id = $1",
         )
         .bind(task_id)
@@ -5981,10 +5991,12 @@ mod tests {
             .mount(&server)
             .await;
         let result = run_claimed_transfer(&f, &server).await;
-        let status: String =
+        // `None` once finished: the sweep (run concurrently by another test)
+        // removes a completed delete whose artifact row is gone.
+        let status: Option<String> =
             sqlx::query_scalar("SELECT status::TEXT FROM sync_tasks WHERE id = $1")
                 .bind(task_id)
-                .fetch_one(&f.pool)
+                .fetch_optional(&f.pool)
                 .await
                 .expect("task");
         teardown_claim_fixture(&f).await;
@@ -5995,28 +6007,40 @@ mod tests {
             "removing the artifact must keep its delete task, with artifact_id NULL"
         );
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(status, "completed");
+        assert!(
+            matches!(status.as_deref(), Some("completed") | None),
+            "the delete must finish: {status:?}"
+        );
         server.verify().await;
     }
 
     /// #5624: after a purge, a re-upload to the same path is pushed only once
     /// the removed artifact's delete is no longer in flight, and a delete
-    /// still queued when the path is live again is superseded instead of
-    /// taking the new artifact off the peer after its push.
+    /// still queued when the path is live again and pushed to the same peer
+    /// is superseded instead of taking the new artifact off the peer after
+    /// its push. The delete is matched by repository KEY and path: here it
+    /// names a different repository id, as it does when the repository was
+    /// deleted and re-created under the same key.
     #[tokio::test]
     async fn push_after_a_purge_waits_for_and_supersedes_the_old_delete_5624() {
         let Some(f) = setup_claim_fixture(1).await else {
             return;
         };
         let push_id = f.task_ids[0];
-        let (path, repo_id, repo_key) = task_address(&f, push_id).await;
+        let (path, _repo_id, repo_key) = task_address(&f, push_id).await;
+        let recreated_from = Uuid::new_v4();
+        // In flight under a live claim of another worker, so crash recovery
+        // (`recover_expired_sync_task_claims`, run by other tests) leaves it.
         let delete_id: Uuid = sqlx::query_scalar(
             "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+                 started_at, claimed_by, claim_token, claim_expires_at, \
                  target_repository_id, target_repository_key, target_path) \
-             VALUES ($1, NULL, 'delete', 'in_progress', $2, $3, $4) RETURNING id",
+             VALUES ($1, NULL, 'delete', 'in_progress', NOW(), 'worker-other', \
+                     gen_random_uuid(), NOW() + INTERVAL '10 minutes', $2, $3, $4) \
+             RETURNING id",
         )
         .bind(f.peer_id)
-        .bind(repo_id)
+        .bind(recreated_from)
         .bind(&repo_key)
         .bind(&path)
         .fetch_one(&f.pool)
@@ -6024,11 +6048,14 @@ mod tests {
         .expect("insert removed artifact's delete");
 
         let while_in_flight = claim_all(&f, 5, 5, "worker-a", 60.0).await;
-        sqlx::query("UPDATE sync_tasks SET status = 'pending' WHERE id = $1")
-            .bind(delete_id)
-            .execute(&f.pool)
-            .await
-            .expect("delete back to pending");
+        sqlx::query(
+            "UPDATE sync_tasks SET status = 'pending', started_at = NULL, claimed_by = NULL, \
+                 claim_token = NULL, claim_expires_at = NULL WHERE id = $1",
+        )
+        .bind(delete_id)
+        .execute(&f.pool)
+        .await
+        .expect("delete back to pending");
         let after = claim_all(&f, 5, 5, "worker-a", 60.0).await;
         let delete_state: (String, Option<String>) =
             sqlx::query_as("SELECT status::TEXT, error_message FROM sync_tasks WHERE id = $1")
@@ -6040,7 +6067,7 @@ mod tests {
 
         assert!(
             while_in_flight.is_empty(),
-            "a push must not race an in-flight delete of the same path"
+            "a push must not race an in-flight delete of the same key and path"
         );
         assert_eq!(after.iter().map(|t| t.id).collect::<Vec<_>>(), [push_id]);
         assert_eq!(
@@ -6049,6 +6076,138 @@ mod tests {
                 "cancelled".to_string(),
                 Some("superseded by a live artifact at the same path".to_string())
             )
+        );
+    }
+
+    /// #5624: a delete of a removed artifact is superseded only for a peer the
+    /// re-uploaded artifact at its path is pushed to. A peer whose
+    /// subscription is disabled, or whose sync policy excludes the new
+    /// artifact, gets no push, so its delete still runs and it loses the
+    /// removed bytes.
+    #[tokio::test]
+    async fn delete_is_kept_for_peers_the_reupload_is_not_pushed_to_5624() {
+        use crate::services::peer_instance_service::{PeerInstanceService, PublishedArtifact};
+        let Some(f) = setup_claim_fixture(1).await else {
+            return;
+        };
+        let (path, repo_id, repo_key) = task_address(&f, f.task_ids[0]).await;
+        let artifact_id: Uuid =
+            sqlx::query_scalar("SELECT artifact_id FROM sync_tasks WHERE id = $1")
+                .bind(f.task_ids[0])
+                .fetch_one(&f.pool)
+                .await
+                .expect("artifact");
+        sqlx::query("DELETE FROM sync_tasks WHERE id = $1")
+            .bind(f.task_ids[0])
+            .execute(&f.pool)
+            .await
+            .expect("drop the fixture push");
+        let tag = Uuid::new_v4().simple().to_string();
+        let policy_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO sync_policies \
+                 (name, repo_selector, peer_selector, artifact_filter, precedence) \
+             VALUES ($1, $2, '{}'::jsonb, $3, 0) RETURNING id",
+        )
+        .bind(format!("purge-reupload-exclude-{tag}"))
+        .bind(serde_json::json!({ "match_repos": [repo_id] }))
+        .bind(serde_json::json!({ "exclude_paths": [path.clone()] }))
+        .fetch_one(&f.pool)
+        .await
+        .expect("policy");
+        let mut peers = Vec::new();
+        for (label, enabled, policy) in [
+            ("pushed", true, None),
+            ("disabled", false, None),
+            ("excluded", true, Some(policy_id)),
+        ] {
+            let peer = if label == "pushed" {
+                f.peer_id
+            } else {
+                crate::api::handlers::test_db_helpers::register_test_peer(&f.pool, label, &tag)
+                    .await
+            };
+            sqlx::query(
+                "INSERT INTO peer_repo_subscriptions \
+                     (peer_instance_id, repository_id, sync_enabled, replication_mode, policy_id) \
+                 VALUES ($1, $2, $3, 'push', $4)",
+            )
+            .bind(peer)
+            .bind(repo_id)
+            .bind(enabled)
+            .bind(policy)
+            .execute(&f.pool)
+            .await
+            .expect("subscribe");
+            let delete_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO sync_tasks (peer_instance_id, artifact_id, task_type, status, \
+                     target_repository_id, target_repository_key, target_path) \
+                 VALUES ($1, NULL, 'delete', 'pending', $2, $3, $4) RETURNING id",
+            )
+            .bind(peer)
+            .bind(repo_id)
+            .bind(&repo_key)
+            .bind(&path)
+            .fetch_one(&f.pool)
+            .await
+            .expect("removed artifact's delete");
+            peers.push((label, peer, delete_id));
+        }
+        // The re-upload's push fan-out, as upload does it.
+        let queued = PeerInstanceService::new(f.pool.clone())
+            .queue_push_sync_tasks(&PublishedArtifact {
+                id: artifact_id,
+                repository_id: repo_id,
+                path: &path,
+                size_bytes: 3,
+                created_at: Utc::now(),
+            })
+            .await;
+
+        let mut outcomes = Vec::new();
+        for (label, peer, delete_id) in &peers {
+            let claimed = claim_pending_sync_tasks(&f.pool, *peer, 5, 5, 3, "worker-a", 60.0)
+                .await
+                .expect("claim");
+            let status: String =
+                sqlx::query_scalar("SELECT status::TEXT FROM sync_tasks WHERE id = $1")
+                    .bind(delete_id)
+                    .fetch_one(&f.pool)
+                    .await
+                    .expect("delete status");
+            let kinds: Vec<String> = claimed.iter().map(|t| t.task_type.clone()).collect();
+            outcomes.push((*label, status, kinds));
+        }
+        for (label, peer, _) in &peers {
+            if *label != "pushed" {
+                let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
+                    .bind(peer)
+                    .execute(&f.pool)
+                    .await;
+            }
+        }
+        teardown_claim_fixture(&f).await;
+        let _ = sqlx::query("DELETE FROM sync_policies WHERE id = $1")
+            .bind(policy_id)
+            .execute(&f.pool)
+            .await;
+
+        assert_eq!(queued, 1, "only the enabled, unfiltered peer gets the push");
+        assert_eq!(
+            outcomes,
+            vec![
+                ("pushed", "cancelled".to_string(), vec!["push".to_string()]),
+                (
+                    "disabled",
+                    "in_progress".to_string(),
+                    vec!["delete".to_string()]
+                ),
+                (
+                    "excluded",
+                    "in_progress".to_string(),
+                    vec!["delete".to_string()]
+                ),
+            ],
+            "the delete is superseded only where the push replaces the copy"
         );
     }
 

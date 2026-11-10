@@ -46,10 +46,10 @@ const CANCEL_SUPERSEDED_PUSH_TASKS_SQL: &str = r#"
 const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                 INSERT INTO sync_tasks (
                     id, peer_instance_id, artifact_id, task_type, status, priority,
-                    target_repository_id, target_repository_key, target_path, target_checksum_sha256
+                    target_repository_id, target_repository_key, target_path
                 )
                 SELECT gen_random_uuid(), pi.id, $1, 'delete', 'pending', 0,
-                       r.id, r.key, a.path, a.checksum_sha256
+                       r.id, r.key, a.path
                 FROM peer_instances pi
                 JOIN peer_repo_subscriptions prs ON prs.peer_instance_id = pi.id
                 JOIN artifacts a ON a.repository_id = prs.repository_id AND a.id = $1
@@ -68,8 +68,7 @@ const ENQUEUE_DELETE_SYNC_TASKS_SQL: &str = r#"
                     claim_expires_at = NULL,
                     target_repository_id = EXCLUDED.target_repository_id,
                     target_repository_key = EXCLUDED.target_repository_key,
-                    target_path = EXCLUDED.target_path,
-                    target_checksum_sha256 = EXCLUDED.target_checksum_sha256
+                    target_path = EXCLUDED.target_path
                 WHERE sync_tasks.status <> 'in_progress'
                 "#;
 

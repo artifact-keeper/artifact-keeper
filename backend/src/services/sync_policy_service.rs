@@ -955,10 +955,9 @@ impl SyncPolicyService {
                 r#"
                 INSERT INTO sync_tasks (
                     peer_instance_id, artifact_id, priority, task_type,
-                    target_repository_id, target_repository_key, target_path,
-                    target_checksum_sha256
+                    target_repository_id, target_repository_key, target_path
                 )
-                SELECT $1, a.id, 0, 'delete', r.id, r.key, a.path, a.checksum_sha256
+                SELECT $1, a.id, 0, 'delete', r.id, r.key, a.path
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 WHERE a.id = $2
@@ -971,8 +970,7 @@ impl SyncPolicyService {
                     claim_expires_at = NULL,
                     target_repository_id = EXCLUDED.target_repository_id,
                     target_repository_key = EXCLUDED.target_repository_key,
-                    target_path = EXCLUDED.target_path,
-                    target_checksum_sha256 = EXCLUDED.target_checksum_sha256
+                    target_path = EXCLUDED.target_path
                 WHERE sync_tasks.status != 'in_progress'
                 "#,
             )

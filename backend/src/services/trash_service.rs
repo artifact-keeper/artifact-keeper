@@ -1028,13 +1028,27 @@ pub(crate) mod tests {
         let queued = subscribe_peer(&fx, &format!("{uid}-queued")).await;
         let unqueued = subscribe_peer(&fx, &format!("{uid}-unqueued")).await;
         let pull = subscribe_peer_with_mode(&fx, &format!("{uid}-pull"), "pull").await;
+        // A peer whose subscription was disabled after the trash delete
+        // queued its delete: that delete must still survive the purge.
+        let disabled = subscribe_peer(&fx, &format!("{uid}-disabled")).await;
         seed_sync_task(&fx, queued, id, "delete", "pending").await;
+        seed_sync_task(&fx, disabled, id, "delete", "failed").await;
+        sqlx::query(
+            "UPDATE peer_repo_subscriptions SET sync_enabled = false \
+             WHERE peer_instance_id = $1 AND repository_id = $2",
+        )
+        .bind(disabled)
+        .bind(fx.repo_id)
+        .execute(&fx.pool)
+        .await
+        .expect("disable subscription");
 
         let purged = service(&fx, 30).purge(id).await;
         let queued_deletes = peer_deletes(&fx, queued).await;
         let unqueued_deletes = peer_deletes(&fx, unqueued).await;
         let pull_deletes = peer_deletes(&fx, pull).await;
-        for peer in [queued, unqueued, pull] {
+        let disabled_deletes = peer_deletes(&fx, disabled).await;
+        for peer in [queued, unqueued, pull, disabled] {
             let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
                 .bind(peer)
                 .execute(&fx.pool)
@@ -1058,6 +1072,16 @@ pub(crate) mod tests {
             "a push subscriber without a queued delete gets one"
         );
         assert!(pull_deletes.is_empty(), "a pull subscriber gets nothing");
+        assert_eq!(
+            disabled_deletes,
+            vec![(
+                None,
+                "failed".to_string(),
+                Some(fx.repo_key.clone()),
+                Some(path.clone()),
+            )],
+            "a disabled subscriber's queued delete is kept and addressed, not re-armed"
+        );
     }
 
     /// #5624: a delete left by a purged artifact is addressed by path only;

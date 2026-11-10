@@ -55,8 +55,10 @@ const QUEUE_RESTORED_PUSH_SQL: &str = r#"
 ///
 /// A delete is matched by its artifact, or by its address when its artifact
 /// row is gone (#5624): a purged artifact that held the restored one's path
-/// left a delete addressed to `($3, $4)`, and the push queued here replaces
-/// the peer's copy anyway.
+/// left a delete addressed to the key of repository `$3` and path `$4`, and
+/// the push queued here replaces the peer's copy anyway. Matched by key, not
+/// repository id: the peer addresses repositories by key, and a repository
+/// deleted and re-created under the same key has a new id.
 const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
     UPDATE sync_tasks
     SET status = 'cancelled',
@@ -67,7 +69,11 @@ const CANCEL_SUPERSEDED_DELETE_TASKS_SQL: &str = r#"
       AND status IN ('pending', 'failed')
       AND (
           artifact_id = $1
-          OR (artifact_id IS NULL AND target_repository_id = $3 AND target_path = $4)
+          OR (
+              artifact_id IS NULL
+              AND target_repository_key = (SELECT key FROM repositories WHERE id = $3)
+              AND target_path = $4
+          )
       )
     "#;
 
@@ -80,8 +86,7 @@ const ADDRESS_QUEUED_DELETE_TASKS_SQL: &str = r#"
     UPDATE sync_tasks st
     SET target_repository_id = $2,
         target_repository_key = $3,
-        target_path = a.path,
-        target_checksum_sha256 = a.checksum_sha256
+        target_path = a.path
     FROM artifacts a
     WHERE st.peer_instance_id = ANY(SELECT id FROM peer_instances WHERE is_local = false)
       AND st.artifact_id = ANY($1)
@@ -97,9 +102,9 @@ const ADDRESS_QUEUED_DELETE_TASKS_SQL: &str = r#"
 const QUEUE_REMOVAL_DELETE_TASKS_SQL: &str = r#"
     INSERT INTO sync_tasks (
         peer_instance_id, artifact_id, task_type, status, priority,
-        target_repository_id, target_repository_key, target_path, target_checksum_sha256
+        target_repository_id, target_repository_key, target_path
     )
-    SELECT prs.peer_instance_id, a.id, 'delete', 'pending', 0, $2, $3, a.path, a.checksum_sha256
+    SELECT prs.peer_instance_id, a.id, 'delete', 'pending', 0, $2, $3, a.path
     FROM artifacts a
     JOIN peer_repo_subscriptions prs ON prs.repository_id = a.repository_id
     JOIN peer_instances pi ON pi.id = prs.peer_instance_id
@@ -119,8 +124,7 @@ const QUEUE_REMOVAL_DELETE_TASKS_SQL: &str = r#"
         claim_expires_at = NULL,
         target_repository_id = EXCLUDED.target_repository_id,
         target_repository_key = EXCLUDED.target_repository_key,
-        target_path = EXCLUDED.target_path,
-        target_checksum_sha256 = EXCLUDED.target_checksum_sha256
+        target_path = EXCLUDED.target_path
     WHERE sync_tasks.status <> 'in_progress'
       AND (
           sync_tasks.status <> 'completed'
