@@ -224,29 +224,45 @@ macro_rules! stronger_hold_column_sql {
 ///
 /// One statement with the upsert, so the carry commits or rolls back with it.
 /// The upsert must read `carried` before it writes (`WHERE (SELECT COUNT(*)
-/// FROM carried) >= 0`): that runs the carry first, so `moved` locks the row
-/// (`FOR UPDATE`, which also makes a hold committed concurrently part of what
-/// is carried) before the upsert rewrites it. Left to run after the upsert,
-/// `moved` would skip the row the same statement had already modified.
+/// FROM carried) >= 0`): that runs the carry first, so `locked` locks the row
+/// before the upsert rewrites it. Left to run after the upsert, it would skip
+/// the row the same statement had already modified.
+///
+/// `locked` selects the row by its key alone and `moved` filters on the hold
+/// afterwards (#5618). Under READ COMMITTED a `FOR UPDATE` that waits for a
+/// concurrent writer re-checks its `WHERE` and returns the row's newest
+/// version, but only for a row that matched in the statement's snapshot. With
+/// the hold test in the locking `WHERE`, a row an administrator was holding
+/// in a transaction still open when this statement started did not match, was
+/// never locked or re-read, and the upsert (which does see the committed hold
+/// once it gets the lock) cleared it: the hold was lost on every alias.
+/// Locking by key first makes the carry decide from the row the upsert then
+/// rewrites.
 /// Binds, shared with the upsert: `$1` repository, `$2` the upserted path,
 /// `$6` the new sha256 hex, `$11` the image name.
 macro_rules! carry_moved_hold_cte {
     () => {
         concat!(
-            "WITH moved AS ( \
+            "WITH locked AS ( \
+                 SELECT a.size_bytes, a.checksum_sha256, a.content_type, a.storage_key, \
+                        a.uploaded_by, a.quarantine_status, a.quarantine_until, \
+                        a.quarantine_reason, a.quarantine_source, a.is_deleted \
+                 FROM artifacts a \
+                 WHERE a.repository_id = $1 AND a.path = $2 \
+                 FOR UPDATE \
+             ), moved AS ( \
                  SELECT a.size_bytes, a.checksum_sha256, a.content_type, a.storage_key, \
                         a.uploaded_by, a.quarantine_status, a.quarantine_until, \
                         a.quarantine_reason, \
                         CASE WHEN a.quarantine_source = 'scan_policy' THEN 'admin' \
                              ELSE a.quarantine_source END AS quarantine_source, \
                         'sha256:' || a.checksum_sha256 AS digest \
-                 FROM artifacts a \
-                 WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = false \
+                 FROM locked a \
+                 WHERE a.is_deleted = false \
                    AND a.checksum_sha256 <> $6::bpchar \
                    AND (a.quarantine_status = 'rejected' \
                         OR (a.quarantine_status = 'quarantined' \
                             AND (a.quarantine_until IS NULL OR a.quarantine_until > NOW()))) \
-                 FOR UPDATE \
              ), carried AS ( \
                  INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
                                         checksum_sha256, content_type, storage_key, uploaded_by, \

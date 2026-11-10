@@ -7271,6 +7271,116 @@ mod tests {
         rig.teardown().await;
     }
 
+    /// #5618: an administrator's hold on the tag row that commits while a
+    /// push moving the tag waits for that row's lock is carried to D1, not
+    /// cleared with the rewrite. The interleaving is forced: the hold's
+    /// UPDATE (the statement `quarantine_now` or the reject runs) is held
+    /// open in a transaction, the push starts and is observed blocked on
+    /// that transaction (`pg_blocking_pids`), and only then does the hold
+    /// commit. The push's statement therefore started before the hold was
+    /// visible and decides the carry after it committed.
+    async fn hold_committed_during_a_tag_move_is_carried(how: Refusal) {
+        let Some(rig) = AliasRig::new().await else {
+            return;
+        };
+        let d1 = rig.push("inflight").await;
+        rig.publish("1.0.0").await;
+        let tag_row = rig.row_id("1.0").await;
+        let pool = &rig.env.fx.pool;
+
+        let status = match how {
+            Refusal::Manual => "quarantined",
+            Refusal::Scanner => "rejected",
+        };
+        let mut admin = pool.begin().await.unwrap();
+        let admin_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *admin)
+            .await
+            .unwrap();
+        let held = sqlx::query(
+            "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
+             quarantine_reason = 'admin hold', quarantine_source = 'admin' \
+             WHERE id = $1 AND is_deleted = false",
+        )
+        .bind(tag_row)
+        .bind(status)
+        .execute(&mut *admin)
+        .await
+        .unwrap();
+        assert_eq!(held.rows_affected(), 1);
+
+        let commit_once_blocked = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut blocked = false;
+            while std::time::Instant::now() < deadline {
+                blocked = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(admin_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            admin.commit().await.unwrap();
+            blocked
+        };
+        let (d2, blocked) = tokio::join!(rig.push("inflight-next"), commit_once_blocked);
+        assert!(
+            blocked,
+            "precondition: the push waited on the uncommitted hold"
+        );
+        assert_ne!(d1, d2);
+
+        // D1 is refused by digest (native hosted and Virtual) and through the
+        // MCP version pinned to it; D2 is served under the moved tag.
+        rig.assert_refused(&d1, how, "after the in-flight move")
+            .await;
+        assert_eq!(
+            rig.rows_of(&d1).await,
+            vec![(
+                format!("v2/{ALIAS_IMAGE}/manifests/{d1}"),
+                Some(status.to_string())
+            )],
+            "the hold committed during the move is on D1's digest row"
+        );
+        for (key, reference) in [
+            (&rig.docker.key, "1.0"),
+            (&rig.docker.key, d2.as_str()),
+            (&rig.oci_virtual.key, "1.0"),
+        ] {
+            assert_eq!(
+                rig.native(key, reference).await,
+                StatusCode::OK,
+                "D2 is served: {key} {reference}"
+            );
+        }
+        let d1_rows = crate::services::oci_manifests::alias_rows(pool, rig.docker.id, &[&d1])
+            .await
+            .unwrap();
+        assert!(
+            d1_rows
+                .iter()
+                .all(|r| r.quarantine_status.as_deref() == Some(status)),
+            "every alias of D1 is held: {d1_rows:?}"
+        );
+        rig.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn quarantine_committed_during_a_tag_move_is_carried_5618() {
+        hold_committed_during_a_tag_move_is_carried(Refusal::Manual).await;
+    }
+
+    #[tokio::test]
+    async fn rejection_committed_during_a_tag_move_is_carried_5618() {
+        hold_committed_during_a_tag_move_is_carried(Refusal::Scanner).await;
+    }
+
     /// `isLatest` is the newest servable version on every read, and
     /// `version=latest` picks the newest before `updated_since` filters.
     #[tokio::test]
