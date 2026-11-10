@@ -1101,11 +1101,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// #5624: a delete left by a purged artifact is addressed by path only;
-    /// restoring a later artifact at that path still cancels it for the
-    /// peers the restore re-pushes to.
+    /// #5699: a delete left by a purged artifact is addressed by path only,
+    /// and restoring a later artifact at that path used to cancel it for the
+    /// peers the restore re-pushes to, on the premise that the push replaces
+    /// the peer's copy. It does not (the peer refuses a push onto its live
+    /// copy with `409` immutable), so the peer kept the purged bytes. A
+    /// restore now cancels only the restored artifact's own delete; the
+    /// purged predecessor's delete stays queued and the push waits for it.
     #[tokio::test]
-    async fn restore_cancels_a_purged_predecessors_delete_by_path_5624() {
+    async fn restore_keeps_a_purged_predecessors_delete_5699() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
@@ -1116,8 +1120,17 @@ pub(crate) mod tests {
         let first = seed_trashed(&fx, &path, true).await;
         let purged = svc.purge(first).await;
         let second = seed_trashed(&fx, &path, true).await;
+        seed_sync_task(&fx, peer, second, "delete", "pending").await;
         let restored = svc.restore(second).await;
-        let deletes = peer_deletes(&fx, peer).await;
+        let predecessor = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status::TEXT, error_message FROM sync_tasks \
+             WHERE peer_instance_id = $1 AND task_type = 'delete' AND artifact_id IS NULL",
+        )
+        .bind(peer)
+        .fetch_optional(&fx.pool)
+        .await
+        .expect("predecessor delete");
+        let own = sync_task_state(&fx, peer, second, "delete").await;
         let push = sync_task_state(&fx, peer, second, "push").await;
         let _ = sqlx::query("DELETE FROM peer_instances WHERE id = $1")
             .bind(peer)
@@ -1128,14 +1141,18 @@ pub(crate) mod tests {
         assert!(purged.is_ok(), "{purged:?}");
         assert!(restored.is_ok(), "{restored:?}");
         assert_eq!(
-            deletes,
-            vec![(
-                None,
+            predecessor,
+            Some(("pending".to_string(), None)),
+            "#5699: the purged artifact's delete must stay queued: the restore's \
+             push cannot replace the purged bytes on the peer"
+        );
+        assert_eq!(
+            own,
+            Some((
                 "cancelled".to_string(),
-                Some(fx.repo_key.clone()),
-                Some(path)
-            )],
-            "the purged artifact's delete must not take the restored one off the peer"
+                Some("superseded by artifact restore".to_string())
+            )),
+            "the restored artifact's own delete is still superseded"
         );
         assert_eq!(push.map(|(s, _)| s).as_deref(), Some("pending"));
     }
