@@ -501,6 +501,9 @@ costs rows rather than memory.
   release context a job does not carry) and a Remote's own stored rows are not
   queued either: none is one cached object a job can reference with everything
   the scan needs.
+- Nor is an empty body (the proxy cache never stores one) or one over the scan
+  cap (a worker refuses it unread). Both take the in-flight table, as with the
+  queue off
 - A job is tried three times with backoff. A worker that dies mid-scan loses its
   claim when the lease lapses, and the attempt counts. A completed job is
   deleted, since the verdict row is the record. A job that failed for good is

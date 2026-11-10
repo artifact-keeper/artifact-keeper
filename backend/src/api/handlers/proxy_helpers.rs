@@ -11867,12 +11867,17 @@ async fn await_conclusive_verdict(
 /// [`ProxyScanMode::File`] is: an OCI image is reassembled from staged blobs,
 /// and the worker scans as plain File, so catalog-requiring scans stay inline.
 /// So does an OS package pin, whose release context a job does not carry.
+/// And a body of `len` bytes no worker would run: an empty one is never cached
+/// (#1618) and one over the scan cap is refused unread
 fn queued_scan_ref<'a>(
     mode: &ProxyScanMode,
     cache_path: Option<&'a str>,
     expected: Option<&crate::services::scanner_service::ExpectedComponent>,
+    len: usize,
 ) -> Option<&'a str> {
-    if expected.is_some_and(|e| e.os.is_some()) {
+    if expected.is_some_and(|e| e.os.is_some())
+        || !(1..=crate::services::scanner_service::PROXY_SCAN_MAX_BYTES).contains(&len)
+    {
         return None;
     }
     match mode {
@@ -12177,7 +12182,7 @@ async fn decide_proxy_scan_serve(
             };
             // Nothing cached means no worker can ever produce a verdict, so
             // that pull takes the in-process path rather than park and 423.
-            let queued = match queued_scan_ref(&mode, cache_path, expected) {
+            let queued = match queued_scan_ref(&mode, cache_path, expected, bytes.len()) {
                 Some(cache_path) if state.config.scan_queue_enabled => {
                     proxy_cached_object_is_readable(state, repo_id, cache_path, digest).await
                         && enqueue_proxy_file_scan(
@@ -12254,9 +12259,11 @@ async fn decide_proxy_scan_serve(
             // No cache probe here: nobody waits on the verdict, and this is the
             // hot path. A dangling reference shows up as a failed job. A digest
             // claimed in the last minute is already queued, and an enqueue that
-            // fails falls through to the in-process scan.
-            if let Some(cache_path) = queued_scan_ref(&mode, cache_path, expected.as_ref())
-                .filter(|_| state.config.scan_queue_enabled)
+            // fails falls through to the in-process scan, as do bytes no job can
+            // run (same digest, same length, so every later pull of them too)
+            if let Some(cache_path) =
+                queued_scan_ref(&mode, cache_path, expected.as_ref(), bytes.len())
+                    .filter(|_| state.config.scan_queue_enabled)
             {
                 if !claim_backfill_enqueue(repo_id, digest).await
                     || enqueue_proxy_file_scan(
@@ -14002,6 +14009,111 @@ mod scanned_proxy_file_tests {
         fx.teardown().await;
     }
 
+    async fn queued_jobs(fx: &tdh::Fixture) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_queue WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count scan jobs")
+    }
+
+    /// With the queue on, fail-open never queues a job no worker can run: an
+    /// empty body is never cached, and a cache hit over the scan cap is refused
+    /// unread. Each was queued again on every pull, then failed. A normal file
+    /// still queues. No worker runs here, so the job stays to be counted
+    #[tokio::test]
+    async fn fail_open_skips_scan_jobs_for_empty_and_over_cap_bytes_queued() {
+        use crate::services::scanner_service::PROXY_SCAN_MAX_BYTES;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let bytes = format!("fake-scanq-skip-{}", Uuid::new_v4()).into_bytes();
+        let Some((fx, mut state, proxy, upstream)) = rig(Some(bytes)).await else {
+            return;
+        };
+        Arc::get_mut(&mut state)
+            .expect("state not shared yet")
+            .config
+            .scan_queue_enabled = true;
+        Mock::given(method("GET"))
+            .and(path("/files/empty-1.0.fake"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+        let base = upstream.uri();
+        let file = FakeFormat::default();
+
+        let mut empty = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        empty.source_path = "files/empty-1.0.fake";
+        empty.cache_path = "files/empty-1.0.fake";
+        empty.filename = "empty-1.0.fake";
+        let mut empty_headers = Vec::new();
+        for _ in 0..2 {
+            let resp = serve_scanned_proxy_file(&state, &proxy, &empty, &file).await;
+            empty_headers.push(resp.map(|r| r.headers()["X-AK-Scan"].clone()));
+        }
+        let after_empty = queued_jobs(&fx).await;
+
+        // Zeroed and never read, so no 200 MiB is touched
+        let over = Bytes::from(vec![0u8; PROXY_SCAN_MAX_BYTES + 1]);
+        let over_digest = format!("scanq-skip-over-{}", Uuid::new_v4());
+        let mut over_outcomes = Vec::new();
+        for _ in 0..2 {
+            let synthetic = FakeFormat::synthetic_artifact(
+                fx.repo_id,
+                "over-1.0.fake",
+                &over_digest,
+                over.len() as i64,
+            );
+            let outcome = gate_proxy_scan_serve(
+                &state,
+                fx.repo_id,
+                "over-1.0.fake",
+                &over_digest,
+                Some("files/over-1.0.fake"),
+                synthetic,
+                &over,
+                ProxyScanAction::FailOpen,
+                ProxySeverityGate::BlockOnAny,
+                ProxyScanIdentity::NotApplicable,
+                ProxyScanMode::File,
+            )
+            .await;
+            over_outcomes.push(matches!(
+                outcome,
+                ProxyScanServeOutcome::Serve(ProxyScanServed::Pending)
+            ));
+        }
+        let after_over = queued_jobs(&fx).await;
+
+        let normal = request(fx.repo_id, &fx.repo_key, &base, ProxyScanAction::FailOpen);
+        let normal = serve_scanned_proxy_file(&state, &proxy, &normal, &file)
+            .await
+            .map(|r| r.headers()["X-AK-Scan"].clone());
+        let after_normal = queued_jobs(&fx).await;
+        fx.teardown().await;
+
+        for header in empty_headers {
+            let header = header.unwrap_or_else(|r| panic!("empty pull withheld: {}", r.status()));
+            assert_eq!(
+                header, "pending",
+                "the empty body reached the fail-open arm"
+            );
+        }
+        assert_eq!(
+            after_empty, 0,
+            "an empty body is never cached, no job can read it"
+        );
+        assert_eq!(over_outcomes, [true, true], "over-cap bytes serve pending");
+        assert_eq!(after_over, 0, "the worker refuses over-cap bytes unread");
+        let normal = normal.unwrap_or_else(|r| panic!("normal pull withheld: {}", r.status()));
+        assert_eq!(normal, "pending");
+        assert_eq!(
+            after_normal, 1,
+            "a normal fail-open pull still queues its scan"
+        );
+    }
+
     /// An upstream miss is passed through as-is (a virtual member walk falls
     /// through to the next member on it) and never reaches the format hooks.
     #[tokio::test]
@@ -14364,22 +14476,32 @@ mod tests {
         });
         let path = Some("pkg/pkg-1.0.tgz");
         assert_eq!(
-            queued_scan_ref(&ProxyScanMode::File, path, Some(&npm)),
+            queued_scan_ref(&ProxyScanMode::File, path, Some(&npm), 1),
             path
         );
-        assert_eq!(queued_scan_ref(&ProxyScanMode::File, path, None), path);
+        assert_eq!(queued_scan_ref(&ProxyScanMode::File, path, None, 1), path);
         assert_eq!(
-            queued_scan_ref(&ProxyScanMode::File, None, Some(&npm)),
+            queued_scan_ref(&ProxyScanMode::File, None, Some(&npm), 1),
             None
         );
         assert_eq!(
-            queued_scan_ref(&ProxyScanMode::File, path, Some(&apk)),
+            queued_scan_ref(&ProxyScanMode::File, path, Some(&apk), 1),
             None
         );
         assert_eq!(
-            queued_scan_ref(&ProxyScanMode::FileRequiringCatalog, path, None),
+            queued_scan_ref(&ProxyScanMode::FileRequiringCatalog, path, None, 1),
             None
         );
+    }
+
+    #[test]
+    fn only_a_body_a_worker_can_run_is_queued() {
+        use crate::services::scanner_service::PROXY_SCAN_MAX_BYTES;
+        let path = Some("pkg/pkg-1.0.tgz");
+        let queued = |len| queued_scan_ref(&ProxyScanMode::File, path, None, len);
+        assert_eq!(queued(0), None, "an empty body is never cached");
+        assert_eq!(queued(PROXY_SCAN_MAX_BYTES), path);
+        assert_eq!(queued(PROXY_SCAN_MAX_BYTES + 1), None, "over the scan cap");
     }
 
     #[test]
