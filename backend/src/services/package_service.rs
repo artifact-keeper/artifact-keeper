@@ -258,6 +258,111 @@ pub struct CatalogPrune {
     pub packages_removed: u64,
 }
 
+/// The newest of `versions` by the catalog's own ordering
+/// ([`version_compare`], the rule the publish upsert uses to move
+/// `packages.version` forward), with its size. `None` for an empty slice.
+pub fn newest_catalog_version(versions: &[(String, i64)]) -> Option<&(String, i64)> {
+    versions.iter().reduce(|best, v| {
+        if version_compare(&v.0, &best.0) > 0 {
+            v
+        } else {
+            best
+        }
+    })
+}
+
+/// What [`refresh_package_latest`] found and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LatestRefresh {
+    /// The repository's format (`repository_format` as text), `None` when the
+    /// repository is gone. Returned so the delete hook can gate its npm-only
+    /// step without a round trip of its own.
+    pub format: Option<String>,
+    /// Whether `packages.version` was moved.
+    pub moved: bool,
+}
+
+/// Point the `(repository_id, name)` catalog row at its newest version that
+/// still has a live artifact (#5632).
+///
+/// `packages.version` is the "Latest" the catalog and the UI install snippet
+/// show, and the publish upsert only ever moves it forward. Both directions
+/// of a soft delete call this: a delete (the version may be gone, so Latest
+/// moves down to what is left) and a trash restore (the version is back, so
+/// Latest moves up to it again). The ordering is [`version_compare`], the
+/// publish upsert's own rule; liveness is the read paths' predicate. A row
+/// with no live version is left alone (the read paths hide it, and a restore
+/// re-points it), as are Remote repositories (#3660). The write is
+/// conditional on the version read, so a concurrent publish wins.
+///
+/// The row is found by `(repository_id, name)` (the `packages` unique key) and
+/// its versions by `package_id`, both indexed. Formats whose catalog name is
+/// not the artifact name (Maven's `groupId:artifactId`) find no row and are
+/// covered by the read-side backstop instead.
+pub async fn refresh_package_latest(
+    db: &PgPool,
+    repository_id: Uuid,
+    name: &str,
+) -> sqlx::Result<LatestRefresh> {
+    let row: Option<(String, String, Option<Uuid>, Option<String>)> = sqlx::query_as(
+        "SELECT r.format::text, r.repo_type::text, p.id, p.version \
+         FROM repositories r \
+         LEFT JOIN packages p ON p.repository_id = r.id AND p.name = $2 \
+         WHERE r.id = $1",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await?;
+    let Some((format, repo_type, package_id, current)) = row else {
+        return Ok(LatestRefresh::default());
+    };
+    let mut out = LatestRefresh {
+        format: Some(format),
+        moved: false,
+    };
+    let (Some(package_id), Some(current)) = (package_id, current) else {
+        return Ok(out);
+    };
+    if repo_type == "remote" {
+        return Ok(out);
+    }
+
+    let live_version = live_package_version_predicate();
+    let live: Vec<(String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
+        r#"
+        SELECT pv.version, pv.size_bytes
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = $1
+          AND {live_version}
+        "#
+    )))
+    .bind(package_id)
+    .fetch_all(db)
+    .await?;
+    let Some((newest, size)) = newest_catalog_version(&live) else {
+        return Ok(out);
+    };
+    if *newest == current {
+        return Ok(out);
+    }
+    out.moved = sqlx::query(
+        "UPDATE packages SET version = $3, size_bytes = $4, updated_at = NOW() \
+         WHERE id = $1 AND version = $2",
+    )
+    .bind(package_id)
+    .bind(&current)
+    .bind(newest)
+    .bind(size)
+    .execute(db)
+    .await?
+    .rows_affected()
+        > 0;
+    Ok(out)
+}
+
 /// Drop the catalog rows left behind by a HARD-deleted artifact (#3660).
 ///
 /// Only genuine purges may call this. Every format-native delete route

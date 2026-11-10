@@ -17,8 +17,8 @@ use crate::error::{AppError, Result};
 use crate::models::access_scope::AccessScope;
 use crate::services::curation_service::version_compare;
 use crate::services::package_service::{
-    live_package_predicate, live_package_version_predicate, package_download_count_over_versions,
-    package_download_counts, version_download_count_sql,
+    live_package_predicate, live_package_version_predicate, newest_catalog_version,
+    package_download_count_over_versions, package_download_counts, version_download_count_sql,
 };
 use crate::services::repository_service::{
     build_visibility_clause_for, RepoVisibility, VisibilityBind,
@@ -401,6 +401,7 @@ pub async fn list_packages(
     // The rows were decided above; this applies each one's view (a held
     // version's row shows the newest servable one).
     let (packages, _hidden) = apply_mcp_catalog_views(&state, auth.as_ref(), packages).await;
+    let packages = with_live_latest(&state, packages).await?;
     let packages = with_download_counts(&state, auth.as_ref(), packages).await?;
 
     let count_sql = format!(
@@ -540,7 +541,8 @@ pub async fn get_package(
         .0
         .pop()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
-    let mut package = with_download_counts(&state, auth.as_ref(), vec![package])
+    let package = with_live_latest(&state, vec![package]).await?;
+    let mut package = with_download_counts(&state, auth.as_ref(), package)
         .await?
         .pop()
         .ok_or_else(|| AppError::NotFound("Package not found".to_string()))?;
@@ -709,6 +711,64 @@ pub async fn get_package_versions(
             .map(PackageVersionResponse::from)
             .collect(),
     }))
+}
+
+/// Show each row's newest LIVE version as its Latest (#5632).
+///
+/// `packages.version` is moved off a deleted version when the delete runs
+/// ([`crate::services::package_service::refresh_package_latest`]); this
+/// is the read-side backstop for a row that still names a version whose bytes
+/// are gone (a delete path that bypassed it, or rows written before it): the
+/// row reports its newest version with a live artifact, by the same liveness
+/// test the version list uses, instead of an install that fails. Rows whose
+/// version is live, MCP rows (decided by [`apply_mcp_catalog_views`]) and
+/// rows with no live version (already filtered out) pass through.
+async fn with_live_latest(
+    state: &SharedState,
+    mut rows: Vec<PackageRow>,
+) -> Result<Vec<PackageRow>> {
+    let ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| r.format != "mcp")
+        .map(|r| r.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(rows);
+    }
+    let live_versions = live_package_version_predicate();
+    let sql = format!(
+        r#"
+        SELECT pv.package_id, pv.version, pv.size_bytes
+        FROM package_versions pv
+        JOIN packages p ON p.id = pv.package_id
+        JOIN repositories r ON r.id = p.repository_id
+        WHERE pv.package_id = ANY($1)
+          AND {live_versions}
+        "#
+    );
+    let live: Vec<(Uuid, String, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(&ids)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    let mut by_package: std::collections::HashMap<Uuid, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (id, version, size) in live {
+        by_package.entry(id).or_default().push((version, size));
+    }
+    for row in rows.iter_mut().filter(|r| r.format != "mcp") {
+        let Some(versions) = by_package.get(&row.id) else {
+            continue;
+        };
+        if versions.iter().any(|(v, _)| *v == row.version) {
+            continue;
+        }
+        if let Some((version, size)) = newest_catalog_version(versions) {
+            row.version = version.clone();
+            row.size_bytes = *size;
+        }
+    }
+    Ok(rows)
 }
 
 /// Fill each row's `download_count` from the recorded download history
@@ -2182,6 +2242,85 @@ mod tests {
             );
 
             f.teardown().await;
+        }
+
+        /// #5632 read-side backstop: a row whose stored `packages.version`
+        /// names a version with no live artifact (soft-deleted behind the
+        /// delete hook's back) reports its newest live version as Latest, in
+        /// the listing and the detail view, and goes back once it is restored.
+        #[tokio::test]
+        async fn latest_falls_back_to_newest_live_version_5632() {
+            let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+                return;
+            };
+            let (pkg, _) = seed_backed_package(&f.pool, f.repo_id, "latest-chart", "1.0.0").await;
+            seed_backed_package(&f.pool, f.repo_id, "latest-chart", "1.1.0").await;
+            let (_, newest) =
+                seed_backed_package(&f.pool, f.repo_id, "latest-chart", "2.0.0").await;
+
+            let listed_latest = |f: &tdh::Fixture| {
+                let app = app(f);
+                let key = f.repo_key.clone();
+                async move {
+                    let (status, body) =
+                        tdh::send(app, tdh::get(format!("/?repository_key={key}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["items"][0]["version"].as_str().unwrap().to_string()
+                }
+            };
+            let detail_latest = |f: &tdh::Fixture| {
+                let app = app(f);
+                async move {
+                    let (status, body) = tdh::send(app, tdh::get(format!("/{pkg}"))).await;
+                    assert_eq!(status, StatusCode::OK);
+                    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    json["version"].as_str().unwrap().to_string()
+                }
+            };
+            assert_eq!(listed_latest(&f).await, "2.0.0");
+
+            set_deleted(&f.pool, f.repo_id, &newest, true).await;
+            let after_listed = listed_latest(&f).await;
+            let after_detail = detail_latest(&f).await;
+            let after_versions = listed_versions(&f, pkg).await;
+
+            // Restore through the real trash restore (its object must exist).
+            let path = "latest-chart/2.0.0/asset.bin";
+            let id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(f.repo_id)
+            .bind(path)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+            f.state
+                .storage_for_repo(
+                    &tdh::make_repo_info(f.repo_id, &f.repo_key, &f.storage_dir, "local", None)
+                        .storage_location(),
+                )
+                .unwrap()
+                .put(path, bytes::Bytes::from_static(b"chart"))
+                .await
+                .unwrap();
+            crate::api::handlers::trash::trash_service(&f.state)
+                .restore(id)
+                .await
+                .expect("restore");
+            let restored = detail_latest(&f).await;
+            f.teardown().await;
+
+            assert_eq!(
+                after_listed, "1.1.0",
+                "listing Latest skips the deleted 2.0.0"
+            );
+            assert_eq!(
+                after_detail, "1.1.0",
+                "detail Latest skips the deleted 2.0.0"
+            );
+            assert_eq!(after_versions, vec!["1.1.0", "1.0.0"]);
+            assert_eq!(restored, "2.0.0", "a restore makes 2.0.0 Latest again");
         }
 
         /// Remote repositories are exempt: proxy-cached artifacts are
