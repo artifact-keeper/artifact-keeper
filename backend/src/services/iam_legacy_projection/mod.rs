@@ -28,6 +28,8 @@ pub use legacy::LegacyAuthorizationState;
 pub use project::{project, project_legacy_state, ProjectionLimits};
 pub use reader::{begin_snapshot, capture_legacy_state, read_database_state, read_sso_config};
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(ak_test_shard = "services-1")]
 #[cfg(test)]
 mod tests;
