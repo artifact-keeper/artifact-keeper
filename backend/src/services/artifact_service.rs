@@ -163,32 +163,14 @@ impl MultiHasher {
 /// Mlmodel only) APPENDS an immutable revision to `artifact_versions` instead
 /// of conflicting, so both checks are relaxed for the HEAD row. Old revisions
 /// stay immutable and addressable.
-pub(crate) async fn enforce_path_immutability(
-    db: &PgPool,
-    repository_id: Uuid,
-    repo: Option<&Repository>,
-    path: &str,
-    version: Option<&str>,
-    checksum_sha256: &str,
-) -> Result<()> {
-    enforce_path_immutability_with(
-        db,
-        repository_id,
-        repo,
-        path,
-        version,
-        checksum_sha256,
-        false,
-    )
-    .await
-}
-
-/// [`enforce_path_immutability`] for a conditional write (#4186).
+///
+/// For a conditional write (#4186, and chunked completion since #4989)
 /// `replaces_current` is true when the write carries an `If-Match` that the
 /// caller has already found to hold: the client named the live content it
 /// replaces, so check 1 (live overwrite) does not apply. Check 2, the
 /// release-immutability backstop, still does, so a released coordinate
 /// cannot be swapped for different bytes even with a matching `If-Match`.
+/// An unconditional write passes `false`.
 pub(crate) async fn enforce_path_immutability_with(
     db: &PgPool,
     repository_id: Uuid,
@@ -440,7 +422,13 @@ async fn dedup_probe(storage: &dyn StorageBackend, storage_key: &str) -> bool {
 /// storage GC candidate. Recorded in the publishing transaction so it exists
 /// exactly when the replace commits. Idempotent; the candidate sweep drops
 /// the row without touching the object if anything still references the key.
-async fn record_replaced_object_gc_candidate(
+///
+/// A row already journalled for the key (an earlier replace, a repository
+/// delete, a failed GC delete) has its `recorded_at` refreshed (#4989): the
+/// sweep only takes rows older than the grace window, so keeping the older
+/// stamp could collect the object the moment this replace commits, with
+/// none of the grace a reader still holding the old bytes is given.
+pub(crate) async fn record_replaced_object_gc_candidate(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     repo: &Repository,
     old_key: &str,
@@ -451,7 +439,8 @@ async fn record_replaced_object_gc_candidate(
         "INSERT INTO oci_gc_candidates \
              (storage_key, storage_backend, storage_path, source_repository_id) \
          VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (storage_backend, storage_path, storage_key) DO NOTHING",
+         ON CONFLICT (storage_backend, storage_path, storage_key) \
+             DO UPDATE SET recorded_at = NOW()",
     )
     .bind(old_key)
     .bind(&scope.backend)

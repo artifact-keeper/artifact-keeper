@@ -334,6 +334,14 @@ fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
     crate::error::AppError::Database(e.to_string()).is_db_unavailable()
 }
 
+/// Whether a database error, as its rendered text, is a deadlock Postgres
+/// broke by rolling the transaction back (#4989), by the same rule the
+/// generic path's `DATABASE_DEADLOCK` 503 uses (#5168).
+fn is_deadlock_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
+    use crate::error::DeadlockError as _;
+    crate::error::AppError::Database(e.to_string()).is_deadlock()
+}
+
 /// Pick the HTTP status for a database error when the response envelope is
 /// format-specific (npm/OCI/Git-LFS/etc.) and cannot go through `db_err`.
 ///
@@ -344,11 +352,13 @@ fn is_db_unavailable_display<E: std::fmt::Display + ?Sized>(e: &E) -> bool {
 /// [`crate::error::AppError::is_db_unavailable`] gives the generic path
 /// (#4750), so an `npm install`, a `docker pull` or a Git LFS batch during an
 /// outage sees a retryable 503 rather than a 500 (#4765). Every other DB
-/// failure (a query or data error) stays 500. Callers keep their own
+/// failure (a query or data error) stays 500. A deadlock Postgres broke by
+/// rolling the transaction back changed nothing, so it is a retryable 503
+/// too, as on the generic path (#5168, #4989). Callers keep their own
 /// format-specific error body and pass this for the status argument; the
 /// envelope helpers add `Retry-After` through [`with_retry_after_on_503`].
 pub fn db_status<E: std::fmt::Display + ?Sized>(e: &E) -> axum::http::StatusCode {
-    if is_db_unavailable_display(e) {
+    if is_db_unavailable_display(e) || is_deadlock_display(e) {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     } else {
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -382,6 +392,11 @@ pub fn db_err_message<E: std::fmt::Display + ?Sized>(e: &E) -> &'static str {
     } else if is_db_unavailable_display(&raw) {
         tracing::error!(error = %raw, code = "DATABASE_UNAVAILABLE", "Request error");
         "Database is temporarily unavailable, retry shortly"
+    } else if is_deadlock_display(&raw) {
+        // Logged at error, as on the generic path: a deadlock that reaches a
+        // client is still a lock-order bug.
+        tracing::error!(error = %raw, code = "DATABASE_DEADLOCK", "Request error");
+        "Database transaction was rolled back by a lock conflict, retry shortly"
     } else {
         tracing::error!(error = %raw, code = "DATABASE_ERROR", "Request error");
         "Database operation failed"
@@ -916,6 +931,22 @@ mod tests {
             );
             assert_eq!(db_err_message(&fault), "Database operation failed");
         }
+    }
+
+    /// #4989: a deadlock on a format route with its own envelope is the
+    /// generic path's retryable 503 (#5168), with the same wording, not a 500.
+    #[test]
+    fn test_db_status_and_message_treat_a_deadlock_as_retryable_4989() {
+        let deadlock = "error returned from database: deadlock detected".to_string();
+        assert_eq!(
+            db_status(&deadlock),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            db_err_message(&deadlock),
+            "Database transaction was rolled back by a lock conflict, retry shortly"
+        );
+        assert!(!db_err_message(&deadlock).contains("deadlock detected"));
     }
 
     #[test]

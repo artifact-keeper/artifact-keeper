@@ -2503,6 +2503,57 @@ pub async fn seed_artifact_with_checksum(
     .expect("seed insert_artifact")
 }
 
+/// Seed a hosted artifact in `fx`'s repository whose row records the SHA-256
+/// (and length) of `recorded` while its stored object holds `stored`, for the
+/// serve-time verification tests (#4323, #4989). Give `stored` the length of
+/// `recorded` so only the digest differs.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_corrupt_artifact(
+    fx: &Fixture,
+    path: &str,
+    name: &str,
+    version: &str,
+    content_type: &str,
+    recorded: &[u8],
+    stored: &'static [u8],
+) -> Uuid {
+    use sha2::Digest as _;
+    assert_eq!(
+        recorded.len(),
+        stored.len(),
+        "only the digest should differ"
+    );
+    seed_artifact_with_checksum(
+        &fx.state,
+        &fx.pool,
+        &fx.repo_info("local", None),
+        &format!("corrupt-4989/{}", Uuid::new_v4()),
+        path,
+        name,
+        version,
+        content_type,
+        Bytes::from_static(stored),
+        fx.user_id,
+        &hex::encode(sha2::Sha256::digest(recorded)),
+    )
+    .await
+}
+
+/// Assert that a serve answered the stored-object integrity refusal: `502`
+/// with the `STORED_OBJECT_INTEGRITY` code and none of the object (#4323).
+pub fn assert_integrity_refusal(status: StatusCode, body: &[u8], stored: &[u8]) {
+    let text = String::from_utf8_lossy(body);
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{text}");
+    assert!(
+        text.contains(crate::storage::verify::STORED_OBJECT_INTEGRITY_CODE),
+        "{text}"
+    );
+    assert!(
+        !body.windows(stored.len()).any(|w| w == stored),
+        "the corrupt bytes must not be served: {text}"
+    );
+}
+
 /// Build a GET request with no body. Centralizes the
 /// `Request::builder().method("GET").uri(...).body(empty)` boilerplate.
 pub fn get(uri: String) -> Request<Body> {
