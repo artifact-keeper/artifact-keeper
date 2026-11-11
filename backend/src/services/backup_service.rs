@@ -2443,6 +2443,27 @@ impl BackupService {
                 validate_restore_layouts(&mut conn, &layouts, false).await?;
                 Self::restore_tables(&mut conn, &entries, &layouts, false, &mut result).await?;
             }
+            // #5793: an archive from before migration 363 carries no
+            // per-image links. Its repositories go back to the
+            // repository-wide digest rule until the next `oci_manifests`
+            // maintenance pass re-runs their first backfill, instead of
+            // answering 404 for every restored digest no tag names.
+            if backup_table(&entries, "oci_image_scope_backfill").is_none() {
+                let ids: Vec<Uuid> = archive_table_rows(&entries, "repositories")
+                    .iter()
+                    .filter_map(|row| row.get("id")?.as_str()?.parse().ok())
+                    .collect();
+                if !ids.is_empty() {
+                    if let Err(e) =
+                        crate::services::oci_image_scope::reset_backfill(&self.db, &ids).await
+                    {
+                        result.errors.push(format!(
+                            "failed to reset the OCI image-scope backfill of the restored \
+                             repositories: {e}"
+                        ));
+                    }
+                }
+            }
         }
 
         // Restore artifact files. The archive's own artifact rows say which
@@ -6570,6 +6591,10 @@ mod tests {
             "oci_blobs",
             "oci_tags",
             "oci_manifests",
+            // #5793: the per-image links and the scope marker travel too.
+            "oci_image_manifests",
+            "oci_image_blobs",
+            "oci_image_scope_backfill",
             "groups",
             "webhooks",
         ] {
@@ -6629,6 +6654,21 @@ mod tests {
             .await
             .expect("restore runs");
         let after_pulls = pulls().await;
+        // #5793: the restored repository is still scoped to its image names,
+        // so a name that never held the layer still answers 404.
+        let (foreign_layer_status, _) = send(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/{}/nobody/blobs/{}",
+                    fx.repo_key,
+                    digest_of(&layer_body)
+                ))
+                .header("Authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         let count = |sql: &'static str, id: Uuid| {
             let pool = pool.clone();
             async move {
@@ -6651,6 +6691,16 @@ mod tests {
         )
         .await;
         let webhooks = count("SELECT COUNT(*) FROM webhooks WHERE id = $1", webhook_id).await;
+        let scope_marker = count(
+            "SELECT COUNT(*) FROM oci_image_scope_backfill WHERE repository_id = $1",
+            fx.repo_id,
+        )
+        .await;
+        let manifest_links = count(
+            "SELECT COUNT(*) FROM oci_image_manifests WHERE repository_id = $1 AND image = 'app'",
+            fx.repo_id,
+        )
+        .await;
         let setting: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT value FROM system_settings WHERE key = $1")
                 .bind(&setting_key)
@@ -6681,6 +6731,19 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "pull {path} after the restore");
             assert!(same, "{path} bytes after the restore");
         }
+        assert_eq!(
+            scope_marker, 1,
+            "the repository's scope marker is restored (#5793)"
+        );
+        assert!(
+            manifest_links >= 1,
+            "the image's manifest link is restored (#5793)"
+        );
+        assert_eq!(
+            foreign_layer_status,
+            StatusCode::NOT_FOUND,
+            "after the restore the layer still resolves only under the image that holds it"
+        );
         assert_eq!(groups, 1, "the group is restored");
         assert_eq!(members, 1, "the group member is restored");
         assert_eq!(permissions, 1, "the group's permission is restored");
