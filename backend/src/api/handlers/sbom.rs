@@ -2691,7 +2691,13 @@ package:
         assert!(linux.len() < whole.len());
 
         // A ceiling between the one-platform and the whole-environment size.
-        let ceiling = whole.len() - 1;
+        // Each render stamps `Utc::now().to_rfc3339()`, whose fractional
+        // seconds vary in length, so a later render can be a few bytes shorter
+        // than `whole`. Take the midpoint of the gap rather than one byte
+        // under `whole`, so the timestamp jitter cannot cross it.
+        let gap = whole.len() - linux.len();
+        assert!(gap > 256, "the fixture's graphs differ by more than the jitter: {gap}");
+        let ceiling = linux.len() + gap / 2;
         let err = render_environment_sbom(
             "conda-lock.yml",
             &env,
