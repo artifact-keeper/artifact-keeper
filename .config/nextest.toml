@@ -154,3 +154,31 @@ test-group = 'db-serial'
 [[profile.default.overrides]]
 filter = 'kind(test)'
 test-group = 'db-serial'
+
+# Per-test timeout (#5241). Without one, a test that hangs (a deadlocked test
+# lock, an await on a mock that never answers) holds its leg until the job's
+# `timeout-minutes` cancels it: the shard burns its full 60 minutes and the
+# cancelled job's log never names the test. With `terminate-after`, nextest
+# kills the hung test, reports it as `TIMEOUT` by name, and the rest of the
+# leg runs on (`--no-fail-fast`).
+#
+# The bound is per test (not per leg) and applies to every invocation of the
+# default profile: the unit-test shards, both integration-test steps, and
+# local runs. Values come from the slowest legitimate tests in three green
+# `main` CI runs (2026-11-10, instrumented coverage builds on hosted
+# runners): outside `signing_service` nothing passes 66s
+# (`grouped_listing_keyset_tests` ~63s, `scanner_service`
+# `incus_construction_switch_is_enforced_by_remote_oci_producer` ~61s), so 5
+# minutes is ~4.5x headroom. Each `SLOW` line still prints every 60s.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# `signing_service` generates RSA/GPG keys in an unoptimized, instrumented
+# build: `rotate_many_times_never_overflows_name_column` took 217-303s and
+# `rotate_leaves_no_none_window_under_concurrent_poll` 124-149s in the same
+# runs. 15 minutes keeps ~3x headroom over the worst observed and still fails
+# a hung signing test well inside the 60-minute leg. Raise this (or move the
+# test here) rather than the default when a new test is legitimately slow.
+[[profile.default.overrides]]
+filter = 'test(/^services::signing_service::tests::/)'
+slow-timeout = { period = "60s", terminate-after = 15 }

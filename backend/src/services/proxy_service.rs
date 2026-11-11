@@ -28699,7 +28699,7 @@ mod tests {
 
     /// Restores the private-address settings on drop.
     struct OutboundPolicyEnv {
-        _lock: tokio::sync::MutexGuard<'static, ()>,
+        _lock: crate::api::validation::OutboundPolicyEnvLock,
         saved: Vec<(&'static str, Option<String>)>,
     }
 
@@ -28711,9 +28711,10 @@ mod tests {
         ];
 
         async fn cleared() -> Self {
-            let lock = crate::api::validation::OUTBOUND_POLICY_ENV_LOCK
-                .lock()
-                .await;
+            let lock = crate::api::validation::lock_outbound_policy_env(
+                "proxy_service::tests::OutboundPolicyEnv",
+            )
+            .await;
             let saved = Self::VARS
                 .iter()
                 .map(|v| (*v, std::env::var(v).ok()))
