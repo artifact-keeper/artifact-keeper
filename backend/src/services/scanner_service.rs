@@ -10691,6 +10691,7 @@ impl ScannerService {
                         error!("Scan of artifact {}: {}", artifact_id, reason);
                         self.record_failed_scan(
                             artifact_id,
+                            &artifact.checksum_sha256,
                             scan_result.id,
                             scanner.as_ref(),
                             &reason,
