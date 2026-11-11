@@ -553,7 +553,6 @@ pub struct ScanConfig {
     /// a finding that carries a CVSS base score blocks at or above this
     /// number whatever its severity label, and a finding with no score is
     /// still graded by `severity_threshold`. See `ProxySeverityGate::Cvss`.
-    #[sqlx(default)]
     #[serde(default)]
     pub cvss_threshold: Option<f64>,
     pub created_at: DateTime<Utc>,

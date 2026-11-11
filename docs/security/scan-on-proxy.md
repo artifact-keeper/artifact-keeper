@@ -492,11 +492,15 @@ With `block_on_policy_violation` on and `cvss_threshold` set to, say, `8.0`:
   it would be with no `cvss_threshold`. A number cannot grade it, so the
   label still does. To block every unscored finding, set
   `severity_threshold` to `low`.
-- Findings graded `info` (Grype's `Negligible`) take no part, scored or not,
-  as under a severity threshold.
+- Scored `info` findings (including Grype's `Negligible`) are graded by the
+  number too. Unscored `info` findings remain exempt. Without a numeric
+  threshold, the existing `info` exemption is unchanged.
 
 With `block_on_policy_violation` off the number is stored but inert, like
-`severity_threshold`: any finding blocks. `record_only` overrides it too.
+`severity_threshold`: any finding above `info` blocks. `record_only`
+overrides it too.
+A scored `info` finding is stored as a vulnerable verdict so numeric policies
+can evaluate it on later pulls; categorical policies still serve it.
 
 `PUT .../security` treats the field three ways: omit it to leave the stored
 value unchanged, send `null` to clear it, send a number to set it. The number
@@ -524,18 +528,24 @@ score today and are graded by `severity_threshold`.
 **Cached verdicts.** A verdict is shared across repositories while the
 threshold is per repository, so the verdict row stores a summary instead of a
 decision: the highest score among its scored findings (`max_cvss_score`) and
-the highest severity among its unscored ones (`max_unscored_severity`). A
-cached verdict is compared with each repository's own threshold on every
-pull, by the same rule as a fresh scan. `GET
+the highest severity above `info` among its unscored ones
+(`max_unscored_severity`). The summary preserves every scanner assessment
+before duplicate findings are collapsed: a scored copy cannot erase an
+unscored copy's severity fallback. A cached verdict is compared with each
+repository's own threshold on every pull, by the same rule as a fresh scan. `GET
 /api/v1/admin/proxy-scan-verdicts/{digest}` shows both values.
 
-**Verdicts recorded before the upgrade** have no summary. A repository with
-a `cvss_threshold` blocks them (`403`) until the digest is scanned again:
-nothing on such a verdict is known to be below the number. They are rescanned
-as they age out or the scanner version changes (see
+**Vulnerable verdicts recorded before the upgrade** have no summary. A
+repository with a `cvss_threshold` blocks them (`403`): nothing on such a
+verdict is known to be below the number. Legacy clean verdicts retain their
+existing freshness rules. Verdicts are rescanned as they age out or the scanner version changes (see
 [Verdicts and freshness](#verdicts-and-freshness)); to clear one sooner,
 rescan the artifact or delete the verdict through the admin endpoint.
-Repositories without a `cvss_threshold` are unaffected.
+An unpinned rescan cannot establish a missing summary for a request-pinned
+verdict: it retains the unknown summary and numeric policies keep blocking.
+Re-scan through a request that supplies the original coordinate, or delete
+the verdict and pull again with that coordinate.
+Repositories without a `cvss_threshold` retain their enforcement behavior.
 
 ## Verdicts and freshness
 
@@ -651,8 +661,9 @@ over the members the caller may read.
 - A Remote member is scanned under the **stricter of two** policies: the
   Virtual's own scan configuration and the member's. Scanning is on if either
   side enables it. `fail_closed` beats `fail_open`, which beats `record_only`,
-  and the severity gate is the stricter of the two. When one side has a
-  severity threshold and the other a `cvss_threshold`, a finding is blocked
+  and the severity gate is the stricter of the two. A numeric gate is also
+  retained alongside block-on-any, which exempts `info` findings. When one
+  side has a severity threshold and the other a `cvss_threshold`, a finding is blocked
   if either would block it; two numeric thresholds combine to the lower
   number and the lower severity for unscored findings.
 - A hosted member, or a Remote member that does not scan, is served as before.

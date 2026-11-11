@@ -5713,10 +5713,10 @@ pub struct ProxyScanVerdict {
     pub low_count: i32,
     /// Highest severity observed across all findings, for policy comparison.
     pub max_severity: Option<Severity>,
-    /// Highest CVSS base score among the findings above `Info` that carry
+    /// Highest CVSS base score among all findings that carry
     /// one (#5263), for a numeric threshold. `None` when none of them does.
     pub max_cvss_score: Option<CvssScore>,
-    /// Highest severity among the findings above `Info` that carry NO CVSS
+    /// Highest severity among findings above `Info` that carry NO CVSS
     /// score (#5263). A numeric threshold cannot grade those, so it grades
     /// them by severity. `None` when every such finding is scored.
     pub max_unscored_severity: Option<Severity>,
@@ -5760,22 +5760,12 @@ pub struct ProxyScanVerdict {
 }
 
 impl ProxyScanVerdict {
-    /// A vulnerable verdict is any finding ABOVE `Info` (#3243 stage 2).
-    /// Whether that BLOCKS a pull is a policy decision made by the caller
-    /// against the repo's action.
-    ///
-    /// `Info` findings are deliberately excluded: that bucket holds Grype's
-    /// `Negligible` (a CVE the distro has triaged as not worth fixing) and
-    /// explicit `info`/`informational` grades. Counting them made fail-closed
-    /// OCI proxying unusable against ordinary Debian/Ubuntu base images —
-    /// every image carries a long tail of `Negligible` CVEs, each of which
-    /// produced a `vulnerable` verdict and a 403. This matches Harbor, which
-    /// documents `negligible` as never blocking a pull at any threshold. The
-    /// findings are still recorded (`findings_count`, the row, the report);
-    /// they just do not 403 the pull. Before #3243 this was
-    /// `findings_count > 0`, i.e. severity-blind.
+    /// Findings above Info, or any scored finding, need policy evaluation.
+    /// Scored Info findings are persisted as vulnerable so numeric gates can
+    /// evaluate them on cache hits. Categorical gates retain the Info exemption.
     pub fn is_vulnerable(&self) -> bool {
         self.critical_count + self.high_count + self.medium_count + self.low_count > 0
+            || self.max_cvss_score.is_some()
     }
 
     /// The stored `proxy_scan_results.verdict` token for this result.
@@ -6040,18 +6030,15 @@ pub fn aggregate_proxy_verdict(
     let count = |sev: Severity| findings.iter().filter(|f| f.severity == sev).count() as i32;
     // Severity is ordered Critical=0 .. Info=4, so `min` is the highest.
     let max_severity = findings.iter().map(|f| f.severity).min();
-    // #5263: the CVSS summary a numeric threshold grades the verdict on, over
-    // the same findings that make a verdict `vulnerable` (see
-    // `ProxyScanVerdict::is_vulnerable`). `Info` findings are left out here
-    // as they are there: that bucket never blocks a pull at any severity
-    // threshold, and it must not start to under a numeric one because some
-    // unrelated finding made the verdict vulnerable.
-    let graded = || findings.iter().filter(|f| f.severity != Severity::Info);
-    let max_cvss_score = graded()
+    // Preserve scored Info findings: numeric policies grade the score regardless
+    // of the label. Only unscored Info keeps the historical exemption.
+    let max_cvss_score = findings
+        .iter()
         .filter_map(|f| f.cvss.as_ref().map(|c| c.score))
         .max();
-    let max_unscored_severity = graded()
-        .filter(|f| f.cvss.is_none())
+    let max_unscored_severity = findings
+        .iter()
+        .filter(|f| f.severity != Severity::Info && f.cvss.is_none())
         .map(|f| f.severity)
         .min();
     ProxyScanVerdict {
@@ -6073,6 +6060,22 @@ pub fn aggregate_proxy_verdict(
         findings: Vec::new(),
         components_cataloged: None,
     }
+}
+
+/// Count each vulnerability once, but retain all policy evidence from scanner
+/// assessments. A scored duplicate must not erase an unscored severity fallback.
+fn aggregate_deduped_proxy_verdict(
+    findings: Vec<RawFinding>,
+    ecosystem: Option<ComponentEcosystem>,
+    scanner_version: Option<String>,
+) -> ProxyScanVerdict {
+    let grade = aggregate_proxy_verdict(&findings, None).grade();
+    let findings = dedupe_findings(findings, ecosystem);
+    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    verdict.max_cvss_score = grade.max_cvss_score;
+    verdict.max_unscored_severity = grade.max_unscored_severity;
+    verdict.findings = retain_proxy_findings(&findings);
+    verdict
 }
 
 /// Project the raw finding list onto the rows `proxy_scan_findings` stores
@@ -6143,8 +6146,9 @@ pub fn retain_proxy_findings(findings: &[RawFinding]) -> Vec<ProxyFinding> {
 ///    scanner failing (an optional Trivy adapter that is down) still must NOT
 ///    abort the scan — only the CVE engine is load-bearing.
 /// 2. **The CVE engine cataloged something** (#3003), when the caller supplied
-///    an `expected_component`. `is_vulnerable()` counts findings above `Info`,
-///    so an engine that ran but had nothing to grade reports "clean". The one
+///    an `expected_component`. `is_vulnerable()` includes scored findings
+///    and findings above `Info`, so an engine that ran but had nothing to
+///    grade reports "clean". The one
 ///    exception is an ecosystem the engine never catalogs as itself (conda,
 ///    see [`ComponentEcosystem::engine_catalogs_the_package`], #4594): there
 ///    an empty catalog from a completed scan is graded on its findings and
@@ -6249,7 +6253,7 @@ async fn run_inline_proxy_scanners_target(
     }
 
     // #3003: "the CVE engine ran Ok" is still not enough. `is_vulnerable()`
-    // counts findings above `Info`, so an engine that RUNS but catalogs
+    // includes scored findings and findings above `Info`, so an engine that catalogs
     // nothing to grade reports zero findings — indistinguishable from a
     // genuinely clean artifact. That is not a hypothetical: syft/grype do not catalog a bare
     // npm `package/package.json` or an sdist's root `PKG-INFO`, so a real
@@ -6384,7 +6388,6 @@ async fn run_inline_proxy_scanners_target(
     // `prepare_pinned` writes into the workspace root) before counts/severity
     // buckets are computed. See `dedupe_findings` for the mechanism and scope.
     let ecosystem = target.expected_component.map(|c| c.ecosystem);
-    let findings = dedupe_findings(findings, ecosystem);
 
     // Verdict provenance = the CVE-AUTHORITATIVE scanner's version, probed
     // through the SAME function the serve path uses as `current_version`
@@ -6411,14 +6414,11 @@ async fn run_inline_proxy_scanners_target(
         None
     };
 
-    let mut verdict = aggregate_proxy_verdict(&findings, scanner_version);
+    let mut verdict = aggregate_deduped_proxy_verdict(findings, ecosystem, scanner_version);
     // Attach the retained inventory. Deliberately after aggregation so the
     // counts/severity contract is computed from findings alone.
     verdict.packages = dedupe_packages(packages);
     verdict.scan_completeness = scan_completeness;
-    // Same contract as `packages`: attached after aggregation so the counts are
-    // computed from the raw findings and this projection cannot move them.
-    verdict.findings = retain_proxy_findings(&findings);
     // #4594: what the engine cataloged, counted once per distinct
     // `name@version`, so the stored verdict says whether it graded any
     // component or only the file contents.
@@ -21842,7 +21842,7 @@ tonic-build = "0.12"
     }
 
     /// The summary is the highest score among scored findings and the highest
-    /// severity among unscored ones, each over the findings above `Info`.
+    /// severity among unscored findings above `Info`.
     #[test]
     fn test_proxy_verdict_cvss_summary() {
         let verdict = aggregate_proxy_verdict(
@@ -21874,27 +21874,58 @@ tonic-build = "0.12"
         assert_eq!(none_scored.max_unscored_severity, Some(Severity::High));
     }
 
-    /// `Info` findings never block at any severity threshold, and they take
-    /// no part in the CVSS summary either, scored or not: an unrelated `low`
-    /// finding must not turn a Negligible advisory with a high NVD score into
-    /// a block.
     #[test]
-    fn test_proxy_verdict_cvss_summary_excludes_info_findings() {
-        let verdict = aggregate_proxy_verdict(
-            &[
-                scored(Severity::Info, Some(9.8)),
-                scored(Severity::Info, None),
-                scored(Severity::Low, Some(3.1)),
-            ],
+    fn scored_info_is_evaluated_by_numeric_policies() {
+        use crate::services::proxy_scan_service::{CvssGate, ProxySeverityGate as G};
+        let verdict = aggregate_proxy_verdict(&[scored(Severity::Info, Some(9.8))], None);
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.verdict_token(), "vulnerable");
+        assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(9.8));
+        assert_eq!(verdict.max_unscored_severity, None);
+        let numeric = G::Cvss(CvssGate {
+            min_score: CvssScore::from_f64(8.0).unwrap(),
+            unscored_severity: Severity::High,
+            any_severity: None,
+        });
+        assert!(numeric.blocks_grade(verdict.grade()));
+        assert!(!G::BlockOnAny.blocks_grade(verdict.grade()));
+        assert!(!G::Threshold(Severity::Info).blocks_grade(verdict.grade()));
+        assert!(G::stricter(G::BlockOnAny, numeric).blocks_grade(verdict.grade()));
+        assert!(!aggregate_proxy_verdict(&[scored(Severity::Info, None)], None).is_vulnerable());
+    }
+
+    #[test]
+    fn deduplication_preserves_unscored_policy_evidence_in_either_order() {
+        use crate::services::proxy_scan_service::{CvssGate, ProxySeverityGate};
+        let mut unscored = scored(Severity::High, None);
+        unscored.cve_id = Some("CVE-2024-0001".to_string());
+        unscored.affected_component = Some("requests".to_string());
+        unscored.affected_version = Some("2.0.0".to_string());
+        let mut scored_copy = unscored.clone();
+        scored_copy.cvss = scored(Severity::High, Some(7.5)).cvss;
+        let gate = ProxySeverityGate::Cvss(CvssGate {
+            min_score: CvssScore::from_f64(8.0).unwrap(),
+            unscored_severity: Severity::High,
+            any_severity: None,
+        });
+        for findings in [
+            vec![unscored.clone(), scored_copy.clone()],
+            vec![scored_copy.clone(), unscored],
+        ] {
+            let verdict =
+                aggregate_deduped_proxy_verdict(findings, Some(ComponentEcosystem::Python), None);
+            assert_eq!(verdict.findings_count, 1);
+            assert_eq!(verdict.findings.len(), 1);
+            assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(7.5));
+            assert_eq!(verdict.max_unscored_severity, Some(Severity::High));
+            assert!(gate.blocks_grade(verdict.grade()));
+        }
+        let scored_only = aggregate_deduped_proxy_verdict(
+            vec![scored_copy],
+            Some(ComponentEcosystem::Python),
             None,
         );
-        assert!(verdict.is_vulnerable());
-        assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(3.1));
-        assert_eq!(verdict.max_unscored_severity, None);
-
-        let info_only = aggregate_proxy_verdict(&[scored(Severity::Info, Some(9.8))], None);
-        assert!(!info_only.is_vulnerable());
-        assert_eq!(info_only.max_cvss_score, None);
+        assert!(!gate.blocks_grade(scored_only.grade()));
     }
 
     /// Duplicates of one vulnerability in one component collapse to the most

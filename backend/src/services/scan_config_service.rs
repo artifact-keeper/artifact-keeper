@@ -1408,7 +1408,10 @@ mod tests {
             "severity to numeric"
         );
         assert!(proxy_policy_weakened(&any, &cvss(0.0)), "from block-on-any");
-        assert!(!proxy_policy_weakened(&cvss(8.0), &any), "to block-on-any");
+        assert!(
+            proxy_policy_weakened(&cvss(8.0), &any),
+            "block-on-any would stop blocking scored Info findings"
+        );
         // The severity threshold under a numeric gate grades unscored
         // findings, so loosening it is weakening too.
         assert!(proxy_policy_weakened(

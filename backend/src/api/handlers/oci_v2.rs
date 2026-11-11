@@ -11155,9 +11155,7 @@ pub(crate) struct BlobVerdictRef {
     pub max_severity: Option<String>,
     /// The verdict's CVSS summary, for a numeric threshold (#5263). Both
     /// `None` (rows recorded before migration 361) fails closed under one.
-    #[sqlx(default)]
     pub max_cvss_score: Option<f64>,
-    #[sqlx(default)]
     pub max_unscored_severity: Option<String>,
 }
 
@@ -11464,9 +11462,7 @@ pub(crate) struct BlobReferrer {
     pub scanner_version: Option<String>,
     pub max_severity: Option<String>,
     /// The verdict's CVSS summary (#5263), as on [`BlobVerdictRef`].
-    #[sqlx(default)]
     pub max_cvss_score: Option<f64>,
-    #[sqlx(default)]
     pub max_unscored_severity: Option<String>,
 }
 

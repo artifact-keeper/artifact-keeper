@@ -111,15 +111,15 @@ pub struct GrypeRelatedVulnerability {
 /// `baseScore` is skipped, not an error.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrypeCvss {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cvss_text")]
     pub source: Option<String>,
     /// `Primary` (the advisory database's own analysis) or `Secondary` (the
     /// CNA's or vendor's).
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", deserialize_with = "deserialize_cvss_text")]
     pub assessment_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cvss_text")]
     pub version: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cvss_text")]
     pub vector: Option<String>,
     #[serde(default)]
     pub metrics: Option<GrypeCvssMetrics>,
@@ -129,6 +129,15 @@ pub struct GrypeCvss {
 pub struct GrypeCvssMetrics {
     #[serde(default, rename = "baseScore")]
     pub base_score: Option<f64>,
+}
+
+/// Descriptive metadata cannot invalidate a usable base score.
+fn deserialize_cvss_text<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().map(str::to_owned))
 }
 
 /// Read a `cvss` array without ever failing the report it is nested in
@@ -5386,6 +5395,23 @@ mod tests {
     fn cvss_findings(json: &str) -> Vec<RawFinding> {
         let report: GrypeReport = serde_json::from_str(json).expect("report must parse");
         GrypeScanner::convert_findings(&report)
+    }
+
+    #[test]
+    fn cvss_metadata_cannot_discard_a_valid_score() {
+        for metadata in [
+            serde_json::json!({"source": 42}),
+            serde_json::json!({"version": 3.1}),
+            serde_json::json!({"vector": []}),
+            serde_json::json!({"type": {"unexpected": true}}),
+            serde_json::json!({"source": "bad\u{0}text"}),
+        ] {
+            let mut entry = metadata;
+            entry["metrics"] = serde_json::json!({"baseScore": 9.8});
+            let parsed: GrypeCvss = serde_json::from_value(entry).unwrap();
+            let (_, assessment) = parsed.assessment().expect("valid score survives");
+            assert_eq!(assessment.score, CvssScore::from_f64(9.8).unwrap());
+        }
     }
 
     /// Grype's wire shape for a match with an NVD assessment on the matched

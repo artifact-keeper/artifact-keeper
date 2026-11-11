@@ -21,9 +21,9 @@
 --    across repositories while the threshold is per repository, so the row
 --    cannot store a decision, and `max_severity` alone cannot re-evaluate a
 --    numeric threshold on a cached verdict. `max_cvss_score` is the highest
---    base score among the findings above `info` that carry one;
---    `max_unscored_severity` the highest severity among those that carry
---    none. Both NULL means the verdict has no summary (recorded before this
+--    base score among all findings that carry one;
+--    `max_unscored_severity` the highest severity above info among findings
+--    with no score. Both NULL on a vulnerable verdict means no summary (before this
 --    migration): a numeric threshold blocks it as ungraded until the digest
 --    is scanned again, the way an unrecorded `max_severity` blocks under a
 --    severity threshold. A repository with no `cvss_threshold` never reads

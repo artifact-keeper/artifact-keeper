@@ -5058,7 +5058,7 @@ pub(crate) fn combined_severity_gate(
 /// thread the returned `action` and severity gate into the
 /// per-format scan gate so the virtual path enforces the same digest-keyed
 /// verdict as a direct pull. The severity gate combines stricter-of-two the
-/// same way (#3243 stage 3): `BlockOnAny` on either side dominates, so a
+/// same way (#3243 stage 3), combining their blocking conditions, so a
 /// virtual that has not opted into threshold gating cannot become the lax
 /// route around a member's block-on-any posture, and vice versa.
 ///
@@ -11529,8 +11529,8 @@ pub(crate) enum ProxyScanServeOutcome {
 /// * a missing row blocks (the caller only asks on `BlockCached`, where a row
 ///   is present; `None` is the defensive arm and takes the strict answer);
 /// * `ProxySeverityGate::BlockOnAny` (every repo that has not opted in via
-///   `block_on_policy_violation`) blocks unconditionally — the historical
-///   posture, byte-for-byte;
+///   `block_on_policy_violation`) blocks findings above `Info`, retaining
+///   the historical exemption even for a scored `Info` verdict;
 /// * under a numeric CVSS gate (#5263) the row's stored CVSS summary is
 ///   graded the same way a fresh scan's is, and a row with no summary
 ///   (recorded before migration 361) blocks.

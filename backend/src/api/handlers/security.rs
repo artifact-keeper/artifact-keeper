@@ -4224,6 +4224,21 @@ pub struct SecurityApiDoc;
 mod tests {
     use super::*;
 
+    #[test]
+    fn flattened_cvss_threshold_preserves_omit_clear_and_set() {
+        for (json, expected) in [
+            (r#"{}"#, None),
+            (
+                r#"{"cvss_threshold": null, "instance_locked": true}"#,
+                Some(None),
+            ),
+            (r#"{"cvss_threshold": 8.0}"#, Some(Some(8.0))),
+        ] {
+            let body: super::UpdateRepoSecurityRequest = serde_json::from_str(json).unwrap();
+            assert_eq!(body.config.cvss_threshold, expected);
+        }
+    }
+
     /// Cross-tenant authz guard (xtenant-write-authz-systemic). The repo-scoped
     /// security endpoints live under the /repositories nest (not gated by
     /// repo_visibility_middleware), so each must enforce the tenant gate itself.
