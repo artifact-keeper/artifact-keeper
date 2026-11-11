@@ -821,10 +821,30 @@ holds the version. Formats without an age gate (OCI, NuGet) are not affected.
 
 One server version is one artifact: path `servers/<name>/<version>/server.json`
 (visible in `GET /api/v1/repositories/{key}/artifacts` and on the Packages
-page), content the key-sorted canonical JSON of the accepted document, stored
-under the content-addressed key `mcp/<name>/<version>/<sha256>.json` so a
-publish that loses a race for the same version cannot overwrite the winner's
-bytes. Status changes of a server run in one transaction with the `isLatest`
+page), content the key-sorted canonical JSON of the accepted document. Its
+storage key is content-addressed, so a publish that loses a race for the same
+version cannot overwrite the winner's bytes. The key's shape depends on the
+storage backend:
+
+| Storage | Server version | MCPB bundle |
+| --- | --- | --- |
+| Cloud (S3, GCS, Azure) | `mcp/<repository-id>/<name>/<version>/<sha256>.json` | `mcp/<repository-id>/<name>/<version>/bundles/<sha256>/<file>` |
+| Filesystem, or `STORAGE_KEY_SCHEME=flat` | `mcp/<name>/<version>/<sha256>.json` | `mcp/<name>/<version>/bundles/<sha256>/<file>` |
+
+On cloud storage every repository shares one namespace, so the repository id
+in the key keeps two MCP repositories that hold the same server version (a
+hosted copy and a Remote's ingested copy, say) from colliding on one object
+(#5660). Under the flat key on cloud storage the second repository's write
+is refused by the cross-repository overwrite guard (`409 CONFLICT`, see
+[Remote repositories](#remote-repositories)).
+
+A version or bundle already stored under the flat key (written by an earlier
+build, or before `STORAGE_KEY_SCHEME` changed) keeps serving from it: every
+MCP read resolves the object through the storage key recorded on its artifact
+row, so no migration is needed and nothing is rewritten. Only new writes use
+the repository-scoped key.
+
+Status changes of a server run in one transaction with the `isLatest`
 recompute. The
 pins, registry state and package policy live in the artifact's metadata.
 Published versions fire `artifact.uploaded` webhooks, are scanned on upload
