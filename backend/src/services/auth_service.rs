@@ -1089,6 +1089,30 @@ async fn acquire_permit_from(
     }
 }
 
+/// Run one bcrypt operation on the blocking pool while holding a permit from
+/// the process-wide auth-concurrency cap for exactly as long as it runs.
+///
+/// The permit is moved INTO the blocking closure (#5485). Held in the async
+/// frame instead, it was released as soon as the request future was dropped
+/// (client disconnect, HTTP/2 `RST_STREAM`, a request timeout), while the
+/// detached blocking task kept computing bcrypt. A client that sent a request
+/// and cancelled it straight away could then keep any number of bcrypt jobs in
+/// flight, and `AUTH_MAX_CONCURRENCY` no longer bounded the CPU work it exists
+/// to bound. The permit now drops when the closure returns or unwinds.
+async fn run_bcrypt_under_permit<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = acquire_auth_permit_for_bcrypt().await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
+}
+
 /// Legacy non-blocking variant retained for tests and callers that need a
 /// synchronous shed boundary (no queue wait). New call sites should prefer
 /// [`acquire_auth_permit_for_bcrypt`] which queues briefly before shedding.
@@ -2882,14 +2906,12 @@ impl AuthService {
         // Hold a process-wide auth-concurrency permit while bcrypt runs so
         // hash() also participates in the load-shed cap (signup, password
         // change, API-token creation all call this).
-        let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
-        tokio::task::spawn_blocking(move || {
+        run_bcrypt_under_permit(move || {
             hash(&pwd, bcrypt_cost())
                 .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))
         })
         .await
-        .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
     }
 
     /// Verify a password against a hash
@@ -2902,15 +2924,13 @@ impl AuthService {
     pub async fn verify_password(password: &str, hash: &str) -> Result<bool> {
         #[cfg(test)]
         bcrypt_verify_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _permit = acquire_auth_permit_for_bcrypt().await?;
         let pwd = password.to_string();
         let h = hash.to_string();
-        tokio::task::spawn_blocking(move || {
+        run_bcrypt_under_permit(move || {
             verify(&pwd, &h)
                 .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))
         })
         .await
-        .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))?
     }
 
     /// Returns a dummy bcrypt hash generated once at runtime, at the same cost
@@ -4608,6 +4628,61 @@ mod tests {
     // instead of `N - K` instant 503 failures, which was the dominant
     // failure shape in the stress-tests behind #1437.
     // -----------------------------------------------------------------------
+
+    /// #5485: cancelling a request mid-bcrypt must not hand its permit back
+    /// while the blocking verify is still running. Before the fix the permit
+    /// lived in the async frame, so dropping the future released it at once
+    /// and `AUTH_MAX_CONCURRENCY` stopped bounding the bcrypt work in flight.
+    ///
+    /// Installs a one-slot cap; nextest's process-per-test isolation keeps
+    /// the `OnceLock` private to this test.
+    #[tokio::test]
+    async fn cancelled_verify_holds_its_permit_until_bcrypt_ends_5485() {
+        let sem = Arc::new(Semaphore::new(1));
+        install_global_auth_semaphore(Some(sem.clone()));
+        let installed = installed_global_auth_semaphore().expect("a cap is installed");
+        assert!(
+            Arc::ptr_eq(&installed, &sem),
+            "another cap was installed first in this process"
+        );
+        // A production-cost hash (hundreds of ms of bcrypt), computed here
+        // without a permit, so the verify is certainly still running when the
+        // future is dropped a few milliseconds after it started.
+        let slow_hash = bcrypt::hash("the-real-password", 12).expect("hash");
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            AuthService::verify_password("a-wrong-guess", &slow_hash),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the verify must still be running at 5 ms"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the cancelled verify's bcrypt is still running, so its permit must still be held"
+        );
+
+        // The permit comes back once the detached bcrypt finishes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while sem.available_permits() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the permit was never released after the blocking verify ended"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(sem.available_permits(), 1);
+
+        // And a normal, uncancelled verify still releases it on completion.
+        let fast_hash = bcrypt::hash("pw", 4).expect("hash");
+        assert!(AuthService::verify_password("pw", &fast_hash)
+            .await
+            .expect("verify"));
+        assert_eq!(sem.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn test_acquire_permit_fast_path_does_not_wait() {

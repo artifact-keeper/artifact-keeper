@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::rejection::{BytesRejection, QueryRejection};
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Query, State};
 use axum::http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, RANGE,
 };
@@ -42,13 +42,14 @@ use crate::api::handlers::oci_digest::{
 use crate::api::handlers::proxy_helpers;
 // The bearer challenge is built in the middleware half so this module and
 // `guest_access_guard` emit byte-identical `WWW-Authenticate` values (#3854).
+use crate::api::middleware::auth::{verify_basic_password, BasicPasswordOutcome};
 use crate::api::middleware::oci_errors::{www_authenticate_header, OCI_TOKEN_SERVICE};
 use crate::api::middleware::rate_limit::LoginRateLimitState;
 use crate::api::SharedState;
 use crate::error::AppError;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::models::user::User;
-use crate::services::auth_service::AuthService;
+use crate::services::auth_service::{is_api_token_shape, is_jwt_shape, AuthService, TimingPad};
 use crate::services::metrics_service::AuthFailureReason;
 use crate::services::repository_service::{format_handler_key, parse_format_str};
 use crate::services::scanner_service::ProxyScanClass;
@@ -362,11 +363,14 @@ async fn validate_token(
 /// could not be completed: the database could not answer
 /// ([`AppError::is_db_unavailable`]) or the bcrypt concurrency cap shed the
 /// request. That answers a retryable 503, because docker and CI clients abort
-/// or re-prompt on 401 but retry on 503.
+/// or re-prompt on 401 but retry on 503. `RateLimited` means a Basic password
+/// was refused unverified because its login budget is spent (#5485): 429 with
+/// `Retry-After`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OciAuthError {
     Invalid,
     Unavailable,
+    RateLimited(u64),
 }
 
 impl OciAuthError {
@@ -393,12 +397,46 @@ fn oci_auth_unavailable() -> Response {
     resp
 }
 
+/// 429 for a Basic password refused because its login budget is spent
+/// (#5485), in the registry's error envelope.
+fn oci_auth_rate_limited(retry_after: u64) -> Response {
+    let mut resp = oci_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "TOOMANYREQUESTS",
+        "too many failed authentication attempts, retry later",
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retry_after.to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    resp
+}
+
 /// The response for a failed `/v2` authentication: the 401 challenge for a
 /// bad credential, a retryable 503 when validation could not be completed.
 fn oci_auth_failure(error: OciAuthError, base_url: &str, scope: Option<&str>) -> Response {
     match error {
         OciAuthError::Invalid => unauthorized_challenge_with_scope(base_url, scope),
         OciAuthError::Unavailable => oci_auth_unavailable(),
+        OciAuthError::RateLimited(retry_after) => oci_auth_rate_limited(retry_after),
+    }
+}
+
+/// The local-password arm of an OCI Basic credential (#5485, #5683): the
+/// middleware's [`verify_basic_password`], so a `/v2` Basic password costs
+/// one bcrypt under the same login budget as every other Basic surface.
+async fn oci_basic_password(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+) -> Result<User, OciAuthError> {
+    match verify_basic_password(auth_service, username, password).await {
+        BasicPasswordOutcome::Verified(user) => Ok(*user),
+        BasicPasswordOutcome::RateLimited(retry_after) => {
+            Err(OciAuthError::RateLimited(retry_after))
+        }
+        BasicPasswordOutcome::Overloaded => Err(OciAuthError::Unavailable),
+        BasicPasswordOutcome::Rejected { .. } => Err(OciAuthError::Invalid),
     }
 }
 
@@ -574,22 +612,31 @@ async fn verify_oci_credential(
         OciCredential::Basic { username, password } => {
             let auth_service = AuthService::new(db.clone(), Arc::new(config.clone()));
 
-            // Try API token in the password field first (service accounts, CI
-            // pipelines, registry mirrors, curl scripts). #1195: `authenticate`
-            // bumps `users.failed_login_attempts` on every bcrypt miss, so any
-            // OCI verb (manifest GET, blob HEAD, blob PUT, etc.) that
-            // presented Basic `<user>:<api_token>` would lock the service
-            // account out after `account_lockout_threshold` requests. Mirrors
-            // the #1145 fix on `/v2/token`. `validate_api_token` has no
-            // failure-counter side effect and rejects a credential that is
-            // not a live token before any bcrypt (#5633), so this reorder
-            // costs a real password nothing. The username from Basic
-            // auth is ignored when an API token validates (matching the
-            // /v2/token behavior): the token itself identifies the user.
-            let validated = match auth_service.validate_api_token(&password).await {
-                Ok(validation) => Some(validation),
-                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
-                Err(_) => None,
+            // The password is classified by its shape, exactly like the auth
+            // middleware's `resolve_basic_pair` (#5640, #5683), cheapest check
+            // first, and a token-shaped secret is only ever a token:
+            //
+            // * API-token-shaped: only an API token (service accounts, CI
+            //   pipelines, registry mirrors, curl scripts). #1195: trying the
+            //   password first bumped `failed_login_attempts` on every OCI
+            //   verb presenting Basic `<user>:<api_token>`. And falling
+            //   through to the password check after a token miss cost a dead
+            //   token a cost-12 bcrypt and an auth-capacity permit on every
+            //   `docker` retry (#5683); `validate_api_token` refuses an
+            //   unknown, revoked or expired token before any bcrypt (#5633).
+            //   The Basic username is ignored when the token validates
+            //   (matching `/v2/token`): the token identifies the user.
+            // * JWT-shaped: only an AK access token (HMAC, no bcrypt), below.
+            // * Anything else: one password check under the Basic-password
+            //   login budget (`oci_basic_password`, #5485).
+            let validated = if is_api_token_shape(&password) {
+                match auth_service.validate_api_token(&password).await {
+                    Ok(validation) => Some(validation),
+                    Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
+                    Err(_) => return Err(OciAuthError::Invalid),
+                }
+            } else {
+                None
             };
             if let Some(validation) = validated {
                 let scopes = validation.scopes.clone();
@@ -619,15 +666,16 @@ async fn verify_oci_credential(
                 return Ok((claims, Some(scopes)));
             }
 
-            // Fall through to username/password authentication. Re-generate
+            // Username/password authentication for a secret that is not
+            // token-shaped; a rejection ends the chain. Re-generate
             // short-lived claims so downstream code has a consistent Claims
             // value regardless of the authentication method.
-            let authenticated = match auth_service.authenticate(&username, &password).await {
-                Ok(pair) => Some(pair),
-                Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
-                Err(_) => None,
+            let authenticated = if is_jwt_shape(&password) {
+                None
+            } else {
+                Some(oci_basic_password(&auth_service, &username, &password).await?)
             };
-            if let Some((user, _tokens)) = authenticated {
+            if let Some(user) = authenticated {
                 let claims = auth_service
                     .generate_tokens(&user)
                     .map_err(|_| OciAuthError::Invalid)
@@ -639,9 +687,10 @@ async fn verify_oci_credential(
                 return Ok((claims, None));
             }
 
-            // Final fallback: accept a valid AK access token (JWT) as the Docker
-            // password. Enables the CI/CD keyless push flow where the token from
-            // the OIDC exchange is used directly as the Docker credential.
+            // A JWT-shaped password: accept a valid AK access token as the
+            // Docker password. Enables the CI/CD keyless push flow where the
+            // token from the OIDC exchange is used directly as the Docker
+            // credential.
             let jwt_claims = match auth_service.validate_access_token_async(&password).await {
                 Ok(claims) => Some(claims),
                 Err(e) if unavailable(&e) => return Err(OciAuthError::Unavailable),
@@ -5352,6 +5401,7 @@ async fn handle_refresh_grant(state: &SharedState, form: &TokenForm) -> Response
 async fn token(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    pad_budget: Option<Extension<crate::api::middleware::rate_limit::LoginPadBudget>>,
     query: Result<Query<TokenQuery>, QueryRejection>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -5452,7 +5502,8 @@ async fn token(
                 // #4750: an outage while checking a presented JWT is a
                 // retryable 503, not "invalid credentials".
                 Err(OciAuthError::Unavailable) => return oci_auth_unavailable(),
-                Err(OciAuthError::Invalid) => None,
+                // A Bearer credential has no password budget to spend.
+                Err(OciAuthError::Invalid | OciAuthError::RateLimited(_)) => None,
             };
             if let Some(claims) = bearer_claims {
                 let auth_service =
@@ -5645,115 +5696,137 @@ async fn token(
     };
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
-    // Try the API-token path first, fall back to username/password.
+    // Classified by the password's shape, like `resolve_basic_pair` in the
+    // auth middleware (#5640, #5683): cheapest check first, and never a
+    // password bcrypt (or an auth-capacity permit) for an issued-token-shaped
+    // secret.
     //
-    // Reverse order — `authenticate(username, api_token)` first — increments
-    // `failed_login_attempts` on every CI push that uses an API token in the
-    // password field (the standard `docker login -p $API_TOKEN` flow), since
-    // bcrypt-comparing the token against the user's password hash always
-    // fails. After `account_lockout_threshold` builds the service account
-    // locks itself out. `validate_api_token` has no failure-counter side
-    // effect, so trying it first keeps the lockout counter accurate while
-    // still falling through to bcrypt for actual passwords.
-    let (user, tokens, authenticated_via_api_token) =
-        match auth_service.validate_api_token(&credentials.1).await {
-            // #4750: validation that could not be completed is a retryable 503;
-            // falling through to the next credential shape would end in a 401.
+    // * API-token-shaped: only an API token. Trying `authenticate(username,
+    //   api_token)` first incremented `failed_login_attempts` on every CI push
+    //   using the standard `docker login -p $API_TOKEN` flow (#1145), and
+    //   falling through to it after a token miss still cost a dead token a
+    //   cost-12 bcrypt and an auth-capacity permit. `validate_api_token` has
+    //   no failure-counter side effect and refuses an unknown, revoked or
+    //   expired token before any bcrypt (#5633).
+    // * JWT-shaped: only an AK access token (HMAC, no bcrypt), the CI/CD
+    //   keyless push flow:
+    //     1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
+    //     2. docker login -u <ci-user> -p <access_token>  (this path)
+    //     3. docker push ...
+    //   This mirrors how Artifactory handles its OIDC-issued tokens.
+    // * Anything else: the username/password check (one bcrypt).
+    let password = credentials.1.as_str();
+    let invalid = || {
+        oci_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "invalid username or password",
+        )
+    };
+    let (user, tokens, authenticated_via_api_token) = if is_api_token_shape(password) {
+        match auth_service.validate_api_token(password).await {
+            // Carry the token's repository and action ceilings onto the minted
+            // OCI bearer (#2290/#2430) and cap it at the token's own expiry
+            // (#3460); `api_token_exchange_response` is shared with the Bearer
+            // slot so the two cannot drift.
+            Ok(validation) => return api_token_exchange_response(&auth_service, validation),
+            // #4750: validation that could not be completed is a retryable
+            // 503, not a 401.
             Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
                 return oci_auth_unavailable()
             }
-            Ok(validation) => {
-                // Carry the token's repository and action ceilings onto the minted
-                // OCI bearer (#2290/#2430) and cap it at the token's own expiry
-                // (#3460); `api_token_exchange_response` is shared with the Bearer
-                // slot so the two cannot drift.
-                return api_token_exchange_response(&auth_service, validation);
+            Err(e) => {
+                record_token_auth_failure(AuthFailureReason::for_token_error(
+                    &e,
+                    AuthFailureReason::InvalidToken,
+                ));
+                return invalid();
             }
-            Err(_) => match auth_service
-                .authenticate_with_reason(&credentials.0, &credentials.1)
-                .await
-            {
-                Ok((user, tokens)) => (user, tokens, false),
-                Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
-                    return oci_auth_unavailable()
-                }
-                Err(password_failure) => {
-                    // Final fallback: accept a valid AK access token (JWT) as the
-                    // Docker password. This enables the CI/CD keyless push flow:
-                    //   1. Exchange GitHub OIDC JWT → AK access_token  (ci_auth handler)
-                    //   2. docker login -u <ci-user> -p <access_token>  (this path)
-                    //   3. docker push ...
-                    // This mirrors how Artifactory handles its OIDC-issued tokens.
-                    match auth_service
-                        .validate_access_token_async(&credentials.1)
-                        .await
-                    {
-                        Ok(claims) => {
-                            let user = match sqlx::query_as::<_, User>(
-                                "SELECT * FROM users WHERE id = $1",
-                            )
-                            .bind(claims.sub)
-                            .fetch_one(&state.db)
-                            .await
-                            {
-                                Ok(u) => u,
-                                Err(ref e)
-                                    if AppError::Database(e.to_string()).is_db_unavailable() =>
-                                {
-                                    return oci_auth_unavailable()
-                                }
-                                Err(_) => {
-                                    return oci_error(
-                                        StatusCode::UNAUTHORIZED,
-                                        "UNAUTHORIZED",
-                                        "user not found",
-                                    )
-                                }
-                            };
-                            // Preserve the incoming access token's action-scope
-                            // ceiling and repository scope on the re-minted bearer
-                            // so this keyless fallback cannot re-widen a restricted
-                            // token (#2430/#2290). Cap at the presented token's
-                            // `exp` (#3460): the re-mint must not extend lifetime.
-                            let tokens = match auth_service.generate_tokens_with_scope_capped(
-                                &user,
-                                claims.scopes.clone(),
-                                claims.allowed_repo_ids.clone(),
-                                chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
-                            ) {
-                                Ok(t) => t,
-                                Err(_) => {
-                                    return oci_error(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "INTERNAL_ERROR",
-                                        "failed to generate tokens",
-                                    )
-                                }
-                            };
-                            // Treat like an API token: bypass the TOTP guard below.
-                            (user, tokens, true)
-                        }
-                        Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
-                            return oci_auth_unavailable()
-                        }
-                        Err(_) => {
-                            // Neither an API token, a password nor an access
-                            // token: count it as the password rejection (#4676).
-                            record_token_auth_failure(
-                                password_failure
-                                    .metric_reason()
-                                    .unwrap_or(AuthFailureReason::BadPassword),
-                            );
-                            return oci_error(
-                                StatusCode::UNAUTHORIZED,
-                                "UNAUTHORIZED",
-                                "invalid username or password",
-                            );
-                        }
+        }
+    } else if is_jwt_shape(password) {
+        match auth_service.validate_access_token_async(password).await {
+            Ok(claims) => {
+                let user = match sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+                    .bind(claims.sub)
+                    .fetch_one(&state.db)
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(ref e) if AppError::Database(e.to_string()).is_db_unavailable() => {
+                        return oci_auth_unavailable()
                     }
-                }
-            },
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::UNAUTHORIZED,
+                            "UNAUTHORIZED",
+                            "user not found",
+                        )
+                    }
+                };
+                // Preserve the incoming access token's action-scope ceiling and
+                // repository scope on the re-minted bearer so this keyless path
+                // cannot re-widen a restricted token (#2430/#2290). Cap at the
+                // presented token's `exp` (#3460): the re-mint must not extend
+                // lifetime.
+                let tokens = match auth_service.generate_tokens_with_scope_capped(
+                    &user,
+                    claims.scopes.clone(),
+                    claims.allowed_repo_ids.clone(),
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(claims.exp, 0),
+                ) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        return oci_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "INTERNAL_ERROR",
+                            "failed to generate tokens",
+                        )
+                    }
+                };
+                // Treat like an API token: bypass the TOTP guard below.
+                (user, tokens, true)
+            }
+            Err(ref e) if OciAuthError::classify(e) == OciAuthError::Unavailable => {
+                return oci_auth_unavailable()
+            }
+            Err(e) => {
+                record_token_auth_failure(AuthFailureReason::for_token_error(
+                    &e,
+                    AuthFailureReason::InvalidToken,
+                ));
+                return invalid();
+            }
+        }
+    } else {
+        // The password arm pays the bcrypt timing pad while this source IP is
+        // within its failed-login budget, which the `/v2/token` rate-limit
+        // middleware computes exactly as for `/api/v1/auth/login` (#5485): an
+        // unknown or federated username then costs the same bcrypt as a wrong
+        // password for a real account. An absent extension (the handler
+        // mounted without that middleware) pads, the safe default.
+        let pad = match pad_budget {
+            Some(Extension(budget)) if !budget.within_budget => TimingPad::Off,
+            _ => TimingPad::On,
         };
+        match auth_service
+            .authenticate_basic_with_reason(&credentials.0, password, pad)
+            .await
+        {
+            Ok((user, tokens)) => (user, tokens, false),
+            Err(ref f) if OciAuthError::classify(&f.error) == OciAuthError::Unavailable => {
+                return oci_auth_unavailable()
+            }
+            Err(password_failure) => {
+                // Count it as the password rejection (#4676).
+                record_token_auth_failure(
+                    password_failure
+                        .metric_reason()
+                        .unwrap_or(AuthFailureReason::BadPassword),
+                );
+                return invalid();
+            }
+        }
+    };
 
     // Block password-based OCI token requests when the user has TOTP 2FA
     // enabled. Docker CLI cannot perform a TOTP challenge, so the user
@@ -5841,7 +5914,8 @@ async fn version_check(
         // #4750: a presented credential that could not be checked is a
         // retryable 503, not a 401 that makes `docker login` give up.
         Err(OciAuthError::Unavailable) => return oci_auth_unavailable(),
-        Err(OciAuthError::Invalid) => {}
+        // A Bearer credential has no password budget to spend.
+        Err(OciAuthError::Invalid | OciAuthError::RateLimited(_)) => {}
     }
 
     // Accept Basic Auth directly (curl -u user:pass, HTTP clients)
@@ -5856,30 +5930,30 @@ async fn version_check(
             }
             Err(_) => None,
         };
-        // API token in the password field first (#5640): it answers from the
-        // token cache and rejects a non-token shape without bcrypt, whereas
-        // trying the password first cost every `user:<api_token>` probe a
-        // cost-12 bcrypt before the token was even looked at.
-        if let Some(resp) = outcome(auth_service.validate_api_token(&password).await.map(|_| ())) {
-            return resp;
-        }
-        if let Some(resp) = outcome(
-            auth_service
-                .authenticate(&username, &password)
-                .await
-                .map(|_| ()),
-        ) {
-            return resp;
-        }
-
-        // Final fallback: accept AK JWT access token in the Basic password field.
-        // This enables CI keyless flows that use `docker login -u <ci-user> -p <access_token>`.
-        if let Some(resp) = outcome(
-            auth_service
-                .validate_access_token_async(&password)
-                .await
-                .map(|_| ()),
-        ) {
+        // Classified by the password's shape like `resolve_basic_pair`
+        // (#5640, #5683): an API-token-shaped secret is only an API token (it
+        // answers from the token cache, and a dead one is refused without a
+        // bcrypt or an auth permit), a JWT-shaped one only an AK access token
+        // (the CI keyless `docker login -u <ci-user> -p <access_token>`), and
+        // anything else one password check under the Basic-password login
+        // budget (#5485).
+        let checked = if is_api_token_shape(&password) {
+            outcome(auth_service.validate_api_token(&password).await.map(|_| ()))
+        } else if is_jwt_shape(&password) {
+            outcome(
+                auth_service
+                    .validate_access_token_async(&password)
+                    .await
+                    .map(|_| ()),
+            )
+        } else {
+            match oci_basic_password(&auth_service, &username, &password).await {
+                Ok(_) => Some(version_check_ok()),
+                Err(OciAuthError::Invalid) => None,
+                Err(error) => Some(oci_auth_failure(error, base_url.as_str(), None)),
+            }
+        };
+        if let Some(resp) = checked {
             return resp;
         }
     }
@@ -18512,6 +18586,318 @@ mod tests {
             super::finalize_upstream_manifest("SHA256:nope", body.clone(), None)
                 .expect("malformed digest reference must be treated as a tag");
         assert_eq!(returned_digest, super::compute_sha256(&body));
+    }
+
+    // -----------------------------------------------------------------------
+    // #5683: the OCI Basic paths (`GET /v2/`, `verify_oci_credential` behind
+    // every manifest/blob verb, and `/v2/token`) classify the password by
+    // shape like the auth middleware's `resolve_basic_pair` (#5640): a dead
+    // token-shaped password is refused without a password bcrypt, i.e.
+    // without an auth-capacity permit, and only a real password pays one.
+    //
+    // Counted, not timed, exactly like `basic_token_first_5640` in
+    // `middleware/auth.rs`: `bcrypt_verify_counter` counts every
+    // `AuthService::verify_password` call, the only place the permit is
+    // taken. nextest's process-per-test isolation keeps it private.
+    // -----------------------------------------------------------------------
+    mod oci_basic_token_first_5683 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const SECRET: &str = "test-secret-at-least-32-bytes-long-for-5683";
+        const PASSWORD: &str = "Correct-Horse-Battery-5683";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic_headers(username: &str, password: &str) -> HeaderMap {
+            let enc =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {enc}")).expect("header value"),
+            );
+            headers
+        }
+
+        /// A local account with a real (cost-4) password hash, hashed with
+        /// `bcrypt::hash` directly so seeding takes no permit and no count.
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("ph-5683-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        async fn failed_logins(pool: &sqlx::PgPool, user_id: Uuid) -> i32 {
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("read failed_login_attempts")
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        async fn v2_status(state: &SharedState, headers: HeaderMap) -> StatusCode {
+            version_check(
+                State(state.clone()),
+                headers,
+                RequestBaseUrl("http://localhost:8080".to_string()),
+            )
+            .await
+            .status()
+        }
+
+        async fn token_status(state: &SharedState, headers: HeaderMap) -> StatusCode {
+            token(
+                State(state.clone()),
+                headers,
+                None,
+                Ok(Query(TokenQuery {
+                    service: None,
+                    account: None,
+                    offline_token: None,
+                })),
+                Ok(Bytes::new()),
+            )
+            .await
+            .status()
+        }
+
+        /// `(minted, expired, revoked)` API tokens for `user_id`.
+        async fn tokens(svc: &AuthService, pool: &sqlx::PgPool, user_id: Uuid) -> [String; 3] {
+            let mut out = Vec::new();
+            let mut ids = Vec::new();
+            for name in ["live", "expired", "revoked"] {
+                let (token, id) = svc
+                    .generate_api_token(user_id, name, vec!["read:artifacts".into()], None)
+                    .await
+                    .expect("mint token");
+                out.push(token);
+                ids.push(id);
+            }
+            sqlx::query(
+                "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1",
+            )
+            .bind(ids[1])
+            .execute(pool)
+            .await
+            .expect("expire");
+            sqlx::query("UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1")
+                .bind(ids[2])
+                .execute(pool)
+                .await
+                .expect("revoke");
+            out.try_into().expect("three tokens")
+        }
+
+        /// The issue's shape: a dead token as the Basic password on `GET
+        /// /v2/`, on an OCI verb (`verify_oci_credential`) and on
+        /// `/v2/token` is a 401 with no bcrypt and no failed-login write.
+        /// Before the fix each of them fell through to the password check
+        /// and paid a bcrypt (and an auth permit) per request.
+        #[tokio::test]
+        async fn oci_basic_dead_token_runs_no_bcrypt() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = test_state_with_secret_and_pool(SECRET, pool.clone());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let (user_id, username) = local_user(&pool).await;
+            let [_live, expired, revoked] = tokens(&svc, &pool, user_id).await;
+            let never_minted = format!("deadbeef_{}", Uuid::new_v4().simple());
+            // JWT-shaped, signed with a key this server does not hold.
+            let foreign_jwt =
+                mint_access_jwt("some-other-secret-at-least-32-bytes", user_id, &username);
+
+            let before = verifies();
+            let mut answers = Vec::new();
+            for secret in [&never_minted, &expired, &revoked, &foreign_jwt] {
+                let headers = basic_headers(&username, secret);
+                answers.push((
+                    secret.clone(),
+                    v2_status(&state, headers.clone()).await,
+                    verify_oci_credential(&state.db, &state.config, &headers)
+                        .await
+                        .err(),
+                    token_status(&state, headers).await,
+                ));
+            }
+            let ran = verifies() - before;
+            let failed = failed_logins(&pool, user_id).await;
+            drop_user(&pool, user_id).await;
+
+            for (secret, v2, verb, exchange) in answers {
+                assert_eq!(v2, StatusCode::UNAUTHORIZED, "GET /v2/ with {secret}");
+                assert_eq!(verb, Some(OciAuthError::Invalid), "OCI verb with {secret}");
+                assert_eq!(
+                    exchange,
+                    StatusCode::UNAUTHORIZED,
+                    "/v2/token with {secret}"
+                );
+            }
+            assert_eq!(
+                ran, 0,
+                "dead tokens as the OCI Basic password ran {ran} bcrypt verifies (each one \
+                 takes an auth-capacity permit, #5683)"
+            );
+            assert_eq!(failed, 0, "a dead token is not a failed login");
+        }
+
+        /// Positive controls: a live API token, a live access token and the
+        /// real password still authenticate on all three paths; a live token
+        /// costs only its own verify, and a wrong password still pays exactly
+        /// one bcrypt on each path.
+        #[tokio::test]
+        async fn oci_basic_live_credentials_still_authenticate() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let state = test_state_with_secret_and_pool(SECRET, pool.clone());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+            let (user_id, username) = local_user(&pool).await;
+            let [live, _expired, _revoked] = tokens(&svc, &pool, user_id).await;
+            let jwt = mint_access_jwt(SECRET, user_id, &username);
+
+            let mut answers = Vec::new();
+            for secret in [&live, &jwt, &PASSWORD.to_string()] {
+                let headers = basic_headers(&username, secret);
+                answers.push((
+                    secret.clone(),
+                    v2_status(&state, headers.clone()).await,
+                    verify_oci_credential(&state.db, &state.config, &headers)
+                        .await
+                        .map(|(claims, _)| claims.sub)
+                        .ok(),
+                    token_status(&state, headers).await,
+                ));
+            }
+
+            // A live token costs exactly its own verify on each path (each
+            // handler builds its own `AuthService`, so there is no shared
+            // token cache to hit), never a second, password bcrypt.
+            let headers = basic_headers(&username, &live);
+            let before = verifies();
+            let cached = (
+                v2_status(&state, headers.clone()).await,
+                verify_oci_credential(&state.db, &state.config, &headers)
+                    .await
+                    .is_ok(),
+                token_status(&state, headers).await,
+            );
+            let cached_cost = verifies() - before;
+
+            let headers = basic_headers(&username, "wrong-password");
+            let mut wrong = Vec::new();
+            for path in 0..3 {
+                let before = verifies();
+                let status = match path {
+                    0 => v2_status(&state, headers.clone()).await,
+                    1 => match verify_oci_credential(&state.db, &state.config, &headers).await {
+                        Ok(_) => StatusCode::OK,
+                        Err(_) => StatusCode::UNAUTHORIZED,
+                    },
+                    _ => token_status(&state, headers.clone()).await,
+                };
+                wrong.push((path, status, verifies() - before));
+            }
+            drop_user(&pool, user_id).await;
+
+            for (secret, v2, verb, exchange) in answers {
+                assert_eq!(v2, StatusCode::OK, "GET /v2/ with {secret}");
+                assert_eq!(verb, Some(user_id), "OCI verb with {secret}");
+                assert_eq!(exchange, StatusCode::OK, "/v2/token with {secret}");
+            }
+            assert_eq!(cached, (StatusCode::OK, true, StatusCode::OK));
+            assert_eq!(cached_cost, 3, "a live API token costs one verify per path");
+            for (path, status, cost) in wrong {
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "path {path}");
+                assert_eq!(cost, 1, "a wrong password pays one bcrypt on path {path}");
+            }
+        }
+        /// #5485: the OCI Basic password arm draws on the Basic-password
+        /// login budget like every other Basic surface. Once the
+        /// (username, IP) failure budget is spent, `GET /v2/` and an OCI verb
+        /// answer 429 with `Retry-After` and run no bcrypt.
+        #[tokio::test]
+        async fn oci_basic_password_is_refused_once_the_budget_is_spent() {
+            use crate::api::middleware::client_ip::with_client_ip_scope;
+            use crate::api::middleware::rate_limit::{
+                install_basic_password_budget, LoginRateLimitState, RateLimitExemptions,
+                RateLimitState, RateLimiter,
+            };
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            install_basic_password_budget(LoginRateLimitState {
+                inner: RateLimitState {
+                    limiter: Arc::new(RateLimiter::new(1, 900)),
+                    exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                    enabled: true,
+                    trusted_proxies: Arc::new(Vec::new()),
+                },
+                backstop: Arc::new(RateLimiter::new(1_000_000, 900)),
+                failed_by_ip: Arc::new(RateLimiter::new(1_000, 900)),
+                audit: None,
+            });
+            let state = test_state_with_secret_and_pool(SECRET, pool.clone());
+            let (user_id, username) = local_user(&pool).await;
+            let ip: std::net::IpAddr = "198.51.100.21".parse().unwrap();
+            let wrong = basic_headers(&username, "wrong-password");
+            let right = basic_headers(&username, PASSWORD);
+
+            let first = with_client_ip_scope(Some(ip), v2_status(&state, wrong.clone())).await;
+            let before = verifies();
+            let refused = with_client_ip_scope(Some(ip), async {
+                version_check(
+                    State(state.clone()),
+                    right.clone(),
+                    RequestBaseUrl("http://localhost:8080".to_string()),
+                )
+                .await
+            })
+            .await;
+            let verb = with_client_ip_scope(
+                Some(ip),
+                verify_oci_credential(&state.db, &state.config, &right),
+            )
+            .await
+            .err();
+            let ran = verifies() - before;
+            drop_user(&pool, user_id).await;
+
+            assert_eq!(first, StatusCode::UNAUTHORIZED);
+            assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(refused
+                .headers()
+                .contains_key(axum::http::header::RETRY_AFTER));
+            assert!(matches!(verb, Some(OciAuthError::RateLimited(s)) if s > 0));
+            assert_eq!(ran, 0, "a refused Basic password runs no bcrypt");
+        }
     }
 }
 
@@ -45137,6 +45523,7 @@ mod token_exchange_expiry_cap_3460 {
         let resp = token(
             State(state),
             headers,
+            None,
             Ok(Query(TokenQuery {
                 service: None,
                 account: None,
@@ -45279,6 +45666,7 @@ mod token_exchange_bearer_api_token_4903 {
         token(
             State(state),
             headers,
+            None,
             Ok(Query(TokenQuery {
                 service: Some(OCI_TOKEN_SERVICE.to_string()),
                 account: None,
