@@ -515,6 +515,7 @@ async fn upload_plugin(
     crate::services::package_service::register_published_package(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         "jetbrains",
         &plugin_name,

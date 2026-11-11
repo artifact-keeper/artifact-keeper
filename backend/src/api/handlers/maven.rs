@@ -5367,6 +5367,7 @@ async fn upload(
     crate::services::package_service::register_published_package_with_metadata(
         &state.db,
         &state.event_bus,
+        crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
         repo.id,
         &package_name,
         &coords.version,
@@ -7227,6 +7228,68 @@ mod tests {
         assert!(xml.contains("<extension>jar</extension>"));
         assert!(xml.contains("<extension>pom</extension>"));
         assert!(xml.contains("<value>1.0-20260702.120000-1</value>"));
+    }
+
+    /// #5573: a Maven publish's `artifact.uploaded` event names the row the
+    /// PUT wrote, as the handler holds it. It used to re-select the newest
+    /// live row with the same `(repository_id, checksum_sha256)`: a query no
+    /// index serves (the top database cost of a busy hosted Maven repository)
+    /// that names another file when the repository already holds the same
+    /// bytes at a different path with a later `created_at`.
+    #[tokio::test]
+    async fn publish_event_names_the_written_row_not_a_checksum_twin_5573() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let body = bytes::Bytes::from_static(b"ak-5573 shared jar bytes");
+        let checksum = format!("{:x}", Sha256::digest(&body));
+        // The same bytes, already live at another coordinate and ordered
+        // after the row the PUT is about to write.
+        let twin: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key, created_at) \
+             VALUES ($1, 'org/example/ak5573/twin/1.0/twin-1.0.jar', 'twin', '1.0', $2, $3, \
+                     'application/java-archive', 'ak5573-twin', NOW() + INTERVAL '1 hour') \
+             RETURNING id",
+        )
+        .bind(fx.repo_id)
+        .bind(body.len() as i64)
+        .bind(&checksum)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("seed the checksum twin");
+
+        let path = "org/example/ak5573/lib/1.0/lib-1.0.jar";
+        let mut events = fx.state.event_bus.subscribe();
+        let (status, response) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(format!("/{}/{path}", fx.repo_key), body),
+        )
+        .await;
+        let written = tdh::artifact_id_at(&fx.pool, fx.repo_id, path).await;
+        let uploaded: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| e.event_type == "artifact.uploaded")
+            .collect();
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "Maven PUT must create {path}; body={}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_ne!(written, twin);
+        assert_eq!(uploaded.len(), 1, "exactly one event: {uploaded:?}");
+        assert_eq!(
+            uploaded[0].entity_id,
+            written.to_string(),
+            "the event must name the row the PUT wrote, not the checksum twin {twin}"
+        );
+        assert_eq!(uploaded[0].repository_id, Some(fx.repo_id));
+        assert_eq!(uploaded[0].actor, Some(fx.user_id.to_string()));
     }
 
     /// #4889 decision: a client-deployed `maven-metadata.xml` stays row-less

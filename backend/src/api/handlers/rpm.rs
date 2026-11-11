@@ -3605,6 +3605,7 @@ async fn store_rpm(
         crate::services::package_service::register_published_package(
             &state.db,
             &state.event_bus,
+            crate::services::package_service::PublishedArtifact::new(artifact_id, user_id),
             repo.id,
             "rpm",
             &pkg_name,

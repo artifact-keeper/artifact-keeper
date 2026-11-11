@@ -12762,6 +12762,7 @@ async fn commit_pushed_manifest(
         crate::services::package_service::register_published_package_with_metadata(
             &state.db,
             &state.event_bus,
+            crate::services::package_service::PublishedArtifact::new(artifact_id, m.uploaded_by),
             m.repo_id,
             m.image,
             m.reference,
