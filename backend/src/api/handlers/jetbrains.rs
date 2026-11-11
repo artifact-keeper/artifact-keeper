@@ -439,7 +439,15 @@ async fn upload_plugin(
     // Store the file — streamed from the staged scratch file, not a heap
     // buffer. `put_artifact_stream` performs the cross-repo write guard itself
     // and unlinks the scratch file on every exit path.
-    let storage_key = format!("jetbrains/{}/{}/{}", plugin_name, plugin_version, filename);
+    // The key is repo-scoped on a shared cloud namespace (#5662), so two
+    // repositories holding the same version do not collide on one key; reads
+    // go through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "jetbrains",
+        repo.id,
+        &format!("{}/{}/{}", plugin_name, plugin_version, filename),
+    );
     let size_bytes = staged.size_bytes();
     proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
 
@@ -1421,6 +1429,34 @@ mod tests {
             "a raw upload -> download round trip must return the exact uploaded bytes"
         );
         assert_eq!(stored, Some((expected_sha, zip.len() as i64)));
+    }
+
+    /// #5662: the same plugin version uploads into two JetBrains repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_plugin_version_uploads_to_two_cloud_repositories_5662() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let zip = binary_plugin_zip();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "jetbrains",
+            key_prefix: "jetbrains",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/plugin/uploadPlugin"),
+                    "multipart/form-data; boundary=JBBND5662",
+                    multipart_body("JBBND5662", &zip, "com.example.scoped5662", "1.0.0"),
+                )]
+            },
+            download: &|key| {
+                tdh::get(format!(
+                    "/{key}/plugin/download/com.example.scoped5662/1.0.0"
+                ))
+            },
+            expected: &zip,
+        })
+        .await;
     }
 
     /// #4725: a plugin upload to a hosted repository must queue a push sync

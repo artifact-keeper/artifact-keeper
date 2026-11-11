@@ -1068,12 +1068,21 @@ async fn upload_chart(
     // retry cannot collide with a half-finished predecessor in
     // `ensure_unique_artifact_path` and get a 409 it can never clear. An
     // orphaned object left in storage by an interrupted upload is overwritten
-    // by that retry -- the storage key is fully determined by chart name and
-    // version.
+    // by that retry -- the storage key is fully determined by the repository,
+    // chart name and version.
 
     // Stream the staged archive into the repo's StorageBackend via `put_stream`,
     // which computes the SHA-256 incrementally as it copies (no re-hash pass).
-    let storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, filename);
+    // The key is repo-scoped on a shared cloud namespace (#5662), so two
+    // repositories holding the same version do not collide on one key; reads
+    // go through the row's storage_key, so legacy flat-key rows keep serving.
+    let key_scheme = crate::storage::StorageKeyScheme::from_env();
+    let storage_key = key_scheme.write_key(
+        &repo.storage_backend,
+        "helm",
+        repo.id,
+        &format!("{}/{}/{}", chart_name, chart_version, filename),
+    );
     let put = proxy_helpers::put_artifact_stream(&state, &repo, &storage_key, staged).await?;
     let computed_sha256 = put.checksum_sha256;
 
@@ -1084,7 +1093,13 @@ async fn upload_chart(
     // through to a `{"saved":true}` reply while the prov is on the floor, and
     // must never leave behind a chart that advertises provenance it cannot
     // serve.
-    let prov_storage_key = format!("helm/{}/{}/{}", chart_name, chart_version, prov_filename);
+    // Repo-scoped beside its chart (#5662).
+    let prov_storage_key = key_scheme.write_key(
+        &repo.storage_backend,
+        "helm",
+        repo.id,
+        &format!("{}/{}/{}", chart_name, chart_version, prov_filename),
+    );
     let prov_put = match staged_prov {
         Some(prov) => {
             Some(proxy_helpers::put_artifact_stream(&state, &repo, &prov_storage_key, prov).await?)
@@ -2446,6 +2461,35 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
             multipart_body("BOUNDARY", parts),
         );
         tdh::send(app, req).await
+    }
+
+    /// #5662: the same signed chart version (chart and `.prov`) uploads into
+    /// two Helm repositories on a shared cloud namespace (on main the second
+    /// answered 409).
+    #[tokio::test]
+    async fn same_chart_version_uploads_to_two_cloud_repositories_5662() {
+        let tgz = signed_chart_tgz();
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "helm",
+            key_prefix: "helm",
+            router: super::router,
+            publish: &|key| {
+                vec![tdh::post(
+                    format!("/{key}/api/charts"),
+                    "multipart/form-data; boundary=BOUNDARY",
+                    multipart_body(
+                        "BOUNDARY",
+                        &[
+                            ("chart", "provchart-0.1.0.tgz", &tgz),
+                            ("prov", "provchart-0.1.0.tgz.prov", REAL_PROV),
+                        ],
+                    ),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/charts/provchart-0.1.0.tgz")),
+            expected: &tgz,
+        })
+        .await;
     }
 
     // -----------------------------------------------------------------------
