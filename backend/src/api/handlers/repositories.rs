@@ -11116,36 +11116,11 @@ pub async fn get_artifact_metadata(
             }
         }
 
-        let ct = result
-            .content_type
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-        let filename = path.rsplit('/').next().unwrap_or(&path);
-
         // Stream the member's artifact body straight through instead of
-        // buffering it; Content-Length comes from the resolved member's
-        // size_bytes when known.
-        let mut builder = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, ct)
-            .header(
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}\"", filename),
-            )
-            .header(
-                header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                "virtual",
-            );
-        if let Some(size) = result.content_length {
-            builder = builder.header(header::CONTENT_LENGTH, size.to_string());
-        }
-        // #3149: a Remote member resolved through this virtual serve returns
-        // upstream's bytes untouched — the proxy pins `Accept-Encoding:
-        // identity` and does not decode — so a content coding must be
-        // declared or the client saves bytes it cannot inflate. Sourced from
-        // the same `StreamingFetchResult` as the CODED `content_length` above.
-        if let Some(ref encoding) = result.content_encoding {
-            builder = builder.header(header::CONTENT_ENCODING, encoding);
-        }
+        // buffering it.
+        let (upstream_etag, winner_id) = (result.etag.clone(), result.artifact_id);
+        let etag = virtual_member_etag(&state.db, upstream_etag, winner_id).await;
+        let builder = virtual_member_serve_head(&result, &path, etag);
         return Ok(builder.body(Body::from_stream(result.body)).unwrap());
     }
 
@@ -11397,6 +11372,86 @@ fn parse_write_precondition(
 /// (#4186). The value conditional writes compare against.
 pub(crate) fn artifact_etag(checksum_sha256: &str) -> String {
     format!("\"{}\"", checksum_sha256.trim())
+}
+
+/// The strong ETag of the hosted artifact row a Virtual walk served (#5615),
+/// the one the hosted route answers with. `None` when the row cannot be read:
+/// the serve then goes out without a validator, as before.
+async fn virtual_winner_etag(db: &sqlx::PgPool, artifact_id: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|checksum| artifact_etag(&checksum))
+}
+
+/// The validator of a Virtual member serve (#5615): the member result's
+/// upstream ETag, else the hosted winning row's `"<sha256>"`.
+async fn virtual_member_etag(
+    db: &sqlx::PgPool,
+    upstream: Option<String>,
+    artifact_id: Option<Uuid>,
+) -> Option<String> {
+    match (upstream, artifact_id) {
+        (Some(etag), _) => Some(etag),
+        (None, Some(id)) => virtual_winner_etag(db, id).await,
+        (None, None) => None,
+    }
+}
+
+/// The `200` head of a Virtual member serve, shared by the generic download
+/// route and `GET .../artifacts/*path` on a Virtual. It carries:
+///
+/// - `Content-Length` from the resolved member when known;
+/// - the member's content coding (#3149): a Remote member's bytes are
+///   upstream's, untouched (the proxy pins `Accept-Encoding: identity` and
+///   does not decode), so the coding must be declared or the client saves
+///   bytes it cannot inflate;
+/// - the serving member's validator (#5615), so `If-Range` can match: a
+///   Remote member's upstream ETag, or a hosted member's `"<sha256>"`, the
+///   ETag the hosted route answers with;
+/// - the stale-if-error markers (#5616) when the member served under that
+///   grace, as a direct Remote serve carries them.
+///
+/// Set before the HEAD/GET body split so HEAD and GET advertise identical
+/// headers (RFC 9110 §9.3.2).
+///
+/// `etag` comes from [`virtual_member_etag`], awaited by the caller before
+/// this borrow of `result` (its body stream is `Send` but not `Sync`, so a
+/// borrow of it cannot live across an `.await` in a handler future).
+fn virtual_member_serve_head(
+    result: &crate::services::proxy_service::StreamingFetchResult,
+    path: &str,
+    etag: Option<String>,
+) -> axum::http::response::Builder {
+    let content_type = result
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", filename),
+        )
+        .header(
+            header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+            "virtual",
+        );
+    if let Some(size) = result.content_length {
+        builder = builder.header(header::CONTENT_LENGTH, size.to_string());
+    }
+    if let Some(ref encoding) = result.content_encoding {
+        builder = builder.header(header::CONTENT_ENCODING, encoding);
+    }
+    if let Some(value) = etag.and_then(|e| header::HeaderValue::from_str(&e).ok()) {
+        builder = builder.header(header::ETAG, value);
+    }
+    proxy_helpers::apply_stale_markers(builder, result.stale_since)
 }
 
 /// An upload body after staging: a local scratch file, or an object on the
@@ -13911,32 +13966,9 @@ pub async fn download_artifact(
                 }
             }
 
-            let ct = result
-                .content_type
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let filename = path.rsplit('/').next().unwrap_or(&path);
-
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, ct)
-                .header(
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", filename),
-                )
-                .header(
-                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                    "virtual",
-                );
-            if let Some(size) = result.content_length {
-                builder = builder.header(header::CONTENT_LENGTH, size.to_string());
-            }
-            // #3149: as in the virtual-artifact serve above. Set before the
-            // HEAD/GET body split so HEAD and GET advertise identical headers
-            // (RFC 9110 §9.3.2) — a HEAD that hid the coding would mislead a
-            // client that sizes its read from it.
-            if let Some(ref encoding) = result.content_encoding {
-                builder = builder.header(header::CONTENT_ENCODING, encoding);
-            }
+            let (upstream_etag, winner_id) = (result.etag.clone(), result.artifact_id);
+            let etag = virtual_member_etag(&state.db, upstream_etag, winner_id).await;
+            let builder = virtual_member_serve_head(&result, &path, etag);
             let body = if is_head {
                 Body::empty()
             } else {
@@ -18177,6 +18209,153 @@ mod tests {
         assert_eq!(&whole.1[..], &data[..]);
     }
 
+    /// A generic Virtual over one Remote member whose upstream answers
+    /// `upstream` for `pkg/{file}`, with a real proxy service: `(remote_id,
+    /// remote_key, virtual_id, virtual_key, state, cache_dir)`.
+    async fn virtual_over_remote_5615(
+        pool: &sqlx::PgPool,
+        server: &wiremock::MockServer,
+    ) -> (Uuid, String, Uuid, String, SharedState, tempfile::TempDir) {
+        let (remote_id, remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(pool, "generic", &server.uri()).await;
+        tdh::publish_repo(pool, virtual_id).await;
+        let cache = tempfile::tempdir().expect("tempdir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), cache.path().to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(pool.clone(), cache.path().to_str().unwrap(), proxy);
+        (remote_id, remote_key, virtual_id, virtual_key, state, cache)
+    }
+
+    /// #5615: a generic Virtual serve carries the serving Remote member's
+    /// strong ETag, so `If-Range` naming it answers `206` and a stale
+    /// validator answers the whole object. Fails on `main`: the Virtual serve
+    /// set no `ETag`, so `If-Range` never matched (200 every time).
+    #[tokio::test]
+    async fn virtual_over_remote_honours_if_range_with_the_member_etag_5615() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let data = range_payload_5502();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pkg/etag.bin"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("etag", "\"member-v1\"")
+                    .set_body_bytes(data.clone()),
+            )
+            .mount(&server)
+            .await;
+        let (remote_id, _, virtual_id, virtual_key, state, cache) =
+            virtual_over_remote_5615(&pool, &server).await;
+        let uri = format!("/{virtual_key}/download/pkg/etag.bin");
+        let send = |if_range: Option<&'static str>| {
+            let mut req = ranged_get_5502(&uri, if_range.map(|_| "bytes=0-99"));
+            if let Some(validator) = if_range {
+                req.headers_mut()
+                    .insert(header::IF_RANGE, validator.parse().unwrap());
+            }
+            tdh::send_with_headers(tdh::router_anon(download_router(), state.clone()), req)
+        };
+
+        let whole = send(None).await;
+        tdh::wait_for_cache_commit(cache.path(), data.len() as u64).await;
+        let matching = send(Some("\"member-v1\"")).await;
+        let changed = send(Some("\"member-v0\"")).await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(whole.0, StatusCode::OK);
+        assert_eq!(
+            whole.2.get(header::ETAG).and_then(|v| v.to_str().ok()),
+            Some("\"member-v1\""),
+            "the Virtual serve carries the member's validator"
+        );
+        assert_eq!(matching.0, StatusCode::PARTIAL_CONTENT, "If-Range matches");
+        assert_eq!(matching.2[header::CONTENT_RANGE], "bytes 0-99/1000");
+        assert_eq!(&matching.1[..], &data[..100]);
+        assert_eq!(
+            changed.0,
+            StatusCode::OK,
+            "a changed validator: whole object"
+        );
+        assert_eq!(&changed.1[..], &data[..]);
+    }
+
+    /// #5616: a generic Virtual serving a Remote member's body under the
+    /// stale-if-error grace marks it stale (`Warning: 110`,
+    /// `X-AK-Stale-Since`), as the direct Remote serve does. Fails on `main`:
+    /// the body was served stale with neither marker.
+    #[tokio::test]
+    async fn virtual_over_a_stale_member_marks_the_serve_stale_5616() {
+        use crate::services::proxy_cache_scope::ProxyCacheScope;
+        use crate::services::proxy_service::{CacheMetadata, ProxyService};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let server = wiremock::MockServer::start().await;
+        mount_upstream_5502(&server, "pkg/stale.bin", b"cached-body").await;
+        let (remote_id, remote_key, virtual_id, virtual_key, state, cache) =
+            virtual_over_remote_5615(&pool, &server).await;
+        let uri = format!("/{virtual_key}/download/pkg/stale.bin");
+        let send = || {
+            tdh::send_with_headers(
+                tdh::router_anon(download_router(), state.clone()),
+                tdh::get(uri.clone()),
+            )
+        };
+
+        let fresh = send().await;
+        tdh::wait_for_cache_commit(cache.path(), b"cached-body".len() as u64).await;
+        // Age the member's entry past its TTL, inside the stale-if-error
+        // grace, and take the upstream down.
+        let sidecar = cache.path().join(
+            ProxyService::cache_metadata_key(
+                &ProxyCacheScope::unscoped(),
+                &remote_key,
+                "pkg/stale.bin",
+            )
+            .unwrap(),
+        );
+        let mut metadata: CacheMetadata =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        metadata.cached_at = chrono::Utc::now() - chrono::Duration::seconds(1200);
+        metadata.expires_at = chrono::Utc::now() - chrono::Duration::seconds(600);
+        std::fs::write(&sidecar, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        server.reset().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let stale = send().await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(fresh.0, StatusCode::OK);
+        assert!(
+            fresh.2.get(header::WARNING).is_none(),
+            "a fresh serve is unmarked"
+        );
+        assert_eq!(stale.0, StatusCode::OK, "served under stale-if-error");
+        assert_eq!(&stale.1[..], b"cached-body");
+        assert_eq!(
+            stale.2.get(header::WARNING).and_then(|v| v.to_str().ok()),
+            Some(proxy_helpers::STALE_WARNING)
+        );
+        assert!(
+            stale.2.get(proxy_helpers::STALE_SINCE_HEADER).is_some(),
+            "X-AK-Stale-Since on the Virtual serve"
+        );
+    }
+
     /// The Virtual arm ranges a LOCAL member's serve too, when the shadowing
     /// guard finds a non-Remote member owning the path (#5554): `206` for a
     /// window, and a HEAD with `Range` is a `200` describing the whole file.
@@ -18222,6 +18401,23 @@ mod tests {
         let mut head = ranged_get_5502(&uri, Some("bytes=100-199"));
         *head.method_mut() = axum::http::Method::HEAD;
         let head = tdh::send_with_headers(fx.router_with_auth(download_router()), head).await;
+        // #5615: the hosted member's `"<sha256>"` is the Virtual serve's ETag,
+        // so `If-Range` naming it is honoured.
+        let sha: String = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(member_id)
+        .bind("vrange/blob.bin")
+        .fetch_one(&fx.pool)
+        .await
+        .expect("the member row's recorded checksum");
+        let sha = sha.trim().to_string();
+        let mut if_range = ranged_get_5502(&uri, Some("bytes=100-199"));
+        if_range
+            .headers_mut()
+            .insert(header::IF_RANGE, format!("\"{sha}\"").parse().unwrap());
+        let if_range =
+            tdh::send_with_headers(fx.router_with_auth(download_router()), if_range).await;
 
         let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
             .bind(fx.repo_id)
@@ -18239,6 +18435,14 @@ mod tests {
         assert_eq!(head.2[header::CONTENT_LENGTH], "1000");
         assert!(head.2.get(header::CONTENT_RANGE).is_none());
         assert!(head.1.is_empty());
+        assert_eq!(head.2[header::ETAG], format!("\"{sha}\"").as_str());
+
+        assert_eq!(
+            if_range.0,
+            StatusCode::PARTIAL_CONTENT,
+            "If-Range: hosted sha"
+        );
+        assert_eq!(&if_range.1[..], &data[100..200]);
     }
 
     // -----------------------------------------------------------------------
