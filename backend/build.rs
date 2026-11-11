@@ -26,28 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto"],
         )?;
 
-    let git_sha = std::env::var("GIT_SHA")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        String::from_utf8(o.stdout)
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| "unknown".to_string())
-        });
+    let env_sha = std::env::var("GIT_SHA").ok().filter(|s| !s.is_empty());
+    let git_sha = env_sha
+        .clone()
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_SHA={git_sha}");
-    println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-env-changed=GIT_SHA");
+    if env_sha.is_none() {
+        emit_git_head_rerun();
+    }
 
     // Compile-time floor for the Debian `Release` `Date:` field, in seconds
     // since the Unix epoch (see `release_date_floor` in
@@ -71,6 +59,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_test_shard_cfg();
 
     Ok(())
+}
+
+/// Run `git` in the package directory and return its trimmed stdout, or
+/// `None` when git is missing, this is not a work tree (a source tarball, a
+/// Docker build context without `.git`), or the command fails.
+fn git(args: &[&str]) -> Option<String> {
+    let dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(&dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The path `git rev-parse --git-path <name>` reports, made absolute, when it
+/// exists. In a linked worktree `.git` is a file, and HEAD lives under
+/// `<common dir>/worktrees/<name>/` while branch refs live in the common dir;
+/// `--git-path` resolves both.
+fn git_path(name: &str) -> Option<std::path::PathBuf> {
+    let reported = std::path::PathBuf::from(git(&["rev-parse", "--git-path", name])?);
+    let path = if reported.is_absolute() {
+        reported
+    } else {
+        std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?).join(reported)
+    };
+    path.exists().then_some(path)
+}
+
+/// Re-run this script (and so refresh `GIT_SHA`) when HEAD moves: a checkout
+/// rewrites HEAD, a commit rewrites the branch ref it points at (a loose ref,
+/// or `packed-refs` after `git pack-refs`). Only paths that exist are
+/// watched: cargo re-runs a build script on every build when a watched path
+/// is missing, which recompiled the whole crate each time in a worktree
+/// while this watched `../.git/HEAD` (#5826). Without git nothing is
+/// emitted.
+fn emit_git_head_rerun() {
+    let Some(head) = git_path("HEAD") else {
+        return;
+    };
+    println!("cargo:rerun-if-changed={}", head.display());
+    let Some(branch_ref) = git(&["symbolic-ref", "-q", "HEAD"]) else {
+        // Detached HEAD: the commit id is in HEAD itself.
+        return;
+    };
+    match git_path(&branch_ref) {
+        Some(loose) => println!("cargo:rerun-if-changed={}", loose.display()),
+        // A packed ref is rewritten loose on the next commit, inside its
+        // existing parent directory, so watch that directory.
+        None => {
+            if let Some(parent) = std::path::Path::new(&branch_ref)
+                .parent()
+                .and_then(|p| p.to_str())
+                .and_then(git_path)
+            {
+                println!("cargo:rerun-if-changed={}", parent.display());
+            }
+        }
+    }
+    if let Some(packed) = git_path("packed-refs") {
+        println!("cargo:rerun-if-changed={}", packed.display());
+    }
 }
 
 /// CI test shards, in the order scripts/ci/test-shards.py lists them. Keep
