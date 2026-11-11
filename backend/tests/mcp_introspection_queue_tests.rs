@@ -110,7 +110,7 @@ async fn time_out(h: &McpHarness, id: Uuid, token: &str) -> Completed {
         parsed,
         h.admin,
         &AccessScope::Admin,
-        true,
+        || async { artifact_keeper_backend::services::mcp_introspection::GateVerdict::Servable },
     )
     .await
     .unwrap()

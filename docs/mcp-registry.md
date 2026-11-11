@@ -2705,15 +2705,20 @@ never leaves a stored snapshot behind a pending job (#5461).
 The same transaction also requires a live lease: a claim whose
 `leaseExpiresAt` has passed cannot complete or retry, whether or not the
 reaper has run yet (`409 mcp_claim_invalid`, nothing stored, the job left for
-the reaper) (#5462). And it revalidates the target (#5463): the reader serve
-gate a claim passes is evaluated once more just before the transaction, and
-inside it these are re-read under lock: the version row's quarantine,
-rejection and deletion, its registry status (`deleted`), and every backing
-package's pinned rows (quarantined, rejected, deleted, or a cache pin under
-its hold). The other gates (scan policy, curation and age gates, Remote
-proxy verdicts, OCI manifest presence) are evaluated only by the
-pre-transaction check (#5533 tracks evaluating the whole gate on the
-transaction). A target that no longer qualifies answers `409
+the reaper) (#5462). And it revalidates the target (#5463): inside it these
+are re-read under lock: the version row's quarantine, rejection and deletion,
+its registry status (`deleted`), and every backing package's pinned rows
+(quarantined, rejected, deleted, or a cache pin under its hold). Then, with
+those locks held, the whole reader serve gate a claim passes is evaluated
+once more (#5533): scan policy, the deny list, curation and age gates, Remote
+proxy verdicts, OCI manifest presence and Virtual shadowing. A hold that
+committed while the completion waited for its locks is therefore seen; a
+quarantine, rejection or deletion of the version or a pinned row waits for
+the completion to commit. A gate change that commits after this evaluation
+is ordered after the completion, as it would be for a completion that had
+already committed. Completions in their transaction are capped at
+half the database pool, at most four (the gate needs a second connection);
+the others wait before opening their transaction. A target that no longer qualifies answers `409
 mcp_target_ineligible` with a `reason`, stores nothing and cancels the job,
 as a claim of a held version does. A gate that cannot be evaluated is no
 hold: a claim returns the job to the queue and tries the next candidate

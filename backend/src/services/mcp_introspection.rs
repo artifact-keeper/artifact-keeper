@@ -836,6 +836,61 @@ pub enum Completed {
     /// `ttlMs` (#5466). Nothing was stored and the claim was left as it was.
     /// `400 mcp_invalid_result_metadata`.
     Invalid(caps::CapError),
+    /// The serve gate could not be evaluated under the completion's locks:
+    /// nothing was stored and the claim was left as it was, for the worker
+    /// to retry or the reaper to return. `503 mcp_gate_unavailable` (#5533).
+    GateUnavailable,
+}
+
+/// The full serve gate's verdict on a job's server version, as
+/// [`complete`] evaluates it under its locks (#5533).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateVerdict {
+    Servable,
+    /// The version, or a backing package, is held: the job is cancelled.
+    Held,
+    /// A gate could not be evaluated: the claim is left for a retry.
+    Unavailable,
+}
+
+/// At most this many completions hold a transaction at once (#5533).
+const MAX_GATED_COMPLETIONS: u32 = 4;
+
+/// How many completions may hold a transaction at once on a pool of
+/// `max_connections` (#5533): half the pool, at most
+/// [`MAX_GATED_COMPLETIONS`], at least one. The serve gate reads through the
+/// pool while the completion's transaction holds a connection, so every
+/// completion inside needs a second connection. Capping them at half the
+/// pool means completions alone can never take every connection and wait on
+/// each other for a gate connection; completions queued on the cap hold no
+/// connection and no lock.
+pub fn gated_completions(max_connections: u32) -> usize {
+    (max_connections / 2).clamp(1, MAX_GATED_COMPLETIONS) as usize
+}
+
+/// The completion cap of a pool of `db`'s size ([`gated_completions`]).
+fn completion_gate(db: &PgPool) -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, std::sync::Arc<tokio::sync::Semaphore>>>,
+    > = std::sync::OnceLock::new();
+    let size = db.options().get_max_connections();
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    gates
+        .entry(size)
+        .or_insert_with(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(gated_completions(size)))
+        })
+        .clone()
+}
+
+/// What [`revalidate`] decided about a job's target.
+enum Revalidated {
+    Eligible(caps::VersionRef),
+    Ineligible(String),
+    GateUnavailable,
 }
 
 /// A claim [`lock_claim`] found current and held by the completing worker.
@@ -898,61 +953,75 @@ async fn lock_version(
 }
 
 /// Re-check, in the completion's transaction, that the job's target is still
-/// eligible (#5463): `Err(reason)` when it is not. `hold` is the version
-/// row's hold from [`lock_version`]; `servable` is the full serve gate the
-/// caller evaluated before the transaction (the same gate a claim passes).
-/// The in-transaction half covers the version (deleted, quarantined,
-/// rejected, its registry status `deleted`) and every backing package's
-/// pinned rows ([`held_backing_package`]). The target entry itself is not
+/// eligible (#5463). `hold` is the version row's hold from [`lock_version`].
+/// The transaction re-reads the version (deleted, quarantined, rejected, its
+/// registry status `deleted`) and every backing package's pinned rows
+/// ([`held_backing_package`]) under its locks. Then `gate`, the full serve
+/// gate a claim passes (scan policy, deny list and curation, OCI manifest
+/// presence, the Remote gates, Virtual shadowing), is evaluated, after the
+/// locks rather than before the transaction (#5533). A hold that committed
+/// before the locks were taken is seen; a change to the version or its
+/// pinned rows waits for the commit. The target entry itself is not
 /// re-checked: a version's server.json is immutable once published, and the
 /// claim checked the entry against it.
 ///
 /// [`held_backing_package`]: crate::services::mcp_packages::held_backing_package
-async fn revalidate(
+async fn revalidate<G, F>(
     tx: &mut sqlx::PgConnection,
     job: &JobRow,
     hold: Option<(Option<String>, Option<DateTime<Utc>>)>,
-    servable: bool,
-) -> crate::error::Result<Result<caps::VersionRef, String>> {
+    gate: G,
+) -> crate::error::Result<Revalidated>
+where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = GateVerdict>,
+{
+    let held = || Ok(Revalidated::Ineligible("server version is held".into()));
     let Some((status, until)) = hold else {
-        return Ok(Err("server version deleted".into()));
+        return Ok(Revalidated::Ineligible("server version deleted".into()));
     };
-    if !servable
-        || crate::services::quarantine_service::check_download_allowed(
-            status.as_deref(),
-            until,
-            Utc::now(),
-        )
-        .is_err()
+    if crate::services::quarantine_service::check_download_allowed(
+        status.as_deref(),
+        until,
+        Utc::now(),
+    )
+    .is_err()
     {
-        return Ok(Err("server version is held".into()));
+        return held();
     }
     let Some(v) = caps::version_ref(&mut *tx, job.artifact_id)
         .await
         .map_err(db_err)?
     else {
-        return Ok(Err("server version deleted".into()));
+        return Ok(Revalidated::Ineligible("server version deleted".into()));
     };
     let Some(stored) = StoredVersion::from_metadata(&v.metadata) else {
-        return Ok(Err("unreadable server version".into()));
+        return Ok(Revalidated::Ineligible("unreadable server version".into()));
     };
     if stored.registry.status == crate::formats::mcp::ServerStatus::Deleted {
-        return Ok(Err("server version deleted".into()));
+        return Ok(Revalidated::Ineligible("server version deleted".into()));
     }
     if let Some(package) = crate::services::mcp_packages::held_backing_package(&mut *tx, &stored)
         .await
         .map_err(db_err)?
     {
-        return Ok(Err(format!("backing package {package} is held")));
+        return Ok(Revalidated::Ineligible(format!(
+            "backing package {package} is held"
+        )));
     }
-    Ok(Ok(v))
+    match gate().await {
+        GateVerdict::Servable => Ok(Revalidated::Eligible(v)),
+        GateVerdict::Held => held(),
+        GateVerdict::Unavailable => Ok(Revalidated::GateUnavailable),
+    }
 }
 
 /// Record a worker result for a claimed job (token and owner already checked
 /// by the caller, [`claim_matches`], but the claim may end concurrently), as
 /// the authenticated principal `worker_user` whose credential carries
-/// repository `scope`. `servable` is the full serve gate of the job's
-/// server version, evaluated by the caller just before (see [`revalidate`]).
+/// repository `scope`. `gate` evaluates the full serve gate of the job's
+/// server version; it is called once, after the version and the claim are
+/// locked (see [`revalidate`], #5533).
 ///
 /// The result's metadata is validated first ([`validate_metadata`], #5466),
 /// before the transaction: an invalid result locks, stores and changes
@@ -975,19 +1044,24 @@ async fn revalidate(
 ///   cache has expired;
 /// * the target is revalidated ([`revalidate`]): one that stopped being
 ///   eligible after the claim cancels the job and stores nothing
-///   ([`Completed::Ineligible`], #5463);
+///   ([`Completed::Ineligible`], #5463). A gate that cannot be evaluated
+///   stores and changes nothing ([`Completed::GateUnavailable`]);
 /// * the result's `observedAt` is validated against the claim
 ///   ([`validated_observed_at`], #5464). The snapshot becomes the current
 ///   view only when it is the freshest of its source.
-pub async fn complete(
+pub async fn complete<G, F>(
     db: &PgPool,
     job: &JobRow,
     result: &WorkerResult,
     parsed: ParsedResult,
     worker_user: Uuid,
     scope: &AccessScope,
-    servable: bool,
-) -> crate::error::Result<Completed> {
+    gate: G,
+) -> crate::error::Result<Completed>
+where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = GateVerdict>,
+{
     let kind = job
         .kind()
         .ok_or_else(|| crate::error::AppError::Internal("unknown job kind".into()))?;
@@ -999,6 +1073,13 @@ pub async fn complete(
     ) {
         return Ok(Completed::Invalid(e));
     }
+    // Taken before the transaction, so a completion waiting here holds no
+    // connection and no lock.
+    let cap = completion_gate(db);
+    let _gate_permit = cap
+        .acquire()
+        .await
+        .map_err(|_| crate::error::AppError::Internal("completion gate closed".into()))?;
     let mut tx = db.begin().await.map_err(db_err)?;
     let hold = lock_version(&mut tx, job.artifact_id).await?;
     let claimed_at = match lock_claim(&mut tx, job, worker_user, scope).await? {
@@ -1008,9 +1089,11 @@ pub async fn complete(
         }) => return Ok(Completed::Forbidden),
         Some(LockedClaim { claimed_at, .. }) => claimed_at,
     };
-    let v = match revalidate(&mut tx, job, hold, servable).await? {
-        Ok(v) => v,
-        Err(reason) => {
+    let v = match revalidate(&mut tx, job, hold, gate).await? {
+        Revalidated::Eligible(v) => v,
+        // Dropping the transaction rolls it back: the claim is unchanged.
+        Revalidated::GateUnavailable => return Ok(Completed::GateUnavailable),
+        Revalidated::Ineligible(reason) => {
             // The row is locked and matched above, so this ends the claim.
             if !finish(&mut *tx, job, "cancelled", None, None, Some(&reason)).await? {
                 return Ok(Completed::ClaimLost);

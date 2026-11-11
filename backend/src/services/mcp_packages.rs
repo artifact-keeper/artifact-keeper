@@ -1772,8 +1772,8 @@ pub(crate) async fn refuse_shadowed_cache_pin(
 /// rejection or deletion of a backing package either is seen here or waits
 /// for the caller's commit. This is the quarantine half of
 /// [`backing_gate`] only: the scan-policy, Remote and OCI-presence gates
-/// stay with the full serve gate, which the caller evaluates beforehand
-/// (#5533 tracks evaluating the whole gate on the transaction).
+/// stay with the full serve gate, which the caller evaluates once these
+/// locks are held (#5533).
 ///
 /// The rows are read, locked, then read again under the locks (#5593): a
 /// write that committed between the read and the lock (an OCI tag move
