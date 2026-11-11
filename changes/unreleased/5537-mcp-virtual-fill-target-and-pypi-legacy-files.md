@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#5537]
+---
+- **An MCP package missing from a Virtual backing repository is now filled through the Remote member the Virtual serves it from, and PyPI pins see legacy distribution files** ([#5537]). The fill used the first direct Remote member by priority, ignoring nested Virtuals, the repository-key tie-break and the format's shadowing guard, so it could fill through a Remote the Virtual would not serve from and the pin was then refused with a misleading hint. It now follows the same member walk as the shadowing check, and answers `mcp_package_not_found` when no Remote member would serve the package. The PyPI per-file check now recognises `.tar.bz2`, `.tar.xz`, `.tgz`, `.tar` and `.egg` files, so such a file named for a pinned project but uploaded under another one holds the version as the other file types do. The check also expands the Virtual once per package instead of up to four times. The MCP registry guide now documents that the PyPI per-file rule applies to a directly mapped Local, and that npm hosted lookups by path can fail with `EINTEGRITY` without holding the version.

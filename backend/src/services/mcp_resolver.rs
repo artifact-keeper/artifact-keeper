@@ -138,7 +138,7 @@ pub async fn resolve_document(
             Ok(pin) => out.pins.push(pin),
             Err(McpError::PackageNotFound { index, detail }) => {
                 let repo = &settings.repos[&pkg.registry_type];
-                let Some(remote) = fill_target(&state.db, repo).await? else {
+                let Some(remote) = fill_target(&state.db, repo, pkg).await? else {
                     return Err(McpError::PackageNotFound { index, detail });
                 };
                 // Foreign coordinates (`open`) are neither pinned from nor
@@ -173,29 +173,40 @@ fn db_err(e: impl std::fmt::Display) -> McpError {
     McpError::Internal(e.to_string())
 }
 
-/// The Remote a missing package can be filled through: the backing
-/// repository itself, or the first Remote member (by priority) of a Virtual
-/// one. `None` for a hosted backing repository (nothing to fill from).
-pub async fn fill_target(db: &PgPool, repo: &BackingRepo) -> Result<Option<BackingRepo>, McpError> {
+/// The Remote a missing package `pkg` can be filled through: the backing
+/// repository itself, or, for a Virtual one, the Remote member its route
+/// would serve `pkg` from ([`fill_remote`]: the member walk with nested
+/// Virtuals inlined and equal priorities broken by key, and the format's
+/// shadowing guard), so a fill never goes through a Remote the pin would
+/// then be refused for (#5537). `None` for a hosted backing repository, or a
+/// Virtual with no Remote member that would serve `pkg` (nothing to fill
+/// from).
+///
+/// [`fill_remote`]: crate::services::mcp_virtual_serve::fill_remote
+pub async fn fill_target(
+    db: &PgPool,
+    repo: &BackingRepo,
+    pkg: &fmt::Package,
+) -> Result<Option<BackingRepo>, McpError> {
     if repo.is_remote() {
         return Ok(Some(repo.clone()));
     }
     if !repo.is_virtual() {
         return Ok(None);
     }
-    let key: Option<String> = sqlx::query_scalar(
-        "SELECT r.key FROM virtual_repo_members m JOIN repositories r ON r.id = m.member_repo_id \
-         WHERE m.virtual_repo_id = $1 AND r.repo_type = 'remote' ORDER BY m.priority LIMIT 1",
+    let remote = crate::services::mcp_virtual_serve::fill_remote(
+        db,
+        repo.id,
+        &pkg.registry_type,
+        &pkg.identifier,
+        pkg.version.as_deref(),
     )
-    .bind(repo.id)
-    .fetch_optional(db)
-    .await
-    .map_err(db_err)?;
-    match key {
-        Some(k) => Ok(mcp_packages::repos_by_key(db, &[k])
+    .await?;
+    match remote {
+        Some((id, key)) => Ok(mcp_packages::repos_by_key(db, &[key])
             .await?
             .into_iter()
-            .next()),
+            .find(|r| r.id == id)),
         None => Ok(None),
     }
 }
@@ -260,30 +271,19 @@ pub fn cache_key(registry_type: &str, identifier: &str, version: &str) -> Option
     }
 }
 
-/// Whether a PyPI distribution file name is `name`'s `version`: a wheel
-/// (`{dist}-{version}-...whl`) or an sdist (`{name}-{version}.tar.gz`,
-/// `.zip`), names compared PEP 503-normalised.
+/// Whether a PyPI distribution file name is `name`'s `version`: a wheel, an
+/// egg or an sdist of any extension the download route serves
+/// ([`pypi_file_parts`]), names compared PEP 503-normalised.
+///
+/// [`pypi_file_parts`]: crate::services::mcp_virtual_serve::pypi_file_parts
 pub fn pypi_file_matches(file: &str, name: &str, version: &str) -> bool {
     use crate::formats::pypi::PypiHandler;
-    let want = PypiHandler::normalize_name(name);
-    let (dist, ver) = if let Some(stem) = file.strip_suffix(".whl") {
-        let mut parts = stem.splitn(3, '-');
-        match (parts.next(), parts.next()) {
-            (Some(d), Some(v)) => (d, v),
-            _ => return false,
+    match crate::services::mcp_virtual_serve::pypi_file_parts(file) {
+        Some((dist, ver)) => {
+            ver == version && PypiHandler::normalize_name(dist) == PypiHandler::normalize_name(name)
         }
-    } else if let Some(stem) = file
-        .strip_suffix(".tar.gz")
-        .or_else(|| file.strip_suffix(".zip"))
-    {
-        match stem.rsplit_once('-') {
-            Some(pair) => pair,
-            None => return false,
-        }
-    } else {
-        return false;
-    };
-    ver == version && PypiHandler::normalize_name(dist) == want
+        None => false,
+    }
 }
 
 /// The proxy-cache entry of a package in `remote`, as `(path, sha256)`.
@@ -429,7 +429,7 @@ pub async fn cached_pin_through(
     pkg: &fmt::Package,
     base_url: &str,
 ) -> Result<Option<PackagePin>, McpError> {
-    let Some(remote) = fill_target(db, mapped).await? else {
+    let Some(remote) = fill_target(db, mapped, pkg).await? else {
         return Ok(None);
     };
     if !mcp_packages::remote_may_serve(pkg, mapped, &remote, base_url) {
@@ -1320,7 +1320,7 @@ async fn resolve_pending(
     // The fill target is recomputed from the current mapping and must be the
     // repository recorded at publish: a pin is never assembled from the
     // mapping of one moment and the Remote of another.
-    let remote = match fill_target(&state.db, mapped).await {
+    let remote = match fill_target(&state.db, mapped, &pkg).await {
         Ok(Some(remote)) if remote.id == p.fill_repository_id => remote,
         Ok(_) => {
             return Err(Step::Failed {

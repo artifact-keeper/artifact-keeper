@@ -3775,15 +3775,29 @@ pub(crate) async fn fetch_npm_virtual_isolate(
 /// `package_name`, i.e. every Remote member must be withheld for this name on
 /// both legs (#3767). The ownership query only runs when the toggle is on, so
 /// a virtual without isolate mode pays one indexed config lookup.
+/// `non_remote_ids` are the Virtual's non-Remote leaves
+/// ([`proxy_helpers::non_remote_leaf_ids`]).
 async fn npm_virtual_isolates_name(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
+    non_remote_ids: &[uuid::Uuid],
     package_name: &str,
 ) -> Result<bool, Response> {
     let isolate = fetch_npm_virtual_isolate(db, virtual_repo_id)
         .await
         .map_err(IntoResponse::into_response)?;
-    npm_virtual_owner_isolates(db, virtual_repo_id, package_name, isolate).await
+    if !isolate {
+        return Ok(false);
+    }
+    proxy_helpers::non_remote_ids_own_name_version(
+        db,
+        virtual_repo_id,
+        non_remote_ids,
+        package_name,
+        None,
+        "npm",
+    )
+    .await
 }
 
 /// [`npm_virtual_isolates_name`] for a caller that already read the toggle
@@ -5087,9 +5101,31 @@ pub(crate) enum NpmVirtualOwnership {
 ///   priority-aware (`OwnedAtPriority` / `NotOwned`);
 /// - it does not: the name-only fail-safe (`OwnedNameOnly` / `NotOwned`);
 /// - the name fails `is_valid_npm_name`: the check is skipped (`NotOwned`).
+#[cfg(test)]
 async fn resolve_npm_virtual_ownership(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
+    package_name: &str,
+    filename: &str,
+) -> Result<NpmVirtualOwnership, Response> {
+    let expansion = proxy_helpers::fetch_virtual_expansion(db, virtual_repo_id).await?;
+    resolve_npm_virtual_ownership_among(
+        db,
+        virtual_repo_id,
+        &proxy_helpers::non_remote_leaf_ids(&expansion.members),
+        package_name,
+        filename,
+    )
+    .await
+}
+
+/// [`resolve_npm_virtual_ownership`] over the non-Remote leaves of an
+/// expansion the caller already holds, so the guard expands the Virtual once
+/// (#5537).
+async fn resolve_npm_virtual_ownership_among(
+    db: &PgPool,
+    virtual_repo_id: uuid::Uuid,
+    non_remote_ids: &[uuid::Uuid],
     package_name: &str,
     filename: &str,
 ) -> Result<NpmVirtualOwnership, Response> {
@@ -5100,7 +5136,7 @@ async fn resolve_npm_virtual_ownership(
     // that check rejects (uppercase, e.g. `MyPackage`), and the packument leg
     // isolates them case-insensitively, so skipping here would let the
     // tarball leg serve upstream for a name the packument hides.
-    if npm_virtual_isolates_name(db, virtual_repo_id, package_name).await? {
+    if npm_virtual_isolates_name(db, virtual_repo_id, non_remote_ids, package_name).await? {
         return Ok(NpmVirtualOwnership::OwnedNameOnly);
     }
     if !crate::formats::npm::is_valid_npm_name(package_name) {
@@ -5109,18 +5145,29 @@ async fn resolve_npm_virtual_ownership(
     let Some(version) = npm_version_from_tarball_filename(package_name, filename) else {
         // Fail-safe (#3646): no readable version, so fall back to the
         // name-only guard rather than fan out on a shape we cannot read.
-        let owns_name =
-            proxy_helpers::virtual_non_remote_owns_name(db, virtual_repo_id, package_name, "npm")
-                .await?;
+        let owns_name = proxy_helpers::non_remote_ids_own_name_version(
+            db,
+            virtual_repo_id,
+            non_remote_ids,
+            package_name,
+            None,
+            "npm",
+        )
+        .await?;
         return Ok(if owns_name {
             NpmVirtualOwnership::OwnedNameOnly
         } else {
             NpmVirtualOwnership::NotOwned
         });
     };
-    let owner_min_priority =
-        proxy_helpers::npm_virtual_owner_min_priority(db, virtual_repo_id, package_name, &version)
-            .await?;
+    let owner_min_priority = proxy_helpers::npm_virtual_owner_min_priority(
+        db,
+        virtual_repo_id,
+        non_remote_ids,
+        package_name,
+        &version,
+    )
+    .await?;
     Ok(match owner_min_priority {
         Some(min_priority) => NpmVirtualOwnership::OwnedAtPriority(min_priority),
         None => NpmVirtualOwnership::NotOwned,
@@ -5162,10 +5209,16 @@ async fn resolve_npm_virtual_ownership(
 /// the exact tarball URL (a pinned lockfile) cannot stream an out-of-scope
 /// `@scope/pkg` through a Remote member. Non-Remote members are always
 /// eligible.
+///
+/// `leaves` is the Virtual's unfiltered leaf expansion, which the owner
+/// guard and the member ranks are read from, and `members` the set that may
+/// serve (the caller's view of `leaves`): the caller expands the Virtual once
+/// for the whole decision (#5537).
 #[allow(clippy::result_large_err)]
 pub(crate) async fn npm_virtual_eligible_members(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
+    leaves: &[proxy_helpers::ExpandedMember],
     members: Vec<crate::models::repository::Repository>,
     package_name: &str,
     filename: &str,
@@ -5176,8 +5229,14 @@ pub(crate) async fn npm_virtual_eligible_members(
     ),
     Response,
 > {
-    let ownership =
-        resolve_npm_virtual_ownership(db, virtual_repo_id, package_name, filename).await?;
+    let ownership = resolve_npm_virtual_ownership_among(
+        db,
+        virtual_repo_id,
+        &proxy_helpers::non_remote_leaf_ids(leaves),
+        package_name,
+        filename,
+    )
+    .await?;
     let member_ids: Vec<uuid::Uuid> = members.iter().map(|m| m.id).collect();
     let scope_policies = fetch_npm_scope_policies(db, &member_ids)
         .await
@@ -5188,10 +5247,7 @@ pub(crate) async fn npm_virtual_eligible_members(
         .collect();
     let members = match ownership {
         NpmVirtualOwnership::OwnedAtPriority(owner_min_priority) => {
-            // The priorities map is fetched only when an owner exists — one
-            // indexed query on exactly the requests the guard engages on.
-            let member_priorities =
-                proxy_helpers::fetch_virtual_member_priorities(db, virtual_repo_id).await?;
+            let member_priorities = proxy_helpers::virtual_member_ranks(leaves);
             members
                 .into_iter()
                 .filter(|m| {
@@ -5468,15 +5524,22 @@ async fn serve_tarball(
 
         // The supply-chain shadowing guard (#1217, #3646, #3955) and the
         // per-member scope policy (#2424): see `npm_virtual_eligible_members`.
-        let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+        let expansion = proxy_helpers::fetch_virtual_expansion(&state.db, repo.id).await?;
+        let members = expansion.members.iter().map(|m| m.repo.clone()).collect();
         // #3178: authorize the member set against the CALLER before any
         // format-specific filtering, so a member this caller could not read
         // directly can never reach the byte resolver.
         let members =
             proxy_helpers::try_authorize_virtual_members(&state.db, auth, repo.id, members).await?;
-        let (ownership, members) =
-            npm_virtual_eligible_members(&state.db, repo.id, members, package_name, filename)
-                .await?;
+        let (ownership, members) = npm_virtual_eligible_members(
+            &state.db,
+            repo.id,
+            &expansion.members,
+            members,
+            package_name,
+            filename,
+        )
+        .await?;
 
         // Passing `None` to the resolver when the guard suppresses every
         // Remote member is the load-bearing security primitive: see

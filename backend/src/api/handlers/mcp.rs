@@ -9634,18 +9634,12 @@ mod tests {
         .await
         .unwrap();
         let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
-        let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream B").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::OK, "{b}");
-        sqlx::query(
-            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
-             size_bytes, checksum_sha256) VALUES ($1, '@acme/echo/-/echo-1.0.0.tgz', 'k', 'm', 1, $2)",
-        )
-        .bind(remote)
-        .bind("b".repeat(64))
-        .execute(&env.fx.pool)
-        .await
-        .unwrap();
+        // The Remote caches the name through its own route (#5537: a real
+        // pull, not a seeded row).
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream B").await;
         assert_eq!(env.view().await, View::Served);
         assert_eq!(
             sf::native_get_with_state(
@@ -9671,36 +9665,83 @@ mod tests {
             return;
         };
         let (virt, m) = env.shadow_virtual("cargo", &[("local", 2)]).await;
-        let (remote, _, _up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
-        seed_crate_cache(&env.fx.pool, remote).await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream A").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(env.pinned_sha().await, fmt::sha256_hex(b"upstream A"));
         assert_eq!(env.view().await, View::Served);
-        env.publish_pkg(case, &m[0], b"hosted B", None).await;
+        let tail = sf::download_tail("cargo", case.name, case.published, None);
+        let through_virtual = format!("/{}{tail}", virt.key);
+        assert_eq!(
+            sf::native_get_with_state(&up.state, &env.fx, "cargo", &through_virtual).await,
+            (StatusCode::OK, Some(fmt::sha256_hex(b"upstream A"))),
+            "the Virtual serves the pinned upstream crate"
+        );
+        let hosted = env.publish_pkg(case, &m[0], b"hosted B", None).await;
         assert_eq!(env.view().await, shadowed());
+        assert_eq!(
+            sf::native_get_with_state(&up.state, &env.fx, "cargo", &through_virtual).await,
+            (StatusCode::OK, Some(hosted.sha256)),
+            "why it is held: the owner guard now serves the hosted crate"
+        );
         env.teardown().await;
     }
 
-    /// Seed `remote`'s proxy cache with the case's crate (`acme-echo@1.0.0`).
-    async fn seed_crate_cache(pool: &sqlx::PgPool, remote: Uuid) {
-        sqlx::query(
-            "INSERT INTO proxy_cache_artifacts (repository_id, path, storage_key, metadata_key, \
-             size_bytes, checksum_sha256) VALUES ($1, 'api/v1/crates/acme-echo/1.0.0/download', \
-             'k', 'm', 1, $2)",
-        )
-        .bind(remote)
-        .bind("a".repeat(64))
-        .execute(pool)
-        .await
-        .unwrap();
+    /// Pull `case` through Remote `remote_key`'s own native route on the mock
+    /// upstream's state, so its proxy cache holds the package exactly as a
+    /// client's pull leaves it, and require the upstream's bytes and a cache
+    /// row (#5537).
+    async fn pull_through(
+        env: &Env,
+        case: &ShadowCase,
+        up: &sf::MockUpstream,
+        remote: Uuid,
+        remote_key: &str,
+        body: &[u8],
+    ) {
+        let tail = sf::download_tail(case.ty, case.name, case.published, None);
+        assert_eq!(
+            sf::native_get_with_state(&up.state, &env.fx, case.ty, &format!("/{remote_key}{tail}"))
+                .await,
+            (StatusCode::OK, Some(fmt::sha256_hex(body))),
+            "{}: pull through the Remote",
+            case.ty
+        );
+        wait_cached(&env.fx.pool, case, remote).await;
     }
 
-    /// #5456: the asynchronous fill applies the same cache-pin refusal as the
-    /// synchronous publish. A crate the Remote member caches after the publish
-    /// was accepted (`202`), while a hosted member of the Virtual now holds
-    /// the same `name@version` (so the owner guard serves the hosted crate),
-    /// fails the job with `mcp_package_shadowed` instead of resolving into a
-    /// version that is held for ever.
+    /// Wait for Remote `remote`'s proxy-cache catalog to record `case`'s
+    /// file where an MCP pin looks for it: the streaming fill writes the row
+    /// once the client stream has ended, from its own task (and the index
+    /// documents the route fetched first may be recorded before it).
+    async fn wait_cached(pool: &sqlx::PgPool, case: &ShadowCase, remote: Uuid) {
+        for _ in 0..100 {
+            let entry = crate::services::mcp_resolver::cached_entry(
+                pool,
+                remote,
+                case.ty,
+                case.name,
+                case.pinned,
+            )
+            .await
+            .unwrap();
+            if entry.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("{}: the pull through the Remote was never cached", case.ty);
+    }
+
+    /// #5456: the asynchronous fill never resolves into a version that is
+    /// held for ever. A crate the Remote member caches after the publish was
+    /// accepted (`202`), while a hosted member of the Virtual now holds the
+    /// same `name@version` (so the owner guard serves the hosted crate),
+    /// fails the job: the fill target is recomputed from the walk (#5537),
+    /// which no longer serves the crate from the Remote recorded at publish,
+    /// so the job fails `mcp_package_not_found` ("publish again", which then
+    /// pins the hosted crate) instead of pinning the Remote's cache.
     #[tokio::test]
     async fn async_fill_refuses_a_shadowed_cache_pin_5456() {
         let case = &SHADOW_CASES[3];
@@ -9708,12 +9749,12 @@ mod tests {
             return;
         };
         let (virt, m) = env.shadow_virtual("cargo", &[("local", 2)]).await;
-        let (remote, _, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::ACCEPTED, "nothing cached or hosted yet: {b}");
         let id = env.server_artifact("com.acme/shadow", "1.0.0").await;
         env.publish_pkg(case, &m[0], b"hosted B", None).await;
-        seed_crate_cache(&env.fx.pool, remote).await;
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream A").await;
         assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
         let res: serde_json::Value = sqlx::query_scalar(
             "SELECT COALESCE(metadata->'resolution', 'null'::jsonb) FROM artifact_metadata \
@@ -9724,7 +9765,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res["state"], "failed", "{res}");
-        assert_eq!(res["error"]["error"], "mcp_package_shadowed", "{res}");
+        assert_eq!(res["error"]["error"], "mcp_package_not_found", "{res}");
+        assert!(
+            res["error"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("no longer fills through")),
+            "{res}"
+        );
         env.teardown().await;
     }
 
@@ -9738,8 +9785,8 @@ mod tests {
             return;
         };
         let (virt, _) = env.shadow_virtual("cargo", &[("local", 2)]).await;
-        let (remote, _, _up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
-        seed_crate_cache(&env.fx.pool, remote).await;
+        let (remote, remote_key, up) = env.upstream_member(case, &virt, 1, b"upstream A").await;
+        pull_through(&env, case, &up, remote, &remote_key, b"upstream A").await;
         let (s, b) = env.publish_shadow_server(case).await;
         assert_eq!(s, StatusCode::OK, "{b}");
         assert_eq!(env.view().await, View::Served);
@@ -9816,6 +9863,26 @@ mod tests {
             "served for acme-echo's file name"
         );
         env.soft_delete(&other.artifact_ids).await;
+        assert_eq!(env.view().await, View::Served);
+
+        // #5537: a legacy egg named for the project, uploaded under another.
+        let egg = sf::publish_native(
+            &env.fx,
+            "pypi",
+            &m[1].key,
+            m[1].id,
+            "zzz",
+            "1.0",
+            b"zzz egg",
+            Some("acme_echo-1.0-py3.12.egg"),
+        )
+        .await;
+        assert_eq!(
+            env.view().await,
+            shadowed(),
+            "served for acme-echo's legacy egg"
+        );
+        env.soft_delete(&egg.artifact_ids).await;
         assert_eq!(env.view().await, View::Served);
 
         // One pinned file gone (the other still gated and served).
@@ -9902,5 +9969,138 @@ mod tests {
             .unwrap();
         assert_eq!(env.view().await, shadowed(), "the pinned member left");
         env.teardown().await;
+    }
+
+    /// #5537: a missing package is filled through the Remote the Virtual's
+    /// route serves it from, here a Remote inside a nested Virtual ranked
+    /// above a direct Remote member, and the asynchronous fill then resolves
+    /// the version from that Remote's real pull.
+    #[tokio::test]
+    async fn async_fill_goes_through_the_walks_remote_5537() {
+        let case = &SHADOW_CASES[0];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, _) = env.shadow_virtual("npm", &[]).await;
+        let nested = env.repo("virtual", "npm").await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, nested.id, 1).await;
+        let (walked_id, walked, up) = env
+            .upstream_member(case, &nested, 1, b"walked upstream")
+            .await;
+        let (direct, direct_key, direct_dir) = tdh::attach_remote_member(
+            &env.fx.pool,
+            virt.id,
+            "npm",
+            "https://direct-remote.invalid",
+            2,
+        )
+        .await;
+        env.extra_repos.push((direct, direct_dir));
+        tdh::grant_repo_role(&env.fx.pool, direct, env.fx.user_id, "reader").await;
+
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(s, StatusCode::ACCEPTED, "nothing cached yet: {b}");
+        let id = env.server_artifact("com.acme/shadow", "1.0.0").await;
+        let resolution = || async {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT COALESCE(metadata->'resolution', 'null'::jsonb) FROM artifact_metadata \
+                 WHERE artifact_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&env.fx.pool)
+            .await
+            .unwrap()
+        };
+        let res = resolution().await;
+        assert_eq!(
+            res["pending"][0]["fillRepository"], walked,
+            "the walk serves from '{walked}', not the direct '{direct_key}': {res}"
+        );
+        assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
+        // The fill's cache row commits after its stream ends; the job looks
+        // again on its next attempt, as the background resolver would.
+        wait_cached(&env.fx.pool, case, walked_id).await;
+        if resolution().await["state"] == "resolving" {
+            assert!(crate::services::mcp_resolver::run_job(&up.state, id).await);
+        }
+        let res = resolution().await;
+        assert_eq!(res["state"], "resolved", "{res}");
+        assert_eq!(env.pinned_sha().await, fmt::sha256_hex(b"walked upstream"));
+        assert_eq!(env.view().await, View::Served);
+        env.teardown().await;
+    }
+
+    /// #5537: PyPI is per file, so a Remote member ranked BELOW the Local
+    /// that holds the version still refuses the publish: it can serve the
+    /// version's other distributions from its upstream.
+    #[tokio::test]
+    async fn pypi_remote_ranked_below_the_local_is_refused_5537() {
+        let case = &SHADOW_CASES[1];
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (virt, m) = env.shadow_virtual("pypi", &[("local", 1)]).await;
+        env.publish_pkg(case, &m[0], b"sdist A", None).await;
+        let (below, below_key, below_dir) = tdh::attach_remote_member(
+            &env.fx.pool,
+            virt.id,
+            "pypi",
+            "https://pypi-below.invalid",
+            2,
+        )
+        .await;
+        env.extra_repos.push((below, below_dir));
+        let (s, b) = env.publish_shadow_server(case).await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_package_shadowed")
+            ),
+            "{b}"
+        );
+        let detail = b["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(&below_key) && detail.contains(&m[0].key),
+            "{detail}"
+        );
+        env.teardown().await;
+    }
+
+    /// #5537: the serve model expands the Virtual once per coordinate,
+    /// whatever its format's guard reads (npm's isolate check and
+    /// priority-aware owner guard, Cargo's exact-version owner guard), and so
+    /// does the fill target.
+    #[tokio::test]
+    async fn serve_model_expands_the_virtual_once_5537() {
+        use crate::api::handlers::proxy_helpers::virtual_expansion_count;
+        use crate::services::mcp_virtual_serve::{fill_remote, serve_model, Winner};
+        for case in [&SHADOW_CASES[0], &SHADOW_CASES[3]] {
+            let ty = case.ty;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 1)]).await;
+            env.publish_pkg(case, &m[0], b"hosted A", None).await;
+            let (remote, _, remote_dir) =
+                tdh::attach_remote_member(&env.fx.pool, virt.id, ty, "https://up.invalid", 2).await;
+            env.extra_repos.push((remote, remote_dir));
+
+            let before = virtual_expansion_count();
+            let model = serve_model(&env.fx.pool, virt.id, ty, case.name, case.pinned)
+                .await
+                .unwrap();
+            assert_eq!(virtual_expansion_count() - before, 1, "{ty}: serve_model");
+            assert!(
+                matches!(&model.winner, Some(Winner::Hosted { key, .. }) if *key == m[0].key),
+                "{ty}: {model:?}"
+            );
+            let before = virtual_expansion_count();
+            fill_remote(&env.fx.pool, virt.id, ty, case.name, Some(case.pinned))
+                .await
+                .unwrap();
+            assert_eq!(virtual_expansion_count() - before, 1, "{ty}: fill_remote");
+            env.teardown().await;
+        }
     }
 }

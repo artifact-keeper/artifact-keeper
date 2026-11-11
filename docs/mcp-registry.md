@@ -602,7 +602,12 @@ download route applies it:
   under). A Remote member can serve other distributions of the version from
   its upstream (a platform wheel, even when a hosted member owns the name),
   so a PyPI package is not pinned through a Virtual that has a Remote
-  member with an upstream.
+  member with an upstream, whether it is ranked above or below the hosted
+  member. Files are matched by their name as a wheel (`.whl`), a legacy egg
+  (`.egg`) or an sdist (`.tar.gz`, `.zip`, and the legacy `.tar.bz2`,
+  `.tar.xz`, `.tgz` and `.tar`): the extensions the download route serves.
+  A file whose name is none of these is matched by the project and version
+  it was uploaded under.
 
 A Remote member that the guard does not withhold, and that is walked before
 the hosted member holding the version, serves it from its upstream whether
@@ -623,6 +628,24 @@ once the route serves the pinned rows again; otherwise publish a new server
 version to pin what it serves now. A pinned row whose bytes changed in place
 (its checksum is no longer the one pinned) no longer counts as the pinned
 row.
+
+**PyPI per file, without a Virtual.** The per-file rule is the PyPI
+format's, not the Virtual's: a PyPI pin covers every file of the version in
+its repository, so it also applies to a directly mapped Local repository.
+Uploading another distribution of an already pinned version there (one more
+wheel, say) holds the MCP version (`mcp_unresolvable`, `gate: shadowed`):
+the repository now serves a file of the version that was never approved.
+Delete the new file to serve the version again, or publish a new server
+version to pin every file.
+
+**npm hosted lookups are by path.** A Virtual's npm tarball route falls back
+to a hosted member's rows by storage path (`<package>/%/<file>`) while the
+model matches the `name` and `version` columns. A generic upload such as
+`@acme/echo/9.9.9/echo-1.0.0.tgz` in a member ranked above the pinned one can
+therefore be served for `echo-1.0.0.tgz` without the version being held.
+That is an availability issue only: npm checks the tarball against the
+`dist.integrity` of the packument and fails with `EINTEGRITY` instead of
+installing the other bytes.
 
 Quarantine and shadowing together, for a Virtual `[H, L]` whose pin is A in
 `L`:
@@ -941,8 +964,9 @@ answers `200`. A pull-through running on another replica is not seen; that
 publish answers `202` as below and the resolver pins the entry on its next
 tick.
 
-A package that is not in the Remote yet (directly mapped, or the first Remote
-member by priority of a mapped Virtual) is **filled** instead of refused:
+A package that is not in the Remote yet (directly mapped, or the Remote
+member a mapped Virtual's download route would serve it from) is **filled**
+instead of refused:
 
 1. Publish stores the version and answers **`202 Accepted`** with the served
    entry plus two members:
@@ -975,7 +999,8 @@ member by priority of a mapped Virtual) is **filled** instead of refused:
    curation or age policy: `mcp_package_refused`), a mapping removed
    (`mcp_external_registry`), a mapping that no longer fills through the
    Remote recorded at publish (`fillRepositoryId`: the mapping now names
-   another repository, or a Virtual's first Remote member changed;
+   another repository, or the Virtual's route now serves the package from
+   another member;
    `mcp_package_not_found`, publish again), the publishing account gone or
    disabled. A
    transient one (`429`, `5xx`, a fill not finished, response body
@@ -993,9 +1018,17 @@ member by priority of a mapped Virtual) is **filled** instead of refused:
    after an admin edit (`PUT`) failed: it may have been served before the
    edit (its `resolution` carries `afterEdit: true`).
 
-With a **Virtual** mapping the fill target is the Virtual's first Remote
-member, so a package that is not (yet) in the hosted member is looked up
-upstream. For an internal package that is a dependency-confusion path when
+With a **Virtual** mapping the fill target is the Remote member the
+Virtual's download route would serve the package from: the same member walk
+as the [shadowing check](#package-policy) (nested Virtuals expanded in place,
+equal priorities broken by repository key, each format's guard applied), so
+a fill never goes through a Remote whose pin would then be refused. npm,
+NuGet and Cargo: the first Remote member with an upstream that the walk
+reaches before any hosted member holding the version and that the format's
+guard does not withhold; when no such member exists the publish answers
+`mcp_package_not_found`. PyPI and OCI: the first Remote member with an
+upstream in walk order. A package that is not (yet) in the hosted member is
+looked up upstream. For an internal package that is a dependency-confusion path when
 its scope or name is not reserved upstream: map the hosted repository
 directly, or call `POST /validate` first and refuse to publish when it
 reports `outcome: fill` for an internal package. Publish the package before

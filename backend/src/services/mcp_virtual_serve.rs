@@ -32,6 +32,23 @@
 //! would: PyPI curation, and an age gate's answer that a Remote's upstream
 //! does not host the version.
 //!
+//! Not modelled either, an availability caveat only: the npm tarball route's
+//! hosted lookup falls back to a member's rows by storage path
+//! (`{pkg}/%/{filename}`, `npm_local_fetch`), while this model matches the
+//! `name` / `version` columns. A generic upload at
+//! `@acme/echo/9.9.9/echo-1.0.0.tgz` in a member walked before the pinned one
+//! is served for `echo-1.0.0.tgz` without the pin being held. npm checks the
+//! tarball against the packument's `dist.integrity`, so the client fails
+//! with `EINTEGRITY` rather than installing other bytes (#5537).
+//!
+//! The PyPI per-file rule is the format's, not the Virtual's: a directly
+//! mapped Local's pin also covers every file of the version
+//! (`mcp_packages::pin_shadowed`, through [`repo_rows`]), so uploading
+//! another wheel of a pinned version there holds the MCP version too.
+//!
+//! One decision expands the Virtual once ([`serve_model`],
+//! [`fill_remote`]): every guard reads that expansion (#5537).
+//!
 //! Per-caller member visibility (#5536). The route drops the members a
 //! caller cannot read, so for a caller who can read the Virtual but not the
 //! winning member, the next member that holds or proxies the coordinate
@@ -55,6 +72,7 @@ use std::collections::HashSet;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::api::handlers::proxy_helpers::ExpandedMember;
 use crate::api::handlers::{escape_like_literal, proxy_helpers};
 use crate::formats::mcp::{McpError, PackagePin};
 use crate::formats::pypi::PypiHandler;
@@ -120,19 +138,28 @@ fn db_err(e: sqlx::Error) -> McpError {
     McpError::Internal(e.to_string())
 }
 
+/// The source-distribution extensions the PyPI download route serves a file
+/// under (`version_from_pypi_filename`'s list): the modern `.tar.gz` and
+/// `.zip`, and the legacy `.tar.bz2`, `.tar.xz`, `.tgz` and `.tar` (#5537).
+const PYPI_SDIST_EXTS: [&str; 6] = [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".tar"];
+
 /// `(distribution, version)` of a PyPI file name: a wheel
-/// (`{dist}-{version}-...whl`) or an sdist (`{name}-{version}.tar.gz`,
-/// `.zip`).
+/// (`{dist}-{version}-...whl`), a legacy egg (`{dist}-{version}(-...)?.egg`)
+/// or an sdist (`{name}-{version}` plus one of [`PYPI_SDIST_EXTS`]).
 pub fn pypi_file_parts(file: &str) -> Option<(&str, &str)> {
-    if let Some(stem) = file.strip_suffix(".whl") {
+    if let Some(stem) = file
+        .strip_suffix(".whl")
+        .or_else(|| file.strip_suffix(".egg"))
+    {
         let mut parts = stem.splitn(3, '-');
         return match (parts.next(), parts.next()) {
             (Some(d), Some(v)) => Some((d, v)),
             _ => None,
         };
     }
-    file.strip_suffix(".tar.gz")
-        .or_else(|| file.strip_suffix(".zip"))?
+    PYPI_SDIST_EXTS
+        .iter()
+        .find_map(|ext| file.strip_suffix(ext))?
         .rsplit_once('-')
 }
 
@@ -268,16 +295,17 @@ fn npm_tarball(name: &str, version: &str) -> String {
 async fn guarded_members(
     db: &PgPool,
     virtual_id: Uuid,
-    members: Vec<Repository>,
+    leaves: &[ExpandedMember],
     registry_type: &str,
     name: &str,
     version: &str,
 ) -> Result<Vec<Repository>, McpError> {
+    let members: Vec<Repository> = leaves.iter().map(|m| m.repo.clone()).collect();
     match registry_type {
         "npm" => {
             let tarball = npm_tarball(name, version);
             let (ownership, members) = crate::api::handlers::npm::npm_virtual_eligible_members(
-                db, virtual_id, members, name, &tarball,
+                db, virtual_id, leaves, members, name, &tarball,
             )
             .await
             .map_err(walk_err)?;
@@ -290,9 +318,10 @@ async fn guarded_members(
         "cargo" => {
             let name_lower = name.to_ascii_lowercase();
             let owned = crate::formats::cargo::is_valid_cargo_name(&name_lower)
-                && proxy_helpers::virtual_non_remote_owns_name_exact_version(
+                && proxy_helpers::non_remote_ids_own_name_exact_version(
                     db,
                     virtual_id,
+                    &proxy_helpers::non_remote_leaf_ids(leaves),
                     &name_lower,
                     version,
                     "cargo",
@@ -320,6 +349,47 @@ fn serves_upstream(m: &Repository) -> bool {
     m.repo_type == RepositoryType::Remote && m.upstream_url.is_some()
 }
 
+/// The leaf members of Virtual `virtual_id` in walk order (the one
+/// expansion a decision reads, #5537).
+async fn leaves_of(db: &PgPool, virtual_id: Uuid) -> Result<Vec<ExpandedMember>, McpError> {
+    Ok(proxy_helpers::fetch_virtual_expansion(db, virtual_id)
+        .await
+        .map_err(walk_err)?
+        .members)
+}
+
+/// The Remote member of Virtual `virtual_id` a missing `registry_type`
+/// `identifier@version` (as submitted) is filled through: the Remote the
+/// Virtual's route would serve it from, so the fill and the pin's shadowing
+/// check agree (#5537). npm, NuGet and Cargo: the model's Remote winner
+/// (`None` when a hosted member serves the version, or the format's guard
+/// withholds every Remote member). PyPI, and a registry type the model does
+/// not cover (OCI): the first Remote member with an upstream in walk order.
+pub async fn fill_remote(
+    db: &PgPool,
+    virtual_id: Uuid,
+    registry_type: &str,
+    identifier: &str,
+    version: Option<&str>,
+) -> Result<Option<(Uuid, String)>, McpError> {
+    let leaves = leaves_of(db, virtual_id).await?;
+    match (registry_type, version) {
+        ("npm" | "nuget" | "cargo", Some(version)) => {
+            let model =
+                serve_model_of(db, virtual_id, &leaves, registry_type, identifier, version).await?;
+            Ok(match model.winner {
+                Some(Winner::Remote { id, key }) => Some((id, key)),
+                _ => None,
+            })
+        }
+        _ => Ok(leaves
+            .iter()
+            .map(|m| &m.repo)
+            .find(|m| serves_upstream(m))
+            .map(|m| (m.id, m.key.clone()))),
+    }
+}
+
 /// The serve model of `registry_type` `identifier@version` (as submitted) in
 /// Virtual `virtual_id`.
 pub async fn serve_model(
@@ -329,13 +399,21 @@ pub async fn serve_model(
     identifier: &str,
     version: &str,
 ) -> Result<ServeModel, McpError> {
-    let members: Vec<Repository> = proxy_helpers::fetch_virtual_expansion(db, virtual_id)
-        .await
-        .map_err(walk_err)?
-        .members
-        .into_iter()
-        .map(|m| m.repo)
-        .collect();
+    let leaves = leaves_of(db, virtual_id).await?;
+    serve_model_of(db, virtual_id, &leaves, registry_type, identifier, version).await
+}
+
+/// [`serve_model`] over the Virtual's expansion `leaves`: every guard reads
+/// that one expansion.
+async fn serve_model_of(
+    db: &PgPool,
+    virtual_id: Uuid,
+    leaves: &[ExpandedMember],
+    registry_type: &str,
+    identifier: &str,
+    version: &str,
+) -> Result<ServeModel, McpError> {
+    let members: Vec<&Repository> = leaves.iter().map(|m| &m.repo).collect();
     let ids: Vec<Uuid> = members.iter().map(|m| m.id).collect();
     let key_of = |id: Uuid| {
         members
@@ -375,16 +453,7 @@ pub async fn serve_model(
         .map(|r| key_of(r.repository_id));
     let mut winner = None;
     let mut later = Vec::new();
-    for m in guarded_members(
-        db,
-        virtual_id,
-        members.clone(),
-        registry_type,
-        &name,
-        version,
-    )
-    .await?
-    {
+    for m in guarded_members(db, virtual_id, leaves, registry_type, &name, version).await? {
         let serving = if m.repo_type == RepositoryType::Remote {
             serves_upstream(&m).then(|| Winner::Remote {
                 id: m.id,
@@ -626,5 +695,32 @@ mod tests {
             "1.0.0"
         ));
         assert_eq!(npm_tarball("@acme/echo", "1.0.0"), "echo-1.0.0.tgz");
+    }
+
+    /// #5537: the legacy distribution types the PyPI download route still
+    /// serves are files of their version too, so a same-named legacy file
+    /// uploaded under another project is seen.
+    #[test]
+    fn pypi_legacy_file_names_and_versions_5537() {
+        for (file, parts) in [
+            ("acme_echo-1.0.tar.bz2", ("acme_echo", "1.0")),
+            ("acme_echo-1.0.tar.xz", ("acme_echo", "1.0")),
+            ("acme_echo-1.0.tgz", ("acme_echo", "1.0")),
+            ("acme_echo-1.0.tar", ("acme_echo", "1.0")),
+            ("acme_echo-1.0-py3.12.egg", ("acme_echo", "1.0")),
+            ("acme_echo-1.0.egg", ("acme_echo", "1.0")),
+        ] {
+            assert_eq!(pypi_file_parts(file), Some(parts), "{file}");
+            assert!(
+                pypi_row_matches(&format!("zzz/{file}"), "zzz", "9", "acme-echo", "1.0.0"),
+                "{file}"
+            );
+            assert!(
+                crate::services::mcp_resolver::pypi_file_matches(file, "Acme-Echo", "1.0"),
+                "{file}"
+            );
+        }
+        assert_eq!(pypi_file_parts("nodash.egg"), None);
+        assert_eq!(pypi_file_parts("acme_echo-1.0.tar.zst"), None);
     }
 }
