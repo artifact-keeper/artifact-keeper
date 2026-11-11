@@ -17,7 +17,9 @@ use crate::formats::mcp::{
     ServerJson, SubmittedRef,
 };
 use crate::models::repository::RepositoryFormat;
-use crate::services::mcp_virtual_serve::{serve_model, shadow_reason, HostedRow, ServeModel};
+use crate::services::mcp_virtual_serve::{
+    hidden_member_shadow, serve_model, shadow_reason, HostedRow, ServeModel,
+};
 use crate::storage::StorageLocation;
 
 /// `repository_config` keys of an MCP repository.
@@ -726,6 +728,19 @@ async fn pinned_rows(
             return Err(shadowed(remote));
         }
         return Ok(model.files);
+    }
+    if matches!(model.winner, Some(Winner::Hosted { .. })) {
+        if let Some(reason) = hidden_member_shadow(db, repo.id, &model, &mut HashMap::new()).await?
+        {
+            return Err(McpError::PackageShadowed {
+                index,
+                detail: format!(
+                    "{} {}@{version} cannot be pinned through repository '{}': {reason}; make the \
+                     member readable by every reader of '{}', or map it directly",
+                    pkg.registry_type, pkg.identifier, repo.key, repo.key
+                ),
+            });
+        }
     }
     match model.winner {
         Some(Winner::Hosted { rows, .. }) => Ok(rows),
@@ -1480,6 +1495,9 @@ fn row_bytes_pinned(pin: &PackagePin, row: &GateRow) -> bool {
 pub(crate) struct ShadowCache {
     repos: HashMap<String, Option<BackingRepo>>,
     models: HashMap<(Uuid, String, String, String), ServeModel>,
+    /// `(virtual, member)`: whether the member is readable by every reader
+    /// of the Virtual (#5536).
+    covers: HashMap<(Uuid, Uuid), bool>,
 }
 
 /// Whether the advertised URL of an npm, PyPI, NuGet or Cargo pin no longer
@@ -1498,6 +1516,11 @@ pub(crate) struct ShadowCache {
 /// upstream. The pin never moves; the version serves again once the route
 /// serves the pinned rows again, or a new server version pins what it
 /// serves now.
+///
+/// The route also drops the members a caller cannot read (#5536): when the
+/// pinned member of a Virtual is not readable by everyone who can read the
+/// Virtual, any later member that holds or proxies the coordinate shadows
+/// the pin as well ([`hidden_member_shadow`]).
 ///
 /// OCI pins are digest-addressed and MCPB bundles are served from their own
 /// route, so neither is affected.
@@ -1569,7 +1592,18 @@ async fn pin_shadowed(
         };
         cache.models.insert(memo.clone(), model);
     }
-    Ok(shadow_reason(&cache.models[&memo], pin, &live, cached).is_some())
+    let model = &cache.models[&memo];
+    if shadow_reason(model, pin, &live, cached).is_some() {
+        return Ok(true);
+    }
+    if !mapped.is_virtual() {
+        return Ok(false);
+    }
+    Ok(
+        hidden_member_shadow(db, mapped.id, model, &mut cache.covers)
+            .await?
+            .is_some(),
+    )
 }
 
 /// Refuse a cache pin (a package a Remote member of `repo` has in its proxy
@@ -1591,7 +1625,11 @@ pub(crate) async fn refuse_shadowed_cache_pin(
         version,
     )
     .await?;
-    match shadow_reason(&model, pin, &[], true) {
+    let reason = match shadow_reason(&model, pin, &[], true) {
+        Some(reason) => Some(reason),
+        None => hidden_member_shadow(db, repo.id, &model, &mut HashMap::new()).await?,
+    };
+    match reason {
         None => Ok(()),
         Some(reason) => Err(McpError::PackageShadowed {
             index: pin.index,

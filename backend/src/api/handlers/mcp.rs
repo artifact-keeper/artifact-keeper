@@ -8865,6 +8865,67 @@ mod tests {
         }
     }
 
+    /// #5536: a Virtual's route drops the members a caller cannot read. With
+    /// a lower member holding the same coordinate (other bytes), a reader of
+    /// the Virtual who cannot read the pinned member is served the lower
+    /// member's copy, so once the pinned member is not readable by every
+    /// reader of the Virtual the version is held (`gate: shadowed`) and a
+    /// new pin of the coordinate is refused (`422 mcp_package_shadowed`).
+    /// Granting that reader the pinned member serves it again. PyPI is not
+    /// affected: every hosted file of the version is already part of its pin.
+    #[tokio::test]
+    async fn pinned_member_hidden_from_a_virtual_reader_shadows_5536() {
+        for case in SHADOW_CASES.iter().filter(|c| c.ty != "pypi") {
+            let ty = case.ty;
+            let Some(mut env) = Env::new().await else {
+                return;
+            };
+            let (virt, m) = env.shadow_virtual(ty, &[("local", 1), ("local", 2)]).await;
+            let a = env.publish_pkg(case, &m[0], b"approved A", None).await;
+            env.publish_pkg(case, &m[1], b"lower B", None).await;
+            let (s, b) = env.publish_shadow_server(case).await;
+            assert_eq!(s, StatusCode::OK, "{ty}: {b}");
+            assert_eq!(env.pinned_sha().await, a.sha256, "{ty}");
+            assert_eq!(
+                env.view().await,
+                View::Served,
+                "{ty}: every reader of the Virtual reads the pinned member"
+            );
+
+            let (reader, _) = tdh::create_user(&env.fx.pool).await;
+            tdh::grant_repo_role(&env.fx.pool, virt.id, reader, "reader").await;
+            assert_eq!(env.view().await, shadowed(), "{ty}");
+            let (s, b) = env
+                .publish(&doc(
+                    "com.acme/shadow",
+                    "1.0.1",
+                    serde_json::json!({"packages": [{"registryType": ty,
+                        "identifier": case.name, "version": case.pinned,
+                        "transport": {"type": "stdio"}}]}),
+                ))
+                .await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some("mcp_package_shadowed")
+                ),
+                "{ty}: {b}"
+            );
+            let detail = b["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains(&m[0].key) && detail.contains(&m[1].key),
+                "{ty}: {detail}"
+            );
+
+            tdh::grant_repo_role(&env.fx.pool, m[0].id, reader, "reader").await;
+            assert_eq!(env.view().await, View::Served, "{ty}");
+            let pool = env.fx.pool.clone();
+            env.teardown().await;
+            tdh::cleanup_user(&pool, reader).await;
+        }
+    }
+
     /// #5456 quarantine orders, each in a clean fixture: the MCP read and the
     /// advertised native download agree on every order.
     #[tokio::test]

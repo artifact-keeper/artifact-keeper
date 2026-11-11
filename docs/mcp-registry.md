@@ -541,7 +541,7 @@ package first, then publish the server.json. A publish answers `422` with one
 | --- | --- |
 | `mcp_external_registry` | The `registryType` has no backing repository, `registryBaseUrl` names anything other than this instance's backing repository (or is present on an `mcpb` entry), an OCI image's host is not the backing Remote's upstream, or (for a Local or Staging OCI backing repository) not this instance: name the image as `<ak-host>/<repo>/<image>:<tag>`. Under `open` only the first case and `registryBaseUrl` on an `mcpb` entry are refused; foreign coordinates are looked up in the backing repository. |
 | `mcp_package_not_found` | The exact package version (npm, PyPI, NuGet, Cargo) or image tag/digest (OCI) is not in a hosted backing repository, or an `mcpb` entry's `fileSha256` matches no uploaded bundle. A package missing from a Remote backing repository is not refused: it is filled (`202`, see [Write path](#write-path-phase-2-and-3)). |
-| `mcp_package_shadowed` | The backing repository is a Virtual whose download route would serve the package from another member than the one holding it: a Remote member that outranks it (or, for PyPI, any Remote member with an upstream). The detail names both members and the fixes. |
+| `mcp_package_shadowed` | The backing repository is a Virtual whose download route would serve the package from another member than the one holding it: a Remote member that outranks it (or, for PyPI, any Remote member with an upstream), or, when the holding member is not readable by every reader of the Virtual, a later member that holds or proxies it (#5536). The detail names both members and the fixes. |
 | `mcp_bundle_signature_required` | The repository sets `mcp_require_bundle_signature` and an `mcpb` entry's bundle (uploaded here or found through `mcp_package_repos.mcpb`) has no recorded signature from a trusted signer (see [MCPB bundles](#mcpb-bundles)). |
 | `mcp_package_version_unpinned` | An npm, PyPI, NuGet or Cargo entry has no `version`. |
 | `mcp_oci_floating_tag` | An OCI identifier is `:latest` or has no tag and no digest. |
@@ -616,13 +616,29 @@ Quarantine and shadowing together, for a Virtual `[H, L]` whose pin is A in
 The model walks every member of the Virtual, whoever is asking. Two of the
 route's skips only make it hold more than the route would: PyPI curation,
 and an age gate reporting that a Remote's upstream does not host the
-version. Per-caller member visibility is different and is a known caveat
-(#5536): the download route drops the members the caller cannot read, so for
-a caller who cannot read the pinned member, a lower-ranked hosted member (or,
-for NuGet, any Remote member) can serve other bytes at the pinned coordinate
-while the version is still served as approved. Until #5536 lands, give every
-reader of an MCP repository read access to the members that hold its pinned
-packages.
+version.
+
+Per-caller member visibility (#5536): the download route drops the members
+the caller cannot read, so for a caller who can read the Virtual but not the
+pinned member, the next member that holds the coordinate (or, past the
+format's guard, a Remote member with an upstream) serves other bytes. When
+the pinned member is not readable by every principal that can read the
+Virtual, any later member that holds or proxies the coordinate therefore
+shadows the pin: a publish is refused with `422 mcp_package_shadowed`, and a
+version already pinned is held with `gate: shadowed`. The pinned member
+counts as readable by every reader of the Virtual when it is public, or when
+the Virtual is not public, has no anonymous rule, and every active
+non-administrator user who may read the Virtual certainly reads the member:
+through an `admin` role, an unconditioned `permissions` rule on the member
+(or its project) carrying `read` or `admin`, or, when no rule on the member
+names the user, a role carrying `read` or `admin`. A rule with conditions (a
+CIDR or MCP namespace list) is never relied on, so such a grant on the member
+alone leaves the version held. Instance administrators read everything and
+are not considered. To serve such a version, give every reader of the
+Virtual read access to the pinned member (or make it public), or map the
+member directly. PyPI is not affected: every hosted file of the version is
+already part of its pin, and any Remote member with an upstream already
+shadows it.
 
 **Upgrading.** The check also applies to versions approved before it
 existed, so some are held as soon as the upgraded server reads them: those
