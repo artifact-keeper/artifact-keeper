@@ -837,17 +837,6 @@ async fn oidc_callback_inner(
         }
     };
 
-    // Federated login succeeded — record it with the same fidelity as the
-    // local-password login audit (#1617 Phase 1).
-    audit_federated_login(
-        &state,
-        AuditAction::Login,
-        Some(user.id),
-        "oidc",
-        serde_json::json!({ "username": user.username }),
-    )
-    .await;
-
     // 7a. Issue #1094: when map_groups_to_groups is enabled, reflect the
     //     OIDC group claim values as Artifact Keeper group memberships.
     //     Auto-create groups (tagged with external_source = 'oidc') on first
@@ -865,36 +854,16 @@ async fn oidc_callback_inner(
         }
     }
 
-    // 8. Create a short-lived exchange code instead of passing raw tokens in the URL
-    let exchange_code = AuthConfigService::create_exchange_code(
-        &state.db,
-        &tokens.access_token,
-        &tokens.refresh_token,
-    )
-    .await?;
-
-    let frontend_url = build_frontend_callback_url(&exchange_code);
-
-    // Set auth cookies on the redirect itself (closes #1405).
-    //
-    // Without this, the browser arrives at `/callback?code=...` with no auth
-    // cookie set. The web AuthProvider mounts and fires `GET /auth/me` before
-    // the page-level `POST /exchange` completes, gets a 401 (no cookie), and
-    // redirects to `/login`. With multiple backend replicas the cookie-set
-    // response from `/exchange` and the cookieless `/auth/me` can interleave
-    // (the customer mitigation was ALB sticky sessions, confirming the race
-    // is per-replica state). Setting cookies on the 307 ensures the cookie is
-    // installed in the browser the instant it lands on `/callback`, so any
-    // eager `/auth/me` from the frontend succeeds. The `/exchange` POST still
-    // runs and re-sets cookies (idempotent) so the existing flow continues to
-    // work for frontends that read the response body.
-    build_sso_callback_redirect(
-        &frontend_url,
-        &tokens.access_token,
-        &tokens.refresh_token,
-        tokens.expires_in,
+    // 8. TOTP step if enrolled (#5484), audit, exchange code, cookies.
+    complete_federated_login(
+        &state,
+        &auth_service,
+        &user,
+        &tokens,
+        "oidc",
         client_is_https,
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +989,27 @@ pub async fn ldap_login(
                 "Failed to sync LDAP groups to local groups; user login still succeeds"
             );
         }
+    }
+
+    // #5484: the directory password is one factor. An LDAP user who enrolled
+    // TOTP gets the same challenge `POST /auth/login` answers with — a
+    // single-use `totp_token` to redeem at `POST /auth/totp/verify` — and no
+    // session until then. (The TOTP policy's enrolment requirement applies to
+    // local accounts only, so it never fires here.)
+    if auth_service.password_only_refusal(&user).await?
+        == Some(crate::services::auth_service::PasswordOnlyRefusal::SecondFactorRequired)
+    {
+        let totp_token = auth_service.generate_totp_pending_token(&user)?;
+        let body = serde_json::json!({
+            "access_token": "",
+            "refresh_token": "",
+            "token_type": "Bearer",
+            "expires_in": tokens.expires_in,
+            "must_change_password": user.must_change_password,
+            "totp_required": true,
+            "totp_token": totp_token,
+        });
+        return Ok(Json(body).into_response());
     }
 
     audit_federated_login(
@@ -1292,15 +1282,6 @@ pub async fn saml_acs(
         )
         .await?;
 
-    audit_federated_login(
-        &state,
-        AuditAction::Login,
-        Some(user.id),
-        "saml",
-        serde_json::json!({ "username": user.username }),
-    )
-    .await;
-
     // Issue #2333 (parity with OIDC #1094): when map_groups_to_groups is
     // enabled, reflect the SAML assertion group values as Artifact Keeper
     // group memberships. Auto-create groups (tagged with
@@ -1321,25 +1302,16 @@ pub async fn saml_acs(
         }
     }
 
-    // Create a short-lived exchange code instead of passing raw tokens in the URL
-    let exchange_code = AuthConfigService::create_exchange_code(
-        &state.db,
-        &tokens.access_token,
-        &tokens.refresh_token,
-    )
-    .await?;
-
-    let frontend_url = build_frontend_callback_url(&exchange_code);
-
-    // Set auth cookies on the redirect itself; see oidc_callback_inner for
-    // the rationale (closes #1405).
-    build_sso_callback_redirect(
-        &frontend_url,
-        &tokens.access_token,
-        &tokens.refresh_token,
-        tokens.expires_in,
+    // TOTP step if enrolled (#5484), audit, exchange code, cookies.
+    complete_federated_login(
+        &state,
+        &auth_service,
+        &user,
+        &tokens,
+        "saml",
         client_is_https,
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1338,15 @@ struct ExchangeCodeResponse {
     /// short-lived (`JWT_ACCESS_TOKEN_EXPIRY_MINUTES`, 30 by default);
     /// automation should mint an API token instead.
     expires_in: u64,
+    /// Present (and `true`) when the account has TOTP enrolled (#5484): the
+    /// code carried no session. `access_token` and `refresh_token` are empty
+    /// and `totp_token` is redeemed at `POST /api/v1/auth/totp/verify`, as
+    /// after `POST /api/v1/auth/login`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    totp_required: Option<bool>,
+    /// Single-use TOTP pending token; see `totp_required`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    totp_token: Option<String>,
 }
 
 /// Seconds left before `access_token` expires, read from its `exp` claim
@@ -1405,6 +1386,26 @@ pub async fn exchange_code(
         .await
         .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
+    // #5484: a code minted by `sso_totp_challenge_redirect` holds a TOTP
+    // pending token and no refresh token. Hand the challenge on; no cookies.
+    if refresh_token.is_empty() {
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        if auth_service
+            .validate_totp_pending_token(&access_token)
+            .is_ok()
+        {
+            return Ok(Json(ExchangeCodeResponse {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                token_type: "Bearer".to_string(),
+                expires_in: 0,
+                totp_required: Some(true),
+                totp_token: Some(access_token),
+            })
+            .into_response());
+        }
+    }
+
     let expires_in = access_token_expires_in(
         &access_token,
         chrono::Utc::now().timestamp(),
@@ -1415,6 +1416,8 @@ pub async fn exchange_code(
         refresh_token: refresh_token.clone(),
         token_type: "Bearer".to_string(),
         expires_in,
+        totp_required: None,
+        totp_token: None,
     };
 
     let mut response = Json(body).into_response();
@@ -1452,6 +1455,71 @@ pub struct SsoApiDoc;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Finish an OIDC callback or SAML ACS for a user the IdP authenticated.
+///
+/// An account that enrolled TOTP in Artifact Keeper stops at the TOTP step
+/// (#5484): `POST /auth/login` and LDAP login answer it with a TOTP
+/// challenge, and the IdP completions used to mint the session straight
+/// away. For such an account the exchange code carries a single-use TOTP
+/// pending token instead of a session, the redirect sets no auth cookies, and
+/// `POST /exchange` returns `totp_required: true` with the `totp_token` to
+/// redeem at `POST /api/v1/auth/totp/verify` (which writes the `LOGIN` audit
+/// row). Otherwise the login is audited and the browser is sent to the
+/// frontend `/callback` with a short-lived exchange code, never raw tokens in
+/// the URL.
+///
+/// The session cookies are set on the redirect itself (closes #1405). Without
+/// this, the browser arrives at `/callback?code=...` with no auth cookie set.
+/// The web AuthProvider mounts and fires `GET /auth/me` before the page-level
+/// `POST /exchange` completes, gets a 401 (no cookie), and redirects to
+/// `/login`. With multiple backend replicas the cookie-set response from
+/// `/exchange` and the cookieless `/auth/me` can interleave (the customer
+/// mitigation was ALB sticky sessions, confirming the race is per-replica
+/// state). Setting cookies on the 307 ensures the cookie is installed in the
+/// browser the instant it lands on `/callback`, so any eager `/auth/me` from
+/// the frontend succeeds. The `/exchange` POST still runs and re-sets cookies
+/// (idempotent) so the existing flow continues to work for frontends that
+/// read the response body.
+async fn complete_federated_login(
+    state: &SharedState,
+    auth_service: &AuthService,
+    user: &crate::models::user::User,
+    tokens: &crate::services::auth_service::TokenPair,
+    provider: &str,
+    client_is_https: bool,
+) -> Result<Response> {
+    if auth_service.password_only_refusal(user).await?
+        == Some(crate::services::auth_service::PasswordOnlyRefusal::SecondFactorRequired)
+    {
+        let totp_token = auth_service.generate_totp_pending_token(user)?;
+        let code = AuthConfigService::create_exchange_code(&state.db, &totp_token, "").await?;
+        return Ok(Redirect::temporary(&build_frontend_callback_url(&code)).into_response());
+    }
+
+    audit_federated_login(
+        state,
+        AuditAction::Login,
+        Some(user.id),
+        provider,
+        serde_json::json!({ "username": user.username }),
+    )
+    .await;
+
+    let exchange_code = AuthConfigService::create_exchange_code(
+        &state.db,
+        &tokens.access_token,
+        &tokens.refresh_token,
+    )
+    .await?;
+    build_sso_callback_redirect(
+        &build_frontend_callback_url(&exchange_code),
+        &tokens.access_token,
+        &tokens.refresh_token,
+        tokens.expires_in,
+        client_is_https,
+    )
+}
 
 /// Build the frontend callback URL for the SSO exchange code flow.
 ///
@@ -3192,8 +3260,12 @@ mod tests {
             refresh_token: "rt_456".to_string(),
             token_type: "Bearer".to_string(),
             expires_in: 1800,
+            totp_required: None,
+            totp_token: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("totp_required").is_none());
+        assert!(json.get("totp_token").is_none());
         assert_eq!(json["expires_in"], 1800);
         assert_eq!(json["access_token"], "at_123");
         assert_eq!(json["refresh_token"], "rt_456");
@@ -4269,6 +4341,108 @@ mod tests {
     // without a database. The coverage CI job provisions Postgres and runs
     // migrations, so the group-reconciliation paths are exercised there.
     // =======================================================================
+
+    /// #5484: `complete_federated_login` (the end of the OIDC callback and
+    /// the SAML ACS) stops a TOTP-enrolled account at the TOTP step: no
+    /// session cookies on the redirect, and `POST /exchange` answers with the
+    /// challenge and no cookies. An account without TOTP gets its session as
+    /// before.
+    mod federated_totp_5484 {
+        use super::super::{complete_federated_login, router};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::AuthService;
+        use axum::http::{Request, StatusCode};
+        use std::sync::Arc;
+        use uuid::Uuid;
+
+        async fn seed(pool: &sqlx::PgPool, totp: bool) -> crate::models::user::User {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO users (id, username, email, auth_provider, external_id, \
+                 is_admin, is_active, totp_enabled, totp_secret) \
+                 VALUES ($1, $2, $3, 'oidc', $4, false, true, $5, $6)",
+            )
+            .bind(id)
+            .bind(format!("fed-5484-{}", id.simple()))
+            .bind(format!("fed-5484-{}@test.local", id.simple()))
+            .bind(format!("sub-{}", id.simple()))
+            .bind(totp)
+            .bind(totp.then_some("JBSWY3DPEHPK3PXP"))
+            .execute(pool)
+            .await
+            .expect("seed user");
+            sqlx::query_as("SELECT * FROM users WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("load user")
+        }
+
+        #[tokio::test]
+        async fn complete_federated_login_challenges_a_totp_account() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let dir = std::env::temp_dir().join(format!("fed-5484-{}", Uuid::new_v4()));
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            let svc = AuthService::new(pool.clone(), Arc::new(state.config.clone()));
+
+            let mut results = Vec::new();
+            for totp in [false, true] {
+                let user = seed(&pool, totp).await;
+                let tokens = svc.generate_tokens(&user).expect("tokens");
+                let resp = complete_federated_login(&state, &svc, &user, &tokens, "oidc", false)
+                    .await
+                    .expect("completion");
+                let status = resp.status();
+                let cookies = resp.headers().get_all("set-cookie").iter().count();
+                let location = resp.headers()["location"].to_str().unwrap().to_string();
+                let code = urlencoding::decode(location.strip_prefix("/callback?code=").unwrap())
+                    .unwrap()
+                    .into_owned();
+                let (ex_status, ex_body, ex_headers) = tdh::send_with_headers(
+                    router().with_state(state.clone()),
+                    Request::builder()
+                        .method("POST")
+                        .uri("/exchange")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({ "code": code }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await;
+                let body: serde_json::Value = serde_json::from_slice(&ex_body).unwrap();
+                let ex_cookies = ex_headers.get_all("set-cookie").iter().count();
+                let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                    .bind(user.id)
+                    .execute(&pool)
+                    .await;
+                results.push((user.id, status, cookies, ex_status, ex_cookies, body));
+            }
+
+            let (_, status, cookies, ex_status, ex_cookies, body) = &results[0];
+            assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT, "control");
+            assert!(*cookies > 0, "control sets session cookies");
+            assert_eq!(*ex_status, StatusCode::OK);
+            assert!(*ex_cookies > 0);
+            assert!(body.get("totp_required").is_none(), "{body}");
+            assert!(body["access_token"].as_str().is_some_and(|t| !t.is_empty()));
+
+            let (user_id, status, cookies, ex_status, ex_cookies, body) = &results[1];
+            assert_eq!(*status, StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(*cookies, 0, "no session before the second factor");
+            assert_eq!(*ex_status, StatusCode::OK, "{body}");
+            assert_eq!(*ex_cookies, 0);
+            assert_eq!(body["totp_required"], true, "{body}");
+            assert_eq!(body["access_token"], "");
+            assert_eq!(body["refresh_token"], "");
+            let claims = svc
+                .validate_totp_pending_token(body["totp_token"].as_str().expect("totp_token"))
+                .expect("pending token");
+            assert_eq!(claims.sub, *user_id);
+        }
+    }
 
     mod sync_db {
         use super::super::{
