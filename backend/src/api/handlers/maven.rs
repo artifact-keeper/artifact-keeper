@@ -2583,7 +2583,7 @@ async fn download(
             // unconditionally. Deliberate (the generated-wins direction is
             // the safe one, #3382 review finding 10), not a bug to "fix" by
             // making the stored sidecar readable again.
-            let content = fetch_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+            let content = serve_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
             let checksum = compute_checksum(&content, checksum_type);
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -2608,7 +2608,7 @@ async fn download(
     // convention) letting clients/groups skip members that can't contain a
     // given groupId.
     if MavenHandler::is_prefixes_file(&path) {
-        let content = fetch_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
+        let content = serve_maven_prefixes_bytes(&state, &repo, auth.as_ref()).await?;
         // A virtual repo's merge (and a private hosted repo's inventory) is
         // caller-dependent, so a shared cache must not store the `public`
         // response for a credentialed request (#3382 review finding 10;
@@ -2890,8 +2890,12 @@ async fn download(
         return Err(AppError::NotFound("File not found".to_string()).into_response());
     }
 
-    // 4. Serve the artifact file
-    serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await
+    // 4. Serve the artifact file. Every serve (hosted, proxied, virtual)
+    // honours the client's `Range` through the shared helper (#5668): a
+    // segmented download (Maven Resolver's, a download manager's) of a
+    // 200-with-the-whole-body otherwise stitches the file together wrong.
+    let served = serve_artifact(&state, &repo, &repo_key, &path, auth.as_ref(), &ctx).await?;
+    proxy_helpers::apply_range_to_streamed_serve(served, &headers, ctx.is_head)
 }
 
 /// One virtual member's answer to a Maven metadata fetch in a merge (#5621).
@@ -3517,8 +3521,8 @@ fn parse_prefixes_lines(text: &str) -> Vec<String> {
 enum PrefixesError {
     /// Locally-decided "no complete answer" (unknown repo_type, or an
     /// upstream/remote-member unavailability that leaves the virtual union
-    /// incomplete). NOT an empty-but-complete set — that's `Ok` with a
-    /// header-only body. Cacheable.
+    /// incomplete), or a complete set that is empty (#5668). Cacheable: a
+    /// publish invalidates the entry.
     NotFound(String),
     /// A DB error from `collect_local_group_prefixes`. `sqlx::Error` isn't
     /// `Clone`, so it's stringified at the call site — the same information
@@ -3631,9 +3635,9 @@ async fn fetch_maven_prefixes_bytes(
 /// their own stored groupIds. An unrecognized `repo_type` fails closed
 /// (finding 4) instead of falling through to the hosted generator. A
 /// COMPLETE-but-empty set (a hosted repo with no artifacts yet, or a virtual
-/// whose members all confirmably contributed nothing) is still a real
-/// header-only 200 — 404 is reserved for the INCOMPLETE case, where the full
-/// set could not be determined at all.
+/// whose members all confirmably contributed nothing) is 404 as well, since a
+/// header-only file denies every path (#5668); see
+/// [`prefixes_or_not_published`].
 async fn fetch_maven_prefixes_bytes_uncached(
     state: &SharedState,
     repo: &RepoInfo,
@@ -3706,26 +3710,66 @@ async fn fetch_maven_prefixes_bytes_uncached(
                     }
                 }
             }
-            // A complete-but-empty union is a real (if unfiltering) answer —
-            // header-only 200, not 404. 404 is reserved for the INCOMPLETE
-            // case above, where the full set genuinely could not be
-            // determined.
-            Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
+            // A complete-but-empty union is 404 too (#5668): a header-only
+            // file is an allowlist with nothing on it, see
+            // `prefixes_or_not_published`.
+            prefixes_or_not_published(prefixes)
         }
         Some(RepositoryType::Local) | Some(RepositoryType::Staging) => {
             let prefixes = collect_local_group_prefixes(&state.db, repo.id)
                 .await
                 .map_err(|e| PrefixesError::Db(e.to_string()))?;
             // A hosted repo's set is always complete (there's no "unknown
-            // member" case), so an empty set is a real header-only 200, not
-            // 404 — a new repo with zero artifacts genuinely filters nothing
-            // yet.
-            Ok(Bytes::from(MavenHandler::generate_prefixes_txt(prefixes)))
+            // member" case), but an empty one is still 404 (#5668).
+            prefixes_or_not_published(prefixes)
         }
         None => Err(PrefixesError::NotFound(
             "Repository type not recognized".to_string(),
         )),
     }
+}
+
+/// The prefix file for a COMPLETE set of group prefixes, or 404 when the set
+/// is empty (#5668).
+///
+/// Maven Resolver reads a prefix file as an allowlist: a header-only file
+/// ("Loaded 0 auto-discovered prefixes") denies every path, so a client that
+/// fetched it from a new, empty repository then refused to read the
+/// SNAPSHOT `maven-metadata.xml` it had just deployed ("the prefixes file
+/// appears stale") and restarted the build number at 1 on every deploy. It
+/// also keeps the file for a day. A 404 is the "no prefix file" answer: the
+/// client does not filter this repository, which is right until a groupId
+/// exists. The first publish invalidates [`MAVEN_PREFIXES_CACHE`], so the
+/// next GET serves the real file.
+fn prefixes_or_not_published(prefixes: Vec<String>) -> Result<Bytes, PrefixesError> {
+    let file = MavenHandler::generate_prefixes_txt(prefixes);
+    if parse_prefixes_lines(&file).is_empty() {
+        return Err(PrefixesError::NotFound(
+            "No prefix file: the repository has no groupIds yet".to_string(),
+        ));
+    }
+    Ok(Bytes::from(file))
+}
+
+/// [`fetch_maven_prefixes_bytes`] for the GET handler: a 404 carries
+/// `Cache-Control: no-store` so neither a client nor a shared cache keeps
+/// "no prefix file" past the first publish (#5668).
+async fn serve_maven_prefixes_bytes(
+    state: &SharedState,
+    repo: &RepoInfo,
+    auth: Option<&AuthExtension>,
+) -> Result<Bytes, Response> {
+    fetch_maven_prefixes_bytes(state, repo, auth)
+        .await
+        .map_err(|mut resp| {
+            if resp.status() == StatusCode::NOT_FOUND {
+                resp.headers_mut().insert(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-store"),
+                );
+            }
+            resp
+        })
 }
 
 /// Distinct groupIds stored in `repo_id`, rendered as prefix paths
@@ -10377,46 +10421,144 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&sha1_body), expected);
     }
 
+    /// #5668: an uncached GET through a Remote whose upstream cannot be
+    /// reached (DNS failure, refused connection) answered
+    /// `500 STORAGE_ERROR`; it is a gateway failure, 502.
     #[tokio::test]
-    async fn test_empty_repo_prefixes_txt_is_header_only() {
-        // A hosted repo's set is always COMPLETE (there's no "unknown
-        // member" case for it), so an empty set is a real header-only 200,
-        // not 404 — 404 is reserved for the virtual INCOMPLETE-union case
-        // (see `test_virtual_prefixes_bails_when_a_member_errors` and
-        // `test_virtual_prefixes_bails_on_upstream_unsupported_marker`).
+    async fn test_remote_unreachable_upstream_is_502_5668() {
         use crate::api::handlers::test_db_helpers as tdh;
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
+        // Nothing listens on port 1: a transport failure, not an HTTP answer.
+        let (remote_id, remote_key, dir) = tdh::create_repo(&pool, "remote", "maven").await;
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind("http://127.0.0.1:1/maven2")
+            .bind(remote_id)
+            .execute(&pool)
+            .await
+            .expect("point remote at a dead upstream");
+        tdh::publish_repo(&pool, remote_id).await;
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
 
-        let (repo_id, repo_key, dir) = tdh::create_repo(&pool, "local", "maven").await;
-        let (user_id, username) = tdh::create_user(&pool).await;
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!(
+                "/{remote_key}/org/apache/commons/commons-collections4/4.4/commons-collections4-4.4.pom"
+            )),
+        )
+        .await;
+        tdh::cleanup_member_repo(&pool, remote_id, &dir).await;
 
-        let state = tdh::build_state(pool.clone(), dir.to_str().unwrap());
-        let auth = tdh::make_auth(user_id, &username);
-        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(!body.contains("STORAGE_ERROR"), "{body}");
+    }
 
-        let req = Request::builder()
-            .method("GET")
-            .uri(format!("/{}/.meta/prefixes.txt", repo_key))
-            .body(Body::empty())
-            .expect("build GET prefixes.txt");
-        let (status, body) = tdh::send(router, req).await;
+    /// #5668: the native `/maven/` route ignored `Range` and answered 200
+    /// with the whole body and no `Accept-Ranges`, so a segmented download
+    /// stitched every segment from byte 0. A hosted serve now answers 206
+    /// with the window, 416 past the end, and advertises `Accept-Ranges`.
+    #[tokio::test]
+    async fn test_native_route_honours_range_5668() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::{header, StatusCode};
 
-        tdh::cleanup(&pool, repo_id, user_id).await;
-        let _ = std::fs::remove_dir_all(&dir);
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+        let path = "com/acme/range5668/lib/1.0/lib-1.0.jar";
+        let jar = bytes::Bytes::from_static(b"0123456789abcdefghij");
+        let uri = format!("/{}/{path}", fx.repo_key);
+        let (put_status, _) = tdh::send(router.clone(), tdh::put(uri.clone(), jar.clone())).await;
+        let ranged = |range: &'static str| {
+            let mut req = tdh::get(uri.clone());
+            req.headers_mut()
+                .insert(header::RANGE, header::HeaderValue::from_static(range));
+            req
+        };
+        let (full_status, full_body, full_headers) =
+            tdh::send_with_headers(router.clone(), tdh::get(uri.clone())).await;
+        let (part_status, part_body, part_headers) =
+            tdh::send_with_headers(router.clone(), ranged("bytes=2-5")).await;
+        let (past_status, _, _) = tdh::send_with_headers(router, ranged("bytes=100-")).await;
+        fx.teardown().await;
+
+        assert_eq!(put_status, StatusCode::CREATED);
+        assert_eq!(full_status, StatusCode::OK);
+        assert_eq!(&full_body[..], &jar[..]);
+        assert_eq!(
+            full_headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(part_status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(&part_body[..], b"2345");
+        assert_eq!(
+            part_headers
+                .get(header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 2-5/20")
+        );
+        assert_eq!(past_status, StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    /// #5668: a new hosted repo served a header-only `.meta/prefixes.txt`.
+    /// Maven Resolver reads that as an allowlist with nothing on it, kept it
+    /// for a day, and refused the SNAPSHOT `maven-metadata.xml` it had just
+    /// deployed, so the build number restarted at 1 on every deploy. With no
+    /// groupId yet the file is 404 (`no-store`, as is its checksum), and the
+    /// first publish makes the next GET serve the real file.
+    #[tokio::test]
+    async fn test_empty_repo_prefixes_txt_is_404_until_first_publish_5668() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::http::StatusCode;
+
+        let Some(fx) = tdh::Fixture::setup("local", "maven").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+        let get = |leaf: &str| tdh::get(format!("/{}/{leaf}", fx.repo_key));
+
+        let (empty_status, _, empty_headers) =
+            tdh::send_with_headers(router.clone(), get(".meta/prefixes.txt")).await;
+        let (sha1_status, _) = tdh::send(router.clone(), get(".meta/prefixes.txt.sha1")).await;
+        let (put_status, _) = tdh::send(
+            router.clone(),
+            tdh::put(
+                format!(
+                    "/{}/com/acme/prfx5668/lib/1.0-SNAPSHOT/lib-1.0-20261101.100000-1.jar",
+                    fx.repo_key
+                ),
+                bytes::Bytes::from_static(b"snapshot jar 5668"),
+            ),
+        )
+        .await;
+        let (status, body) = tdh::send(router, get(".meta/prefixes.txt")).await;
+        fx.teardown().await;
 
         assert_eq!(
-            status,
-            StatusCode::OK,
-            "expected 200 even with no artifacts"
+            empty_status,
+            StatusCode::NOT_FOUND,
+            "no groupId yet: no file"
         );
         assert_eq!(
+            empty_headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "the 404 must not be cached past the first publish"
+        );
+        assert_eq!(sha1_status, StatusCode::NOT_FOUND, "nor its checksum");
+        assert_eq!(put_status, StatusCode::CREATED);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
             String::from_utf8_lossy(&body),
-            "## repository-prefixes/2.0\n"
+            "## repository-prefixes/2.0\n/com/acme/prfx5668\n"
         );
     }
 
@@ -11005,6 +11147,51 @@ mod tests {
             ["## repository-prefixes/2.0", "/com/local/prfxnone"],
             "expected only the local member's prefixes: {}",
             text
+        );
+    }
+
+    /// #5668: a virtual whose members all confirmably publish nothing (here
+    /// one remote whose upstream has no prefix file) answers 404, not the
+    /// header-only file Maven reads as "deny everything".
+    #[tokio::test]
+    async fn test_virtual_prefixes_empty_union_is_404_5668() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        // No mock mounted: wiremock 404s every request, including this path.
+        let mock = wiremock::MockServer::start().await;
+        let (remote_id, _remote_key, virtual_id, virtual_key) =
+            tdh::create_remote_and_virtual(&pool, "maven", &mock.uri()).await;
+        let dir = std::env::temp_dir().join(format!("prfx5668-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), dir.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), dir.to_str().unwrap(), proxy);
+
+        let (status, body) = tdh::send(
+            tdh::router_anon(super::router(), state),
+            tdh::get(format!("/{}/.meta/prefixes.txt", virtual_key)),
+        )
+        .await;
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(virtual_id)
+            .execute(&pool)
+            .await;
+        for id in [virtual_id, remote_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            String::from_utf8_lossy(&body)
         );
     }
 

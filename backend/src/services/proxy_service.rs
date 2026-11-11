@@ -1099,8 +1099,12 @@ fn is_ssrf_block_error(err: &(dyn std::error::Error + 'static)) -> bool {
 /// SSRF-blocked is not mislabeled as a proxy failure — that just confuses
 /// triage since no proxy was involved. Either way it is a 503 and the
 /// redacted-URL `context` (never proxy creds/IP) is preserved. Every other
-/// (non-SSRF) transport failure keeps the pre-existing `Storage` mapping
-/// unchanged.
+/// (non-SSRF) transport failure (a DNS failure, a refused or reset
+/// connection, a timeout) is a `BadGateway` 502 (#5668): the upstream could
+/// not be reached, which is a gateway failure, not the `500 STORAGE_ERROR`
+/// it used to answer. A virtual member walk still reads it as unavailable
+/// (no upstream status), and the stale-if-error refill still serves the
+/// cached copy.
 fn map_transport_error(
     proxy_configured: bool,
     is_ssrf_block: bool,
@@ -1118,7 +1122,7 @@ fn map_transport_error(
             ))
         }
     } else {
-        AppError::Storage(format!("Failed to {context}: {detail}"))
+        AppError::BadGateway(format!("Failed to {context}: {detail}"))
     }
 }
 
@@ -11925,19 +11929,31 @@ mod tests {
     }
 
     #[test]
-    fn map_transport_error_generic_upstream_error_keeps_storage_path() {
-        // A generic transport error (proxy configured but NOT an SSRF block)
-        // must keep the pre-existing Storage mapping.
-        let err = map_transport_error(
-            true,  // proxy configured
-            false, // not an SSRF block (e.g. connection reset)
-            "fetch from upstream https://registry.example/x",
-            "connection reset by peer",
-        );
-        assert!(
-            matches!(err, AppError::Storage(_)),
-            "generic upstream error must map to Storage, got {err:?}"
-        );
+    fn map_transport_error_generic_upstream_error_is_bad_gateway_5668() {
+        // A generic transport error (a DNS failure, a reset connection; NOT
+        // an SSRF block) is an unreachable upstream: 502, not the
+        // `500 STORAGE_ERROR` it used to be (#5668). It still reads as an
+        // unavailable member in a virtual walk.
+        for proxy_configured in [true, false] {
+            let err = map_transport_error(
+                proxy_configured,
+                false,
+                "fetch from upstream https://bogus-upstream.invalid/x",
+                "error sending request",
+            );
+            assert!(
+                matches!(err, AppError::BadGateway(_)),
+                "generic upstream error must map to BadGateway, got {err:?}"
+            );
+            assert_eq!(
+                classify_member_fetch_failure(&err),
+                MemberFetchFailure::Unavailable
+            );
+            assert_eq!(
+                axum::response::IntoResponse::into_response(err).status(),
+                axum::http::StatusCode::BAD_GATEWAY
+            );
+        }
     }
 
     #[test]
