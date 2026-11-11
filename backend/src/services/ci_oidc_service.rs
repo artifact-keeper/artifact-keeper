@@ -848,10 +848,17 @@ pub struct CiOidcService {
 /// token that is not valid yet used to be accepted. Both time claims share the
 /// library's default leeway (60 s), so ordinary clock skew between the issuer
 /// and this server is tolerated in both directions.
+///
+/// `iss` and `aud` are also *required* (#5482). `jsonwebtoken` compares them
+/// only when the token carries them in a parseable shape, so without this an
+/// assertion with no `aud`, `aud: null` or a non-string `aud` was accepted for
+/// every provider on its issuer, and one with no `iss` was exchanged through
+/// the `provider_id` override.
 fn ci_jwt_validation(alg: Algorithm, provider: &CiOidcProvider) -> Validation {
     let mut validation = Validation::new(alg);
     validation.set_audience(&[provider.audience.as_str()]);
     validation.set_issuer(&[provider.issuer_url.as_str()]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     validation.validate_nbf = true;
     validation
 }
@@ -1657,7 +1664,8 @@ impl CiOidcService {
             // A malformed assertion is deliberately NOT rejected here: the
             // override path only cross-checks what it can read, and
             // `validate_ci_jwt` is the single place that decides whether an
-            // assertion is acceptable.
+            // assertion is acceptable. It requires `iss` and `aud` (#5482),
+            // so an assertion with no readable `iss` is refused there.
             if let Some(hints) = Self::peek_assertion_hints(jwt_str) {
                 if normalize_issuer(&hints.issuer) != normalize_issuer(&provider.issuer_url) {
                     return Err(AppError::Validation(format!(
@@ -4798,6 +4806,46 @@ mod tests {
             .validate_ci_jwt(&provider, &with_nbf(now - 30))
             .await
             .expect("an nbf in the past verifies");
+    }
+
+    /// #5482: `iss` and `aud` are required, not just compared when present.
+    /// A validly signed assertion with no `aud`, `aud: null`, a non-string
+    /// `aud`, or no `iss` used to verify for any provider on the issuer.
+    #[tokio::test]
+    async fn an_assertion_without_iss_or_aud_is_refused_5482() {
+        let k1 = test_key(0, Some("k1"));
+        let provider = static_provider(&[&k1]);
+        let base = k8s_token_claims(ONPREM_ISSUER);
+        let without = |claim: &str| {
+            let mut c = base.clone();
+            c.as_object_mut().unwrap().remove(claim);
+            c
+        };
+        let with_aud = |aud: serde_json::Value| {
+            let mut c = base.clone();
+            c["aud"] = aud;
+            c
+        };
+        for (case, claim, claims) in [
+            ("no aud", "aud", without("aud")),
+            ("aud: null", "aud", with_aud(json!(null))),
+            ("aud: 42", "aud", with_aud(json!(42))),
+            ("no iss", "iss", without("iss")),
+        ] {
+            let err = test_service()
+                .validate_ci_jwt(&provider, &sign(&k1, Some("k1"), &claims))
+                .await
+                .expect_err(case);
+            assert!(
+                matches!(&err, crate::error::AppError::Authentication(m)
+                    if m.contains("Missing required claim") && m.contains(claim)),
+                "{case}: {err:?}"
+            );
+        }
+        test_service()
+            .validate_ci_jwt(&provider, &sign(&k1, Some("k1"), &base))
+            .await
+            .expect("the same assertion with iss and aud still verifies");
     }
 
     /// 3.1 — a static provider verifies against its stored set and never

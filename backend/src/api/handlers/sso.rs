@@ -97,6 +97,21 @@ fn record_sso_auth_failure(err: &AppError, fallback: AuthFailureReason) {
     );
 }
 
+/// Refuse a login through a provider the operator has disabled (#5482).
+///
+/// The config getters load a provider by id or slug whatever its `is_enabled`
+/// flag (the admin API needs that), so every login entry point and every
+/// completion (OIDC callbacks, SAML ACS) checks the flag itself. A disabled
+/// provider answers like a missing one: `GET /auth/sso/providers` does not
+/// list it either.
+fn require_enabled_provider(is_enabled: bool, kind: &str) -> Result<()> {
+    if is_enabled {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(format!("{kind} provider not found")))
+    }
+}
+
 /// Re-validate an OIDC endpoint URL against the outbound-URL SSRF guard
 /// immediately before the server fetches it as a first hop. The shared
 /// HTTP client's redirect policy only guards redirect hops, never the
@@ -254,6 +269,7 @@ pub async fn oidc_login(
 
     // 1. Get decrypted OIDC config
     let (row, _client_secret) = AuthConfigService::get_oidc_decrypted(&state.db, id).await?;
+    require_enabled_provider(row.is_enabled, "OIDC")?;
 
     // 2. If PKCE is enabled for this provider, generate a verifier and stash
     //    it in the SSO session for use on callback.
@@ -628,6 +644,9 @@ async fn oidc_callback_inner(
     // 1. Get decrypted OIDC config
     let (row, client_secret) =
         AuthConfigService::get_oidc_decrypted(&state.db, provider_id).await?;
+    // Re-checked here, not only at login: a login started before the
+    // operator disabled the provider must not be completable (#5482).
+    require_enabled_provider(row.is_enabled, "OIDC")?;
 
     // 2. Fetch OIDC discovery for token_endpoint
     let discovery = fetch_oidc_discovery(&row.issuer_url).await?;
@@ -702,10 +721,8 @@ async fn oidc_callback_inner(
     let email_claim = resolve_oidc_claim_name(attr, "email_claim", "email");
     let group_claim_candidates = oidc_groups_claim_candidates(attr);
 
-    let sub = claims["sub"]
-        .as_str()
-        .ok_or_else(|| AppError::Internal("ID token missing sub claim".into()))?
-        .to_string();
+    let sub = oidc_subject(&claims)
+        .inspect_err(|e| record_sso_auth_failure(e, AuthFailureReason::InvalidToken))?;
 
     let email = oidc_provisioning_email(&claims, email_claim, &sub);
 
@@ -900,6 +917,7 @@ pub async fn ldap_login(
     let client_is_https = request_scheme_is_https(&headers);
     // Get decrypted LDAP config
     let (row, bind_password) = AuthConfigService::get_ldap_decrypted(&state.db, id).await?;
+    require_enabled_provider(row.is_enabled, "LDAP")?;
 
     // Create LDAP service from DB config
     let ldap_svc =
@@ -1090,13 +1108,18 @@ fn build_saml_acs_url(use_absolute: bool, trusted_base: Option<&str>, segment: &
 /// own `Display` form (as before this change) or the slug as stored. Both
 /// build_saml_acs_url calls in a request use that one value, so the ACS URL a
 /// request computes cannot vary with how the caller spelled the path.
+///
+/// Both SAML entry points (login and ACS) resolve through here, so a disabled
+/// provider is refused for either spelling (#5482).
 async fn resolve_saml_config(db: &sqlx::PgPool, segment: &str) -> Result<(SamlConfigRow, String)> {
     if let Ok(id) = Uuid::parse_str(segment) {
         let row = AuthConfigService::get_saml_decrypted(db, id).await?;
+        require_enabled_provider(row.is_enabled, "SAML")?;
         let canonical = row.id.to_string();
         return Ok((row, canonical));
     }
     let row = AuthConfigService::get_saml_decrypted_by_slug(db, segment).await?;
+    require_enabled_provider(row.is_enabled, "SAML")?;
     // `get_saml_decrypted_by_slug` matched on this column, so it is Some; the
     // fallback keeps the resolution total rather than panicking.
     let canonical = row.slug.clone().unwrap_or_else(|| row.id.to_string());
@@ -1566,6 +1589,19 @@ pub(crate) fn resolve_oidc_claim_name<'a>(
         .get(key)
         .and_then(|v| v.as_str())
         .unwrap_or(default)
+}
+
+/// The federated identity key of a verified id_token: its `sub`, which must be
+/// a non-blank string (#5482). `sub` is what `users.external_id` is matched
+/// on, so accepting `""` (or whitespace) would map every such token from the
+/// provider to one shared account.
+fn oidc_subject(claims: &serde_json::Value) -> Result<String> {
+    match claims["sub"].as_str() {
+        Some(sub) if !sub.trim().is_empty() => Ok(sub.to_string()),
+        _ => Err(AppError::Authentication(
+            "ID token has no usable sub claim".into(),
+        )),
+    }
 }
 
 /// Address to store in `users.email` for a user arriving through the
@@ -2262,6 +2298,30 @@ fn validate_legacy_rsa_claims(
     Ok(())
 }
 
+/// Verify an ID token signed by a key at or above the RSA baseline (or any EC /
+/// PSS key) and check `iss`, `aud` and `exp`.
+///
+/// All three are *required* (#5482): `jsonwebtoken` compares `iss` and `aud`
+/// only when the token carries them in a parseable shape, so an id_token with
+/// no `aud`, `aud: null`, a non-string `aud` or no `iss` used to pass. The
+/// legacy RSA path (`validate_legacy_rsa_claims`) already required both.
+fn verify_id_token_strict(
+    id_token: &str,
+    jwk: &serde_json::Value,
+    alg: jsonwebtoken::Algorithm,
+    client_id: &str,
+    issuer_url: &str,
+) -> Result<serde_json::Value> {
+    let decoding_key = decoding_key_from_jwk(jwk)?;
+    let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.set_audience(&[client_id]);
+    validation.set_issuer(&[issuer_url]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    jsonwebtoken::decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+        .map(|data| data.claims)
+        .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))
+}
+
 /// Validate an OIDC ID token by verifying its signature against the provider's
 /// JWKS and checking the `iss`, `aud`, `exp`, and `nonce` claims.
 ///
@@ -2278,7 +2338,7 @@ async fn validate_id_token(
     session_nonce: Option<&str>,
     allow_legacy_rsa_keys: bool,
 ) -> Result<serde_json::Value> {
-    use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
+    use jsonwebtoken::{decode_header, Algorithm};
 
     let jwks_uri = discovery["jwks_uri"]
         .as_str()
@@ -2337,22 +2397,10 @@ async fn validate_id_token(
             }
             verify_id_token_with_legacy_rsa(id_token, &jwk, alg, client_id, issuer_url)?
         } else {
-            let decoding_key = decoding_key_from_jwk(&jwk)?;
-            let mut validation = Validation::new(alg);
-            validation.set_audience(&[client_id]);
-            validation.set_issuer(&[issuer_url]);
-            decode::<serde_json::Value>(id_token, &decoding_key, &validation)
-                .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))?
-                .claims
+            verify_id_token_strict(id_token, &jwk, alg, client_id, issuer_url)?
         }
     } else {
-        let decoding_key = decoding_key_from_jwk(&jwk)?;
-        let mut validation = Validation::new(alg);
-        validation.set_audience(&[client_id]);
-        validation.set_issuer(&[issuer_url]);
-        decode::<serde_json::Value>(id_token, &decoding_key, &validation)
-            .map_err(|e| AppError::Authentication(format!("ID token validation failed: {e}")))?
-            .claims
+        verify_id_token_strict(id_token, &jwk, alg, client_id, issuer_url)?
     };
 
     if let Some(expected_nonce) = session_nonce {
@@ -5529,6 +5577,73 @@ mod tests {
             )
             .unwrap_err();
             assert!(matches!(err, AppError::Authentication(_)));
+        }
+
+        /// #5482: the strict (>= 2048-bit) path requires `iss` and `aud`
+        /// rather than comparing them only when present.
+        #[test]
+        fn test_strict_id_token_requires_iss_and_aud_5482() {
+            let pk = shared_2048_rsa_key();
+            let jwk = jwk_for(&RsaPublicKey::from(pk));
+            let verify = |payload: &serde_json::Value| {
+                let token = sign_jwt(pk, jsonwebtoken::Algorithm::RS256, payload);
+                super::super::verify_id_token_strict(
+                    &token,
+                    &jwk,
+                    jsonwebtoken::Algorithm::RS256,
+                    "client-abc",
+                    "https://idp.example.com",
+                )
+            };
+            let mut no_aud = well_formed_payload();
+            no_aud.as_object_mut().unwrap().remove("aud");
+            let mut null_aud = well_formed_payload();
+            null_aud["aud"] = json!(null);
+            let mut numeric_aud = well_formed_payload();
+            numeric_aud["aud"] = json!(42);
+            let mut no_iss = well_formed_payload();
+            no_iss.as_object_mut().unwrap().remove("iss");
+            for (case, payload) in [
+                ("no aud", no_aud),
+                ("aud: null", null_aud),
+                ("aud: 42", numeric_aud),
+                ("no iss", no_iss),
+            ] {
+                let err = verify(&payload).expect_err(case);
+                assert!(
+                    matches!(&err, AppError::Authentication(m) if m.contains("Missing required claim")),
+                    "{case}: {err:?}"
+                );
+            }
+            let claims = verify(&well_formed_payload()).expect("well-formed token verifies");
+            assert_eq!(claims["sub"].as_str(), Some("user-1"));
+        }
+
+        /// #5482: a blank `sub` is not a federated identity.
+        #[test]
+        fn test_oidc_subject_rejects_blank_or_missing_sub_5482() {
+            for claims in [
+                json!({"sub": ""}),
+                json!({"sub": "   "}),
+                json!({"sub": 7}),
+                json!({}),
+            ] {
+                let err = super::super::oidc_subject(&claims).expect_err("blank sub");
+                assert!(matches!(err, AppError::Authentication(_)), "{claims}");
+            }
+            assert_eq!(
+                super::super::oidc_subject(&json!({"sub": "guid-1"})).unwrap(),
+                "guid-1"
+            );
+        }
+
+        #[test]
+        fn test_require_enabled_provider_5482() {
+            assert!(super::super::require_enabled_provider(true, "OIDC").is_ok());
+            assert!(matches!(
+                super::super::require_enabled_provider(false, "SAML"),
+                Err(AppError::NotFound(_))
+            ));
         }
 
         #[test]
