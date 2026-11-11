@@ -158,7 +158,7 @@ async fn invalidate_proxy_metadata_lru(metadata_key: &str) {
 /// well under a second on object stores; a publish that takes longer than this
 /// degrades to the pre-#3335 behaviour (the read classifies as a miss and
 /// refetches upstream), never to an unbounded stall.
-const TEE_PUBLISH_WAIT_MAX: Duration = Duration::from_secs(5);
+pub(crate) const TEE_PUBLISH_WAIT_MAX: Duration = Duration::from_secs(5);
 
 /// Upper bound on how long a cache read waits for a buffered body that the
 /// scan gate is still deciding on (#4514): the inline scan budget plus the
@@ -182,6 +182,10 @@ struct TeePublishEntry {
     /// a streaming tee, [`DEFERRED_PUBLISH_WAIT_MAX`] for a buffered body
     /// waiting on the scan gate (#4514).
     wait_max: Duration,
+    /// The `proxy_cache_artifacts` row (`repository_id`, `path`) a streaming
+    /// fill commits in its tail, so a catalog reader can wait for it
+    /// ([`await_catalog_fill`], #5702). `None` for a deferred body.
+    catalog: Option<(Uuid, String)>,
 }
 
 /// Process-global registry of in-flight streaming cache publishes (#3335).
@@ -217,8 +221,19 @@ struct TeePublishGuard {
 }
 
 impl TeePublishGuard {
+    #[cfg(test)]
     fn register(metadata_key: &str) -> Self {
-        Self::register_with(metadata_key, false, TEE_PUBLISH_WAIT_MAX)
+        Self::register_with(metadata_key, false, TEE_PUBLISH_WAIT_MAX, None)
+    }
+
+    /// A streaming fill that commits the catalog row `(repository_id, path)`.
+    fn register_fill(metadata_key: &str, repository_id: Uuid, path: &str) -> Self {
+        Self::register_with(
+            metadata_key,
+            false,
+            TEE_PUBLISH_WAIT_MAX,
+            Some((repository_id, path.to_string())),
+        )
     }
 
     /// Register a buffered body held back for the scan gate (#4514). It is
@@ -226,15 +241,21 @@ impl TeePublishGuard {
     /// that misses the entry waits (up to [`DEFERRED_PUBLISH_WAIT_MAX`]) for
     /// the gate to publish or discard it instead of fetching it again.
     fn register_deferred(metadata_key: &str) -> Self {
-        Self::register_with(metadata_key, true, DEFERRED_PUBLISH_WAIT_MAX)
+        Self::register_with(metadata_key, true, DEFERRED_PUBLISH_WAIT_MAX, None)
     }
 
-    fn register_with(metadata_key: &str, tail: bool, wait_max: Duration) -> Self {
+    fn register_with(
+        metadata_key: &str,
+        tail: bool,
+        wait_max: Duration,
+        catalog: Option<(Uuid, String)>,
+    ) -> Self {
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         let entry = Arc::new(TeePublishEntry {
             tail: std::sync::atomic::AtomicBool::new(tail),
             done_rx,
             wait_max,
+            catalog,
         });
         lock_tee_publish_registry().insert(metadata_key.to_string(), Arc::clone(&entry));
         Self {
@@ -285,6 +306,59 @@ async fn await_tee_publish(metadata_key: &str) -> bool {
     let mut done_rx = entry.done_rx.clone();
     let _ = tokio::time::timeout(entry.wait_max, done_rx.wait_for(|done| *done)).await;
     true
+}
+
+/// Wait, at most `max`, for this process's in-flight streaming fills of the
+/// Remote `repository_id` whose catalog path passes `matches` and that are in
+/// their publish tail (#5702): the client already has the last byte, but the
+/// `proxy_cache_artifacts` row is written only as the writer's tail ends. A
+/// reader of the catalog alone (the MCP package resolver) that arrives in
+/// that window would report a miss for an entry about to land. Returns
+/// `true` when such a fill was waited for (re-read the catalog). A fill still
+/// streaming, or one on another replica, is not waited for.
+pub(crate) async fn await_catalog_fill(
+    repository_id: Uuid,
+    matches: impl Fn(&str) -> bool,
+    max: Duration,
+) -> bool {
+    let fills: Vec<Arc<TeePublishEntry>> = lock_tee_publish_registry()
+        .values()
+        .filter(|e| {
+            e.tail.load(std::sync::atomic::Ordering::Acquire)
+                && e.catalog
+                    .as_ref()
+                    .is_some_and(|(id, path)| *id == repository_id && matches(path))
+        })
+        .cloned()
+        .collect();
+    if fills.is_empty() {
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + max;
+    for fill in fills {
+        let mut done_rx = fill.done_rx.clone();
+        let _ = tokio::time::timeout_at(deadline, done_rx.wait_for(|done| *done)).await;
+    }
+    true
+}
+
+/// A tail-phase streaming fill of the catalog row `(repository_id, path)`
+/// registered for a test (#5702); dropping it ends the fill.
+#[cfg(test)]
+pub(crate) struct TestCatalogFill(#[allow(dead_code)] TeePublishGuard);
+
+#[cfg(test)]
+pub(crate) fn test_catalog_fill(repository_id: Uuid, path: &str) -> TestCatalogFill {
+    let guard = TeePublishGuard::register_fill(
+        &format!("test-fill/{repository_id}/{path}"),
+        repository_id,
+        path,
+    );
+    guard
+        .entry
+        .tail
+        .store(true, std::sync::atomic::Ordering::Release);
+    TestCatalogFill(guard)
 }
 
 /// Drop this process's memoised sidecar lookup for `metadata_key` before a
@@ -3664,7 +3738,8 @@ impl CachePersister {
         // is moved into the writer task and dropped on every exit path; the
         // client-facing stream keeps a handle only to flip the tail flag at
         // upstream EOF.
-        let publish_guard = TeePublishGuard::register(&metadata_key);
+        let publish_guard =
+            TeePublishGuard::register_fill(&metadata_key, template.repository_id, &template.path);
         let publish_entry = publish_guard.entry_handle();
         tokio::spawn(async move {
             // Deregisters the publish + wakes waiters when this task ends,
@@ -19514,7 +19589,9 @@ mod tests {
         }
 
         let src = include_str!("proxy_service.rs");
-        let production = &src[..src.find("\n#[cfg(test)]").expect("test module")];
+        let production = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module")];
         let literal = ["Upstream returned", " error status"].concat();
         let hand_formatted: Vec<&str> = production
             .lines()
@@ -28930,6 +29007,44 @@ mod tests {
     /// streaming (the single-flight coordinator owns that phase), MUST wait
     /// for a tail-phase publish, and must observe the guard's drop from every
     /// writer exit path.
+    /// #5702: a catalog reader waits only for a tail-phase fill of its own
+    /// Remote and a matching path, and never longer than its bound.
+    #[tokio::test]
+    async fn test_await_catalog_fill_matches_and_is_bounded_5702() {
+        let repo = Uuid::new_v4();
+        let short = Duration::from_millis(200);
+        assert!(
+            !await_catalog_fill(repo, |_| true, short).await,
+            "nothing registered"
+        );
+        // Still streaming: the single-flight coordinator owns that phase.
+        let streaming = TeePublishGuard::register_fill("k-stream", repo, "a/-/a-1.tgz");
+        assert!(!await_catalog_fill(repo, |_| true, short).await);
+        drop(streaming);
+        let fill = test_catalog_fill(repo, "a/-/a-1.tgz");
+        assert!(
+            !await_catalog_fill(Uuid::new_v4(), |_| true, short).await,
+            "other Remote"
+        );
+        assert!(
+            !await_catalog_fill(repo, |p| p == "b/-/b-1.tgz", short).await,
+            "other path"
+        );
+        let started = tokio::time::Instant::now();
+        assert!(await_catalog_fill(repo, |p| p == "a/-/a-1.tgz", short).await);
+        let waited = started.elapsed();
+        assert!(waited >= short && waited < short * 5, "bounded: {waited:?}");
+        // The writer ending wakes the reader at once.
+        let ends = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(fill);
+        });
+        let started = tokio::time::Instant::now();
+        assert!(await_catalog_fill(repo, |_| true, Duration::from_secs(10)).await);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        ends.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_await_tee_publish_waits_only_for_tail_phase_3335() {
         let key = format!(
