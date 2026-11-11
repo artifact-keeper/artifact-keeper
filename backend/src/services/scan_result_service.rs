@@ -2,14 +2,15 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::security::{
     DashboardSummary, Grade, GradeStatus, RawFinding, RawPackage, RepoSecurityScore, ScanFinding,
-    ScanResult, ScoreCoverage, Severity, VulnDbProvenance,
+    ScanResult, ScoreCoverage, Severity, UncatalogedPolicy, VulnDbProvenance,
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, ResourceType};
 
@@ -517,6 +518,262 @@ macro_rules! score_columns {
     };
 }
 
+/// The grade status and coverage of the repository `artifact_id` lives in
+/// (#4994), as quality gates and promotion rules read them: `unrated` when
+/// the repository has no score yet.
+pub async fn repo_grade_state_of_artifact(
+    db: &PgPool,
+    artifact_id: Uuid,
+) -> Result<crate::models::security::RepoGradeState> {
+    const SQL: &str = concat!(
+        "SELECT ",
+        score_columns!(),
+        " FROM repo_security_scores \
+          WHERE repository_id = (SELECT repository_id FROM artifacts WHERE id = $1)"
+    );
+    let row = sqlx::query_as::<_, RepoSecurityScore>(SQL)
+        .bind(artifact_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(crate::models::security::RepoGradeState::of(row.as_ref()))
+}
+
+/// Where one live artifact stands in its repository's coverage (#4994), by
+/// the same per-artifact rule as the `coverage` counts of
+/// [`ScanResultService::recalculate_score`]: `failed` if some latest scan
+/// failed, else `uncataloged` if some latest completed scan cataloged
+/// nothing, else `partial` / `cataloged` when a latest completed scan
+/// assessed it, else `unscanned` (no finished scan: none yet, pending,
+/// running, or every scanner not applicable; not counted in `scanned`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageStatus {
+    Failed,
+    Uncataloged,
+    Partial,
+    Cataloged,
+    Unscanned,
+}
+
+impl CoverageStatus {
+    pub const ALL: [CoverageStatus; 5] = [
+        CoverageStatus::Failed,
+        CoverageStatus::Uncataloged,
+        CoverageStatus::Partial,
+        CoverageStatus::Cataloged,
+        CoverageStatus::Unscanned,
+    ];
+
+    /// What the coverage listing returns when the caller names no status:
+    /// the artifacts that keep a repository from `rated`.
+    pub const NOT_FULLY_ASSESSED: [CoverageStatus; 3] = [
+        CoverageStatus::Failed,
+        CoverageStatus::Uncataloged,
+        CoverageStatus::Partial,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoverageStatus::Failed => "failed",
+            CoverageStatus::Uncataloged => "uncataloged",
+            CoverageStatus::Partial => "partial",
+            CoverageStatus::Cataloged => "cataloged",
+            CoverageStatus::Unscanned => "unscanned",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == value)
+    }
+
+    /// Parse a comma-separated `status` filter; `None` or empty gives
+    /// [`Self::NOT_FULLY_ASSESSED`]. An unknown value is a 400.
+    pub fn parse_filter(raw: Option<&str>) -> Result<Vec<Self>> {
+        let mut out = Vec::new();
+        for token in raw.unwrap_or("").split(',').map(str::trim) {
+            if token.is_empty() {
+                continue;
+            }
+            let status = Self::parse(token).ok_or_else(|| {
+                AppError::Validation(format!(
+                    "invalid status {token:?}: expected a comma-separated list of \
+                     failed, uncataloged, partial, cataloged, unscanned"
+                ))
+            })?;
+            if !out.contains(&status) {
+                out.push(status);
+            }
+        }
+        if out.is_empty() {
+            out.extend(Self::NOT_FULLY_ASSESSED);
+        }
+        Ok(out)
+    }
+}
+
+/// The latest scan of one scanner for one artifact, as the coverage listing
+/// reports it (#4994).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CoverageScan {
+    pub scan_id: Uuid,
+    pub scan_type: String,
+    pub status: String,
+    pub scan_completeness: Option<String>,
+    /// `scan_completeness_reason` for a completed scan, `error_message` for a
+    /// failed one.
+    pub reason: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// One artifact behind a repository's coverage counts (#4994).
+#[derive(Debug, Clone)]
+pub struct CoverageArtifact {
+    pub artifact_id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub path: String,
+    pub coverage_status: CoverageStatus,
+    pub scans: Vec<CoverageScan>,
+}
+
+/// One page of the coverage listing plus the live count of every status.
+#[derive(Debug, Clone, Default)]
+pub struct CoverageListing {
+    pub counts: std::collections::BTreeMap<&'static str, i64>,
+    pub total: i64,
+    pub items: Vec<CoverageArtifact>,
+}
+
+/// The per-artifact classification of the coverage listing: every live
+/// artifact of repository `$1` with its status and latest scans. The window
+/// and the per-artifact rule are those of the coverage counts in
+/// `recalculate_score_once`.
+macro_rules! coverage_classified_cte {
+    () => {
+        r#"
+WITH latest AS (
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+           sr.artifact_id, sr.id, sr.scan_type, sr.status, sr.scan_completeness,
+           sr.scan_completeness_reason, sr.error_message, sr.completed_at
+    FROM scan_results sr
+    JOIN artifacts a ON a.id = sr.artifact_id
+    WHERE a.repository_id = $1
+      AND NOT a.is_deleted
+    ORDER BY sr.artifact_id, sr.scan_type,
+             sr.completed_at DESC NULLS LAST, sr.created_at DESC
+),
+per_artifact AS (
+    SELECT artifact_id,
+           bool_or(status = 'failed') AS failed,
+           bool_or(status = 'completed'
+                   AND scan_completeness = 'not_cataloged') AS uncataloged,
+           bool_or(status = 'completed'
+                   AND scan_completeness IN ('complete', 'partial')) AS cataloged,
+           bool_or(status = 'completed'
+                   AND scan_completeness = 'partial') AS partial,
+           jsonb_agg(jsonb_build_object(
+               'scan_id', id,
+               'scan_type', scan_type,
+               'status', status,
+               'scan_completeness', scan_completeness,
+               'reason', CASE WHEN status = 'failed' THEN error_message
+                              ELSE scan_completeness_reason END,
+               'completed_at', completed_at
+           ) ORDER BY scan_type) AS scans
+    FROM latest
+    GROUP BY artifact_id
+),
+classified AS (
+    SELECT a.id AS artifact_id, a.name, a.version, a.path,
+           CASE WHEN pa.failed THEN 'failed'
+                WHEN pa.uncataloged THEN 'uncataloged'
+                WHEN pa.cataloged AND pa.partial THEN 'partial'
+                WHEN pa.cataloged THEN 'cataloged'
+                ELSE 'unscanned' END AS coverage_status,
+           COALESCE(pa.scans, '[]'::jsonb) AS scans
+    FROM artifacts a
+    LEFT JOIN per_artifact pa ON pa.artifact_id = a.id
+    WHERE a.repository_id = $1
+      AND NOT a.is_deleted
+)
+"#
+    };
+}
+
+/// List the live artifacts of a repository whose coverage status is in
+/// `statuses`, `limit` / `offset` paged by path, with the live count of
+/// every status (#4994).
+pub async fn list_coverage_artifacts(
+    db: &PgPool,
+    repository_id: Uuid,
+    statuses: &[CoverageStatus],
+    limit: i64,
+    offset: i64,
+) -> Result<CoverageListing> {
+    let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+    const COUNTS_SQL: &str = concat!(
+        coverage_classified_cte!(),
+        " SELECT coverage_status, COUNT(*) FROM classified GROUP BY coverage_status"
+    );
+    let rows: Vec<(String, i64)> = sqlx::query_as(COUNTS_SQL)
+        .bind(repository_id)
+        .fetch_all(db)
+        .await
+        .map_err(db_err)?;
+    let mut listing = CoverageListing::default();
+    for status in CoverageStatus::ALL {
+        listing.counts.insert(status.as_str(), 0);
+    }
+    for (status, n) in rows {
+        if let Some(s) = CoverageStatus::parse(&status) {
+            listing.counts.insert(s.as_str(), n);
+            if statuses.contains(&s) {
+                listing.total += n;
+            }
+        }
+    }
+
+    let wanted: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+    const PAGE_SQL: &str = concat!(
+        coverage_classified_cte!(),
+        " SELECT artifact_id, name, version, path, coverage_status, scans \
+         FROM classified WHERE coverage_status = ANY($2) \
+         ORDER BY path, artifact_id LIMIT $3 OFFSET $4"
+    );
+    #[allow(clippy::type_complexity)]
+    let page: Vec<(
+        Uuid,
+        String,
+        Option<String>,
+        String,
+        String,
+        serde_json::Value,
+    )> = sqlx::query_as(PAGE_SQL)
+        .bind(repository_id)
+        .bind(&wanted)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(db)
+        .await
+        .map_err(db_err)?;
+    listing.items = page
+        .into_iter()
+        .map(
+            |(artifact_id, name, version, path, status, scans)| CoverageArtifact {
+                artifact_id,
+                name,
+                version,
+                path,
+                coverage_status: CoverageStatus::parse(&status)
+                    .unwrap_or(CoverageStatus::Unscanned),
+                scans: serde_json::from_value(scans).unwrap_or_default(),
+            },
+        )
+        .collect();
+    Ok(listing)
+}
+
 /// The grade letter 1.11 replicas read from `repo_security_scores.grade`
 /// (#4336 keeps writing it unchanged): the score's letter, floored to F while
 /// a failed scan (#2167) or a floor-qualifying uncataloged artifact (#4036,
@@ -540,12 +797,17 @@ pub(crate) fn legacy_grade_letter(
 /// failed on counts as failed in the coverage, and the findings of an earlier
 /// completed scan stay counted after a failed rescan; either way the findings
 /// are real, so the repository is `incomplete` and shows their letter.
+///
+/// `uncataloged_policy` is the repository's (#4994): under `warn` an artifact
+/// no scanner could catalog counts as assessed
+/// ([`ScoreCoverage::grade_status_under`]).
 pub(crate) fn repository_grade_status(
     coverage: &ScoreCoverage,
     any_artifact_assessed: bool,
     has_findings: bool,
+    uncataloged_policy: UncatalogedPolicy,
 ) -> GradeStatus {
-    match coverage.grade_status() {
+    match coverage.grade_status_under(uncataloged_policy) {
         GradeStatus::Unrated if any_artifact_assessed || has_findings => GradeStatus::Incomplete,
         status => status,
     }
@@ -3019,10 +3281,22 @@ impl ScanResultService {
             failed: failed_count,
             uncataloged: uncataloged_count,
         };
+        // #4994: the repository's uncataloged policy, read in the same snapshot.
+        let uncataloged_policy: Option<String> =
+            sqlx::query_scalar("SELECT uncataloged_policy FROM repositories WHERE id = $1")
+                .bind(repository_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        let uncataloged_policy = uncataloged_policy
+            .as_deref()
+            .map(UncatalogedPolicy::from_db)
+            .unwrap_or_default();
         let status = repository_grade_status(
             &coverage,
             assessed_any_count > 0,
             critical + high + medium + low + acknowledged + total > 0,
+            uncataloged_policy,
         );
         let rated = rated_grade_letter(grade, status);
         let as_i32 = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
@@ -5022,17 +5296,17 @@ mod tests {
             ..ScoreCoverage::default()
         };
         assert_eq!(
-            repository_grade_status(&failed_only, false, false),
+            repository_grade_status(&failed_only, false, false, UncatalogedPolicy::Fail),
             GradeStatus::Unrated
         );
         // One scanner cataloged the artifact, another failed on it.
         assert_eq!(
-            repository_grade_status(&failed_only, true, false),
+            repository_grade_status(&failed_only, true, false, UncatalogedPolicy::Fail),
             GradeStatus::Incomplete
         );
         // Findings of an earlier completed scan, latest rescan failed.
         assert_eq!(
-            repository_grade_status(&failed_only, false, true),
+            repository_grade_status(&failed_only, false, true, UncatalogedPolicy::Fail),
             GradeStatus::Incomplete
         );
         let rated = ScoreCoverage {
@@ -5042,7 +5316,7 @@ mod tests {
             ..ScoreCoverage::default()
         };
         assert_eq!(
-            repository_grade_status(&rated, true, true),
+            repository_grade_status(&rated, true, true, UncatalogedPolicy::Fail),
             GradeStatus::Rated
         );
     }
@@ -6395,6 +6669,647 @@ mod tests {
             assert_eq!(score.display_grade(), None);
             assert_eq!(score.coverage().unwrap().failed, 1);
             cleanup_repo(&pool, only_failed).await;
+        }
+
+        async fn set_uncataloged_policy_4994(pool: &PgPool, repo_id: Uuid, policy: &str) {
+            sqlx::query("UPDATE repositories SET uncataloged_policy = $2 WHERE id = $1")
+                .bind(repo_id)
+                .bind(policy)
+                .execute(pool)
+                .await
+                .expect("set uncataloged_policy");
+        }
+
+        /// An artifact with one completed scan of `completeness`.
+        async fn scanned_artifact_4994(
+            pool: &PgPool,
+            svc: &ScanResultService,
+            repo_id: Uuid,
+            suffix: &str,
+            completeness: &str,
+        ) -> Uuid {
+            let (id, _) = insert_test_artifact(pool, repo_id, suffix).await;
+            let s = svc
+                .create_scan_result(id, repo_id, "dependency")
+                .await
+                .expect("create scan");
+            complete_as_4336(svc, s.id, completeness).await;
+            id
+        }
+
+        /// #4994 item 3: under `uncataloged_policy = warn` an archive no
+        /// scanner could catalog counts as assessed, so a repository of plain
+        /// archives is `rated`; it is still counted and flagged. `fail`, the
+        /// default, keeps the #4336 status.
+        #[tokio::test]
+        async fn uncataloged_policy_warn_rates_plain_archives_4994() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            scanned_artifact_4994(&pool, &svc, repo_id, "docs", "not_cataloged").await;
+
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Unrated, "fail is the default");
+
+            set_uncataloged_policy_4994(&pool, repo_id, "warn").await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Rated);
+            assert!(
+                score.display_grade().is_some(),
+                "a rated repository has a letter"
+            );
+            assert!(score.has_uncataloged_scan, "still flagged");
+            assert_eq!(score.coverage().expect("coverage").uncataloged, 1);
+
+            // With a cataloged artifact beside it: incomplete under fail,
+            // rated under warn.
+            scanned_artifact_4994(&pool, &svc, repo_id, "jar", "complete").await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Rated);
+            set_uncataloged_policy_4994(&pool, repo_id, "fail").await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+
+            // A failed scan is never relaxed by warn.
+            set_uncataloged_policy_4994(&pool, repo_id, "warn").await;
+            let (img, _) = insert_test_artifact(&pool, repo_id, "img").await;
+            let f = svc
+                .create_scan_result(img, repo_id, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Incomplete);
+
+            // The column refuses anything but fail and warn (no `ignore`).
+            let ignore =
+                sqlx::query("UPDATE repositories SET uncataloged_policy = 'ignore' WHERE id = $1")
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await;
+            assert!(ignore.is_err(), "ignore must be refused: {ignore:?}");
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// #4994 item 4: one call lists the artifacts behind the coverage
+        /// counts, by the same per-artifact rule, with each artifact's latest
+        /// scans and why they did not assess it.
+        #[tokio::test]
+        async fn coverage_listing_names_the_artifacts_behind_the_counts_4994() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let docs = scanned_artifact_4994(&pool, &svc, repo_id, "docs", "not_cataloged").await;
+            let jar = scanned_artifact_4994(&pool, &svc, repo_id, "jar", "complete").await;
+            let iso = scanned_artifact_4994(&pool, &svc, repo_id, "iso", "partial").await;
+            let (img, _) = insert_test_artifact(&pool, repo_id, "img").await;
+            let f = svc
+                .create_scan_result(img, repo_id, "image")
+                .await
+                .expect("create");
+            svc.fail_scan(f.id, "scanner error", Some("t"), chrono::Utc::now())
+                .await
+                .expect("fail");
+            let (fresh, _) = insert_test_artifact(&pool, repo_id, "fresh").await;
+
+            let default = CoverageStatus::parse_filter(None).expect("default filter");
+            let listing = list_coverage_artifacts(&pool, repo_id, &default, 100, 0)
+                .await
+                .expect("list");
+            let by_id = |id: Uuid| {
+                listing
+                    .items
+                    .iter()
+                    .find(|a| a.artifact_id == id)
+                    .map(|a| a.coverage_status)
+            };
+            assert_eq!(listing.total, 3);
+            assert_eq!(by_id(docs), Some(CoverageStatus::Uncataloged));
+            assert_eq!(by_id(iso), Some(CoverageStatus::Partial));
+            assert_eq!(by_id(img), Some(CoverageStatus::Failed));
+            assert_eq!(by_id(jar), None, "fully assessed is not listed by default");
+            assert_eq!(by_id(fresh), None);
+            let failed = listing.items.iter().find(|a| a.artifact_id == img).unwrap();
+            assert_eq!(failed.scans.len(), 1);
+            assert_eq!(failed.scans[0].status, "failed");
+            assert_eq!(failed.scans[0].reason.as_deref(), Some("scanner error"));
+            let uncataloged = listing
+                .items
+                .iter()
+                .find(|a| a.artifact_id == docs)
+                .unwrap();
+            assert_eq!(
+                uncataloged.scans[0].scan_completeness.as_deref(),
+                Some("not_cataloged")
+            );
+
+            // The live counts agree with the stored coverage.
+            let cov = svc
+                .recalculate_score(repo_id)
+                .await
+                .expect("recalculate")
+                .coverage()
+                .expect("coverage");
+            let n = |s: CoverageStatus| listing.counts[s.as_str()];
+            assert_eq!(n(CoverageStatus::Failed), cov.failed);
+            assert_eq!(n(CoverageStatus::Uncataloged), cov.uncataloged);
+            assert_eq!(n(CoverageStatus::Partial), cov.partial);
+            assert_eq!(
+                n(CoverageStatus::Cataloged) + n(CoverageStatus::Partial),
+                cov.cataloged
+            );
+            assert_eq!(n(CoverageStatus::Unscanned), cov.artifacts - cov.scanned);
+
+            // An explicit filter, and paging.
+            let only = CoverageStatus::parse_filter(Some("cataloged,unscanned")).expect("filter");
+            let listing = list_coverage_artifacts(&pool, repo_id, &only, 1, 0)
+                .await
+                .expect("list");
+            assert_eq!((listing.total, listing.items.len()), (2, 1));
+            assert!(CoverageStatus::parse_filter(Some("ignored")).is_err());
+            cleanup_repo(&pool, repo_id).await;
+        }
+
+        /// Health score row the quality gate and the promotion rule read: a
+        /// perfect score, so only the grade-status check can fail them.
+        async fn perfect_health_4994(pool: &PgPool, artifact_id: Uuid) {
+            sqlx::query(
+                "INSERT INTO artifact_health_scores (artifact_id, health_score, health_grade, \
+                    security_score, total_issues, critical_issues, checks_passed, checks_total) \
+                 VALUES ($1, 100, 'A', 100, 0, 0, 0, 0)",
+            )
+            .bind(artifact_id)
+            .execute(pool)
+            .await
+            .expect("insert health score");
+        }
+
+        /// #4994 item 1: a quality gate's `min_security_score` and a
+        /// promotion rule's `min_health_score` pass a score of 100, which is
+        /// what a repository whose scans cataloged nothing has. They now fail
+        /// closed on `unrated` and `incomplete` by default, and
+        /// `accepted_grade_status` relaxes them.
+        #[tokio::test]
+        async fn gates_and_rules_fail_closed_on_grade_status_4994() {
+            use crate::models::security::AcceptedGradeStatus;
+            use crate::services::promotion_rule_service::{
+                CreatePromotionRuleInput, PromotionRuleService, UpdatePromotionRuleInput,
+            };
+            use crate::services::quality_check_service::{
+                CreateQualityGateInput, QualityCheckService, UpdateQualityGateInput,
+            };
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let target = insert_test_repo(&pool).await;
+            let docs = scanned_artifact_4994(&pool, &svc, repo_id, "docs", "not_cataloged").await;
+            perfect_health_4994(&pool, docs).await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!((score.score, score.status()), (100, GradeStatus::Unrated));
+
+            let qc = QualityCheckService::new(pool.clone());
+            let gate = qc
+                .create_gate(CreateQualityGateInput {
+                    repository_id: Some(repo_id),
+                    name: format!("gate-4994-{}", repo_id.as_simple()),
+                    description: None,
+                    min_health_score: None,
+                    min_security_score: Some(50),
+                    min_quality_score: None,
+                    min_metadata_score: None,
+                    max_critical_issues: None,
+                    max_high_issues: None,
+                    max_medium_issues: None,
+                    required_checks: vec![],
+                    enforce_on_promotion: true,
+                    enforce_on_download: false,
+                    action: "block".to_string(),
+                    accepted_grade_status: AcceptedGradeStatus::default(),
+                })
+                .await
+                .expect("create gate");
+            assert_eq!(
+                gate.accepted_grade_status, "rated",
+                "the default is explicit"
+            );
+            let relax = |to: AcceptedGradeStatus| UpdateQualityGateInput {
+                name: None,
+                description: None,
+                min_health_score: None,
+                min_security_score: None,
+                min_quality_score: None,
+                min_metadata_score: None,
+                max_critical_issues: None,
+                max_high_issues: None,
+                max_medium_issues: None,
+                required_checks: None,
+                enforce_on_promotion: None,
+                enforce_on_download: None,
+                action: None,
+                is_enabled: None,
+                accepted_grade_status: Some(to),
+            };
+            let grade_violation = |eval: &crate::models::quality::QualityGateEvaluation| {
+                eval.violations
+                    .iter()
+                    .find(|v| v.rule == "grade_status")
+                    .cloned()
+            };
+
+            let eval = qc.evaluate_quality_gate(docs, repo_id).await.expect("eval");
+            assert!(
+                !eval.passed,
+                "score 100 of an unrated repository must not pass"
+            );
+            let v = grade_violation(&eval).expect("grade_status violation");
+            assert_eq!(
+                (v.expected.as_str(), v.actual.as_str()),
+                ("rated", "unrated")
+            );
+            assert!(
+                v.message.contains("1 could not be cataloged"),
+                "{}",
+                v.message
+            );
+
+            qc.update_gate(gate.id, relax(AcceptedGradeStatus::Incomplete))
+                .await
+                .expect("relax");
+            let eval = qc.evaluate_quality_gate(docs, repo_id).await.expect("eval");
+            assert!(!eval.passed, "incomplete still refuses unrated");
+
+            // Something assessed beside it: incomplete, which `incomplete` accepts
+            // and `rated` does not.
+            scanned_artifact_4994(&pool, &svc, repo_id, "jar", "complete").await;
+            svc.recalculate_score(repo_id).await.expect("recalculate");
+            let eval = qc.evaluate_quality_gate(docs, repo_id).await.expect("eval");
+            assert!(
+                eval.passed,
+                "incomplete accepts incomplete: {:?}",
+                eval.violations
+            );
+            qc.update_gate(gate.id, relax(AcceptedGradeStatus::Rated))
+                .await
+                .expect("tighten");
+            let eval = qc.evaluate_quality_gate(docs, repo_id).await.expect("eval");
+            assert!(!eval.passed, "rated refuses incomplete");
+            qc.update_gate(gate.id, relax(AcceptedGradeStatus::Any))
+                .await
+                .expect("relax");
+            let eval = qc.evaluate_quality_gate(docs, repo_id).await.expect("eval");
+            assert!(eval.passed, "any: the score alone decides, as before 1.12");
+
+            // The promotion rule's min_health_score, the same way.
+            let rules = PromotionRuleService::new(pool.clone());
+            let rule = rules
+                .create(CreatePromotionRuleInput {
+                    name: format!("rule-4994-{}", repo_id.as_simple()),
+                    source_repo_id: repo_id,
+                    target_repo_id: target,
+                    is_enabled: true,
+                    max_cve_severity: None,
+                    allowed_licenses: None,
+                    require_signature: false,
+                    min_staging_hours: None,
+                    max_artifact_age_days: None,
+                    min_health_score: Some(50),
+                    auto_promote: false,
+                    accepted_grade_status: AcceptedGradeStatus::default(),
+                })
+                .await
+                .expect("create rule");
+            assert_eq!(rule.accepted_grade_status, "rated");
+            let eval = rules
+                .evaluate_artifact(docs, &rule, false)
+                .await
+                .expect("eval");
+            assert!(!eval.passed, "rated refuses incomplete");
+            assert!(
+                eval.violations
+                    .iter()
+                    .any(|v| v.contains("grade status is incomplete")),
+                "{:?}",
+                eval.violations
+            );
+            let rule = rules
+                .update(
+                    rule.id,
+                    UpdatePromotionRuleInput {
+                        name: None,
+                        is_enabled: None,
+                        max_cve_severity: None,
+                        allowed_licenses: None,
+                        require_signature: None,
+                        min_staging_hours: None,
+                        max_artifact_age_days: None,
+                        min_health_score: None,
+                        auto_promote: None,
+                        accepted_grade_status: Some(AcceptedGradeStatus::Incomplete),
+                    },
+                )
+                .await
+                .expect("relax rule");
+            let eval = rules
+                .evaluate_artifact(docs, &rule, false)
+                .await
+                .expect("eval");
+            assert!(eval.passed, "{:?}", eval.violations);
+
+            // A repository with no score at all is unrated.
+            let empty = insert_test_repo(&pool).await;
+            let (bare, _) = insert_test_artifact(&pool, empty, "bare").await;
+            let state = repo_grade_state_of_artifact(&pool, bare)
+                .await
+                .expect("state");
+            assert_eq!(state.status, GradeStatus::Unrated);
+            assert!(state.violation(AcceptedGradeStatus::Incomplete).is_some());
+            assert!(state.violation(AcceptedGradeStatus::Any).is_none());
+            cleanup_repo(&pool, empty).await;
+            cleanup_repo(&pool, repo_id).await;
+            cleanup_repo(&pool, target).await;
+        }
+
+        /// #4994: migration 361 gives every gate and rule that exists at
+        /// upgrade `accepted_grade_status = 'any'` (the 1.11 behaviour), and
+        /// every row created afterwards without the field `rated`. The
+        /// migration is replayed against pre-upgrade copies of the tables in
+        /// a scratch schema, inside a transaction that is rolled back.
+        #[tokio::test]
+        async fn migration_361_existing_rows_any_new_rows_rated_4994() {
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            // The migrated schema: the column default for new rows.
+            for table in ["quality_gates", "promotion_rules"] {
+                let default: Option<String> = sqlx::query_scalar(
+                    "SELECT column_default FROM information_schema.columns \
+                     WHERE table_schema = current_schema() AND table_name = $1 \
+                       AND column_name = 'accepted_grade_status'",
+                )
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .expect("column default");
+                assert_eq!(default.as_deref(), Some("'rated'::text"), "{table}");
+            }
+
+            let schema = format!("m361_{}", Uuid::new_v4().simple());
+            let mut tx = pool.begin().await.expect("begin");
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}; \
+                 CREATE TABLE quality_gates (id INT PRIMARY KEY); \
+                 CREATE TABLE promotion_rules (id INT PRIMARY KEY); \
+                 CREATE TABLE scan_policies (id INT PRIMARY KEY); \
+                 CREATE TABLE repositories (id INT PRIMARY KEY); \
+                 INSERT INTO quality_gates (id) VALUES (1); \
+                 INSERT INTO promotion_rules (id) VALUES (1);"
+            )))
+            .execute(&mut *tx)
+            .await
+            .expect("pre-upgrade tables");
+            sqlx::raw_sql(include_str!(
+                "../../migrations/361_grade_status_enforcement.sql"
+            ))
+            .execute(&mut *tx)
+            .await
+            .expect("apply migration 361");
+            sqlx::raw_sql(
+                "INSERT INTO quality_gates (id) VALUES (2); \
+                 INSERT INTO promotion_rules (id) VALUES (2);",
+            )
+            .execute(&mut *tx)
+            .await
+            .expect("post-upgrade rows");
+            for table in ["quality_gates", "promotion_rules"] {
+                let rows: Vec<(i32, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                    "SELECT id, accepted_grade_status FROM {schema}.{table} ORDER BY id"
+                )))
+                .fetch_all(&mut *tx)
+                .await
+                .expect("read back");
+                assert_eq!(
+                    rows,
+                    vec![(1, "any".to_string()), (2, "rated".to_string())],
+                    "{table}: existing row any, new row rated"
+                );
+            }
+            tx.rollback().await.expect("rollback");
+        }
+
+        /// #4994 review: a promotion rule checks the grade status only when
+        /// the artifact has a health score, like a quality gate, which skips
+        /// an artifact with none (#4156). Before the fix a rule refused such
+        /// an artifact in an unrated repository, which 1.11 passed.
+        #[tokio::test]
+        async fn rules_skip_grade_status_without_health_score_like_gates_4994() {
+            use crate::models::security::AcceptedGradeStatus;
+            use crate::services::promotion_rule_service::{
+                CreatePromotionRuleInput, PromotionRuleService,
+            };
+            use crate::services::quality_check_service::{
+                CreateQualityGateInput, QualityCheckService,
+            };
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let target = insert_test_repo(&pool).await;
+            // Unrated repository; the artifact has no health score yet.
+            let docs = scanned_artifact_4994(&pool, &svc, repo_id, "docs", "not_cataloged").await;
+            let score = svc.recalculate_score(repo_id).await.expect("recalculate");
+            assert_eq!(score.status(), GradeStatus::Unrated);
+
+            // The gate skips it: no health score is NotFound (#4156).
+            let qc = QualityCheckService::new(pool.clone());
+            qc.create_gate(CreateQualityGateInput {
+                repository_id: Some(repo_id),
+                name: format!("gate-4994-nohs-{}", repo_id.as_simple()),
+                description: None,
+                min_health_score: Some(50),
+                min_security_score: None,
+                min_quality_score: None,
+                min_metadata_score: None,
+                max_critical_issues: None,
+                max_high_issues: None,
+                max_medium_issues: None,
+                required_checks: vec![],
+                enforce_on_promotion: true,
+                enforce_on_download: false,
+                action: "block".to_string(),
+                accepted_grade_status: AcceptedGradeStatus::Rated,
+            })
+            .await
+            .expect("create gate");
+            assert!(matches!(
+                qc.evaluate_quality_gate(docs, repo_id).await,
+                Err(AppError::NotFound(_))
+            ));
+
+            // The rule passes it too.
+            let rules = PromotionRuleService::new(pool.clone());
+            let rule = rules
+                .create(CreatePromotionRuleInput {
+                    name: format!("rule-4994-nohs-{}", repo_id.as_simple()),
+                    source_repo_id: repo_id,
+                    target_repo_id: target,
+                    is_enabled: true,
+                    max_cve_severity: None,
+                    allowed_licenses: None,
+                    require_signature: false,
+                    min_staging_hours: None,
+                    max_artifact_age_days: None,
+                    min_health_score: Some(50),
+                    auto_promote: false,
+                    accepted_grade_status: AcceptedGradeStatus::Rated,
+                })
+                .await
+                .expect("create rule");
+            let eval = rules
+                .evaluate_artifact(docs, &rule, false)
+                .await
+                .expect("eval");
+            assert!(
+                eval.passed,
+                "no health score: the rule skips the check, as the gate does: {:?}",
+                eval.violations
+            );
+
+            // Once it has a health score, both refuse the unrated repository.
+            perfect_health_4994(&pool, docs).await;
+            let eval = rules
+                .evaluate_artifact(docs, &rule, false)
+                .await
+                .expect("eval");
+            assert!(
+                !eval.passed
+                    && eval
+                        .violations
+                        .iter()
+                        .any(|v| v.contains("grade status is unrated")),
+                "{:?}",
+                eval.violations
+            );
+            let eval = qc.evaluate_quality_gate(docs, repo_id).await.expect("eval");
+            assert!(eval.violations.iter().any(|v| v.rule == "grade_status"));
+            cleanup_repo(&pool, repo_id).await;
+            cleanup_repo(&pool, target).await;
+        }
+
+        /// #4994 item 2: a scan policy with `block_uncataloged` refuses, on
+        /// the download gate and the promotion gate, an artifact whose latest
+        /// completed scan cataloged nothing. Off by default.
+        #[tokio::test]
+        async fn block_uncataloged_refuses_uncataloged_artifacts_4994() {
+            use crate::services::policy_service::PolicyService;
+            use crate::services::promotion_policy_service::PromotionPolicyService;
+            let Some(pool) = db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = ScanResultService::new(pool.clone());
+            let repo_id = insert_test_repo(&pool).await;
+            let docs = scanned_artifact_4994(&pool, &svc, repo_id, "docs", "not_cataloged").await;
+            let jar = scanned_artifact_4994(&pool, &svc, repo_id, "jar", "complete").await;
+
+            let policies = PolicyService::new(pool.clone());
+            let policy = policies
+                .create_policy(
+                    &format!("p-4994-{}", repo_id.as_simple()),
+                    Some(repo_id),
+                    "critical",
+                    false,
+                    false,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .await
+                .expect("create policy");
+            assert!(!policy.block_uncataloged, "off by default");
+            let refused = |r: &crate::models::security::PolicyResult| {
+                r.violations.iter().any(|v| v.contains("not_cataloged"))
+            };
+            let r = policies
+                .evaluate_artifact(docs, repo_id)
+                .await
+                .expect("eval");
+            assert!(!refused(&r), "off: not refused: {:?}", r.violations);
+
+            let policy = policies
+                .update_policy_with_uncataloged(
+                    policy.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("enable block_uncataloged");
+            assert!(policy.block_uncataloged);
+            assert!(
+                policies
+                    .get_policy(policy.id)
+                    .await
+                    .unwrap()
+                    .block_uncataloged
+            );
+            let r = policies
+                .evaluate_artifact(docs, repo_id)
+                .await
+                .expect("eval");
+            assert!(!r.allowed && refused(&r), "{:?}", r.violations);
+            let r = policies
+                .evaluate_artifact(jar, repo_id)
+                .await
+                .expect("eval");
+            assert!(
+                !refused(&r),
+                "a cataloged artifact passes: {:?}",
+                r.violations
+            );
+
+            let promo = PromotionPolicyService::new(pool.clone());
+            let e = promo.evaluate_artifact(docs, repo_id).await.expect("eval");
+            assert!(!e.passed);
+            assert!(
+                e.violations.iter().any(|v| v.rule == "block-uncataloged"),
+                "{:?}",
+                e.violations
+            );
+            let e = promo.evaluate_artifact(jar, repo_id).await.expect("eval");
+            assert!(
+                !e.violations.iter().any(|v| v.rule == "block-uncataloged"),
+                "{:?}",
+                e.violations
+            );
+
+            // A rescan that catalogs the artifact clears it.
+            let s = svc
+                .create_scan_result(docs, repo_id, "dependency")
+                .await
+                .expect("create");
+            complete_as_4336(&svc, s.id, "complete").await;
+            let r = policies
+                .evaluate_artifact(docs, repo_id)
+                .await
+                .expect("eval");
+            assert!(!refused(&r), "{:?}", r.violations);
+            cleanup_repo(&pool, repo_id).await;
         }
 
         /// Poll until a backend other than `exclude` is waiting on a lock held
