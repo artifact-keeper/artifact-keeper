@@ -14051,7 +14051,9 @@ pub async fn download_artifact(
 ///
 /// A delete is blocked when the coordinates classify as
 /// [`cache_classifier::Mutability::Immutable`] (the same structural rule the
-/// upload and proxy-cache paths use) and the caller is not an admin. Admins
+/// upload and proxy-cache paths use, extended to the hosted npm and cargo
+/// stored layouts the request path is resolved to, #5626) and the caller is
+/// not an admin. Admins
 /// keep an explicit retraction escape hatch; mutable paths (e.g. Maven
 /// SNAPSHOT directories, indexes) are always deletable.
 ///
@@ -14060,7 +14062,7 @@ pub async fn download_artifact(
 /// replication header adds nothing here (#5455,
 /// [`super::trusted_peer_replication`] implies an admin).
 fn delete_blocked_by_immutability(format: &RepositoryFormat, path: &str, is_admin: bool) -> bool {
-    !is_admin && cache_classifier::classify(format, path).is_immutable()
+    !is_admin && cache_classifier::classify_stored(format, path).is_immutable()
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -37457,6 +37459,18 @@ mod tests {
             "lodash",
             false,
         ));
+        // #5626: the stored shapes the hosted publish routes write (and the
+        // REST delete resolves `/-/` to) are releases too.
+        assert!(delete_blocked_by_immutability(
+            &RepositoryFormat::Npm,
+            "lodash/4.17.21/lodash-4.17.21.tgz",
+            false,
+        ));
+        assert!(delete_blocked_by_immutability(
+            &RepositoryFormat::Cargo,
+            "serde/1.0.0/serde-1.0.0.crate",
+            false,
+        ));
     }
 
     #[test]
@@ -38163,11 +38177,25 @@ mod tests {
         );
 
         // (4) Scoped delete via the canonical `/-/` URL shape -> Ok (was 404),
-        // and the row is soft-deleted. npm tarballs classify Mutable (no `/-/`
-        // in the resolved stored path) so the immutability gate permits this.
-        let del_scoped = delete_artifact(
+        // and the row is soft-deleted. A published npm tarball is a release
+        // (#5626): the writer is refused with 409, and an administrator's
+        // retraction resolves the `/-/` path and lands.
+        let writer_delete = delete_artifact(
             State(state.clone()),
             Extension(auth.clone()),
+            Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
+            Query(DeleteArtifactQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(writer_delete, Err(AppError::Conflict(_))),
+            "a writer cannot delete a published npm tarball (#5626): {writer_delete:?}"
+        );
+        let admin = Some(tdh::admin_auth(user_id, &username));
+        let del_scoped = delete_artifact(
+            State(state.clone()),
+            Extension(admin.clone()),
             Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
             Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
@@ -38190,7 +38218,7 @@ mod tests {
         // (5) Unscoped delete via the canonical `/-/` URL shape -> Ok, row gone.
         let del_unscoped = delete_artifact(
             State(state.clone()),
-            Extension(auth.clone()),
+            Extension(admin.clone()),
             Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
             Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
@@ -43765,6 +43793,128 @@ mod replication_peer_identity_5455_tests {
             Some(user_id),
             "the generic delete audits its authenticated actor"
         );
+    }
+
+    /// Publish `body` through a format's real publish route as the rig's
+    /// administrator, and return the stored path of the one row it wrote.
+    async fn publish_through_route(
+        rig: &Rig,
+        router: axum::Router<SharedState>,
+        req: axum::http::Request<Body>,
+    ) -> String {
+        let app = tdh::router_with_auth(router, rig.state().0, rig.peer.clone());
+        let (status, body) = tdh::send(app, req).await;
+        assert!(
+            status.is_success(),
+            "publish: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        sqlx::query_scalar(
+            "SELECT path FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
+        )
+        .bind(rig.repo_id)
+        .fetch_one(&rig.pool)
+        .await
+        .expect("the published row")
+    }
+
+    /// Delete a release published through its real route, as a non-admin
+    /// writer with the `delete` action, through every path the REST delete
+    /// accepts for it: 409 each time and the row stays live. The
+    /// administrator's delete still lands.
+    async fn assert_release_delete_refused_5626(rig: Rig, stored: String, paths: &[&str]) {
+        let mut writer = rig.service_account.clone();
+        writer.is_service_account = false;
+        let mut refused = Vec::new();
+        for path in paths {
+            let plain = rig.delete(&writer, path, HeaderMap::new()).await;
+            let forged = rig.delete(&writer, path, replication_headers()).await;
+            refused.push((path.to_string(), plain, forged));
+        }
+        let live: bool = sqlx::query_scalar(
+            "SELECT NOT is_deleted FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(rig.repo_id)
+        .bind(&stored)
+        .fetch_one(&rig.pool)
+        .await
+        .expect("the published row");
+        let admin = rig.delete(&rig.peer, &stored, HeaderMap::new()).await;
+        rig.teardown().await;
+
+        for (path, plain, forged) in refused {
+            assert!(
+                matches!(plain, Err(AppError::Conflict(_))),
+                "{path}: a non-admin release delete is a 409: {plain:?}"
+            );
+            assert!(
+                matches!(forged, Err(AppError::Conflict(_))),
+                "{path}: the replication header does not unlock it: {forged:?}"
+            );
+        }
+        assert!(live, "the release stays live");
+        assert!(admin.is_ok(), "an administrator still retracts: {admin:?}");
+    }
+
+    /// #5626: an npm release published through `PUT /npm/<repo>/<pkg>` is
+    /// stored as `<pkg>/<ver>/<pkg>-<ver>.tgz`; the REST delete resolves the
+    /// `/-/` URL to that shape before the immutability check, which used to
+    /// recognise only `/-/` and answered 200.
+    #[tokio::test]
+    async fn npm_release_published_through_the_route_is_immutable_5626_db() {
+        use base64::Engine;
+        let Some(rig) = Rig::setup("npm").await else {
+            return;
+        };
+        let doc = serde_json::json!({
+            "name": "imm-5626",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": { "name": "imm-5626", "version": "1.0.0" } },
+            "_attachments": { "imm-5626-1.0.0.tgz": {
+                "data": base64::engine::general_purpose::STANDARD.encode("tgz-imm-5626"),
+            } },
+        });
+        let req = tdh::put_json(
+            format!("/{}/imm-5626", rig.key),
+            Bytes::from(serde_json::to_vec(&doc).unwrap()),
+        );
+        let stored = publish_through_route(&rig, crate::api::handlers::npm::router(), req).await;
+        assert_eq!(stored, "imm-5626/1.0.0/imm-5626-1.0.0.tgz");
+        assert_release_delete_refused_5626(
+            rig,
+            stored.clone(),
+            &["imm-5626/-/imm-5626-1.0.0.tgz", &stored],
+        )
+        .await;
+    }
+
+    /// #5626: the same for a crate published through
+    /// `PUT /cargo/<repo>/api/v1/crates/new`, stored as
+    /// `<crate>/<ver>/<crate>-<ver>.crate` (no `crates/` segment).
+    #[tokio::test]
+    async fn cargo_release_published_through_the_route_is_immutable_5626_db() {
+        let Some(rig) = Rig::setup("cargo").await else {
+            return;
+        };
+        let meta = serde_json::to_vec(&serde_json::json!({
+            "name": "imm-5626",
+            "vers": "0.1.0",
+            "description": "immutable crate",
+        }))
+        .unwrap();
+        let tarball = b"crate-imm-5626";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&meta);
+        payload.extend_from_slice(&(tarball.len() as u32).to_le_bytes());
+        payload.extend_from_slice(tarball);
+        let req = tdh::put(
+            format!("/{}/api/v1/crates/new", rig.key),
+            Bytes::from(payload),
+        );
+        let stored = publish_through_route(&rig, crate::api::handlers::cargo::router(), req).await;
+        assert_eq!(stored, "imm-5626/0.1.0/imm-5626-0.1.0.crate");
+        assert_release_delete_refused_5626(rig, stored.clone(), &[&stored]).await;
     }
 
     /// The generic delete of an MCP server.json, header or not, is refused

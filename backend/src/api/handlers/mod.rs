@@ -668,6 +668,7 @@ pub mod proxy_helpers;
 pub(crate) mod proxy_scan_archive;
 pub(crate) mod proxy_scan_inflight;
 pub mod pub_registry;
+pub(crate) mod publish_lock;
 pub mod publish_quota;
 pub mod puppet;
 pub mod pypi;
