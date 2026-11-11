@@ -1613,6 +1613,41 @@ impl ScanResultService {
         Ok(())
     }
 
+    /// Fail `scan_id` with `error` only if it is still `running`, and return
+    /// the checksum of the bytes it was prepared for (`Some(None)` when the
+    /// row carries none), or `None` when the row is already terminal or gone
+    /// (#5830).
+    ///
+    /// Used for a trigger's pre-allocated rows once the scan has returned:
+    /// a row the scan finished is left alone, and one it never reached ends
+    /// `failed` with its inventory `failed`, as a scanner that errored does,
+    /// instead of sitting `running` until the stuck-scan janitor reaps it.
+    /// `started_at` is kept, so the row still says when the scan was queued.
+    pub async fn fail_scan_if_running(
+        &self,
+        scan_id: Uuid,
+        error: &str,
+    ) -> Result<Option<Option<String>>> {
+        // Runtime query (not `query!`) so the `.sqlx/` offline cache needs
+        // no new entry, as in `cleanup_stuck_scans_with_limit`.
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            r#"
+            UPDATE scan_results
+            SET status = 'failed', error_message = $2, completed_at = NOW(),
+                inventory_status = 'failed'
+            WHERE id = $1 AND status = 'running'
+            RETURNING checksum_sha256::text
+            "#,
+        )
+        .bind(scan_id)
+        .bind(error)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(row.map(|(checksum,)| checksum))
+    }
+
     /// Mark a scan as `not_applicable` (#1470): the scanner does not apply to
     /// this artifact's format, so it never ran. This is a distinct terminal
     /// status from `failed` (which is reserved for a scanner that started and
