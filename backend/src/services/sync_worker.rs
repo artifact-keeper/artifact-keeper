@@ -45,12 +45,55 @@ const STALE_CHECK_INTERVAL_TICKS: u64 = 6;
 /// `PEER_STALE_THRESHOLD_MINUTES`, falling back to
 /// `STALE_PEER_THRESHOLD_MINUTES`.  Non-positive values are rejected so we
 /// never disable detection by accident.
+#[cfg(test)]
 pub(crate) fn stale_peer_threshold_minutes() -> i32 {
+    stale_threshold_from_env().unwrap_or(STALE_PEER_THRESHOLD_MINUTES)
+}
+
+/// The `system_settings` key of the admin-settable stale-peer threshold
+/// (`POST /api/v1/admin/settings`, `edge_stale_threshold_minutes`).
+pub(crate) const STALE_THRESHOLD_SETTING: &str = "edge_stale_threshold_minutes";
+
+/// A positive `PEER_STALE_THRESHOLD_MINUTES`, which pins the threshold.
+pub(crate) fn stale_threshold_from_env() -> Option<i32> {
     std::env::var("PEER_STALE_THRESHOLD_MINUTES")
         .ok()
         .and_then(|v| v.parse::<i32>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(STALE_PEER_THRESHOLD_MINUTES)
+}
+
+/// The stale-peer threshold in force (#5652): `PEER_STALE_THRESHOLD_MINUTES`
+/// when set, else a positive stored `edge_stale_threshold_minutes`, else the
+/// default. The background detector and `POST /api/v1/admin/cleanup` both use
+/// it, so the admin setting is the one value an operator sees and changes.
+pub(crate) fn resolve_stale_threshold(env: Option<i32>, stored: Option<&serde_json::Value>) -> i32 {
+    env.or_else(|| {
+        stored
+            .and_then(serde_json::Value::as_i64)
+            .filter(|n| *n > 0)
+            .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+    })
+    .unwrap_or(STALE_PEER_THRESHOLD_MINUTES)
+}
+
+/// [`resolve_stale_threshold`] against the database. A read error keeps the
+/// env/default value rather than skipping detection.
+pub(crate) async fn effective_stale_threshold_minutes(db: &PgPool) -> i32 {
+    let env = stale_threshold_from_env();
+    if env.is_some() {
+        return resolve_stale_threshold(env, None);
+    }
+    let stored: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT value FROM system_settings WHERE key = $1",
+    )
+    .bind(STALE_THRESHOLD_SETTING)
+    .fetch_optional(db)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "could not read {STALE_THRESHOLD_SETTING}; using the default");
+        None
+    });
+    resolve_stale_threshold(None, stored.as_ref())
 }
 
 /// Read the configured stale-check tick interval from
@@ -300,7 +343,7 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
 
         let mut tick_count: u64 = 0;
         let stale_interval_ticks = stale_check_interval_ticks();
-        let stale_threshold_min = stale_peer_threshold_minutes();
+        let stale_threshold_min = effective_stale_threshold_minutes(&db).await;
         let peer_heartbeat_enabled = env_bool("PEER_HEARTBEAT_ENABLED", true);
         let peer_heartbeat_interval_secs = env_u64_min(
             "PEER_HEARTBEAT_INTERVAL_SECS",
@@ -365,7 +408,10 @@ pub async fn spawn_sync_worker(db: PgPool, storage_registry: Arc<StorageRegistry
 
             // Periodically check for stale peers and mark them offline.
             if plan.stale_check {
-                run_stale_peer_detection(&db, stale_threshold_min).await;
+                // Re-read each check, so an admin change applies without a
+                // restart (#5652).
+                let threshold = effective_stale_threshold_minutes(&db).await;
+                run_stale_peer_detection(&db, threshold).await;
                 match sweep_orphaned_sync_tasks(&db).await {
                     Ok(0) => {}
                     Ok(n) => tracing::debug!("Swept {n} sync task(s) of removed artifacts"),
@@ -4582,6 +4628,29 @@ mod tests {
         std::env::remove_var("PEER_STALE_THRESHOLD_MINUTES");
         assert_eq!(observed, 1);
         assert_eq!(stale_peer_threshold_minutes(), STALE_PEER_THRESHOLD_MINUTES);
+    }
+
+    /// #5652: the admin setting drives the detector unless the env pins it.
+    #[test]
+    fn test_resolve_stale_threshold_env_then_setting_then_default_5652() {
+        let stored = serde_json::json!(12);
+        assert_eq!(resolve_stale_threshold(Some(2), Some(&stored)), 2);
+        assert_eq!(resolve_stale_threshold(None, Some(&stored)), 12);
+        assert_eq!(
+            resolve_stale_threshold(None, None),
+            STALE_PEER_THRESHOLD_MINUTES
+        );
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-3),
+            serde_json::json!("x"),
+        ] {
+            assert_eq!(
+                resolve_stale_threshold(None, Some(&bad)),
+                STALE_PEER_THRESHOLD_MINUTES,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

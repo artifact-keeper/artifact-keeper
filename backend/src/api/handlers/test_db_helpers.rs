@@ -316,6 +316,25 @@ pub async fn hidden_nav_items_serial_lock() -> HiddenNavItemsSerialGuard {
     }
 }
 
+/// Advisory-lock key for [`admin_settings_serial_lock`] (#5652).
+const ADMIN_SETTINGS_TEST_LOCK_KEY: i64 = 0x4153_5652; // "AS" + issue #5652
+
+/// Cross-process serialization guard for the DB-backed tests that write the
+/// `POST /api/v1/admin/settings` rows (#5652): one row per key in
+/// `system_settings`, shared by the whole database. Mirrors
+/// [`hidden_nav_items_serial_lock`].
+pub struct AdminSettingsSerialGuard {
+    _conn: Option<sqlx::PgConnection>,
+}
+
+/// Acquire the admin-settings test lock, blocking until it is free. Returns an
+/// inert guard when the database is unreachable, mirroring [`try_pool`].
+pub async fn admin_settings_serial_lock() -> AdminSettingsSerialGuard {
+    AdminSettingsSerialGuard {
+        _conn: serial_lock_session(ADMIN_SETTINGS_TEST_LOCK_KEY).await,
+    }
+}
+
 /// Advisory-lock key for [`usage_ledger_serial_lock`] (#2992).
 ///
 /// Distinct from the other test lock keys and from the application advisory

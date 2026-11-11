@@ -164,6 +164,7 @@ such as `credential_replaced` or `secret_rotated`.
 | `SYNC_POLICY_CREATED` / `_DELETED` | `sync_policy` | `name`, `policy` (the policy without timestamps) |
 | `SYNC_POLICY_UPDATED` | `sync_policy` | `name`, `changed_fields`, `before`, `after` (written by update and by enable / disable) |
 | `CONFIG_IMPORTED` | `setting` (`resource_name: config_document`); one summary row per `POST /api/v1/admin/config/import?mode=apply` (#5292), on top of the per-repository rows each write records | `schema_version`, `completed`, `error` (null on success), `planned_create`, `planned_update` (keys), `unchanged` and `not_in_document` (counts), `created`, `updated`, `members_updated` (keys actually written), `prune` |
+| `SETTING_CHANGED` (system settings) | `setting` (`resource_name`: the key); one row per field a `POST /api/v1/admin/settings` changes (#5652), none for a field sent unchanged. See [operations/system-settings.md](operations/system-settings.md) | `key`, `old_value`, `new_value` (strings), `setting`, `from`, `to` (numbers) |
 
 A webhook `url` is recorded as scheme, host, port and path: userinfo, query
 string and fragment are dropped because receivers often carry a token there.
