@@ -542,6 +542,7 @@ mod tests {
             source: Some("test".into()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         };
         svc.create_completed_scan_with_findings(
             npm_id,

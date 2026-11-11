@@ -547,6 +547,15 @@ pub struct ScanConfig {
     /// #2954: fail-open (default) vs fail-closed action for the inline proxy
     /// scan-on-fetch. `'fail_open'` | `'fail_closed'`.
     pub proxy_scan_action: String,
+    /// Numeric CVSS floor for the inline proxy scan gate (#5263), LIVE only
+    /// when `block_on_policy_violation` is set, like `severity_threshold`.
+    /// `None` (the default) keeps the gate on severity categories. When set,
+    /// a finding that carries a CVSS base score blocks at or above this
+    /// number whatever its severity label, and a finding with no score is
+    /// still graded by `severity_threshold`. See `ProxySeverityGate::Cvss`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub cvss_threshold: Option<f64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1049,6 +1058,168 @@ impl VulnDbProvenance {
     }
 }
 
+/// A CVSS base score, held as tenths so it is exact, ordered and `Eq`
+/// (#5263): `7.5` is `CvssScore(75)`. Only values in `0.0..=10.0` exist.
+///
+/// On the wire and in the database it is the plain number (`7.5`); the tenths
+/// are an implementation detail of comparing a score to a threshold without
+/// floating-point equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CvssScore(u8);
+
+impl CvssScore {
+    /// The highest score the scale has, `10.0`. Also what an unreadable
+    /// stored score is read as, so that it can only fail closed.
+    pub const MAX: CvssScore = CvssScore(100);
+
+    /// The lowest score the scale has, `0.0`. As a threshold it blocks every
+    /// scored finding, which is what an unreadable stored threshold is read
+    /// as.
+    pub const MIN: CvssScore = CvssScore(0);
+
+    /// A score from the number a scanner or an operator gave, rounded to one
+    /// decimal as CVSS itself is. `None` for a value that is not a number or
+    /// lies outside `0.0..=10.0`.
+    pub fn from_f64(score: f64) -> Option<Self> {
+        if !score.is_finite() || !(0.0..=10.0).contains(&score) {
+            return None;
+        }
+        Some(Self((score * 10.0).round() as u8))
+    }
+
+    /// The score as the number CVSS states it, e.g. `7.5`.
+    pub fn as_f64(self) -> f64 {
+        f64::from(self.0) / 10.0
+    }
+}
+
+impl std::fmt::Display for CvssScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.0 / 10, self.0 % 10)
+    }
+}
+
+impl Serialize for CvssScore {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(self.as_f64())
+    }
+}
+
+impl<'de> Deserialize<'de> for CvssScore {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = f64::deserialize(deserializer)?;
+        Self::from_f64(raw).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "invalid CVSS score {raw}: expected a number between 0.0 and 10.0"
+            ))
+        })
+    }
+}
+
+/// The CVSS assessment a finding is graded by (#5263): the base score, and
+/// where it came from, so an operator can see why a numeric threshold did or
+/// did not block.
+///
+/// An advisory often carries several assessments (NVD and the CNA, CVSS 3.1
+/// and 4.0). A scanner adapter picks ONE by the precedence documented on
+/// [`CvssAssessment::prefer`]; this is that one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CvssAssessment {
+    /// Base score, `0.0..=10.0`.
+    #[schema(value_type = f64)]
+    pub score: CvssScore,
+    /// CVSS version the score was computed under, e.g. `3.1`.
+    pub version: Option<String>,
+    /// The vector string, e.g. `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`.
+    pub vector: Option<String>,
+    /// Who made the assessment, as the scanner reports it, e.g.
+    /// `nvd@nist.gov`.
+    pub source: Option<String>,
+}
+
+impl CvssAssessment {
+    /// `(major, minor)` of [`version`](Self::version), `(0, 0)` when absent
+    /// or unreadable, so an unversioned assessment ranks below every
+    /// versioned one.
+    fn version_rank(&self) -> (u32, u32) {
+        let Some(version) = self.version.as_deref() else {
+            return (0, 0);
+        };
+        let mut parts = version.trim().split('.');
+        let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (major, minor)
+    }
+
+    /// `2` for an assessment marked primary, `0` for one marked secondary,
+    /// `1` for one the scanner did not mark either way.
+    fn type_rank(primary: Option<bool>) -> u8 {
+        match primary {
+            Some(true) => 2,
+            None => 1,
+            Some(false) => 0,
+        }
+    }
+
+    /// The assessment a finding is graded by when one advisory record carries
+    /// several (#5263). Each candidate comes with the scanner's own mark for
+    /// it: `Some(true)` primary, `Some(false)` secondary, `None` unmarked.
+    /// In order:
+    ///
+    /// 1. **Primary before secondary.** The primary assessment is the
+    ///    advisory database's own analysis; a secondary one is the vendor's
+    ///    or CNA's. An unmarked assessment ranks between the two.
+    /// 2. **Newest CVSS version** (4.0, then 3.1, 3.0, 2.0). An assessment
+    ///    with no readable version ranks last.
+    /// 3. **Highest score**, so two assessments that tie on both counts
+    ///    cannot grade a finding lower than either states.
+    ///
+    /// Assessments that tie on all three keep scanner order (the first wins).
+    /// `None` for an empty list.
+    pub fn prefer(
+        candidates: impl IntoIterator<Item = (Option<bool>, CvssAssessment)>,
+    ) -> Option<CvssAssessment> {
+        let mut best: Option<(Option<bool>, CvssAssessment)> = None;
+        for (primary, candidate) in candidates {
+            let rank = (
+                Self::type_rank(primary),
+                candidate.version_rank(),
+                candidate.score,
+            );
+            let better = match &best {
+                None => true,
+                Some((best_primary, current)) => {
+                    rank > (
+                        Self::type_rank(*best_primary),
+                        current.version_rank(),
+                        current.score,
+                    )
+                }
+            };
+            if better {
+                best = Some((primary, candidate));
+            }
+        }
+        best.map(|(_, assessment)| assessment)
+    }
+
+    /// The highest-scored of several findings' assessments, for a merge of
+    /// findings that are one vulnerability in one component: the merged
+    /// finding must not grade lower than any finding it stands for. The
+    /// first wins a tie; `None` when no finding carries a score.
+    pub fn highest<'a>(
+        candidates: impl IntoIterator<Item = Option<&'a CvssAssessment>>,
+    ) -> Option<CvssAssessment> {
+        let mut best: Option<&CvssAssessment> = None;
+        for candidate in candidates.into_iter().flatten() {
+            if best.is_none_or(|current| candidate.score > current.score) {
+                best = Some(candidate);
+            }
+        }
+        best.cloned()
+    }
+}
+
 /// A raw finding produced by a scanner before it is persisted.
 #[derive(Debug, Clone, Serialize)]
 pub struct RawFinding {
@@ -1063,6 +1234,10 @@ pub struct RawFinding {
     pub source_url: Option<String>,
     /// What kind of finding this is (#3013).
     pub finding_class: FindingClass,
+    /// The CVSS assessment the finding is graded by, when the scanner
+    /// reported one (#5263). `None` is an UNSCORED finding, which a numeric
+    /// CVSS threshold grades by its severity instead.
+    pub cvss: Option<CvssAssessment>,
 }
 
 /// A CVE-identified finding retained from an inline proxy scan so it can be
@@ -1093,6 +1268,11 @@ pub struct ProxyFinding {
     /// most actionable field for an operator whose build was just blocked.
     pub fixed_version: Option<String>,
     pub title: Option<String>,
+    /// The CVSS assessment the finding was graded by (#5263): score, version,
+    /// vector and source. `null` for a finding the scanner reported no score
+    /// for, and for findings recorded before scores were kept.
+    #[serde(default)]
+    pub cvss: Option<CvssAssessment>,
 }
 
 /// A package observed by a scanner during inventory enumeration, regardless
@@ -1467,6 +1647,7 @@ mod tests {
             proxy_scan_action: "fail_open".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            cvss_threshold: None,
         };
         assert_eq!(config.threshold(), Severity::Critical);
     }
@@ -1484,6 +1665,7 @@ mod tests {
             proxy_scan_action: "fail_open".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            cvss_threshold: None,
         };
         assert_eq!(config.threshold(), Severity::High);
     }
@@ -1834,5 +2016,135 @@ mod tests {
         assert_eq!(stale.status(), GradeStatus::Incomplete);
         assert!(stale.coverage().is_none());
         assert_eq!(stale.display_grade().as_deref(), Some("B"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CvssScore / CvssAssessment (#5263)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cvss_score_accepts_only_the_scale_and_rounds_to_one_decimal() {
+        assert_eq!(CvssScore::from_f64(0.0), Some(CvssScore::MIN));
+        assert_eq!(CvssScore::from_f64(10.0), Some(CvssScore::MAX));
+        assert_eq!(CvssScore::from_f64(7.5).unwrap().as_f64(), 7.5);
+        assert_eq!(CvssScore::from_f64(9.8).unwrap().to_string(), "9.8");
+        assert_eq!(CvssScore::from_f64(8.0).unwrap().to_string(), "8.0");
+        // Rounded as CVSS states scores, so 8.04 and 8.0 are one threshold.
+        assert_eq!(CvssScore::from_f64(8.04), CvssScore::from_f64(8.0));
+        assert_eq!(CvssScore::from_f64(7.96), CvssScore::from_f64(8.0));
+        for bad in [-0.1, 10.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(CvssScore::from_f64(bad), None, "{bad}");
+        }
+        assert!(CvssScore::from_f64(7.9).unwrap() < CvssScore::from_f64(8.0).unwrap());
+    }
+
+    #[test]
+    fn test_cvss_score_is_a_plain_number_on_the_wire() {
+        let score = CvssScore::from_f64(9.8).unwrap();
+        assert_eq!(serde_json::to_value(score).unwrap(), serde_json::json!(9.8));
+        assert_eq!(
+            serde_json::from_value::<CvssScore>(serde_json::json!(9.8)).unwrap(),
+            score
+        );
+        assert_eq!(
+            serde_json::from_value::<CvssScore>(serde_json::json!(8)).unwrap(),
+            CvssScore::from_f64(8.0).unwrap()
+        );
+        assert!(serde_json::from_value::<CvssScore>(serde_json::json!(10.5)).is_err());
+        assert!(serde_json::from_value::<CvssScore>(serde_json::json!("9.8")).is_err());
+    }
+
+    fn assessment(score: f64, version: Option<&str>) -> CvssAssessment {
+        CvssAssessment {
+            score: CvssScore::from_f64(score).unwrap(),
+            version: version.map(str::to_string),
+            vector: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn test_cvss_prefer_orders_by_type_then_version_then_score() {
+        let score_of = |candidates: Vec<(Option<bool>, CvssAssessment)>| {
+            CvssAssessment::prefer(candidates).map(|c| c.score.as_f64())
+        };
+        assert_eq!(score_of(vec![]), None);
+        // Primary beats a newer, higher secondary; unmarked sits between.
+        assert_eq!(
+            score_of(vec![
+                (Some(false), assessment(9.9, Some("4.0"))),
+                (None, assessment(9.0, Some("4.0"))),
+                (Some(true), assessment(5.0, Some("2.0"))),
+            ]),
+            Some(5.0)
+        );
+        assert_eq!(
+            score_of(vec![
+                (Some(false), assessment(9.9, Some("4.0"))),
+                (None, assessment(6.0, Some("3.1"))),
+            ]),
+            Some(6.0)
+        );
+        // Then the newest version; an unreadable version ranks last.
+        assert_eq!(
+            score_of(vec![
+                (None, assessment(9.0, None)),
+                (None, assessment(8.0, Some("three"))),
+                (None, assessment(7.0, Some("3.0"))),
+                (None, assessment(6.0, Some("3.1"))),
+                (None, assessment(5.0, Some("4.0"))),
+            ]),
+            Some(5.0)
+        );
+        // Then the highest score; a full tie keeps the first.
+        let tie = CvssAssessment::prefer(vec![
+            (
+                None,
+                CvssAssessment {
+                    source: Some("first".to_string()),
+                    ..assessment(7.0, Some("3.1"))
+                },
+            ),
+            (None, assessment(8.5, Some("3.1"))),
+            (
+                None,
+                CvssAssessment {
+                    source: Some("later".to_string()),
+                    ..assessment(8.5, Some("3.1"))
+                },
+            ),
+        ])
+        .unwrap();
+        assert_eq!((tie.score.as_f64(), tie.source), (8.5, None));
+    }
+
+    #[test]
+    fn test_cvss_highest_keeps_the_top_score_of_merged_findings() {
+        let low = assessment(4.0, Some("3.1"));
+        let high = assessment(9.1, Some("3.1"));
+        assert_eq!(CvssAssessment::highest([None, None]), None);
+        assert_eq!(
+            CvssAssessment::highest([Some(&low), None, Some(&high)]),
+            Some(high.clone())
+        );
+        assert_eq!(
+            CvssAssessment::highest([Some(&high), Some(&low)]),
+            Some(high)
+        );
+    }
+
+    /// A finding stored before scores were kept has no `cvss` key at all.
+    #[test]
+    fn test_proxy_finding_without_cvss_still_deserializes() {
+        let finding: ProxyFinding = serde_json::from_value(serde_json::json!({
+            "cve_id": "CVE-2024-0001",
+            "severity": "high",
+            "package_name": null,
+            "package_version": null,
+            "fixed_version": null,
+            "title": null
+        }))
+        .unwrap();
+        assert_eq!(finding.cvss, None);
     }
 }

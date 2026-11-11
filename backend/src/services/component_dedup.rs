@@ -451,6 +451,11 @@ pub fn merge_artifact_self_findings(
                 .iter()
                 .map(|&i| findings[i].finding_class)
                 .fold(base.finding_class, |acc, c| acc.most_severe(c)),
+            // #5263: likewise the merge keeps the highest score any member
+            // carries, so it cannot grade lower than one of them did.
+            cvss: crate::models::security::CvssAssessment::highest(
+                members.iter().map(|&i| findings[i].cvss.as_ref()),
+            ),
         };
 
         merged_at.insert(members[0], merged);
@@ -545,6 +550,7 @@ mod tests {
             source: Some(source.to_string()),
             source_url: None,
             finding_class: crate::models::security::FindingClass::Vulnerability,
+            cvss: None,
         }
     }
 

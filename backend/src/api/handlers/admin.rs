@@ -2802,6 +2802,17 @@ pub struct ProxyScanVerdictItem {
     pub medium_count: i32,
     pub low_count: i32,
     pub max_severity: Option<String>,
+    /// Highest CVSS base score among the verdict's findings above `info`
+    /// that carry one (#5263): what a repository's numeric `cvss_threshold`
+    /// is compared with. `null` when none carries a score.
+    pub max_cvss_score: Option<f64>,
+    /// Highest severity among the verdict's findings above `info` that carry
+    /// no CVSS score (#5263): those are graded by `severity_threshold` even
+    /// under a numeric threshold. `null` when every one is scored. Both this
+    /// and `max_cvss_score` are `null` on a verdict recorded before scores
+    /// were kept; a numeric threshold blocks such a verdict until the digest
+    /// is scanned again.
+    pub max_unscored_severity: Option<String>,
     pub scanner_version: Option<String>,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2818,6 +2829,8 @@ impl From<crate::services::proxy_scan_service::ProxyScanRow> for ProxyScanVerdic
             medium_count: r.medium_count,
             low_count: r.low_count,
             max_severity: r.max_severity,
+            max_cvss_score: r.max_cvss_score,
+            max_unscored_severity: r.max_unscored_severity,
             scanner_version: r.scanner_version,
             scanned_at: r.scanned_at,
         }

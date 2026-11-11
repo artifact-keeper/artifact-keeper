@@ -283,6 +283,7 @@ impl OpenScapScanner {
                     // #3013: a failed XCCDF rule is a configuration /
                     // compliance violation, not a known weakness.
                     finding_class: crate::models::security::FindingClass::Policy,
+                    cvss: None,
                 }
             })
             .collect()

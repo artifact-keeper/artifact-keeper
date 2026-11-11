@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
-use crate::models::security::Severity;
+use crate::models::security::{CvssScore, Severity};
 
 /// A persisted proxy scan verdict row.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -35,6 +35,31 @@ pub struct ProxyScanRow {
     pub max_severity: Option<String>,
     pub scanner_version: Option<String>,
     pub scanned_at: DateTime<Utc>,
+    /// Highest CVSS base score among the verdict's findings above `info`
+    /// that carry one (#5263, migration 361). NULL when none does, and on
+    /// every verdict recorded before the column existed.
+    ///
+    /// `#[sqlx(default)]` on both CVSS columns: a query that does not select
+    /// them reads NULL, which a numeric threshold treats as ungraded and
+    /// blocks. A read that forgets the columns can only fail closed.
+    #[sqlx(default)]
+    pub max_cvss_score: Option<f64>,
+    /// Highest severity among the verdict's findings above `info` that carry
+    /// NO CVSS score (#5263). NULL when every one of them is scored, and on
+    /// verdicts recorded before the column existed.
+    #[sqlx(default)]
+    pub max_unscored_severity: Option<String>,
+}
+
+impl ProxyScanRow {
+    /// What a repository's gate grades this stored verdict on (#5263).
+    pub fn grade(&self) -> VerdictGrade {
+        VerdictGrade::from_stored(
+            self.max_severity.as_deref(),
+            self.max_cvss_score,
+            self.max_unscored_severity.as_deref(),
+        )
+    }
 }
 
 /// The three terminal verdicts stored in `proxy_scan_results.verdict`.
@@ -80,6 +105,152 @@ pub enum ProxySeverityGate {
     /// the record-only action resolves to this gate; it is the WEAKEST gate,
     /// so any enforcing side of a stricter-of-two combination wins.
     RecordOnly,
+    /// Opted-in numeric posture (#5263, `scan_configs.cvss_threshold` set
+    /// with `block_on_policy_violation`): a finding that carries a CVSS base
+    /// score blocks at or above the configured number, whatever its severity
+    /// label. See [`CvssGate`].
+    Cvss(CvssGate),
+}
+
+/// The numeric CVSS policy of [`ProxySeverityGate::Cvss`] (#5263).
+///
+/// A severity label and a CVSS score are two assessments that need not agree
+/// (a distro can label `low` what NVD scores 9.8, and two `high` findings can
+/// sit either side of 8.0), so "block CVSS >= 8.0" cannot be expressed as a
+/// severity threshold. Under this gate a `vulnerable` verdict blocks when:
+///
+/// * a finding with a score has one at or above [`min_score`](Self::min_score),
+///   whatever its label; or
+/// * a finding WITHOUT a score has a severity at or above
+///   [`unscored_severity`](Self::unscored_severity). This is the explicit
+///   policy for missing scores: a number cannot grade them, so the
+///   repository's `severity_threshold` still does, exactly as it would with
+///   no numeric threshold set; or
+/// * the verdict's highest severity is at or above
+///   [`any_severity`](Self::any_severity), when that is set. A repository's
+///   own config never sets it; it only carries a severity-threshold gate that
+///   was combined with this one ([`ProxySeverityGate::stricter`]); or
+/// * the verdict carries no CVSS summary at all (recorded before migration
+///   361, or kept ungraded on purpose). Fail closed, as an ungraded severity
+///   is under a severity threshold: serve only what is KNOWN to be below.
+///
+/// Findings graded `info` take no part, as under every other gate: they do
+/// not make a verdict `vulnerable`, and they are not in the stored summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CvssGate {
+    /// Scored findings block at or above this base score.
+    pub min_score: CvssScore,
+    /// Unscored findings block at or above this severity.
+    pub unscored_severity: Severity,
+    /// When set, ANY finding at or above this severity blocks too.
+    pub any_severity: Option<Severity>,
+}
+
+impl CvssGate {
+    fn blocks(self, grade: VerdictGrade) -> bool {
+        if let Some(threshold) = self.any_severity {
+            if severity_blocks(grade.max_severity, threshold) {
+                return true;
+            }
+        }
+        if grade.max_cvss_score.is_none() && grade.max_unscored_severity.is_none() {
+            // No CVSS summary: nothing here is known to be below the bar.
+            return true;
+        }
+        grade
+            .max_cvss_score
+            .is_some_and(|score| score >= self.min_score)
+            || grade
+                .max_unscored_severity
+                .is_some_and(|severity| severity.meets_threshold(self.unscored_severity))
+    }
+}
+
+/// Does a verdict whose highest severity is `max_severity` block at
+/// `threshold`? `None` (missing or unparseable) blocks: an ungraded
+/// vulnerable verdict is fail-closed, never fail-open (#3243).
+fn severity_blocks(max_severity: Option<Severity>, threshold: Severity) -> bool {
+    match max_severity {
+        None => true,
+        Some(severity) => severity.meets_threshold(threshold),
+    }
+}
+
+/// What a `vulnerable` verdict is graded on by a repository's gate (#5263):
+/// its highest severity, and the CVSS summary a numeric threshold needs.
+///
+/// The verdict is shared by digest across repositories while the threshold is
+/// per repository, so the row cannot store a decision. It stores these three
+/// values, and every seam (a fresh scan, a cached verdict, a Virtual's
+/// combined gate, the dashboards) grades them with the same
+/// [`ProxySeverityGate::blocks_grade`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VerdictGrade {
+    /// Highest severity across the findings; `None` when not recorded.
+    pub max_severity: Option<Severity>,
+    /// Highest CVSS base score among the findings above `info` that carry
+    /// one.
+    pub max_cvss_score: Option<CvssScore>,
+    /// Highest severity among the findings above `info` that carry no score.
+    pub max_unscored_severity: Option<Severity>,
+}
+
+impl VerdictGrade {
+    /// A grade with no CVSS summary: what a caller that only knows the
+    /// highest severity has. A numeric gate blocks it.
+    pub fn severity_only(max_severity: Option<Severity>) -> Self {
+        Self {
+            max_severity,
+            ..Self::default()
+        }
+    }
+
+    /// The grade stored on a `proxy_scan_results` row (`max_severity`,
+    /// `max_cvss_score`, `max_unscored_severity`).
+    ///
+    /// A stored value that is present but unreadable must not read as
+    /// absent, or a damaged row would look like one with nothing to block
+    /// on: an out-of-range score reads as the highest score, and an unknown
+    /// unscored severity as the highest severity. (`max_severity` keeps its
+    /// own rule: unparseable is `None`, which every gate blocks.)
+    pub fn from_stored(
+        max_severity: Option<&str>,
+        max_cvss_score: Option<f64>,
+        max_unscored_severity: Option<&str>,
+    ) -> Self {
+        Self {
+            max_severity: max_severity.and_then(Severity::from_str_loose),
+            max_cvss_score: max_cvss_score
+                .map(|score| CvssScore::from_f64(score).unwrap_or(CvssScore::MAX)),
+            max_unscored_severity: max_unscored_severity
+                .map(|token| Severity::from_str_loose(token).unwrap_or(Severity::Critical)),
+        }
+    }
+
+    /// Whether the verdict carries a CVSS summary. `false` for a verdict
+    /// recorded before migration 361.
+    pub fn has_cvss_summary(&self) -> bool {
+        self.max_cvss_score.is_some() || self.max_unscored_severity.is_some()
+    }
+
+    /// Whether this grade is at least as severe as `stored` in CVSS terms:
+    /// no numeric gate that blocks `stored` could serve this one. For the
+    /// rescan replacement rule (#5628), which must not let a rescan that
+    /// graded the bytes as no release lower a request-pinned verdict.
+    pub fn cvss_at_least_as_severe_as(&self, stored: &VerdictGrade) -> bool {
+        let score_holds = match (stored.max_cvss_score, self.max_cvss_score) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(was), Some(now)) => now >= was,
+        };
+        let unscored_holds = match (stored.max_unscored_severity, self.max_unscored_severity) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            // `Severity` orders Critical first, so `<=` is "as severe or more".
+            (Some(was), Some(now)) => now <= was,
+        };
+        score_holds && unscored_holds
+    }
 }
 
 impl ProxySeverityGate {
@@ -96,18 +267,59 @@ impl ProxySeverityGate {
         }
     }
 
+    /// [`from_config`](Self::from_config) plus the repo's numeric
+    /// `scan_configs.cvss_threshold` (#5263).
+    ///
+    /// The number is live under the same opt-in as the severity threshold
+    /// (`block_on_policy_violation`): with the opt-in off, or the stored
+    /// severity threshold unparseable, the gate is [`Self::BlockOnAny`] as
+    /// before and the number is inert. With it on, `None` keeps the severity
+    /// [`Self::Threshold`], and a number yields [`Self::Cvss`], in which the
+    /// severity threshold grades the findings that carry no score. A stored
+    /// number outside `0.0..=10.0` (the CHECK constraint forbids it) must not
+    /// weaken the gate, so it is block-on-any too.
+    pub fn from_config_with_cvss(
+        block_on_policy_violation: bool,
+        severity_threshold: &str,
+        cvss_threshold: Option<f64>,
+    ) -> Self {
+        let categorical = Self::from_config(block_on_policy_violation, severity_threshold);
+        let (Self::Threshold(unscored_severity), Some(raw)) = (categorical, cvss_threshold) else {
+            return categorical;
+        };
+        match CvssScore::from_f64(raw) {
+            Some(min_score) => Self::Cvss(CvssGate {
+                min_score,
+                unscored_severity,
+                any_severity: None,
+            }),
+            None => Self::BlockOnAny,
+        }
+    }
+
     /// Does a `vulnerable` verdict with this highest observed severity block?
     ///
     /// `None` (missing / unparseable stored `max_severity`) blocks under every
     /// gate: an ungraded vulnerable verdict is fail-closed, never fail-open.
+    ///
+    /// This is [`blocks_grade`](Self::blocks_grade) for a caller that knows
+    /// only the severity. Under [`Self::Cvss`] such a verdict has no CVSS
+    /// summary and therefore blocks; a seam that can serve below a numeric
+    /// threshold must pass the full grade.
     pub fn blocks(self, max_severity: Option<Severity>) -> bool {
+        self.blocks_grade(VerdictGrade::severity_only(max_severity))
+    }
+
+    /// Does a `vulnerable` verdict graded `grade` block (#5263)? The one
+    /// decision every seam shares, for a fresh scan
+    /// ([`ProxyScanVerdict::grade`](crate::services::scanner_service::ProxyScanVerdict::grade))
+    /// and a stored row ([`ProxyScanRow::grade`]) alike.
+    pub fn blocks_grade(self, grade: VerdictGrade) -> bool {
         match self {
             Self::RecordOnly => false,
             Self::BlockOnAny => true,
-            Self::Threshold(t) => match max_severity {
-                None => true,
-                Some(s) => s.meets_threshold(t),
-            },
+            Self::Threshold(threshold) => severity_blocks(grade.max_severity, threshold),
+            Self::Cvss(gate) => gate.blocks(grade),
         }
     }
 
@@ -118,11 +330,36 @@ impl ProxySeverityGate {
     /// threshold blocks everything at-or-above it, so the numerically larger
     /// variant is the stricter gate).
     /// `RecordOnly` is the weakest gate: it yields to anything that enforces.
+    ///
+    /// A severity threshold and a numeric CVSS gate (#5263) are not ordered:
+    /// each blocks verdicts the other serves. Their combination therefore
+    /// blocks what EITHER blocks, which is what "stricter of two" has to mean
+    /// for a Virtual: the numeric gate with the severity threshold carried in
+    /// [`CvssGate::any_severity`]. Two numeric gates combine field by field
+    /// (the lower score, the lower severity floors), which is again exactly
+    /// the verdicts either one blocks.
     pub fn stricter(a: Self, b: Self) -> Self {
+        // The stricter of two optional severity floors: the one that blocks
+        // more severities, and a floor beats no floor.
+        let stricter_floor = |x: Option<Severity>, y: Option<Severity>| match (x, y) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, y) => x.or(y),
+        };
         match (a, b) {
             (Self::BlockOnAny, _) | (_, Self::BlockOnAny) => Self::BlockOnAny,
             (Self::RecordOnly, other) | (other, Self::RecordOnly) => other,
             (Self::Threshold(x), Self::Threshold(y)) => Self::Threshold(x.max(y)),
+            (Self::Threshold(t), Self::Cvss(c)) | (Self::Cvss(c), Self::Threshold(t)) => {
+                Self::Cvss(CvssGate {
+                    any_severity: stricter_floor(c.any_severity, Some(t)),
+                    ..c
+                })
+            }
+            (Self::Cvss(x), Self::Cvss(y)) => Self::Cvss(CvssGate {
+                min_score: x.min_score.min(y.min_score),
+                unscored_severity: x.unscored_severity.max(y.unscored_severity),
+                any_severity: stricter_floor(x.any_severity, y.any_severity),
+            }),
         }
     }
 
@@ -354,6 +591,19 @@ pub fn decide_serve(
     }
 }
 
+/// What the rescan replacement rule reads of a stored verdict (#3396, #5628,
+/// #5263): see
+/// [`ProxyScanService::lookup_verdict_catalog`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StoredVerdictCatalog {
+    pub verdict: String,
+    pub components_cataloged: Option<i32>,
+    pub pin_identity: Option<String>,
+    pub max_severity: Option<String>,
+    pub max_cvss_score: Option<f64>,
+    pub max_unscored_severity: Option<String>,
+}
+
 /// A stored verdict as the proxy-cache fast paths read it (#4514): the row,
 /// the coordinate it was graded as (`pin_identity`, #4952) and how many
 /// components it was graded on (`components_cataloged`).
@@ -442,12 +692,7 @@ pub fn decide_cache_scan_gate(
     });
     if let Some(s) = reusable {
         if verdict_blocks(&s.row.verdict) {
-            let max_severity = s
-                .row
-                .max_severity
-                .as_deref()
-                .and_then(Severity::from_str_loose);
-            return if severity_gate.blocks(max_severity) {
+            return if severity_gate.blocks_grade(s.row.grade()) {
                 CacheScanGate::Block
             } else {
                 CacheScanGate::Serve
@@ -610,28 +855,29 @@ impl ProxyScanService {
     }
 
     /// Look up a stored verdict for `(checksum_sha256, scan_type)`.
+    ///
+    /// Runtime query (no macro) since #5263, so that it reads the CVSS
+    /// summary columns without offline sqlx data.
     pub async fn lookup_verdict(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
     ) -> Result<Option<ProxyScanRow>> {
-        let row = sqlx::query_as!(
-            ProxyScanRow,
+        sqlx::query_as::<_, ProxyScanRow>(
             r#"
             SELECT checksum_sha256, scan_type, verdict,
                    findings_count, critical_count, high_count, medium_count, low_count,
-                   max_severity, scanner_version, scanned_at
+                   max_severity, scanner_version, scanned_at,
+                   max_cvss_score, max_unscored_severity
             FROM proxy_scan_results
             WHERE checksum_sha256 = $1 AND scan_type = $2
             "#,
-            checksum_sha256,
-            scan_type,
         )
+        .bind(checksum_sha256)
+        .bind(scan_type)
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        Ok(row)
+        .map_err(|e| AppError::Database(e.to_string()))
     }
 
     /// [`lookup_verdict`](Self::lookup_verdict) plus the coordinate the
@@ -656,7 +902,7 @@ impl ProxyScanService {
             SELECT checksum_sha256, scan_type, verdict,
                    findings_count, critical_count, high_count, medium_count, low_count,
                    max_severity, scanner_version, scanned_at, pin_identity,
-                   components_cataloged
+                   components_cataloged, max_cvss_score, max_unscored_severity
             FROM proxy_scan_results
             WHERE checksum_sha256 = $1 AND scan_type = $2
             "#,
@@ -699,17 +945,18 @@ impl ProxyScanService {
 
     /// The stored verdict for `(checksum_sha256, scan_type)`, the number of
     /// components it was graded on (`components_cataloged`, `None` when not
-    /// recorded), the coordinate it was graded as (`pin_identity`) and its
-    /// `max_severity` (#5628), for the rescan's replacement rule (#3396).
-    /// Runtime query (no macro) so this adds no offline sqlx data.
-    #[allow(clippy::type_complexity)]
+    /// recorded), the coordinate it was graded as (`pin_identity`), its
+    /// `max_severity` (#5628) and its CVSS summary (#5263), for the rescan's
+    /// replacement rule (#3396). Runtime query (no macro) so this adds no
+    /// offline sqlx data.
     pub async fn lookup_verdict_catalog(
         &self,
         checksum_sha256: &str,
         scan_type: &str,
-    ) -> Result<Option<(String, Option<i32>, Option<String>, Option<String>)>> {
-        sqlx::query_as::<_, (String, Option<i32>, Option<String>, Option<String>)>(
-            "SELECT verdict, components_cataloged, pin_identity, max_severity \
+    ) -> Result<Option<StoredVerdictCatalog>> {
+        sqlx::query_as::<_, StoredVerdictCatalog>(
+            "SELECT verdict, components_cataloged, pin_identity, max_severity, \
+                    max_cvss_score, max_unscored_severity \
              FROM proxy_scan_results \
              WHERE checksum_sha256 = $1 AND scan_type = $2",
         )
@@ -723,8 +970,13 @@ impl ProxyScanService {
     /// Upsert a verdict keyed on `(checksum_sha256, scan_type)`. A newer scan of
     /// the same bytes (e.g. against a bumped CVE-DB) replaces the prior row.
     /// Leaves `components_cataloged` as it was; the inline gate records through
-    /// [`record_verdict_with_catalog`](Self::record_verdict_with_catalog),
+    /// [`record_verdict_if_unchanged`](Self::record_verdict_if_unchanged),
     /// which writes it with the verdict (#4594).
+    ///
+    /// The verdict is recorded WITHOUT a CVSS summary, and a summary already
+    /// on the row is cleared (#5263): it described the previous verdict's
+    /// findings, and left in place it could let a numeric threshold serve
+    /// the new one. Runtime query (no macro) for that reason.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict(
         &self,
@@ -740,7 +992,7 @@ impl ProxyScanService {
         scanner_version: Option<&str>,
         repository_id: Option<Uuid>,
     ) -> Result<()> {
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO proxy_scan_results (
                 checksum_sha256, scan_type, verdict,
@@ -758,20 +1010,22 @@ impl ProxyScanService {
                 max_severity = EXCLUDED.max_severity,
                 scanner_version = EXCLUDED.scanner_version,
                 repository_id = EXCLUDED.repository_id,
+                max_cvss_score = NULL,
+                max_unscored_severity = NULL,
                 scanned_at = now()
             "#,
-            checksum_sha256,
-            scan_type,
-            verdict,
-            findings_count,
-            critical_count,
-            high_count,
-            medium_count,
-            low_count,
-            max_severity,
-            scanner_version,
-            repository_id,
         )
+        .bind(checksum_sha256)
+        .bind(scan_type)
+        .bind(verdict)
+        .bind(findings_count)
+        .bind(critical_count)
+        .bind(high_count)
+        .bind(medium_count)
+        .bind(low_count)
+        .bind(max_severity)
+        .bind(scanner_version)
+        .bind(repository_id)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -791,7 +1045,8 @@ impl ProxyScanService {
             r#"
             SELECT checksum_sha256, scan_type, verdict,
                    findings_count, critical_count, high_count, medium_count, low_count,
-                   max_severity, scanner_version, scanned_at
+                   max_severity, scanner_version, scanned_at,
+                   max_cvss_score, max_unscored_severity
             FROM proxy_scan_results
             WHERE checksum_sha256 = $1
             ORDER BY scan_type
@@ -821,7 +1076,8 @@ impl ProxyScanService {
             WHERE checksum_sha256 = $1
             RETURNING checksum_sha256, scan_type, verdict,
                       findings_count, critical_count, high_count, medium_count, low_count,
-                      max_severity, scanner_version, scanned_at
+                      max_severity, scanner_version, scanned_at,
+                      max_cvss_score, max_unscored_severity
             "#,
         )
         .bind(checksum_sha256)
@@ -943,6 +1199,11 @@ impl ProxyScanService {
     /// `pin_identity` is the coordinate the verdict was graded as
     /// ([`ExpectedComponent::pin_identity`](crate::services::scanner_service::ExpectedComponent::pin_identity)),
     /// `None` for a scan without one (#4952); it is replaced with the verdict.
+    ///
+    /// Records no CVSS summary (#5263): a numeric threshold blocks the
+    /// verdict as ungraded. A scan records through
+    /// [`record_verdict_if_unchanged`](Self::record_verdict_if_unchanged),
+    /// which takes one.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict_with_catalog(
         &self,
@@ -975,6 +1236,7 @@ impl ProxyScanService {
             components_cataloged,
             pin_identity,
             None,
+            VerdictGrade::default(),
         )
         .await
         .map(|_| ())
@@ -985,6 +1247,11 @@ impl ProxyScanService {
     /// if its `scanned_at` is still that value (`None` inside: there was no row),
     /// so a verdict recorded since the scan started is not overwritten. Returns
     /// whether the row was written. `observed: None` always writes.
+    ///
+    /// `grade` supplies the CVSS summary stored with the verdict (#5263):
+    /// its `max_cvss_score` and `max_unscored_severity`. (`max_severity` is
+    /// the separate argument it always was.) Pass
+    /// [`VerdictGrade::default`] to record the verdict ungraded.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_verdict_if_unchanged(
         &self,
@@ -1002,6 +1269,7 @@ impl ProxyScanService {
         components_cataloged: Option<i32>,
         pin_identity: Option<&str>,
         observed: Option<Option<DateTime<Utc>>>,
+        grade: VerdictGrade,
     ) -> Result<bool> {
         self.upsert_verdict(
             checksum_sha256,
@@ -1018,6 +1286,7 @@ impl ProxyScanService {
             components_cataloged,
             pin_identity,
             observed,
+            grade,
         )
         .await
     }
@@ -1039,6 +1308,7 @@ impl ProxyScanService {
         components_cataloged: Option<i32>,
         pin_identity: Option<&str>,
         observed: Option<Option<DateTime<Utc>>>,
+        grade: VerdictGrade,
     ) -> Result<bool> {
         let written = sqlx::query(
             r#"
@@ -1046,9 +1316,9 @@ impl ProxyScanService {
                 checksum_sha256, scan_type, verdict,
                 findings_count, critical_count, high_count, medium_count, low_count,
                 max_severity, scanner_version, repository_id, components_cataloged,
-                pin_identity, scanned_at
+                pin_identity, max_cvss_score, max_unscored_severity, scanned_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $16, $17, now())
             ON CONFLICT (checksum_sha256, scan_type) DO UPDATE SET
                 verdict = EXCLUDED.verdict,
                 findings_count = EXCLUDED.findings_count,
@@ -1061,6 +1331,8 @@ impl ProxyScanService {
                 repository_id = EXCLUDED.repository_id,
                 components_cataloged = EXCLUDED.components_cataloged,
                 pin_identity = EXCLUDED.pin_identity,
+                max_cvss_score = EXCLUDED.max_cvss_score,
+                max_unscored_severity = EXCLUDED.max_unscored_severity,
                 scanned_at = now()
             WHERE NOT $14 OR proxy_scan_results.scanned_at IS NOT DISTINCT FROM $15
             "#,
@@ -1080,6 +1352,8 @@ impl ProxyScanService {
         .bind(pin_identity)
         .bind(observed.is_some())
         .bind(observed.flatten())
+        .bind(grade.max_cvss_score.map(CvssScore::as_f64))
+        .bind(grade.max_unscored_severity.map(Severity::as_str))
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?
@@ -1199,17 +1473,43 @@ impl ProxyScanService {
             findings.iter().map(|f| f.package_version.clone()).collect();
         let fixed: Vec<Option<String>> = findings.iter().map(|f| f.fixed_version.clone()).collect();
         let titles: Vec<Option<String>> = findings.iter().map(|f| f.title.clone()).collect();
+        // #5263: the CVSS assessment each finding was graded by. Replaced
+        // with the finding on a rescan, never COALESCEd over the previous
+        // value: these columns must describe the same scan the verdict row's
+        // CVSS summary was computed from.
+        let cvss_scores: Vec<Option<f64>> = findings
+            .iter()
+            .map(|f| f.cvss.as_ref().map(|c| c.score.as_f64()))
+            .collect();
+        let cvss_versions: Vec<Option<String>> = findings
+            .iter()
+            .map(|f| f.cvss.as_ref().and_then(|c| c.version.clone()))
+            .collect();
+        let cvss_vectors: Vec<Option<String>> = findings
+            .iter()
+            .map(|f| f.cvss.as_ref().and_then(|c| c.vector.clone()))
+            .collect();
+        let cvss_sources: Vec<Option<String>> = findings
+            .iter()
+            .map(|f| f.cvss.as_ref().and_then(|c| c.source.clone()))
+            .collect();
 
         sqlx::query(
             r#"
             INSERT INTO proxy_scan_findings (
                 checksum_sha256, scan_type, cve_id, severity,
-                package_name, package_version, fixed_version, title, recorded_at
+                package_name, package_version, fixed_version, title,
+                cvss_score, cvss_version, cvss_vector, cvss_source, recorded_at
             )
             SELECT $1, $2, u.cve_id, u.severity,
-                   u.package_name, u.package_version, u.fixed_version, u.title, now()
-            FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[])
-                AS u(cve_id, severity, package_name, package_version, fixed_version, title)
+                   u.package_name, u.package_version, u.fixed_version, u.title,
+                   u.cvss_score, u.cvss_version, u.cvss_vector, u.cvss_source, now()
+            FROM UNNEST(
+                    $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[],
+                    $9::float8[], $10::text[], $11::text[], $12::text[]
+                 )
+                AS u(cve_id, severity, package_name, package_version, fixed_version, title,
+                     cvss_score, cvss_version, cvss_vector, cvss_source)
             ON CONFLICT (
                 checksum_sha256, scan_type, cve_id,
                 COALESCE(package_name, ''), COALESCE(package_version, '')
@@ -1218,6 +1518,10 @@ impl ProxyScanService {
                 severity = EXCLUDED.severity,
                 fixed_version = COALESCE(EXCLUDED.fixed_version, proxy_scan_findings.fixed_version),
                 title = COALESCE(EXCLUDED.title, proxy_scan_findings.title),
+                cvss_score = EXCLUDED.cvss_score,
+                cvss_version = EXCLUDED.cvss_version,
+                cvss_vector = EXCLUDED.cvss_vector,
+                cvss_source = EXCLUDED.cvss_source,
                 recorded_at = now()
             "#,
         )
@@ -1229,6 +1533,10 @@ impl ProxyScanService {
         .bind(&versions)
         .bind(&fixed)
         .bind(&titles)
+        .bind(&cvss_scores)
+        .bind(&cvss_versions)
+        .bind(&cvss_vectors)
+        .bind(&cvss_sources)
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -1259,9 +1567,14 @@ impl ProxyScanService {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
         )> = sqlx::query_as(
             r#"
-            SELECT cve_id, severity, package_name, package_version, fixed_version, title
+            SELECT cve_id, severity, package_name, package_version, fixed_version, title,
+                   cvss_score, cvss_version, cvss_vector, cvss_source
             FROM proxy_scan_findings
             WHERE checksum_sha256 = $1 AND scan_type = $2
             ORDER BY CASE severity
@@ -1286,7 +1599,18 @@ impl ProxyScanService {
         Ok(rows
             .into_iter()
             .map(
-                |(cve_id, severity, package_name, package_version, fixed_version, title)| {
+                |(
+                    cve_id,
+                    severity,
+                    package_name,
+                    package_version,
+                    fixed_version,
+                    title,
+                    cvss_score,
+                    cvss_version,
+                    cvss_vector,
+                    cvss_source,
+                )| {
                     crate::models::security::ProxyFinding {
                         cve_id,
                         severity,
@@ -1294,6 +1618,17 @@ impl ProxyScanService {
                         package_version,
                         fixed_version,
                         title,
+                        // A stored score outside the scale is not shown as a
+                        // score. It grades nothing: the gate reads the
+                        // verdict row's summary, not these rows.
+                        cvss: cvss_score.and_then(CvssScore::from_f64).map(|score| {
+                            crate::models::security::CvssAssessment {
+                                score,
+                                version: cvss_version,
+                                vector: cvss_vector,
+                                source: cvss_source,
+                            }
+                        }),
                     }
                 },
             )
@@ -1850,6 +2185,8 @@ mod tests {
             max_severity: None,
             scanner_version: scanner_version.map(str::to_string),
             scanned_at,
+            max_cvss_score: None,
+            max_unscored_severity: None,
         }
     }
 
@@ -2101,6 +2438,7 @@ mod tests {
             package_version: Some("0.15.0".to_string()),
             fixed_version: Some("0.15.3".to_string()),
             title: Some(format!("{cve} in {pkg}")),
+            cvss: None,
         };
 
         assert!(
@@ -2313,5 +2651,464 @@ mod tests {
             );
             assert_eq!(gate(None, live, record_only.0, record_only.1), Serve);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Numeric CVSS threshold (#5263)
+    // -----------------------------------------------------------------------
+
+    fn score(raw: f64) -> CvssScore {
+        CvssScore::from_f64(raw).expect("a score on the scale")
+    }
+
+    fn cvss_gate(min: f64, unscored: Severity) -> ProxySeverityGate {
+        ProxySeverityGate::Cvss(CvssGate {
+            min_score: score(min),
+            unscored_severity: unscored,
+            any_severity: None,
+        })
+    }
+
+    fn graded(
+        max_severity: Severity,
+        max_cvss_score: Option<f64>,
+        max_unscored_severity: Option<Severity>,
+    ) -> VerdictGrade {
+        VerdictGrade {
+            max_severity: Some(max_severity),
+            max_cvss_score: max_cvss_score.map(score),
+            max_unscored_severity,
+        }
+    }
+
+    /// The reported case: two `high` findings either side of 8.0 get
+    /// different decisions under "block CVSS >= 8.0", which no severity
+    /// threshold can express. The comparison is `>=`, to one decimal.
+    #[test]
+    fn cvss_gate_separates_findings_a_severity_threshold_cannot() {
+        let gate = cvss_gate(8.0, Severity::High);
+        let high = |s: f64| graded(Severity::High, Some(s), None);
+        assert!(!gate.blocks_grade(high(7.5)), "7.5 is below 8.0");
+        assert!(!gate.blocks_grade(high(7.9)));
+        assert!(gate.blocks_grade(high(8.0)), "the threshold itself blocks");
+        assert!(gate.blocks_grade(high(8.1)));
+        assert!(gate.blocks_grade(high(10.0)));
+
+        // The severity threshold treats all five alike, in either direction.
+        for s in [7.5, 7.9, 8.0, 8.1, 10.0] {
+            assert!(ProxySeverityGate::Threshold(Severity::High).blocks_grade(high(s)));
+            assert!(!ProxySeverityGate::Threshold(Severity::Critical).blocks_grade(high(s)));
+        }
+    }
+
+    /// The score decides for a scored finding, not the label: a `low` label
+    /// with a 9.8 blocks, a `critical` label with a 7.0 serves.
+    #[test]
+    fn cvss_gate_grades_scored_findings_by_score_not_label() {
+        let gate = cvss_gate(8.0, Severity::High);
+        assert!(gate.blocks_grade(graded(Severity::Low, Some(9.8), None)));
+        assert!(!gate.blocks_grade(graded(Severity::Critical, Some(7.0), None)));
+    }
+
+    /// The missing-score policy: a finding with no score is graded by the
+    /// repository's severity threshold, exactly as with no numeric threshold.
+    #[test]
+    fn cvss_gate_grades_unscored_findings_by_the_severity_threshold() {
+        let gate = cvss_gate(8.0, Severity::High);
+        // Scored findings all below the bar; the unscored one decides.
+        assert!(gate.blocks_grade(graded(Severity::High, Some(5.0), Some(Severity::High))));
+        assert!(gate.blocks_grade(graded(Severity::Critical, None, Some(Severity::Critical))));
+        assert!(!gate.blocks_grade(graded(Severity::Medium, Some(5.0), Some(Severity::Medium))));
+        assert!(!gate.blocks_grade(graded(Severity::Low, None, Some(Severity::Low))));
+        // A scored `critical` label below the bar does not count as unscored.
+        assert!(!gate.blocks_grade(graded(Severity::Critical, Some(7.0), Some(Severity::Low))));
+    }
+
+    /// A verdict with no CVSS summary (recorded before migration 361, or
+    /// read by a seam that only knows the severity) blocks under a numeric
+    /// threshold whatever its severity, and still serves or blocks by
+    /// severity under a severity threshold.
+    #[test]
+    fn cvss_gate_fails_closed_on_a_verdict_with_no_cvss_summary() {
+        let gate = cvss_gate(8.0, Severity::High);
+        for sev in [
+            Some(Severity::Low),
+            Some(Severity::Medium),
+            Some(Severity::Critical),
+            None,
+        ] {
+            assert!(gate.blocks(sev), "{sev:?} has no CVSS summary");
+            assert!(gate.blocks_grade(VerdictGrade::severity_only(sev)));
+        }
+        let legacy = VerdictGrade::from_stored(Some("low"), None, None);
+        assert!(!legacy.has_cvss_summary());
+        assert!(gate.blocks_grade(legacy));
+        assert!(!ProxySeverityGate::Threshold(Severity::High).blocks_grade(legacy));
+    }
+
+    /// The number is live under the same opt-in as the severity threshold,
+    /// and nothing unreadable weakens the gate.
+    #[test]
+    fn cvss_gate_from_config_requires_the_opt_in_and_fails_closed() {
+        use ProxySeverityGate as G;
+        assert_eq!(
+            G::from_config_with_cvss(false, "high", Some(8.0)),
+            G::BlockOnAny,
+            "inert while block_on_policy_violation is off"
+        );
+        assert_eq!(
+            G::from_config_with_cvss(true, "high", None),
+            G::Threshold(Severity::High),
+            "no number keeps the severity threshold"
+        );
+        assert_eq!(
+            G::from_config_with_cvss(true, "medium", Some(8.0)),
+            cvss_gate(8.0, Severity::Medium)
+        );
+        assert_eq!(
+            G::from_config_with_cvss(true, "high", Some(0.0)),
+            cvss_gate(0.0, Severity::High)
+        );
+        assert_eq!(
+            G::from_config_with_cvss(true, "garbage", Some(8.0)),
+            G::BlockOnAny
+        );
+        for bad in [-0.1, 10.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                G::from_config_with_cvss(true, "high", Some(bad)),
+                G::BlockOnAny,
+                "{bad} is not a CVSS score"
+            );
+        }
+    }
+
+    /// The property a Virtual's combined gate rests on: `stricter(a, b)`
+    /// blocks a verdict exactly when `a` or `b` does. Checked over every pair
+    /// of a spread of gates and every grade a verdict can carry, which covers
+    /// the pairs with no order between them (a severity threshold and a
+    /// numeric gate each block verdicts the other serves).
+    #[test]
+    fn stricter_gate_blocks_exactly_what_either_gate_blocks() {
+        use ProxySeverityGate as G;
+        let severities = [
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+        ];
+        let mut gates = vec![G::BlockOnAny, G::RecordOnly];
+        gates.extend(severities.map(G::Threshold));
+        for min in [0.0, 4.0, 7.0, 8.0, 10.0] {
+            for unscored in severities {
+                gates.push(cvss_gate(min, unscored));
+            }
+        }
+
+        let optional_severities: Vec<Option<Severity>> =
+            std::iter::once(None).chain(severities.map(Some)).collect();
+        let optional_scores: Vec<Option<CvssScore>> = std::iter::once(None)
+            .chain([0.0, 3.9, 4.0, 6.9, 7.0, 7.9, 8.0, 9.8, 10.0].map(|s| Some(score(s))))
+            .collect();
+        let mut grades = Vec::new();
+        for max_severity in &optional_severities {
+            for max_cvss_score in &optional_scores {
+                for max_unscored_severity in &optional_severities {
+                    grades.push(VerdictGrade {
+                        max_severity: *max_severity,
+                        max_cvss_score: *max_cvss_score,
+                        max_unscored_severity: *max_unscored_severity,
+                    });
+                }
+            }
+        }
+
+        // Three-way too, so a combined gate (which carries `any_severity`)
+        // is itself combined.
+        for a in &gates {
+            for b in &gates {
+                let ab = G::stricter(*a, *b);
+                assert_eq!(ab, G::stricter(ab, ab), "idempotent: {a:?} {b:?}");
+                for grade in &grades {
+                    assert_eq!(
+                        ab.blocks_grade(*grade),
+                        a.blocks_grade(*grade) || b.blocks_grade(*grade),
+                        "stricter({a:?}, {b:?}) on {grade:?}"
+                    );
+                    assert_eq!(
+                        G::stricter(*b, *a).blocks_grade(*grade),
+                        ab.blocks_grade(*grade),
+                        "commutative on {grade:?}: {a:?} {b:?}"
+                    );
+                }
+                for c in &gates {
+                    let abc = G::stricter(ab, *c);
+                    for grade in &grades {
+                        assert_eq!(
+                            abc.blocks_grade(*grade),
+                            ab.blocks_grade(*grade) || c.blocks_grade(*grade),
+                            "stricter(stricter({a:?}, {b:?}), {c:?}) on {grade:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A stored value that is present but unreadable reads as the most
+    /// severe one, never as absent.
+    #[test]
+    fn verdict_grade_from_stored_reads_damaged_values_as_most_severe() {
+        let grade = VerdictGrade::from_stored(Some("high"), Some(7.5), Some("medium"));
+        assert_eq!(
+            grade,
+            graded(Severity::High, Some(7.5), Some(Severity::Medium))
+        );
+
+        let damaged = VerdictGrade::from_stored(Some("junk"), Some(42.0), Some("junk"));
+        assert_eq!(damaged.max_severity, None);
+        assert_eq!(damaged.max_cvss_score, Some(CvssScore::MAX));
+        assert_eq!(damaged.max_unscored_severity, Some(Severity::Critical));
+        assert!(cvss_gate(10.0, Severity::Critical).blocks_grade(damaged));
+    }
+
+    /// The rescan replacement rule's CVSS half: a rescan may replace a
+    /// request-pinned verdict only when no numeric gate that blocks the
+    /// stored verdict could serve the rescan's.
+    #[test]
+    fn cvss_at_least_as_severe_compares_scores_and_unscored_severity() {
+        let stored = graded(Severity::High, Some(9.0), Some(Severity::High));
+        let holds = |now: VerdictGrade| now.cvss_at_least_as_severe_as(&stored);
+        assert!(holds(stored));
+        assert!(holds(graded(
+            Severity::High,
+            Some(9.5),
+            Some(Severity::Critical)
+        )));
+        assert!(!holds(graded(
+            Severity::High,
+            Some(8.9),
+            Some(Severity::High)
+        )));
+        assert!(!holds(graded(
+            Severity::High,
+            Some(9.0),
+            Some(Severity::Medium)
+        )));
+        assert!(!holds(graded(Severity::High, None, Some(Severity::High))));
+        assert!(
+            !holds(graded(Severity::High, Some(9.0), None)),
+            "a finding that is now scored is no longer graded by severity"
+        );
+        // A stored verdict with no summary has nothing to hold the rescan to.
+        let legacy = VerdictGrade::from_stored(Some("high"), None, None);
+        assert!(graded(Severity::Low, Some(1.0), None).cvss_at_least_as_severe_as(&legacy));
+    }
+
+    /// The cached-verdict seam grades the stored row with the same decision
+    /// as a fresh scan: the same row serves under one repository's numeric
+    /// threshold and blocks under another's.
+    #[test]
+    fn cache_scan_gate_reevaluates_a_stored_cvss_summary_per_repository() {
+        use CacheScanGate::*;
+        let live = Some("grype-live");
+        let now = Utc::now();
+        let stored =
+            |max_cvss_score: Option<f64>, max_unscored_severity: Option<&str>| StoredProxyVerdict {
+                row: ProxyScanRow {
+                    checksum_sha256: "abc".to_string(),
+                    scan_type: "proxy".to_string(),
+                    verdict: VERDICT_VULNERABLE.to_string(),
+                    findings_count: 1,
+                    critical_count: 0,
+                    high_count: 1,
+                    medium_count: 0,
+                    low_count: 0,
+                    max_severity: Some("high".to_string()),
+                    scanner_version: live.map(str::to_string),
+                    scanned_at: now,
+                    max_cvss_score,
+                    max_unscored_severity: max_unscored_severity.map(str::to_string),
+                },
+                pin_identity: None,
+                components_cataloged: Some(1),
+            };
+        let decide = |row: &StoredProxyVerdict, gate: ProxySeverityGate| {
+            decide_cache_scan_gate(Some(row), live, ProxyScanAction::FailClosed, gate, 30, now)
+        };
+
+        let scored = stored(Some(7.5), None);
+        assert_eq!(decide(&scored, cvss_gate(8.0, Severity::High)), Serve);
+        assert_eq!(decide(&scored, cvss_gate(7.0, Severity::High)), Block);
+        assert_eq!(
+            decide(&scored, ProxySeverityGate::Threshold(Severity::High)),
+            Block,
+            "the severity threshold still sees a `high`"
+        );
+
+        let unscored = stored(None, Some("high"));
+        assert_eq!(decide(&unscored, cvss_gate(8.0, Severity::High)), Block);
+        assert_eq!(decide(&unscored, cvss_gate(8.0, Severity::Critical)), Serve);
+
+        let legacy = stored(None, None);
+        assert_eq!(
+            decide(&legacy, cvss_gate(8.0, Severity::Critical)),
+            Block,
+            "a verdict recorded without a CVSS summary is not known to be below"
+        );
+    }
+
+    /// DB-backed (#5263): the CVSS summary round-trips through every read of
+    /// the verdict row, each finding's assessment round-trips through
+    /// `proxy_scan_findings`, and a verdict recorded without a summary
+    /// clears one left by the verdict it replaces.
+    /// Skips cleanly when DATABASE_URL is unset.
+    #[tokio::test]
+    async fn cvss_summary_and_finding_assessments_roundtrip() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::models::security::{CvssAssessment, ProxyFinding};
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let svc = ProxyScanService::new(pool.clone());
+        let digest = format!("{:0>64}", uuid::Uuid::new_v4().simple());
+        let grade = graded(Severity::High, Some(7.5), Some(Severity::Medium));
+
+        let written = svc
+            .record_verdict_if_unchanged(
+                &digest,
+                "grype",
+                VERDICT_VULNERABLE,
+                2,
+                0,
+                1,
+                1,
+                0,
+                Some("high"),
+                Some("grype-test"),
+                None,
+                Some(2),
+                None,
+                None,
+                grade,
+            )
+            .await
+            .expect("record graded verdict");
+        assert!(written);
+
+        let row = svc
+            .lookup_verdict(&digest, "grype")
+            .await
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(row.max_cvss_score, Some(7.5));
+        assert_eq!(row.max_unscored_severity.as_deref(), Some("medium"));
+        assert_eq!(row.grade(), grade);
+
+        let (pinned, _, _) = svc
+            .lookup_verdict_with_pin(&digest, "grype")
+            .await
+            .expect("lookup with pin")
+            .expect("row");
+        assert_eq!(pinned.grade(), grade);
+
+        let catalog = svc
+            .lookup_verdict_catalog(&digest, "grype")
+            .await
+            .expect("lookup catalog")
+            .expect("row");
+        assert_eq!(catalog.max_cvss_score, Some(7.5));
+        assert_eq!(catalog.max_unscored_severity.as_deref(), Some("medium"));
+
+        let listed = svc
+            .list_verdicts_for_digest(&digest)
+            .await
+            .expect("list verdicts");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].grade(), grade);
+
+        // Findings: one scored, one not.
+        let scored = ProxyFinding {
+            cve_id: "CVE-2026-0001".to_string(),
+            severity: "high".to_string(),
+            package_name: Some("openssl".to_string()),
+            package_version: Some("3.0.0".to_string()),
+            fixed_version: None,
+            title: None,
+            cvss: Some(CvssAssessment {
+                score: score(7.5),
+                version: Some("3.1".to_string()),
+                vector: Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H".to_string()),
+                source: Some("nvd@nist.gov".to_string()),
+            }),
+        };
+        let unscored = ProxyFinding {
+            cve_id: "CVE-2026-0002".to_string(),
+            severity: "medium".to_string(),
+            package_name: Some("zlib".to_string()),
+            package_version: Some("1.2.0".to_string()),
+            fixed_version: None,
+            title: None,
+            cvss: None,
+        };
+        svc.record_findings(&digest, "grype", &[scored.clone(), unscored.clone()])
+            .await
+            .expect("record findings");
+        let mut read = svc
+            .fetch_findings(&digest, "grype", 10)
+            .await
+            .expect("fetch findings");
+        read.sort_by(|a, b| a.cve_id.cmp(&b.cve_id));
+        assert_eq!(read, vec![scored.clone(), unscored]);
+
+        // A rescan that no longer scores the finding replaces the stored
+        // assessment; it is not kept from the earlier scan.
+        let rescored = ProxyFinding {
+            cvss: None,
+            ..scored
+        };
+        svc.record_findings(&digest, "grype", std::slice::from_ref(&rescored))
+            .await
+            .expect("re-record finding");
+        let read = svc
+            .fetch_findings(&digest, "grype", 10)
+            .await
+            .expect("fetch findings");
+        assert!(
+            read.iter().all(|f| f.cvss.is_none()),
+            "the earlier assessment must not survive: {read:?}"
+        );
+
+        // A verdict recorded without a summary clears the stored one.
+        svc.record_verdict(
+            &digest,
+            "grype",
+            VERDICT_VULNERABLE,
+            1,
+            1,
+            0,
+            0,
+            0,
+            Some("critical"),
+            Some("grype-test"),
+            None,
+        )
+        .await
+        .expect("record ungraded verdict");
+        let row = svc
+            .lookup_verdict(&digest, "grype")
+            .await
+            .expect("lookup")
+            .expect("row");
+        assert_eq!(row.max_severity.as_deref(), Some("critical"));
+        assert!(
+            !row.grade().has_cvss_summary(),
+            "the previous verdict's summary must not grade this one"
+        );
+
+        let deleted = svc
+            .delete_verdicts_for_digest(&digest)
+            .await
+            .expect("delete verdicts");
+        assert_eq!(deleted.len(), 1);
     }
 }

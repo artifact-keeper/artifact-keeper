@@ -5096,8 +5096,8 @@ pub(crate) async fn remote_scan_policy(
 
 /// One `scan_configs` row as the proxy scan policy reads it:
 /// `(scan_on_proxy, proxy_scan_action, block_on_policy_violation,
-/// severity_threshold)`.
-type ScanConfigRow = (bool, String, bool, String);
+/// severity_threshold, cvss_threshold)`.
+type ScanConfigRow = (bool, String, bool, String, Option<f64>);
 
 /// The DB-free half of [`remote_scan_policy`]: `repo_id`'s own row, if any,
 /// mapped by [`scan_policy_from_row`]; a missing row or a disabled flag is
@@ -5151,12 +5151,15 @@ fn scan_policy_from_row(
     crate::services::proxy_scan_service::ProxySeverityGate,
 ) {
     use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
-    row.map(|(enabled, action, block, threshold)| {
+    row.map(|(enabled, action, block, threshold, cvss_threshold)| {
         (
             *enabled,
             ProxyScanAction::from_db(action),
             crate::services::scan_config_service::proxy_severity_gate_for_row(
-                *block, threshold, action,
+                *block,
+                threshold,
+                action,
+                *cvss_threshold,
             ),
         )
     })
@@ -10849,6 +10852,7 @@ fn scan_file_in_flight(
                     .map(crate::services::scanner_service::ExpectedComponent::pin_identity)
                     .as_deref(),
                 Some(observed),
+                true,
             ),
         )
         .await;
@@ -10987,6 +10991,20 @@ pub(crate) struct StoredRescanRow<'a> {
     pub components_cataloged: Option<i32>,
     pub pin_identity: Option<&'a str>,
     pub max_severity: Option<&'a str>,
+    /// The stored CVSS summary (#5263); both `None` on a verdict recorded
+    /// before migration 361.
+    pub max_cvss_score: Option<f64>,
+    pub max_unscored_severity: Option<&'a str>,
+}
+
+impl StoredRescanRow<'_> {
+    fn grade(&self) -> crate::services::proxy_scan_service::VerdictGrade {
+        crate::services::proxy_scan_service::VerdictGrade::from_stored(
+            self.max_severity,
+            self.max_cvss_score,
+            self.max_unscored_severity,
+        )
+    }
 }
 
 /// What a rescan may do with the stored verdict for the same digest.
@@ -11016,7 +11034,13 @@ pub(crate) enum RescanReplacement {
 ///   a rescan replaces the verdict only when it is blocking too and at least
 ///   as severe, and the stored pin is kept. Anything less (a `clean`, or a
 ///   lower severity that an opted-in severity threshold would serve) is
-///   [`ProxyScanInconclusive::RequestPinned`].
+///   [`ProxyScanInconclusive::RequestPinned`]. "At least as severe" also
+///   covers the stored CVSS summary (#5263), when the stored verdict has
+///   one: a rescan whose highest score, or whose highest unscored severity,
+///   is lower could be served by a numeric threshold that blocks the stored
+///   verdict. A stored verdict with no summary has nothing to compare; the
+///   caller then records the rescan without one, so a numeric threshold
+///   keeps blocking it.
 /// * **Any other blocking verdict** is replaced by a `clean` one only when
 ///   the rescan cataloged at least as many components as the stored verdict
 ///   was graded on; otherwise [`ProxyScanInconclusive::ScanFailed`]. A rescan
@@ -11045,7 +11069,8 @@ pub(crate) fn rescan_replacement(
         let stored_severity = stored
             .max_severity
             .and_then(crate::models::security::Severity::from_str_loose);
-        return if new_blocks && rank(new.max_severity) <= rank(stored_severity) {
+        let cvss_holds = new.grade().cvss_at_least_as_severe_as(&stored.grade());
+        return if new_blocks && rank(new.max_severity) <= rank(stored_severity) && cvss_holds {
             RescanReplacement::ReplaceKeepingPin(pin.to_string())
         } else {
             RescanReplacement::Refuse(ProxyScanInconclusive::RequestPinned)
@@ -11081,6 +11106,7 @@ async fn scan_and_record(
 
     let pss = crate::services::proxy_scan_service::ProxyScanService::new(state.db.clone());
     let mut pin = expected.map(crate::services::scanner_service::ExpectedComponent::pin_identity);
+    let mut record_cvss_summary = true;
     if rescan {
         // #3396, #5628: see `rescan_replacement`. An unreadable stored row
         // cannot be compared, so it is inconclusive too.
@@ -11094,15 +11120,27 @@ async fn scan_and_record(
                 return Err(ProxyScanInconclusive::ScanFailed);
             }
         };
-        let stored_row = stored.as_ref().map(|(v, c, p, sev)| StoredRescanRow {
-            verdict: v,
-            components_cataloged: *c,
-            pin_identity: p.as_deref(),
-            max_severity: sev.as_deref(),
+        let stored_row = stored.as_ref().map(|s| StoredRescanRow {
+            verdict: &s.verdict,
+            components_cataloged: s.components_cataloged,
+            pin_identity: s.pin_identity.as_deref(),
+            max_severity: s.max_severity.as_deref(),
+            max_cvss_score: s.max_cvss_score,
+            max_unscored_severity: s.max_unscored_severity.as_deref(),
         });
         match rescan_replacement(stored_row, &verdict) {
             RescanReplacement::Replace => {}
-            RescanReplacement::ReplaceKeepingPin(stored_pin) => pin = Some(stored_pin),
+            RescanReplacement::ReplaceKeepingPin(stored_pin) => {
+                pin = Some(stored_pin);
+                // #5263: the stored verdict was graded as a coordinate this
+                // rescan cannot grade the bytes as. Where it carried a CVSS
+                // summary, `rescan_replacement` has checked the rescan's is
+                // no lower. Where it carried none there was nothing to
+                // check, so the rescan's summary is not recorded either: the
+                // verdict stays ungraded and a numeric threshold keeps
+                // blocking it, as it did before the rescan.
+                record_cvss_summary = stored_row.is_some_and(|s| s.grade().has_cvss_summary());
+            }
             RescanReplacement::Refuse(reason) => {
                 tracing::warn!(
                     repo_id = %repo_id, file = %filename, digest = %digest,
@@ -11129,6 +11167,7 @@ async fn scan_and_record(
         &verdict,
         pin.as_deref(),
         None,
+        record_cvss_summary,
     )
     .await;
     record_verdict_detail(&pss, repo_id, digest, &filename, &verdict).await;
@@ -11202,6 +11241,10 @@ async fn run_scan_within(
 /// `scanned_at` (`None` inside: no row), and the return says whether it did. A
 /// write that fails is logged and counts as done: the verdict still decides the
 /// request.
+///
+/// `record_cvss_summary` is `false` only for a rescan that keeps a stored pin
+/// whose verdict carried no CVSS summary (#5263, see `scan_and_record`): the
+/// row is then written without one.
 #[allow(clippy::too_many_arguments)]
 async fn record_verdict_row(
     pss: &crate::services::proxy_scan_service::ProxyScanService,
@@ -11211,7 +11254,13 @@ async fn record_verdict_row(
     verdict: &crate::services::scanner_service::ProxyScanVerdict,
     pin_identity: Option<&str>,
     observed: Option<Option<chrono::DateTime<Utc>>>,
+    record_cvss_summary: bool,
 ) -> bool {
+    let grade = if record_cvss_summary {
+        verdict.grade()
+    } else {
+        crate::services::proxy_scan_service::VerdictGrade::default()
+    };
     // #4594: the cataloged-component count is written with the verdict, so
     // the proxy-scans view can say when a verdict was graded on file
     // contents only.
@@ -11231,6 +11280,7 @@ async fn record_verdict_row(
             verdict.components_cataloged,
             pin_identity,
             observed,
+            grade,
         )
         .await
     {
@@ -11480,19 +11530,17 @@ pub(crate) enum ProxyScanServeOutcome {
 ///   is present; `None` is the defensive arm and takes the strict answer);
 /// * `ProxySeverityGate::BlockOnAny` (every repo that has not opted in via
 ///   `block_on_policy_violation`) blocks unconditionally — the historical
-///   posture, byte-for-byte.
+///   posture, byte-for-byte;
+/// * under a numeric CVSS gate (#5263) the row's stored CVSS summary is
+///   graded the same way a fresh scan's is, and a row with no summary
+///   (recorded before migration 361) blocks.
 pub(crate) fn stored_verdict_blocks_under_gate(
     row: Option<&crate::services::proxy_scan_service::ProxyScanRow>,
     severity_gate: crate::services::proxy_scan_service::ProxySeverityGate,
 ) -> bool {
-    let row_max_severity = row.and_then(|r| {
-        r.max_severity
-            .as_deref()
-            .and_then(crate::models::security::Severity::from_str_loose)
-    });
     match row {
         None => true,
-        Some(_) => severity_gate.blocks(row_max_severity),
+        Some(row) => severity_gate.blocks_grade(row.grade()),
     }
 }
 
@@ -11586,7 +11634,7 @@ fn scan_inline_serve_decision(
     digest: &str,
 ) -> ProxyScanServeOutcome {
     match result {
-        Ok(verdict) if verdict.is_vulnerable() && severity_gate.blocks(verdict.max_severity) => {
+        Ok(verdict) if verdict.is_vulnerable() && severity_gate.blocks_grade(verdict.grade()) => {
             tracing::warn!(repo_id = %repo_id, file = %filename, digest = %digest, "blocking proxy pull: inline scan found vulnerabilities");
             ProxyScanServeOutcome::Deny(scan_blocked_response(filename))
         }
@@ -12347,9 +12395,9 @@ async fn read_scan_config_rows(
     context_id: Uuid,
     ids: &[Uuid],
 ) -> Result<Vec<(Uuid, ScanConfigRow)>, Response> {
-    let rows: Vec<(Uuid, bool, String, bool, String)> = sqlx::query_as(
+    let rows: Vec<(Uuid, bool, String, bool, String, Option<f64>)> = sqlx::query_as(
         r#"SELECT repository_id, scan_on_proxy, proxy_scan_action,
-                  block_on_policy_violation, severity_threshold
+                  block_on_policy_violation, severity_threshold, cvss_threshold
            FROM scan_configs WHERE repository_id = ANY($1)"#,
     )
     .bind(ids)
@@ -12364,7 +12412,9 @@ async fn read_scan_config_rows(
     })?;
     Ok(rows
         .into_iter()
-        .map(|(id, enabled, action, block, threshold)| (id, (enabled, action, block, threshold)))
+        .map(|(id, enabled, action, block, threshold, cvss_threshold)| {
+            (id, (enabled, action, block, threshold, cvss_threshold))
+        })
         .collect())
 }
 
@@ -13592,6 +13642,7 @@ mod scanned_proxy_file_tests {
                     block_on_policy_violation: Some(block),
                     severity_threshold: Some(threshold.to_string()),
                     proxy_scan_action: Some(action.to_string()),
+                    cvss_threshold: None,
                 },
             )
             .await
@@ -13914,6 +13965,7 @@ mod tests {
                 source: Some("grype".to_string()),
                 source_url: None,
                 finding_class: crate::models::security::FindingClass::Vulnerability,
+                cvss: None,
             })
             .into_iter()
             .collect();
@@ -13933,6 +13985,8 @@ mod tests {
             components_cataloged,
             pin_identity,
             max_severity,
+            max_cvss_score: None,
+            max_unscored_severity: None,
         }
     }
 
@@ -14480,6 +14534,7 @@ mod tests {
                     source: None,
                     source_url: None,
                     finding_class: crate::models::security::FindingClass::Vulnerability,
+                    cvss: None,
                 }],
                 ..Default::default()
             })
@@ -14913,6 +14968,8 @@ mod tests {
             max_severity: None,
             scanner_version: Some("grype-test".to_string()),
             scanned_at: Utc::now(),
+            max_cvss_score: None,
+            max_unscored_severity: None,
         };
         let clean = row("clean", 0);
         assert!(stored_clean_graded_nothing(&clean, None, Some(0)));
@@ -15272,6 +15329,8 @@ mod tests {
             max_severity: max_severity.map(|s| s.to_string()),
             scanner_version: Some("grype-1.0.0".to_string()),
             scanned_at: Utc::now(),
+            max_cvss_score: None,
+            max_unscored_severity: None,
         };
         let high = ProxySeverityGate::Threshold(Severity::High);
 
@@ -28641,7 +28700,13 @@ mod scan_policy_read_tests {
     use crate::services::proxy_scan_service::{ProxyScanAction, ProxySeverityGate};
 
     fn row(enabled: bool, action: &str) -> ScanConfigRow {
-        (enabled, action.to_string(), false, "critical".to_string())
+        (
+            enabled,
+            action.to_string(),
+            false,
+            "critical".to_string(),
+            None,
+        )
     }
 
     #[test]

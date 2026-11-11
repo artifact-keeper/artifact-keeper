@@ -583,6 +583,9 @@ pub mod details {
         pub severity_threshold: String,
         /// `fail_open` / `fail_closed` / `record_only`.
         pub proxy_scan_action: String,
+        /// Numeric CVSS threshold of the proxy scan gate (#5263); `null`
+        /// when the repository has none.
+        pub cvss_threshold: Option<crate::models::security::CvssScore>,
     }
 
     /// The prior policy and the actor's tier for one age-gate policy change.

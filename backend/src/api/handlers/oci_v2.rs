@@ -11067,7 +11067,8 @@ async fn blob_vulnerable_verdict_status(
 ) -> Result<BlobVerdictStatus, sqlx::Error> {
     let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity,
+               psr.max_cvss_score, psr.max_unscored_severity
         FROM manifest_blob_refs mbr
         JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -11116,7 +11117,8 @@ async fn blob_vulnerable_verdict_status_any(
     }
     let refs = sqlx::query_as::<_, BlobVerdictRef>(
         r#"
-        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
+        SELECT DISTINCT psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity,
+               psr.max_cvss_score, psr.max_unscored_severity
         FROM manifest_blob_refs mbr
         JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -11151,6 +11153,22 @@ pub(crate) struct BlobVerdictRef {
     /// Highest observed severity of the referencing manifest's verdict, for
     /// the #3243 severity-threshold gate. `None` (legacy rows) fails closed.
     pub max_severity: Option<String>,
+    /// The verdict's CVSS summary, for a numeric threshold (#5263). Both
+    /// `None` (rows recorded before migration 361) fails closed under one.
+    #[sqlx(default)]
+    pub max_cvss_score: Option<f64>,
+    #[sqlx(default)]
+    pub max_unscored_severity: Option<String>,
+}
+
+impl BlobVerdictRef {
+    fn grade(&self) -> crate::services::proxy_scan_service::VerdictGrade {
+        crate::services::proxy_scan_service::VerdictGrade::from_stored(
+            self.max_severity.as_deref(),
+            self.max_cvss_score,
+            self.max_unscored_severity.as_deref(),
+        )
+    }
 }
 
 /// What the referencing manifests' verdicts say about serving one blob (#3259).
@@ -11227,15 +11245,11 @@ pub(crate) fn classify_blob_verdicts(
     // A ref whose verdict would not block under the gate is out of scope
     // entirely — it neither blocks nor holds the blob as StaleOnly. A ref
     // with an absent/unparseable `max_severity` stays in scope (fail closed).
+    // #5263: likewise under a numeric CVSS threshold, graded on the verdict's
+    // stored CVSS summary exactly as the manifest gate grades it.
     let in_scope: Vec<&BlobVerdictRef> = refs
         .iter()
-        .filter(|r| {
-            severity_gate.blocks(
-                r.max_severity
-                    .as_deref()
-                    .and_then(crate::models::security::Severity::from_str_loose),
-            )
-        })
+        .filter(|r| severity_gate.blocks_grade(r.grade()))
         .collect();
     if in_scope.is_empty() {
         return BlobVerdictStatus::NoVerdict;
@@ -11449,6 +11463,11 @@ pub(crate) struct BlobReferrer {
     pub scanned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub scanner_version: Option<String>,
     pub max_severity: Option<String>,
+    /// The verdict's CVSS summary (#5263), as on [`BlobVerdictRef`].
+    #[sqlx(default)]
+    pub max_cvss_score: Option<f64>,
+    #[sqlx(default)]
+    pub max_unscored_severity: Option<String>,
 }
 
 /// How the manifest gate treats an image owned by one repository whose refs
@@ -11525,6 +11544,8 @@ pub(crate) fn manifest_gate_serves_referrer(
             max_severity: referrer.max_severity.clone(),
             scanner_version: referrer.scanner_version.clone(),
             scanned_at,
+            max_cvss_score: referrer.max_cvss_score,
+            max_unscored_severity: referrer.max_unscored_severity.clone(),
         }),
         _ => None,
     };
@@ -11545,12 +11566,9 @@ pub(crate) fn manifest_gate_serves_referrer(
         ReferrerPosture::Proxy(action) => {
             match decide_serve(row.as_ref(), current_version, action, ttl, now) {
                 ServeDecision::ServeCached | ServeDecision::ServePendingScanAsync => true,
-                ServeDecision::BlockCached => !severity_gate.blocks(
-                    referrer
-                        .max_severity
-                        .as_deref()
-                        .and_then(crate::models::security::Severity::from_str_loose),
-                ),
+                ServeDecision::BlockCached => {
+                    !proxy_helpers::stored_verdict_blocks_under_gate(row.as_ref(), severity_gate)
+                }
                 ServeDecision::ScanInline => false,
             }
         }
@@ -11580,7 +11598,8 @@ async fn blob_needed_by_servable_image(
     let referrers = sqlx::query_as::<_, BlobReferrer>(
         r#"
         SELECT DISTINCT mbr.repository_id, mbr.manifest_digest,
-               psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity
+               psr.verdict, psr.scanned_at, psr.scanner_version, psr.max_severity,
+               psr.max_cvss_score, psr.max_unscored_severity
         FROM manifest_blob_refs mbr
         LEFT JOIN proxy_scan_results psr
           ON psr.checksum_sha256 = REPLACE(mbr.manifest_digest, 'sha256:', '')
@@ -39898,6 +39917,8 @@ mod proxy_scan_block_tests {
             scanned_at: verdict.map(|_| chrono::Utc::now() - chrono::Duration::days(age_days)),
             scanner_version: verdict.map(|_| "grype-1.0.0-test".to_string()),
             max_severity: max_severity.map(str::to_string),
+            max_cvss_score: None,
+            max_unscored_severity: None,
         }
     }
 
@@ -40191,6 +40212,8 @@ mod proxy_scan_block_tests {
             scanned_at: now - chrono::Duration::days(age_days),
             scanner_version: version.map(|v| v.to_string()),
             max_severity: Some("critical".to_string()),
+            max_cvss_score: None,
+            max_unscored_severity: None,
         };
         let gate = crate::services::proxy_scan_service::ProxySeverityGate::BlockOnAny;
 
@@ -40271,6 +40294,8 @@ mod proxy_scan_block_tests {
             scanned_at: now - chrono::Duration::days(1),
             scanner_version: Some("grype-1.0.0".to_string()),
             max_severity: max_severity.map(|v| v.to_string()),
+            max_cvss_score: None,
+            max_unscored_severity: None,
         };
         let high = ProxySeverityGate::Threshold(Severity::High);
 
@@ -42661,6 +42686,7 @@ mod proxy_scan_block_tests {
                     block_on_policy_violation: Some(block),
                     severity_threshold: Some(threshold.to_string()),
                     proxy_scan_action: Some(action.to_string()),
+                    cvss_threshold: None,
                 },
             )
             .await

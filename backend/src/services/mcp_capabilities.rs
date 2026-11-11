@@ -1421,6 +1421,7 @@ pub fn drift_finding(
         source: Some(DRIFT_FINDING_SOURCE.to_string()),
         source_url: None,
         finding_class: FindingClass::Policy,
+        cvss: None,
     }
 }
 

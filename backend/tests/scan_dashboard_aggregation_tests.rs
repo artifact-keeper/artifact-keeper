@@ -124,6 +124,7 @@ async fn create_scans_with_findings(
                     source_url: None,
                     finding_class:
                         artifact_keeper_backend::models::security::FindingClass::Vulnerability,
+                    cvss: None,
                 }
             })
             .collect();
