@@ -25,6 +25,7 @@ use axum::{
 use base64::Engine;
 use uuid::Uuid;
 
+use crate::api::middleware::rate_limit::{basic_password_budget, BasicPasswordBudget};
 use crate::api::{
     CachedRepo, RepoCache, RepoMissCache, REPO_CACHE_TTL_SECS, REPO_MISS_CACHE_MAX_ENTRIES,
 };
@@ -989,8 +990,12 @@ pub async fn auth_middleware(
                     // A transient bcrypt-capacity shed or a pool-acquire
                     // timeout is a retryable 503, never a 401: twine does not
                     // retry on 401 but does on 503 (#2125).
-                    AuthOutcome::Overloaded | AuthOutcome::RateLimited(_) => {
+                    AuthOutcome::Overloaded => {
                         return service_unavailable_response();
+                    }
+                    // The Basic-password login budget is spent (#5485).
+                    AuthOutcome::RateLimited(retry_after) => {
+                        return rate_limited_response(retry_after);
                     }
                     AuthOutcome::InvalidCredential | AuthOutcome::NoCredential => Err((
                         "Invalid credentials",
@@ -1231,8 +1236,11 @@ pub(crate) enum AuthOutcome {
     /// it did not coincide with a saturated cap); twine does not retry on
     /// 401 but does on 503.
     Overloaded,
-    /// The shared login limiter refused an LDAP Basic-auth passthrough bind
-    /// (#3830). Carries the `Retry-After` seconds.
+    /// A login budget refused the credential before it was verified: the
+    /// shared login limiter refused an LDAP Basic-auth passthrough bind
+    /// (#3830), or the Basic `username:password` failure budget for this
+    /// username and source IP is spent (#5485). Carries the `Retry-After`
+    /// seconds; callers answer 429.
     RateLimited(u64),
 }
 
@@ -1451,15 +1459,25 @@ async fn resolve_auth_outcome(
             }
             // Some package managers (npm, cargo, goproxy) send Bearer tokens
             // that are base64-encoded `username:password` rather than JWTs or
-            // API keys. Try decoding as credentials before giving up.
+            // API keys. Try decoding as credentials before giving up, through
+            // the same shape-classified resolution as a Basic header (#5683):
+            // a dead token-shaped password is refused without a password
+            // bcrypt or an auth permit, and a real password pays one under the
+            // Basic-password budget. The Bearer failure labels above stand.
             if let Some((username, password)) = decode_basic_credentials(token) {
-                match auth_service.authenticate(&username, &password).await {
-                    Ok((user, _)) => return AuthOutcome::Resolved(AuthExtension::from(user)),
-                    // A transient bcrypt-capacity shed must surface as 503, not
-                    // 401. See `AuthOutcome::Overloaded`.
-                    Err(AppError::ServiceUnavailable(_)) => return AuthOutcome::Overloaded,
-                    Err(ref e) if e.is_db_unavailable() => return AuthOutcome::Overloaded,
-                    Err(_) => {}
+                let mut pair_failure = None;
+                match resolve_basic_pair(
+                    auth_service,
+                    &username,
+                    &password,
+                    allow_basic_api_token,
+                    &mut pair_failure,
+                    refused,
+                )
+                .await
+                {
+                    AuthOutcome::InvalidCredential | AuthOutcome::NoCredential => {}
+                    resolved_or_shed => return resolved_or_shed,
                 }
             }
             AuthOutcome::InvalidCredential
@@ -1525,11 +1543,12 @@ async fn resolve_auth_outcome(
 ///    `AuthService::authenticate_basic_with_reason`, which pads the
 ///    unknown-username, federated and hashless arms with the same bcrypt so
 ///    an unknown username is not answered measurably faster than a known one.
-///    The pad is off while the LDAP Basic-auth passthrough is enabled: a
-///    directory user's password then takes the federated or no-local-row arm
-///    on every request on its way to the passthrough (cache hits included),
-///    and must not pay a bcrypt and an auth permit for it (see
-///    `AuthEntry::Basic`).
+///    The pad is off while the LDAP Basic-auth passthrough is enabled on a
+///    surface that runs it: a directory user's password then takes the
+///    federated or no-local-row arm on every request on its way to the
+///    passthrough (cache hits included), and must not pay a bcrypt and an
+///    auth permit for it (see `AuthEntry::Basic`). The verification draws on
+///    the Basic-password login budget (#5485); see [`verify_basic_password`].
 ///
 /// Consequence, deliberate: a local account whose password happens to be
 /// shaped exactly like an AK-issued token cannot use it as a Basic password
@@ -1587,7 +1606,83 @@ async fn resolve_basic_pair(
         };
     }
 
-    let pad = if crate::services::ldap_basic_auth::passthrough_enabled() {
+    match verify_basic_password(auth_service, username, password, allow_basic_api_token).await {
+        BasicPasswordOutcome::Verified(user) => AuthOutcome::Resolved(AuthExtension::from(*user)),
+        BasicPasswordOutcome::RateLimited(retry_after) => AuthOutcome::RateLimited(retry_after),
+        BasicPasswordOutcome::Overloaded => AuthOutcome::Overloaded,
+        BasicPasswordOutcome::Rejected {
+            metric,
+            audit_reason,
+        } => {
+            *failure = Some((AuthFailureSurface::Basic, metric));
+            // #5653: a refused Basic password is a failed login. Who writes
+            // its row is the caller's call (see `record_basic_refusal`).
+            *refused = Some(BasicRefusal {
+                username: username.to_string(),
+                reason: audit_reason,
+            });
+            AuthOutcome::InvalidCredential
+        }
+    }
+}
+
+/// The result of one HTTP Basic password verification
+/// ([`verify_basic_password`]).
+#[derive(Debug)]
+pub(crate) enum BasicPasswordOutcome {
+    /// The password is this local account's.
+    Verified(Box<User>),
+    /// The Basic-password login budget for this username and source IP is
+    /// spent; nothing was verified (#5485). Carries `Retry-After` seconds.
+    RateLimited(u64),
+    /// The bcrypt-capacity cap shed the verify, or the database was
+    /// unreachable: a retryable 503, never a 401.
+    Overloaded,
+    /// A credential-level rejection: its `ak_auth_failures_total` reason and
+    /// the `LOGIN_FAILED` audit reason (#5653).
+    Rejected {
+        metric: AuthFailureReason,
+        audit_reason: &'static str,
+    },
+}
+
+/// Verify an HTTP Basic `username:password` as a local password, under the
+/// Basic-password login budget (#5485).
+///
+/// The password arm of [`resolve_basic_pair`], shared with the OCI `/v2`
+/// handlers that read Basic credentials themselves (`GET /v2/`, every OCI
+/// verb, `/v2/token`), so every Basic password check on the format routes
+/// and the management API costs the same and draws on the same budget:
+///
+/// * a spent per-`(username, IP)` failure budget refuses before any bcrypt;
+/// * otherwise exactly one bcrypt runs: against the account's hash, or, for
+///   an unknown, federated or hashless username, against the dummy hash (the
+///   timing pad) while the source IP is within its failed-login budget;
+/// * a failure is charged to both budgets.
+///
+/// `passthrough_follows` is true when the LDAP Basic-auth passthrough runs
+/// after a rejection here (`repo_visibility_middleware` and the other
+/// `allow_basic_api_token = true` surfaces). With the passthrough enabled a
+/// local failure is then the normal first step of every directory user's
+/// request: it is neither padded (#5640) nor metered, because the
+/// passthrough's own limiter charges the directory bind instead.
+pub(crate) async fn verify_basic_password(
+    auth_service: &AuthService,
+    username: &str,
+    password: &str,
+    passthrough_follows: bool,
+) -> BasicPasswordOutcome {
+    let passthrough =
+        passthrough_follows && crate::services::ldap_basic_auth::passthrough_enabled();
+    let budget = if passthrough {
+        BasicPasswordBudget::Unmetered
+    } else {
+        basic_password_budget(username).await
+    };
+    if let BasicPasswordBudget::Refused(retry_after) = budget {
+        return BasicPasswordOutcome::RateLimited(retry_after);
+    }
+    let pad = if passthrough || !budget.pad_allowed() {
         TimingPad::Off
     } else {
         TimingPad::On
@@ -1596,27 +1691,23 @@ async fn resolve_basic_pair(
         .authenticate_basic_with_reason(username, password, pad)
         .await
     {
-        Ok((user, _)) => AuthOutcome::Resolved(AuthExtension::from(user)),
+        Ok((user, _)) => BasicPasswordOutcome::Verified(Box::new(user)),
         // A transient bcrypt-capacity shed must surface as 503, not a 401.
         // Without this, twine (which sends standard Basic auth) gets a
         // spurious 401 under parallel-suite load and aborts, while a single
         // curl -u upload with the same credentials succeeds. See
         // `AuthOutcome::Overloaded`.
-        Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => AuthOutcome::Overloaded,
+        Err(ref f) if matches!(f.error, AppError::ServiceUnavailable(_)) => {
+            BasicPasswordOutcome::Overloaded
+        }
         // A pool-acquire timeout is a retryable 503, never a 401 (#2125).
-        Err(ref f) if f.error.is_db_unavailable() => AuthOutcome::Overloaded,
+        Err(ref f) if f.error.is_db_unavailable() => BasicPasswordOutcome::Overloaded,
         Err(f) => {
-            *failure = Some((
-                AuthFailureSurface::Basic,
-                f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
-            ));
-            // #5653: a refused Basic password is a failed login. Who writes
-            // its row is the caller's call (see `record_basic_refusal`).
-            *refused = Some(BasicRefusal {
-                username: username.to_string(),
-                reason: f.reason.unwrap_or("invalid_password"),
-            });
-            AuthOutcome::InvalidCredential
+            budget.record_failure().await;
+            BasicPasswordOutcome::Rejected {
+                metric: f.metric_reason().unwrap_or(AuthFailureReason::BadPassword),
+                audit_reason: f.reason.unwrap_or("invalid_password"),
+            }
         }
     }
 }
@@ -1988,13 +2079,17 @@ pub async fn optional_auth_middleware(
     if matches!(outcome, AuthOutcome::Overloaded) {
         return service_unavailable_response();
     }
+    // The Basic-password login budget is spent (#5485): 429, never anonymous.
+    if let AuthOutcome::RateLimited(retry_after) = outcome {
+        return rate_limited_response(retry_after);
+    }
     let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
     let mut auth_ext: Option<AuthExtension> = match outcome {
         AuthOutcome::Resolved(ext) => Some(ext),
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
         // Handled above with an early 503 return.
         AuthOutcome::Overloaded => None,
-        // `try_resolve_auth_outcome` cannot produce this.
+        // Handled above with an early 429 return.
         AuthOutcome::RateLimited(_) => None,
     };
 
@@ -2215,7 +2310,7 @@ pub async fn admin_middleware(
     let auth_ext = match try_resolve_auth_outcome(&auth_service, extracted, false).await {
         AuthOutcome::Resolved(ext) => ext,
         AuthOutcome::Overloaded => return service_unavailable_response(),
-        // `try_resolve_auth_outcome` cannot produce this.
+        // The Basic-password login budget is spent (#5485).
         AuthOutcome::RateLimited(retry_after) => {
             return rate_limited_response(retry_after);
         }
@@ -3305,6 +3400,10 @@ pub async fn repo_visibility_middleware(
         if matches!(outcome, AuthOutcome::Overloaded) {
             return service_unavailable_response();
         }
+        // The Basic-password login budget is spent (#5485).
+        if let AuthOutcome::RateLimited(retry_after) = outcome {
+            return rate_limited_response(retry_after);
+        }
         let credential_invalid = matches!(outcome, AuthOutcome::InvalidCredential);
         // #1808: Close the anonymous repo-existence oracle. An existing
         // *private* repo returns 401 to an anonymous caller (visibility check
@@ -3321,8 +3420,7 @@ pub async fn repo_visibility_middleware(
             AuthOutcome::Resolved(ext) => Some(ext),
             AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => None,
             AuthOutcome::Overloaded => None,
-            // `try_resolve_auth_outcome` cannot produce this, but the enum is
-            // shared with the passthrough-aware call above.
+            // Handled above with an early 429 return.
             AuthOutcome::RateLimited(_) => None,
         };
         if credential_invalid && auth_ext.is_none() {
@@ -13324,6 +13422,403 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(3),
                 "the burst queued on the auth cap ({elapsed:?})"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #5485: HTTP Basic `username:password` verification has a login budget.
+    // Counted with `bcrypt_verify_counter`, like `basic_token_first_5640`;
+    // nextest's process-per-test isolation keeps the counter and the
+    // installed budget private to each test.
+    // -----------------------------------------------------------------------
+    mod basic_password_budget_5485 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use crate::api::middleware::rate_limit::{
+            install_basic_password_budget, LoginRateLimitState, RateLimitExemptions,
+            RateLimitState, RateLimiter,
+        };
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::net::IpAddr;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5485";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn basic(username: &str, password: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+        }
+
+        fn install(per_pair_failures: u32, per_ip_failures: u32) {
+            install_basic_password_budget(LoginRateLimitState {
+                inner: RateLimitState {
+                    limiter: Arc::new(RateLimiter::new(per_pair_failures, 900)),
+                    exemptions: Arc::new(RateLimitExemptions::new(Vec::new(), false)),
+                    enabled: true,
+                    trusted_proxies: Arc::new(Vec::new()),
+                },
+                backstop: Arc::new(RateLimiter::new(1_000_000, 900)),
+                failed_by_ip: Arc::new(RateLimiter::new(per_ip_failures, 900)),
+                audit: None,
+            });
+        }
+
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("bb-5485-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        async fn drop_user(pool: &sqlx::PgPool, user_id: Uuid) {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+
+        /// One Basic attempt from `ip`: `(outcome, bcrypt verifies it ran)`.
+        async fn attempt(
+            svc: &AuthService,
+            ip: &str,
+            username: &str,
+            password: &str,
+            allow_basic_api_token: bool,
+        ) -> (AuthOutcome, u64) {
+            let header = basic(username, password);
+            let ip: IpAddr = ip.parse().expect("ip");
+            let before = verifies();
+            let outcome = with_client_ip_scope(
+                Some(ip),
+                try_resolve_auth_outcome(
+                    svc,
+                    ExtractedToken::Basic(&header),
+                    allow_basic_api_token,
+                ),
+            )
+            .await;
+            (outcome, verifies() - before)
+        }
+
+        fn service(pool: &sqlx::PgPool) -> AuthService {
+            AuthService::new(pool.clone(), Arc::new(crate::config::Config::default()))
+        }
+
+        /// Failed Basic password verifications are budgeted per (username,
+        /// source IP), on the format routes and on the management API alike.
+        /// Correct passwords are never charged. Once the pair's failures are
+        /// spent the next attempt is a 429 with no bcrypt, for a real account
+        /// and an unknown username identically, while the same username from
+        /// another address is unaffected. Before the fix every guess paid a
+        /// bcrypt and answered 401, without limit.
+        #[tokio::test]
+        async fn failed_basic_passwords_are_budgeted_per_username_and_ip() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            const BUDGET: u32 = 3;
+            install(BUDGET, 1_000);
+            let svc = service(&pool);
+            let (user_id, username) = local_user(&pool).await;
+            let ghost = format!("ghost-5485-{}", Uuid::new_v4().simple());
+            let ip = "198.51.100.7";
+
+            // Correct passwords cost one bcrypt each and are never charged.
+            let mut correct = Vec::new();
+            for _ in 0..(2 * BUDGET) {
+                correct.push(attempt(&svc, ip, &username, PASSWORD, true).await);
+            }
+
+            let mut guesses = Vec::new();
+            for allow in [true, false] {
+                let (who, name) = if allow {
+                    ("local", username.clone())
+                } else {
+                    ("ghost", ghost.clone())
+                };
+                for n in 0..BUDGET {
+                    let (outcome, ran) = attempt(&svc, ip, &name, "wrong", allow).await;
+                    guesses.push((who, n, outcome, ran));
+                }
+            }
+            let refused_local = attempt(&svc, ip, &username, "wrong", true).await;
+            let refused_owner = attempt(&svc, ip, &username, PASSWORD, false).await;
+            let refused_ghost = attempt(&svc, ip, &ghost, "wrong", false).await;
+            let other_ip = attempt(&svc, "198.51.100.8", &username, PASSWORD, true).await;
+            drop_user(&pool, user_id).await;
+
+            for (outcome, ran) in correct {
+                assert!(
+                    matches!(outcome, AuthOutcome::Resolved(ref e) if e.user_id == user_id),
+                    "{outcome:?}"
+                );
+                assert_eq!(ran, 1);
+            }
+            for (who, n, outcome, ran) in guesses {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "{who} guess {n} is inside the budget: {outcome:?}"
+                );
+                assert_eq!(
+                    ran, 1,
+                    "{who} guess {n} pays one bcrypt (pad for the ghost)"
+                );
+            }
+            for (label, (outcome, ran)) in [
+                ("local wrong", refused_local),
+                ("owner correct", refused_owner),
+                ("ghost wrong", refused_ghost),
+            ] {
+                assert!(
+                    matches!(outcome, AuthOutcome::RateLimited(s) if s > 0),
+                    "{label} past the budget must be refused with 429: {outcome:?}"
+                );
+                assert_eq!(ran, 0, "{label}: a refused attempt runs no bcrypt");
+            }
+            assert!(
+                matches!(other_ip.0, AuthOutcome::Resolved(ref e) if e.user_id == user_id),
+                "another source IP has its own budget: {:?}",
+                other_ip.0
+            );
+        }
+
+        /// The timing pad on Basic draws on the per-IP failed-login budget the
+        /// login endpoint uses. Within it an unknown username costs the same
+        /// bcrypt as a wrong password for a real account (no username oracle);
+        /// past it, cycling unknown usernames buys no more bcrypt work, while
+        /// a real account's password is still verified normally.
+        #[tokio::test]
+        async fn basic_timing_pad_follows_the_per_ip_failed_login_budget() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            const PER_IP: u32 = 4;
+            install(1_000, PER_IP);
+            let svc = service(&pool);
+            let (user_id, username) = local_user(&pool).await;
+            let ip = "198.51.100.9";
+
+            let mut padded = Vec::new();
+            for _ in 0..PER_IP {
+                let ghost = format!("ghost-5485-{}", Uuid::new_v4().simple());
+                padded.push(attempt(&svc, ip, &ghost, "wrong", true).await);
+            }
+            let ghost = format!("ghost-5485-{}", Uuid::new_v4().simple());
+            let unpadded = attempt(&svc, ip, &ghost, "wrong", true).await;
+            let real_wrong = attempt(&svc, ip, &username, "wrong", true).await;
+            let real_right = attempt(&svc, ip, &username, PASSWORD, true).await;
+            let other_ip = attempt(&svc, "198.51.100.10", &ghost, "wrong", true).await;
+            drop_user(&pool, user_id).await;
+
+            for (outcome, ran) in padded {
+                assert!(matches!(outcome, AuthOutcome::InvalidCredential));
+                assert_eq!(
+                    ran, 1,
+                    "within the per-IP budget an unknown username is padded"
+                );
+            }
+            assert!(matches!(unpadded.0, AuthOutcome::InvalidCredential));
+            assert_eq!(unpadded.1, 0, "past the per-IP budget the pad stops");
+            assert!(matches!(real_wrong.0, AuthOutcome::InvalidCredential));
+            assert_eq!(real_wrong.1, 1, "a stored hash is still verified");
+            assert!(matches!(real_right.0, AuthOutcome::Resolved(ref e) if e.user_id == user_id));
+            assert_eq!(other_ip.1, 1, "another source IP keeps its pad");
+        }
+    }
+    // -----------------------------------------------------------------------
+    // #5683: a Bearer header carrying base64 `user:<secret>` (npm, cargo,
+    // goproxy) is resolved like a Basic pair, token-first. A dead token there
+    // used to fall through to `authenticate` and pay a password bcrypt and an
+    // auth-capacity permit on every request.
+    // -----------------------------------------------------------------------
+    mod bearer_base64_token_first_5683 {
+        use super::*;
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::auth_service::bcrypt_verify_counter;
+        use std::sync::atomic::Ordering;
+
+        const PASSWORD: &str = "Correct-Horse-Battery-5683";
+
+        fn verifies() -> u64 {
+            bcrypt_verify_counter().load(Ordering::Relaxed)
+        }
+
+        fn bearer_b64(username: &str, secret: &str) -> String {
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{secret}"))
+        }
+
+        async fn local_user(pool: &sqlx::PgPool) -> (Uuid, String) {
+            let id = Uuid::new_v4();
+            let username = format!("bb-5683-{id}");
+            let hash = bcrypt::hash(PASSWORD, 4).expect("hash password");
+            sqlx::query(
+                r#"INSERT INTO users
+                   (id, username, email, password_hash, auth_provider,
+                    is_admin, is_active, is_service_account)
+                   VALUES ($1, $2, $3, $4, 'local', false, true, false)"#,
+            )
+            .bind(id)
+            .bind(&username)
+            .bind(format!("{username}@test.local"))
+            .bind(&hash)
+            .execute(pool)
+            .await
+            .expect("insert local user");
+            (id, username)
+        }
+
+        async fn failed_logins(pool: &sqlx::PgPool, user_id: Uuid) -> i32 {
+            sqlx::query_scalar("SELECT failed_login_attempts FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .expect("read failed_login_attempts")
+        }
+
+        /// Dead tokens (never minted, expired, revoked, foreign-signed JWT)
+        /// in the Bearer base64 form are a 401 with no bcrypt and no failed
+        /// login, on the format and the management surfaces alike.
+        #[tokio::test]
+        async fn bearer_base64_dead_token_runs_no_bcrypt() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let config = crate::config::Config::default();
+            let svc = AuthService::new(pool.clone(), Arc::new(config.clone()));
+            let (user_id, username) = local_user(&pool).await;
+            let mut dead = vec![format!("deadbeef_{}", Uuid::new_v4().simple())];
+            for name in ["expired", "revoked"] {
+                let (token, id) = svc
+                    .generate_api_token(user_id, name, vec!["read:artifacts".into()], None)
+                    .await
+                    .expect("mint token");
+                let sql = if name == "expired" {
+                    "UPDATE api_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1"
+                } else {
+                    "UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1"
+                };
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .expect("kill token");
+                dead.push(token);
+            }
+            dead.push(mint_access_jwt(
+                "some-other-secret-at-least-32-bytes-5683",
+                user_id,
+                &username,
+            ));
+
+            let before = verifies();
+            let mut answers = Vec::new();
+            for secret in &dead {
+                let header = bearer_b64(&username, secret);
+                for allow in [true, false] {
+                    answers.push((
+                        secret.clone(),
+                        allow,
+                        try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&header), allow)
+                            .await,
+                    ));
+                }
+            }
+            let ran = verifies() - before;
+            let failed = failed_logins(&pool, user_id).await;
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .ok();
+
+            for (secret, allow, outcome) in answers {
+                assert!(
+                    matches!(outcome, AuthOutcome::InvalidCredential),
+                    "Bearer base64 {secret} (allow={allow}): {outcome:?}"
+                );
+            }
+            assert_eq!(
+                ran, 0,
+                "dead tokens in the Bearer base64 form ran {ran} bcrypt verifies (#5683)"
+            );
+            assert_eq!(failed, 0, "a dead token is not a failed login");
+        }
+
+        /// Positive controls: a live token resolves as its owner on the format
+        /// surface (and is refused on the management API, like Basic, #2806);
+        /// the real password resolves with one bcrypt, a wrong one is a 401
+        /// with one bcrypt.
+        #[tokio::test]
+        async fn bearer_base64_live_credentials_still_resolve() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let config = crate::config::Config::default();
+            let svc = AuthService::new(pool.clone(), Arc::new(config));
+            let (user_id, username) = local_user(&pool).await;
+            let (live, _) = svc
+                .generate_api_token(user_id, "npm", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+
+            let token_header = bearer_b64(&username, &live);
+            let format_token =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&token_header), true).await;
+            let before = verifies();
+            let mgmt_token =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&token_header), false).await;
+            let mgmt_token_cost = verifies() - before;
+
+            let right = bearer_b64(&username, PASSWORD);
+            let before = verifies();
+            let password =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&right), false).await;
+            let password_cost = verifies() - before;
+            let wrong = bearer_b64(&username, "wrong-password");
+            let before = verifies();
+            let wrong_outcome =
+                try_resolve_auth_outcome(&svc, ExtractedToken::Bearer(&wrong), true).await;
+            let wrong_cost = verifies() - before;
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .ok();
+
+            assert!(
+                matches!(format_token, AuthOutcome::Resolved(ref e) if e.is_api_token && e.user_id == user_id),
+                "{format_token:?}"
+            );
+            assert!(
+                matches!(mgmt_token, AuthOutcome::InvalidCredential),
+                "{mgmt_token:?}"
+            );
+            assert_eq!(mgmt_token_cost, 0);
+            assert!(
+                matches!(password, AuthOutcome::Resolved(ref e) if !e.is_api_token && e.user_id == user_id),
+                "{password:?}"
+            );
+            assert_eq!(password_cost, 1);
+            assert!(matches!(wrong_outcome, AuthOutcome::InvalidCredential));
+            assert_eq!(wrong_cost, 1);
         }
     }
 }
