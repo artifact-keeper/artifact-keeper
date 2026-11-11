@@ -90,7 +90,10 @@ tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip", "compression-br"] }
 
 # Database
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
+# No TLS feature here: the backend crate picks the Postgres TLS provider
+# through its `default-tls` / `fips` features (backend/Cargo.toml), because
+# sqlx hard-codes `ring` whenever its ring feature is on at all.
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -199,7 +202,10 @@ git2 = "0.21"
 
 # OpenSSL (vendored feature for cross-compilation in release builds)
 openssl = { version = "0.10" }
-opensearch = "2"
+# Default features off so the backend crate chooses the TLS stack: its
+# `default-tls` feature turns on `native-tls` (the opensearch default), its
+# `fips` feature `rustls-tls` instead.
+opensearch = { version = "2", default-features = false }
 
 # OpenAPI
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
@@ -225,8 +231,15 @@ url = "2.5"
 # where CK_ULONG = u32. Unblock once kryptering ships a Windows-portable fix.
 bergshamra = "=0.5.1"
 
-# SMTP email delivery
-lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+# SMTP email delivery. Default features off so the TLS backend can be chosen
+# per build: backend `default-tls` adds `tokio1-native-tls` (which also turns
+# on `native-tls`, the lettre default), `fips` adds rustls.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "pool",
+    "hostname",
+    "builder",
+] }
 
 # In-memory cache with TTL eviction (used by #2079 Maven metadata cache).
 moka = { version = "0.12", features = ["future"] }

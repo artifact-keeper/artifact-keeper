@@ -16,6 +16,52 @@ name = "ak-mcp-introspector"
 path = "src/bin/mcp_introspector/main.rs"
 
 [features]
+# The default TLS stacks, exactly as they were before the `fips` feature
+# existed: rustls on `ring` (the provider `main` installs and sqlx uses for
+# Postgres) and native-tls for the OpenSearch client, LDAP (ldap3) and SMTP
+# (lettre). They live in a feature only so that a FIPS build can leave them
+# out: Cargo features are additive, and sqlx uses `ring` for Postgres whenever
+# its ring feature is on at all.
+default = ["default-tls"]
+default-tls = [
+    "rustls/ring",
+    "sqlx/tls-rustls-ring-webpki",
+    "opensearch/native-tls",
+    "dep:native-tls",
+    "ldap3/tls",
+    "lettre/tokio1-native-tls",
+]
+
+# FIPS 140-3 build, for deployments that require FIPS 140-3 validated
+# cryptography. Build it with the defaults OFF:
+#
+#   cargo build --no-default-features --features fips,jemalloc
+#
+# It links the AWS-LC FIPS module (`aws-lc-fips-sys`, which needs a C
+# toolchain, CMake and Go to build) under every `aws-lc-rs` user in the graph,
+# installs the rustls FIPS provider at startup and refuses to start if that
+# provider does not report FIPS, routes Postgres, every reqwest client (ours,
+# object_store, OpenSearch, sigstore, OTLP), Redis, LDAP and SMTP through it,
+# and switches new password and token hashes to PBKDF2-HMAC-SHA256. Neither
+# `ring` nor OpenSSL is linked. See
+# docs/fips.md for what is and is not covered. Enabling both `fips` and
+# `default-tls` is a compile error.
+fips = [
+    "dep:aws-lc-rs",
+    "aws-lc-rs/fips",
+    "rustls/fips",
+    "sqlx/tls-rustls-aws-lc-rs",
+    "opensearch/rustls-tls",
+    # LDAP and SMTP over rustls with the installed FIPS provider instead of
+    # native-tls (OpenSSL), so the FIPS build links no OpenSSL.
+    "dep:rustls-native-certs",
+    "ldap3/tls-rustls",
+    "ldap3/rustls-provider",
+    "lettre/tokio1-rustls",
+    "lettre/rustls-native-certs",
+    "lettre/fips",
+]
+
 vendored-openssl = ["openssl/vendored"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
@@ -86,7 +132,16 @@ http-body.workspace = true
 http-body-util.workspace = true
 
 # TLS (explicit provider selection for rustls 0.23+)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The provider is chosen by the `default-tls` (ring) or `fips` (aws-lc-rs
+# FIPS) feature above.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+# Only in the `fips` build: the FIPS self-test check at startup and
+# PBKDF2-HMAC-SHA256 password hashing. Already in the tree (jsonwebtoken,
+# object_store, rustls); the `fips` feature switches it to the FIPS module.
+aws-lc-rs = { version = "1.18", optional = true }
+# Only in the `fips` build: the system trust store for LDAP's rustls config
+# (the default build's native-tls reads it itself).
+rustls-native-certs = { version = "0.8", optional = true }
 
 # Logging/Tracing
 tracing.workspace = true
@@ -204,9 +259,11 @@ walkdir = "2.5"
 rsa = { version = "0.9", features = ["sha2"] }
 urlencoding = "2.1.3"
 url.workspace = true
-ldap3 = "0.12"
+# TLS backend chosen by the `default-tls` (native-tls) or `fips` (rustls)
+# feature above.
+ldap3 = { version = "0.12", default-features = false, features = ["sync"] }
 bergshamra = { workspace = true }
-native-tls = "0.2"
+native-tls = { version = "0.2", optional = true }
 
 # OpenAPI
 utoipa.workspace = true

@@ -1,0 +1,5 @@
+---
+section: Added
+issues: [#5874, #5577]
+---
+- **Opt-in FIPS 140-3 build of the backend, for deployments that require FIPS 140-3 validated cryptography** (#5874, #5577). A new `fips` cargo feature (`cargo build --no-default-features --features fips`) and a `FIPS=1` build argument for `docker/Dockerfile.backend` (the `-fips` image variant) link the AWS-LC FIPS module, install the rustls FIPS provider at startup and refuse to start unless it reports FIPS. In that build every outbound TLS connection (Postgres, S3 and other object stores, OpenSearch, Redis, LDAP, SMTP, upstream registries, SSO, webhooks) goes through the FIPS provider, `ring` and OpenSSL are not linked, and new password, API-token and TOTP backup-code hashes use PBKDF2-HMAC-SHA256; existing bcrypt hashes are rehashed on next use or refused, per `FIPS_LEGACY_PASSWORD_HASHES`. The default build and image are unchanged. See `docs/fips.md` and the cryptographic inventory in `docs/fips-crypto-inventory.md`, which lists what is not yet covered.

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Instant;
 
+#[cfg(not(feature = "fips"))]
 use bcrypt::{hash, verify};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{
@@ -1159,6 +1160,27 @@ fn auth_token_cache_registry() -> &'static RwLock<Vec<Weak<TokenCacheMap>>> {
 // `AppState::new` from `Config::auth_max_concurrency`; tests that exercise
 // the static methods directly leave it unset and get the legacy uncapped
 // behaviour, which preserves their semantics.
+/// FIPS build: which stored credential hash [`AuthService::upgrade_stored_hash`]
+/// rewrites.
+#[cfg(feature = "fips")]
+#[derive(Debug, Clone, Copy)]
+enum RehashTarget {
+    /// `users.password_hash`, after a password login.
+    UserPassword,
+    /// `api_tokens.token_hash`, after an API-token verify.
+    ApiToken,
+}
+
+#[cfg(feature = "fips")]
+impl RehashTarget {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::UserPassword => "password",
+            Self::ApiToken => "api_token",
+        }
+    }
+}
+
 static GLOBAL_AUTH_SEMAPHORE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 
 /// The bcrypt work factor used for every hash this crate produces.
@@ -1190,13 +1212,16 @@ static GLOBAL_AUTH_SEMAPHORE: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new()
 /// Deliberately *not* a serial lock around the affected tests. That is the fix
 /// for #3402 (genuinely shared DB state) and would make this failure worse, by
 /// holding auth permits for longer while serialised tests queue behind them.
-#[cfg(not(test))]
+///
+/// Not compiled in the `fips` build, which hashes with PBKDF2 instead (see
+/// [`crate::services::fips_password::iterations`]).
+#[cfg(all(not(test), not(feature = "fips")))]
 pub(crate) fn bcrypt_cost() -> u32 {
     bcrypt::DEFAULT_COST
 }
 
 /// See [`bcrypt_cost`] — test-binary work factor (#3407).
-#[cfg(test)]
+#[cfg(all(test, not(feature = "fips")))]
 pub(crate) fn bcrypt_cost() -> u32 {
     4
 }
@@ -2204,6 +2229,20 @@ impl AuthService {
         .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // FIPS build: replace a legacy bcrypt password hash with PBKDF2 now
+        // that the password has verified.
+        #[cfg(feature = "fips")]
+        if let Some(old_hash) = user.password_hash.as_deref() {
+            Self::upgrade_stored_hash(
+                &self.db,
+                RehashTarget::UserPassword,
+                user.id,
+                password,
+                old_hash,
+            )
+            .await;
+        }
 
         // Check password expiration for local users
         let mut user = user;
@@ -3435,11 +3474,18 @@ impl AuthService {
         // hash() also participates in the load-shed cap (signup, password
         // change, API-token creation all call this).
         let pwd = password.to_string();
-        run_bcrypt_under_permit(move || {
+        #[cfg(not(feature = "fips"))]
+        let work = move || {
             hash(&pwd, bcrypt_cost())
                 .map_err(|e| AppError::Internal(format!("Password hashing failed: {}", e)))
-        })
-        .await
+        };
+        // FIPS build: PBKDF2-HMAC-SHA256 from the AWS-LC FIPS module, under
+        // the same permit and blocking-thread offload as bcrypt.
+        #[cfg(feature = "fips")]
+        let work = move || {
+            crate::services::fips_password::hash(&pwd, crate::services::fips_password::iterations())
+        };
+        run_bcrypt_under_permit(work).await
     }
 
     /// Verify a password against a hash
@@ -3454,11 +3500,80 @@ impl AuthService {
         bcrypt_verify_counter().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pwd = password.to_string();
         let h = hash.to_string();
-        run_bcrypt_under_permit(move || {
+        #[cfg(not(feature = "fips"))]
+        let work = move || {
             verify(&pwd, &h)
                 .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))
-        })
-        .await
+        };
+        // FIPS build: dispatch on the stored format. PBKDF2 verifies in the
+        // FIPS module; a legacy bcrypt hash follows
+        // `FIPS_LEGACY_PASSWORD_HASHES` (see `fips_password::verify`).
+        #[cfg(feature = "fips")]
+        let work = move || {
+            crate::services::fips_password::verify(
+                &pwd,
+                &h,
+                crate::services::fips_password::legacy_policy(),
+            )
+        };
+        run_bcrypt_under_permit(work).await
+    }
+
+    /// FIPS build: whether a stored password or token hash that has just
+    /// verified should be replaced with a fresh PBKDF2 hash (it is legacy
+    /// bcrypt, or PBKDF2 below the current iteration count).
+    #[cfg(feature = "fips")]
+    pub fn needs_rehash(hash: &str) -> bool {
+        crate::services::fips_password::needs_rehash(hash)
+    }
+
+    /// FIPS build: after `secret` verified against `old_hash`, replace the
+    /// stored hash with a PBKDF2 one if [`Self::needs_rehash`] says so.
+    ///
+    /// The UPDATE is compare-and-swap on `old_hash`, so a password change or
+    /// a concurrent rehash that landed first is never overwritten. Failure is
+    /// logged and swallowed: the credential already verified, and the next
+    /// successful use retries.
+    #[cfg(feature = "fips")]
+    async fn upgrade_stored_hash(
+        db: &PgPool,
+        target: RehashTarget,
+        id: Uuid,
+        secret: &str,
+        old_hash: &str,
+    ) {
+        if !Self::needs_rehash(old_hash) {
+            return;
+        }
+        let new_hash = match Self::hash_password(secret).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(target: "security", %id, kind = target.kind(), error = %e,
+                    "could not rehash a legacy credential hash; will retry on next use");
+                return;
+            }
+        };
+        let sql = match target {
+            RehashTarget::UserPassword => {
+                "UPDATE users SET password_hash = $2 WHERE id = $1 AND password_hash = $3"
+            }
+            RehashTarget::ApiToken => {
+                "UPDATE api_tokens SET token_hash = $2 WHERE id = $1 AND token_hash = $3"
+            }
+        };
+        match sqlx::query(sql)
+            .bind(id)
+            .bind(&new_hash)
+            .bind(old_hash)
+            .execute(db)
+            .await
+        {
+            Ok(r) if r.rows_affected() > 0 => tracing::info!(target: "security", %id,
+                kind = target.kind(), "replaced a credential hash with PBKDF2-HMAC-SHA256"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "security", %id, kind = target.kind(),
+                error = %e, "could not store a rehashed credential; will retry on next use"),
+        }
     }
 
     /// Returns a dummy bcrypt hash generated once at runtime, at the same cost
@@ -3471,6 +3586,15 @@ impl AuthService {
     /// *different* cost from real hashes would make the "not found" path take
     /// visibly different time from the "wrong password" path — reintroducing
     /// exactly the oracle the dummy exists to close.
+    ///
+    /// In the `fips` build this is a PBKDF2 hash at the same iteration count
+    /// as real hashes instead ([`crate::services::fips_password::dummy_hash`]).
+    #[cfg(feature = "fips")]
+    fn dummy_bcrypt_hash() -> &'static str {
+        crate::services::fips_password::dummy_hash()
+    }
+
+    #[cfg(not(feature = "fips"))]
     fn dummy_bcrypt_hash() -> &'static str {
         static DUMMY: OnceLock<String> = OnceLock::new(); //NOSONAR - intentional dummy hash for constant-time rejection
         DUMMY.get_or_init(|| {
@@ -3602,6 +3726,17 @@ impl AuthService {
         // prefix matches.
         let hash_matches = Self::verify_password(token, &stored_token.token_hash).await?;
         check_token_validation_result(true, false, hash_matches)?;
+        // FIPS build: a token minted by a default build carries a bcrypt hash;
+        // replace it now that it has verified.
+        #[cfg(feature = "fips")]
+        Self::upgrade_stored_hash(
+            &self.db,
+            RehashTarget::ApiToken,
+            stored_token.id,
+            token,
+            &stored_token.token_hash,
+        )
+        .await;
 
         // Debounced usage analytics: only update last_used_at if it has been
         // more than 5 minutes since the last recorded use (or never used).
@@ -6388,6 +6523,7 @@ mod tests {
     // Timing side-channel: dummy bcrypt hash for constant-time rejection
     // -----------------------------------------------------------------------
 
+    #[cfg(not(feature = "fips"))] // bcrypt-specific; the fips build pins PBKDF2 in fips_password
     #[test]
     fn test_dummy_bcrypt_hash_is_valid_and_never_matches() {
         let dummy = AuthService::dummy_bcrypt_hash();
@@ -6425,6 +6561,7 @@ mod tests {
 
     /// Parse the cost factor out of a bcrypt modular-crypt string
     /// (`$2b$<cost>$<salt+digest>`). Test-only.
+    #[cfg(not(feature = "fips"))] // bcrypt-specific; the fips build pins PBKDF2 in fips_password
     fn cost_of(hash_str: &str) -> u32 {
         let mut parts = hash_str.split('$');
         parts.next(); // leading empty segment
@@ -6448,6 +6585,7 @@ mod tests {
     /// Pinning the value matters: if someone "restores" `DEFAULT_COST` here
     /// the flake comes back intermittently and at a distance, which is the
     /// worst possible failure mode to rediscover.
+    #[cfg(not(feature = "fips"))] // bcrypt-specific; the fips build pins PBKDF2 in fips_password
     #[tokio::test]
     async fn hash_password_uses_the_cheap_test_cost_factor() {
         let hashed = AuthService::hash_password("correct horse battery staple")
@@ -6473,6 +6611,7 @@ mod tests {
     /// visibly different wall-clock time from the "wrong password" path — the
     /// exact side channel `dummy_bcrypt_hash` exists to close (#3407 must not
     /// regress the constant-time property it piggybacks on).
+    #[cfg(not(feature = "fips"))] // bcrypt-specific; the fips build pins PBKDF2 in fips_password
     #[test]
     fn dummy_bcrypt_hash_cost_matches_real_hash_cost() {
         assert_eq!(
@@ -11823,5 +11962,139 @@ mod tests {
         assert_eq!(first, Some(token_id), "cache miss");
         assert_eq!(cached, Some(token_id), "cache hit");
         assert_eq!(refused, None, "a refused token records nothing");
+    }
+
+    // -----------------------------------------------------------------------
+    // FIPS build: PBKDF2 hashing and the legacy-bcrypt rehash on success
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "fips")]
+    mod fips_rehash {
+        use super::*;
+
+        const PBKDF2_TEST_PREFIX: &str = "$pbkdf2-sha256$i=1000$";
+
+        async fn stored_password_hash(pool: &PgPool, id: Uuid) -> String {
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("load password_hash")
+        }
+
+        async fn stored_token_hash(pool: &PgPool, id: Uuid) -> String {
+            sqlx::query_scalar("SELECT token_hash FROM api_tokens WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("load token_hash")
+        }
+
+        #[tokio::test]
+        async fn hash_password_writes_pbkdf2_and_the_pad_matches_it() {
+            let h = AuthService::hash_password("pw").await.unwrap();
+            assert!(h.starts_with(PBKDF2_TEST_PREFIX), "{h}");
+            assert!(AuthService::verify_password("pw", &h).await.unwrap());
+            assert!(!AuthService::verify_password("pW", &h).await.unwrap());
+            assert!(!AuthService::needs_rehash(&h));
+            let dummy = AuthService::dummy_bcrypt_hash();
+            assert!(dummy.starts_with(PBKDF2_TEST_PREFIX), "{dummy}");
+            assert!(!AuthService::verify_password("", dummy).await.unwrap());
+        }
+
+        /// A default-build (bcrypt) password logs in once under the default
+        /// `rehash` policy and comes out of it as PBKDF2, which then verifies
+        /// on its own.
+        #[tokio::test]
+        async fn password_login_replaces_a_legacy_bcrypt_hash() {
+            let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+                return;
+            };
+            let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+            let username = format!("fips_rehash_{}", &Uuid::new_v4().to_string()[..8]);
+            let password = "Legacy-Bcrypt-Pass-2026";
+            let id = insert_test_user(&pool, &username).await;
+            let legacy = bcrypt::hash(password, 4).unwrap();
+            sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+                .bind(id)
+                .bind(&legacy)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            // A wrong password does not rewrite anything.
+            assert!(svc.authenticate(&username, "wrong").await.is_err());
+            assert_eq!(stored_password_hash(&pool, id).await, legacy);
+
+            svc.authenticate(&username, password)
+                .await
+                .expect("legacy bcrypt verifies under `rehash`");
+            let upgraded = stored_password_hash(&pool, id).await;
+            assert!(upgraded.starts_with(PBKDF2_TEST_PREFIX), "{upgraded}");
+
+            // The new hash is the one that verifies now, and is left alone.
+            svc.authenticate(&username, password)
+                .await
+                .expect("PBKDF2 hash verifies");
+            assert_eq!(stored_password_hash(&pool, id).await, upgraded);
+            assert!(svc.authenticate(&username, "wrong").await.is_err());
+
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+
+        /// An API token minted by a default build verifies once and has its
+        /// `token_hash` replaced with PBKDF2.
+        #[tokio::test]
+        async fn api_token_verify_replaces_a_legacy_bcrypt_hash() {
+            let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+                return;
+            };
+            let config = Arc::new(Config::test_config());
+            let svc = AuthService::new(pool.clone(), config.clone());
+            let username = format!("fips_tok_{}", &Uuid::new_v4().to_string()[..8]);
+            let user_id = insert_test_user(&pool, &username).await;
+            let (token, token_id) = svc
+                .generate_api_token(user_id, "fips-rehash", vec!["read:artifacts".into()], None)
+                .await
+                .expect("mint token");
+            let minted = stored_token_hash(&pool, token_id).await;
+            assert!(minted.starts_with(PBKDF2_TEST_PREFIX), "{minted}");
+
+            // Make it look like a default-build token.
+            let legacy = bcrypt::hash(&token, 4).unwrap();
+            sqlx::query("UPDATE api_tokens SET token_hash = $2 WHERE id = $1")
+                .bind(token_id)
+                .bind(&legacy)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            svc.validate_api_token(&token)
+                .await
+                .expect("legacy token verifies under `rehash`");
+            let upgraded = stored_token_hash(&pool, token_id).await;
+            assert!(upgraded.starts_with(PBKDF2_TEST_PREFIX), "{upgraded}");
+            assert_ne!(upgraded, minted);
+
+            // A fresh service (empty token cache) verifies against the new hash.
+            let fresh = AuthService::new(pool.clone(), config);
+            fresh
+                .validate_api_token(&token)
+                .await
+                .expect("PBKDF2 token hash verifies");
+            assert_eq!(stored_token_hash(&pool, token_id).await, upgraded);
+
+            let _ = sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+                .bind(token_id)
+                .execute(&pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await;
+        }
     }
 }
