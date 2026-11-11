@@ -41,17 +41,30 @@ use crate::services::metrics_service::AuthFailureReason;
 use crate::services::oidc_service::resolve_federated_email;
 use crate::services::saml_service::SamlService;
 
-/// Create public SSO routes (no auth required)
+/// Create public SSO routes (no auth required).
+///
+/// The LDAP password login is not here: it is mounted from
+/// [`ldap_login_router`] behind the login rate limiter (#5485).
 pub fn router() -> Router<SharedState> {
     Router::new()
         .route("/providers", get(list_providers))
         .route("/oidc/callback", get(oidc_callback_generic))
         .route("/oidc/:id/login", get(oidc_login))
         .route("/oidc/:id/callback", get(oidc_callback))
-        .route("/ldap/:id/login", post(ldap_login))
         .route("/saml/:id/login", get(saml_login))
         .route("/saml/:id/acs", post(saml_acs))
         .route("/exchange", post(exchange_code))
+}
+
+/// The LDAP username/password login, `POST /ldap/:id/login` (#5485).
+///
+/// Split out of [`router`] so `create_router` can put it behind the same
+/// `login_rate_limit_middleware` as `POST /api/v1/auth/login`: it is a
+/// password-guessing surface too, and it used to have only the API-wide
+/// limiter. Its JSON body carries `username`, which the middleware peeks to
+/// key the per-`(username, IP)` bucket.
+pub fn ldap_login_router() -> Router<SharedState> {
+    Router::new().route("/ldap/:id/login", post(ldap_login))
 }
 
 /// Fire-and-forget audit for a federated (SSO) login outcome (#1617 Phase 1).

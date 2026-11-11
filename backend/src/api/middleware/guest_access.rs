@@ -213,6 +213,10 @@ fn guard_short_circuit(
         // Transient bcrypt-capacity shed: retryable 503, never a 401 — on the
         // OCI surface as on every other.
         AuthOutcome::Overloaded => Some(service_unavailable_response()),
+        // The Basic-password login budget is spent (#5485).
+        AuthOutcome::RateLimited(retry_after) => {
+            Some(super::auth::rate_limited_response(*retry_after))
+        }
         // No/invalid credential presented: guest access is disabled → 401,
         // shaped for the protocol the client is speaking.
         AuthOutcome::NoCredential | AuthOutcome::InvalidCredential => Some(match oci_base_url {
