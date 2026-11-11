@@ -52,13 +52,20 @@ of a migration job). The requester and instance administrators can read it.
 
 | Field | Meaning |
 |---|---|
-| `status` | `pending`, `running`, `completed` or `failed` |
+| `status` | `pending`, `running`, `completed`, `completed_with_errors` or `failed` |
 | `phase` | `queued`, `collect`, `delete_rows`, `purge`, `cleanup`, `done` |
 | `total_items` / `completed_items` | artifacts when the job started / artifact rows deleted |
 | `total_bytes` / `transferred_bytes` | their bytes |
 | `skipped_items` | stored objects kept because another repository still references them |
 | `failed_items` | stored objects whose delete failed (left for storage GC) |
-| `error_summary` | the last step failure, if any |
+| `error_summary` | the last step failure, if any; for `completed_with_errors`, the number of objects whose delete failed and the first of their keys |
+
+`completed_with_errors` (#5655) is terminal: the repository and its rows are
+gone, but `failed_items` stored objects could not be deleted (a storage outage,
+for example). Their keys stay journaled in `oci_gc_candidates` and storage GC
+deletes them on a later run; nothing needs to be re-run. Before 1.12.0 such a
+job reported `completed`. A client that polls `status_url` should treat
+`completed`, `completed_with_errors` and `failed` as terminal.
 
 ## How the job runs
 
