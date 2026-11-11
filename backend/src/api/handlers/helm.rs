@@ -4952,17 +4952,14 @@ mod virtual_member_failure_tests {
             return;
         };
         let good = good_upstream().await;
-        let stalled = upstream(
-            ResponseTemplate::new(200)
-                .set_body_string(GOOD_INDEX)
-                .set_delay(std::time::Duration::from_secs(5)),
-        )
-        .await;
+        let stalled = tdh::SilentUpstream::start().await;
         let rig = Rig::new(pool, &[good.uri(), stalled.uri()]).await;
         let started = std::time::Instant::now();
         let (status, body, headers) =
             crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
-                std::time::Duration::from_millis(300),
+                // #5823: generous, so the healthy member (an immediate local
+                // answer) is always inside it; the stalled member never answers.
+                std::time::Duration::from_secs(5),
                 rig.index(),
             )
             .await;
@@ -4975,7 +4972,7 @@ mod virtual_member_failure_tests {
         assert!(body.contains("alpha"), "{body}");
         assert_partial(&headers, &stalled_key);
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
+            elapsed < std::time::Duration::from_secs(15),
             "the deadline must bound the wait: took {elapsed:?}"
         );
     }
