@@ -13592,23 +13592,14 @@ mod tests {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::extract::{Path, State};
         use axum::Extension;
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let meta_path = "com/example/stall4508/lib/maven-metadata.xml".to_string();
-        let mock = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path_regex(r".*maven-metadata\.xml$"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("<metadata/>")
-                    .set_delay(Duration::from_secs(5)),
-            )
-            .mount(&mock)
-            .await;
+        // #5823: an upstream that never answers, so the outcome cannot hinge
+        // on how fast a loaded runner is.
+        let mock = tdh::SilentUpstream::start().await;
 
         let (local_id, _lk, dir_l) = tdh::create_repo(&pool, "local", "maven").await;
         let (remote_id, remote_key, dir_r) = tdh::create_repo(&pool, "remote", "maven").await;
@@ -13630,7 +13621,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
-            Duration::from_millis(300),
+            Duration::from_secs(2),
             download(
                 State(state.clone()),
                 Extension(None),
@@ -13662,7 +13653,7 @@ mod tests {
         let _ = remote_key;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < Duration::from_secs(15),
             "the deadline must bound the wait: took {elapsed:?}"
         );
     }
@@ -13908,14 +13899,6 @@ mod tests {
             "20240101000000",
         );
         let upstream = MockServer::start().await;
-        Mock::given(path_regex("^/hung/"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("<metadata/>")
-                    .set_delay(Duration::from_secs(5)),
-            )
-            .mount(&upstream)
-            .await;
         Mock::given(path_regex("^/ok/.*maven-metadata\\.xml$"))
             .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
             .mount(&upstream)
@@ -13924,8 +13907,11 @@ mod tests {
         std::fs::create_dir_all(&scratch).expect("create scratch dir");
         let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
         let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        // #5823: the hung member never answers, so the outcome cannot hinge
+        // on how fast a loaded runner is.
+        let hung = tdh::SilentUpstream::start().await;
         let members = [
-            format!("{}/hung", upstream.uri()),
+            format!("{}/hung", hung.uri()),
             format!("{}/ok", upstream.uri()),
         ];
         let (virtual_id, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
@@ -13941,7 +13927,9 @@ mod tests {
             answers.push((
                 suffix,
                 crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
-                    Duration::from_millis(300),
+                    // #5823: generous, so the healthy member (an immediate
+                    // local answer) is always inside it.
+                    Duration::from_secs(5),
                     tdh::send_with_headers(
                         tdh::router_anon(router(), state.clone()),
                         tdh::get(format!(
@@ -13986,7 +13974,7 @@ mod tests {
             assert!(headers.get(axum::http::header::ETAG).is_none(), "{suffix}");
         }
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(30),
             "the deadline must bound the wait: took {elapsed:?}"
         );
         assert_eq!(

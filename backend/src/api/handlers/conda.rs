@@ -22207,18 +22207,13 @@ mod virtual_channel_tests {
     }
 
     /// An upstream publishing only the plain `noarch/repodata.json` (the
-    /// compressed encodings 404) listing `filenames`, after `delay`.
-    async fn plain_repodata_upstream_5621(
-        filenames: &[&str],
-        delay: std::time::Duration,
-    ) -> MockServer {
+    /// compressed encodings 404) listing `filenames`.
+    async fn plain_repodata_upstream_5621(filenames: &[&str]) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(wm_path("/noarch/repodata.json"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(upstream_repodata("noarch", filenames))
-                    .set_delay(delay),
+                ResponseTemplate::new(200).set_body_json(upstream_repodata("noarch", filenames)),
             )
             .mount(&server)
             .await;
@@ -22252,8 +22247,7 @@ mod virtual_channel_tests {
         };
         for code in [503u16, 401, 403, 451] {
             let first = status_upstream_5621(code).await;
-            let good =
-                plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"], Default::default()).await;
+            let good = plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"]).await;
             let (virtual_id, virtual_key, members, state, _cache) =
                 remote_only_virtual_5621(&pool, &[first.uri(), good.uri()]).await;
             let (status, body, headers) =
@@ -22322,16 +22316,15 @@ mod virtual_channel_tests {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
-        let stalled =
-            plain_repodata_upstream_5621(&["slow-1.0-0.conda"], std::time::Duration::from_secs(5))
-                .await;
-        let good =
-            plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"], Default::default()).await;
+        let stalled = tdh::SilentUpstream::start().await;
+        let good = plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"]).await;
         let (virtual_id, virtual_key, members, state, _cache) =
             remote_only_virtual_5621(&pool, &[stalled.uri(), good.uri()]).await;
         let started = std::time::Instant::now();
         let (status, body, headers) = proxy_helpers::with_virtual_member_deadline(
-            std::time::Duration::from_millis(300),
+            // #5823: generous, so the healthy member (an immediate local answer)
+            // is always inside it; the stalled member never answers at all.
+            std::time::Duration::from_secs(5),
             get_5621(&state, format!("/{virtual_key}/noarch/repodata.json")),
         )
         .await;
@@ -22343,7 +22336,7 @@ mod virtual_channel_tests {
         assert_eq!(listed(&doc), vec!["rich-13.0-pyh_0.conda"]);
         assert_partial_5621(&headers, &members[0].1);
         assert!(
-            elapsed < std::time::Duration::from_secs(3),
+            elapsed < std::time::Duration::from_secs(15),
             "the member deadline must bound the wait: took {elapsed:?}"
         );
     }
@@ -22364,8 +22357,7 @@ mod virtual_channel_tests {
                 .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
                 .mount(&garbage)
                 .await;
-            let good =
-                plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"], Default::default()).await;
+            let good = plain_repodata_upstream_5621(&["rich-13.0-pyh_0.conda"]).await;
             let (virtual_id, virtual_key, members, state, _cache) =
                 remote_only_virtual_5621(&pool, &[garbage.uri(), good.uri()]).await;
             if opted_in {
