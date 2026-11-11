@@ -3906,6 +3906,18 @@ mod tests {
 
     async fn seed_oci(env: &mut Env) -> (RepoInfo, String) {
         let oci = env.repo("local", "docker").await;
+        let digest = seed_oci_image(env, &oci).await;
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"oci": oci.key}).to_string(),
+        )
+        .await;
+        (oci, digest)
+    }
+
+    /// Store `acme/mcp:1.2` (an index over two platform children) in `oci`
+    /// as a push or a pull writes it; returns the index digest.
+    async fn seed_oci_image(env: &Env, oci: &RepoInfo) -> String {
         let body = index_body('a');
         let digest = format!("sha256:{}", fmt::sha256_hex(&body));
         let key = crate::api::handlers::oci_v2::manifest_storage_key(&digest);
@@ -3921,7 +3933,7 @@ mod tests {
         tdh::seed_artifact_with_checksum(
             &env.fx.state,
             &env.fx.pool,
-            &oci,
+            oci,
             "test-seed/oci-manifest-row",
             "v2/acme/mcp/manifests/1.2",
             "acme/mcp",
@@ -3938,7 +3950,7 @@ mod tests {
             tdh::seed_artifact_with_checksum(
                 &env.fx.state,
                 &env.fx.pool,
-                &oci,
+                oci,
                 &format!("test-seed/oci-child-{child}"),
                 &format!("v2/acme/mcp/manifests/sha256:{hex}"),
                 "acme/mcp",
@@ -3950,12 +3962,7 @@ mod tests {
             )
             .await;
         }
-        env.config(
-            mcp_packages::REPOS_KEY,
-            &serde_json::json!({"oci": oci.key}).to_string(),
-        )
-        .await;
-        (oci, digest)
+        digest
     }
 
     fn oci_doc(identifier: &str) -> serde_json::Value {
@@ -4025,6 +4032,280 @@ mod tests {
         assert_eq!(
             (s, json(&b)["error"].as_str()),
             (StatusCode::NOT_FOUND, Some("mcp_backing_artifact_blocked"))
+        );
+        env.teardown().await;
+    }
+
+    /// #5518: behind a Virtual `oci` backing repository the image host is
+    /// checked against the member whose manifest wins, as the artifact path
+    /// checks the winning row (#5515). A Virtual over a Remote proxying
+    /// `ghcr.io` and a Local member: `evil.example/acme/mcp:1.2` was pinned to
+    /// the `ghcr.io` image of the same path; it is refused under either
+    /// policy while the Remote member wins, `ghcr.io/acme/mcp:1.2` still
+    /// pins through it, and with the Local member winning a foreign host is
+    /// refused under `own-repos` and pinned with the warning under `open`.
+    #[tokio::test]
+    async fn virtual_oci_backing_checks_the_winning_members_host_5518() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let ghcr = env.repo("remote", "docker").await;
+        sqlx::query("UPDATE repositories SET upstream_url = 'https://ghcr.io' WHERE id = $1")
+            .bind(ghcr.id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let local = env.repo("local", "docker").await;
+        let virt = env.repo("virtual", "docker").await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, ghcr.id, 1).await;
+        tdh::link_virtual_member(&env.fx.pool, virt.id, local.id, 2).await;
+        let digest = seed_oci_image(&env, &ghcr).await;
+        assert_eq!(seed_oci_image(&env, &local).await, digest);
+        env.config(
+            mcp_packages::REPOS_KEY,
+            &serde_json::json!({"oci": virt.key}).to_string(),
+        )
+        .await;
+        let publish = |name: &str, identifier: &str| {
+            let mut d = oci_doc(identifier);
+            d["name"] = name.into();
+            d
+        };
+
+        // The Remote member wins: a foreign host is refused under both
+        // policies, and nothing is stored.
+        for policy in ["own-repos", "open"] {
+            env.config(mcp_packages::POLICY_KEY, policy).await;
+            let name = format!("com.acme/evil-{policy}");
+            let (s, b) = env
+                .publish(&publish(&name, "evil.example/acme/mcp:1.2"))
+                .await;
+            assert_eq!(
+                (s, b["error"].as_str()),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some("mcp_external_registry")
+                ),
+                "{policy}: {b}"
+            );
+            assert!(
+                b["detail"].as_str().unwrap().contains(&ghcr.key),
+                "{policy}: {b}"
+            );
+            let stored: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(env.fx.repo_id)
+            .bind(fmt::storage_path(&name, "1.0.0"))
+            .fetch_optional(&env.fx.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored, None, "{policy}");
+        }
+
+        // An image no member holds is not filled through a Remote of another
+        // upstream (it was queued as a `202` fill of the `ghcr.io` image).
+        let (s, b) = env
+            .publish(&publish(
+                "com.acme/evil-fill",
+                "evil.example/acme/absent:1.0",
+            ))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_external_registry")
+            ),
+            "{b}"
+        );
+
+        // The Remote's own upstream still pins through it, unwarned.
+        env.config(mcp_packages::POLICY_KEY, "own-repos").await;
+        let (s, b) = env
+            .publish(&publish("com.acme/ghcr", "ghcr.io/acme/mcp:1.2"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pins = stored_pins(&env, "com.acme/ghcr", "1.0.0").await;
+        assert_eq!(pins[0]["resolved"]["repositoryId"], ghcr.id.to_string());
+        assert_eq!(pins[0]["resolved"]["digest"], digest.as_str());
+        assert!(
+            pins[0]["resolved"]["warnings"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{pins}"
+        );
+
+        // The Local member wins: a foreign host is external under
+        // `own-repos` and foreign coordinates under `open`.
+        sqlx::query("UPDATE virtual_repo_members SET priority = 3 WHERE member_repo_id = $1")
+            .bind(ghcr.id)
+            .execute(&env.fx.pool)
+            .await
+            .unwrap();
+        let (s, b) = env
+            .publish(&publish("com.acme/local-own", "evil.example/acme/mcp:1.2"))
+            .await;
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("mcp_external_registry")
+            ),
+            "{b}"
+        );
+        env.config(mcp_packages::POLICY_KEY, "open").await;
+        let (s, b) = env
+            .publish(&publish("com.acme/local-open", "evil.example/acme/mcp:1.2"))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pins = stored_pins(&env, "com.acme/local-open", "1.0.0").await;
+        assert_eq!(pins[0]["resolved"]["repositoryId"], local.id.to_string());
+        assert_eq!(
+            pins[0]["resolved"]["warnings"],
+            serde_json::json!([mcp_packages::FOREIGN_COORDINATES_WARNING])
+        );
+        env.teardown().await;
+    }
+
+    /// #5593: the backing gate of an introspection completion
+    /// ([`mcp_packages::held_backing_package`]) re-reads its rows under the
+    /// `FOR SHARE` locks. The interleaving is forced: a tag move (the
+    /// tag-path row rewritten in place to other bytes, its rejection moved
+    /// onto a digest-path row the gate has not seen) is held open, the
+    /// gate starts and is observed blocked on it (`pg_blocking_pids`), and
+    /// only then does the move commit. The gate's first read predates the
+    /// move; before the fix its lock returned the rewritten, clean tag row
+    /// and the version passed while the pinned digest was rejected.
+    #[tokio::test]
+    async fn held_backing_package_rereads_rows_moved_before_the_lock_5593() {
+        let Some(mut env) = Env::new().await else {
+            return;
+        };
+        let (oci, digest) = seed_oci(&mut env).await;
+        let identifier = format!("localhost/{}/acme/mcp:1.2", oci.key);
+        let (s, b) = env.publish(&oci_doc(&identifier)).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        let pool = &env.fx.pool;
+        let meta: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM artifact_metadata WHERE artifact_id = $1")
+                .bind(env.server_artifact("com.acme/img", "1.0.0").await)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let stored = StoredVersion::from_metadata(&meta).unwrap();
+        let label = stored.pins[0].label();
+
+        // Before the move only the tag-path row carries the pinned index,
+        // rejected; the digest-path row is not live yet.
+        let hex = fmt::sha256_hex(&index_body('a'));
+        let tag_row: Uuid = sqlx::query_scalar(
+            "UPDATE artifacts SET quarantine_status = 'rejected', quarantine_source = 'scan_policy' \
+             WHERE repository_id = $1 AND path = 'v2/acme/mcp/manifests/1.2' RETURNING id",
+        )
+        .bind(oci.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let digest_path = format!("v2/acme/mcp/manifests/{digest}");
+        let digest_row: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2 \
+             RETURNING id",
+        )
+        .bind(oci.id)
+        .bind(&digest_path)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        let digest_row = match digest_row {
+            Some(id) => id,
+            None => {
+                tdh::seed_artifact_with_checksum(
+                    &env.fx.state,
+                    pool,
+                    &oci,
+                    "test-seed/oci-digest-row",
+                    &digest_path,
+                    "acme/mcp",
+                    &digest,
+                    INDEX_MT,
+                    Bytes::from_static(b"{}"),
+                    env.fx.user_id,
+                    &hex,
+                )
+                .await
+            }
+        };
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(digest_row)
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut probe = pool.acquire().await.unwrap();
+        assert_eq!(
+            mcp_packages::held_backing_package(&mut probe, &stored)
+                .await
+                .unwrap(),
+            Some(label.clone()),
+            "control: the rejected tag row holds the version"
+        );
+        drop(probe);
+
+        // The tag move, held open.
+        let mut mover = pool.begin().await.unwrap();
+        let mover_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *mover)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET checksum_sha256 = $2, quarantine_status = NULL, \
+             quarantine_source = NULL WHERE id = $1",
+        )
+        .bind(tag_row)
+        .bind("c".repeat(64))
+        .execute(&mut *mover)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = false, quarantine_status = 'rejected', \
+             quarantine_source = 'scan_policy' WHERE id = $1",
+        )
+        .bind(digest_row)
+        .execute(&mut *mover)
+        .await
+        .unwrap();
+
+        let mut gate_tx = pool.begin().await.unwrap();
+        let commit_once_blocked = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut blocked = false;
+            while std::time::Instant::now() < deadline {
+                blocked = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(mover_pid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            mover.commit().await.unwrap();
+            blocked
+        };
+        let (held, blocked) = tokio::join!(
+            mcp_packages::held_backing_package(&mut gate_tx, &stored),
+            commit_once_blocked
+        );
+        assert!(blocked, "precondition: the gate waited on the tag move");
+        gate_tx.rollback().await.unwrap();
+        assert_eq!(
+            held.unwrap(),
+            Some(label),
+            "the rejection moved onto the digest-path row still holds the version"
         );
         env.teardown().await;
     }
@@ -6475,7 +6756,9 @@ mod tests {
             &serde_json::json!({"oci": virt.key}).to_string(),
         )
         .await;
-        let mut d = oci_doc("ghcr.io/acme/one:1.0");
+        // Named on the Virtual: a hosted member serves no other host's image
+        // under `own-repos` (#5518).
+        let mut d = oci_doc(&format!("localhost/{}/acme/one:1.0", virt.key));
         d["name"] = "com.acme/one".into();
         let (s, b) = env.publish(&d).await;
         assert_eq!(s, StatusCode::OK, "{b}");
