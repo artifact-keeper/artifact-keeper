@@ -2566,15 +2566,19 @@ async fn download(
     //    the repo is local, remote, or virtual (with merge).
     if let Some((base_path, checksum_type)) = parse_checksum_path(&path) {
         if MavenHandler::is_metadata(base_path) {
-            let content =
+            let (content, marks) =
                 fetch_maven_metadata_bytes(&state, &repo, &repo_key, base_path, auth.as_ref())
                     .await?;
             let checksum = compute_checksum(&content, checksum_type);
-            return Ok(Response::builder()
+            let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "text/plain")
                 .body(Body::from(checksum))
-                .unwrap());
+                .unwrap();
+            // The checksum describes the body the metadata route serves, so
+            // it carries the same partial and stale marks (#5621, #5616).
+            marks.apply(&mut response);
+            return Ok(response);
         } else if MavenHandler::is_prefixes_file(base_path) {
             // Always the GENERATED checksum, never a stored sidecar: a hosted
             // repo's upload handler accepts `PUT .../.meta/prefixes.txt.sha1`
@@ -2595,13 +2599,19 @@ async fn download(
 
     // 2a. Check if this is a maven-metadata.xml request
     if MavenHandler::is_metadata(&path) {
-        let content =
+        let (content, marks) =
             fetch_maven_metadata_bytes(&state, &repo, &repo_key, &path, auth.as_ref()).await?;
-        return Ok(cache_headers::cacheable_response(
-            content.to_vec(),
-            "text/xml",
-            &headers,
-        ));
+        // A partial merge is never a 304 against the complete document's
+        // validator, and carries none of its own (#5621).
+        let conditional = if marks.is_partial() {
+            HeaderMap::new()
+        } else {
+            headers
+        };
+        let mut response =
+            cache_headers::cacheable_response(content.to_vec(), "text/xml", &conditional);
+        marks.apply(&mut response);
+        return Ok(response);
     }
 
     // 2b. `.meta/prefixes.txt` — repository-prefixes file (Maven RRF
@@ -2897,32 +2907,106 @@ async fn download(
 /// One virtual member's answer to a Maven metadata fetch in a merge (#5621).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MemberMetadata {
-    /// The member's document.
-    Doc(String),
+    /// The member's document, and when it was served under the
+    /// `stale-if-error` grace the instant its freshness lapsed (#5616).
+    Doc {
+        xml: String,
+        stale_since: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// Nothing to contribute: not a Remote member, or a permanent answer (an
     /// upstream 404 or other permanent 4xx, a body that is not UTF-8).
     Miss,
     /// The member could not answer (an upstream 5xx, a transport failure or
-    /// timeout; see
+    /// timeout, the virtual member deadline; see
     /// [`crate::services::proxy_service::classify_member_fetch_failure`]), so
     /// whether it lists any version is unknowable.
     Unavailable,
 }
 
 impl MemberMetadata {
+    /// A fresh document (a hosted member's), or a miss.
     fn from_doc(doc: Option<String>) -> Self {
-        doc.map_or(Self::Miss, Self::Doc)
+        doc.map_or(Self::Miss, |xml| Self::Doc {
+            xml,
+            stale_since: None,
+        })
+    }
+}
+
+/// What the response for a Maven metadata document (or its checksum) must
+/// say about how it was built (#5621, #5616).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MetadataMarks {
+    /// Virtual members that could not answer, in member order: the merge was
+    /// served without them, so the response is marked partial and uncacheable.
+    unavailable: Vec<String>,
+    /// The oldest instant a body the response was built from stopped being
+    /// fresh, when one was served under the `stale-if-error` grace (#4581):
+    /// the response carries `Warning: 110` and `X-AK-Stale-Since`.
+    stale_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl MetadataMarks {
+    fn stale(&mut self, since: Option<chrono::DateTime<chrono::Utc>>) {
+        if let Some(since) = since {
+            self.stale_since = Some(self.stale_since.map_or(since, |s| s.min(since)));
+        }
     }
 
-    /// The document, if any, noting in `unavailable` a member that could not
-    /// answer.
-    fn into_doc(self, unavailable: &mut bool) -> Option<String> {
-        match self {
-            Self::Doc(doc) => Some(doc),
-            Self::Miss => None,
-            Self::Unavailable => {
-                *unavailable = true;
+    fn unavailable(&mut self, member: &str) {
+        if !self.unavailable.iter().any(|m| m == member) {
+            self.unavailable.push(member.to_string());
+        }
+    }
+
+    /// The document of `member`'s answer, if any, noting a member that could
+    /// not answer or a stale body.
+    fn note(
+        &mut self,
+        member: &crate::models::repository::Repository,
+        answer: MemberMetadata,
+    ) -> Option<String> {
+        match answer {
+            MemberMetadata::Doc { xml, stale_since } => {
+                self.stale(stale_since);
+                Some(xml)
+            }
+            MemberMetadata::Miss => None,
+            MemberMetadata::Unavailable => {
+                self.unavailable(&member.key);
                 None
+            }
+        }
+    }
+
+    fn is_partial(&self) -> bool {
+        !self.unavailable.is_empty()
+    }
+
+    /// Whether a merge built under these marks is the complete, fresh answer
+    /// and may be kept in `VIRTUAL_MAVEN_METADATA_CACHE`: a merge without an
+    /// unavailable member would keep answering without it after the member
+    /// is back (#5621), and a stale one would lose its marks (#5616).
+    fn cacheable(&self) -> bool {
+        self.unavailable.is_empty() && self.stale_since.is_none()
+    }
+
+    /// Mark `response`: partial and uncacheable (`X-AK-Partial-Members`,
+    /// `Cache-Control: no-store`, `Warning: 199`, no `ETag`), and stale
+    /// (`Warning: 110`, `X-AK-Stale-Since`), as the virtual metadata merges
+    /// and the remote download path mark theirs.
+    fn apply(&self, response: &mut Response) {
+        proxy_helpers::PartialMerge::of_members(self.unavailable.iter().map(String::as_str))
+            .mark(response);
+        if let Some(since) = self.stale_since {
+            use axum::http::HeaderValue;
+            let headers = response.headers_mut();
+            headers.append(
+                axum::http::header::WARNING,
+                HeaderValue::from_static(proxy_helpers::STALE_WARNING),
+            );
+            if let Ok(v) = HeaderValue::from_str(&since.to_rfc3339()) {
+                headers.insert(proxy_helpers::STALE_SINCE_HEADER, v);
             }
         }
     }
@@ -2944,13 +3028,15 @@ fn virtual_metadata_not_found(member_unavailable: bool) -> Response {
 /// from upstream (via the proxy cache), as a UTF-8 string. A non-Remote
 /// member or a miss is [`MemberMetadata::Miss`]; a member whose upstream
 /// could not answer is [`MemberMetadata::Unavailable`] (#5621), so a merge
-/// that finds nothing answers 503 instead of a 404 clients cache.
+/// that finds nothing answers 503 instead of a 404 clients cache, and a merge
+/// that finds something is served marked partial.
 ///
 /// Bounded by the virtual member deadline (#4508): a member whose upstream is
 /// down used to hold every metadata miss for the upstream client's full
 /// timeout, longer than a reverse proxy waits, so clients saw 504 and builds
-/// crawled. A member that misses the deadline is `Err`, a 502 naming it,
-/// which the merge returns instead of waiting.
+/// crawled. A member that misses the deadline is
+/// [`MemberMetadata::Unavailable`] like any other member that could not
+/// answer (#5621): the healthy members' metadata is still served.
 ///
 /// Extracted so the Maven virtual metadata-merge loops can fan out across remote
 /// members CONCURRENTLY (#2069): a cold metadata merge then costs the slowest
@@ -2961,16 +3047,16 @@ async fn fetch_remote_member_metadata(
     state: &SharedState,
     member: &crate::models::repository::Repository,
     path: &str,
-) -> Result<MemberMetadata, Response> {
+) -> MemberMetadata {
     if member.repo_type != RepositoryType::Remote {
-        return Ok(MemberMetadata::Miss);
+        return MemberMetadata::Miss;
     }
     let (Some(upstream_url), Some(proxy)) =
         (member.upstream_url.as_deref(), state.proxy_service.as_ref())
     else {
-        return Ok(MemberMetadata::Miss);
+        return MemberMetadata::Miss;
     };
-    let fetched = proxy_helpers::member_metadata_fetch_capped_budgeted(
+    let fetched = match proxy_helpers::member_metadata_fetch_capped_budgeted(
         proxy,
         member.id,
         &member.key,
@@ -2980,19 +3066,27 @@ async fn fetch_remote_member_metadata(
         RepositoryFormat::Maven,
     )
     .await
-    .map_err(|deadline| {
-        proxy_helpers::virtual_member_deadline_response(&member.key, path, deadline)
-    })?;
-    let content = match fetched {
-        Ok((content, _, _budget_permit)) => content,
-        Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
-            return Ok(MemberMetadata::Unavailable)
+    {
+        Ok(fetched) => fetched,
+        Err(deadline) => {
+            proxy_helpers::record_virtual_member_deadline_miss(&member.key, path, deadline);
+            return MemberMetadata::Unavailable;
         }
-        Err(_) => return Ok(MemberMetadata::Miss),
     };
-    Ok(MemberMetadata::from_doc(
-        std::str::from_utf8(&content).ok().map(|s| s.to_string()),
-    ))
+    let (content, stale_since) = match fetched {
+        Ok((content, stale_since, _budget_permit)) => (content, stale_since),
+        Err(resp) if proxy_helpers::is_member_unavailable_response(&resp) => {
+            return MemberMetadata::Unavailable
+        }
+        Err(_) => return MemberMetadata::Miss,
+    };
+    match std::str::from_utf8(&content) {
+        Ok(xml) => MemberMetadata::Doc {
+            xml: xml.to_string(),
+            stale_since,
+        },
+        Err(_) => MemberMetadata::Miss,
+    }
 }
 
 /// [`fetch_remote_member_metadata`] for a GA-level document, with the
@@ -3003,8 +3097,8 @@ async fn fetch_remote_member_metadata_gated(
     member: &crate::models::repository::Repository,
     path: &str,
 ) -> Result<MemberMetadata, Response> {
-    let xml = match fetch_remote_member_metadata(state, member, path).await? {
-        MemberMetadata::Doc(xml) => xml,
+    let (xml, stale_since) = match fetch_remote_member_metadata(state, member, path).await {
+        MemberMetadata::Doc { xml, stale_since } => (xml, stale_since),
         // A miss or an unavailable member: nothing to filter.
         other => return Ok(other),
     };
@@ -3012,7 +3106,7 @@ async fn fetch_remote_member_metadata_gated(
         member.upstream_url.as_deref(),
         state.proxy_service.as_deref(),
     ) else {
-        return Ok(MemberMetadata::Doc(xml));
+        return Ok(MemberMetadata::Doc { xml, stale_since });
     };
     let upstream = MavenGateUpstream {
         proxy,
@@ -3027,9 +3121,13 @@ async fn fetch_remote_member_metadata_gated(
         Bytes::from(xml),
     )
     .await?;
-    Ok(MemberMetadata::from_doc(
-        std::str::from_utf8(&filtered).ok().map(|s| s.to_string()),
-    ))
+    Ok(match std::str::from_utf8(&filtered) {
+        Ok(xml) => MemberMetadata::Doc {
+            xml: xml.to_string(),
+            stale_since,
+        },
+        Err(_) => MemberMetadata::Miss,
+    })
 }
 
 /// Read a Local/Staging virtual member's stored metadata document at `path`.
@@ -3074,43 +3172,51 @@ async fn read_member_stored_metadata(
     None
 }
 
+/// The Maven metadata document at `path` for `repo`, with the marks its
+/// response must carry ([`MetadataMarks`]): a Remote body served under the
+/// `stale-if-error` grace (#5616), a Virtual merge built without a member
+/// that could not answer (#5621) or from a stale member body.
 async fn fetch_maven_metadata_bytes(
     state: &SharedState,
     repo: &RepoInfo,
     repo_key: &str,
     path: &str,
     auth: Option<&AuthExtension>,
-) -> Result<Bytes, Response> {
+) -> Result<(Bytes, MetadataMarks), Response> {
+    let mut marks = MetadataMarks::default();
     // Remote repos: proxy from upstream. No local storage probe, no dynamic
     // generation — the upstream is the source of truth.
     if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            let (content, _, _budget_permit) = proxy_helpers::proxy_fetch_capped_budgeted(
-                proxy,
-                repo.id,
-                repo_key,
-                upstream_url,
-                path,
-                proxy_helpers::LARGE_METADATA_MAX_BYTES,
-                RepositoryFormat::Maven,
-            )
-            .await?;
+            let (content, stale_since, _budget_permit) =
+                proxy_helpers::proxy_fetch_capped_budgeted_stale(
+                    proxy,
+                    repo.id,
+                    repo_key,
+                    upstream_url,
+                    path,
+                    proxy_helpers::LARGE_METADATA_MAX_BYTES,
+                    RepositoryFormat::Maven,
+                )
+                .await?;
             // #4702: withhold versions the age gate refuses.
             let upstream = MavenGateUpstream {
                 proxy,
                 repo_key,
                 upstream_url,
             };
-            return maven_filter_listing(
+            marks.stale(stale_since);
+            let filtered = maven_filter_listing(
                 state,
                 proxy_helpers::age_gate_params(repo),
                 &upstream,
                 path,
                 content,
             )
-            .await;
+            .await?;
+            return Ok((filtered, marks));
         }
         return Err(AppError::NotFound("Metadata not found".to_string()).into_response());
     }
@@ -3127,9 +3233,9 @@ async fn fetch_maven_metadata_bytes(
         // the next caller, anonymous included.
         let merge_cacheable =
             proxy_helpers::virtual_aggregate_cacheable(&state.db, repo.id, true).await;
-        // Whether a member could not answer (#5621): a merge that then finds
-        // no document answers 503, not the 404 Maven/Gradle cache.
-        let mut member_unavailable = false;
+        // The members that could not answer (#5621), in `marks`: a merge that
+        // then finds no document answers 503, not the 404 Maven/Gradle cache,
+        // and one that finds a document is served marked partial.
 
         if let Some((group_id, artifact_id)) = parse_metadata_path(path) {
             // Remote members the GA pass found unavailable in THIS request
@@ -3183,18 +3289,17 @@ async fn fetch_maven_metadata_bytes(
                                 }
                             }))
                             .await;
-                        // A member that missed the deadline fails the merge
-                        // (#4508); nothing is cached for it.
+                        // A member that missed the deadline is unavailable
+                        // like any other that could not answer (#5621); only
+                        // the age-gate filter can fail the merge here.
                         let member_docs = member_docs.into_iter().collect::<Result<Vec<_>, _>>()?;
-                        for (member, doc) in chunk.iter().zip(&member_docs) {
-                            if *doc == MemberMetadata::Unavailable {
+                        for (member, doc) in chunk.iter().zip(member_docs) {
+                            if doc == MemberMetadata::Unavailable {
                                 unavailable_members.insert(member.id);
                             }
-                        }
-                        for xml in member_docs
-                            .into_iter()
-                            .filter_map(|doc| doc.into_doc(&mut member_unavailable))
-                        {
+                            let Some(xml) = marks.note(member, doc) else {
+                                continue;
+                            };
                             if let Some(ts) =
                                 crate::formats::maven::parse_metadata_last_updated(&xml)
                             {
@@ -3239,10 +3344,12 @@ async fn fetch_maven_metadata_bytes(
                         Some(Bytes::from(xml))
                     };
 
-                    // An empty merge with a member that could not answer is
-                    // not a definitive "no versions" (#5621): caching it would
-                    // keep answering for 60 s after the member is back.
-                    if merge_cacheable && (merged.is_some() || !member_unavailable) {
+                    // A merge built without a member that could not answer is
+                    // not the complete answer (#5621): caching it would keep
+                    // answering without that member's versions (or with "no
+                    // versions") for 60 s after the member is back. A merge
+                    // from a stale member body is not kept either (#5616).
+                    if merge_cacheable && marks.cacheable() {
                         VIRTUAL_MAVEN_METADATA_CACHE
                             .insert(cache_key, merged.clone())
                             .await;
@@ -3252,7 +3359,7 @@ async fn fetch_maven_metadata_bytes(
             };
 
             if let Some(xml) = ga_merge {
-                return Ok(xml);
+                return Ok((xml, marks));
             }
 
             // Group-level plugin-prefix metadata (#1595). A path like
@@ -3273,24 +3380,24 @@ async fn fetch_maven_metadata_bytes(
                     // see `read_member_stored_metadata`.
                     if unavailable_members.contains(&member.id) {
                         // Already unavailable this request (#5673); the GA
-                        // pass recorded it in `member_unavailable`.
-                        Ok(MemberMetadata::Unavailable)
+                        // pass recorded it in `marks`.
+                        MemberMetadata::Unavailable
                     } else if member.repo_type == RepositoryType::Remote {
                         fetch_remote_member_metadata(state, member, path).await
                     } else {
-                        Ok(MemberMetadata::from_doc(
+                        MemberMetadata::from_doc(
                             read_member_stored_metadata(state, member, path).await,
-                        ))
+                        )
                     }
                 }))
                 .await;
-                for doc in batch {
-                    member_docs.extend(doc?.into_doc(&mut member_unavailable));
+                for (member, doc) in chunk.iter().zip(batch) {
+                    member_docs.extend(marks.note(member, doc));
                 }
             }
 
             if let Some(xml) = crate::formats::maven::merge_plugin_prefix_metadata(&member_docs) {
-                return Ok(Bytes::from(xml));
+                return Ok((Bytes::from(xml), marks));
             }
         }
 
@@ -3307,13 +3414,11 @@ async fn fetch_maven_metadata_bytes(
             for chunk in members.chunks(proxy_helpers::MAX_VIRTUAL_FANOUT) {
                 let per_member = futures::future::join_all(chunk.iter().map(|member| async {
                     let mut entries: Vec<SnapshotEntry> = Vec::new();
-                    let mut unavailable = false;
+                    let mut answer = MemberMetadata::Miss;
                     if member.repo_type == RepositoryType::Remote {
-                        if let Some(xml_str) = fetch_remote_member_metadata(state, member, path)
-                            .await?
-                            .into_doc(&mut unavailable)
-                        {
-                            entries.extend(parse_snapshot_versions_xml(&xml_str));
+                        answer = fetch_remote_member_metadata(state, member, path).await;
+                        if let MemberMetadata::Doc { xml, .. } = &answer {
+                            entries.extend(parse_snapshot_versions_xml(xml));
                         }
                     } else {
                         // Stored-document read: repo-scoped key first, then the
@@ -3336,12 +3441,13 @@ async fn fetch_maven_metadata_bytes(
                             .await,
                         );
                     }
-                    Ok::<_, Response>((entries, unavailable))
+                    (entries, answer)
                 }))
                 .await;
-                for answer in per_member {
-                    let (entries, unavailable) = answer?;
-                    member_unavailable |= unavailable;
+                for (member, (entries, answer)) in chunk.iter().zip(per_member) {
+                    // Notes an unavailable member or a stale body (#5621,
+                    // #5616); the entries were parsed above.
+                    let _ = marks.note(member, answer);
                     all_entries.extend(entries);
                 }
             }
@@ -3350,12 +3456,12 @@ async fn fetch_maven_metadata_bytes(
                 if let Some(xml) =
                     generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &all_entries)
                 {
-                    return Ok(Bytes::from(xml));
+                    return Ok((Bytes::from(xml), marks));
                 }
             }
         }
 
-        return Err(virtual_metadata_not_found(member_unavailable));
+        return Err(virtual_metadata_not_found(marks.is_partial()));
     }
 
     // Local/Staging repos: try stored metadata file, then dynamic generation.
@@ -3380,7 +3486,7 @@ async fn fetch_maven_metadata_bytes(
         path,
     ) {
         if let Ok(content) = storage.get(&scoped_key).await {
-            return Ok(content);
+            return Ok((content, marks));
         }
     }
     let meta_storage_key = format!("maven/{}", path);
@@ -3393,7 +3499,7 @@ async fn fetch_maven_metadata_bytes(
     .await
     {
         if let Ok(content) = storage.get(&meta_storage_key).await {
-            return Ok(content);
+            return Ok((content, marks));
         }
     }
 
@@ -3401,7 +3507,7 @@ async fn fetch_maven_metadata_bytes(
         if let Ok(xml) =
             generate_metadata_for_artifact(&state.db, repo.id, &group_id, &artifact_id).await
         {
-            return Ok(Bytes::from(xml));
+            return Ok((Bytes::from(xml), marks));
         }
     }
 
@@ -3411,7 +3517,7 @@ async fn fetch_maven_metadata_bytes(
         if let Some(xml) =
             generate_snapshot_metadata_xml(&group_id, &artifact_id, &version, &entries)
         {
-            return Ok(Bytes::from(xml));
+            return Ok((Bytes::from(xml), marks));
         }
     }
 
@@ -13098,12 +13204,14 @@ mod tests {
         );
     }
 
-    /// #4508: a virtual's Remote member whose upstream stalls must not hold
-    /// every `maven-metadata.xml` miss for the upstream's full timeout. The
-    /// member fetch is bounded by the member deadline, and a member that
-    /// misses it fails the request with a 502 naming the member.
+    /// #4508 / #5621: a virtual's Remote member whose upstream stalls must
+    /// not hold every `maven-metadata.xml` miss for the upstream's full
+    /// timeout. The member fetch is bounded by the member deadline; a member
+    /// that misses it is unavailable (it used to fail the request with a 502
+    /// naming it), so with no other member holding the document the answer
+    /// is the retryable 503.
     #[tokio::test]
-    async fn test_virtual_metadata_stalled_member_fails_within_the_deadline_4508() {
+    async fn test_virtual_metadata_stalled_member_answers_503_within_the_deadline_5621() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::extract::{Path, State};
         use axum::Extension;
@@ -13174,11 +13282,8 @@ mod tests {
             .await
             .expect("read body");
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(
-            body.contains(&remote_key),
-            "the 502 must name the member: {body}"
-        );
+        let _ = remote_key;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(
             elapsed < Duration::from_secs(3),
             "the deadline must bound the wait: took {elapsed:?}"
@@ -13400,6 +13505,224 @@ mod tests {
             vec![None],
             "an empty merge with an unavailable member must not be cached (#5621)"
         );
+    }
+
+    /// #5621: a Remote member that misses the member deadline in front of a
+    /// healthy one used to fail the whole merge with 502. It is left out: the
+    /// healthy member's versions are served for the metadata and its
+    /// checksums, marked partial and uncacheable, and the merge is not kept
+    /// in the virtual metadata cache, so the next request asks the member
+    /// again.
+    #[tokio::test]
+    async fn test_virtual_metadata_stalled_member_is_left_out_5621() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream_meta = generate_metadata_xml(
+            "com.stall5621",
+            "lib",
+            &["2.0.0".to_string()],
+            "2.0.0",
+            Some("2.0.0"),
+            "20240101000000",
+        );
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex("^/hung/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<metadata/>")
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(path_regex("^/ok/.*maven-metadata\\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
+            .mount(&upstream)
+            .await;
+        let scratch = std::env::temp_dir().join(format!("mvn5621s-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let members = [
+            format!("{}/hung", upstream.uri()),
+            format!("{}/ok", upstream.uri()),
+        ];
+        let (virtual_id, virtual_key, repos) = metadata_outage_virtual_5621(&pool, &members).await;
+        let hung_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(repos[1].0)
+            .fetch_one(&pool)
+            .await
+            .expect("hung member key");
+
+        let started = std::time::Instant::now();
+        let mut answers = Vec::new();
+        for suffix in ["", ".sha1"] {
+            answers.push((
+                suffix,
+                crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+                    Duration::from_millis(300),
+                    tdh::send_with_headers(
+                        tdh::router_anon(router(), state.clone()),
+                        tdh::get(format!(
+                            "/{virtual_key}/com/stall5621/lib/maven-metadata.xml{suffix}"
+                        )),
+                    ),
+                )
+                .await,
+            ));
+        }
+        let elapsed = started.elapsed();
+        let key = (virtual_id, "com.stall5621".to_string(), "lib".to_string());
+        let cached = VIRTUAL_MAVEN_METADATA_CACHE.get(&key).await;
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        for (suffix, (status, body, headers)) in &answers {
+            let body = String::from_utf8_lossy(body);
+            assert_eq!(*status, StatusCode::OK, "{suffix}: {body}");
+            if suffix.is_empty() {
+                assert!(
+                    body.contains("<version>2.0.0</version>"),
+                    "the healthy member's versions are served: {body}"
+                );
+            }
+            assert_eq!(
+                headers
+                    .get(crate::api::handlers::proxy_helpers::PARTIAL_MEMBERS_HEADER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(hung_key.as_str()),
+                "{suffix}: the response names the member it lacks"
+            );
+            assert_eq!(
+                headers
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{suffix}"
+            );
+            assert!(headers.get(axum::http::header::ETAG).is_none(), "{suffix}");
+        }
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the deadline must bound the wait: took {elapsed:?}"
+        );
+        assert_eq!(
+            cached, None,
+            "a merge built without an unavailable member must not be cached (#5621)"
+        );
+    }
+
+    /// #5616: a Remote `maven-metadata.xml` (and its checksum) served under
+    /// the `stale-if-error` grace, because the upstream answers 503 after
+    /// the cached copy's TTL lapsed, carries `Warning: 110` and
+    /// `X-AK-Stale-Since` like every other stale serve (#4581); so does a
+    /// Virtual merge built from that member's stale copy.
+    #[tokio::test]
+    async fn test_remote_metadata_served_stale_is_marked_5616() {
+        use crate::api::handlers::proxy_helpers::{STALE_SINCE_HEADER, STALE_WARNING};
+        use crate::api::handlers::test_db_helpers as tdh;
+        use wiremock::matchers::path_regex;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let upstream_meta = generate_metadata_xml(
+            "com.stale5616",
+            "lib",
+            &["1.0.0".to_string()],
+            "1.0.0",
+            Some("1.0.0"),
+            "20240101000000",
+        );
+        let upstream = MockServer::start().await;
+        Mock::given(path_regex(".*maven-metadata\\.xml$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(upstream_meta))
+            .mount(&upstream)
+            .await;
+        let (virtual_id, virtual_key, repos) =
+            metadata_outage_virtual_5621(&pool, &[upstream.uri()]).await;
+        let remote_id = repos[1].0;
+        let remote_key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+            .bind(remote_id)
+            .fetch_one(&pool)
+            .await
+            .expect("remote key");
+        // A one-second TTL, so the cached copy is past it a moment later.
+        sqlx::query(
+            "INSERT INTO repository_config (repository_id, key, value) \
+             VALUES ($1, 'cache_ttl_secs', '1')",
+        )
+        .bind(remote_id)
+        .execute(&pool)
+        .await
+        .expect("store cache_ttl_secs");
+        let scratch = std::env::temp_dir().join(format!("mvn5616-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        let proxy = tdh::build_proxy_service_with_fs(pool.clone(), scratch.to_str().unwrap());
+        let state = tdh::build_state_with_proxy(pool.clone(), scratch.to_str().unwrap(), proxy);
+        let get = |repo: &str, suffix: &str| {
+            tdh::send_with_headers(
+                tdh::router_anon(router(), state.clone()),
+                tdh::get(format!(
+                    "/{repo}/com/stale5616/lib/maven-metadata.xml{suffix}"
+                )),
+            )
+        };
+
+        let (fresh_status, _, fresh_headers) = get(&remote_key, "").await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        upstream.reset().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+        let mut stale = Vec::new();
+        for (repo, suffix) in [
+            (remote_key.as_str(), ""),
+            (remote_key.as_str(), ".sha1"),
+            (virtual_key.as_str(), ""),
+            (virtual_key.as_str(), ".sha1"),
+        ] {
+            stale.push((repo.to_string(), suffix, get(repo, suffix).await));
+        }
+        let _ = sqlx::query("DELETE FROM repository_config WHERE repository_id = $1")
+            .bind(remote_id)
+            .execute(&pool)
+            .await;
+        let _ = virtual_id;
+        for (id, dir) in &repos {
+            tdh::cleanup_member_repo(&pool, *id, dir).await;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert_eq!(fresh_status, StatusCode::OK);
+        assert!(fresh_headers.get(STALE_SINCE_HEADER).is_none());
+        for (repo, suffix, (status, body, headers)) in &stale {
+            let body = String::from_utf8_lossy(body);
+            assert_eq!(
+                *status,
+                StatusCode::OK,
+                "{repo} {suffix}: stale-if-error: {body}"
+            );
+            assert!(
+                headers
+                    .get_all(axum::http::header::WARNING)
+                    .iter()
+                    .any(|v| v.to_str().ok() == Some(STALE_WARNING)),
+                "{repo} {suffix}: Warning: 110 missing: {headers:?}"
+            );
+            assert!(
+                headers.get(STALE_SINCE_HEADER).is_some(),
+                "{repo} {suffix}: X-AK-Stale-Since missing: {headers:?}"
+            );
+        }
     }
 
     /// #1562: a virtual repo must serve an artifact that one of its REMOTE

@@ -552,8 +552,9 @@ async fn index_yaml(
             }
         }
 
-        // A member that failed is a 502 above (#4192), unless the virtual
-        // allows partial merges: then the index is marked as such.
+        // An unavailable member is left out and the index marked partial
+        // (#5621); a member whose index does not parse is a 502 above unless
+        // the virtual allows partial merges (#4192).
         return remote_indexes
             .partial
             .apply(build_index_response(all_charts, None));
@@ -4635,12 +4636,13 @@ mod virtual_member_authz_tests {
     }
 }
 
-/// #4192 / #4508: a Remote member of a virtual Helm repository whose
-/// `index.yaml` cannot be fetched or parsed, or that does not answer within
-/// the member deadline, fails the merged index loudly (502 naming the member)
-/// instead of serving an index that silently lacks the member. A member that
-/// answers 404 publishes nothing and is not a failure; a virtual that opted
-/// into partial merges serves the rest, marked partial and uncacheable.
+/// #4192 / #4508 / #5621: a Remote member of a virtual Helm repository whose
+/// `index.yaml` does not parse fails the merged index loudly (502 naming the
+/// member) unless the virtual opted into partial merges. A member that is
+/// unavailable (5xx, the member deadline) is left out and the index served
+/// marked partial and uncacheable, or a 503 with `Retry-After` when no member
+/// answered. A member that answers 404 or another permanent 4xx publishes
+/// nothing and is not a failure.
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod virtual_member_failure_tests {
@@ -4745,42 +4747,125 @@ mod virtual_member_failure_tests {
         upstream(ResponseTemplate::new(200).set_body_string(GOOD_INDEX)).await
     }
 
-    /// #4192: a member answering 500 or a document that does not parse fails
-    /// the merged index with 502 naming that member, by default.
-    #[tokio::test]
-    async fn failed_member_fails_the_merged_index_by_default_4192() {
-        let Some(pool) = tdh::try_pool().await else {
-            return;
-        };
-        for bad in [
-            ResponseTemplate::new(500),
-            ResponseTemplate::new(200).set_body_string("entries: [this is: not an index"),
-        ] {
-            let good = good_upstream().await;
-            let bad = upstream(bad).await;
-            let rig = Rig::new(pool.clone(), &[good.uri(), bad.uri()]).await;
-            let (status, body, _) = rig.index().await;
-            let bad_key = rig.member_keys[1].clone();
-            rig.cleanup().await;
-
-            let body = String::from_utf8_lossy(&body);
-            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-            assert!(
-                body.contains(&bad_key),
-                "the 502 must name the member: {body}"
-            );
-        }
+    fn unparseable() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_string("entries: [this is: not an index")
     }
 
-    /// #4192: with `virtual_metadata_partial` the healthy members are served,
-    /// the missing member is named, and the response is not cacheable.
+    fn assert_partial(headers: &HeaderMap, missing: &str) {
+        assert_eq!(
+            headers
+                .get("x-ak-partial-members")
+                .and_then(|v| v.to_str().ok()),
+            Some(missing)
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(headers.get(axum::http::header::WARNING).is_some());
+        assert!(headers.get(axum::http::header::ETAG).is_none());
+    }
+
+    /// #4192: a member whose document does not parse fails the merged index
+    /// with 502 naming that member, by default. (Before #5621 a member
+    /// answering 500 did too; it is now left out, see below.)
     #[tokio::test]
-    async fn failed_member_is_served_partial_when_the_virtual_allows_it_4192() {
+    async fn unparseable_member_fails_the_merged_index_by_default_4192() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
         let good = good_upstream().await;
-        let bad = upstream(ResponseTemplate::new(500)).await;
+        let bad = upstream(unparseable()).await;
+        let rig = Rig::new(pool, &[good.uri(), bad.uri()]).await;
+        let (status, body, _) = rig.index().await;
+        let bad_key = rig.member_keys[1].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body.contains(&bad_key),
+            "the 502 must name the member: {body}"
+        );
+    }
+
+    /// #5621: a member answering 503 in front of a healthy one is left out:
+    /// the healthy member's charts are served, marked partial and
+    /// uncacheable, without `virtual_metadata_partial`.
+    #[tokio::test]
+    async fn unavailable_member_is_left_out_and_marked_partial_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let bad = upstream(ResponseTemplate::new(503)).await;
+        let good = good_upstream().await;
+        let rig = Rig::new(pool, &[bad.uri(), good.uri()]).await;
+        let (status, body, headers) = rig.index().await;
+        let bad_key = rig.member_keys[0].clone();
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert_partial(&headers, &bad_key);
+    }
+
+    /// #5621: a member answering a permanent 401/403/451 is a miss, as in the
+    /// artifact walk (#5504): the healthy member is served complete.
+    #[tokio::test]
+    async fn permanently_refusing_member_is_a_miss_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        for code in [401, 403, 451] {
+            let refusing = upstream(ResponseTemplate::new(code)).await;
+            let good = good_upstream().await;
+            let rig = Rig::new(pool.clone(), &[refusing.uri(), good.uri()]).await;
+            let (status, body, headers) = rig.index().await;
+            rig.cleanup().await;
+
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::OK, "{code}: {body}");
+            assert!(body.contains("alpha"), "{code}: {body}");
+            assert!(
+                headers.get("x-ak-partial-members").is_none(),
+                "{code}: a permanent answer is not a partial merge"
+            );
+        }
+    }
+
+    /// #5621: with no member able to answer, the index is a retryable 503
+    /// with `Retry-After`, never a 502 or an empty index.
+    #[tokio::test]
+    async fn only_unavailable_members_answer_503_5621() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let bad = upstream(ResponseTemplate::new(503)).await;
+        let rig = Rig::new(pool, &[bad.uri()]).await;
+        let (status, body, headers) = rig.index().await;
+        rig.cleanup().await;
+
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            headers.get(axum::http::header::RETRY_AFTER).is_some(),
+            "the 503 must carry Retry-After"
+        );
+    }
+
+    /// #4192: with `virtual_metadata_partial` a member whose document does
+    /// not parse is left out: the healthy members are served, the missing
+    /// member is named, and the response is not cacheable.
+    #[tokio::test]
+    async fn unparseable_member_is_served_partial_when_the_virtual_allows_it_4192() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let good = good_upstream().await;
+        let bad = upstream(unparseable()).await;
         let rig = Rig::new(pool, &[good.uri(), bad.uri()]).await;
         rig.allow_partial().await;
         let (status, body, headers) = rig.index().await;
@@ -4790,19 +4875,7 @@ mod virtual_member_failure_tests {
         let body = String::from_utf8_lossy(&body);
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body.contains("alpha"), "{body}");
-        assert_eq!(
-            headers
-                .get("x-ak-partial-members")
-                .and_then(|v| v.to_str().ok()),
-            Some(bad_key.as_str())
-        );
-        assert_eq!(
-            headers
-                .get(axum::http::header::CACHE_CONTROL)
-                .and_then(|v| v.to_str().ok()),
-            Some("no-store")
-        );
-        assert!(headers.get(axum::http::header::WARNING).is_some());
+        assert_partial(&headers, &bad_key);
     }
 
     /// #4192: a member that answers 404 publishes no index; that is not a
@@ -4824,12 +4897,12 @@ mod virtual_member_failure_tests {
         assert!(headers.get("x-ak-partial-members").is_none());
     }
 
-    /// #4508: a member that does not answer within the member deadline fails
-    /// the merged index with 502 naming it, promptly, instead of holding the
-    /// request for the upstream's full timeout (which outlasts a reverse
-    /// proxy's and turns into a 504).
+    /// #4508 / #5621: a member that does not answer within the member
+    /// deadline is left out promptly, instead of holding the request for the
+    /// upstream's full timeout (which outlasts a reverse proxy's and turns
+    /// into a 504); the healthy member is served, marked partial.
     #[tokio::test]
-    async fn stalled_member_fails_within_the_deadline_4508() {
+    async fn stalled_member_is_left_out_within_the_deadline_5621() {
         let Some(pool) = tdh::try_pool().await else {
             return;
         };
@@ -4842,18 +4915,20 @@ mod virtual_member_failure_tests {
         .await;
         let rig = Rig::new(pool, &[good.uri(), stalled.uri()]).await;
         let started = std::time::Instant::now();
-        let (status, body, _) = crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
-            std::time::Duration::from_millis(300),
-            rig.index(),
-        )
-        .await;
+        let (status, body, headers) =
+            crate::api::handlers::proxy_helpers::with_virtual_member_deadline(
+                std::time::Duration::from_millis(300),
+                rig.index(),
+            )
+            .await;
         let elapsed = started.elapsed();
         let stalled_key = rig.member_keys[1].clone();
         rig.cleanup().await;
 
         let body = String::from_utf8_lossy(&body);
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-        assert!(body.contains(&stalled_key), "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("alpha"), "{body}");
+        assert_partial(&headers, &stalled_key);
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "the deadline must bound the wait: took {elapsed:?}"
