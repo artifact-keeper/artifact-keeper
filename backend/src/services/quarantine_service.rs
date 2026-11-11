@@ -592,6 +592,47 @@ pub async fn transition(
     Ok(())
 }
 
+/// The admin rejection of [`transition`], bound to the bytes the
+/// administrator saw (#5646), as [`quarantine_now_bound`] is: when an OCI tag
+/// moved to another image before the write, the old image's row is rejected
+/// (it must itself be quarantined, as for any rejection), never the new one.
+pub async fn reject_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    reason: Option<&str>,
+    expected_digest: Option<&str>,
+) -> Result<HoldOutcome> {
+    let seen = hold_binding(db, artifact_id, expected_digest).await?;
+    let not_quarantined = || {
+        AppError::Conflict(
+            "Artifact is not in quarantined state; transition not allowed".to_string(),
+        )
+    };
+    bound_hold_write(
+        db,
+        artifact_id,
+        seen,
+        "rejected",
+        not_quarantined,
+        |id, seen| async move {
+            sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'rejected', quarantine_until = NULL, \
+             quarantine_reason = COALESCE($2, quarantine_reason) \
+             WHERE id = $1 AND quarantine_status = 'quarantined' \
+               AND ($3::text IS NULL OR checksum_sha256 = $3::bpchar)",
+            )
+            .bind(id)
+            .bind(reason)
+            .bind(seen)
+            .execute(db)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| AppError::Database(e.to_string()))
+        },
+    )
+    .await
+}
+
 /// Release a scan-policy hold whose policy no longer refuses the artifact (#5153).
 ///
 /// A hold with `quarantine_source = 'scan_policy'` exists only because of the
@@ -606,13 +647,29 @@ pub async fn release_cleared_scan_policy_hold(
     actor: Option<Uuid>,
     released_by: &str,
 ) -> Result<bool> {
+    release_cleared_scan_policy_hold_bound(db, artifact_id, actor, released_by, None).await
+}
+
+/// [`release_cleared_scan_policy_hold`] only while the row still holds the
+/// bytes `seen` (sha256 hex) the policy was evaluated on (#5646), so a rescan
+/// of an OCI image whose tag moved meanwhile cannot release the new image's
+/// hold. `None` releases unbound.
+pub async fn release_cleared_scan_policy_hold_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    actor: Option<Uuid>,
+    released_by: &str,
+    seen: Option<&str>,
+) -> Result<bool> {
     let released = sqlx::query(
         "UPDATE artifacts SET quarantine_status = 'released', quarantine_until = NULL, \
              quarantine_reason = NULL, quarantine_source = NULL \
          WHERE id = $1 AND quarantine_status = 'quarantined' \
-           AND quarantine_until IS NULL AND quarantine_source = 'scan_policy'",
+           AND quarantine_until IS NULL AND quarantine_source = 'scan_policy' \
+           AND ($2::text IS NULL OR checksum_sha256 = $2::bpchar)",
     )
     .bind(artifact_id)
+    .bind(seen)
     .execute(db)
     .await
     .map_err(|e| AppError::Database(e.to_string()))?
@@ -660,37 +717,179 @@ pub async fn quarantine_now(
     artifact_id: Uuid,
     reason: Option<String>,
 ) -> Result<&'static str> {
+    Ok(quarantine_now_bound(db, artifact_id, reason, None)
+        .await?
+        .status)
+}
+
+/// What an administrator's hold did (#5646): the status written and, when
+/// the OCI tag it named moved to another image before the hold landed, the
+/// row of the old digest that took the hold instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldOutcome {
+    pub status: &'static str,
+    pub moved: Option<MovedHold>,
+}
+
+/// The hold landed on the image the tag named when it was read, not on the
+/// one it names now (#5646).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedHold {
+    /// The row of `held_digest` that carries the hold.
+    pub artifact_id: Uuid,
+    pub held_digest: String,
+    /// The digest the tag names now; it is not held by this action.
+    pub moved_to: String,
+}
+
+/// The sha256 hex a hold on `artifact_id` binds to (#5646): the operator's
+/// `expected_digest` (`sha256:<hex>`) when given, else the checksum of a live
+/// OCI manifest row as read now. `None` (no binding) for any other row.
+async fn hold_binding(
+    db: &PgPool,
+    artifact_id: Uuid,
+    expected_digest: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(expected) = expected_digest {
+        let hex = expected
+            .strip_prefix("sha256:")
+            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "expected_digest must be a sha256 digest (sha256:<64 hex>)".to_string(),
+                )
+            })?;
+        return Ok(Some(hex.to_ascii_lowercase()));
+    }
+    crate::services::oci_manifests::manifest_checksum(db, artifact_id)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
+}
+
+/// Run a hold write `write(row_id, seen)` bound to the bytes `seen` (#5646).
+/// The write must match its row only while the row still holds `seen`. When
+/// it matched nothing because an OCI tag moved, it is run once more against a
+/// row of the old digest ([`hold_target`]), and the outcome says so. A write
+/// that matched nothing for any other reason answers `refused`.
+///
+/// [`hold_target`]: crate::services::oci_manifests::hold_target
+async fn bound_hold_write<F, Fut>(
+    db: &PgPool,
+    artifact_id: Uuid,
+    seen: Option<String>,
+    status: &'static str,
+    refused: impl Fn() -> AppError,
+    write: F,
+) -> Result<HoldOutcome>
+where
+    F: Fn(Uuid, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
+    if write(artifact_id, seen.clone()).await? > 0 {
+        return Ok(HoldOutcome {
+            status,
+            moved: None,
+        });
+    }
+    let Some(seen) = seen else {
+        return Err(refused());
+    };
+    use crate::services::oci_manifests::{hold_target, HoldTarget};
+    match hold_target(db, artifact_id, &seen)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?
+    {
+        HoldTarget::Same => Err(refused()),
+        HoldTarget::Gone {
+            held_digest,
+            moved_to,
+        } => Err(AppError::Conflict(format!(
+            "The tag moved to {moved_to} before the hold was applied, and {held_digest} has \
+             no row left to hold; nothing was changed"
+        ))),
+        HoldTarget::Moved {
+            artifact_id: target,
+            held_digest,
+            moved_to,
+        } => {
+            if write(target, Some(seen)).await? == 0 {
+                return Err(refused());
+            }
+            tracing::warn!(
+                %artifact_id,
+                held_artifact_id = %target,
+                %held_digest,
+                %moved_to,
+                status,
+                "OCI tag moved before the hold was applied; held the digest it named when read"
+            );
+            Ok(HoldOutcome {
+                status,
+                moved: Some(MovedHold {
+                    artifact_id: target,
+                    held_digest,
+                    moved_to,
+                }),
+            })
+        }
+    }
+}
+
+/// [`quarantine_now`] bound to the bytes the administrator saw (#5646):
+/// `expected_digest`, or for an OCI manifest row the digest it names when
+/// read. When an OCI tag moved to another image before the write, the old
+/// image is quarantined (through a row of its digest) and the new one is
+/// left alone; [`HoldOutcome::moved`] names both digests.
+pub async fn quarantine_now_bound(
+    db: &PgPool,
+    artifact_id: Uuid,
+    reason: Option<String>,
+    expected_digest: Option<&str>,
+) -> Result<HoldOutcome> {
     let Some((status, _until, _reason)) = fetch_quarantine_fields(db, artifact_id).await? else {
         return Err(AppError::NotFound(format!(
             "Artifact {artifact_id} not found"
         )));
     };
-    if !admin_quarantine_allowed(status.as_deref()) {
-        return Err(AppError::Conflict(
+    let rejected = || {
+        AppError::Conflict(
             "Artifact was rejected during security review; cannot re-quarantine".to_string(),
-        ));
+        )
+    };
+    if !admin_quarantine_allowed(status.as_deref()) {
+        return Err(rejected());
     }
     let reason = reason.unwrap_or_else(|| "Quarantined by administrator".to_string());
+    let seen = hold_binding(db, artifact_id, expected_digest).await?;
     // Re-check `rejected` in the statement as well: the read above and this write
     // are not atomic, so a concurrent admin reject must not be downgraded.
-    let result = sqlx::query(
-        "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
-         quarantine_reason = $2, quarantine_source = 'admin' \
-         WHERE id = $1 AND is_deleted = false \
-           AND quarantine_status IS DISTINCT FROM 'rejected'",
+    bound_hold_write(
+        db,
+        artifact_id,
+        seen,
+        "quarantined",
+        rejected,
+        |id, seen| {
+            let reason = reason.clone();
+            async move {
+                sqlx::query(
+                "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
+                 quarantine_reason = $2, quarantine_source = 'admin' \
+                 WHERE id = $1 AND is_deleted = false \
+                   AND quarantine_status IS DISTINCT FROM 'rejected' \
+                   AND ($3::text IS NULL OR checksum_sha256 = $3::bpchar)",
+            )
+            .bind(id)
+            .bind(reason)
+            .bind(seen)
+            .execute(db)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| AppError::Database(e.to_string()))
+            }
+        },
     )
-    .bind(artifact_id)
-    .bind(reason)
-    .execute(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
-
-    if result.rows_affected() == 0 {
-        return Err(AppError::Conflict(
-            "Artifact was rejected during security review; cannot re-quarantine".to_string(),
-        ));
-    }
-    Ok("quarantined")
 }
 
 /// Fetch the raw `(quarantine_status, quarantine_until, quarantine_reason)`

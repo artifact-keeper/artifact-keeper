@@ -10080,7 +10080,11 @@ impl ScannerService {
                     // is a pure re-derivation from existing rows, so it is cheap and
                     // idempotent (#2912).
                     if let Err(e) = self
-                        .update_quarantine_status(artifact_id, source_scan.findings_count)
+                        .update_quarantine_status_of(
+                            artifact_id,
+                            Some(&artifact.checksum_sha256),
+                            source_scan.findings_count,
+                        )
                         .await
                     {
                         warn!(
@@ -10130,8 +10134,12 @@ impl ScannerService {
                         );
                         catalog_set.record_reused(&reused.scan_completeness);
                         // Update quarantine status based on copied findings
-                        self.update_quarantine_status(artifact_id, reused.findings_count)
-                            .await?;
+                        self.update_quarantine_status_of(
+                            artifact_id,
+                            Some(&artifact.checksum_sha256),
+                            reused.findings_count,
+                        )
+                        .await?;
                         continue;
                     }
                     Err(e) => {
@@ -10394,6 +10402,7 @@ impl ScannerService {
                         error!("Scan of artifact {}: {}", artifact_id, reason);
                         self.record_failed_scan(
                             artifact_id,
+                            &artifact.checksum_sha256,
                             scan_result.id,
                             scanner.as_ref(),
                             &reason,
@@ -10580,7 +10589,12 @@ impl ScannerService {
                     );
 
                     // Update quarantine status
-                    self.update_quarantine_status(artifact_id, total).await?;
+                    self.update_quarantine_status_of(
+                        artifact_id,
+                        Some(&artifact.checksum_sha256),
+                        total,
+                    )
+                    .await?;
                 }
                 Err(AppError::ScannerEngineUnavailable(reason)) => {
                     // #2059 dropped the trivy CLI from the runtime image (image
@@ -10624,6 +10638,7 @@ impl ScannerService {
                     );
                     self.record_failed_scan(
                         artifact_id,
+                        &artifact.checksum_sha256,
                         scan_result.id,
                         scanner.as_ref(),
                         &e.to_string(),
@@ -11278,6 +11293,7 @@ impl ScannerService {
     async fn record_failed_scan(
         &self,
         artifact_id: Uuid,
+        scanned: &str,
         scan_result_id: Uuid,
         scanner: &dyn Scanner,
         reason: &str,
@@ -11347,7 +11363,8 @@ impl ScannerService {
         // 'flagged' is downloadable, so a `block_on_fail` policy has to
         // be applied here — this path never reaches
         // update_quarantine_status (#2912).
-        self.enforce_policy_after_failed_scan(artifact_id).await;
+        self.enforce_policy_after_failed_scan(artifact_id, scanned)
+            .await;
         Ok(())
     }
 
@@ -11362,7 +11379,11 @@ impl ScannerService {
     /// Escalate-only: on a violation the artifact becomes a permanent quarantine;
     /// a clean evaluation leaves the `flagged` status the caller just set, so this
     /// can never downgrade. Guarded against `rejected`, and fails open on error.
-    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid) {
+    ///
+    /// The hold binds to the bytes the scan read (`scanned`, #5646): when an
+    /// OCI tag moved to another image during the scan, the old image's row is
+    /// held, not the new one.
+    async fn enforce_policy_after_failed_scan(&self, artifact_id: Uuid, scanned: &str) {
         let repository_id: Option<Uuid> =
             match sqlx::query_scalar("SELECT repository_id FROM artifacts WHERE id = $1")
                 .bind(artifact_id)
@@ -11406,16 +11427,31 @@ impl ScannerService {
             violations = %reason,
             "Quarantining artifact after failed scan due to scan policy violation"
         );
+        let (row_id, bind) = match self.scan_hold_row(artifact_id, Some(scanned)).await {
+            Ok(Some(target)) => target,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    error = %e,
+                    "Failed to resolve the scanned image's row; not quarantining"
+                );
+                return;
+            }
+        };
         if let Err(e) = sqlx::query(
             "UPDATE artifacts SET quarantine_status = 'quarantined', quarantine_until = NULL, \
              quarantine_reason = $2, \
              quarantine_source = CASE WHEN quarantine_status = 'quarantined' \
                                            AND quarantine_until IS NULL \
-                                      THEN quarantine_source ELSE 'scan_policy' END \
-             WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected'",
+                                      THEN quarantine_source ELSE $4 END \
+             WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'rejected' \
+               AND ($3::text IS NULL OR checksum_sha256 = $3::bpchar)",
         )
-        .bind(artifact_id)
+        .bind(row_id)
         .bind(&reason)
+        .bind(bind.as_deref())
+        .bind(scan_hold_source(artifact_id, row_id))
         .execute(&self.db)
         .await
         {
@@ -11437,7 +11473,91 @@ impl ScannerService {
     /// and clears the quarantine_until timestamp. Uses a conditional UPDATE
     /// (`WHERE quarantine_status = 'quarantined'`) to prevent a clean scan
     /// from overwriting a rejection set by an admin or another scanner.
+    #[cfg(test)]
     async fn update_quarantine_status(&self, artifact_id: Uuid, findings_count: i32) -> Result<()> {
+        self.update_quarantine_status_of(artifact_id, None, findings_count)
+            .await
+    }
+
+    /// The row a hold decided by a scan of `artifact_id` lands on, and the
+    /// checksum the write binds to (#5646). `scanned` is the sha256 hex of
+    /// the bytes the scan read. For an OCI manifest row whose tag moved to
+    /// another image meanwhile, that is a row of the scanned digest
+    /// ([`oci_manifests::hold_target`]); `None` when the scanned digest has
+    /// no row left, so nothing is written. Any other row is written as before,
+    /// unbound.
+    ///
+    /// [`oci_manifests::hold_target`]: crate::services::oci_manifests::hold_target
+    async fn scan_hold_row(
+        &self,
+        artifact_id: Uuid,
+        scanned: Option<&str>,
+    ) -> Result<Option<(Uuid, Option<String>)>> {
+        use crate::services::oci_manifests::{hold_target, manifest_checksum, HoldTarget};
+        let db_err = |e: sqlx::Error| AppError::Database(e.to_string());
+        let Some(scanned) = scanned else {
+            return Ok(Some((artifact_id, None)));
+        };
+        if manifest_checksum(&self.db, artifact_id)
+            .await
+            .map_err(db_err)?
+            .is_none()
+        {
+            return Ok(Some((artifact_id, None)));
+        }
+        let bind = Some(scanned.trim().to_ascii_lowercase());
+        Ok(
+            match hold_target(&self.db, artifact_id, scanned.trim())
+                .await
+                .map_err(db_err)?
+            {
+                HoldTarget::Same => Some((artifact_id, bind)),
+                HoldTarget::Moved {
+                    artifact_id: target,
+                    held_digest,
+                    moved_to,
+                } => {
+                    tracing::info!(
+                        %artifact_id,
+                        held_artifact_id = %target,
+                        %held_digest,
+                        %moved_to,
+                        "OCI tag moved during the scan; its verdict applies to the scanned digest"
+                    );
+                    Some((target, bind))
+                }
+                HoldTarget::Gone {
+                    held_digest,
+                    moved_to,
+                } => {
+                    tracing::info!(
+                        %artifact_id,
+                        %held_digest,
+                        %moved_to,
+                        "OCI tag moved during the scan and the scanned digest has no row left; \
+                         verdict not applied"
+                    );
+                    None
+                }
+            },
+        )
+    }
+
+    /// [`Self::update_quarantine_status`] for the bytes `scanned` (sha256
+    /// hex) the scan read (#5646): see [`Self::scan_hold_row`]. The policy is
+    /// evaluated on `artifact_id`, whose scan results these are; the state
+    /// read and written is that of the row the verdict lands on.
+    async fn update_quarantine_status_of(
+        &self,
+        scanned_artifact_id: Uuid,
+        scanned: Option<&str>,
+        findings_count: i32,
+    ) -> Result<()> {
+        let Some((artifact_id, bind)) = self.scan_hold_row(scanned_artifact_id, scanned).await?
+        else {
+            return Ok(());
+        };
+        let hold_source = scan_hold_source(scanned_artifact_id, artifact_id);
         // Read the quarantine state and the owning repository in one round trip:
         // whether the artifact is in quarantine-period mode, whether that
         // quarantine is a timed hold (upload/age-gate, non-NULL quarantine_until)
@@ -11463,7 +11583,10 @@ impl ScannerService {
         let policy_result = match repository_id {
             Some(repository_id) => {
                 let svc = crate::services::policy_service::PolicyService::new(self.db.clone());
-                match svc.evaluate_artifact(artifact_id, repository_id).await {
+                match svc
+                    .evaluate_artifact(scanned_artifact_id, repository_id)
+                    .await
+                {
                     Ok(r) => Some(r),
                     Err(e) => {
                         tracing::warn!(
@@ -11493,11 +11616,12 @@ impl ScannerService {
         if matches!(current_status.as_deref(), Some("quarantined"))
             && !has_timed_hold
             && policy_result.as_ref().is_some_and(|p| p.allowed)
-            && crate::services::quarantine_service::release_cleared_scan_policy_hold(
+            && crate::services::quarantine_service::release_cleared_scan_policy_hold_bound(
                 &self.db,
                 artifact_id,
                 None,
                 "scan",
+                bind.as_deref(),
             )
             .await?
         {
@@ -11519,7 +11643,7 @@ impl ScannerService {
             );
         }
 
-        if decision.clear_until {
+        let written = if decision.clear_until {
             // Guard on BOTH halves of the predicate that selected this branch: the
             // artifact must still be quarantined AND still carry a timed hold.
             // Re-checking only the status would let this write land on an admin
@@ -11531,14 +11655,17 @@ impl ScannerService {
                 "UPDATE artifacts SET quarantine_status = $2, quarantine_until = NULL, \
                        quarantine_reason = CASE WHEN $2 = 'released' THEN NULL \
                                                 ELSE COALESCE($3, quarantine_reason) END, \
-                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN $5 \
                                                 ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status = 'quarantined' \
-                       AND quarantine_until IS NOT NULL",
+                       AND quarantine_until IS NOT NULL \
+                       AND ($4::text IS NULL OR checksum_sha256 = $4::bpchar)",
             )
             .bind(artifact_id)
             .bind(&decision.status)
             .bind(&decision.reason)
+            .bind(bind.as_deref())
+            .bind(hold_source)
             .execute(&self.db)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -11550,6 +11677,7 @@ impl ScannerService {
                     "Quarantine transition skipped: artifact is no longer under a timed hold"
                 );
             }
+            result.rows_affected()
         } else {
             // Deliberate change from the unguarded pre-enforcement UPDATE: a
             // completing scan must never downgrade a concurrently set admin
@@ -11558,19 +11686,54 @@ impl ScannerService {
                 "UPDATE artifacts SET quarantine_status = $2, \
                        quarantine_until = CASE WHEN $2 = 'quarantined' THEN NULL ELSE quarantine_until END, \
                        quarantine_reason = $3, \
-                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN 'scan_policy' \
+                       quarantine_source = CASE WHEN $2 = 'quarantined' THEN $5 \
                                                 ELSE quarantine_source END \
                  WHERE id = $1 AND quarantine_status IS DISTINCT FROM 'quarantined' \
-                       AND quarantine_status IS DISTINCT FROM 'rejected'",
+                       AND quarantine_status IS DISTINCT FROM 'rejected' \
+                       AND ($4::text IS NULL OR checksum_sha256 = $4::bpchar)",
             )
             .bind(artifact_id)
             .bind(&decision.status)
             .bind(&decision.reason)
+            .bind(bind.as_deref())
+            .bind(hold_source)
             .execute(&self.db)
             .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected()
+        };
+        // #5646: the tag moved between the row was resolved and the write,
+        // which the checksum binding then refused: decide again for the row of
+        // the scanned digest (once: that row's checksum never changes).
+        if written == 0
+            && bind.is_some()
+            && artifact_id == scanned_artifact_id
+            && crate::services::oci_manifests::manifest_checksum(&self.db, artifact_id)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?
+                .is_some_and(|now| Some(now.to_ascii_lowercase()) != bind)
+        {
+            return Box::pin(self.update_quarantine_status_of(
+                scanned_artifact_id,
+                scanned,
+                findings_count,
+            ))
+            .await;
         }
         Ok(())
+    }
+}
+
+/// The `quarantine_source` a scan's hold records on `row_id` (#5646): the
+/// scan-policy origin on the scanned row itself; `admin` on a row of the
+/// scanned digest that took the verdict after a tag move, as a carried hold
+/// is recorded (#5457): that row has no scan of its own, so an acknowledgement
+/// release would otherwise lift it with the findings still open.
+fn scan_hold_source(scanned_artifact_id: Uuid, row_id: Uuid) -> &'static str {
+    if scanned_artifact_id == row_id {
+        "scan_policy"
+    } else {
+        "admin"
     }
 }
 
@@ -13394,6 +13557,92 @@ mod tests {
         .execute(&fx.pool)
         .await
         .expect("insert artifact");
+    }
+
+    /// #5646: a scan of an OCI image whose tag moved to another image while
+    /// the scan ran lands its verdict on the scanned digest, never on the tag
+    /// row that now names the new image. The tag row already names D2; the
+    /// scan read D1, whose only record is the registry's manifest row, so its
+    /// digest-path row is created and held (recorded `admin`, as a carried
+    /// hold is). The control scan of D2 itself holds the tag row.
+    #[tokio::test]
+    async fn scan_verdict_after_a_tag_move_holds_the_scanned_digest_5646() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "docker").await else {
+            return;
+        };
+        let (d1, d2) = (fresh_checksum(), fresh_checksum());
+        let tag_row = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO artifacts (id, repository_id, name, path, size_bytes, checksum_sha256, \
+                                    content_type, storage_key) \
+             VALUES ($1, $2, 'app:1.0', 'v2/app/manifests/1.0', 10, $3, \
+                     'application/vnd.oci.image.manifest.v1+json', $4)",
+        )
+        .bind(tag_row)
+        .bind(fx.repo_id)
+        .bind(&d2)
+        .bind(format!("oci-manifests/sha256:{d2}"))
+        .execute(&fx.pool)
+        .await
+        .expect("insert tag row");
+        sqlx::query(
+            "INSERT INTO oci_manifests (repository_id, digest, content_type, size_bytes) \
+             VALUES ($1, $2, 'application/vnd.oci.image.manifest.v1+json', 10)",
+        )
+        .bind(fx.repo_id)
+        .bind(format!("sha256:{d1}"))
+        .execute(&fx.pool)
+        .await
+        .expect("record D1");
+        seed_completed_scan_with_high_finding(&fx.pool, tag_row, fx.repo_id).await;
+        seed_enabled_policy(&fx.pool, fx.repo_id, "gate-5646").await;
+
+        let scanner = scanner_for_fixture(&fx);
+        scanner
+            .update_quarantine_status_of(tag_row, Some(&d1), 1)
+            .await
+            .expect("verdict for D1");
+        let hold = |path: String| {
+            let pool = fx.pool.clone();
+            let repo = fx.repo_id;
+            async move {
+                sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                    "SELECT quarantine_status, quarantine_source FROM artifacts \
+                     WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
+                )
+                .bind(repo)
+                .bind(path)
+                .fetch_optional(&pool)
+                .await
+                .expect("read hold")
+            }
+        };
+        let tag_after_d1 = hold("v2/app/manifests/1.0".into()).await;
+        let d1_row = hold(format!("v2/app/manifests/sha256:{d1}")).await;
+
+        scanner
+            .update_quarantine_status_of(tag_row, Some(&d2), 1)
+            .await
+            .expect("verdict for D2");
+        let tag_after_d2 = hold("v2/app/manifests/1.0".into()).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            tag_after_d1,
+            Some((None, None)),
+            "D1's verdict must not hold the tag row, which names D2"
+        );
+        assert_eq!(
+            d1_row,
+            Some((Some("quarantined".into()), Some("admin".into()))),
+            "D1's verdict holds D1's digest row"
+        );
+        assert_eq!(
+            tag_after_d2,
+            Some((Some("quarantined".into()), Some("scan_policy".into()))),
+            "control: D2's own verdict holds the tag row"
+        );
     }
 
     /// The regression test for the headline bug (#2912): an enabled scan policy

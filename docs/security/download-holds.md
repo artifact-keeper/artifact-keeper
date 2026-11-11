@@ -86,6 +86,18 @@ own upload hold if the repository has one. A moved scan-policy hold is
 recorded as `admin`. The digest row has no scan of its own, so acknowledging
 findings cannot release it, and an administrator releases it instead.
 
+A hold that an administrator or the scanner decides on a tag row binds to the
+digest the row named when the hold was decided (#5646). When a push moves the
+tag to another image before the hold is written, the hold goes to the old
+digest's digest row instead (created if needed), and the new image is not
+changed. The quarantine and reject actions then answer with
+`held_artifact_id`, `held_digest` and `moved_to_digest`. They also accept an
+optional `expected_digest` (`sha256:<hex>`) naming the image the operator saw,
+so a tag that moved before the request was sent is handled the same way. When
+the old digest has no row left (it was deleted by digest), they answer `409`
+and change nothing. A scan verdict on the old image that would hold it is
+recorded as `admin`, like a moved hold.
+
 What this means for operators:
 
 - Releasing or rejecting acts on one row. To serve a held image again, release
