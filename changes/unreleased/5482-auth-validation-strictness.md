@@ -1,0 +1,5 @@
+---
+section: Security
+issues: [#5482]
+---
+- **CI token exchange and OIDC sign-in require `iss` and `aud`, a disabled SSO provider no longer signs anyone in, and an OIDC `sub` must be non-blank** ([#5482]). The JWT library checks `iss` and `aud` only when the token carries them. So a validly signed CI assertion with no `aud`, `aud: null` or a non-string `aud` was exchanged at `POST /api/v1/auth/ci/token` for any provider on its issuer, and one with no `iss` was exchanged through the `provider_id` override. An OIDC id_token without them was accepted at the callback too. Both claims are now required and such tokens get `401`. OIDC login and both callbacks, LDAP login, and SAML login and ACS (by UUID and by slug) now check the provider's enabled flag. A disabled provider answers `404` like a missing one, including for a login that was already in progress when the provider was disabled. Before, only the provider list hid it. An id_token whose `sub` is empty or whitespace is refused with `401`. Before, every such token from a provider signed in as one shared account.
