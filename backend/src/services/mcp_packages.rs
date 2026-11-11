@@ -499,13 +499,33 @@ fn submitted_host(pkg: &mcp::Package) -> Option<String> {
 /// package identity by another of the same name: `@corp/tool` on
 /// `npm.internal.corp` by a same-named (possibly squatted) public package the
 /// Remote proxies, with a fill pulling it in on the publisher's behalf.
+///
+/// An OCI package carries its registry in the image host instead (#5518):
+/// the host must be `remote`'s upstream host (Docker Hub aliases
+/// canonicalised), unless the identifier names `mapped` on this instance.
 pub fn remote_may_serve(
     pkg: &mcp::Package,
     mapped: &BackingRepo,
     remote: &BackingRepo,
     base_url: &str,
 ) -> bool {
+    if pkg.registry_type == "oci" {
+        return match mcp::parse_oci_reference(&pkg.identifier) {
+            Ok((r, _)) => {
+                oci_names_repo(&r, mapped, base_url).is_some() || oci_host_is_upstream(&r, remote)
+            }
+            Err(_) => false,
+        };
+    }
     !registry_base_url_is_foreign(pkg, mapped, base_url) || upstream_is_named(pkg, remote)
+}
+
+/// Whether `r`'s image host is `remote`'s upstream host.
+fn oci_host_is_upstream(r: &mcp::OciRef, remote: &BackingRepo) -> bool {
+    remote
+        .upstream_url
+        .as_deref()
+        .is_some_and(|u| same_registry_host(&r.host, &mcp::host_of(u)))
 }
 
 /// Whether `pkg`'s `registryBaseUrl` is under `remote`'s upstream URL.
@@ -553,6 +573,25 @@ pub fn url_is_under(upstream: &str, submitted: &str) -> bool {
 /// The refusal of foreign coordinates that would resolve through a Remote of
 /// another upstream ([`remote_may_serve`]).
 pub fn foreign_through_remote(index: usize, pkg: &mcp::Package, repo: &BackingRepo) -> McpError {
+    if pkg.registry_type == "oci" {
+        let host = mcp::parse_oci_reference(&pkg.identifier)
+            .map(|(r, _)| r.host)
+            .unwrap_or_default();
+        return McpError::ExternalRegistry {
+            index,
+            detail: format!(
+                "image host '{host}' is not the upstream of the Remote repository '{}' ({}) \
+                 that would serve {}; name the image on the Remote's upstream, or push it to \
+                 a hosted repository and name it there",
+                repo.key,
+                repo.upstream_url
+                    .as_deref()
+                    .map(mcp::host_of)
+                    .unwrap_or_default(),
+                pkg.identifier
+            ),
+        };
+    }
     McpError::ExternalRegistry {
         index,
         detail: format!(
@@ -835,13 +874,11 @@ fn oci_backing_path(
     policy: PackagePolicy,
 ) -> Result<OciBackingPath, String> {
     // An identifier that already names this instance's repository.
-    if same_registry_host(&r.host, &mcp::host_of(base_url)) {
-        if let Some(rest) = r.path.strip_prefix(&format!("{}/", repo.key)) {
-            return Ok(OciBackingPath {
-                path: rest.to_string(),
-                foreign: false,
-            });
-        }
+    if let Some(rest) = oci_names_repo(r, repo, base_url) {
+        return Ok(OciBackingPath {
+            path: rest.to_string(),
+            foreign: false,
+        });
     }
     match oci_host_refusal(r, repo, base_url) {
         None => Ok(OciBackingPath {
@@ -856,7 +893,18 @@ fn oci_backing_path(
     }
 }
 
+/// The image path inside `repo` when `r` names `repo` on this instance
+/// (`<this host>/<repo key>/<path>`).
+fn oci_names_repo<'r>(r: &'r mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Option<&'r str> {
+    if !same_registry_host(&r.host, &mcp::host_of(base_url)) {
+        return None;
+    }
+    r.path.strip_prefix(&format!("{}/", repo.key))
+}
+
 /// Why an image host is not one `repo` serves under `own-repos`, if it is not.
+/// A Virtual's answer depends on the member that serves the image
+/// ([`virtual_oci_winner_refusal`]).
 fn oci_host_refusal(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Option<String> {
     if repo.is_remote() {
         let upstream = repo
@@ -882,6 +930,61 @@ fn oci_host_refusal(r: &mcp::OciRef, repo: &BackingRepo, base_url: &str) -> Opti
         ));
     }
     None
+}
+
+/// Whether the image a Virtual `repo` serves from member `winner` may be
+/// pinned for `pkg`, whose identifier does not name `repo` on this instance
+/// (#5518). `Ok(true)` when it is pinned as foreign coordinates (`open`).
+///
+/// * A Remote member's images came from its upstream: the image host must
+///   be that upstream ([`remote_may_serve`]), under either policy.
+///   Otherwise `evil.example/acme/mcp:1.2` would be pinned to the
+///   `ghcr.io/acme/mcp:1.2` a `ghcr.io` member proxies.
+/// * A hosted member holds what was pushed to this instance: another host
+///   is foreign, accepted only under `open`, as for a hosted backing
+///   repository ([`oci_backing_path`]).
+async fn virtual_oci_winner_refusal(
+    db: &PgPool,
+    index: usize,
+    pkg: &mcp::Package,
+    repo: &BackingRepo,
+    winner: Uuid,
+    base_url: &str,
+    policy: PackagePolicy,
+) -> Result<bool, McpError> {
+    let key: String = sqlx::query_scalar("SELECT key FROM repositories WHERE id = $1")
+        .bind(winner)
+        .fetch_one(db)
+        .await
+        .map_err(db_err)?;
+    let member = repos_by_key(db, &[key])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| McpError::Internal("virtual member vanished".into()))?;
+    if member.is_remote() {
+        if !remote_may_serve(pkg, repo, &member, base_url) {
+            return Err(foreign_through_remote(index, pkg, &member));
+        }
+        return Ok(false);
+    }
+    if policy == PackagePolicy::Open {
+        return Ok(true);
+    }
+    Err(McpError::ExternalRegistry {
+        index,
+        detail: format!(
+            "image host '{}' is not this registry, and repository '{}' would serve the image \
+             from its hosted member '{}'; name the image as {}/{}/<image>:<tag>",
+            mcp::parse_oci_reference(&pkg.identifier)
+                .map(|(r, _)| r.host)
+                .unwrap_or_default(),
+            repo.key,
+            member.key,
+            mcp::host_of(base_url),
+            repo.key
+        ),
+    })
 }
 
 /// One manifest found in the backing repository.
@@ -1018,7 +1121,7 @@ async fn resolve_oci_package(
             ))
         }
     };
-    let OciBackingPath { path, foreign } = oci_backing_path(&r, repo, base_url, policy)
+    let OciBackingPath { path, mut foreign } = oci_backing_path(&r, repo, base_url, policy)
         .map_err(|detail| McpError::ExternalRegistry { index, detail })?;
     let repo_ids = content_repo_ids(&state.db, repo).await?;
     let names = oci_name_candidates(&r.host, &path);
@@ -1033,6 +1136,18 @@ async fn resolve_oci_package(
                 not_pulled_hint(repo)
             ),
         })?;
+    if repo.is_virtual() && oci_names_repo(&r, repo, base_url).is_none() {
+        foreign = virtual_oci_winner_refusal(
+            &state.db,
+            index,
+            pkg,
+            repo,
+            found.repo_id,
+            base_url,
+            policy,
+        )
+        .await?;
+    }
     let location = if found.repo_id == repo.id {
         repo.location.clone()
     } else {
@@ -1463,6 +1578,12 @@ async fn gate_rows(
 /// checksum is the one recorded at publish (`artifact_sha256s`, or the
 /// pin's `sha256` for an older single-row pin). A row rewritten in place no
 /// longer counts as the pinned row.
+///
+/// A no-op for OCI pins: they record neither `artifact_sha256s` nor
+/// `sha256`, and their gate rows are selected by digest
+/// ([`crate::services::oci_manifests::alias_rows`]), so every row passes.
+/// Recording checksums on OCI pins would make this drop the alias rows
+/// (#5593): a digest-path row is not among the ids pinned at publish.
 fn row_bytes_pinned(pin: &PackagePin, row: &GateRow) -> bool {
     let r = &pin.resolved;
     let expected = match r.artifact_ids.iter().position(|id| *id == row.id) {
@@ -1615,6 +1736,14 @@ pub(crate) async fn refuse_shadowed_cache_pin(
 /// [`backing_gate`] only: the scan-policy, Remote and OCI-presence gates
 /// stay with the full serve gate, which the caller evaluates beforehand
 /// (#5533 tracks evaluating the whole gate on the transaction).
+///
+/// The rows are read, locked, then read again under the locks (#5593): a
+/// write that committed between the read and the lock (an OCI tag move
+/// rewrites the tag-path row in place to other bytes and moves the hold onto
+/// a digest-path row the read did not see) changes the gate's row set or a
+/// locked row's checksum, and the rows are taken again. A set that is still
+/// moving after [`HELD_BACKING_ATTEMPTS`] reads is reported held (fail
+/// closed); the caller's next attempt evaluates it afresh.
 pub async fn held_backing_package(
     conn: &mut sqlx::PgConnection,
     stored: &mcp::StoredVersion,
@@ -1622,47 +1751,103 @@ pub async fn held_backing_package(
     if let Some(package) = stored.unpinned_package() {
         return Ok(Some(package));
     }
-    let mut pins = Vec::new();
+    for _ in 0..HELD_BACKING_ATTEMPTS {
+        let pins = all_gate_rows(&mut *conn, stored).await?;
+        // Every pinned row of every pin locked in one statement, in id
+        // order, so two completions never take them in opposite orders.
+        let mut ids: Vec<Uuid> = pins
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().filter(|r| !r.cached).map(|r| r.id))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        let locked: HashMap<Uuid, LockedRow> =
+            sqlx::query_as::<_, (Uuid, String, Option<String>, Option<DateTime<Utc>>)>(
+                "SELECT id, checksum_sha256::text, quarantine_status, quarantine_until \
+             FROM artifacts WHERE id = ANY($1) AND is_deleted = false ORDER BY id FOR SHARE",
+            )
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|(id, sha, status, until)| (id, (sha, status, until)))
+            .collect();
+        // Under the locks no row of the set can change until commit; one
+        // that changed before the lock shows here.
+        let again = all_gate_rows(&mut *conn, stored).await?;
+        if !rows_settled(&pins, &again, &locked) {
+            continue;
+        }
+        let now = Utc::now();
+        let cleared = |r: &GateRow| {
+            if r.cached {
+                return !r.cache_held(now);
+            }
+            locked.get(&r.id).is_some_and(|(_, status, until)| {
+                crate::services::quarantine_service::check_download_allowed(
+                    status.as_deref(),
+                    *until,
+                    now,
+                )
+                .is_ok()
+            })
+        };
+        return Ok(pins
+            .iter()
+            .find(|(_, rows)| rows.is_empty() || !rows.iter().all(cleared))
+            .map(|(pin, _)| pin.label()));
+    }
+    Ok(stored.pins.first().map(PackagePin::label))
+}
+
+/// How often [`held_backing_package`] takes a backing row set that moves
+/// under it before reporting the version held.
+const HELD_BACKING_ATTEMPTS: usize = 3;
+
+/// `checksum_sha256`, `quarantine_status`, `quarantine_until` of a row
+/// [`held_backing_package`] locked.
+type LockedRow = (String, Option<String>, Option<DateTime<Utc>>);
+
+/// The gate rows of every pin of `stored`, read on `conn`.
+async fn all_gate_rows<'p>(
+    conn: &mut sqlx::PgConnection,
+    stored: &'p mcp::StoredVersion,
+) -> Result<Vec<(&'p PackagePin, Vec<GateRow>)>, sqlx::Error> {
+    let mut pins = Vec::with_capacity(stored.pins.len());
     for pin in &stored.pins {
         pins.push((pin, gate_rows(&mut *conn, pin).await?));
     }
-    // Every pinned row of every pin locked in one statement, in id order, so
-    // two completions never take them in opposite orders.
-    let mut ids: Vec<Uuid> = pins
-        .iter()
-        .flat_map(|(_, rows)| rows.iter().filter(|r| !r.cached).map(|r| r.id))
-        .collect();
-    ids.sort();
-    ids.dedup();
-    let locked: HashMap<Uuid, (Option<String>, Option<DateTime<Utc>>)> =
-        sqlx::query_as::<_, (Uuid, Option<String>, Option<DateTime<Utc>>)>(
-            "SELECT id, quarantine_status, quarantine_until FROM artifacts \
-         WHERE id = ANY($1) AND is_deleted = false ORDER BY id FOR SHARE",
-        )
-        .bind(&ids)
-        .fetch_all(&mut *conn)
-        .await?
-        .into_iter()
-        .map(|(id, status, until)| (id, (status, until)))
-        .collect();
-    let now = Utc::now();
-    let cleared = |r: &GateRow| {
-        if r.cached {
-            return !r.cache_held(now);
-        }
-        locked.get(&r.id).is_some_and(|(status, until)| {
-            crate::services::quarantine_service::check_download_allowed(
-                status.as_deref(),
-                *until,
-                now,
-            )
-            .is_ok()
-        })
+    Ok(pins)
+}
+
+/// Whether the gate rows read before the lock are the rows read under it:
+/// the same `artifacts` rows per pin, each locked with the checksum it was
+/// read with (a row rewritten in place, or a row the first read missed,
+/// fails). Cache rows are not locked and are compared by id and checksum.
+fn rows_settled(
+    before: &[(&PackagePin, Vec<GateRow>)],
+    after: &[(&PackagePin, Vec<GateRow>)],
+    locked: &HashMap<Uuid, LockedRow>,
+) -> bool {
+    let key = |rows: &[GateRow]| {
+        let mut k: Vec<(Uuid, String)> = rows
+            .iter()
+            .map(|r| (r.id, r.checksum.to_ascii_lowercase()))
+            .collect();
+        k.sort();
+        k
     };
-    Ok(pins
-        .iter()
-        .find(|(_, rows)| rows.is_empty() || !rows.iter().all(cleared))
-        .map(|(pin, _)| pin.label()))
+    before.len() == after.len()
+        && before
+            .iter()
+            .zip(after)
+            .all(|((_, b), (_, a))| key(b) == key(a))
+        && before.iter().flat_map(|(_, rows)| rows).all(|r| {
+            r.cached
+                || locked
+                    .get(&r.id)
+                    .is_some_and(|(sha, _, _)| sha.eq_ignore_ascii_case(&r.checksum))
+        })
 }
 
 /// Whether the pinned OCI manifest still exists in its repository.
