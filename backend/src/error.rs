@@ -205,6 +205,13 @@ pub enum AppError {
     #[error("Validation error ({code}): {message}")]
     CodedValidation { code: &'static str, message: String },
 
+    /// A 409 that carries its own machine-readable `code` instead of the
+    /// generic `CONFLICT`, for a refusal a client is expected to recognise
+    /// (e.g. `mcp_name_case_conflict` on a promotion into an MCP registry,
+    /// #5435).
+    #[error("Conflict ({code}): {message}")]
+    CodedConflict { code: &'static str, message: String },
+
     /// The request was well-formed and syntactically valid but asks for a
     /// configuration that is semantically unsupported in this release (e.g. a
     /// Debian proxy filter that requests metadata regeneration/re-signing, or
@@ -406,6 +413,7 @@ impl AppError {
             Self::PreconditionFailed(_) => (StatusCode::PRECONDITION_FAILED, "PRECONDITION_FAILED"),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             Self::CodedValidation { code, .. } => (StatusCode::BAD_REQUEST, code),
+            Self::CodedConflict { code, .. } => (StatusCode::CONFLICT, code),
             Self::UnprocessableEntity(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE_ENTITY")
             }
@@ -552,9 +560,9 @@ impl AppError {
             | Self::ServiceUnavailable(msg)
             | Self::ScannerEngineUnavailable(msg)
             | Self::NotImplemented(msg) => msg.clone(),
-            Self::CodedValidation { message, .. } | Self::CodedBadGateway { message, .. } => {
-                message.clone()
-            }
+            Self::CodedValidation { message, .. }
+            | Self::CodedConflict { message, .. }
+            | Self::CodedBadGateway { message, .. } => message.clone(),
             Self::Json(_) => "Invalid JSON".to_string(),
         }
     }

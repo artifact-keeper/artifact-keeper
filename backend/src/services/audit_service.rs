@@ -302,6 +302,8 @@ pub enum AuditAction {
     McpServerReopened,
     /// An upstream entry changed content under an already ingested name@version. (#5253).
     McpServerContentDrift,
+    /// A peer replication stored an MCP server name that differs only in letter case from a name the registry already recorded. (#5435).
+    McpNameCaseTwinReplicated,
     /// An MCP serve gate could not be evaluated and the surface answered 503 (fail closed). (#5253).
     McpGateUnavailable,
     /// A capability snapshot (tools/resources/prompts) was recorded for a server version. (#5253).
@@ -468,6 +470,7 @@ impl AuditAction {
             AuditAction::McpServerRejected => "MCP_SERVER_REJECTED",
             AuditAction::McpServerReopened => "MCP_SERVER_REOPENED",
             AuditAction::McpServerContentDrift => "MCP_SERVER_CONTENT_DRIFT",
+            AuditAction::McpNameCaseTwinReplicated => "MCP_NAME_CASE_TWIN_REPLICATED",
             AuditAction::McpGateUnavailable => "MCP_GATE_UNAVAILABLE",
             AuditAction::McpCapabilitiesIngested => "MCP_CAPABILITIES_INGESTED",
             AuditAction::McpToolsDrift => "MCP_TOOLS_DRIFT",
@@ -2016,6 +2019,11 @@ mod proxy_scan_blocked_4777_tests {
                 AuditAction::McpGateUnavailable,
                 "MCP_GATE_UNAVAILABLE",
                 Outcome::Failure,
+            ),
+            (
+                AuditAction::McpNameCaseTwinReplicated,
+                "MCP_NAME_CASE_TWIN_REPLICATED",
+                Outcome::Success,
             ),
             (
                 AuditAction::McpCapabilitiesIngested,

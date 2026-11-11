@@ -11810,6 +11810,55 @@ pub(crate) fn audit_generic_mcp_publish(
         &version,
         serde_json::json!({ "repository_id": repo.id, "replicated": true }),
     );
+    // #5435: a replica mirrors its peer, so a case-only twin of a recorded
+    // name is stored as sent (refusing it would leave the mirror out of step
+    // for good) and reported instead.
+    let (db, repo_id, repo_key) = (db.clone(), repo.id, repo.key.clone());
+    tokio::spawn(async move {
+        audit_replicated_case_twin(&db, repo_id, &repo_key, actor, artifact_id, &name, &version)
+            .await;
+    });
+}
+
+/// `MCP_NAME_CASE_TWIN_REPLICATED` when the server name a peer replication
+/// just stored has case-only twins recorded in the registry (#5435), naming
+/// them. Returns the twins found (empty: nothing audited).
+pub(crate) async fn audit_replicated_case_twin(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    repo_key: &str,
+    actor: Uuid,
+    artifact_id: Uuid,
+    name: &str,
+    version: &str,
+) -> Vec<String> {
+    let twins = match super::mcp::case_twins_of(db, repo_id, name).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, server = name, "MCP case-twin check after replication failed");
+            return Vec::new();
+        }
+    };
+    if twins.is_empty() {
+        return twins;
+    }
+    tracing::warn!(
+        repository = repo_key,
+        server = name,
+        twins = ?twins,
+        "peer replication stored an MCP server name that differs only in letter case from a recorded one"
+    );
+    crate::services::mcp_write::audit(
+        db,
+        crate::services::audit_service::AuditAction::McpNameCaseTwinReplicated,
+        crate::services::mcp_write::Actor::User(actor),
+        repo_key,
+        Some(artifact_id),
+        name,
+        version,
+        serde_json::json!({ "repository_id": repo_id, "twins": twins }),
+    );
+    twins
 }
 
 fn mcp_refusal(format: &RepositoryFormat, trusted_peer: bool, message: &str) -> Result<()> {
