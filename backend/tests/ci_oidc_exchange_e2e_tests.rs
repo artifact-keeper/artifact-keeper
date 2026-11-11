@@ -1054,3 +1054,59 @@ async fn static_kubernetes_provider_needs_no_reachable_issuer() {
     );
     fx.teardown().await;
 }
+
+/// #5482: `iss` and `aud` are required. A validly signed assertion with no
+/// `aud`, `aud: null` or a non-string `aud` used to be exchanged for any
+/// provider on its issuer, and one with no `iss` through the `provider_id`
+/// override (whose issuer cross-check had nothing to compare).
+#[tokio::test]
+#[ignore]
+async fn an_assertion_without_iss_or_aud_is_refused() {
+    let Some(fx) = Fixture::new().await else {
+        return;
+    };
+    fx.create_mapping(json!({})).await;
+    let base = fx
+        .issuer
+        .gitlab_claims(AUDIENCE, "group/app", "branch", "main");
+    let without = |claim: &str| {
+        let mut c = base.clone();
+        c.as_object_mut().unwrap().remove(claim);
+        c
+    };
+    let with_aud = |aud: Value| {
+        let mut c = base.clone();
+        c["aud"] = aud;
+        c
+    };
+    for (case, claims) in [
+        ("no aud", without("aud")),
+        ("aud: null", with_aud(Value::Null)),
+        ("aud: 42", with_aud(json!(42))),
+    ] {
+        assert_refused(&fx, &fx.issuer.sign(&claims), case).await;
+    }
+
+    // No `iss`, with the provider named explicitly, as the pre-#3548
+    // request shape does.
+    let before = fx.provider_accounts().await;
+    let (status, body) = fx
+        .send(
+            "POST",
+            TOKEN_ROUTE,
+            Some(&fx.issuer.sign(&without("iss"))),
+            Some(json!({ "provider_id": fx.provider_id })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no iss: {body}");
+    assert_eq!(
+        fx.provider_accounts().await,
+        before,
+        "no iss: nothing created"
+    );
+
+    // The same assertion with both claims still exchanges.
+    let (status, body) = fx.exchange(&fx.issuer.sign(&base)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fx.teardown().await;
+}

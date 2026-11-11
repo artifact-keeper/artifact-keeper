@@ -1580,3 +1580,65 @@ async fn test_saml_acs_uuid_addressing_unchanged_without_a_slug() {
     delete_saml_user(&pool, &name_id).await;
     delete_saml_provider(&pool, provider_id).await;
 }
+
+/// #5482: a disabled SAML provider neither starts a login nor accepts an
+/// assertion at its ACS, whether addressed by UUID or by slug — including for
+/// a login that was already pending when the operator disabled it.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn test_saml_disabled_provider_cannot_log_in() {
+    let Some(pool) = try_pool().await else {
+        return;
+    };
+    let slug = fresh_slug("disabled");
+    let provider_id = create_saml_provider(
+        &pool,
+        SamlProviderOpts {
+            slug: Some(slug.clone()),
+            ..SamlProviderOpts::default()
+        },
+    )
+    .await;
+    let pending: Vec<String> = vec![
+        seed_session(&pool, provider_id).await,
+        seed_session(&pool, provider_id).await,
+    ];
+    AuthConfigService::toggle_saml(
+        &pool,
+        provider_id,
+        artifact_keeper_backend::services::auth_config_service::ToggleRequest { enabled: false },
+    )
+    .await
+    .expect("disable saml provider");
+
+    for (segment, request_id) in [provider_id.to_string(), slug.clone()]
+        .into_iter()
+        .zip(pending)
+    {
+        let login = sso_app(build_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/saml/{segment}/login"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("login oneshot");
+        assert_eq!(login.status(), StatusCode::NOT_FOUND, "login at {segment}");
+
+        let name_id = format!("saml-5482-{}", Uuid::new_v4().as_simple());
+        let resp = post_acs_at(
+            build_state(pool.clone()),
+            &segment,
+            &happy_spec(&request_id, &name_id).signed_b64(),
+        )
+        .await;
+        let provisioned = get_saml_user(&pool, &name_id).await.is_some();
+        delete_saml_user(&pool, &name_id).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "ACS at {segment}");
+        assert!(!provisioned, "ACS at {segment}: no account");
+    }
+
+    delete_saml_provider(&pool, provider_id).await;
+}
