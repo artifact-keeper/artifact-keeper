@@ -13,7 +13,8 @@ use uuid::Uuid;
 use crate::api::extractors::Json as BodyJson;
 use crate::api::handlers::artifacts::check_artifact_visibility;
 use crate::api::handlers::repositories::{
-    require_repo_action, require_repo_admin, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_action, require_repo_admin,
+    require_repo_write_access, require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -2604,7 +2605,10 @@ async fn update_repo_security(
     // repository administration, not artifact publishing. Same admin tier and
     // fail-closed gate as the configuration subresources fixed in #2745
     // (#2603 sibling, #2750).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &repo_service).await?;
     let svc = ScanConfigService::new(state.db.clone());
     // #3645: the previous row is read in the same transaction as the write,
     // so the audited "before" is exactly what this write replaced. #4363: the
@@ -3702,7 +3706,10 @@ async fn rescan_proxy_cached_path(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
-    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let write = require_repo_action(&auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(write, &auth, &repo, &repo_service).await?;
 
     let path = body.path.trim().to_string();
     if path.is_empty() {

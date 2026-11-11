@@ -2873,7 +2873,10 @@ pub async fn set_cache_ttl(
     // same administrative tier as delete/update, so the tenant write gate above
     // is not sufficient on its own. `require_repo_admin` honors an `admin`
     // action held through a role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (see #917).
@@ -3033,8 +3036,10 @@ pub async fn set_on_upstream_not_found(
     // supply-chain control on the same administrative tier as delete/update,
     // so the tenant write gate above is not sufficient on its own.
     // `require_repo_admin` honors an `admin` action held through a role
-    // (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // (`repository-owner`), not only a rule (#4834). Refused to a caller who
+    // cannot read the repository, it is the unknown-key 404 (#5645).
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     // Reject writes on non-remote repos before any further validation: the
     // value would never be read back by the proxy code path (#4640).
@@ -3197,8 +3202,11 @@ pub async fn set_upstream_mode(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
     // Same administrative tier as `on_upstream_not_found`: turning upstream
-    // contact off (or back on) is a pull-through proxy control.
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // contact off (or back on) is a pull-through proxy control. Refused to a
+    // caller who cannot read the repository, it is the unknown-key 404
+    // (#5645).
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
     is_upstream_mode_configurable(&repo.repo_type)?;
 
     let previous = upstream_mode::stored_upstream_mode(&state.db, repo.id).await?;
@@ -3307,8 +3315,10 @@ pub async fn set_stale_if_error_grace(
     // Same administrative tier as `set_cache_ttl`: the grace window is a
     // pull-through supply-chain control, so a tenant write grant is not enough.
     // `require_repo_admin` honors an `admin` action held through a role
-    // (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // (`repository-owner`), not only a rule (#4834). Refused to a caller who
+    // cannot read the repository, it is the unknown-key 404 (#5645).
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     // Only Remote (proxy) repositories consume the value; writing it elsewhere
     // is dead state (mirrors `set_cache_ttl`).
@@ -3899,7 +3909,10 @@ pub async fn set_npm_scope_policy(
     // repository (mirrors `set_cache_ttl`; the global-admin bypass is
     // preserved). `require_repo_admin` honors an `admin` action held through a
     // role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     is_npm_scope_policy_configurable(&repo.repo_type, &repo.format)?;
 
@@ -4035,7 +4048,10 @@ pub async fn invalidate_cache(
     // window). `require_repo_admin` requires `repository:admin` for non-admins
     // (mirroring `set_cache_ttl`) while honoring an `admin` action held through
     // a role (`repository-owner`), not only a rule (#4834).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
@@ -4201,7 +4217,10 @@ pub async fn put_pypi_track(
     // Declaring a PEP 708 `tracks` upstream changes cross-member version
     // resolution — a repository configuration/supply-chain control that
     // requires the repository `admin` action, not merely `write` (#2603).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
     require_pypi_tracks_repo(&repo)?;
 
     let tracks_url = payload.tracks_url.trim().to_string();
@@ -4265,7 +4284,10 @@ pub async fn delete_pypi_track(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
     // Same administrative tier as `put_pypi_track` (#2603).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     let normalized = crate::api::handlers::pypi::normalize_pep503(&project);
     sqlx::query(
@@ -11886,7 +11908,10 @@ pub(crate) async fn authorize_generic_upload(
     // read/write. Route the `write` decision through the canonical
     // `check_repository_action` choke-point (deny-by-default): public
     // visibility and rules-less repositories never confer write.
-    require_repo_action(auth, repo.id, "write", &state.permission_service)
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let write = require_repo_action(auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(write, auth, &repo, &repo_service)
         .await
         .map_err(|e| e.into_response())?;
 
@@ -13849,7 +13874,10 @@ pub async fn delete_artifact(
     // decision through the canonical `check_repository_action` choke-point
     // (deny-by-default) so a write-only grantee cannot destroy artifacts and a
     // rules-less/public repo confers no delete. Mirrors the upload `write` gate.
-    require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let delete = require_repo_action(&auth, repo.id, "delete", &state.permission_service).await;
+    hide_write_denial_from_non_readers(delete, &auth, &repo, &repo_service).await?;
     // After the access gates (nothing is said about a repository the caller
     // cannot delete from): MCP versions are deleted through the namespace-
     // gated MCP route only.
@@ -15286,7 +15314,10 @@ pub async fn set_routing_rules(
     // Routing rules rewrite the upstream request path (a proxy supply-chain
     // control on the same tier as cache TTL): require the repository `admin`
     // action, not merely `write` (#2603).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     let value = serde_json::to_string(&payload.rules)
         .map_err(|e| AppError::Internal(format!("Failed to serialize routing rules: {}", e)))?;
@@ -15339,7 +15370,10 @@ pub async fn delete_routing_rules(
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
     // Same administrative tier as `set_routing_rules` (#2603).
-    require_repo_admin(&auth, repo.id, &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let admin = require_repo_admin(&auth, repo.id, &state.permission_service).await;
+    hide_write_denial_from_non_readers(admin, &auth, &repo, &service).await?;
 
     sqlx::query(
         r#"
@@ -37931,6 +37965,162 @@ mod tests {
             );
         }
         assert!(still_there, "the refused DELETE removed nothing");
+    }
+
+    /// #5645: the routes that layered an admin (or `write` / `delete`) check
+    /// after the tenant write gate answered a caller who holds
+    /// a grant on a private repository but cannot read it (a publish-only
+    /// `write` grant) with the 403 where an unknown key answers 404. They now
+    /// answer exactly what an unknown key answers (status, headers, body); a
+    /// reader keeps the 403. The RPM rebuild needs `write` itself, so its
+    /// non-reader is a grantee holding only `delete`.
+    #[tokio::test]
+    async fn publish_only_grantee_denials_match_an_unknown_key() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, repo_key, repo_dir) = tdh::create_repo(&pool, "local", "npm").await;
+        let (publisher, publisher_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, repo_id, publisher, &["write"]).await;
+        let (deleter, deleter_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, repo_id, deleter, &["delete"]).await;
+        let (reader, reader_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_role(&pool, repo_id, reader, "reader").await;
+        let state = tdh::build_state(pool.clone(), &repo_dir.to_string_lossy());
+        let unknown = format!("ak5645-unknown-{}", Uuid::new_v4());
+        let publisher_auth = tdh::make_auth(publisher, &publisher_name);
+        let deleter_auth = tdh::make_auth(deleter, &deleter_name);
+        let cases: Vec<(&str, &str, Option<&str>, &AuthExtension)> = vec![
+            ("GET", "/age-gate", None, &publisher_auth),
+            (
+                "PUT",
+                "/age-gate",
+                Some(r#"{"enabled": true, "min_age_days": 1}"#),
+                &publisher_auth,
+            ),
+            (
+                "PUT",
+                "/on-upstream-not-found",
+                Some(r#"{"on_upstream_not_found": "keep"}"#),
+                &publisher_auth,
+            ),
+            (
+                "PUT",
+                "/upstream-mode",
+                Some(r#"{"upstream_mode": "cache_only"}"#),
+                &publisher_auth,
+            ),
+            (
+                "PUT",
+                "/stale-if-error-grace",
+                Some(r#"{"stale_if_error_grace_seconds": 60}"#),
+                &publisher_auth,
+            ),
+            (
+                "POST",
+                "/cache/seed",
+                Some(r#"{"kind": "paths", "content": []}"#),
+                &publisher_auth,
+            ),
+            ("POST", "/rpm/repodata/rebuild", None, &deleter_auth),
+            // The older routes with the same shape: an admin or action check
+            // after the tenant write gate, refused unhidden.
+            (
+                "PUT",
+                "/cache-ttl",
+                Some(r#"{"cache_ttl_seconds": 60}"#),
+                &publisher_auth,
+            ),
+            (
+                "PUT",
+                "/npm-scope-policy",
+                Some(r#"{"allowed_scopes": []}"#),
+                &publisher_auth,
+            ),
+            (
+                "POST",
+                "/cache/invalidate?path=a/b.tgz",
+                None,
+                &publisher_auth,
+            ),
+            (
+                "PUT",
+                "/pypi-tracks/acme-sdk",
+                Some(r#"{"tracks_url": "https://pypi.org/simple/acme-sdk/"}"#),
+                &publisher_auth,
+            ),
+            ("DELETE", "/pypi-tracks/acme-sdk", None, &publisher_auth),
+            (
+                "POST",
+                "/routing-rules",
+                Some(r#"{"rules": []}"#),
+                &publisher_auth,
+            ),
+            ("DELETE", "/routing-rules", None, &publisher_auth),
+            ("GET", "/email-subscriptions", None, &publisher_auth),
+            ("PUT", "/security", Some("{}"), &publisher_auth),
+            (
+                "POST",
+                "/security/proxy-scans/rescan",
+                Some(r#"{"path": "a/b.tgz"}"#),
+                &deleter_auth,
+            ),
+            ("PUT", "/labels", Some(r#"{"labels": []}"#), &deleter_auth),
+            ("DELETE", "/artifacts/a/b.tgz", None, &publisher_auth),
+            ("PUT", "/artifacts/a/b.tgz", Some("bytes"), &deleter_auth),
+            (
+                "POST",
+                "/image-builds/render",
+                Some(r#"{"spec": {}}"#),
+                &deleter_auth,
+            ),
+        ];
+        let send = |auth: AuthExtension, method: &str, uri: String, body: Option<&str>| {
+            let router = tdh::router_with_auth(
+                super::router()
+                    .merge(crate::api::handlers::age_gate::repo_config_routes())
+                    .merge(crate::api::handlers::rpm::repo_router())
+                    .merge(crate::api::handlers::image_builds::repo_router()),
+                state.clone(),
+                auth,
+            );
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if body.is_some() {
+                b = b.header("content-type", "application/json");
+            }
+            let req = b
+                .body(axum::body::Body::from(body.unwrap_or("").to_string()))
+                .unwrap();
+            tdh::send_with_headers(router, req)
+        };
+        let mut answers = Vec::new();
+        for (method, tail, body, auth) in &cases {
+            let existing = send((*auth).clone(), method, format!("/{repo_key}{tail}"), *body).await;
+            let missing = send((*auth).clone(), method, format!("/{unknown}{tail}"), *body).await;
+            let as_reader = send(
+                tdh::make_auth(reader, &reader_name),
+                method,
+                format!("/{repo_key}{tail}"),
+                *body,
+            )
+            .await
+            .0;
+            answers.push((format!("{method} {tail}"), existing, missing, as_reader));
+        }
+        for user in [publisher, deleter, reader] {
+            tdh::cleanup_user(&pool, user).await;
+        }
+        tdh::cleanup_member_repo(&pool, repo_id, &repo_dir).await;
+
+        for (case, existing, missing, as_reader) in answers {
+            assert_eq!(existing.0, StatusCode::NOT_FOUND, "{case}: {existing:?}");
+            assert_eq!(existing, missing, "{case}: existing private vs unknown key");
+            assert_eq!(
+                as_reader,
+                StatusCode::FORBIDDEN,
+                "{case}: a reader keeps the 403"
+            );
+        }
     }
 
     /// #5612: `GET /{key}/members` answers a caller who cannot read a private

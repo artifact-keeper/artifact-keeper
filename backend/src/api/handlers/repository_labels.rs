@@ -10,7 +10,8 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::repositories::{
-    require_repo_action, require_repo_write_access, require_visible,
+    hide_write_denial_from_non_readers, require_repo_action, require_repo_write_access,
+    require_visible,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -103,7 +104,10 @@ async fn authorize_label_write(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
-    require_repo_action(&auth, repo.id, "write", &state.permission_service).await?;
+    // #5645: refused to a caller who cannot read the repository (a
+    // publish-only or delete-only grantee), it is the unknown-key 404.
+    let write = require_repo_action(&auth, repo.id, "write", &state.permission_service).await;
+    hide_write_denial_from_non_readers(write, &auth, &repo, &repo_service).await?;
     Ok(repo)
 }
 
