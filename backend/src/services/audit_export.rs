@@ -168,6 +168,11 @@ impl AuditAction {
             | AuditAction::DebianBackfillRun
             | AuditAction::CacheSeeded
             | AuditAction::ConfigImported
+            | AuditAction::GroupCreated
+            | AuditAction::GroupUpdated
+            | AuditAction::GroupDeleted
+            | AuditAction::GroupMembersAdded
+            | AuditAction::GroupMembersRemoved
             | AuditAction::RepositoryAllowlistChanged
             | AuditAction::QuarantineReleased
             | AuditAction::FindingAcknowledged
