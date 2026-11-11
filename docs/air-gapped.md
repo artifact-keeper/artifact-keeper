@@ -570,7 +570,7 @@ content crosses. Offline, a Remote answers them as follows:
 | Request | Upstream unreachable | Refused by the upstream filter | Cache-only |
 | --- | --- | --- | --- |
 | `GET /-/npm/v1/attestations/...`, `/-/v1/search` and other `/-/` reads | `503 upstream unreachable: ...` | `404 path excluded by the upstream filter of repository '<key>'` | `404 not in cache; repository '<key>' is cache-only` |
-| `POST /-/npm/v1/security/advisories/bulk`, `/-/npm/v1/security/audits/quick` | `200` with an empty advisory set | `200` with an empty advisory set | `200` with an empty advisory set |
+| `POST /-/npm/v1/security/advisories/bulk`, `/-/npm/v1/security/audits/quick` | `503 npm audit could not be performed through repository '<key>': upstream unavailable: ...` | `501 npm audit is not available through repository '<key>': ...` | `501 npm audit is not available through repository '<key>': ...` |
 | `GET /-/ping`, `/-/whoami` | answered locally | `404` (filter reason) | `404` (cache-only reason) |
 
 - An attestation answer still held in the attestation negative cache
@@ -578,9 +578,17 @@ content crosses. Offline, a Remote answers them as follows:
   for up to an hour by default) is served instead of the refusal or the `503`.
   Positive attestation bundles are never cached, so `npm audit signatures`
   cannot verify provenance offline.
-- The audit endpoints degrade to an empty advisory set (#1400), so offline
-  `npm audit` reports `found 0 vulnerabilities`. That is not a clean audit:
-  audit on the low side.
+- An audit that cannot be performed is an error, never an empty advisory set
+  (#5631), so offline `npm audit` fails with the message above instead of
+  reporting `found 0 vulnerabilities`, and `npm install` prints an audit
+  warning. Audit on the low side. (Before 1.12.0 these endpoints answered
+  `200` with an empty advisory set, a false all-clear.)
+- `npm audit` through a Virtual repository is forwarded to the first Remote
+  member whose upstream answers the audit API, with that member's credentials,
+  egress proxy, upstream filter and scope policy. A Local or Staging
+  repository holds no advisory data and answers `501`, as does a Virtual with
+  no Remote member that can answer; `503` when a member's upstream was
+  contacted and failed.
 - A Virtual repository tries each Remote member in turn. When none answers it
   returns `503` if a member was unreachable, otherwise `404` listing each
   member's refusal reason.
