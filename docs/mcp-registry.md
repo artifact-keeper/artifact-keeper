@@ -1904,8 +1904,13 @@ sync ingests it. When the ingested version cannot be stored, the approval
 still stands (the next sync retries) but the request answers the storage
 error instead of `200`: `409 CONFLICT` when the storage key is held by
 another repository (only possible with `STORAGE_KEY_SCHEME=flat` on cloud
-storage), `507 QUOTA_EXCEEDED` for a quota, `500 STORAGE_ERROR` otherwise. A
-bulk approval ingests in the background.
+storage), `507 QUOTA_EXCEEDED` for a quota or full storage, `400
+PAYLOAD_TOO_LARGE` when the version exceeds the upload size cap, `500
+STORAGE_ERROR` otherwise. A seed job reports such a pin `failed` with
+"approved, but not ingested yet (storage: ...); the next sync retries it".
+The next syncs retry a stalled ingest least recently attempted first; one
+that failed 5 times is retried once a day until it succeeds. A bulk
+approval ingests in the background.
 
 Bulk decisions by pattern take a glob over the **full** server name, the
 same rule as `mcp_auto_approve_namespaces` and `mcp_server_deny` (`*`
