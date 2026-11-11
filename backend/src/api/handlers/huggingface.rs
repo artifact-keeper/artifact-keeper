@@ -50,10 +50,12 @@ const MAX_MODEL_ID_LEN: usize = 255;
 const MAX_REVISION_LEN: usize = 255;
 
 /// Maximum artifact path length. The `path` and `storage_key` columns are
-/// VARCHAR(2048). The storage key adds a `huggingface/` prefix (12 chars),
-/// so the artifact path must stay within 2036 to keep the storage key under
-/// the column limit.
-const MAX_PATH_LEN: usize = 2036;
+/// VARCHAR(2048). On a shared cloud namespace the storage key is repo-scoped
+/// (#5662) and prefixes the path with `huggingface/{repository_id}/`: 12
+/// chars for `huggingface/`, 36 for the UUID and 1 for its `/`, 49 in all.
+/// The artifact path must stay within 2048 - 49 = 1999 to keep the storage
+/// key under the column limit (the flat `huggingface/{path}` key is shorter).
+const MAX_PATH_LEN: usize = 1999;
 
 /// Total deadline for the best-effort model-info fallback in
 /// [`fetch_upstream_commit_sha`] (#2915).
@@ -1783,7 +1785,15 @@ async fn upload_file_impl(
     )
     .await?;
 
-    let storage_key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
+    // The key is repo-scoped on a shared cloud namespace (#5662), so two
+    // repositories holding the same version do not collide on one key; reads
+    // go through the row's storage_key, so legacy flat-key rows keep serving.
+    let storage_key = crate::storage::StorageKeyScheme::from_env().write_key(
+        &repo.storage_backend,
+        "huggingface",
+        repo.id,
+        &format!("{}/{}/{}", model_id, revision, filename),
+    );
     proxy_helpers::put_artifact_bytes(&state, &repo, &storage_key, body.clone()).await?;
 
     let size_bytes = body.len() as i64;
@@ -2234,18 +2244,44 @@ mod tests {
         );
     }
 
+    /// The longest key the upload writes, the repo-scoped cloud key
+    /// (`huggingface/{repository_id}/` + path, #5662).
+    fn longest_storage_key(path: &str) -> String {
+        crate::storage::StorageKeyScheme::RepoScoped.write_key(
+            "s3",
+            "huggingface",
+            uuid::Uuid::new_v4(),
+            path,
+        )
+    }
+
     #[test]
     fn test_long_model_id_storage_key_fits_in_db() {
-        // Storage key adds "huggingface/" prefix (12 chars).
+        // The repo-scoped storage key adds "huggingface/{uuid}/" (49 chars).
         let model_id = "a".repeat(MAX_MODEL_ID_LEN);
         let revision = "main";
         let filename = "model.safetensors";
-        let key = format!("huggingface/{}/{}/{}", model_id, revision, filename);
+        let key = longest_storage_key(&format!("{}/{}/{}", model_id, revision, filename));
         assert!(
             key.len() <= 2048,
             "storage_key length {} exceeds VARCHAR(2048)",
             key.len()
         );
+    }
+
+    /// #5662: a path of exactly MAX_PATH_LEN still fits VARCHAR(2048) under
+    /// the repo-scoped cloud key, and the cap is not looser than that.
+    #[test]
+    fn test_max_path_len_storage_key_fits_in_db_5662() {
+        let key = longest_storage_key(&"p".repeat(MAX_PATH_LEN));
+        assert_eq!(key.len(), 2048);
+        let flat = crate::storage::StorageKeyScheme::Flat.write_key(
+            "s3",
+            "huggingface",
+            uuid::Uuid::new_v4(),
+            &"p".repeat(MAX_PATH_LEN),
+        );
+        assert!(flat.len() <= 2048);
     }
 
     #[test]
@@ -2261,10 +2297,7 @@ mod tests {
         assert_eq!(model_id.len(), 120);
         let path = format!("{}/{}/{}", model_id, "main", "weights.safetensors");
         assert!(path.len() <= MAX_PATH_LEN);
-        let key = format!(
-            "huggingface/{}/{}/{}",
-            model_id, "main", "weights.safetensors"
-        );
+        let key = longest_storage_key(&path);
         assert!(key.len() <= 2048);
     }
 
@@ -2374,6 +2407,47 @@ mod tests {
             status
         );
         f.teardown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #5662: hosted uploads write repo-scoped keys on cloud storage.
+    // -----------------------------------------------------------------------
+
+    fn upload_request(
+        repo_key: &str,
+        model: &str,
+        filename: &str,
+        body: Body,
+    ) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{repo_key}/api/models/{model}/upload/main"))
+            .header("x-filename", filename)
+            .body(body)
+            .unwrap()
+    }
+
+    /// #5662: the same model file uploads into two Hugging Face repositories
+    /// on a shared cloud namespace (on main the second answered 409).
+    #[tokio::test]
+    async fn same_model_file_uploads_to_two_cloud_repositories_5662() {
+        let file = b"{\"model_type\":\"scoped-5662\"}";
+        tdh::assert_cloud_publish_is_repo_scoped(tdh::CloudPublishCase {
+            format: "huggingface",
+            key_prefix: "huggingface",
+            router: super::router,
+            publish: &|key| {
+                vec![upload_request(
+                    key,
+                    "scoped5662-model",
+                    "config.json",
+                    Body::from(&file[..]),
+                )]
+            },
+            download: &|key| tdh::get(format!("/{key}/scoped5662-model/resolve/main/config.json")),
+            expected: file,
+        })
+        .await;
     }
 
     /// #4725: a HuggingFace file upload to a hosted repository must queue a
