@@ -21826,6 +21826,123 @@ tonic-build = "0.12"
     }
 
     // -----------------------------------------------------------------------
+    // CVSS summary of a proxy verdict (#5263)
+    // -----------------------------------------------------------------------
+
+    fn scored(severity: Severity, score: Option<f64>) -> RawFinding {
+        RawFinding {
+            cvss: score.map(|s| crate::models::security::CvssAssessment {
+                score: CvssScore::from_f64(s).unwrap(),
+                version: Some("3.1".to_string()),
+                vector: None,
+                source: Some("nvd@nist.gov".to_string()),
+            }),
+            ..make_finding(severity)
+        }
+    }
+
+    /// The summary is the highest score among scored findings and the highest
+    /// severity among unscored ones, each over the findings above `Info`.
+    #[test]
+    fn test_proxy_verdict_cvss_summary() {
+        let verdict = aggregate_proxy_verdict(
+            &[
+                scored(Severity::High, Some(7.5)),
+                scored(Severity::Low, Some(9.8)),
+                scored(Severity::Critical, Some(6.0)),
+                scored(Severity::Medium, None),
+                scored(Severity::Low, None),
+            ],
+            None,
+        );
+        assert_eq!(verdict.max_severity, Some(Severity::Critical));
+        assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(9.8));
+        assert_eq!(verdict.max_unscored_severity, Some(Severity::Medium));
+        assert_eq!(
+            verdict.grade(),
+            crate::services::proxy_scan_service::VerdictGrade {
+                max_severity: Some(Severity::Critical),
+                max_cvss_score: CvssScore::from_f64(9.8),
+                max_unscored_severity: Some(Severity::Medium),
+            }
+        );
+
+        let all_scored = aggregate_proxy_verdict(&[scored(Severity::High, Some(7.5))], None);
+        assert_eq!(all_scored.max_unscored_severity, None);
+        let none_scored = aggregate_proxy_verdict(&[scored(Severity::High, None)], None);
+        assert_eq!(none_scored.max_cvss_score, None);
+        assert_eq!(none_scored.max_unscored_severity, Some(Severity::High));
+    }
+
+    /// `Info` findings never block at any severity threshold, and they take
+    /// no part in the CVSS summary either, scored or not: an unrelated `low`
+    /// finding must not turn a Negligible advisory with a high NVD score into
+    /// a block.
+    #[test]
+    fn test_proxy_verdict_cvss_summary_excludes_info_findings() {
+        let verdict = aggregate_proxy_verdict(
+            &[
+                scored(Severity::Info, Some(9.8)),
+                scored(Severity::Info, None),
+                scored(Severity::Low, Some(3.1)),
+            ],
+            None,
+        );
+        assert!(verdict.is_vulnerable());
+        assert_eq!(verdict.max_cvss_score, CvssScore::from_f64(3.1));
+        assert_eq!(verdict.max_unscored_severity, None);
+
+        let info_only = aggregate_proxy_verdict(&[scored(Severity::Info, Some(9.8))], None);
+        assert!(!info_only.is_vulnerable());
+        assert_eq!(info_only.max_cvss_score, None);
+    }
+
+    /// Duplicates of one vulnerability in one component collapse to the most
+    /// severe copy, and that copy carries the highest score either had,
+    /// whichever order they arrive in.
+    #[test]
+    fn test_dedupe_findings_keeps_the_highest_cvss_score() {
+        let copy = |severity: Severity, score: Option<f64>| RawFinding {
+            cvss: scored(severity, score).cvss,
+            ..dedup_finding(
+                Some("CVE-2024-0001"),
+                Some("requests"),
+                Some("2.0.0"),
+                severity,
+                Some("grype"),
+                "dup",
+            )
+        };
+        for (first, second) in [
+            (copy(Severity::High, None), copy(Severity::Low, Some(9.1))),
+            (copy(Severity::Low, Some(9.1)), copy(Severity::High, None)),
+            (
+                copy(Severity::High, Some(7.0)),
+                copy(Severity::Low, Some(9.1)),
+            ),
+        ] {
+            let deduped = dedupe_findings(vec![first, second], Some(ComponentEcosystem::Python));
+            assert_eq!(deduped.len(), 1);
+            assert_eq!(deduped[0].severity, Severity::High);
+            assert_eq!(
+                deduped[0].cvss.as_ref().map(|c| c.score),
+                CvssScore::from_f64(9.1)
+            );
+        }
+    }
+
+    /// The finding rows shown to an operator carry the assessment the
+    /// verdict was graded by.
+    #[test]
+    fn test_retain_proxy_findings_carries_the_cvss_assessment() {
+        let mut finding = scored(Severity::High, Some(8.8));
+        finding.cve_id = Some("CVE-2024-0002".to_string());
+        let retained = retain_proxy_findings(&[finding.clone()]);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].cvss, finding.cvss);
+    }
+
+    // -----------------------------------------------------------------------
     // dedupe_findings — proxy scan findings_count inflation fix
     //
     // Mechanism under test: `ScanWorkspace::prepare_pinned` catalogs a PyPI

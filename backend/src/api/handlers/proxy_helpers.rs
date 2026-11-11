@@ -14029,6 +14029,124 @@ mod tests {
         assert_eq!(decide(stored_clean(), &vulnerable), "Replace");
     }
 
+    /// #5263: "at least as severe" covers the stored CVSS summary. A rescan
+    /// that grades the bytes as no release may not lower the score, or the
+    /// unscored severity, of a verdict graded as a request-pinned coordinate:
+    /// a numeric threshold that blocks the stored verdict could serve the
+    /// rescan's. A stored verdict with no summary leaves the rule as it was.
+    #[test]
+    fn rescan_never_lowers_the_cvss_summary_of_a_request_pinned_verdict_5263() {
+        use crate::models::security::{CvssScore, Severity};
+        use crate::services::scanner_service::{ComponentEcosystem, ExpectedComponent};
+        let pin = ExpectedComponent::new(ComponentEcosystem::Go, "golang.org/x/net", "v0.1.0")
+            .pin_identity();
+        let stored = |score: Option<f64>, unscored: Option<&'static str>| {
+            Some(StoredRescanRow {
+                max_cvss_score: score,
+                max_unscored_severity: unscored,
+                ..stored_row("vulnerable", Some(1), Some(pin.as_str()), Some("high"))
+            })
+        };
+        let rescan = |score: Option<f64>, unscored: Option<Severity>| {
+            let mut verdict = rescan_verdict(Some(Severity::High), Some(1));
+            verdict.max_cvss_score = score.and_then(CvssScore::from_f64);
+            verdict.max_unscored_severity = unscored;
+            verdict
+        };
+        let kept = format!("ReplaceKeepingPin({pin:?})");
+        let refused = "Refuse(RequestPinned)";
+
+        // Stored: scored 9.0, nothing unscored.
+        assert_eq!(
+            decide(stored(Some(9.0), None), &rescan(Some(9.0), None)),
+            kept
+        );
+        assert_eq!(
+            decide(stored(Some(9.0), None), &rescan(Some(9.8), None)),
+            kept
+        );
+        assert_eq!(
+            decide(stored(Some(9.0), None), &rescan(Some(7.0), None)),
+            refused
+        );
+        assert_eq!(
+            decide(stored(Some(9.0), None), &rescan(None, Some(Severity::High))),
+            refused,
+            "a rescan that no longer scores the finding is not as severe"
+        );
+        // Stored: an unscored `high`.
+        assert_eq!(
+            decide(
+                stored(None, Some("high")),
+                &rescan(None, Some(Severity::Critical))
+            ),
+            kept
+        );
+        assert_eq!(
+            decide(
+                stored(None, Some("high")),
+                &rescan(None, Some(Severity::Medium))
+            ),
+            refused
+        );
+        assert_eq!(
+            decide(stored(None, Some("high")), &rescan(Some(9.9), None)),
+            refused,
+            "a scored finding is no longer graded by the severity threshold"
+        );
+        // Stored with no summary: the severity rule alone decides, as before.
+        assert_eq!(decide(stored(None, None), &rescan(Some(1.0), None)), kept);
+    }
+
+    /// #5263: a stored row is graded on its CVSS summary under a numeric
+    /// gate, and a row without one blocks.
+    #[test]
+    fn stored_verdict_is_graded_on_its_cvss_summary_under_a_numeric_gate_5263() {
+        use crate::models::security::{CvssScore, Severity};
+        use crate::services::proxy_scan_service::{CvssGate, ProxyScanRow, ProxySeverityGate};
+        let gate = ProxySeverityGate::Cvss(CvssGate {
+            min_score: CvssScore::from_f64(8.0).unwrap(),
+            unscored_severity: Severity::High,
+            any_severity: None,
+        });
+        let row = |score: Option<f64>, unscored: Option<&str>| ProxyScanRow {
+            checksum_sha256: "abc".to_string(),
+            scan_type: PROXY_SCAN_TYPE.to_string(),
+            verdict: "vulnerable".to_string(),
+            findings_count: 1,
+            critical_count: 0,
+            high_count: 1,
+            medium_count: 0,
+            low_count: 0,
+            max_severity: Some("high".to_string()),
+            scanner_version: None,
+            scanned_at: Utc::now(),
+            max_cvss_score: score,
+            max_unscored_severity: unscored.map(str::to_string),
+        };
+        assert!(!stored_verdict_blocks_under_gate(
+            Some(&row(Some(7.5), None)),
+            gate
+        ));
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&row(Some(8.0), None)),
+            gate
+        ));
+        assert!(stored_verdict_blocks_under_gate(
+            Some(&row(Some(7.5), Some("high"))),
+            gate
+        ));
+        assert!(!stored_verdict_blocks_under_gate(
+            Some(&row(Some(7.5), Some("medium"))),
+            gate
+        ));
+        assert!(
+            stored_verdict_blocks_under_gate(Some(&row(None, None)), gate),
+            "a verdict recorded before scores were kept"
+        );
+        assert!(stored_verdict_blocks_under_gate(None, gate));
+    }
+
     /// #5628: a `vulnerable` verdict graded as a request-pinned coordinate (an
     /// OS package of a release, a Go/Composer/Conan coordinate) is replaced by
     /// an unpinned rescan only when the rescan is blocking and at least as

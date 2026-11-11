@@ -4275,6 +4275,50 @@ mod tests {
         }
     }
 
+    /// #5263: the count grades a verdict on its CVSS summary under a
+    /// repository's numeric threshold, as the gate does: the same digest is
+    /// blocked by the repository whose threshold it reaches and not by the
+    /// one whose threshold it is below, and a verdict with no summary counts
+    /// as blocked under a numeric threshold.
+    #[test]
+    fn test_count_blocked_proxy_digests_follows_a_cvss_threshold() {
+        let candidate =
+            |digest: &str, threshold: Option<f64>, score: Option<f64>| ProxyBlockCandidate {
+                cvss_threshold: threshold,
+                max_cvss_score: score,
+                ..block_candidate(digest, Some("high"), "fail_open", true, "critical")
+            };
+        // Scored 7.5: below 8.0, at or above 7.0.
+        assert_eq!(
+            count_blocked_proxy_digests(&[candidate("a", Some(8.0), Some(7.5))]),
+            0
+        );
+        assert_eq!(
+            count_blocked_proxy_digests(&[
+                candidate("a", Some(8.0), Some(7.5)),
+                candidate("a", Some(7.0), Some(7.5)),
+            ]),
+            1
+        );
+        // No numeric threshold: the `critical` severity threshold serves a
+        // `high`, whatever its score.
+        assert_eq!(
+            count_blocked_proxy_digests(&[candidate("b", None, Some(9.8))]),
+            0
+        );
+        // No CVSS summary on the verdict: not known to be below the number.
+        assert_eq!(
+            count_blocked_proxy_digests(&[candidate("c", Some(8.0), None)]),
+            1
+        );
+        // An unscored `high` is graded by the severity threshold (`critical`).
+        let unscored = ProxyBlockCandidate {
+            max_unscored_severity: Some("high".to_string()),
+            ..candidate("d", Some(8.0), None)
+        };
+        assert_eq!(count_blocked_proxy_digests(&[unscored]), 0);
+    }
+
     /// #4380: the dashboard counts a proxied verdict as blocked exactly when
     /// the proxy scan gate would refuse it, once per digest.
     #[test]

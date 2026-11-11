@@ -1282,4 +1282,217 @@ mod tests {
 
         fx.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // cvss_threshold (#5263)
+    // -----------------------------------------------------------------------
+
+    fn with_cvss(base: MergedScanConfig, threshold: Option<f64>) -> MergedScanConfig {
+        MergedScanConfig {
+            cvss_threshold: threshold.map(|t| CvssScore::from_f64(t).unwrap()),
+            ..base
+        }
+    }
+
+    /// The request field is three-way: omitted keeps the stored value, `null`
+    /// clears it, a number sets it.
+    #[test]
+    fn cvss_threshold_request_field_is_three_way() {
+        let parse = |json: &str| serde_json::from_str::<UpsertScanConfigRequest>(json).unwrap();
+        assert_eq!(parse("{}").cvss_threshold, None);
+        assert_eq!(
+            parse(r#"{"cvss_threshold": null}"#).cvss_threshold,
+            Some(None)
+        );
+        assert_eq!(
+            parse(r#"{"cvss_threshold": 8.0}"#).cvss_threshold,
+            Some(Some(8.0))
+        );
+        assert_eq!(
+            parse(r#"{"cvss_threshold": 8}"#).cvss_threshold,
+            Some(Some(8.0))
+        );
+        assert!(
+            serde_json::from_str::<UpsertScanConfigRequest>(r#"{"cvss_threshold": "high"}"#)
+                .is_err()
+        );
+
+        let stored = ScanConfig {
+            cvss_threshold: Some(8.0),
+            ..sample_config()
+        };
+        let merge = |json: &str| merge_scan_config(&parse(json), Some(&stored));
+        let eight = CvssScore::from_f64(8.0);
+        assert_eq!(merge("{}").unwrap().cvss_threshold, eight);
+        assert_eq!(
+            merge(r#"{"severity_threshold": "low"}"#)
+                .unwrap()
+                .cvss_threshold,
+            eight,
+            "a patch that does not name the field must not clear it"
+        );
+        assert_eq!(
+            merge(r#"{"cvss_threshold": null}"#).unwrap().cvss_threshold,
+            None
+        );
+        assert_eq!(
+            merge(r#"{"cvss_threshold": 7.04}"#).unwrap().cvss_threshold,
+            CvssScore::from_f64(7.0),
+            "rounded to the one decimal CVSS scores have"
+        );
+        // No row yet: the default is no numeric threshold.
+        assert_eq!(
+            merge_scan_config(&parse("{}"), None)
+                .unwrap()
+                .cvss_threshold,
+            None
+        );
+    }
+
+    /// A number off the CVSS scale is a 400 naming the field, not a CHECK
+    /// violation surfacing as a 500.
+    #[test]
+    fn cvss_threshold_off_the_scale_is_a_validation_error() {
+        for bad in ["-0.1", "10.1", "100"] {
+            let req: UpsertScanConfigRequest =
+                serde_json::from_str(&format!(r#"{{"cvss_threshold": {bad}}}"#)).unwrap();
+            match merge_scan_config(&req, None) {
+                Err(AppError::Validation(message)) => {
+                    assert!(message.contains("cvss_threshold"), "{message}")
+                }
+                other => panic!("{bad}: expected a validation error, got {other:?}"),
+            }
+        }
+    }
+
+    /// The gate one row resolves to: the number is live only under the
+    /// opt-in, record-only still overrides everything, and the severity
+    /// threshold becomes the rule for unscored findings.
+    #[test]
+    fn proxy_severity_gate_for_row_reads_the_cvss_threshold() {
+        use crate::services::proxy_scan_service::{CvssGate, ProxySeverityGate};
+        assert_eq!(
+            proxy_severity_gate_for_row(true, "medium", "fail_open", Some(8.0)),
+            ProxySeverityGate::Cvss(CvssGate {
+                min_score: CvssScore::from_f64(8.0).unwrap(),
+                unscored_severity: Severity::Medium,
+                any_severity: None,
+            })
+        );
+        assert_eq!(
+            proxy_severity_gate_for_row(false, "medium", "fail_closed", Some(8.0)),
+            ProxySeverityGate::BlockOnAny
+        );
+        assert_eq!(
+            proxy_severity_gate_for_row(true, "medium", "record_only", Some(8.0)),
+            ProxySeverityGate::RecordOnly
+        );
+    }
+
+    /// #4363 for the numeric threshold: on a locked repository a repository
+    /// administrator may lower the number but not raise or clear it, and may
+    /// not trade a severity threshold for a numeric one or back, since each
+    /// blocks verdicts the other serves.
+    #[test]
+    fn proxy_policy_weakened_covers_the_cvss_threshold() {
+        let any = merged(true, "fail_open", false, "high");
+        let high = merged(true, "fail_open", true, "high");
+        let cvss = |t: f64| with_cvss(high.clone(), Some(t));
+
+        assert!(proxy_policy_weakened(&cvss(7.0), &cvss(8.0)), "raised");
+        assert!(!proxy_policy_weakened(&cvss(8.0), &cvss(7.0)), "lowered");
+        assert!(!proxy_policy_weakened(&cvss(8.0), &cvss(8.0)), "unchanged");
+        assert!(proxy_policy_weakened(&cvss(8.0), &high), "cleared");
+        assert!(
+            proxy_policy_weakened(&high, &cvss(8.0)),
+            "severity to numeric"
+        );
+        assert!(proxy_policy_weakened(&any, &cvss(0.0)), "from block-on-any");
+        assert!(!proxy_policy_weakened(&cvss(8.0), &any), "to block-on-any");
+        // The severity threshold under a numeric gate grades unscored
+        // findings, so loosening it is weakening too.
+        assert!(proxy_policy_weakened(
+            &cvss(8.0),
+            &with_cvss(merged(true, "fail_open", true, "critical"), Some(8.0))
+        ));
+        assert!(!proxy_policy_weakened(
+            &cvss(8.0),
+            &with_cvss(merged(true, "fail_open", true, "low"), Some(8.0))
+        ));
+        // With the opt-in off the number is inert: changing it changes no gate.
+        assert!(!proxy_policy_weakened(
+            &with_cvss(any.clone(), Some(5.0)),
+            &with_cvss(any, Some(9.0))
+        ));
+    }
+
+    /// DB-backed (#5263): the threshold is stored, read back by every config
+    /// read, resolved into the gate, preserved by a patch that does not name
+    /// it, and cleared by `null`. Skips cleanly when DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_cvss_threshold_db_roundtrip_and_gate() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::proxy_scan_service::{CvssGate, ProxySeverityGate};
+        let Some(fx) = tdh::Fixture::setup("remote", "pypi").await else {
+            return;
+        };
+        let svc = ScanConfigService::new(fx.pool.clone());
+        let patch = |json: &str| serde_json::from_str::<UpsertScanConfigRequest>(json).unwrap();
+
+        let cfg = svc
+            .upsert_config(
+                fx.repo_id,
+                &patch(
+                    r#"{"scan_enabled": true, "scan_on_proxy": true,
+                        "block_on_policy_violation": true, "cvss_threshold": 8.0}"#,
+                ),
+            )
+            .await
+            .expect("set the threshold");
+        assert_eq!(cfg.cvss_threshold, Some(8.0));
+        assert_eq!(
+            svc.get_config(fx.repo_id)
+                .await
+                .expect("get")
+                .expect("row")
+                .cvss_threshold,
+            Some(8.0)
+        );
+        assert!(svc
+            .list_configs()
+            .await
+            .expect("list")
+            .iter()
+            .any(|c| c.repository_id == fx.repo_id && c.cvss_threshold == Some(8.0)));
+        assert_eq!(
+            svc.proxy_severity_gate(fx.repo_id).await.expect("gate"),
+            ProxySeverityGate::Cvss(CvssGate {
+                min_score: CvssScore::from_f64(8.0).unwrap(),
+                unscored_severity: Severity::High,
+                any_severity: None,
+            })
+        );
+
+        let cfg = svc
+            .upsert_config(fx.repo_id, &patch(r#"{"severity_threshold": "medium"}"#))
+            .await
+            .expect("patch another field");
+        assert_eq!(
+            cfg.cvss_threshold,
+            Some(8.0),
+            "preserved by a partial patch"
+        );
+
+        let cfg = svc
+            .upsert_config(fx.repo_id, &patch(r#"{"cvss_threshold": null}"#))
+            .await
+            .expect("clear the threshold");
+        assert_eq!(cfg.cvss_threshold, None);
+        assert_eq!(
+            svc.proxy_severity_gate(fx.repo_id).await.expect("gate"),
+            ProxySeverityGate::Threshold(Severity::Medium)
+        );
+
+        fx.teardown().await;
+    }
 }
