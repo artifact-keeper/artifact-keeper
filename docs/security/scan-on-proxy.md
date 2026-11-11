@@ -24,6 +24,7 @@ The settings live in the repository's scan configuration
 | `proxy_scan_action` | `fail_open` (default), `fail_closed` or `record_only`. See [Actions](#actions). |
 | `block_on_policy_violation` | Off (default): any finding blocks. On: only findings at or above `severity_threshold` block. |
 | `severity_threshold` | `critical`, `high`, `medium`, `low` or `info`. Used only with `block_on_policy_violation`. |
+| `cvss_threshold` | A number from `0.0` to `10.0`, or `null` (default). Used only with `block_on_policy_violation`. See [Blocking by CVSS score](#blocking-by-cvss-score). |
 
 A Virtual repository has its own scan configuration too. See
 [Virtual repositories](#virtual-repositories).
@@ -45,7 +46,11 @@ weakens it:
   `fail_open`, or either to `record_only`);
 - loosening the severity gate: turning `block_on_policy_violation` on (from
   "any finding blocks") or raising `severity_threshold` (for example `high`
-  to `critical`).
+  to `critical`);
+- loosening the CVSS gate: raising or clearing `cvss_threshold`, or setting
+  one where there was none. A severity threshold and a numeric threshold each
+  block findings the other serves, so moving from one to the other counts as
+  weakening in both directions. Lowering the number is tightening.
 
 A repository administrator who sends `instance_locked` at all gets `403`.
 `scan_enabled` and `scan_on_upload` are not governed by the lock. Existing
@@ -469,6 +474,69 @@ budget fits inside it. A lower wait refuses more of a first install on a small h
 see [the OCI timeouts page](../operations/oci-reverse-proxy-timeouts.md) for how to
 set the timeout on each proxy.
 
+## Blocking by CVSS score
+
+A severity threshold compares the scanner's severity label. Two `high`
+findings scored 7.5 and 8.1 get the same decision, so a policy such as "block
+CVSS 8.0 and above" cannot be written as a severity threshold, and `critical`
+is a different policy. `cvss_threshold` adds the number (#5263, migration
+361).
+
+With `block_on_policy_violation` on and `cvss_threshold` set to, say, `8.0`:
+
+- A finding **with a CVSS base score** blocks when the score is `8.0` or
+  higher, whatever its severity label. The label and the score are two
+  assessments and need not agree: a distribution can label `low` what NVD
+  scores 9.8. The score decides.
+- A finding **with no score** is graded by `severity_threshold`, exactly as
+  it would be with no `cvss_threshold`. A number cannot grade it, so the
+  label still does. To block every unscored finding, set
+  `severity_threshold` to `low`.
+- Findings graded `info` (Grype's `Negligible`) take no part, scored or not,
+  as under a severity threshold.
+
+With `block_on_policy_violation` off the number is stored but inert, like
+`severity_threshold`: any finding blocks. `record_only` overrides it too.
+
+`PUT .../security` treats the field three ways: omit it to leave the stored
+value unchanged, send `null` to clear it, send a number to set it. The number
+is rounded to one decimal. Anything outside `0.0` to `10.0` is a `400`.
+
+**Which score.** An advisory often carries several assessments. For a Grype
+finding the gate uses one, chosen in this order:
+
+1. The assessments on the advisory record Grype matched the package
+   against. If that record has none (a distribution advisory usually has
+   none), the assessments on its related records, taken together: for a
+   distribution advisory, the NVD entry of the same CVE.
+2. Among those, a `Primary` assessment (the advisory database's own
+   analysis) before a `Secondary` one (the vendor's or CNA's). An assessment
+   marked neither ranks between them.
+3. Then the newest CVSS version: 4.0, then 3.1, 3.0, 2.0.
+4. Then the highest score.
+
+The chosen score, its CVSS version, vector and source are stored with each
+finding and returned as `cvss` wherever a proxy scan finding is listed, so
+you can see why a pull was or was not blocked. Advisory matches from the
+dependency scanner and findings from the optional Trivy adapter carry no
+score today and are graded by `severity_threshold`.
+
+**Cached verdicts.** A verdict is shared across repositories while the
+threshold is per repository, so the verdict row stores a summary instead of a
+decision: the highest score among its scored findings (`max_cvss_score`) and
+the highest severity among its unscored ones (`max_unscored_severity`). A
+cached verdict is compared with each repository's own threshold on every
+pull, by the same rule as a fresh scan. `GET
+/api/v1/admin/proxy-scan-verdicts/{digest}` shows both values.
+
+**Verdicts recorded before the upgrade** have no summary. A repository with
+a `cvss_threshold` blocks them (`403`) until the digest is scanned again:
+nothing on such a verdict is known to be below the number. They are rescanned
+as they age out or the scanner version changes (see
+[Verdicts and freshness](#verdicts-and-freshness)); to clear one sooner,
+rescan the artifact or delete the verdict through the admin endpoint.
+Repositories without a `cvss_threshold` are unaffected.
+
 ## Verdicts and freshness
 
 Verdicts are stored per content digest in `proxy_scan_results` and shared
@@ -583,7 +651,10 @@ over the members the caller may read.
 - A Remote member is scanned under the **stricter of two** policies: the
   Virtual's own scan configuration and the member's. Scanning is on if either
   side enables it. `fail_closed` beats `fail_open`, which beats `record_only`,
-  and the severity gate is the stricter of the two.
+  and the severity gate is the stricter of the two. When one side has a
+  severity threshold and the other a `cvss_threshold`, a finding is blocked
+  if either would block it; two numeric thresholds combine to the lower
+  number and the lower severity for unscored findings.
 - A hosted member, or a Remote member that does not scan, is served as before.
   A lower-priority Remote member never shadows a hosted copy.
 - A scanning member's `403`, `409` (quarantine hold) or `423` is its verdict

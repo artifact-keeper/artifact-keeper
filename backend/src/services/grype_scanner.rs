@@ -163,11 +163,14 @@ impl GrypeCvss {
                 _ => None,
             }
         });
+        // Descriptive text only. A NUL byte cannot be stored in a `TEXT`
+        // column and would fail the whole findings batch, so such a value is
+        // dropped; the score it describes is kept.
         let text = |value: &Option<String>| {
             value
                 .as_deref()
                 .map(str::trim)
-                .filter(|v| !v.is_empty())
+                .filter(|v| !v.is_empty() && !v.contains('\0'))
                 .map(str::to_string)
         };
         Some((
