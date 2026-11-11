@@ -630,9 +630,12 @@ enum AuthError {
 impl AuthError {
     fn from_app(error: &AppError) -> Self {
         match error {
-            AppError::Authentication(_) | AppError::NotFound(_) | AppError::Conflict(_) => {
-                Self::Invalid
-            }
+            // `Authorization`: a directory account not linked to a provider
+            // (#5483) is a refused credential, not an outage.
+            AppError::Authentication(_)
+            | AppError::Authorization(_)
+            | AppError::NotFound(_)
+            | AppError::Conflict(_) => Self::Invalid,
             other => {
                 if other.is_db_unavailable() || matches!(other, AppError::ServiceUnavailable(_)) {
                     Self::Unavailable
@@ -1023,10 +1026,14 @@ async fn sync_directory_user(
     // the federated sync: an admin disable must stay effective for package
     // clients (#4933), and this check also covers the window before the sync's
     // own `is_active` preservation runs.
+    // Scoped to this provider (#5483): the same DN in another directory is
+    // another account.
     let existing_by_dn = sqlx::query_as::<_, (Uuid, bool)>(
-        "SELECT id, is_active FROM users WHERE external_id = $1 AND auth_provider = 'ldap'",
+        "SELECT id, is_active FROM users \
+         WHERE external_id = $1 AND auth_provider = 'ldap' AND auth_provider_id = $2",
     )
     .bind(&ldap_user.dn)
+    .bind(row.id)
     .fetch_optional(db)
     .await
     .map_err(|e| AuthError::from_app(&AppError::Database(e.to_string())))?;
@@ -1045,6 +1052,7 @@ async fn sync_directory_user(
         // LDAP has no per-provider auto-create switch; login always
         // provisions, and the passthrough keeps that behaviour (#2057).
         auto_create_users: true,
+        provider_id: Some(row.id),
     };
     let user = auth_service
         .sync_federated_user(AuthProvider::Ldap, &credentials)
@@ -1462,13 +1470,14 @@ mod tests {
     /// Pin the provider on the account so the test is not at the mercy of
     /// other enabled providers another test may have left in the shared
     /// database. This also matches the production steady state: a directory
-    /// user is recorded with the provider that created them.
+    /// user is recorded with the provider that created them (and, since
+    /// #5483, bound to it).
     async fn insert_known_user(pool: &PgPool, username: &str, dn: &str, provider_id: Uuid) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO users (id, username, email, auth_provider, external_id, is_active, \
-             is_admin, ldap_provider_id) \
-             VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, true, false, $5)",
+             is_admin, ldap_provider_id, auth_provider_id) \
+             VALUES ($1, $2, $3, 'ldap'::auth_provider, $4, true, false, $5, $5)",
         )
         .bind(id)
         .bind(username)

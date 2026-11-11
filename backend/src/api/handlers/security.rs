@@ -12375,6 +12375,93 @@ mod tests {
         assert_eq!(stored_findings, 3, "2 + 1 findings across both submissions");
     }
 
+    /// #5564: an external verdict's `scanner_version` used to be written into
+    /// `scan_results.scanner_version VARCHAR(50)`, so a longer vendor build id
+    /// answered 500 `DATABASE_ERROR`. It is `TEXT` now and must be stored
+    /// whole. A finding the schema still refuses (an over-long `cve_id`)
+    /// stays a 400 `VALIDATION_ERROR`, not a 500, and writes no scan row.
+    #[tokio::test]
+    async fn test_ingest_external_findings_stores_long_scanner_version_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let art = seed_artifact_row(&fx.pool, fx.repo_id).await;
+        let app = tdh::router_with_auth_ext(
+            router(),
+            fx.state.clone(),
+            tdh::admin_auth(fx.user_id, &fx.username),
+        );
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/findings/external")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let long_version = format!("acme-scanner-{}", "v".repeat(120));
+        let (status, body) = tdh::send(
+            app.clone(),
+            post(serde_json::json!({
+                "artifact_id": art,
+                "scanner": "acme",
+                "scanner_version": long_version.clone(),
+                "findings": [{
+                    "severity": "high",
+                    "title": "backdoor",
+                    "cve_id": "CVE-2024-3094",
+                }],
+            })),
+        )
+        .await;
+        let overlong_id = format!("VENDOR-ADVISORY-{}", "1".repeat(30));
+        let (bad_status, bad_body) = tdh::send(
+            app,
+            post(serde_json::json!({
+                "artifact_id": art,
+                "scanner": "acme",
+                "findings": [{
+                    "severity": "high",
+                    "title": "backdoor",
+                    "cve_id": overlong_id,
+                }],
+            })),
+        )
+        .await;
+        let stored: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, scanner_version FROM scan_results WHERE artifact_id = $1",
+        )
+        .bind(art)
+        .fetch_all(&fx.pool)
+        .await
+        .expect("read the ingested scan back");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "a long scanner version must be accepted, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            stored.len(),
+            1,
+            "the refused submission must write no scan row"
+        );
+        assert_eq!(stored[0].0, "completed");
+        assert_eq!(stored[0].1.as_deref(), Some(long_version.as_str()));
+        assert_eq!(
+            bad_status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "an over-long cve_id stays a 400, got {}",
+            String::from_utf8_lossy(&bad_body)
+        );
+        assert!(String::from_utf8_lossy(&bad_body).contains("VALIDATION_ERROR"));
+    }
+
     #[tokio::test]
     async fn test_ingest_external_findings_rejects_unknown_artifact_db() {
         use crate::api::handlers::test_db_helpers as tdh;
