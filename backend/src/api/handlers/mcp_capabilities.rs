@@ -945,15 +945,16 @@ async fn complete_job(
         Utc::now(),
     )
     .map_err(|e| invalid_metadata(&e))?;
-    // The full serve gate a claim passes, evaluated again now (#5463); the
-    // version's and its backing packages' holds are re-read under lock in
-    // the transaction as well.
-    let servable = match version_servable(&state, job.artifact_id, base.as_str()).await? {
-        Servability::Servable => true,
-        Servability::Held => false,
-        // No verdict is no hold: the claim stays for the worker to retry or
-        // the reaper to return.
-        Servability::Unavailable => return Err(gate_unavailable()),
+    // The full serve gate a claim passes (#5463), evaluated by
+    // `jobs::complete` once the version and the claim are locked (#5533), so
+    // a hold that committed before the locks is seen. No verdict is no hold:
+    // the claim stays for the worker to retry or the reaper to return.
+    let gate = || async {
+        match version_servable(&state, job.artifact_id, base.as_str()).await {
+            Ok(Servability::Servable) => jobs::GateVerdict::Servable,
+            Ok(Servability::Held) => jobs::GateVerdict::Held,
+            Ok(Servability::Unavailable) | Err(_) => jobs::GateVerdict::Unavailable,
+        }
     };
     // The claim token proves only the claim; the repository scope is
     // re-checked against the job's repository inside the transaction that
@@ -965,7 +966,7 @@ async fn complete_job(
         parsed,
         auth.user_id,
         &scope,
-        servable,
+        gate,
     )
         .await
         .map_err(app_error)?
@@ -1002,14 +1003,16 @@ async fn complete_job(
             ))
         }
         jobs::Completed::Invalid(e) => return Err(invalid_metadata(&e)),
+        jobs::Completed::GateUnavailable => return Err(gate_unavailable()),
     };
     Ok(json_resp(StatusCode::OK, &out))
 }
 
 /// The serve gate a claim passes ([`claim_payload`]) for the server version
 /// `artifact_id` now: a deleted version is [`Servability::Held`]. A
-/// repository that vanished since the claim answers its own `404` from
-/// `mcp_repo`, leaving the claim for the reaper.
+/// repository that vanished since the claim is `Err` (`mcp_repo`'s `404`),
+/// which a completion treats as no verdict, leaving the claim for the
+/// reaper.
 async fn version_servable(
     state: &SharedState,
     artifact_id: Uuid,
@@ -2015,7 +2018,7 @@ mod db_tests {
             jobs::parse_result(&r1).unwrap(),
             env.fx.user_id,
             &AccessScope::Admin,
-            true,
+            || async { jobs::GateVerdict::Servable },
         )
         .await
         .unwrap();
@@ -2032,7 +2035,7 @@ mod db_tests {
             jobs::parse_result(&r2).unwrap(),
             env.fx.user_id,
             &AccessScope::Admin,
-            true,
+            || async { jobs::GateVerdict::Servable },
         )
         .await
         .unwrap();
@@ -2072,7 +2075,7 @@ mod db_tests {
             parsed.clone(),
             env.fx.user_id,
             &AccessScope::Admin,
-            true,
+            || async { jobs::GateVerdict::Servable },
         )
         .await
         .unwrap();
@@ -2084,7 +2087,7 @@ mod db_tests {
             parsed,
             env.fx.user_id,
             &AccessScope::Admin,
-            true,
+            || async { jobs::GateVerdict::Servable },
         )
         .await
         .unwrap();
@@ -2347,9 +2350,10 @@ mod db_tests {
 
     /// Post every result in `results` to `job` at once, deterministically
     /// interleaved: a side connection holds the job row `FOR UPDATE` while
-    /// the completions pass the handler's token check and pre-check and
-    /// queue on the claim lock (as many as the fixture pool lets open a
-    /// transaction), and only then lets them go. Without the claim lock's
+    /// the completions pass the handler's token check and queue on the claim
+    /// lock (as many as the completion cap of the fixture pool lets open a
+    /// transaction, `jobs::gated_completions`, #5533), and only then lets
+    /// them go. Without the claim lock's
     /// re-check (#5389) every queued completion would store.
     async fn race(env: &Env, job: Uuid, results: Vec<Value>) -> Vec<(StatusCode, Value)> {
         // Two side connections: the lock holder, and a poller outside its
@@ -2361,9 +2365,9 @@ mod db_tests {
             .execute(&mut *holder)
             .await
             .unwrap();
-        let queued = results
-            .len()
-            .min(env.fx.pool.options().get_max_connections() as usize);
+        let queued = results.len().min(jobs::gated_completions(
+            env.fx.pool.options().get_max_connections(),
+        ));
         assert!(queued >= 2, "a race needs two queued completions");
         let uri = format!("/jobs/{job}/complete");
         let tasks: Vec<_> = results
@@ -2408,9 +2412,13 @@ mod db_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_completions_of_one_claim_have_one_winner() {
         let _queue = QUEUE_LOCK.lock().await;
-        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+        let Some(mut fx) = tdh::Fixture::setup("local", "mcp").await else {
             return;
         };
+        // A pool large enough for several completions to hold a transaction
+        // at once, each with room for its serve gate (#5533).
+        fx.pool = crate::testing::try_pool_with(8).await.expect("race pool");
+        fx.state = tdh::build_state(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
         let env = Env { fx };
         env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
             .await;
@@ -2616,6 +2624,100 @@ mod db_tests {
         env.cleanup().await;
     }
 
+    /// #5533: the serve gate a completion checks runs after the version and
+    /// the claim are locked, not before the transaction. A hold only the
+    /// full gate sees (here a deny-list entry, which changes no row the
+    /// completion locks) commits while the completion waits for its version
+    /// lock, after the handler's earlier gate pass would have run: the result
+    /// is refused with `409 mcp_target_ineligible`, nothing is stored and the
+    /// job is cancelled. With the entry lifted, a new claim completes.
+    #[tokio::test]
+    async fn completion_gate_sees_a_hold_committed_before_its_locks_5533() {
+        let _queue = QUEUE_LOCK.lock().await;
+        let Some(fx) = tdh::Fixture::setup("local", "mcp").await else {
+            return;
+        };
+        let env = Env { fx };
+        env.config(crate::services::mcp_settings::PROBE_KEY, "hosted_only")
+            .await;
+        env.publish("1.0.0").await;
+        let version = env.artifact("1.0.0").await;
+        let pool = env.fx.pool.clone();
+        let job = env.claim_probe(version, "tok-5533").await;
+
+        // A concurrent writer holds the version row, so the completion waits
+        // at its version lock.
+        let mut blocker = pool.begin().await.unwrap();
+        let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM artifacts WHERE id = $1 FOR UPDATE")
+            .bind(version)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let deny_once_blocked = async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut blocked = false;
+            while std::time::Instant::now() < deadline {
+                blocked = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(blocker_pid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            env.config(
+                crate::services::mcp_settings::SERVER_DENY_KEY,
+                &json!(["com.acme/weather"]).to_string(),
+            )
+            .await;
+            blocker.commit().await.unwrap();
+            blocked
+        };
+        let ((s, b), blocked) = tokio::join!(
+            env.complete(
+                job.id,
+                ok_result("tok-5533", json!([{"name": "exfiltrate"}]))
+            ),
+            deny_once_blocked
+        );
+        assert!(blocked, "precondition: the completion waited at its lock");
+        assert_eq!(
+            (s, b["error"].as_str()),
+            (StatusCode::CONFLICT, Some("mcp_target_ineligible")),
+            "{b}"
+        );
+        let after = jobs::get_job(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(after.status, "cancelled");
+        assert!(after.snapshot_id.is_none());
+        assert_eq!(snapshot_count(&env, version).await, 0);
+
+        // Benign: the entry lifted, a new claim completes.
+        env.config(crate::services::mcp_settings::SERVER_DENY_KEY, "[]")
+            .await;
+        let job = env.claim_probe(version, "tok-5533-ok").await;
+        let (s, b) = env
+            .complete(
+                job.id,
+                ok_result("tok-5533-ok", json!([{"name": "get_weather"}])),
+            )
+            .await;
+        assert_eq!(
+            (s, b["status"].as_str()),
+            (StatusCode::OK, Some("stored")),
+            "{b}"
+        );
+        env.cleanup().await;
+    }
+
     /// #5463: a target that changes after the claim is revalidated when the
     /// result arrives. The version quarantined, rejected, marked deleted or
     /// deleted, or its backing package quarantined or deleted: the result is
@@ -2753,7 +2855,7 @@ mod db_tests {
                 parsed,
                 env.fx.user_id,
                 &AccessScope::Admin,
-                true,
+                || async { jobs::GateVerdict::Servable },
             )
             .await
             .unwrap();
@@ -2985,7 +3087,7 @@ mod db_tests {
             jobs::parse_result(&r).unwrap(),
             b_user,
             &AccessScope::Admin,
-            true,
+            || async { jobs::GateVerdict::Servable },
         )
         .await
         .unwrap();
@@ -3133,7 +3235,7 @@ mod db_tests {
                 jobs::parse_result(&r).unwrap(),
                 env.fx.user_id,
                 &AccessScope::Admin,
-                true,
+                || async { jobs::GateVerdict::Servable },
             ),
         )
         .await
