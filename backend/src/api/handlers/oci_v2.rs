@@ -4158,6 +4158,13 @@ pub async fn resolve_virtual_blob(
                 // rejects them — but never poisons the proxy cache. This is
                 // the same serve posture the plain-Remote path already ships.
                 let expected_checksum = digest.strip_prefix("sha256:").map(str::to_string);
+                // #5810: an open download breaker passes the member over
+                // without dialling it.
+                let breaker = proxy.member_breaker();
+                let Some(_admission) = breaker.admit(member.id) else {
+                    indeterminate = true;
+                    continue;
+                };
                 for image in candidate_upstream_images(image_name, upstream_url) {
                     let upstream_path = upstream_blob_path(&image, digest);
                     // A member without the blob (404) or any upstream error
@@ -4194,6 +4201,7 @@ pub async fn resolve_virtual_blob(
                                     &upstream_path,
                                     deadline,
                                 );
+                                breaker.record(member.id, &member.key, true);
                                 // Not evidence the blob is absent (#3836).
                                 indeterminate = true;
                                 break;
@@ -4201,6 +4209,16 @@ pub async fn resolve_virtual_blob(
                         },
                         None => fetch.await,
                     };
+                    // Only a deadline miss trips the breaker here: the error
+                    // `Response` no longer says whether an unavailable member
+                    // answered `5xx` or `429`, so such an answer leaves the
+                    // count as it is, and any other answer closes it.
+                    if !fetched
+                        .as_ref()
+                        .is_err_and(proxy_helpers::is_member_unavailable_response)
+                    {
+                        breaker.record(member.id, &member.key, false);
+                    }
                     match fetched {
                         Ok(result) => return Some(VirtualBlobResolution::RemoteStream { result }),
                         Err(error) => {

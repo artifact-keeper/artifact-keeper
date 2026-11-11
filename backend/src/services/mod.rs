@@ -172,6 +172,7 @@ pub mod upstream_not_found_policy;
 pub mod upstream_pause;
 pub mod upstream_tracing;
 pub mod version_order;
+pub mod virtual_member_breaker;
 pub mod wasm_bindings;
 pub mod wasm_plugin_service;
 pub mod wasm_runtime;
