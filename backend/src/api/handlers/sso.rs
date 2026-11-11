@@ -803,6 +803,8 @@ async fn oidc_callback_inner(
                 // #2057: only provision a new local user when the provider's
                 // "Auto Create Users" switch is enabled.
                 auto_create_users: row.auto_create_users,
+                // #5483: bind the account to this provider.
+                provider_id: Some(provider_id),
             },
         )
         .await
@@ -963,6 +965,7 @@ pub async fn ldap_login(
                 // LDAP has no per-provider auto-create toggle; preserve the
                 // existing always-provision behaviour (#2057 is OIDC-scoped).
                 auto_create_users: true,
+                provider_id: Some(id),
             },
         )
         .await?;
@@ -1271,6 +1274,7 @@ pub async fn saml_acs(
                 // SAML has no per-provider auto-create toggle; preserve the
                 // existing always-provision behaviour (#2057 is OIDC-scoped).
                 auto_create_users: true,
+                provider_id: Some(id),
             },
         )
         .await?;
