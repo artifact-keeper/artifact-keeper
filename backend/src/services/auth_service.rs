@@ -3318,6 +3318,8 @@ impl AuthService {
                             "User account is deactivated".to_string(),
                         ));
                     }
+                    // #4987: audit rows written for this request name the token.
+                    crate::api::middleware::request_span::record_api_token(entry.token_id);
                     return Ok(entry.validation.clone());
                 }
             }
@@ -3505,6 +3507,7 @@ impl AuthService {
             cache.insert(cache_key, (entry, Instant::now()));
         }
 
+        crate::api::middleware::request_span::record_api_token(stored_token.id);
         Ok(validation)
     }
 
@@ -11116,5 +11119,48 @@ mod tests {
         assert!(!SESSION_SIGNED_OUT_MESSAGE
             .to_ascii_lowercase()
             .contains("expired"));
+    }
+
+    /// #4987: a verified API token is recorded on the request in flight, on
+    /// the first validation and on a cache hit alike, so an audit row written
+    /// for the request (`PROXY_SCAN_BLOCKED`) can name the token.
+    #[tokio::test]
+    async fn test_4987_validated_api_token_is_recorded_on_the_request() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::request_span::{recorded_api_token, with_request_span};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, _uname) = tdh::create_user(&pool).await;
+        let svc = AuthService::new(pool.clone(), Arc::new(Config::test_config()));
+        let (token, token_id) = svc
+            .generate_api_token(user_id, "audit-4987", vec!["read:artifacts".into()], None)
+            .await
+            .expect("mint API token");
+
+        let (svc_ref, token_ref) = (&svc, token.as_str());
+        let seen = || {
+            with_request_span(tracing::Span::none(), async move {
+                assert_eq!(recorded_api_token(), None, "nothing before auth");
+                svc_ref
+                    .validate_api_token(token_ref)
+                    .await
+                    .expect("validates");
+                recorded_api_token()
+            })
+        };
+        let first = seen().await;
+        let cached = seen().await;
+        let refused = with_request_span(tracing::Span::none(), async {
+            let _ = svc.validate_api_token("ak_nottoken_garbage").await;
+            recorded_api_token()
+        })
+        .await;
+        tdh::cleanup_user(&pool, user_id).await;
+
+        assert_eq!(first, Some(token_id), "cache miss");
+        assert_eq!(cached, Some(token_id), "cache hit");
+        assert_eq!(refused, None, "a refused token records nothing");
     }
 }

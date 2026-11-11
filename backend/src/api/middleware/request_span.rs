@@ -73,6 +73,10 @@ struct RequestAttributes {
     /// per-request `Request completed` log line (#4674). A log field only:
     /// never a span attribute or metric label.
     user: RefCell<Option<String>>,
+    /// The id of the API token the request authenticated with, when it did
+    /// (#4987): for audit attribution (`PROXY_SCAN_BLOCKED`), never a span
+    /// attribute, log field or metric label.
+    api_token_id: Cell<Option<uuid::Uuid>>,
 }
 
 tokio::task_local! {
@@ -122,6 +126,24 @@ pub fn record_user(username: &str) {
 pub fn recorded_user() -> Option<String> {
     REQUEST_ATTRIBUTES
         .try_with(|attrs| attrs.user.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Record the id of the API token this request authenticated with (#4987).
+/// Called by `AuthService::validate_api_token` once a token has verified, so
+/// every surface that accepts an API token (Bearer, `X-API-Key`, Basic
+/// password, the OCI credential check) records it the same way; the last
+/// call wins. A no-op outside a request scope.
+pub fn record_api_token(token_id: uuid::Uuid) {
+    let _ = REQUEST_ATTRIBUTES.try_with(|attrs| attrs.api_token_id.set(Some(token_id)));
+}
+
+/// The API token id recorded by [`record_api_token`] for the request in
+/// flight, if any.
+pub fn recorded_api_token() -> Option<uuid::Uuid> {
+    REQUEST_ATTRIBUTES
+        .try_with(|attrs| attrs.api_token_id.get())
         .ok()
         .flatten()
 }

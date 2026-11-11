@@ -279,9 +279,13 @@ as "scanning off" (#4365).
   digest and principal per minute; see
   [audit events](../audit-events.md#proxy-scan-refusals).
 
-Refusals answered outside the shared gate are not audited yet: a conda
-attestation sidecar of a blocked package, the NuGet digest-pinned row repair
-path, and OCI image pulls.
+The refusals answered outside the shared gate from a stored verdict write the
+same entry and count in `ak_proxy_scan_verdicts_total` the same way: a conda
+`.sigs` attestation sidecar of a blocked package (the entry names the sidecar
+and the package's digest), the NuGet digest-pinned row repair, and an OCI blob
+pull of a blocked image (the entry names `<image>@<blob digest>`). OCI
+manifest pulls go through the shared gate. A Docker schema1 manifest refused
+under scan-on-proxy has no verdict and writes no entry.
 
 ## Previewing enforcement
 

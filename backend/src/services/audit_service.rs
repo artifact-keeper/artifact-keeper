@@ -1521,6 +1521,19 @@ pub const PROXY_SCAN_BLOCK_WINDOW: std::time::Duration = std::time::Duration::fr
 /// is not aggregated.
 const PROXY_SCAN_BLOCK_MAX_KEYS: usize = 10_000;
 
+/// `PROXY_SCAN_BLOCKED` writes that may run at once on this replica (#4987).
+/// Each write holds a pool connection for two statements (the context read
+/// and the insert); repeats from one caller are coalesced by the aggregator,
+/// but many distinct callers each start a write, and without a bound a burst
+/// of them could take the pool the pulls themselves need.
+const PROXY_SCAN_BLOCK_WRITE_CONCURRENCY: usize = 4;
+
+/// `PROXY_SCAN_BLOCKED` writes that may be pending (waiting for a permit or
+/// running) on this replica (#4987). Past it a row is dropped and the drop
+/// is logged, so a flood of distinct callers cannot grow the backlog without
+/// bound either. The 403 itself is never affected.
+const PROXY_SCAN_BLOCK_WRITE_BACKLOG: usize = 10_000;
+
 /// What one refused pull should write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockAdmission {
@@ -1608,6 +1621,67 @@ impl BlockAggregator {
     }
 }
 
+fn block_write_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| tokio::sync::Semaphore::new(PROXY_SCAN_BLOCK_WRITE_CONCURRENCY))
+}
+
+static BLOCK_WRITES_PENDING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static BLOCK_WRITES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run `write` once a permit of `permits` is free, unless `pending` already
+/// counts `backlog` writes, in which case `write` is dropped and `false` is
+/// returned. `pending` counts the writes waiting for a permit and the ones
+/// running.
+async fn bounded_write<F: std::future::Future<Output = ()>>(
+    permits: &tokio::sync::Semaphore,
+    pending: &std::sync::atomic::AtomicUsize,
+    backlog: usize,
+    write: F,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if pending.fetch_add(1, Ordering::AcqRel) >= backlog {
+        pending.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
+    let permit = permits.acquire().await.ok();
+    write.await;
+    drop(permit);
+    pending.fetch_sub(1, Ordering::AcqRel);
+    true
+}
+
+/// [`write_proxy_scan_blocked`] under the replica's write limit
+/// ([`PROXY_SCAN_BLOCK_WRITE_CONCURRENCY`], [`PROXY_SCAN_BLOCK_WRITE_BACKLOG`]).
+async fn write_proxy_scan_blocked_bounded(
+    db: &PgPool,
+    event: &ProxyScanBlockEvent,
+    principal: &BlockPrincipal,
+    attempts: u64,
+    aggregated: bool,
+) {
+    let written = bounded_write(
+        block_write_permits(),
+        &BLOCK_WRITES_PENDING,
+        PROXY_SCAN_BLOCK_WRITE_BACKLOG,
+        write_proxy_scan_blocked(db, event, principal, attempts, aggregated),
+    )
+    .await;
+    if !written {
+        let dropped = BLOCK_WRITES_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Logged at 1, 2, 4, 8, ... drops so a flood does not flood the log.
+        if dropped.is_power_of_two() {
+            tracing::warn!(
+                repository_id = %event.repository_id, digest = %event.checksum_sha256,
+                attempts, dropped_total = dropped,
+                backlog = PROXY_SCAN_BLOCK_WRITE_BACKLOG,
+                "PROXY_SCAN_BLOCKED audit backlog is full; dropping the entry"
+            );
+        }
+    }
+}
+
 fn block_aggregator() -> &'static std::sync::Mutex<BlockAggregator> {
     static AGG: std::sync::OnceLock<std::sync::Mutex<BlockAggregator>> = std::sync::OnceLock::new();
     AGG.get_or_init(Default::default)
@@ -1632,6 +1706,9 @@ pub struct ProxyScanBlockEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct BlockPrincipal {
     pub(crate) username: Option<String>,
+    /// The API token the request authenticated with (#4987); `None` for a
+    /// session, Basic password, anonymous or other non-token principal.
+    pub(crate) api_token_id: Option<Uuid>,
     pub(crate) ip: Option<IpAddr>,
     pub(crate) correlation_id: Option<String>,
 }
@@ -1640,17 +1717,22 @@ impl BlockPrincipal {
     pub(crate) fn current() -> Self {
         Self {
             username: crate::api::middleware::request_span::recorded_user(),
+            api_token_id: crate::api::middleware::request_span::recorded_api_token(),
             ip: crate::api::middleware::client_ip::current_verified_client_ip(),
             correlation_id: crate::api::middleware::tracing::current_correlation_id()
                 .map(crate::api::middleware::tracing::CorrelationId::into_string),
         }
     }
 
-    /// The aggregation key's principal: the username, or for an anonymous
+    /// The aggregation key's principal: the username (and the API token, so
+    /// two tokens of one user are told apart, #4987), or for an anonymous
     /// pull the client address (one CI runner's loop is one key).
     fn key(&self) -> String {
         match (&self.username, self.ip) {
-            (Some(u), _) => format!("user:{u}"),
+            (Some(u), _) => match self.api_token_id {
+                Some(token) => format!("user:{u}:token:{token}"),
+                None => format!("user:{u}"),
+            },
             (None, Some(ip)) => format!("anonymous:{ip}"),
             (None, None) => "anonymous".to_string(),
         }
@@ -1688,9 +1770,10 @@ pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
         BlockAdmission::Write { closed_repeats } => {
             tokio::spawn(async move {
                 if closed_repeats > 0 {
-                    write_proxy_scan_blocked(&db, &event, &principal, closed_repeats, true).await;
+                    write_proxy_scan_blocked_bounded(&db, &event, &principal, closed_repeats, true)
+                        .await;
                 }
-                write_proxy_scan_blocked(&db, &event, &principal, 1, false).await;
+                write_proxy_scan_blocked_bounded(&db, &event, &principal, 1, false).await;
             });
         }
         BlockAdmission::Suppress {
@@ -1709,7 +1792,7 @@ pub fn record_proxy_scan_blocked(db: &PgPool, event: ProxyScanBlockEvent) {
                     Err(poisoned) => poisoned.into_inner().take_suppressed(&key, started),
                 };
                 if repeats > 0 {
-                    write_proxy_scan_blocked(&db, &event, &principal, repeats, true).await;
+                    write_proxy_scan_blocked_bounded(&db, &event, &principal, repeats, true).await;
                 }
             });
         }
@@ -1771,6 +1854,7 @@ async fn write_proxy_scan_blocked(
         "findings_count": ctx.findings_count,
         "scanned_at": ctx.scanned_at,
         "principal": principal.username,
+        "api_token_id": principal.api_token_id,
         "anonymous": principal.username.is_none(),
         "attempts": attempts,
         "aggregated": aggregated,
@@ -1911,12 +1995,138 @@ mod proxy_scan_blocked_4777_tests {
     fn principal_key_prefers_the_username_then_the_address() {
         let p = |u: Option<&str>, ip: Option<&str>| BlockPrincipal {
             username: u.map(str::to_string),
+            api_token_id: None,
             ip: ip.map(|s| s.parse().unwrap()),
             correlation_id: None,
         };
         assert_eq!(p(Some("ci"), Some("10.0.0.1")).key(), "user:ci");
         assert_eq!(p(None, Some("10.0.0.1")).key(), "anonymous:10.0.0.1");
         assert_eq!(p(None, None).key(), "anonymous");
+    }
+
+    /// #4987: two API tokens of one user are separate keys, so the summary
+    /// row of one never absorbs the other's refusals.
+    #[test]
+    fn principal_key_tells_two_tokens_of_one_user_apart() {
+        let token = |id: Option<Uuid>| BlockPrincipal {
+            username: Some("ci".to_string()),
+            api_token_id: id,
+            ip: None,
+            correlation_id: None,
+        };
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_ne!(token(Some(a)).key(), token(Some(b)).key());
+        assert_ne!(token(Some(a)).key(), token(None).key());
+        assert_eq!(token(None).key(), "user:ci");
+    }
+
+    /// #4987: the principal reads the token id the auth path recorded on the
+    /// request.
+    #[tokio::test]
+    async fn principal_carries_the_recorded_api_token() {
+        use crate::api::middleware::request_span as rs;
+        let id = Uuid::new_v4();
+        let p = rs::with_request_span(tracing::Span::none(), async {
+            rs::record_user("ci");
+            rs::record_api_token(id);
+            BlockPrincipal::current()
+        })
+        .await;
+        assert_eq!(p.username.as_deref(), Some("ci"));
+        assert_eq!(p.api_token_id, Some(id));
+    }
+
+    /// #4987: refused-pull audit writes run at most `permits` at a time, and
+    /// past the backlog a write is dropped instead of queued.
+    #[tokio::test]
+    async fn bounded_write_caps_concurrency_and_backlog() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let (permits, pending, running, peak) = (
+                permits.clone(),
+                pending.clone(),
+                running.clone(),
+                peak.clone(),
+            );
+            tasks.push(tokio::spawn(async move {
+                bounded_write(&permits, &pending, 100, async {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+            }));
+        }
+        for t in tasks {
+            assert!(t.await.unwrap(), "under the backlog every write runs");
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2, "peak {peak:?}");
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+
+        // A full backlog drops the write without running it.
+        let closed = tokio::sync::Semaphore::new(0);
+        let full = AtomicUsize::new(3);
+        let ran = AtomicUsize::new(0);
+        let written = bounded_write(&closed, &full, 3, async {
+            ran.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(!written);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            full.load(Ordering::SeqCst),
+            3,
+            "a dropped write is not counted"
+        );
+    }
+
+    /// #4987: the row names the API token the refused pull authenticated with.
+    #[tokio::test]
+    async fn the_audit_row_records_the_api_token_id() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (repo_id, _key, dir) = tdh::create_repo(&pool, "remote", "npm").await;
+        let token = Uuid::new_v4();
+        let event = ProxyScanBlockEvent {
+            repository_id: repo_id,
+            path: "left-pad-1.0.0.tgz".to_string(),
+            checksum_sha256: format!("{:064x}", Uuid::new_v4().as_u128()),
+        };
+        let principal = |api_token_id| BlockPrincipal {
+            username: None,
+            api_token_id,
+            ip: None,
+            correlation_id: None,
+        };
+        write_proxy_scan_blocked(&pool, &event, &principal(Some(token)), 1, false).await;
+        let with_token = tdh::audit_row_eventually(&pool, repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        write_proxy_scan_blocked(&pool, &event, &principal(None), 1, false).await;
+        let without = tdh::audit_row_eventually(&pool, repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(with_token.details["api_token_id"], token.to_string());
+        assert!(without.details["api_token_id"].is_null());
     }
 
     #[test]

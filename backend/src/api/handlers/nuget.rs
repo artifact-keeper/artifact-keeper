@@ -4299,7 +4299,9 @@ async fn flatcontainer_download(
                             )
                             .await
                             {
-                                return Err(proxy_helpers::scan_blocked_response(&filename));
+                                return Err(proxy_helpers::audited_scan_blocked_response(
+                                    &state.db, repo.id, &filename, &expected,
+                                ));
                             }
                         }
 
@@ -13198,6 +13200,14 @@ mod scan_on_proxy_tests {
         let (status, body, _) = pull_anon(&state, &fx.repo_key, FLAT).await;
         assert_scan_blocked(status, &body, FILE);
         assert_eq!(tdh::download_count(&fx.pool, row).await, 0);
+        // #4987: audited as the gate's own refusal is.
+        let audit = tdh::audit_row_eventually(&fx.pool, fx.repo_id, "PROXY_SCAN_BLOCKED").await;
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        assert_eq!(audit.details["path"], FILE);
+        assert_eq!(audit.details["checksum_sha256"], digest);
 
         server.verify().await;
         tdh::drop_proxy_verdicts(&fx.pool, &[digest]).await;

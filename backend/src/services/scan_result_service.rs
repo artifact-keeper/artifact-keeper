@@ -435,6 +435,43 @@ pub struct ProxyBlockedEntry {
     pub proxy_scan_action: String,
 }
 
+/// Where a keyset-paged blocked-proxy listing resumes (#4987): the
+/// `(repository key, path, digest)` of the last candidate a page examined,
+/// in the listing's own order. The digest makes the key unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyBlockedKey {
+    pub repository_key: String,
+    pub path: String,
+    pub checksum_sha256: String,
+}
+
+impl ProxyBlockedKey {
+    fn of(entry: &ProxyBlockedEntry) -> Self {
+        Self {
+            repository_key: entry.repository_key.clone(),
+            path: entry.path.clone(),
+            checksum_sha256: entry.checksum_sha256.clone(),
+        }
+    }
+}
+
+/// One keyset page of [`ScanResultService::list_blocked_proxy_entries_page`].
+#[derive(Debug, Clone, Default)]
+pub struct ProxyBlockedPage {
+    pub entries: Vec<ProxyBlockedEntry>,
+    /// Where the next page resumes; `None` once the candidates are exhausted.
+    pub resume_after: Option<ProxyBlockedKey>,
+}
+
+/// Candidates one keyset read fetches (#4987).
+const PROXY_BLOCKED_PAGE_BATCH: i64 = 500;
+
+/// Candidates one keyset page examines at most before it returns short with
+/// a resume key (#4987), so a page over many vulnerable verdicts the gate
+/// does not refuse (record-only repositories, sub-threshold severities) stays
+/// bounded.
+const PROXY_BLOCKED_PAGE_EXAMINE_BUDGET: usize = 5_000;
+
 /// Upper bound on the candidate rows one blocked-proxy listing reads. The
 /// candidates are vulnerable verdicts on cached paths, a small set in
 /// practice; the cap only bounds a pathological instance, and is logged.
@@ -1571,6 +1608,7 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(new_scan)
     }
 
@@ -1881,6 +1919,7 @@ impl ScanResultService {
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(updated)
     }
 
@@ -1952,6 +1991,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(())
     }
 
@@ -1984,6 +2024,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(())
     }
 
@@ -2016,6 +2057,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(())
     }
 
@@ -2056,6 +2098,7 @@ impl ScanResultService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        scan_completed();
         Ok(result)
     }
 
@@ -3284,7 +3327,9 @@ impl ScanResultService {
         &self,
         repository_key: Option<&str>,
     ) -> Result<Vec<ProxyBlockedEntry>> {
-        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        let mut rows = self
+            .cached_vulnerable_proxy_entries(repository_key, None, PROXY_BLOCKED_CANDIDATE_CAP)
+            .await?;
         rows.retain(|r| {
             proxy_gate_refuses(
                 &r.repository_format,
@@ -3297,6 +3342,59 @@ impl ScanResultService {
         Ok(rows)
     }
 
+    /// One keyset page of [`Self::list_blocked_proxy_entries`] (#4987): up to
+    /// `limit` refused entries after `after`, in the same order. Reads the
+    /// candidates from the resume key on in batches, so a page costs what it
+    /// examines, not a read of the whole list; a page examines at most
+    /// [`PROXY_BLOCKED_PAGE_EXAMINE_BUDGET`] candidates and may come back short
+    /// with a resume key. Rows that appear or disappear between pages never
+    /// shift the next page, as an offset would.
+    pub async fn list_blocked_proxy_entries_page(
+        &self,
+        repository_key: Option<&str>,
+        after: Option<&ProxyBlockedKey>,
+        limit: usize,
+    ) -> Result<ProxyBlockedPage> {
+        let limit = limit.max(1);
+        let mut page = ProxyBlockedPage::default();
+        let mut cursor = after.cloned();
+        let mut examined = 0usize;
+        loop {
+            let batch = self
+                .cached_vulnerable_proxy_entries(
+                    repository_key,
+                    cursor.as_ref(),
+                    PROXY_BLOCKED_PAGE_BATCH,
+                )
+                .await?;
+            let exhausted = (batch.len() as i64) < PROXY_BLOCKED_PAGE_BATCH;
+            for entry in batch {
+                examined += 1;
+                cursor = Some(ProxyBlockedKey::of(&entry));
+                if proxy_gate_refuses(
+                    &entry.repository_format,
+                    entry.block_on_policy_violation,
+                    &entry.severity_threshold,
+                    &entry.proxy_scan_action,
+                    entry.max_severity.as_deref(),
+                ) {
+                    page.entries.push(entry);
+                    if page.entries.len() >= limit {
+                        page.resume_after = cursor;
+                        return Ok(page);
+                    }
+                }
+            }
+            if exhausted {
+                return Ok(page);
+            }
+            if examined >= PROXY_BLOCKED_PAGE_EXAMINE_BUDGET {
+                page.resume_after = cursor;
+                return Ok(page);
+            }
+        }
+    }
+
     /// Every proxied path a repository's proxy scan gate would refuse if it
     /// enforced (#5232): [`Self::list_blocked_proxy_entries`] over the same
     /// candidates, filtered with [`proxy_gate_would_refuse`].
@@ -3304,7 +3402,9 @@ impl ScanResultService {
         &self,
         repository_key: Option<&str>,
     ) -> Result<Vec<ProxyBlockedEntry>> {
-        let mut rows = self.cached_vulnerable_proxy_entries(repository_key).await?;
+        let mut rows = self
+            .cached_vulnerable_proxy_entries(repository_key, None, PROXY_BLOCKED_CANDIDATE_CAP)
+            .await?;
         rows.retain(|r| {
             proxy_gate_would_refuse(
                 &r.repository_format,
@@ -3383,10 +3483,13 @@ impl ScanResultService {
     }
 
     /// Fresh `vulnerable` verdicts on cached paths of scanning repositories,
-    /// ordered by repository key then path, before any gate decides.
+    /// ordered by repository key, path and digest, before any gate decides:
+    /// at most `limit`, after `after` when given (#4987).
     async fn cached_vulnerable_proxy_entries(
         &self,
         repository_key: Option<&str>,
+        after: Option<&ProxyBlockedKey>,
+        limit: i64,
     ) -> Result<Vec<ProxyBlockedEntry>> {
         let rows: Vec<ProxyBlockedEntry> = sqlx::query_as(
             r#"
@@ -3418,18 +3521,23 @@ impl ScanResultService {
             WHERE sc.scan_on_proxy
               AND r.repo_type IN ('remote', 'virtual')
               AND ($3::text IS NULL OR r.key = $3)
-            ORDER BY r.key, cached.path
+              AND ($5::text IS NULL
+                   OR (r.key, cached.path, psr.checksum_sha256) > ($5, $6, $7))
+            ORDER BY r.key, cached.path, psr.checksum_sha256
             LIMIT $4
             "#,
         )
         .bind(crate::api::handlers::proxy_helpers::PROXY_SCAN_TYPE)
         .bind(crate::services::scanner_service::DEDUP_TTL_DAYS)
         .bind(repository_key)
-        .bind(PROXY_BLOCKED_CANDIDATE_CAP)
+        .bind(limit)
+        .bind(after.map(|k| k.repository_key.as_str()))
+        .bind(after.map(|k| k.path.as_str()))
+        .bind(after.map(|k| k.checksum_sha256.as_str()))
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-        if rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
+        if after.is_none() && rows.len() as i64 >= PROXY_BLOCKED_CANDIDATE_CAP {
             tracing::warn!(
                 cap = PROXY_BLOCKED_CANDIDATE_CAP,
                 "blocked proxy listing reached its candidate cap; later repositories are not listed"
@@ -3437,6 +3545,16 @@ impl ScanResultService {
         }
         Ok(rows)
     }
+}
+
+/// A scan reached a terminal state (completed, reused, failed, not
+/// applicable), which can move a scan policy's decision on its artifact
+/// (`block_unscanned`, `block_on_fail`, the severity thresholds): drop the
+/// generated listings' cached decisions so they follow it at once instead of
+/// within their TTL (#4987). Process-local; another replica's caches expire
+/// on their TTL.
+fn scan_completed() {
+    crate::services::quarantine_service::invalidate_listing_decisions();
 }
 
 /// Longest `scan_findings.cve_id` the column holds, in characters
